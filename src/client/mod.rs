@@ -58,5 +58,7 @@ mod data_types;
 mod quantum;
 
 pub use chunk_protocol::send_and_await_chunk_response;
-pub use data_types::{compute_address, ChunkStats, DataChunk, XorName};
+pub use data_types::{
+    compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk, XorName,
+};
 pub use quantum::{QuantumClient, QuantumConfig};

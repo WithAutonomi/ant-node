@@ -33,6 +33,9 @@ use tracing::{debug, info, warn};
 /// Default timeout for network operations in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
+/// Number of closest peers to consider for chunk routing.
+const CLOSE_GROUP_SIZE: usize = 8;
+
 /// Default number of replicas for data redundancy.
 const DEFAULT_REPLICA_COUNT: u8 = 4;
 
@@ -126,7 +129,7 @@ impl QuantumClient {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
-        let target_peer = Self::pick_target_peer(node).await?;
+        let target_peer = Self::pick_target_peer(node, address).await?;
 
         // Create and send GET request
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -231,10 +234,10 @@ impl QuantumClient {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
-        let target_peer = Self::pick_target_peer(node).await?;
-
-        // Compute content address using SHA-256
+        // Compute content address using SHA-256 (before peer selection so we can route by it)
         let address = crate::client::compute_address(&content);
+
+        let target_peer = Self::pick_target_peer(node, &address).await?;
 
         // Create PUT request with empty payment proof
         let empty_payment = rmp_serde::to_vec(&ant_evm::ProofOfPayment {
@@ -320,13 +323,32 @@ impl QuantumClient {
         self.get_chunk(address).await.map(|opt| opt.is_some())
     }
 
-    /// Pick a target peer from the connected peers list.
-    async fn pick_target_peer(node: &P2PNode) -> Result<String> {
-        let peers = node.connected_peers().await;
-        peers
+    /// Pick the closest peer to `target` using an iterative Kademlia network lookup.
+    ///
+    /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest nodes to the target
+    /// address and returns the single closest remote peer (excluding ourselves).
+    async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<String> {
+        let local_dht_hex =
+            hex::encode(saorsa_core::dht::derive_dht_key_from_peer_id(node.peer_id()));
+
+        let closest_nodes = node
+            .dht()
+            .find_closest_nodes(target, CLOSE_GROUP_SIZE)
+            .await
+            .map_err(|e| Error::Network(format!("Kademlia closest-nodes lookup failed: {e}")))?;
+
+        let closest = closest_nodes
             .into_iter()
-            .next()
-            .ok_or_else(|| Error::Network("No connected peers available".into()))
+            .find(|n| n.peer_id != local_dht_hex)
+            .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
+
+        debug!(
+            "Selected closest peer {} for target {}",
+            closest.peer_id,
+            hex::encode(target)
+        );
+
+        Ok(closest.peer_id)
     }
 }
 

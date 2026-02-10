@@ -56,7 +56,10 @@ pub use ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
-pub use client::{compute_address, DataChunk, QuantumClient, QuantumConfig, XorName};
+pub use client::{
+    compute_address, peer_id_to_xor_name, xor_distance, DataChunk, QuantumClient, QuantumConfig,
+    XorName,
+};
 pub use config::{BootstrapCacheConfig, NodeConfig, StorageConfig};
 pub use devnet::{Devnet, DevnetConfig, DevnetManifest};
 pub use error::{Error, Result};

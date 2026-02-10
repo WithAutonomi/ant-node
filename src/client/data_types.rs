@@ -18,6 +18,32 @@ pub fn compute_address(content: &[u8]) -> XorName {
     address
 }
 
+/// Compute the XOR distance between two 32-byte addresses.
+///
+/// Lexicographic comparison of the result gives correct Kademlia distance ordering.
+#[must_use]
+pub fn xor_distance(a: &XorName, b: &XorName) -> XorName {
+    let mut result = [0u8; 32];
+    for i in 0..32 {
+        result[i] = a[i] ^ b[i];
+    }
+    result
+}
+
+/// Convert a hex-encoded peer ID string to an `XorName`.
+///
+/// Returns `None` if the string is not valid hex or is not exactly 32 bytes (64 hex chars).
+#[must_use]
+pub fn peer_id_to_xor_name(peer_id: &str) -> Option<XorName> {
+    let bytes = hex::decode(peer_id).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut name = [0u8; 32];
+    name.copy_from_slice(&bytes);
+    Some(name)
+}
+
 /// A content-addressed identifier (32 bytes).
 ///
 /// The address is computed as SHA256(content) for chunks,
@@ -116,6 +142,55 @@ mod tests {
         assert_eq!(chunk.address, expected);
         assert_eq!(chunk.content, content);
         assert!(chunk.verify());
+    }
+
+    #[test]
+    fn test_xor_distance_identity() {
+        let a = [0xAB; 32];
+        assert_eq!(xor_distance(&a, &a), [0u8; 32]);
+    }
+
+    #[test]
+    fn test_xor_distance_symmetry() {
+        let a = [0x01; 32];
+        let b = [0xFF; 32];
+        assert_eq!(xor_distance(&a, &b), xor_distance(&b, &a));
+    }
+
+    #[test]
+    fn test_xor_distance_known_values() {
+        let a = [0x00; 32];
+        let b = [0xFF; 32];
+        assert_eq!(xor_distance(&a, &b), [0xFF; 32]);
+
+        let mut c = [0x00; 32];
+        c[0] = 0x80;
+        let mut expected = [0x00; 32];
+        expected[0] = 0x80;
+        assert_eq!(xor_distance(&a, &c), expected);
+    }
+
+    #[test]
+    fn test_peer_id_to_xor_name_valid() {
+        let hex_str = "ab".repeat(32);
+        let result = peer_id_to_xor_name(&hex_str);
+        assert_eq!(result, Some([0xAB; 32]));
+    }
+
+    #[test]
+    fn test_peer_id_to_xor_name_invalid_hex() {
+        assert_eq!(peer_id_to_xor_name("not_hex_at_all!"), None);
+    }
+
+    #[test]
+    fn test_peer_id_to_xor_name_wrong_length() {
+        // 16 bytes instead of 32
+        let short = "ab".repeat(16);
+        assert_eq!(peer_id_to_xor_name(&short), None);
+
+        // 33 bytes
+        let long = "ab".repeat(33);
+        assert_eq!(peer_id_to_xor_name(&long), None);
     }
 
     #[test]
