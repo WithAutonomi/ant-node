@@ -702,7 +702,7 @@ impl Devnet {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(check_interval) => {
                         for (i, node) in nodes.iter().enumerate() {
-                            if !node.is_running().await {
+                            if !node.is_running() {
                                 warn!("Node {} appears unhealthy", i);
                             }
                         }
