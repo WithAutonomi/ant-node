@@ -8,7 +8,7 @@ use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
-use crate::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
 use rand::Rng;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
@@ -515,14 +515,15 @@ impl Devnet {
     }
 
     async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
-        let storage_config = DiskStorageConfig {
+        let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
+            ..LmdbStorageConfig::default()
         };
-        let storage = DiskStorage::new(storage_config)
+        let storage = LmdbStorage::new(storage_config)
             .await
-            .map_err(|e| DevnetError::Core(format!("Failed to create disk storage: {e}")))?;
+            .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {

@@ -7,7 +7,7 @@ use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEvent
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
-use crate::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
@@ -185,17 +185,18 @@ impl NodeBuilder {
 
     /// Build the ANT protocol handler from config.
     ///
-    /// Initializes disk storage, payment verifier, and quote generator.
+    /// Initializes LMDB storage, payment verifier, and quote generator.
     async fn build_ant_protocol(config: &NodeConfig) -> Result<AntProtocol> {
-        // Create disk storage
-        let storage_config = DiskStorageConfig {
+        // Create LMDB storage
+        let storage_config = LmdbStorageConfig {
             root_dir: config.root_dir.clone(),
             verify_on_read: config.storage.verify_on_read,
             max_chunks: config.storage.max_chunks,
+            ..LmdbStorageConfig::default()
         };
-        let storage = DiskStorage::new(storage_config)
+        let storage = LmdbStorage::new(storage_config)
             .await
-            .map_err(|e| Error::Startup(format!("Failed to create disk storage: {e}")))?;
+            .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
 
         // Create payment verifier
         let evm_network = match config.payment.evm_network {

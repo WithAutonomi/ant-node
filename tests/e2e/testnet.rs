@@ -27,7 +27,7 @@ use saorsa_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
-use saorsa_node::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -951,14 +951,15 @@ impl TestNetwork {
     /// - Quote generator with a test rewards address
     async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
         // Create disk storage
-        let storage_config = DiskStorageConfig {
+        let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
             max_chunks: 0, // Unlimited for tests
+            ..LmdbStorageConfig::default()
         };
-        let storage = DiskStorage::new(storage_config)
+        let storage = LmdbStorage::new(storage_config)
             .await
-            .map_err(|e| TestnetError::Core(format!("Failed to create disk storage: {e}")))?;
+            .map_err(|e| TestnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
         // Create payment verifier with EVM disabled
         let payment_config = PaymentVerifierConfig {

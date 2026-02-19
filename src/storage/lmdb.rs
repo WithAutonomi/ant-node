@@ -1,40 +1,48 @@
-//! Content-addressed disk storage with sharded directories.
+//! Content-addressed LMDB storage for chunks.
 //!
-//! Provides persistent storage for chunks using a two-level directory structure
-//! to avoid large directory listings:
+//! Provides persistent storage for chunks using LMDB (via heed) for
+//! memory-mapped, zero-copy reads with ACID transactions.
 //!
 //! ```text
-//! {root}/chunks/{xx}/{yy}/{address}.chunk
+//! {root}/chunks.mdb/   -- LMDB environment directory
 //! ```
-//!
-//! Where `xx` and `yy` are the first two bytes of the address in hex.
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
+use heed::types::Bytes;
+use heed::{Database, Env, EnvOpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::fs;
-use tokio::io::AsyncWriteExt;
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace, warn};
 
-/// Configuration for disk storage.
+/// Default LMDB map size: 1 TiB virtual address space (costs nothing until used).
+const DEFAULT_MAX_MAP_SIZE: usize = 1_099_511_627_776;
+
+/// LMDB map size for tests: 10 MiB.
+#[cfg(test)]
+const TEST_MAP_SIZE: usize = 10 * 1024 * 1024;
+
+/// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
-pub struct DiskStorageConfig {
-    /// Root directory for chunk storage.
+pub struct LmdbStorageConfig {
+    /// Root directory for storage (LMDB env lives at `{root_dir}/chunks.mdb/`).
     pub root_dir: PathBuf,
     /// Whether to verify content on read (compares hash to address).
     pub verify_on_read: bool,
     /// Maximum number of chunks to store (0 = unlimited).
     pub max_chunks: usize,
+    /// LMDB maximum map size in bytes (default: 1 TiB).
+    pub max_map_size: usize,
 }
 
-impl Default for DiskStorageConfig {
+impl Default for LmdbStorageConfig {
     fn default() -> Self {
         Self {
             root_dir: PathBuf::from(".saorsa/chunks"),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: DEFAULT_MAX_MAP_SIZE,
         }
     }
 }
@@ -54,47 +62,89 @@ pub struct StorageStats {
     pub duplicates: u64,
     /// Number of verification failures on read.
     pub verification_failures: u64,
-    /// Number of chunks currently persisted on disk.
+    /// Number of chunks currently persisted.
     pub current_chunks: u64,
 }
 
-/// Content-addressed disk storage.
+/// Content-addressed LMDB storage.
 ///
-/// Uses a sharded directory structure for efficient storage:
-/// ```text
-/// {root}/chunks/{xx}/{yy}/{address}.chunk
-/// ```
-pub struct DiskStorage {
+/// Uses heed (LMDB wrapper) for memory-mapped, transactional chunk storage.
+/// Keys are 32-byte `XorName` addresses, values are raw chunk bytes.
+pub struct LmdbStorage {
+    /// LMDB environment.
+    env: Env,
+    /// The unnamed default database (key=XorName bytes, value=chunk bytes).
+    db: Database<Bytes, Bytes>,
     /// Storage configuration.
-    config: DiskStorageConfig,
+    config: LmdbStorageConfig,
     /// Operation statistics.
     stats: parking_lot::RwLock<StorageStats>,
-    /// Current number of chunks on disk.
+    /// Current number of chunks in the database.
     current_chunks: AtomicU64,
 }
 
-impl DiskStorage {
-    /// Create a new disk storage instance.
+impl LmdbStorage {
+    /// Create a new LMDB storage instance.
+    ///
+    /// Opens (or creates) an LMDB environment at `{root_dir}/chunks.mdb/`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the root directory cannot be created.
-    pub async fn new(config: DiskStorageConfig) -> Result<Self> {
-        // Ensure root directory exists
-        let chunks_dir = config.root_dir.join("chunks");
-        fs::create_dir_all(&chunks_dir)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to create chunks directory: {e}")))?;
+    /// Returns an error if the LMDB environment cannot be opened.
+    #[allow(unsafe_code)]
+    pub async fn new(config: LmdbStorageConfig) -> Result<Self> {
+        let env_dir = config.root_dir.join("chunks.mdb");
+        let max_map_size = config.max_map_size;
 
-        debug!("Initialized disk storage at {:?}", config.root_dir);
+        // Create the directory synchronously before opening LMDB
+        std::fs::create_dir_all(&env_dir)
+            .map_err(|e| Error::Storage(format!("Failed to create LMDB directory: {e}")))?;
 
-        let scan_dir = chunks_dir.clone();
-        let existing_chunks = spawn_blocking(move || Self::count_existing_chunks(&scan_dir))
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to count chunks: {e}")))?
-            .map_err(|e| Error::Storage(format!("Failed to count chunks: {e}")))?;
+        let env_dir_clone = env_dir.clone();
+        let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
+            // SAFETY: We ensure the LMDB environment directory is unique per node
+            // instance via `root_dir`, so no two processes open the same env
+            // concurrently. The directory is created above and owned by this node.
+            let env = unsafe {
+                EnvOpenOptions::new()
+                    .map_size(max_map_size)
+                    .max_dbs(1)
+                    .open(&env_dir_clone)
+                    .map_err(|e| Error::Storage(format!("Failed to open LMDB env: {e}")))?
+            };
+
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+            let db: Database<Bytes, Bytes> = env
+                .create_database(&mut wtxn, None)
+                .map_err(|e| Error::Storage(format!("Failed to create database: {e}")))?;
+            wtxn.commit()
+                .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
+
+            Ok((env, db))
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB init task failed: {e}")))??;
+
+        // Read existing entry count from env stats
+        let rtxn = env
+            .read_txn()
+            .map_err(|e| Error::Storage(format!("Failed to read LMDB stats: {e}")))?;
+        let stat = db
+            .stat(&rtxn)
+            .map_err(|e| Error::Storage(format!("Failed to get db stat: {e}")))?;
+        let existing_chunks = stat.entries as u64;
+        drop(rtxn);
+
+        debug!(
+            "Initialized LMDB storage at {:?} ({} existing chunks)",
+            env_dir, existing_chunks
+        );
 
         Ok(Self {
+            env,
+            db,
             config,
             stats: parking_lot::RwLock::new(StorageStats::default()),
             current_chunks: AtomicU64::new(existing_chunks),
@@ -102,8 +152,6 @@ impl DiskStorage {
     }
 
     /// Store a chunk.
-    ///
-    /// Uses atomic write (temp file + rename) for crash safety.
     ///
     /// # Arguments
     ///
@@ -128,10 +176,8 @@ impl DiskStorage {
             )));
         }
 
-        let chunk_path = self.chunk_path(address);
-
-        // Check if already exists
-        if chunk_path.exists() {
+        // Check if already exists (fast mmap read)
+        if self.exists(address) {
             trace!("Chunk {} already exists", hex::encode(address));
             {
                 let mut stats = self.stats.write();
@@ -141,11 +187,9 @@ impl DiskStorage {
         }
 
         // Enforce max_chunks capacity limit (0 = unlimited)
-        let mut reserved_slot = false;
-        let mut increment_after_commit = false;
         if self.config.max_chunks > 0 {
             let max_chunks = self.config.max_chunks as u64;
-            match self
+            if self
                 .current_chunks
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
                     if current >= max_chunks {
@@ -153,60 +197,45 @@ impl DiskStorage {
                     } else {
                         Some(current + 1)
                     }
-                }) {
-                Ok(_) => {
-                    reserved_slot = true;
-                }
-                Err(current) => {
-                    return Err(Error::Storage(format!(
-                        "Storage capacity reached: {} chunks stored, max is {}",
-                        current, self.config.max_chunks
-                    )));
-                }
+                })
+                .is_err()
+            {
+                let current = self.current_chunks.load(Ordering::SeqCst);
+                return Err(Error::Storage(format!(
+                    "Storage capacity reached: {} chunks stored, max is {}",
+                    current, self.config.max_chunks
+                )));
             }
-        } else {
-            increment_after_commit = true;
         }
 
-        let mut release_slot = || {
-            if reserved_slot {
+        let key = *address;
+        let value = content.to_vec();
+        let env = self.env.clone();
+        let db = self.db;
+
+        let write_result = spawn_blocking(move || -> Result<()> {
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+            db.put(&mut wtxn, &key, &value)
+                .map_err(|e| Error::Storage(format!("Failed to put chunk: {e}")))?;
+            wtxn.commit()
+                .map_err(|e| Error::Storage(format!("Failed to commit put: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))?;
+
+        if let Err(e) = write_result {
+            // Roll back the capacity reservation on failure
+            if self.config.max_chunks > 0 {
                 self.current_chunks.fetch_sub(1, Ordering::SeqCst);
-                reserved_slot = false;
             }
-        };
-
-        // Ensure parent directories exist
-        if let Some(parent) = chunk_path.parent() {
-            fs::create_dir_all(parent).await.map_err(|e| {
-                release_slot();
-                Error::Storage(format!("Failed to create shard directory: {e}"))
-            })?;
+            return Err(e);
         }
 
-        // Atomic write: temp file + rename
-        let temp_path = chunk_path.with_extension("tmp");
-        let mut file = fs::File::create(&temp_path).await.map_err(|e| {
-            release_slot();
-            Error::Storage(format!("Failed to create temp file: {e}"))
-        })?;
-
-        file.write_all(content).await.map_err(|e| {
-            release_slot();
-            Error::Storage(format!("Failed to write chunk: {e}"))
-        })?;
-
-        file.flush().await.map_err(|e| {
-            release_slot();
-            Error::Storage(format!("Failed to flush chunk: {e}"))
-        })?;
-
-        // Rename for atomic commit
-        fs::rename(&temp_path, &chunk_path).await.map_err(|e| {
-            release_slot();
-            Error::Storage(format!("Failed to rename temp file: {e}"))
-        })?;
-
-        if increment_after_commit {
+        // Increment current_chunks for unlimited mode (already incremented above for limited)
+        if self.config.max_chunks == 0 {
             self.current_chunks.fetch_add(1, Ordering::SeqCst);
         }
 
@@ -239,16 +268,26 @@ impl DiskStorage {
     ///
     /// Returns an error if read fails or verification fails.
     pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        let chunk_path = self.chunk_path(address);
+        let key = *address;
+        let env = self.env.clone();
+        let db = self.db;
 
-        if !chunk_path.exists() {
+        let content = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let rtxn = env
+                .read_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+            let value = db
+                .get(&rtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
+            Ok(value.map(Vec::from))
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB get task failed: {e}")))??;
+
+        let Some(content) = content else {
             trace!("Chunk {} not found", hex::encode(address));
             return Ok(None);
-        }
-
-        let content = fs::read(&chunk_path)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to read chunk: {e}")))?;
+        };
 
         // Verify content if configured
         if self.config.verify_on_read {
@@ -288,7 +327,14 @@ impl DiskStorage {
     /// Check if a chunk exists.
     #[must_use]
     pub fn exists(&self, address: &XorName) -> bool {
-        self.chunk_path(address).exists()
+        let Ok(rtxn) = self.env.read_txn() else {
+            return false;
+        };
+        self.db
+            .get(&rtxn, address.as_ref())
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     /// Delete a chunk.
@@ -297,21 +343,30 @@ impl DiskStorage {
     ///
     /// Returns an error if deletion fails.
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
-        let chunk_path = self.chunk_path(address);
+        let key = *address;
+        let env = self.env.clone();
+        let db = self.db;
 
-        if !chunk_path.exists() {
-            return Ok(false);
+        let deleted = spawn_blocking(move || -> Result<bool> {
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+            let existed = db
+                .delete(&mut wtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to delete chunk: {e}")))?;
+            wtxn.commit()
+                .map_err(|e| Error::Storage(format!("Failed to commit delete: {e}")))?;
+            Ok(existed)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))??;
+
+        if deleted {
+            self.current_chunks.fetch_sub(1, Ordering::SeqCst);
+            debug!("Deleted chunk {}", hex::encode(address));
         }
 
-        fs::remove_file(&chunk_path)
-            .await
-            .map_err(|e| Error::Storage(format!("Failed to delete chunk: {e}")))?;
-
-        self.current_chunks.fetch_sub(1, Ordering::SeqCst);
-
-        debug!("Deleted chunk {}", hex::encode(address));
-
-        Ok(true)
+        Ok(deleted)
     }
 
     /// Get storage statistics.
@@ -320,21 +375,6 @@ impl DiskStorage {
         let mut stats = self.stats.read().clone();
         stats.current_chunks = self.current_chunks.load(Ordering::SeqCst);
         stats
-    }
-
-    /// Get the path for a chunk.
-    fn chunk_path(&self, address: &XorName) -> PathBuf {
-        // Two-level sharding using first two bytes
-        let shard1 = format!("{:02x}", address[0]);
-        let shard2 = format!("{:02x}", address[1]);
-        let filename = format!("{}.chunk", hex::encode(address));
-
-        self.config
-            .root_dir
-            .join("chunks")
-            .join(shard1)
-            .join(shard2)
-            .join(filename)
     }
 
     /// Compute content address (SHA256 hash).
@@ -348,24 +388,6 @@ impl DiskStorage {
     pub fn root_dir(&self) -> &Path {
         &self.config.root_dir
     }
-
-    fn count_existing_chunks(dir: &Path) -> std::io::Result<u64> {
-        if !dir.exists() {
-            return Ok(0);
-        }
-
-        let mut count = 0u64;
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                count += Self::count_existing_chunks(&path)?;
-            } else if matches!(path.extension().and_then(|ext| ext.to_str()), Some("chunk")) {
-                count += 1;
-            }
-        }
-        Ok(count)
-    }
 }
 
 #[cfg(test)]
@@ -374,14 +396,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    async fn create_test_storage() -> (DiskStorage, TempDir) {
+    async fn create_test_storage() -> (LmdbStorage, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
-        let config = DiskStorageConfig {
+        let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: TEST_MAP_SIZE, // 10 MiB for tests
         };
-        let storage = DiskStorage::new(config).await.expect("create storage");
+        let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
     }
 
@@ -390,7 +413,7 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
 
         let content = b"hello world";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         // Store chunk
         let is_new = storage.put(&address, content).await.expect("put");
@@ -406,7 +429,7 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
 
         let content = b"test data";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         // First store
         let is_new1 = storage.put(&address, content).await.expect("put 1");
@@ -436,7 +459,7 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
 
         let content = b"exists test";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         assert!(!storage.exists(&address));
 
@@ -450,7 +473,7 @@ mod tests {
         let (storage, _temp) = create_test_storage().await;
 
         let content = b"delete test";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         // Store
         storage.put(&address, content).await.expect("put");
@@ -469,19 +492,20 @@ mod tests {
     #[tokio::test]
     async fn test_max_chunks_enforced() {
         let temp_dir = TempDir::new().expect("create temp dir");
-        let config = DiskStorageConfig {
+        let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 2,
+            max_map_size: TEST_MAP_SIZE,
         };
-        let storage = DiskStorage::new(config).await.expect("create storage");
+        let storage = LmdbStorage::new(config).await.expect("create storage");
 
         let content1 = b"chunk one";
         let content2 = b"chunk two";
         let content3 = b"chunk three";
-        let addr1 = DiskStorage::compute_address(content1);
-        let addr2 = DiskStorage::compute_address(content2);
-        let addr3 = DiskStorage::compute_address(content3);
+        let addr1 = LmdbStorage::compute_address(content1);
+        let addr2 = LmdbStorage::compute_address(content2);
+        let addr3 = LmdbStorage::compute_address(content3);
 
         // First two should succeed
         assert!(storage.put(&addr1, content1).await.is_ok());
@@ -505,29 +529,11 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("mismatch"));
     }
 
-    #[tokio::test]
-    async fn test_chunk_path_sharding() {
-        let (storage, _temp) = create_test_storage().await;
-
-        // Address starting with 0xAB, 0xCD...
-        let mut address = [0u8; 32];
-        address[0] = 0xAB;
-        address[1] = 0xCD;
-
-        let path = storage.chunk_path(&address);
-        let path_str = path.to_string_lossy();
-
-        // Should contain sharded directories
-        assert!(path_str.contains("ab"));
-        assert!(path_str.contains("cd"));
-        assert!(path_str.ends_with(".chunk"));
-    }
-
     #[test]
     fn test_compute_address() {
         // Known SHA256 hash of "hello world"
         let content = b"hello world";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         let expected_hex = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
         assert_eq!(hex::encode(address), expected_hex);
@@ -539,8 +545,8 @@ mod tests {
 
         let content1 = b"content 1";
         let content2 = b"content 2";
-        let address1 = DiskStorage::compute_address(content1);
-        let address2 = DiskStorage::compute_address(content2);
+        let address1 = LmdbStorage::compute_address(content1);
+        let address2 = LmdbStorage::compute_address(content2);
 
         // Store two chunks
         storage.put(&address1, content1).await.expect("put 1");
@@ -563,17 +569,18 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_recovers_after_delete() {
         let temp_dir = TempDir::new().expect("create temp dir");
-        let config = DiskStorageConfig {
+        let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 1,
+            max_map_size: TEST_MAP_SIZE,
         };
-        let storage = DiskStorage::new(config).await.expect("create storage");
+        let storage = LmdbStorage::new(config).await.expect("create storage");
 
         let first = b"first chunk";
         let second = b"second chunk";
-        let addr1 = DiskStorage::compute_address(first);
-        let addr2 = DiskStorage::compute_address(second);
+        let addr1 = LmdbStorage::compute_address(first);
+        let addr2 = LmdbStorage::compute_address(second);
 
         storage.put(&addr1, first).await.expect("put first");
         storage.delete(&addr1).await.expect("delete first");
@@ -583,5 +590,38 @@ mod tests {
 
         let stats = storage.stats();
         assert_eq!(stats.current_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn test_persistence_across_reopen() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let content = b"persistent data";
+        let address = LmdbStorage::compute_address(content);
+
+        // Store a chunk
+        {
+            let config = LmdbStorageConfig {
+                root_dir: temp_dir.path().to_path_buf(),
+                verify_on_read: true,
+                max_chunks: 0,
+                max_map_size: TEST_MAP_SIZE,
+            };
+            let storage = LmdbStorage::new(config).await.expect("create storage");
+            storage.put(&address, content).await.expect("put");
+        }
+
+        // Re-open and verify it persisted
+        {
+            let config = LmdbStorageConfig {
+                root_dir: temp_dir.path().to_path_buf(),
+                verify_on_read: true,
+                max_chunks: 0,
+                max_map_size: TEST_MAP_SIZE,
+            };
+            let storage = LmdbStorage::new(config).await.expect("reopen storage");
+            assert_eq!(storage.current_chunks.load(Ordering::SeqCst), 1);
+            let retrieved = storage.get(&address).await.expect("get");
+            assert_eq!(retrieved, Some(content.to_vec()));
+        }
     }
 }

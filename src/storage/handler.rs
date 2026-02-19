@@ -1,7 +1,7 @@
 //! ANT protocol handler for autonomi protocol messages.
 //!
 //! This handler processes chunk PUT/GET requests with optional payment verification,
-//! storing chunks to disk and using the DHT for network-wide retrieval.
+//! storing chunks to LMDB and using the DHT for network-wide retrieval.
 //!
 //! # Architecture
 //!
@@ -18,7 +18,7 @@
 //! │   ChunkQuoteRequest           ChunkPutRequest    ChunkGetRequest
 //! │         │                         │                 │  │
 //! │         ▼                         ▼                 ▼  │
-//! │   QuoteGenerator          PaymentVerifier    DiskStorage│
+//! │   QuoteGenerator          PaymentVerifier    LmdbStorage│
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
@@ -33,18 +33,18 @@ use crate::ant_protocol::{
 };
 use crate::error::Result;
 use crate::payment::{PaymentVerifier, QuoteGenerator};
-use crate::storage::disk::DiskStorage;
+use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
 ///
-/// Handles chunk PUT/GET/Quote requests using disk storage for persistence
+/// Handles chunk PUT/GET/Quote requests using LMDB storage for persistence
 /// and optional payment verification.
 pub struct AntProtocol {
-    /// Disk storage for chunk persistence.
-    storage: Arc<DiskStorage>,
+    /// LMDB storage for chunk persistence.
+    storage: Arc<LmdbStorage>,
     /// Payment verifier for checking payments.
     payment_verifier: Arc<PaymentVerifier>,
     /// Quote generator for creating storage quotes.
@@ -56,12 +56,12 @@ impl AntProtocol {
     ///
     /// # Arguments
     ///
-    /// * `storage` - Disk storage for chunk persistence
+    /// * `storage` - LMDB storage for chunk persistence
     /// * `payment_verifier` - Payment verifier for validating payments
     /// * `quote_generator` - Quote generator for creating storage quotes
     #[must_use]
     pub fn new(
-        storage: Arc<DiskStorage>,
+        storage: Arc<LmdbStorage>,
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
@@ -175,7 +175,7 @@ impl AntProtocol {
             }
         }
 
-        // 5. Store to disk
+        // 5. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
                 info!(
@@ -303,20 +303,24 @@ mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
-    use crate::storage::DiskStorageConfig;
+    use crate::storage::LmdbStorageConfig;
     use ant_evm::RewardsAddress;
     use tempfile::TempDir;
+
+    /// LMDB map size for tests: 10 MiB.
+    const TEST_MAP_SIZE: usize = 10 * 1024 * 1024;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
 
-        let storage_config = DiskStorageConfig {
+        let storage_config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
             max_chunks: 0,
+            max_map_size: TEST_MAP_SIZE,
         };
         let storage = Arc::new(
-            DiskStorage::new(storage_config)
+            LmdbStorage::new(storage_config)
                 .await
                 .expect("create storage"),
         );
@@ -343,7 +347,7 @@ mod tests {
         let (protocol, _temp) = create_test_protocol().await;
 
         let content = b"hello world";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         // Create PUT request - with empty payment proof (EVM disabled)
         let put_request = ChunkPutRequest::with_payment(
@@ -476,7 +480,7 @@ mod tests {
 
         // Create oversized content
         let content = vec![0u8; MAX_CHUNK_SIZE + 1];
-        let address = DiskStorage::compute_address(&content);
+        let address = LmdbStorage::compute_address(&content);
 
         let put_request = ChunkPutRequest::new(address, content);
         let put_msg = ChunkMessage {
@@ -507,7 +511,7 @@ mod tests {
         let (protocol, _temp) = create_test_protocol().await;
 
         let content = b"duplicate content";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         // Store first time
         let put_request = ChunkPutRequest::with_payment(
@@ -557,7 +561,7 @@ mod tests {
         let (protocol, _temp) = create_test_protocol().await;
 
         let content = b"local access test";
-        let address = DiskStorage::compute_address(content);
+        let address = LmdbStorage::compute_address(content);
 
         assert!(!protocol.exists(&address));
 

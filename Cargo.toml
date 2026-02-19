@@ -44,6 +44,9 @@ xor_name = "5"
 lru = "0.16.3"
 parking_lot = "0.12"  # Efficient mutex for cache
 
+# Storage - LMDB via heed for content-addressed chunk store
+heed = "0.22"
+
 # Migration: Decrypt ant-node data (read-only)
 aes-gcm-siv = "0.11"
 hkdf = "0.12"
@@ -117,7 +120,7 @@ strip = true
 opt-level = 1
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [lints.clippy]

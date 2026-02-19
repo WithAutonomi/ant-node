@@ -34,7 +34,7 @@
 //! }
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
@@ -66,4 +66,4 @@ pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
 pub use node::{NodeBuilder, RunningNode};
 pub use payment::{PaymentStatus, PaymentVerifier, PaymentVerifierConfig};
-pub use storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+pub use storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};

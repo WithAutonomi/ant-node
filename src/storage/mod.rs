@@ -1,6 +1,6 @@
 //! Storage subsystem for chunk persistence.
 //!
-//! This module provides content-addressed disk storage for chunks,
+//! This module provides content-addressed LMDB storage for chunks,
 //! along with a protocol handler that integrates with saorsa-core's
 //! `Protocol` trait for automatic message routing.
 //!
@@ -19,7 +19,7 @@
 //! │   QuoteRequest           ChunkPutRequest    ChunkGetRequest
 //! │         │                         │                 │  │
 //! │         ▼                         ▼                 ▼  │
-//! │   QuoteGenerator          PaymentVerifier    DiskStorage│
+//! │   QuoteGenerator          PaymentVerifier   LmdbStorage│
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
@@ -30,11 +30,11 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use saorsa_node::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+//! use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 //!
 //! // Create storage
-//! let config = DiskStorageConfig::default();
-//! let storage = DiskStorage::new(config).await?;
+//! let config = LmdbStorageConfig::default();
+//! let storage = LmdbStorage::new(config).await?;
 //!
 //! // Create protocol handler
 //! let protocol = AntProtocol::new(storage, payment_verifier, quote_generator);
@@ -43,9 +43,9 @@
 //! listener.register_protocol(protocol).await?;
 //! ```
 
-mod disk;
 mod handler;
+mod lmdb;
 
 pub use crate::ant_protocol::XorName;
-pub use disk::{DiskStorage, DiskStorageConfig, StorageStats};
 pub use handler::AntProtocol;
+pub use lmdb::{LmdbStorage, LmdbStorageConfig, StorageStats};
