@@ -178,6 +178,7 @@ impl Cli {
         // Override with CLI arguments
         if let Some(root_dir) = self.root_dir {
             config.root_dir = root_dir;
+            config.root_dir_explicit = true;
         }
 
         config.port = self.port;

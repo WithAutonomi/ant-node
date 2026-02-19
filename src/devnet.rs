@@ -4,6 +4,7 @@
 //! multi-node networks on a single machine.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::config::NODE_IDENTITY_FILENAME;
 use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -11,6 +12,7 @@ use crate::payment::{
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
 use rand::Rng;
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -265,6 +267,7 @@ pub enum NodeState {
 pub struct DevnetNode {
     index: usize,
     node_id: String,
+    peer_id: String,
     port: u16,
     address: SocketAddr,
     data_dir: PathBuf,
@@ -497,11 +500,21 @@ impl Devnet {
 
         tokio::fs::create_dir_all(&data_dir).await?;
 
+        // Generate and persist a stable identity for this devnet node
+        let identity = NodeIdentity::generate()
+            .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
+        let peer_id = hex::encode(identity.node_id().0);
+        identity
+            .save_to_file(&data_dir.join(NODE_IDENTITY_FILENAME))
+            .await
+            .map_err(|e| DevnetError::Core(format!("Failed to save node identity: {e}")))?;
+
         let ant_protocol = Self::create_ant_protocol(&data_dir).await?;
 
         Ok(DevnetNode {
             index,
             node_id,
+            peer_id,
             port,
             address,
             data_dir,
@@ -553,6 +566,7 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
+        core_config.peer_id = Some(node.peer_id.clone());
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
