@@ -445,9 +445,9 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
 
-    /// Maximum LMDB database size in GiB.
-    /// Default: 32 (on Unix the mmap is a lazy reservation and costs nothing
-    /// until pages are faulted in).
+    /// Maximum LMDB database size in GiB (0 = use default of 32 GiB).
+    /// On Unix the mmap is a lazy reservation and costs nothing until pages
+    /// are faulted in.
     #[serde(default)]
     pub db_size_gb: usize,
 }

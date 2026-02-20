@@ -29,7 +29,7 @@ pub struct LmdbStorageConfig {
     pub verify_on_read: bool,
     /// Maximum number of chunks to store (0 = unlimited).
     pub max_chunks: usize,
-    /// Maximum LMDB map size in bytes (0 = use platform default).
+    /// Maximum LMDB map size in bytes (0 = use default of 32 GiB).
     pub max_map_size: usize,
 }
 
@@ -105,9 +105,10 @@ impl LmdbStorage {
             // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses memory-mapped
             // I/O and relies on OS file-locking to prevent corruption from concurrent
             // access by multiple processes. We satisfy this by giving each node instance
-            // a unique `root_dir` (scoped by peer-ID hex prefix), ensuring no two
-            // processes open the same LMDB environment. Callers who manually configure
-            // `--root-dir` must not point multiple nodes at the same directory.
+            // a unique `root_dir` (typically a directory named by its full 64-hex peer
+            // ID), ensuring no two processes open the same LMDB environment. Callers
+            // who manually configure `--root-dir` must not point multiple nodes at the
+            // same directory.
             let env = unsafe {
                 EnvOpenOptions::new()
                     .map_size(map_size)
@@ -366,7 +367,13 @@ impl LmdbStorage {
     #[must_use]
     pub fn stats(&self) -> StorageStats {
         let mut stats = self.stats.read().clone();
-        stats.current_chunks = self.current_chunks().unwrap_or(0);
+        match self.current_chunks() {
+            Ok(count) => stats.current_chunks = count,
+            Err(e) => {
+                warn!("Failed to read current_chunks for stats: {e}");
+                stats.current_chunks = 0;
+            }
+        }
         stats
     }
 

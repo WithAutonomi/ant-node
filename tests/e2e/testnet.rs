@@ -11,7 +11,7 @@
 //! - Message encoding/decoding (postcard serialization)
 //! - Content address verification
 //! - Payment verification (when enabled)
-//! - Disk storage persistence
+//! - LMDB storage persistence
 
 use ant_evm::RewardsAddress;
 use bytes::Bytes;
@@ -906,7 +906,7 @@ impl TestNetwork {
     /// Create a test node (but don't start it yet).
     ///
     /// Initializes the `AntProtocol` handler with:
-    /// - Disk storage in the node's data directory
+    /// - LMDB storage in the node's data directory
     /// - Payment verification disabled (for testing)
     /// - Quote generation with a test rewards address
     async fn create_node(

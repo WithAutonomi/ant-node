@@ -712,7 +712,8 @@ mod tests {
 
     #[test]
     fn test_scan_identity_dirs_nonexistent_dir() {
-        let path = PathBuf::from("/tmp/saorsa_nonexistent_test_dir_12345");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent_identity_dir");
         let dirs = NodeBuilder::scan_identity_dirs(&path).unwrap();
         assert!(dirs.is_empty());
     }

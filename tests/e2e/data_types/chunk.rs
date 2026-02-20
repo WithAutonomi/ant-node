@@ -364,18 +364,23 @@ mod tests {
         // 1. Abort the protocol task that holds an Arc<AntProtocol>
         // 2. Drop the node's own Arc<AntProtocol>
         // This ensures the LMDB env is fully closed before reopening.
-        let data_dir = {
+        let (protocol_task, data_dir) = {
             let node = harness
                 .network_mut()
                 .node_mut(0)
                 .expect("Node 0 should exist");
-            if let Some(handle) = node.protocol_task.take() {
-                handle.abort();
-            }
+            let handle = node.protocol_task.take();
             let dir = node.data_dir.clone();
             node.ant_protocol = None;
-            dir
+            (handle, dir)
         };
+
+        // Abort the protocol task and wait for it to fully shut down so the
+        // LMDB env is closed before we reopen it.
+        if let Some(handle) = protocol_task {
+            handle.abort();
+            let _ = handle.await;
+        }
 
         // Recreate AntProtocol from the same data directory (simulates restart)
         let new_protocol = TestNetwork::create_ant_protocol(&data_dir)
