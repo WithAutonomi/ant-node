@@ -181,11 +181,12 @@ impl NodeBuilder {
 
     /// Resolve the node identity from disk or generate a new one.
     ///
-    /// **When `root_dir_explicit` is true** (i.e. `--root-dir` was provided):
+    /// **When `root_dir` is explicit** (set via `--root-dir` or differs from the
+    /// platform default, e.g. loaded from `config.toml`):
     ///   - If `{root_dir}/node_identity.key` exists, load it.
     ///   - Otherwise, generate a new identity and save it there.
     ///
-    /// **When `root_dir_explicit` is false** (default):
+    /// **When `root_dir` is the platform default** (first run, no config file):
     ///   1. Compute `base_dir` = platform data dir for "saorsa".
     ///   2. Scan `base_dir` for subdirectories containing `node_identity.key`.
     ///   3. **None found** — first run: generate identity, derive `{base_dir}/{hex_prefix}/`,
@@ -193,11 +194,14 @@ impl NodeBuilder {
     ///   4. **Exactly one found** — load it and update `config.root_dir`.
     ///   5. **Multiple found** — return an error asking the user to specify `--root-dir`.
     async fn resolve_identity(config: &mut NodeConfig) -> Result<NodeIdentity> {
-        if config.root_dir_explicit {
+        // Treat root_dir as explicit if it was set via --root-dir OR differs from
+        // the platform default (e.g. loaded from config.toml). This prevents
+        // silently ignoring a custom root_dir from config files.
+        let base_dir = default_root_dir();
+        if config.root_dir_explicit || config.root_dir != base_dir {
             return Self::load_or_generate_identity(&config.root_dir).await;
         }
 
-        let base_dir = default_root_dir();
         Self::resolve_identity_in_base_dir(config, &base_dir).await
     }
 
