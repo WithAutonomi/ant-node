@@ -1,617 +1,487 @@
-# Record Replication Design
+# Replication Logic Specification (Codebase-Agnostic)
 
-## Overview
+> Status: Design-level specification for pre-implementation validation.
 
-This document describes how record replication works in a Kademlia-based decentralized storage network with one-time payments and permanent storage. There is no publisher republishing, no ongoing payments, and no erasure coding. Records are fully replicated across multiple nodes. The replication system keeps records durable despite continuous node churn.
+## 1. Purpose
 
-Standard Kademlia replication is designed for ephemeral data with TTLs and publisher-driven republishing. This design replaces that with a multi-tiered, pull-based, churn-aware scheme built for permanent storage without a publisher.
+This document specifies replication behavior as a pure system design, independent of any language, framework, transport, or existing codebase.
 
-This design is for the node-level replication pipeline implemented in `saorsa-node`. It does **not** use `saorsa-core`'s replication manager APIs.
+Primary goal: validate correctness, safety, and liveness of replication logic before implementation.
 
-## Key Differences from Standard Kademlia
+## 2. Scope
 
-| Standard Kademlia | This Design |
-|---|---|
-| Publisher must republish every hour | No publisher involvement after initial upload |
-| Records expire after 24 hours | Records are permanent |
-| Push full records to k closest nodes | Push key lists, receivers pull what they need |
-| Single republish timer | Three replication tiers at different timescales |
-| Fixed replication to k closest | Dynamic responsible distance range based on network density |
-| Accept stores from anyone | Sender validation, quorum requirement, range checks |
-| No verification of stored data | Batched random-range chunk proofs with burst audits |
-| No concept of node quality | Bad node detection with eviction |
-| Blind reaction to topology changes | Churn-aware triggering with restart suppression |
+### In scope
 
-## Core Constants
+- Permanent record replication in a decentralized key-addressed network.
+- Pull-based repair (key offers + receiver fetch).
+- Churn-aware maintenance and proactive repair.
+- Admission control, quorum verification, and storage audits.
 
-| Constant | Value | Purpose |
+### Out of scope
+
+- Concrete wire formats and RPC APIs.
+- Disk layout, serialization details, and database choices.
+- Cryptographic algorithm selection beyond required properties.
+
+## 3. System Model
+
+- `Node`: participant with routing view, local store, and replication worker.
+- `Record`: immutable, content-addressed data unit with key `K`.
+- `Distance(K, N)`: deterministic distance metric between key and node identity.
+- `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
+- `ResponsibleRange(N)`: max distance from node `N` within which `N` is willing to store replicated records.
+- `Holder`: node that stores a valid copy of a record.
+- `PoP`: proof that a record was authorized for initial storage/payment policy.
+- `PaidForList(N)`: in-memory set of keys node `N` currently believes are paid-authorized.
+- `ClosestX(K)`: `PAID_LIST_CLOSEST_X` nearest nodes to key `K` that participate in paid-list consensus.
+- `ClosestY(K)`: `PAYMENT_ACCEPT_CLOSEST_Y` nearest nodes to key `K` allowed to accept initial paid writes (`Y <= X`).
+
+## 4. Tunable Parameters
+
+All parameters are configurable. Values below are a reference profile used for logic validation.
+
+| Parameter | Meaning | Reference |
 |---|---|---|
-| `CLOSE_GROUP_SIZE` | 8 | Closest-peer set size used for replication lookups |
-| `REPLICATION_FACTOR` | 8 | Maximum number of nodes holding each record (when network has capacity) |
-| `MIN_REPLICATION_FACTOR` | 4 | Floor replication factor under storage pressure |
-| `MAX_RECORDS_COUNT` | `storage.max_chunks` when `> 0` | Max records per node before considered full (capacity-managed mode only) |
-| `PERIODIC_REPLICATION_INTERVAL_MAX_S` | 180 | Upper bound of randomised interval replication timer |
-| `MIN_REPLICATION_INTERVAL_S` | 30 | Global cooldown between replication runs |
-| `MAX_PARALLEL_FETCH` | 5 | Concurrent record fetch limit (normal operation) |
-| `MAX_PARALLEL_FETCH_BOOTSTRAP` | 20 | Concurrent record fetch limit during bootstrap sync |
-| `MAX_PARALLEL_QUORUM_CHECKS` | 16 | Concurrent receiver-side quorum verifications |
-| `REPLICATION_KEYS_PAGE_TARGET_BYTES` | 262,144 (256 KiB) | Target serialized size for key-list pages |
-| `REPLICATION_KEYS_PAGE_MAX_KEYS` | 4096 | Hard upper bound of keys in one key-list page |
-| `FETCH_TIMEOUT` | 20s | Per-fetch timeout |
-| `PENDING_TIMEOUT` | 900s (15 min) | Time-to-live for unfetched entries |
-| `QUORUM_RESPONSE_TIMEOUT` | 3s | Receiver-side quorum probe deadline for unknown keys |
-| `QUORUM_RETRY_BACKOFF` | 60s | Backoff before re-probing a key after failed quorum |
-| `REPLICATION_TIMEOUT` | 45s | Per-target deduplication window |
-| `REPLICATION_DEADLINE_SECS` | 4 days | Network-wide replication cycle duration |
-| `NETWORK_WIDE_REPLICATION_INTERVAL` | 15 min | How often network-wide replication fires |
-| `REPLICATION_SENDER_CLOSE_GROUP_THRESHOLD` | `CLOSE_GROUP_SIZE` (8) | Sender must be in close group to be a valid replication source |
-| `CLOSE_GROUP_TRACKING_LIMIT` | 20 | Peers tracked for churn suppression |
-| `CLOSE_GROUP_RESTART_SUPPRESSION` | 90s | Suppression window for peer restart detection |
-| `AUDIT_RANGE_BYTES` | 4096 | Random byte-range size per challenged chunk |
-| `AUDIT_BATCH_SIZE` | 8 | Number of chunks challenged per normal audit |
-| `AUDIT_BURST_BATCH_SIZE` | 32 | Number of chunks challenged per burst audit |
-| `AUDIT_RESPONSE_TIMEOUT` | 5s | Max time for full batched audit response |
-| `AUDIT_ESCALATION_THRESHOLD` | 3 in 10 min | Failed normal audits before escalating to burst mode |
-| `BURST_AUDIT_REPLICATION_FAILURES` | 1 | Failed burst audit emits one `ReplicationFailure` |
+| `CLOSE_GROUP_SIZE` | Close-group width | `7` |
+| `REPLICATION_FACTOR` | Target holder count per key | `7` |
+| `QUORUM_THRESHOLD` | Required positive presence votes | `floor(REPLICATION_FACTOR/2)+1` (`4`) |
+| `PAID_LIST_CLOSEST_X` | Number of closest nodes tracking paid status for a key | `20` |
+| `PAYMENT_ACCEPT_CLOSEST_Y` | Number of closest nodes allowed to accept initial paid write | `7` |
+| `PAID_LIST_CONFIRM_THRESHOLD` | Paid-list confirmations needed to treat key as paid | `floor(PAID_LIST_CLOSEST_X/2)+1` (`11`) |
+| `K_AUTH` | Probe auth window (per key) | `12` |
+| `K_AUTH_OFFER` | Offer auth window (per key) | `12` |
+| `QUORUM_PROBE_FANOUT` | Peers probed per key during quorum check | `max(CLOSE_GROUP_SIZE, K_AUTH)` (`12`) |
+| `TIER2_INTERVAL` | Neighbor sync cadence | random in `[90s, 180s]` |
+| `TIER3_INTERVAL` | Global verification cadence | `15 min` |
+| `GLOBAL_REPL_COOLDOWN` | Min spacing between Tier 2 runs | `30s` |
+| `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s` |
+| `RESTART_SUPPRESSION` | Rejoin suppression window | `90s` |
+| `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2` |
+| `FETCH_TIMEOUT` | Per-record fetch timeout | `20s` |
+| `PENDING_TIMEOUT` | Max queue residency | `15 min` |
+| `QUORUM_RESPONSE_TIMEOUT` | Presence probe wait budget | `3s` |
+| `QUORUM_RETRY_BACKOFF` | Retry delay after failed quorum | `60s` |
+| `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5` |
+| `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20` |
+| `MAX_PARALLEL_QUORUM_CHECKS` | Concurrent quorum checks | `16` |
+| `NETWORK_CYCLE_DEADLINE` | Max time to re-check all records | `4 days` |
+| `AUDIT_RANGE_BYTES` | Bytes proven per challenged record | `4096` |
+| `AUDIT_BATCH_SIZE` | Normal audit items | `8` |
+| `AUDIT_BURST_BATCH_SIZE` | Escalated audit items | `32` |
+| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s` |
+| `AUDIT_ESCALATION_THRESHOLD` | Normal audit failures before burst | `3 in 10 min` |
+| `MAX_QUORUM_FAILURES` | Consecutive quorum failures before key is abandoned | `3` |
+| `BAD_NODE_WINDOW` | Window for failure counting | `5 min` |
+| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3` |
 
-**Capacity model alignment (current codebase):**
-- Source of truth for capacity is `StorageConfig.max_chunks` (`src/config.rs`), not a hard-coded replication constant.
-- Current default is `max_chunks = 0` (unlimited). In this mode, the node reports `Unbounded` capacity and still influences dynamic RF as low pressure.
-- Dynamic RF uses both finite-capacity and unbounded-capacity reports.
-- Recommended production profile: set an explicit finite `storage.max_chunks` (for example, 16384) so capacity pressure and dynamic RF are observable.
+Parameter safety constraints (MUST hold):
 
-**Wire-size safety constraint:**
-- The ANT chunk protocol decoder enforces a maximum wire message size of 5 MiB (`src/ant_protocol/chunk.rs`, `MAX_WIRE_MESSAGE_SIZE`).
-- Replication key-list exchange must use pagination/chunking and never send unbounded key vectors in one message.
+1. `1 <= QUORUM_THRESHOLD <= REPLICATION_FACTOR`.
+2. `QUORUM_THRESHOLD <= QUORUM_PROBE_FANOUT`.
+3. `QUORUM_PROBE_FANOUT >= CLOSE_GROUP_SIZE`.
+4. `QUORUM_PROBE_FANOUT >= K_AUTH`.
+5. `1 <= PAYMENT_ACCEPT_CLOSEST_Y <= PAID_LIST_CLOSEST_X`.
+6. `1 <= PAID_LIST_CONFIRM_THRESHOLD <= PAID_LIST_CLOSEST_X`.
+7. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
-## Architecture: Three Replication Tiers
+## 5. Core Invariants (Must Hold)
 
-The system uses three complementary replication modes operating at different timescales. Each tier catches failures that the others miss.
+1. A record is accepted only if it passes integrity and responsibility checks.
+2. Tier 2 and Tier 3 repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
+3. Tier 1 bypasses presence quorum only when PoP is valid.
+4. Unauthorized offer keys are dropped per key (not per message).
+5. Presence probes are key-scoped authorized; no neighbor-only bypass is allowed.
+6. `REPLICATION_FACTOR` is a target holder count, not guaranteed send fanout.
+7. Receiver stores only records in its current responsible range.
+8. Queue dedup prevents duplicate pending/fetch work for same key.
+9. No unbounded key-list transfer; each offer exchange MUST be resource-bounded.
+10. Bad-node decisions are local-only (no gossip reputation).
+11. Global replication prioritizes low-observed-replica records first.
+12. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
+13. Every Tier 2 offer exchange reaches a deterministic terminal state.
+14. `RejectedBusy` is retryable and does not count as an explicit negative vote.
+15. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
+16. Paid-list authorization is key-scoped and majority-based across `ClosestX(K)`, not node-global.
+17. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `ClosestX(K)` (plus short-lived transition slack).
 
-```
-Tier 1: Interval Replication    (every 90-180s)     Neighbour sync
-Tier 2: Fresh Replication       (immediate)          New upload fast-path
-Tier 3: Network-Wide Replication (every 15 min)      Proactive repair
-```
+## 6. Replication Tiers
 
-### Tier 1: Interval Replication
+### Tier 1: Fresh Propagation (Immediate)
 
-**Purpose:** Keep nearby nodes synchronised with each other.
+Trigger: node accepts a newly written record with valid PoP.
 
-**Triggers:**
-- A periodic timer fires every 90-180 seconds (randomised per node to prevent synchronisation spikes across the network)
-- A peer is added to the routing table (new node joined the neighbourhood)
-- A peer is removed from the routing table (node left)
+Rules:
 
-**Flow:**
+1. Store locally after normal validation.
+2. Compute holder target set for the key with size `REPLICATION_FACTOR`.
+3. Send fresh offers to remote target members only.
+4. Fresh offer MUST include PoP.
+5. Receiver MUST reject fresh path if PoP is missing or invalid.
+6. Fresh path MAY bypass normal fetch queue limits for low-latency propagation.
+7. A node that validates PoP for key `K` MUST add `K` to `PaidForList(self)` and SHOULD notify peers in `ClosestX(K)` to verify/add `K` to their local paid lists.
 
-```
-1. Node gathers all its local record keys
-2. Selects up to `effective_rf` closest peers within responsible distance range
-3. For each selected peer, split keys into pages (`<= REPLICATION_KEYS_PAGE_MAX_KEYS`, target `REPLICATION_KEYS_PAGE_TARGET_BYTES` serialized)
-4. Send paginated `ChunkMessageBody::ReplicationOfferRequest` pages (`offer_id`, `page_index`, `has_more`)
-5. Receiver diffs each page against its own store and accumulates unknown keys per `offer_id`
-6. After the final page (`has_more = false`), receiver starts quorum checks for accumulated unknown keys using `ReplicationPresenceRequest`
-7. If quorum passes, receiver queues the key in its ReplicationFetcher
-8. ReplicationFetcher sends `ChunkMessageBody::ReplicatedRecordGetRequest` to a quorum-confirmed holder
-9. Received records are validated and stored
-```
+### Tier 2: Neighbor Anti-Entropy (Periodic + Topology Events)
 
-**Key property:** Only key lists are pushed, not full records. Receivers pull what they need. This is bandwidth-efficient because most neighbours already hold most of the same records.
+Triggers:
 
-**Paging requirement:** Tier 1 key lists are always paged. Receivers may discard malformed page streams (for example, duplicate or out-of-order `page_index` for the same `offer_id`).
+- Periodic randomized timer.
+- Topology changes that are not suppressed as restart noise.
 
-**Rate limiting:**
-- **Global cooldown (30s):** If interval replication ran within the last 30 seconds, skip. Prevents rapid-fire replication from multiple routing table events.
-- **Per-target dedup (45s):** Track which peers were recently sent to. Don't re-send to the same peer within the dedup window.
-- **Restart suppression (90s):** A `CloseGroupTracker` monitors the closest 20 peers. If a peer is removed and quickly re-added (node restart), suppress replication for 90 seconds. Only trigger on genuine topology changes.
+Rules:
 
-### Tier 2: Fresh Replication
+1. Sender enumerates local keys.
+2. For each key, sender computes holder target set and selects remote members.
+3. Sender transmits one logical offer set of keys to each target for the sync run.
+4. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
+5. Receiver treats the offer set as an unordered key collection and deduplicates repeated keys.
+6. Receiver diffs offered keys against local store and pending sets.
+7. Receiver runs per-key admission rules before quorum logic.
+8. Receiver launches quorum checks exactly once per admitted unknown key in the offer set.
+9. Keys passing presence quorum or paid-list authorization are queued for fetch.
 
-**Purpose:** Quickly replicate newly uploaded data to its full replication factor without waiting for the next interval timer.
+Rate control:
 
-**Trigger:** A node receives and validates a new record from a client upload.
+- Skip Tier 2 if `GLOBAL_REPL_COOLDOWN` not elapsed.
+- Do not send to same target within `PER_TARGET_DEDUP`.
+- Suppress triggers from remove+quick-readd patterns within `RESTART_SUPPRESSION`.
 
-**Flow:**
+### Tier 3: Global Verification and Repair (Proactive)
 
-```
-1. Node stores the record locally
-2. Sends `ChunkMessageBody::FreshReplicationOfferRequest` to `effective_rf` closest peers for that record's address
-3. Message includes payment proof so receivers can verify the record is legitimately paid for
-4. Receivers validate payment and fetch the record immediately
-```
+Trigger: periodic timer (`TIER3_INTERVAL`).
 
-**Key property:** Fresh records bypass the normal quorum requirement (see Sybil Resistance below) because they carry payment proof. They also bypass the parallel fetch capacity limit and are fetched immediately without queueing.
+Rules:
 
-**Payment rule for Tier 2:** `FreshReplicationOfferRequest` must include `ProofOfPayment` for each key. A fresh-replication fetch is rejected if proof is missing or invalid.
+1. Select batch size paced to complete full local-key coverage within `NETWORK_CYCLE_DEADLINE`.
+2. Prioritize keys by last observed replica count (ascending).
+3. For each key, query close-group members for presence.
+4. Offer repair to members that report missing.
+5. Mark severe shortfall when observed holders `< QUORUM_THRESHOLD`.
+6. Severe shortfall raises priority only; it does not bypass admission, presence quorum, or paid-list safeguards.
 
-### Tier 3: Network-Wide Replication
+## 7. Authorization and Admission Rules
 
-**Purpose:** Proactive repair. Actively verifies that records exist at their target close group and replicates to any nodes that are missing them. This is the most thorough mode and catches anything interval replication missed.
+### 7.1 Offer Key Admission (Per Key)
 
-**Trigger:** A background timer fires every 15 minutes.
+For each offered key `K`, accept if either condition holds:
 
-**Flow:**
+1. Sender is in receiver-local top `K_AUTH_OFFER` nodes nearest `K`.
+2. Key is PoP-authorized (fresh path), or key is already in receiver-local `PaidForList`.
 
-```
-1. Check record store for records not yet verified
-2. Calculate how many keys to process this cycle (paced across a 4-day deadline)
-3. For each selected record:
-   a. Kademlia lookup: find the CLOSE_GROUP_SIZE closest peers to the record's address
-   b. Query each peer via `ChunkMessageBody::ReplicationPresenceRequest`: "Do you have this record?"
-   c. For any peer that does NOT have it: send `ChunkMessageBody::ReplicationOfferRequest` directly to that peer
-      (receiver validates via its own quorum check before fetching)
-   d. Let `holders` be peers that answered "present" for the record.
-      If `holders < ceil(effective_rf / 2)`, mark the record as severely under-replicated and prioritise immediate repair
-```
+Notes:
 
-**Pacing:** The 4-day deadline ensures all records are verified within a complete cycle. The number of keys processed per 15-minute interval is dynamically calculated:
-- Few records: space them out evenly across the deadline
-- Many records: process proportionally more per interval
+- Authorization decision is local-route-state only.
+- Unauthorized keys are dropped immediately.
+- Mixed offers are valid: accept authorized keys, drop unauthorized keys.
+- On unauthorized drop, receiver SHOULD return `RejectedUnauthorized` plus optional `AuthHint` (small list of currently authorized peers for `K`) so sender can retry through those peers instead of blind retries.
+- Senders SHOULD apply `QUORUM_RETRY_BACKOFF` before retrying an `AuthHint` path and MUST respect `PER_TARGET_DEDUP` for repeat attempts.
 
-**Replica-count prioritisation:** Each Tier 3 query reveals how many close group peers hold the record. This count is stored per record and used to prioritise future batches:
+### 7.2 Paid-List Authorization (Per Key)
 
-1. After querying a record, store its observed replica count and timestamp
-2. When selecting the next batch, sort by last-observed replica count ascending — records with the fewest replicas are checked first
-3. Records never scanned (new to the store) are assigned default priority (assume they are at `effective_rf`)
-4. If a record is found below `MIN_REPLICATION_FACTOR` during a batch, repair it immediately — do not wait for the next pacing interval
+When handling an admitted unknown key `K` for Tier 2/3 repair:
 
-This ensures that the most vulnerable records are always verified and repaired first. After the first full cycle, the node has replica counts for all its records and can focus repair effort where it matters most.
+1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
+2. Otherwise query `ClosestX(K)` peers for paid-list presence of `K` and optional current holder presence for source selection.
+3. If paid confirmations `>= PAID_LIST_CONFIRM_THRESHOLD`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
+4. If confirmations are below threshold, paid-list authorization fails for this attempt.
+5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from chunk presence alone.
+6. If a node learns `K` is paid-authorized by majority, it SHOULD notify queried peers that answered unknown so they can re-check and converge.
 
-**Severe shortfall handling:** A record with `holders < ceil(effective_rf / 2)` is treated as severe under-replication. This increases repair priority only; it does not relax receiver sender-validation rules.
+### 7.3 Presence Probe Admission (Per Key)
 
-## Receiver-Side Filtering
+Presence probe for key `K` is accepted only if:
 
-When a node receives a replication key list, it applies these filters in order before fetching anything:
+1. Requester is in receiver-local top `K_AUTH` for key `K`.
 
-### 1. Source Validation
+If unauthorized, return `RejectedUnauthorized` and skip expensive lookup work when possible.
 
-The sender must be a known peer in the node's close group (`CLOSE_GROUP_SIZE` closest peers). Reject replication from distant or unknown nodes.
+### 7.4 Presence Response Semantics
 
-**Rationale:** Prevents random nodes across the network from flooding a node with replication requests. Only neighbours who should plausibly hold the same records can trigger replication.
+- `Present`: key exists locally.
+- `Absent`: requester authorized; key not found locally.
+- `RejectedUnauthorized`: requester not authorized for key.
+- `RejectedBusy`: requester authorized but temporarily rate-limited/overloaded.
 
-### 2. Already Stored
+Quorum counting:
 
-Skip keys already present in the local record store.
+- `Present` counts positive.
+- `Absent` and `RejectedUnauthorized` count non-positive.
+- `RejectedBusy` is neutral (retryable, not a negative vote).
 
-### 3. Already Pending
+## 8. Receiver Verification State Machine
 
-Skip keys already queued for fetch or already in `PendingVerify`.
-
-### 4. Range Check
-
-Only accept records within the node's responsible distance range. Records too far away in XOR space are another node's responsibility.
-
-### 5. Receiver-Driven Quorum Verification (Sybil Resistance)
-
-For unknown keys (not already stored and not already pending), the receiver actively verifies the offer by querying close-group peers.
-The required quorum scales with the current dynamic replication target:
-
-`quorum_threshold = floor(effective_rf / 2) + 1`
-
-With `effective_rf` in `[MIN_REPLICATION_FACTOR, REPLICATION_FACTOR]` = `[4, 8]`, this yields:
-- `effective_rf = 8` -> `quorum_threshold = 5`
-- `effective_rf = 7` -> `quorum_threshold = 4`
-- `effective_rf = 6` -> `quorum_threshold = 4`
-- `effective_rf = 5` -> `quorum_threshold = 3`
-- `effective_rf = 4` -> `quorum_threshold = 3`
-
-**Flow for one unknown key:**
-1. Enter `PendingVerify` (deduped per key) and send `ReplicationPresenceRequest { key }` to close-group peers
-2. Wait up to `QUORUM_RESPONSE_TIMEOUT`
-3. If positives reach `quorum_threshold`, mark key `QuorumVerified` and queue for fetch
-4. Fetch from one of the positive responders (not necessarily the original offer sender)
-5. If quorum fails, drop from pending verification and apply `QUORUM_RETRY_BACKOFF`
-
-**Rationale:** Keeps anti-injection quorum checks in place while avoiding repair deadlock when `effective_rf` is reduced under storage pressure.
-
-**Exception:** Tier 2 (fresh replication) bypasses this requirement because it carries payment proof, which serves as an alternative trust signal.
-
-### Receiver Verification State Machine
-
-```
+```text
 Idle
   -> OfferReceived
 OfferReceived
-  -> FilterRejected (source/range/already-stored/already-pending)
+  -> FilterRejected
   -> PendingVerify
 PendingVerify
-  -> QuorumVerified      (>= quorum_threshold before timeout)
-  -> QuorumFailed        (< quorum_threshold at timeout/all responses)
+  -> QuorumVerified
+  -> PaidListVerified
+  -> QuorumInconclusive
+  -> QuorumFailed
 QuorumVerified
+  -> QueuedForFetch
+PaidListVerified
   -> QueuedForFetch
 QueuedForFetch
   -> Fetching
 Fetching
-  -> Stored              (all validation checks pass)
-  -> FetchFailed         (timeout/invalid response)
+  -> Stored
+  -> FetchRetryable     (timeout/error and retry count < MAX_FETCH_RETRIES and alternate sources remain)
+  -> FetchAbandoned     (retry count >= MAX_FETCH_RETRIES or no alternate sources)
+FetchRetryable
+  -> QueuedForFetch     (select next alternate source from verified source set)
+FetchAbandoned
+  -> Idle               (key forgotten; requires new offer to re-enter pipeline)
 QuorumFailed
-  -> Backoff             (QUORUM_RETRY_BACKOFF)
+  -> Backoff            (quorum_failure_count < MAX_QUORUM_FAILURES)
+  -> QuorumAbandoned    (quorum_failure_count >= MAX_QUORUM_FAILURES)
+QuorumInconclusive
+  -> Backoff            (quorum_failure_count < MAX_QUORUM_FAILURES)
+  -> QuorumAbandoned    (quorum_failure_count >= MAX_QUORUM_FAILURES)
+QuorumAbandoned
+  -> Idle               (key forgotten; stops wasting probe resources)
+Backoff
+  -> Idle (after retry window)
 ```
 
-## Responsible Distance Range
-
-Every 15 seconds, each node recalculates the XOR address range it is responsible for:
-
-```
-1. Estimate network size from K-bucket occupancy
-2. Network density = MAX_ADDRESS_SPACE / estimated_network_size
-3. Responsible distance = density * CLOSE_GROUP_SIZE
-4. Take max(responsible_distance, distance_to_(CLOSE_GROUP_SIZE + 2)th_closest_peer)
-5. Apply as cutoff to both the record store and the replication fetcher
-```
+Transition requirements:
 
-**Effect:** In a small network, each node covers more address space. As the network grows, each node's responsibility shrinks. Records beyond the responsible distance are not accepted via replication and can be pruned from the store during garbage collection.
+- `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
+- `PendingVerify -> QuorumVerified` only if positives `>= QUORUM_THRESHOLD`. On success, record the set of positive responders as verified fetch sources.
+- `PendingVerify -> PaidListVerified` only if paid confirmations `>= PAID_LIST_CONFIRM_THRESHOLD`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
+- `PendingVerify -> QuorumInconclusive` when positives are insufficient but retryable outcomes (`RejectedBusy`/timeout) keep quorum undecidable in this round.
+- `Fetching -> Stored` only after all storage validation checks pass.
+- `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), retry count has not reached `MAX_FETCH_RETRIES`, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
+- `Fetching -> FetchAbandoned` when fetch fails and either retry count `>= MAX_FETCH_RETRIES` or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
+- `FetchRetryable -> QueuedForFetch` selects the next untried verified source and re-enters the fetch queue without repeating quorum verification.
+- `QuorumFailed -> QuorumAbandoned` when `quorum_failure_count >= MAX_QUORUM_FAILURES`. Key is forgotten and stops consuming probe resources. Requires a new offer to re-enter the pipeline.
+- `QuorumInconclusive -> QuorumAbandoned` same threshold as `QuorumFailed`. Consecutive failures of either type increment the same counter.
 
-## Fetch Scheduling (ReplicationFetcher)
+## 9. Quorum Verification Logic
 
-The `ReplicationFetcher` manages the queue of records waiting to be fetched:
+For each unknown key:
 
-```
-ReplicationFetcher {
-    to_be_fetched:    HashMap<(RecordKey, ValidationType, PeerId), Timeout>
-    on_going_fetches: HashMap<(RecordKey, ValidationType), (PeerId, Timeout)>
-    distance_range:   Option<Distance>
-    farthest_acceptable_distance: Option<Distance>
-    peers_scores:     HashMap<PeerId, (VecDeque<bool>, Instant)>
-    initial_replicates: HashMap<(Address, ValidationType), HashSet<PeerId>>
-    quorum_pending:   HashMap<(Address, ValidationType), QuorumState>
-}
-```
+1. Deduplicate key in pending-verification table.
+2. Run paid-list authorization check (Section 7.2). If it succeeds, mark `PaidListVerified` and queue for fetch.
+3. If paid-list authorization fails, select up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self) and send presence probes.
+4. Wait up to `QUORUM_RESPONSE_TIMEOUT`.
+5. Pass if positive responses `>= QUORUM_THRESHOLD`.
+6. Fail fast if `positives + unresolved_remaining < QUORUM_THRESHOLD`, where `unresolved_remaining` excludes explicit negatives (`Absent`, `RejectedUnauthorized`) but includes `RejectedBusy` and no-response peers.
+7. If timeout occurs with undecidable outcome (not pass, not fail-fast), mark `QuorumInconclusive`.
+8. On `QuorumFailed` or `QuorumInconclusive`, apply `QUORUM_RETRY_BACKOFF`.
 
-**Scheduling rules:**
-- **Max parallel fetches: 5.** No more than 5 concurrent record downloads. Additional keys queue in `to_be_fetched`.
-- **Max parallel quorum checks: 16.** No more than 16 simultaneous `PendingVerify` quorum probes.
-- **Closest-first ordering:** The fetch queue is sorted by XOR distance to self before selecting the next batch. The most relevant records are fetched first.
-- **Fetch timeout: 20 seconds.** If a fetch does not complete within 20 seconds, it is considered failed. The slot is freed and the holder is marked as a failed source.
-- **Pending timeout: 15 minutes.** Entries in `to_be_fetched` that are not fetched within 15 minutes are discarded.
-- **Quorum gate:** Unknown keys are queued for fetch only after quorum verification succeeds (Tier 2 is the only bypass).
+Security-liveness policy:
 
-**Full node behaviour (`storage.max_chunks > 0`):** When the record store reaches `MAX_RECORDS_COUNT` and a new record arrives within the responsible distance range:
-- Evict the farthest stored record that is **outside** the current responsible distance range (this record is now another, closer node's responsibility)
-- Accept the new record in its place
-- If no stored records are outside the responsible range, the node cannot accept the new record (the dynamic replication factor should make this rare — see below)
-- Periodically prune records that have drifted outside the responsible range as the network grows and ranges shrink
+- Tier 2/3 never store without either presence quorum or paid-list authorization.
+- Tier 1 can store with valid PoP alone.
+- Therefore, below-quorum data is recoverable only if paid-list authorization can still be established.
 
-If `storage.max_chunks == 0` (unlimited), this full-node path does not apply and the node reports `Unbounded` capacity in replication offers.
+## 10. Record Storage Validation
 
-## Dynamic Replication Factor
+A fetched record is written only if all checks pass:
 
-The replication factor is not fixed — it scales down as the network's storage capacity tightens, and recovers as capacity frees up. This prevents the network from grinding to a halt when nodes approach their storage limits.
+1. Type/schema validity.
+2. Content-address integrity (`hash(content) == key`).
+3. Auditable commitment validity (when audits are enabled): record can produce deterministic range proofs bound to key.
+4. Authorization validity:
+   - Tier 1: valid PoP, or
+   - Tier 2/3: prior quorum-verified key or paid-list-authorized key.
+5. Responsible-range inclusion at write time.
 
-### Close Group Pressure (From Capacity Signals)
+## 11. Responsible Range Logic
 
-Each node reports a capacity signal to close group peers during Tier 1 interval replication alongside key lists:
+Periodic recalculation (example cadence: 15s):
 
-```
-if storage.max_chunks > 0:
-    holder_capacity = Finite { fullness: record_count / storage.max_chunks }
-else:
-    holder_capacity = Unbounded
-```
+1. Estimate network size from routing-table density.
+2. Derive density-based distance budget.
+3. Compute responsible cutoff from density and close-group parameters.
+4. Lower-bound cutoff using distance to a nearby rank (for stability).
+5. Apply cutoff to:
+   - Accept/reject future replication writes.
+   - Background pruning eligibility.
+   - Paid-list retention eligibility (drop paid-list entries when node is no longer in `ClosestX(K)`, after transition slack).
 
-Map each received capacity signal to a pressure sample:
+Effect:
 
-```
-Finite { fullness } -> clamp(fullness, 0.0, 1.0)
-Unbounded          -> 0.0
-```
+- Small network: larger per-node responsibility.
+- Large network: narrower per-node responsibility.
 
-Compute **close group pressure** using a robust estimator across the `CLOSE_GROUP_SIZE` closest peers:
+## 12. Scheduling and Capacity Rules
 
-```
-close_group_pressure = median(pressure_samples)
-```
+Queue model:
 
-### Effective Replication Factor
+- `PendingVerify`: keys awaiting quorum result.
+- `FetchQueue`: presence-quorum-passed or paid-list-authorized keys waiting for fetch slot.
+- `InFlightFetch`: active downloads.
 
-The effective replication factor is linearly interpolated between `REPLICATION_FACTOR` and `MIN_REPLICATION_FACTOR` based on close group pressure:
+Rules:
 
-```
-if capacity_reports < floor(CLOSE_GROUP_SIZE / 2) + 1:
-    effective_rf = REPLICATION_FACTOR                    // pressure unknown
-else if close_group_pressure <= 0.5:
-    effective_rf = REPLICATION_FACTOR                    // 8
-else if close_group_pressure >= 0.9:
-    effective_rf = MIN_REPLICATION_FACTOR                // 4
-else:
-    // Linear scale between 50% and 90% pressure
-    pressure = (close_group_pressure - 0.5) / 0.4
-    effective_rf = round(REPLICATION_FACTOR - pressure * (REPLICATION_FACTOR - MIN_REPLICATION_FACTOR))
-```
+1. Enforce `MAX_PARALLEL_QUORUM_CHECKS`.
+2. Enforce `MAX_PARALLEL_FETCH` (or bootstrap override).
+3. Sort fetch candidates by relevance (e.g., nearest-first) before dequeue.
+4. Evict stale queued entries after `PENDING_TIMEOUT`.
+5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
+6. `PENDING_TIMEOUT` applies to total time since verification success (`QuorumVerified` or `PaidListVerified`), including retry cycles. A key that exhausts `PENDING_TIMEOUT` across retries transitions to `FetchAbandoned`.
 
-| Close group pressure | Effective RF |
-|---|---|
-| ≤ 50% | 8 |
-| 60% | 7 |
-| 70% | 6 |
-| 80% | 5 |
-| ≥ 90% | 4 |
+Capacity-managed mode (finite store):
 
-### Where It Applies
+1. If full and new in-range key arrives, evict farthest out-of-range key if available.
+2. If no out-of-range key exists, reject new key.
+3. Periodically prune keys that moved out of responsibility.
+4. `PaidForList` is in-memory only and SHOULD be bounded with paging/eviction policies; keys outside `ClosestX(K)` are first candidates for removal.
 
-All three replication tiers use `effective_rf` instead of the static `REPLICATION_FACTOR`:
+## 13. Churn and Topology Change Handling
 
-- **Tier 1:** Send key lists to `effective_rf` closest peers instead of `REPLICATION_FACTOR`
-- **Tier 2:** Fresh-replicate new records to `effective_rf` closest peers
-- **Tier 3:** When verifying a record's replication, the target replica count is `effective_rf`, not `REPLICATION_FACTOR`
+Maintain tracker for closest peers and classify topology events:
 
-### Recovery
+- `Trigger`: genuine change, run Tier 2.
+- `Skip`: probable restart churn, suppress.
+- `Ignore`: far peers, no action.
 
-When capacity frees up (new nodes join, responsible ranges shrink, out-of-range records are pruned), close group pressure drops and `effective_rf` rises. Tier 3 network-wide replication naturally detects under-replicated records (records with fewer holders than the current `effective_rf`) and replicates them to additional peers.
+Goal: avoid replication storms from restart noise while still reacting to real topology shifts.
 
-### Why This Works With Out-of-Range Eviction
-
-The two mechanisms are complementary:
-
-1. **Dynamic RF reduces inflow.** Fewer replicas per record means each node receives fewer replication requests, slowing the rate at which nodes fill up.
-2. **Out-of-range eviction creates outflow.** As the network grows or stabilises, responsible ranges shrink and records at the edges drift outside range, becoming evictable.
-3. **Together they prevent the deadlock** where every node is full, all records are within range, and nothing can be evicted. Reducing RF from 8 to 4 halves the per-record storage footprint across the network, which means fewer records per node, which means more records drift outside responsible ranges, which means more can be evicted.
-
-## Bad Node Detection
-
-Track replication failures per peer to identify and evict misbehaving nodes:
-
-### Failure Tracking
-
-When a fetch from a peer times out (20 seconds), or a burst audit fails:
-1. Record a `ReplicationFailure` against that peer
-2. Remove all other pending fetches from that peer (they are likely to fail too)
-3. Fire a local replication-failure event (`FailedToFetchHolders` for fetch failures; audit-failure event for audits)
-
-### Eviction
-
-If a peer accumulates **3 `ReplicationFailure` events within 5 minutes**:
-1. Consider the peer a bad node
-2. Evict it from the routing table
-3. Block future replication from that peer
-
-Eviction is a local decision based on direct observation only. There is no gossip about bad nodes — each node independently detects and evicts misbehaving peers through its own fetch timeouts and challenge failures. This prevents a malicious node from poisoning another node's reputation across the network by broadcasting false accusations.
-
-### False Positive Prevention
-
-Before recording a `ReplicationFailure`, check whether the record has since been stored locally (e.g., fetched from a different peer). If so, the failure is stale — do not penalise the peer.
-
-## Proof of Storage (Verification)
-
-Nodes periodically verify that neighbours actually store chunks they claim to hold. The primary threat is the **outsourcing attack**: a node that does not store data locally and fetches it from another node only when challenged.
-
-### Batched Random-Range Audit
-
-Chunks are stored as whole files on disk. Verification challenges random byte ranges within those chunks.
-
-```
-1. Challenger creates `challenge_id` and random `nonce`
-2. Challenger selects X chunks the target should hold
-3. For each selected chunk, challenger picks random (offset, length)
-   where `length = AUDIT_RANGE_BYTES` (or remaining bytes if near end)
-4. Challenger sends one batched audit request with all challenge items
-5. Target reads each requested byte range from local chunk files
-6. For each item, target computes:
-   proof_i = SHA3-256(
-       "saorsa-repl-proof-v1" ||
-       challenge_id ||
-       target_peer_id ||
-       chunk_address ||
-       offset || length ||
-       chunk_bytes[offset..offset+length] ||
-       nonce
-   )
-7. Target returns all proofs in a single batched response
-8. Challenger recomputes proofs from local copies and verifies all items
-```
-
-**Replay resistance:** Binding proofs to `challenge_id`, `nonce`, and `target_peer_id` prevents replay across time, across peers, or across different challenge sets.
-
-**Important:** Never use only `hash(chunk_address || nonce || peer_id)` as a proof. `chunk_address` is public and does not prove possession of content bytes.
-
-### Audit Modes
-
-- **Normal audit:** `AUDIT_BATCH_SIZE` items per audit.
-- **Burst audit:** `AUDIT_BURST_BATCH_SIZE` items when a node repeatedly fails normal audits.
-- **Deadline:** The full batched response must arrive before `AUDIT_RESPONSE_TIMEOUT`.
-
-### Failure and Escalation
-
-- Audit failure conditions: timeout, missing proof item, invalid proof item, malformed response.
-- `AUDIT_ESCALATION_THRESHOLD` failed normal audits within 10 minutes triggers burst mode for that peer.
-- A failed burst audit emits `BURST_AUDIT_REPLICATION_FAILURES` `ReplicationFailure` event(s).
-- Eviction remains local and unchanged: accumulated `ReplicationFailure` events drive bad-node eviction.
-
-### Why This Works
-
-- Honest nodes can read X random ranges from local disk and hash them quickly.
-- Outsourcing nodes must fetch unpredictable ranges from third parties during the challenge window, which adds extra network latency/bandwidth pressure and fails more often under batched deadlines.
-- Verification uses only local observations; no cross-peer timing sharing or gossip is required.
-
-## Protocol Messages
-
-Replication is implemented as a planned extension of the existing ANT chunk protocol (`ChunkMessage` + `ChunkMessageBody`) in this repository. It does not introduce a separate `Cmd::`/`Query::` transport layer.
-
-### ANT Replication Message Families (Planned)
-
-```
-ChunkMessageBody::ReplicationOfferRequest {
-    holder: NetworkAddress,
-    offer_id: [u8; 16],    // stable ID across pages in one offer stream
-    page_index: u32,       // 0-based, strictly increasing per offer_id
-    has_more: bool,        // false marks the final page
-    keys: Vec<(NetworkAddress, ValidationType)>,
-    holder_capacity: CapacitySignal,
-}
-ChunkMessageBody::ReplicationOfferResponse { ... }
-
-ChunkMessageBody::FreshReplicationOfferRequest {
-    holder: NetworkAddress,
-    keys: Vec<(NetworkAddress, DataType, ValidationType, Option<ProofOfPayment>)>,
-}
-ChunkMessageBody::FreshReplicationOfferResponse { ... }
-
-ChunkMessageBody::ReplicatedRecordGetRequest {
-    key: RecordKey,
-}
-ChunkMessageBody::ReplicatedRecordGetResponse { ... }
-
-ChunkMessageBody::ReplicationPresenceRequest {
-    key: RecordKey,
-}
-ChunkMessageBody::ReplicationPresenceResponse {
-    present: bool,
-}
-
-ChunkMessageBody::ReplicationKeyListRequest {
-    range: Distance,
-    cursor: Option<Vec<u8>>, // opaque pagination cursor from prior response
-    limit: u32,              // requested max keys for this page (<= REPLICATION_KEYS_PAGE_MAX_KEYS)
-}
-ChunkMessageBody::ReplicationKeyListResponse {
-    keys: Vec<(NetworkAddress, ValidationType)>,
-    next_cursor: Option<Vec<u8>>, // None means pagination complete
-}
-
-ChunkMessageBody::ReplicationAuditRequest {
-    challenge_id: [u8; 16],
-    nonce: [u8; 32],
-    target_peer_id: NetworkAddress,
-    items: Vec<(RecordKey, u32, u32)>, // (key, offset, length)
-}
-ChunkMessageBody::ReplicationAuditResponse {
-    challenge_id: [u8; 16],
-    proofs: Vec<[u8; 32]>,
-}
-```
-
-Where:
-
-```
-enum CapacitySignal {
-    Finite { fullness: f32 }, // clamped to [0.0, 1.0]
-    Unbounded,                // storage.max_chunks == 0
-}
-```
-
-For key-list paging, senders must enforce:
-- page-size target of `REPLICATION_KEYS_PAGE_TARGET_BYTES` serialized bytes
-- hard key-count cap of `REPLICATION_KEYS_PAGE_MAX_KEYS`
-- total wire size below protocol `MAX_WIRE_MESSAGE_SIZE` (5 MiB)
-
-`ReplicationPresenceRequest/Response` is used in two places:
-- Tier 3 proactive scans (auditor asks peers whether they hold a key)
-- Receiver-driven quorum verification (offer receiver confirms unknown keys before fetch)
-
-## Payment Validation Modes
-
-Replication uses two payment-validation paths:
-
-1. **Fresh path (Tier 2): proof-required**
-   - Trust signal: cryptographic `ProofOfPayment`
-   - Transport: proof is carried in `FreshReplicationOfferRequest`
-   - Rule: receiver must verify proof before storing
-
-2. **Repair path (Tier 1/Tier 3): quorum-authorized**
-   - Trust signal: receiver-side quorum (`floor(effective_rf / 2) + 1` positive presence responses)
-   - Transport: replicated pull (`ReplicatedRecordGet*`) does not require payment proof material
-   - Rule: receiver only fetches after quorum success, then applies normal integrity/range/type checks before store
-
-This separation avoids requiring payment proof on routine repair traffic while preserving anti-injection protection through receiver-side quorum confirmation.
-
-## Record Validation on Storage
-
-When a fetched record arrives, validate it before writing to the local store:
-
-1. **Type check:** Record type is known and well-formed (Chunk, GraphEntry, Pointer, Scratchpad, etc.)
-2. **Integrity check:** Content hash matches the record's address (content-addressable integrity)
-3. **Payment authorization check:** one of:
-   - Tier 2: valid `ProofOfPayment` is present and verified
-   - Tier 1/Tier 3: key passed receiver-side quorum verification
-4. **Range check:** The record is within the node's responsible distance range
-
-Only after all checks pass is the record written to disk.
-
-## Churn Handling
-
-### Close Group Tracker
-
-A `CloseGroupTracker` monitors the closest 20 peers and their behaviour:
-
-```
-CloseGroupTracker {
-    self_address: NetworkAddress,
-    close_peers: BTreeSet<(Distance, PeerId)>,    // closest 20
-    tracked_entries: HashMap<PeerId, BehaviourEntry>,
-}
-```
-
-**Replication directives:** When a peer is added or removed, the tracker returns one of:
-
-| Directive | Meaning | Action |
-|---|---|---|
-| `Trigger` | Genuine topology change | Run interval replication |
-| `Skip` | Restart detected (remove + quick re-add) | Suppress for 90 seconds |
-| `Ignore` | Peer too far away to matter | Do nothing |
-
-### Why Restart Suppression Matters
-
-Without suppression, a node restarting generates two events (remove + add), each triggering replication to all neighbours. In a network with normal operational restarts, this creates unnecessary bandwidth spikes. The 90-second suppression window allows the restarted node to rejoin without triggering a replication storm.
-
-## New Node Bootstrapping
-
-When a new node joins the network, it has an empty record store but is immediately responsible for a range of the keyspace. Rather than waiting for neighbours to push key lists during their next Tier 1 cycle (up to 180 seconds away), the new node actively bootstraps its store.
-
-### Bootstrap Flow
-
-```
-1. New node joins the network and populates its routing table via Kademlia
-2. Computes its responsible distance range
-3. Sends `ChunkMessageBody::ReplicationKeyListRequest { range, cursor: None, limit = REPLICATION_KEYS_PAGE_MAX_KEYS }` to all CLOSE_GROUP_SIZE closest peers
-4. For each peer, continues paging with returned `next_cursor` until `next_cursor = None`
-5. Cross-references aggregated responses: keys reported by >= `floor(effective_rf / 2) + 1` peers
-   are accepted (same quorum rule as normal replication, resolved in one paged round)
-6. Queues all accepted keys in the ReplicationFetcher with MAX_PARALLEL_FETCH_BOOTSTRAP (20)
-   concurrent fetch slots instead of the normal MAX_PARALLEL_FETCH (5)
-7. Once all queued keys have been fetched (or failed), bootstrap is complete —
-   the node drops to normal MAX_PARALLEL_FETCH and enters standard Tier 1 operation
-```
-
-### Why Active Bootstrap
-
-Without active bootstrapping, the new node depends on neighbours' Tier 1 timers firing (up to 180s), followed by quorum agreement building across multiple independent Tier 1 cycles from different peers. A node could sit partially empty for several minutes while records in its range have reduced replication.
-
-Active bootstrapping resolves quorum agreement in a single round (by querying all close group peers simultaneously) and uses an elevated fetch limit to sync quickly. The trust model is identical to normal operation — the same quorum requirement applies.
-
-### Interaction With Other Tiers
-
-- **Tier 1** triggers normally when neighbours detect the new node in their routing table. Any keys discovered through Tier 1 that were not in the bootstrap set are handled via the standard ReplicationFetcher path.
-- **Tier 2** works immediately — the new node can receive and process fresh replication for new uploads from the moment it joins.
-- **Tier 3** begins its first cycle after the node has been running for one `NETWORK_WIDE_REPLICATION_INTERVAL` (15 minutes), by which time bootstrap should be complete.
-
-## Design Anti-Patterns (What NOT to Do)
-
-- **Do NOT use Kademlia's built-in record republishing.** It is designed for ephemeral data with TTLs and publisher-driven refresh. It will expire your permanent records.
-- **Do NOT push full records during interval replication.** Push key lists only. Let receivers pull what they need. Pushing full records wastes bandwidth when neighbours already hold most records.
-- **Do NOT trigger replication on every routing table change.** Use cooldowns (30s global, 45s per-target) and restart suppression (90s) to batch changes.
-- **Do NOT repair eagerly on every node departure.** Many departures are transient (restarts, temporary network issues). The interval timer and network-wide replication will catch genuine losses.
-- **Do NOT accept replication from any node.** Validate sender distance (sender must be in close group) and require quorum agreement for unknown records.
-- **Do NOT send unbounded key lists.** Always paginate Tier 1 offers and bootstrap key-list responses.
-- **Do NOT fetch records outside the responsible distance range.** Each node should only store records it is geometrically responsible for.
-- **Do NOT treat all fetches equally.** Fresh records with payment proof get priority. Regular replication fetches are queued, sorted closest-first, and limited to 5 concurrent.
-- **Do NOT use a fixed replication factor when nodes are full.** A static RF causes cascading rejection when the network is at capacity. Scale RF down (to `MIN_REPLICATION_FACTOR`) based on close group pressure from capacity signals to reduce storage pressure, and evict records outside the responsible distance range to make room.
-- **Do NOT gossip about bad nodes.** A "node X is bad" message from one peer is unverifiable and trivially abusable for reputation poisoning. Each node must detect and evict bad peers based on its own direct observations (fetch timeouts, challenge failures) only.
-
-## Summary
-
-```
-          Frequency       Scope              Mechanism           Purpose
-Tier 1    90-180s         Closest peers       Paged key-list diff + quorum probe  Neighbour sync
-Tier 2    Immediate       Record close group  Payment-verified    New upload propagation
-Tier 3    15 min          Network-wide        Query + push        Proactive repair
-
-Protection      Mechanism
-Sybil           Receiver-driven quorum check (need floor(effective_rf/2)+1 positive responses)
-Bad nodes       Failure tracking + eviction after 3 failures in 5 min
-Bandwidth       Paged key-list diffing, cooldowns, parallel fetch limit, closest-first ordering
-Churn           Restart suppression, adaptive distance range, severe-shortfall repair prioritisation
-Bootstrap       Active paged key-list query + quorum agreement in one round, elevated fetch parallelism
-Verification    Batched random-range chunk proofs with burst audits
-Full nodes      Out-of-range eviction, dynamic RF (8→4) based on close group pressure
-```
+## 14. Bad Node Detection and Eviction
+
+Failure events include:
+
+- Fetch timeout failures.
+- Escalated audit failures.
+
+Rules:
+
+1. Track failures per peer over rolling `BAD_NODE_WINDOW`.
+2. Evict peer at `BAD_NODE_THRESHOLD` failures.
+3. Purge pending work assigned to evicted peer.
+4. Do not penalize stale failures if key already succeeded via another source (including via fetch retry from an alternate holder).
+5. Never gossip reputation; eviction is local.
+6. A `ReplicationFailure` is recorded per peer per failed fetch attempt, not per key. If a key requires two retries from two different peers before succeeding on the third, each of the two failed peers receives one failure event.
+
+## 15. Storage Audit Protocol (Anti-Outsourcing)
+
+Challenge-response for claimed holders:
+
+1. Challenger creates unique challenge id + nonce.
+2. Selects random records the target should hold.
+3. Requests random byte ranges per selected record.
+4. Target returns bytes plus range proofs bound to challenge id, nonce, target id, key, offset, and length.
+5. Challenger verifies returned bytes against the record's auditable commitment before deadline.
+
+Audit-proof requirements:
+
+1. Challenger MUST hold a local copy of each challenged record to verify range proofs. Audit selection is therefore limited to records the challenger stores.
+2. Commitment MUST be deterministically derived from record content and cryptographically bound to key `K`.
+3. Responses lacking valid commitment linkage are invalid even if bytes are well-formed.
+
+Audit modes:
+
+- Normal: `AUDIT_BATCH_SIZE`.
+- Burst: `AUDIT_BURST_BATCH_SIZE` after repeated normal failures.
+
+Failure conditions:
+
+- Timeout, missing items, invalid proofs, malformed response, or commitment mismatch.
+
+## 16. New Node Bootstrap Logic
+
+A joining node performs active sync:
+
+1. Discover close-group peers.
+2. Request key lists and paid-list snapshots for its responsible range from those peers.
+3. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= PAID_LIST_CONFIRM_THRESHOLD`.
+4. Aggregate key-presence reports and accept keys observed from `>= QUORUM_THRESHOLD` peers, or keys that are now paid-authorized locally.
+5. Fetch accepted keys with bootstrap concurrency.
+6. Fall back to normal concurrency after bootstrap drains.
+
+This compresses quorum formation into one bootstrap round instead of waiting for multiple periodic cycles.
+
+## 17. Logic-Risk Checklist (Pre-Implementation)
+
+Use this list to find design flaws before coding:
+
+1. Quorum deadlock risk:
+   - Can strict admission + strict quorum prevent legitimate repair in sparse/partitioned states?
+2. Bootstrap incompleteness:
+   - If close-group peers are partially unavailable, is there a deterministic retry strategy?
+3. Range oscillation:
+   - Can rapid responsible-range shifts cause thrash (store/prune/store loops)?
+4. Restart suppression false negatives:
+   - Could real topology loss be suppressed too long?
+5. Offer-set integrity:
+   - How are duplicate keys, partial deliveries, and retries handled deterministically?
+6. Severe shortfall behavior:
+   - Is priority escalation enough, or are additional safeguards needed when holders fall below quorum?
+7. Admission asymmetry:
+   - Can two honest nodes disagree on `top K` enough to block propagation?
+8. Capacity fairness:
+   - Can nearest-first plus finite capacity starve less-near but still responsible keys?
+9. Audit bias:
+   - Are audit targets selected fairly, or can adversaries avoid frequent challenge?
+10. Failure attribution:
+   - Could transient network issues misclassify healthy peers as bad without dampening?
+11. Paid-list poisoning:
+   - Can colluding nodes in `ClosestX(K)` falsely mark unpaid keys as paid?
+12. Paid-list cold-start:
+   - After broad restart, can paid-list snapshots be rebuilt deterministically before churn repair starts?
+
+## 18. Pre-Implementation Test Matrix
+
+Each scenario should assert exact expected outcomes and state transitions.
+
+1. Fresh write happy path:
+   - Valid PoP propagates to target holders without quorum check.
+2. Fresh write invalid PoP:
+   - Receiver rejects and does not enqueue fetch.
+3. Tier 2 unknown key quorum pass:
+   - Key transitions to stored through full state machine.
+4. Tier 2 unknown key quorum fail:
+   - Key enters backoff and is not fetched.
+5. Unauthorized offer sender:
+   - Unauthorized keys dropped, authorized keys in same offer still processed.
+6. Unauthorized probe requester:
+   - Response is `RejectedUnauthorized`; no positive quorum credit.
+7. Out-of-range key offer:
+   - Key rejected regardless of quorum.
+8. Duplicate and retry safety:
+   - Duplicate keys and repeated offers do not create invalid acceptance or duplicate queue/fetch work.
+9. Fetch timeout with alternate source retry:
+   - First source times out, key transitions to `FetchRetryable`, re-enters `QueuedForFetch` with next verified source, and succeeds. Verification is not re-run. Failed source receives one `ReplicationFailure`; successful alternate source clears stale failure attribution (rule 14.4).
+10. Fetch retry exhaustion:
+   - All verified sources fail or `MAX_FETCH_RETRIES` reached. Key transitions to `FetchAbandoned`. Each failed source receives one `ReplicationFailure`.
+11. Repeated true source failures:
+   - Peer evicted exactly at threshold behavior.
+12. Bootstrap quorum aggregation:
+   - Node accepts only keys meeting multi-peer threshold.
+13. Responsible range shrink:
+   - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
+14. Severe under-replication:
+   - Key is prioritized immediately in next Tier 3 selection.
+15. Partition and heal:
+   - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
+16. Authorized but overloaded quorum responder:
+   - `RejectedBusy` yields `QuorumInconclusive`/retry, not immediate hard fail.
+17. Offer admission asymmetry:
+   - `AuthHint`-guided retry via authorized peer succeeds without relaxing admission policy.
+18. Invalid runtime config:
+   - Node rejects configs violating parameter safety constraints.
+19. Audit commitment mismatch:
+   - Challenge fails even if response bytes are syntactically valid.
+20. Paid-list local hit:
+   - Unknown key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
+21. Paid-list majority confirmation:
+   - Unknown key not in local paid list is accepted only after `>= PAID_LIST_CONFIRM_THRESHOLD` confirmations from `ClosestX(K)`.
+22. Paid-list rejection:
+   - Unknown key is rejected when paid confirmations are below threshold and presence quorum also fails.
+23. Paid-list cleanup after churn:
+   - Node drops paid-list entries for keys where it is no longer in `ClosestX(K)`.
+
+## 19. Acceptance Criteria for This Design
+
+The design is logically acceptable for implementation when:
+
+1. All invariants in Section 5 can be expressed as executable assertions.
+2. Every scenario in Section 18 has deterministic pass/fail expectations.
+3. Security-over-liveness tradeoffs are explicitly accepted by stakeholders.
+4. Parameter sensitivity (especially `K_AUTH*`, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
+5. Audit-proof commitment requirements are implemented and test-validated.
