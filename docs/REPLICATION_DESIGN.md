@@ -190,9 +190,9 @@ Notes:
 When handling an admitted unknown key `K` for Tier 2/3 repair:
 
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
-2. Otherwise query all peers in `ClosestX(K)` for paid-list presence of `K` and optional current holder presence for source selection.
-3. If paid confirmations `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
-4. If confirmations are below threshold, paid-list authorization fails for this attempt.
+2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `ClosestX(K)` (same round as presence evidence; no separate paid-list-only round).
+3. If paid confirmations from `ClosestX(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
+4. If confirmations are below threshold, paid-list authorization fails for this verification round.
 5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from chunk presence alone.
 6. If a node learns `K` is paid-authorized by majority, it MUST notify queried peers that answered unknown so they can re-check and converge.
 7. If paid-list checks show missing `PaidForList` entries among `ClosestX(K)`, node MUST enqueue `PaidNotify(K)` repair for missing peers in the next maintenance pass.
@@ -279,9 +279,9 @@ QuorumAbandoned
 Transition requirements:
 
 - `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
-- `PendingVerify -> QuorumVerified` only if positives `>= QUORUM_THRESHOLD`. On success, record the set of positive responders as verified fetch sources.
-- `PendingVerify -> PaidListVerified` only if paid confirmations `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
-- `PendingVerify -> QuorumInconclusive` when positives are insufficient but neutral outcomes (`RejectedBusy`/timeout) keep quorum undecidable in this round.
+- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QUORUM_THRESHOLD`. On success, record the set of positive responders as verified fetch sources.
+- `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
+- `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and neutral outcomes (`RejectedBusy`/timeout) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
 - `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), retry count has not reached `MAX_FETCH_RETRIES`, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
 - `Fetching -> FetchAbandoned` when fetch fails and either retry count `>= MAX_FETCH_RETRIES` or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
@@ -294,13 +294,20 @@ Transition requirements:
 For each unknown key:
 
 1. Deduplicate key in pending-verification table.
-2. Run paid-list authorization check (Section 7.2). If it succeeds, mark `PaidListVerified` and queue for fetch.
-3. If paid-list authorization fails, select up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self) and send presence probes.
-4. Wait up to `QUORUM_RESPONSE_TIMEOUT`.
-5. Pass if positive responses `>= QUORUM_THRESHOLD`.
-6. Fail fast if `positives + unresolved_remaining < QUORUM_THRESHOLD`, where `unresolved_remaining` excludes explicit negatives (`Absent`, `RejectedUnauthorized`) but includes `RejectedBusy` and no-response peers.
-7. If timeout occurs with undecidable outcome (not pass, not fail-fast), mark `QuorumInconclusive`.
-8. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+2. If `K` is already in local `PaidForList`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
+3. Otherwise compute `PaidTargets = ClosestX(K)`.
+4. Compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self).
+5. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
+6. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+7. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
+8. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QUORUM_THRESHOLD`.
+9. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QUORUM_THRESHOLD)`.
+10. If timeout occurs with neither success nor fail-fast, mark `QuorumInconclusive`.
+11. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+
+Single-round requirement:
+
+- Unknown-key verification MUST NOT run a second sequential network round for presence after a paid-list miss; both evidence types are collected in the same request round.
 
 Security-liveness policy:
 
@@ -515,6 +522,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - For a known paid key with incomplete `ClosestX(K)` coverage, nodes detect missing peers and attempt repair on each Tier 2/topology convergence pass; per-pass completion uses `acked_count == X_eff(K)`.
 27. Dynamic paid-list threshold in undersized consensus set:
    - With `X_eff(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
+28. Single-round dual-evidence verification:
+   - For unknown key verification, implementation sends one request round to `VerifyTargets`; no second sequential quorum-probe round is issued after paid-list miss.
 
 ## 19. Acceptance Criteria for This Design
 
