@@ -52,9 +52,8 @@ All parameters are configurable. Values below are a reference profile used for l
 | `PAID_LIST_CLOSEST_X` | Maximum number of closest nodes tracking paid status for a key | `20` |
 | `PAYMENT_ACCEPT_CLOSEST_Y` | Number of closest nodes allowed to accept initial paid write | `7` |
 | `PAID_LIST_CONFIRM_THRESHOLD` | Legacy reference value for full-size paid-list set; effective per-key threshold is `ConfirmNeeded(K)` | `11` (when `X_eff(K)=20`) |
-| `K_AUTH` | Probe auth window (per key) | `12` |
 | `K_AUTH_OFFER` | Offer auth window (per key) | `12` |
-| `QUORUM_PROBE_FANOUT` | Peers probed per key during quorum check | `max(CLOSE_GROUP_SIZE, K_AUTH)` (`12`) |
+| `QUORUM_PROBE_FANOUT` | Peers queried per key during unknown-key verification round | `12` |
 | `TIER2_INTERVAL` | Neighbor sync cadence | random in `[90s, 180s]` |
 | `TIER3_INTERVAL` | Global verification cadence | `15 min` |
 | `GLOBAL_REPL_COOLDOWN` | Min spacing between Tier 2 runs | `30s` |
@@ -82,10 +81,9 @@ Parameter safety constraints (MUST hold):
 1. `1 <= QUORUM_THRESHOLD <= REPLICATION_FACTOR`.
 2. `QUORUM_THRESHOLD <= QUORUM_PROBE_FANOUT`.
 3. `QUORUM_PROBE_FANOUT >= CLOSE_GROUP_SIZE`.
-4. `QUORUM_PROBE_FANOUT >= K_AUTH`.
-5. `1 <= PAYMENT_ACCEPT_CLOSEST_Y <= PAID_LIST_CLOSEST_X`.
-6. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(X_eff(K)/2)+1`.
-7. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
+4. `1 <= PAYMENT_ACCEPT_CLOSEST_Y <= PAID_LIST_CLOSEST_X`.
+5. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(X_eff(K)/2)+1`.
+6. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
 ## 5. Core Invariants (Must Hold)
 
@@ -93,7 +91,7 @@ Parameter safety constraints (MUST hold):
 2. Tier 2 and Tier 3 repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
 3. Tier 1 bypasses presence quorum only when PoP is valid.
 4. Unauthorized offer keys are dropped per key (not per message).
-5. Presence probes are key-scoped authorized; no neighbor-only bypass is allowed.
+5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
 6. `REPLICATION_FACTOR` is a target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
@@ -102,7 +100,7 @@ Parameter safety constraints (MUST hold):
 11. Global replication prioritizes low-observed-replica records first.
 12. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
 13. Every Tier 2 offer exchange reaches a deterministic terminal state.
-14. `RejectedBusy` is retryable and does not count as an explicit negative vote.
+14. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
 15. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
 16. Paid-list authorization is key-scoped and majority-based across `ClosestX(K)`, not node-global.
 17. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `ClosestX(K)` (plus short-lived transition slack).
@@ -220,26 +218,24 @@ Nodes that already treat key `K` as paid-authorized MUST help keep `ClosestX(K)`
 5. If incomplete, keep key `K` in the convergence set and evaluate again on the next Tier 2 or topology trigger (no dedicated retry loop/backoff).
 6. On topology churn, recompute membership and continue convergence on the new `ClosestX(K)` set.
 
-### 7.5 Presence Probe Admission (Per Key)
+### 7.5 Presence Probe Handling (Per Key)
 
-Presence probe for key `K` is accepted only if:
+For a presence probe on key `K`:
 
-1. Requester is in receiver-local top `K_AUTH` for key `K`.
-
-If unauthorized, return `RejectedUnauthorized` and skip expensive lookup work when possible.
+1. Receiver checks local store for key `K`.
+2. Receiver returns `Present` if key `K` exists, else `Absent`.
+3. If receiver cannot respond before deadline (overload/network delay), the requester observes timeout/no-response rather than a special protocol error code.
 
 ### 7.6 Presence Response Semantics
 
 - `Present`: key exists locally.
-- `Absent`: requester authorized; key not found locally.
-- `RejectedUnauthorized`: requester not authorized for key.
-- `RejectedBusy`: requester authorized but temporarily rate-limited/overloaded.
+- `Absent`: key not found locally.
 
 Quorum counting:
 
 - `Present` counts positive.
-- `Absent` and `RejectedUnauthorized` count non-positive.
-- `RejectedBusy` is neutral (retryable, not a negative vote).
+- `Absent` counts non-positive.
+- Timeout/no-response is unresolved (neutral, not a negative vote).
 
 ## 8. Receiver Verification State Machine
 
@@ -281,7 +277,7 @@ Transition requirements:
 - `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
 - `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QUORUM_THRESHOLD`. On success, record the set of positive responders as verified fetch sources.
 - `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
-- `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and neutral outcomes (`RejectedBusy`/timeout) keep both outcomes undecidable in this round.
+- `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
 - `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), retry count has not reached `MAX_FETCH_RETRIES`, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
 - `Fetching -> FetchAbandoned` when fetch fails and either retry count `>= MAX_FETCH_RETRIES` or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
@@ -298,7 +294,7 @@ For each unknown key:
 3. Otherwise compute `PaidTargets = ClosestX(K)`.
 4. Compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self).
 5. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
-6. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+6. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
 7. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
 8. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QUORUM_THRESHOLD`.
 9. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QUORUM_THRESHOLD)`.
@@ -478,8 +474,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Key transitions to `QuorumAbandoned` (then `Idle`) and is not fetched.
 5. Unauthorized offer sender:
    - Unauthorized keys dropped, authorized keys in same offer still processed.
-6. Unauthorized probe requester:
-   - Response is `RejectedUnauthorized`; no positive quorum credit.
+6. Presence probe response shape:
+   - Presence responses are only `Present` or `Absent`; there are no `RejectedUnauthorized`/`RejectedBusy` presence codes.
 7. Out-of-range key offer:
    - Key rejected regardless of quorum.
 8. Duplicate and retry safety:
@@ -498,8 +494,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Key is prioritized immediately in next Tier 3 selection.
 15. Partition and heal:
    - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
-16. Authorized but overloaded quorum responder:
-   - `RejectedBusy` can yield `QuorumInconclusive`, which is terminal for that offer lifecycle (`QuorumAbandoned` -> `Idle`).
+16. Quorum responder timeout handling:
+   - No-response/timeouts are unresolved and can yield `QuorumInconclusive`, which is terminal for that offer lifecycle (`QuorumAbandoned` -> `Idle`).
 17. Offer admission asymmetry:
    - `AuthHint`-guided retry via authorized peer succeeds without relaxing admission policy.
 18. Invalid runtime config:
@@ -532,5 +528,5 @@ The design is logically acceptable for implementation when:
 1. All invariants in Section 5 can be expressed as executable assertions.
 2. Every scenario in Section 18 has deterministic pass/fail expectations.
 3. Security-over-liveness tradeoffs are explicitly accepted by stakeholders.
-4. Parameter sensitivity (especially `K_AUTH*`, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
+4. Parameter sensitivity (especially `K_AUTH_OFFER`, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
 5. Audit-proof commitment requirements are implemented and test-validated.
