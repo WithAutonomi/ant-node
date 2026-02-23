@@ -68,10 +68,10 @@ All parameters are configurable. Values below are a reference profile used for l
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20` |
 | `MAX_PARALLEL_QUORUM_CHECKS` | Concurrent quorum checks | `16` |
 | `NETWORK_CYCLE_DEADLINE` | Max time to re-check all records | `4 days` |
-| `AUDIT_BATCH_SIZE` | Normal audit items | `8` |
-| `AUDIT_BURST_BATCH_SIZE` | Escalated audit items | `32` |
+| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min` |
+| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]` |
+| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8` |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s` |
-| `AUDIT_ESCALATION_THRESHOLD` | Normal audit failures before burst | `3 in 10 min` |
 | `BAD_NODE_WINDOW` | Window for failure counting | `5 min` |
 | `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3` |
 
@@ -106,6 +106,8 @@ Parameter safety constraints (MUST hold):
 18. Tier 1 paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `ClosestX(K)` (reference profile: up to 20 peers when available), not a subset.
 19. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
 20. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `ClosestX(K)` until full coverage is restored or the key leaves maintenance scope.
+21. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`, and only after at least one responsible-range computation has completed.
+22. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 
 ## 6. Replication Tiers
 
@@ -357,6 +359,7 @@ Rules:
 5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
 6. `PENDING_TIMEOUT` applies to total time since verification success (`QuorumVerified` or `PaidListVerified`), including retry cycles. A key that exhausts `PENDING_TIMEOUT` across retries transitions to `FetchAbandoned`.
 7. `PendingPaidNotify` tracks a single pass outcome per key; pass completion is `acked_count == X_eff(K)`. Missing peers are evaluated again only on the next Tier 2 or topology trigger.
+8. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
 
 Capacity-managed mode (finite store):
 
@@ -380,7 +383,7 @@ Goal: avoid replication storms from restart noise while still reacting to real t
 Failure events include:
 
 - Fetch timeout failures.
-- Escalated audit failures.
+- Audit failures (timeout, missing items, malformed response, or `AuditDigest` mismatch).
 
 Rules:
 
@@ -396,10 +399,15 @@ Rules:
 Challenge-response for claimed holders:
 
 1. Challenger creates unique challenge id + nonce.
-2. Challenger selects a random set of records the target should hold, bounded by active audit mode item count (`AUDIT_BATCH_SIZE` for normal or `AUDIT_BURST_BATCH_SIZE` for burst). Record size is capped at `4 MiB`, so total challenge bytes are implicitly bounded by `item_count * 4 MiB`.
-3. Challenger sends the ordered challenge key set to the target.
-4. Target computes and returns one `AuditDigest` as `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
-5. Challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
+2. Challenger samples `SeedKeys` uniformly at random from locally stored record keys, with `|SeedKeys| = min(AUDIT_BATCH_SIZE, local_store_key_count)`. If local store is empty, the audit tick is idle.
+3. For each `K` in `SeedKeys`, challenger performs one network closest-peer lookup and records the returned closest-peer set for `K`.
+4. Challenger builds `CandidatePeers` as the union of returned peers across all sampled keys, then filters to `CandidatePeersRT = CandidatePeers ∩ LocalRT(self)`.
+5. Challenger builds `PeerKeySet(P)` for each `P` in `CandidatePeersRT` as the subset of `SeedKeys` whose lookup result included `P`. This derivation MUST use only lookup results from step 3 (no additional lookup requests).
+6. Challenger removes peers with empty `PeerKeySet(P)`. If no peers remain, the audit tick is idle.
+7. Challenger selects one peer uniformly at random from remaining peers as `challenged_peer_id`.
+8. Challenger sends that peer an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
+9. Target computes and returns one `AuditDigest` as `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
+10. Challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
 
 Audit-proof requirements:
 
@@ -410,15 +418,23 @@ Audit-proof requirements:
 5. Nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
 6. Responses are invalid if the receiver cannot recompute `AuditDigest` from `nonce`, `challenged_peer_id`, and the challenged records' full bytes.
 
-Audit modes:
+Audit challenge bound:
 
-- Normal: `AUDIT_BATCH_SIZE`.
-- Burst: `AUDIT_BURST_BATCH_SIZE` after repeated normal failures.
-- Worst-case challenge bytes are mode-dependent because each record is max `4 MiB` (`normal <= AUDIT_BATCH_SIZE * 4 MiB`, `burst <= AUDIT_BURST_BATCH_SIZE * 4 MiB`).
+- Challenge size is dynamic per selected peer: `1 <= |PeerKeySet(challenged_peer_id)| <= AUDIT_BATCH_SIZE` when a challenge is issued.
+- Worst-case challenge bytes are bounded because each record is max `4 MiB` (`<= AUDIT_BATCH_SIZE * 4 MiB`).
 
 Failure conditions:
 
 - Timeout, missing items, malformed response, or `AuditDigest` mismatch.
+
+Audit trigger and target selection:
+
+1. Node MUST NOT schedule storage-proof audits until both conditions hold: bootstrap is complete and `AUDIT_STARTUP_GRACE` has elapsed since bootstrap completion.
+2. Node MUST also wait for at least one responsible-range computation before the first audit scheduling tick; if unavailable, skip the tick.
+3. Audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
+4. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
+5. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
+6. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
 
 ## 16. New Node Bootstrap Logic
 
@@ -522,6 +538,14 @@ Each scenario should assert exact expected outcomes and state transitions.
    - With `X_eff(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
 28. Single-round dual-evidence verification:
    - For unknown key verification, implementation sends one request round to `VerifyTargets`; no second sequential quorum-probe round is issued after paid-list miss.
+29. Audit start gate:
+   - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE` and before at least one responsible-range computation.
+30. Audit peer selection from sampled keys:
+   - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
+31. Audit periodic cadence with jitter:
+   - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window (`5-10 min` in reference profile).
+32. Dynamic challenge size:
+   - Challenged key count equals `|PeerKeySet(challenged_peer_id)|` and is dynamic per round; if no eligible peer remains after `LocalRT` filtering, the tick is idle and no audit is sent.
 
 ## 19. Acceptance Criteria for This Design
 
