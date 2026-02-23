@@ -398,18 +398,17 @@ Challenge-response for claimed holders:
 1. Challenger creates unique challenge id + nonce.
 2. Challenger selects a random set of records the target should hold, bounded by active audit mode item count (`AUDIT_BATCH_SIZE` for normal or `AUDIT_BURST_BATCH_SIZE` for burst). Record size is capped at `4 MiB`, so total challenge bytes are implicitly bounded by `item_count * 4 MiB`.
 3. Challenger sends the ordered challenge key set to the target.
-4. Target returns one `AuditDigest` over a canonical transcript that includes challenge id, nonce, target id, ordered challenged keys, and each challenged record's full bytes with length framing.
+4. Target computes and returns one `AuditDigest` as `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
 5. Challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
 
 Audit-proof requirements:
 
 1. Challenger MUST hold a local copy of each challenged record to recompute `AuditDigest`. Audit selection is therefore limited to records the challenger stores.
 2. Records are opaque bytes for replication; audit digest construction MUST operate over raw record bytes (no schema dependency) and be deterministic.
-3. Transcript encoding MUST be canonical and length-delimited to avoid ambiguity/collision from concatenation.
-4. `AuditDigest` MUST be cryptographically bound to challenge id, nonce, target id, and the exact ordered challenged key set.
-5. `AuditDigest` MUST include per-record value contribution derived from full record bytes for every challenged key; key-only digests are invalid.
-6. Digest material MAY be precomputed per record and combined per challenge, or derived lazily at audit time, but nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
-7. Responses lacking valid challenge binding are invalid even if response format is well-formed.
+3. `AuditDigest` input MUST be exactly ordered concatenation: `nonce`, then challenged node public peer id (`challenged_peer_id`), then full bytes of each challenged record in challenge order.
+4. `AuditDigest` MUST include full record bytes for every challenged record; key-only digests are invalid.
+5. Nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
+6. Responses are invalid if the receiver cannot recompute `AuditDigest` from `nonce`, `challenged_peer_id`, and the challenged records' full bytes.
 
 Audit modes:
 
@@ -419,7 +418,7 @@ Audit modes:
 
 Failure conditions:
 
-- Timeout, missing items, malformed response, non-canonical transcript encoding, or `AuditDigest` mismatch.
+- Timeout, missing items, malformed response, or `AuditDigest` mismatch.
 
 ## 16. New Node Bootstrap Logic
 
