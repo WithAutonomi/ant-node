@@ -68,7 +68,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20` |
 | `MAX_PARALLEL_QUORUM_CHECKS` | Concurrent quorum checks | `16` |
 | `NETWORK_CYCLE_DEADLINE` | Max time to re-check all records | `4 days` |
-| `AUDIT_RANGE_BYTES` | Bytes proven per challenged record | `4096` |
 | `AUDIT_BATCH_SIZE` | Normal audit items | `8` |
 | `AUDIT_BURST_BATCH_SIZE` | Escalated audit items | `32` |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s` |
@@ -317,11 +316,10 @@ A fetched record is written only if all checks pass:
 
 1. Type/schema validity.
 2. Content-address integrity (`hash(content) == key`).
-3. Auditable commitment validity (when audits are enabled): record can produce deterministic range proofs bound to key.
-4. Authorization validity:
+3. Authorization validity:
    - Tier 1: valid PoP, or
    - Tier 2/3: prior quorum-verified key or paid-list-authorized key.
-5. Responsible-range inclusion at write time.
+4. Responsible-range inclusion at write time.
 
 ## 11. Responsible Range Logic
 
@@ -398,25 +396,30 @@ Rules:
 Challenge-response for claimed holders:
 
 1. Challenger creates unique challenge id + nonce.
-2. Selects random records the target should hold.
-3. Requests random byte ranges per selected record.
-4. Target returns bytes plus range proofs bound to challenge id, nonce, target id, key, offset, and length.
-5. Challenger verifies returned bytes against the record's auditable commitment before deadline.
+2. Challenger selects a random set of records the target should hold, bounded by active audit mode item count (`AUDIT_BATCH_SIZE` for normal or `AUDIT_BURST_BATCH_SIZE` for burst). Record size is capped at `4 MiB`, so total challenge bytes are implicitly bounded by `item_count * 4 MiB`.
+3. Challenger sends the ordered challenge key set to the target.
+4. Target returns one `AuditDigest` over a canonical transcript that includes challenge id, nonce, target id, ordered challenged keys, and each challenged record's full bytes with length framing.
+5. Challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
 
 Audit-proof requirements:
 
-1. Challenger MUST hold a local copy of each challenged record to verify range proofs. Audit selection is therefore limited to records the challenger stores.
-2. Commitment MUST be deterministically derived from record content and cryptographically bound to key `K`.
-3. Responses lacking valid commitment linkage are invalid even if bytes are well-formed.
+1. Challenger MUST hold a local copy of each challenged record to recompute `AuditDigest`. Audit selection is therefore limited to records the challenger stores.
+2. Records are opaque bytes for replication; audit digest construction MUST operate over raw record bytes (no schema dependency) and be deterministic.
+3. Transcript encoding MUST be canonical and length-delimited to avoid ambiguity/collision from concatenation.
+4. `AuditDigest` MUST be cryptographically bound to challenge id, nonce, target id, and the exact ordered challenged key set.
+5. `AuditDigest` MUST include per-record value contribution derived from full record bytes for every challenged key; key-only digests are invalid.
+6. Digest material MAY be precomputed per record and combined per challenge, or derived lazily at audit time, but nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
+7. Responses lacking valid challenge binding are invalid even if response format is well-formed.
 
 Audit modes:
 
 - Normal: `AUDIT_BATCH_SIZE`.
 - Burst: `AUDIT_BURST_BATCH_SIZE` after repeated normal failures.
+- Worst-case challenge bytes are mode-dependent because each record is max `4 MiB` (`normal <= AUDIT_BATCH_SIZE * 4 MiB`, `burst <= AUDIT_BURST_BATCH_SIZE * 4 MiB`).
 
 Failure conditions:
 
-- Timeout, missing items, invalid proofs, malformed response, or commitment mismatch.
+- Timeout, missing items, malformed response, non-canonical transcript encoding, or `AuditDigest` mismatch.
 
 ## 16. New Node Bootstrap Logic
 
@@ -500,8 +503,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - `AuthHint`-guided retry via authorized peer succeeds without relaxing admission policy.
 18. Invalid runtime config:
    - Node rejects configs violating parameter safety constraints.
-19. Audit commitment mismatch:
-   - Challenge fails even if response bytes are syntactically valid.
+19. Audit digest mismatch:
+   - Challenge fails when `AuditDigest` mismatches, even if response format is syntactically valid.
 20. Paid-list local hit:
    - Unknown key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
 21. Paid-list majority confirmation:
@@ -529,4 +532,4 @@ The design is logically acceptable for implementation when:
 2. Every scenario in Section 18 has deterministic pass/fail expectations.
 3. Security-over-liveness tradeoffs are explicitly accepted by stakeholders.
 4. Parameter sensitivity (especially `K_AUTH_OFFER`, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
-5. Audit-proof commitment requirements are implemented and test-validated.
+5. Audit-proof digest requirements are implemented and test-validated.
