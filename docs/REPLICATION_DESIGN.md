@@ -57,11 +57,9 @@ All parameters are configurable. Values below are a reference profile used for l
 | `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2` |
 | `FETCH_TIMEOUT` | Per-record fetch timeout | `20s` |
 | `PENDING_TIMEOUT` | Max queue residency | `15 min` |
-| `QUORUM_RESPONSE_TIMEOUT` | Presence probe wait budget | `3s` |
 | `QUORUM_RETRY_BACKOFF` | Retry delay for non-quorum sender retry paths (e.g., `AuthHint`) | `60s` |
 | `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5` |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20` |
-| `MAX_PARALLEL_QUORUM_CHECKS` | Concurrent quorum checks | `16` |
 | `NETWORK_CYCLE_DEADLINE` | Max time to re-check all records | `4 days` |
 | `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min` |
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]` |
@@ -279,11 +277,11 @@ For each unknown key:
 4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (including self).
 5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
-7. Send verification requests to peers in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+7. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
 8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
 9. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`.
 10. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
-11. If timeout occurs with neither success nor fail-fast, mark `QuorumInconclusive`.
+11. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
 12. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
 
 Single-round requirement:
@@ -338,7 +336,7 @@ Queue model:
 
 Rules:
 
-1. Enforce `MAX_PARALLEL_QUORUM_CHECKS`.
+1. Drive quorum checks with an adaptive worker budget that scales with backlog and observed network latency while respecting local CPU/memory/network guardrails.
 2. Enforce `MAX_PARALLEL_FETCH` (or bootstrap override).
 3. Sort fetch candidates by relevance (e.g., nearest-first) before dequeue.
 4. Evict stale queued entries after `PENDING_TIMEOUT`.
