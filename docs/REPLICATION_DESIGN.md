@@ -99,6 +99,7 @@ Parameter safety constraints (MUST hold):
 19. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
 20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
 21. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
+22. Verification-request batching (if used) preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 
 ## 6. Replication Modes
 
@@ -278,7 +279,7 @@ For each unknown key:
 4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (including self).
 5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
-7. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+7. Send verification requests to peers in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
 8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
 9. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`.
 10. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
@@ -288,6 +289,12 @@ For each unknown key:
 Single-round requirement:
 
 - Unknown-key verification MUST NOT run a second sequential network round for presence after a paid-list miss; both evidence types are collected in the same request round.
+
+Verification request batching optimization:
+
+- Implementation MAY coalesce concurrent unknown-key verification into one request per peer carrying many keys.
+- Each peer response MUST include explicit per-key results: presence (`Present`/`Absent`) for each requested key, plus paid-list presence for keys where that peer is in `PaidTargets`.
+- If a peer response omits key `K`, or the peer times out/no-responds, that peer contributes unresolved evidence for key `K` (never a negative vote).
 
 Security-liveness policy:
 
@@ -524,6 +531,10 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window (`5-10 min` in reference profile).
 32. Dynamic challenge size:
    - Challenged key count equals `|PeerKeySet(challenged_peer_id)|` and is dynamic per round; if no eligible peer remains after `LocalRT` filtering, the tick is idle and no audit is sent.
+33. Batched unknown-key verification:
+   - When multiple unknown keys share a target peer, implementation may send one batched verification request; responses must still be keyed per key with binary presence semantics (and paid-list presence where applicable).
+34. Batched partial response semantics:
+   - If a batched response omits key `K` or a peer times out, evidence for that peer/key pair is unresolved for `K` and does not count as an explicit negative vote.
 
 ## 19. Acceptance Criteria for This Design
 
