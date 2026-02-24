@@ -27,6 +27,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 
 - `Node`: participant with routing view, local store, and replication worker.
 - `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set.
+- `NeighborSyncSet(N)`: up to `NEIGHBOR_SYNC_PEER_COUNT` peers nearest to node `N` in `LocalRT(N)`; periodic repair sync partners for `N`.
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
@@ -49,14 +50,15 @@ All parameters are configurable. Values below are a reference profile used for l
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                               |
-| `CLOSE_GROUP_REPAIR_INTERVAL` | Close-group repair cadence | random in `[10m, 20m]`             |
-| `CLOSE_GROUP_REPAIR_COOLDOWN` | Min spacing between close-group repair runs | `30s`                              |
+| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `20`                               |
+| `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`             |
+| `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `30s`                              |
 | `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s`                              |
 | `RESTART_SUPPRESSION` | Rejoin suppression window | `90s`                              |
 | `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2`                                |
 | `FETCH_TIMEOUT` | Per-record fetch timeout | `20s`                              |
 | `PENDING_TIMEOUT` | Max queue residency | `15 min`                           |
-| `QUORUM_RETRY_BACKOFF` | Retry delay for non-quorum sender retry paths (e.g., `AuthHint`) | `60s`                              |
+| `QUORUM_RETRY_BACKOFF` | Retry delay before repeating a previously rejected/failed hint path | `60s`                              |
 | `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5`                                |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                               |
 | `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                            |
@@ -75,26 +77,26 @@ Parameter safety constraints (MUST hold):
 ## 5. Core Invariants (Must Hold)
 
 1. A record is accepted only if it passes integrity and responsibility checks.
-2. Close-group repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
+2. Neighbor-sync repair traffic passes verification only if either condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, or presence positives `>= QuorumNeeded(K)`.
 3. Fresh replication bypasses presence quorum only when PoP is valid.
-4. Unauthorized offer keys are dropped per key (not per message).
+4. Neighbor-sync hints from non-`NeighborSyncSet(self)` peers are dropped.
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
 6. `CLOSE_GROUP_SIZE` is both the close-group width and the target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
 9. Bad-node decisions are local-only (no gossip reputation).
 10. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
-11. Every close-group repair offer exchange reaches a deterministic terminal state.
+11. Every neighbor-sync hint exchange reaches a deterministic terminal state.
 12. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
 13. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
 14. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
 15. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
 16. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 17. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
-18. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
+18. Neighbor-sync paid hints are non-authoritative and carry no PoP; receivers MUST only whitelist by paid-list majority verification (`>= ConfirmNeeded(K)`), never by hint claims alone.
 19. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
-21. Verification-request batching is mandatory for unknown-key close-group verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
+21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 
 ## 6. Replication Modes
 
@@ -113,59 +115,63 @@ Rules:
 7. In parallel with record propagation, sender MUST send `PaidNotify(K)` to every member of `PaidCloseGroup(K)` and include the PoP for receiver verification.
 8. Sender sends `PaidNotify(K)` with PoP to each peer in `PaidCloseGroup(K)` once (fire-and-forget, no ack tracking or retry).
 
-### 6.2 Close-group Replication Repair
+### 6.2 Neighbor Replication Sync
 
 Triggers:
 
-- Periodic randomized timer (`CLOSE_GROUP_REPAIR_INTERVAL`).
+- Periodic randomized timer (`NEIGHBOR_SYNC_INTERVAL`).
 
 Rules:
 
-1. Sender enumerates locally stored record keys.
-2. For each key, sender computes holder target set and selects remote members.
-3. Sender transmits one logical offer set of keys to each target for the sync run.
+1. Node computes `NeighborSyncSet(self)` as the up to `NEIGHBOR_SYNC_PEER_COUNT` closest peers to self from `LocalRT(self)`.
+2. Node initiates a bidirectional sync session with each peer in `NeighborSyncSet(self)` (or responds if peer initiated first).
+3. In each session, both sides send peer-targeted hint sets:
+   - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (`receiver ∈ CloseGroup(K)` in sender view).
+   - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (`receiver ∈ PaidCloseGroup(K)` in sender view).
 4. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
-5. Receiver treats the offer set as an unordered key collection and deduplicates repeated keys.
-6. Receiver diffs offered keys against local store and pending sets.
-7. Receiver runs per-key admission rules before quorum logic.
-8. Receiver launches quorum checks exactly once per admitted unknown key in the offer set.
-9. Keys passing presence quorum or paid-list authorization are queued for fetch.
-10. During close-group repair runs, nodes SHOULD also execute paid-list convergence maintenance for locally known paid keys by repairing missing `PaidForList` entries in `PaidCloseGroup(K)`.
+5. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
+6. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
+7. Receiver launches quorum checks exactly once per admitted unknown replica key.
+8. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
+9. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
+10. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
+11. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
 
 Rate control:
 
-- Skip close-group repair if `CLOSE_GROUP_REPAIR_COOLDOWN` not elapsed.
-- Do not send to same target within `PER_TARGET_DEDUP`.
+- Skip neighbor sync if `NEIGHBOR_SYNC_COOLDOWN` not elapsed.
+- Do not sync same target within `PER_TARGET_DEDUP`.
 - Suppress triggers from remove+quick-readd patterns within `RESTART_SUPPRESSION`.
 
 ## 7. Authorization and Admission Rules
 
-### 7.1 Offer Key Admission (Per Key)
+### 7.1 Neighbor-Sync Hint Admission (Per Key)
 
-For each offered key `K`, accept if either condition holds:
+For each hinted key `K`, receiver accepts the hint into verification only if both conditions hold:
 
-1. Sender is in receiver-local top `PAID_LIST_CLOSE_GROUP_SIZE` nodes nearest `K`.
-2. Key is PoP-authorized (fresh path), or key is already in receiver-local `PaidForList`.
+1. Sender is authenticated and currently in `NeighborSyncSet(self)`.
+2. Key is relevant to the receiver:
+   - Replica hint: receiver is currently responsible (`IsResponsible(self, K)`) or key already exists in local store/pending pipeline.
+   - Paid hint: receiver is currently in `PaidCloseGroup(K)` (or key is already in local `PaidForList` pending cleanup).
 
 Notes:
 
 - Authorization decision is local-route-state only.
-- Unauthorized keys are dropped immediately.
-- Mixed offers are valid: accept authorized keys, drop unauthorized keys.
-- On unauthorized drop, receiver SHOULD return `RejectedUnauthorized` plus optional `AuthHint` (small list of currently authorized peers for `K`) so sender can retry through those peers instead of blind retries.
-- Senders SHOULD apply `QUORUM_RETRY_BACKOFF` before retrying an `AuthHint` path and MUST respect `PER_TARGET_DEDUP` for repeat attempts.
+- Hints from non-neighbor-sync peers are dropped immediately.
+- Mixed hint sets are valid: process admitted keys, drop non-admitted keys.
+- Receiver MAY return rejected-key metadata to help sender avoid repeating obviously invalid hints; sender SHOULD apply `QUORUM_RETRY_BACKOFF` before repeating the same rejected path.
 
 ### 7.2 Paid-List Authorization (Per Key)
 
-When handling an admitted unknown key `K` for close-group repair:
+When handling an admitted unknown key `K` from neighbor sync:
 
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
 3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
 4. If confirmations are below threshold, paid-list authorization fails for this verification round.
 5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from record presence alone.
-6. If a node learns `K` is paid-authorized by majority, it MUST notify queried peers that answered unknown so they can re-check and converge.
-7. If paid-list checks show missing `PaidForList` entries among `PaidCloseGroup(K)`, node MUST enqueue `PaidNotify(K)` repair for missing peers in the next maintenance pass.
+6. If a node learns `K` is paid-authorized by majority, it SHOULD include `K` in outbound `PaidHintsForPeer` for relevant neighbors so peers can re-check and converge.
+7. Unknown paid hints that fail majority confirmation are dropped for this lifecycle and require a new hint/session to re-enter.
 
 ### 7.3 Fresh-Replication Paid-List Notification (Per Key)
 
@@ -177,12 +183,13 @@ When fresh replication accepts a new key `K` with valid PoP:
 
 ### 7.4 Paid-List Convergence Maintenance (Ongoing)
 
-Nodes that already treat key `K` as paid-authorized MUST help keep `PaidCloseGroup(K)` populated with `K` in `PaidForList`:
+Nodes that already treat key `K` as paid-authorized SHOULD help convergence by advertising paid hints during neighbor sync:
 
-1. Trigger on close-group repair cadence, topology changes affecting `PaidCloseGroup(K)`, and any observation that a `PaidCloseGroup(K)` peer reports unknown for paid key `K`.
+1. Trigger on neighbor-sync cadence, topology changes affecting `PaidCloseGroup(K)`, and any observation that a `PaidCloseGroup(K)` peer reports unknown for paid key `K`.
 2. Compute current `PaidCloseGroup(K)` membership.
-3. For each member missing `K`, send `PaidNotify(K)` with PoP (fire-and-forget).
-4. On topology churn, recompute membership and continue on the new `PaidCloseGroup(K)` set.
+3. During sync with peer `P`, if sender believes `P` is in `PaidCloseGroup(K)` and may be missing `K`, include `K` in `PaidHintsForPeer`.
+4. Receiver treats paid hints as claims only and adds `K` to `PaidForList` only after local majority confirmation (`>= ConfirmNeeded(K)`).
+5. On topology churn, recompute membership and continue on the new `PaidCloseGroup(K)` set.
 
 ### 7.5 Presence Probe Handling (Per Key)
 
@@ -242,7 +249,7 @@ Transition requirements:
 
 - `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
 - `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources.
-- `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
+- `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or hint sender.
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
 - `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), retry count has not reached `MAX_FETCH_RETRIES`, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
@@ -264,9 +271,14 @@ For each unknown key:
 7. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
 8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
 9. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`.
-10. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
-11. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
-12. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+10. Verification succeeds as soon as either step 8 or step 9 condition is met (logical OR).
+11. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
+12. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
+13. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+
+Undersized verification-set behavior:
+
+- Presence threshold remains dynamic per key via `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 
 Single-round requirement:
 
@@ -280,7 +292,7 @@ Verification request batching requirement:
 
 Security-liveness policy:
 
-- Close-group repair never stores without either presence quorum or paid-list authorization.
+- Neighbor-sync repair never stores without either presence quorum or paid-list authorization.
 - Fresh replication can store with valid PoP alone.
 - Therefore, below-quorum data is recoverable only if paid-list authorization can still be established.
 
@@ -292,7 +304,7 @@ A fetched record is written only if all checks pass:
 2. Content-address integrity (`hash(content) == key`).
 3. Authorization validity:
    - Fresh replication: valid PoP, or
-   - Close-group repair: prior quorum-verified key or paid-list-authorized key.
+   - Neighbor-sync repair: prior quorum-verified key or paid-list-authorized key.
 4. Responsibility check: `IsResponsible(self, K)` at write time.
 
 ## 11. Responsibility Check
@@ -339,7 +351,7 @@ Capacity-managed mode (finite store):
 
 Maintain tracker for closest peers and classify topology events:
 
-- `Trigger`: genuine change, run close-group repair.
+- `Trigger`: genuine change, run neighbor sync.
 - `Skip`: probable restart churn, suppress.
 - `Ignore`: far peers, no action.
 
@@ -406,8 +418,8 @@ Audit trigger and target selection:
 
 A joining node performs active sync:
 
-1. Discover close-group peers.
-2. Request key lists and paid-list snapshots for its responsible range from those peers.
+1. Discover up to `NEIGHBOR_SYNC_PEER_COUNT` closest peers to self from `LocalRT(self)`.
+2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) from those peers.
 3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
 5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
@@ -423,17 +435,17 @@ Use this list to find design flaws before coding:
 1. Quorum deadlock risk:
    - Can strict admission + strict quorum prevent legitimate repair in sparse/partitioned states?
 2. Bootstrap incompleteness:
-   - If close-group peers are partially unavailable, is there a deterministic retry strategy?
+   - If enough neighbor-sync peers are unavailable, is there a deterministic retry strategy?
 3. Range oscillation:
    - Can rapid responsible-range shifts cause thrash (store/prune/store loops)?
 4. Restart suppression false negatives:
    - Could real topology loss be suppressed too long?
-5. Offer-set integrity:
+5. Hint-set integrity:
    - How are duplicate keys, partial deliveries, and retries handled deterministically?
-6. Close-group repair coverage:
-   - Under sustained backlog/churn, does close-group repair still revisit all local keys within an acceptable bound?
+6. Neighbor-sync coverage:
+   - Under sustained backlog/churn, do neighbor sync rounds still revisit all relevant keys within an acceptable bound?
 7. Admission asymmetry:
-   - Can two honest nodes disagree on `top K` enough to block propagation?
+   - Can two honest nodes disagree on neighbor-sync membership enough to delay propagation?
 8. Capacity fairness:
    - Can nearest-first plus finite capacity starve less-near but still responsible keys?
 9. Audit bias:
@@ -453,18 +465,18 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Valid PoP propagates to target holders without quorum check.
 2. Fresh write invalid PoP:
    - Receiver rejects and does not enqueue fetch.
-3. Close-group repair unknown key quorum pass:
+3. Neighbor-sync unknown key quorum pass:
    - Key transitions to stored through full state machine.
-4. Close-group repair unknown key quorum fail:
+4. Neighbor-sync unknown key quorum fail:
    - Key transitions to `QuorumAbandoned` (then `Idle`) and is not fetched.
-5. Unauthorized offer sender:
-   - Unauthorized keys dropped, authorized keys in same offer still processed.
+5. Unauthorized sync peer:
+   - Hints from non-`NeighborSyncSet(self)` peer are dropped and do not enter verification.
 6. Presence probe response shape:
    - Presence responses are only `Present` or `Absent`; there are no `RejectedUnauthorized`/`RejectedBusy` presence codes.
-7. Out-of-range key offer:
+7. Out-of-range key hint:
    - Key rejected regardless of quorum.
 8. Duplicate and retry safety:
-   - Duplicate keys and repeated offers do not create invalid acceptance or duplicate queue/fetch work.
+   - Duplicate keys and repeated hints do not create invalid acceptance or duplicate queue/fetch work.
 9. Fetch timeout with alternate source retry:
    - First source times out, key transitions to `FetchRetryable`, re-enters `QueuedForFetch` with next verified source, and succeeds. Verification is not re-run. Failed source receives one `ReplicationFailure`; successful alternate source clears stale failure attribution (rule 14.4).
 10. Fetch retry exhaustion:
@@ -475,14 +487,14 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Node accepts only keys meeting multi-peer threshold.
 13. Responsible range shrink:
    - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
-14. Close-group repair coverage under backlog:
-   - Under load, each local key is eventually re-offered within expected close-group repair timing bounds.
+14. Neighbor-sync coverage under backlog:
+   - Under load, each local key is eventually re-hinted within expected neighbor-sync timing bounds.
 15. Partition and heal:
    - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
 16. Quorum responder timeout handling:
    - No-response/timeouts are unresolved and can yield `QuorumInconclusive`, which is terminal for that offer lifecycle (`QuorumAbandoned` -> `Idle`).
-17. Offer admission asymmetry:
-   - `AuthHint`-guided retry via authorized peer succeeds without relaxing admission policy.
+17. Neighbor-sync admission asymmetry:
+   - When two honest nodes temporarily disagree on `NeighborSyncSet` membership, propagation resumes after topology refresh without relaxing admission policy.
 18. Invalid runtime config:
    - Node rejects configs violating parameter safety constraints.
 19. Audit digest mismatch:
@@ -498,7 +510,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 24. Fresh-replication paid-list propagation:
    - Freshly accepted key sends `PaidNotify` with PoP to all peers in current `PaidCloseGroup(K)` (fire-and-forget).
 25. Paid-list convergence repair:
-   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes detect missing peers and send `PaidNotify(K)` with PoP on each close-group repair/topology convergence pass (fire-and-forget).
+   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes include `K` in `PaidHintsForPeer` during neighbor sync; receiver whitelists only after `>= ConfirmNeeded(K)` confirmations (no PoP in sync payloads).
 26. Dynamic paid-list threshold in undersized consensus set:
    - With `PaidGroupSize(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
 27. Single-round dual-evidence verification:
