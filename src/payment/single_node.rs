@@ -527,7 +527,11 @@ mod tests {
                 data_size: chunk_size,
                 data_type: 0,
                 close_records_stored: 10 + i,
-                records_per_type: vec![(0, (10 + i) as u32)],
+                records_per_type: vec![(
+                    0,
+                    u32::try_from(10 + i)
+                        .map_err(|e| Error::Payment(format!("Invalid record count: {e}")))?,
+                )],
                 max_records: 1000,
                 received_payment_count: 5,
                 live_time: 3600,
