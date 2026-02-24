@@ -122,11 +122,10 @@ Rules:
 Triggers:
 
 - Periodic randomized timer (`CLOSE_GROUP_REPAIR_INTERVAL`).
-- Topology changes that are not suppressed as restart noise.
 
 Rules:
 
-1. Sender enumerates local keys.
+1. Sender enumerates locally stored record keys.
 2. For each key, sender computes holder target set and selects remote members.
 3. Sender transmits one logical offer set of keys to each target for the sync run.
 4. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
