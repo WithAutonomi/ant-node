@@ -38,6 +38,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `ClosestX(K)`: `PAID_LIST_CLOSEST_X` nearest nodes to key `K` that participate in paid-list consensus.
 - `X_eff(K)`: effective paid-list consensus set size for key `K`, defined as `|ClosestX(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(X_eff(K)/2)+1`.
+- `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
 - `ClosestY(K)`: `PAYMENT_ACCEPT_CLOSEST_Y` nearest nodes to key `K` allowed to accept initial paid writes (`Y <= X`).
 
 ## 4. Tunable Parameters
@@ -48,7 +49,7 @@ All parameters are configurable. Values below are a reference profile used for l
 |---|---|---|
 | `CLOSE_GROUP_SIZE` | Close-group width | `7` |
 | `REPLICATION_FACTOR` | Target holder count per key | `7` |
-| `QUORUM_THRESHOLD` | Required positive presence votes | `floor(REPLICATION_FACTOR/2)+1` (`4`) |
+| `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(REPLICATION_FACTOR/2)+1` (`4`) |
 | `PAID_LIST_CLOSEST_X` | Maximum number of closest nodes tracking paid status for a key | `20` |
 | `PAYMENT_ACCEPT_CLOSEST_Y` | Number of closest nodes allowed to accept initial paid write | `7` |
 | `PAID_LIST_CONFIRM_THRESHOLD` | Legacy reference value for full-size paid-list set; effective per-key threshold is `ConfirmNeeded(K)` | `11` (when `X_eff(K)=20`) |
@@ -276,7 +277,7 @@ QuorumAbandoned
 Transition requirements:
 
 - `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
-- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QUORUM_THRESHOLD`. On success, record the set of positive responders as verified fetch sources.
+- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources.
 - `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or offer sender.
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
@@ -294,13 +295,14 @@ For each unknown key:
 2. If `K` is already in local `PaidForList`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
 3. Otherwise compute `PaidTargets = ClosestX(K)`.
 4. Compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self).
-5. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
-6. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
-7. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
-8. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QUORUM_THRESHOLD`.
-9. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QUORUM_THRESHOLD)`.
-10. If timeout occurs with neither success nor fail-fast, mark `QuorumInconclusive`.
-11. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
+6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
+7. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
+9. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`.
+10. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
+11. If timeout occurs with neither success nor fail-fast, mark `QuorumInconclusive`.
+12. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
 
 Single-round requirement:
 
@@ -442,10 +444,11 @@ A joining node performs active sync:
 
 1. Discover close-group peers.
 2. Request key lists and paid-list snapshots for its responsible range from those peers.
-3. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
-4. Aggregate key-presence reports and accept keys observed from `>= QUORUM_THRESHOLD` peers, or keys that are now paid-authorized locally.
-5. Fetch accepted keys with bootstrap concurrency.
-6. Fall back to normal concurrency after bootstrap drains.
+3. For each discovered key `K`, compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
+4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
+5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
+6. Fetch accepted keys with bootstrap concurrency.
+7. Fall back to normal concurrency after bootstrap drains.
 
 This compresses quorum formation into one bootstrap round instead of waiting for multiple periodic cycles.
 
@@ -538,13 +541,15 @@ Each scenario should assert exact expected outcomes and state transitions.
    - With `X_eff(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
 28. Single-round dual-evidence verification:
    - For unknown key verification, implementation sends one request round to `VerifyTargets`; no second sequential quorum-probe round is issued after paid-list miss.
-29. Audit start gate:
+29. Dynamic quorum threshold in undersized verification set:
+   - With `|QuorumTargets|=3`, unknown-key presence quorum requires `QuorumNeeded(K)=2` confirmations (not 4).
+30. Audit start gate:
    - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE` and before at least one responsible-range computation.
-30. Audit peer selection from sampled keys:
+31. Audit peer selection from sampled keys:
    - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
-31. Audit periodic cadence with jitter:
+32. Audit periodic cadence with jitter:
    - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window (`5-10 min` in reference profile).
-32. Dynamic challenge size:
+33. Dynamic challenge size:
    - Challenged key count equals `|PeerKeySet(challenged_peer_id)|` and is dynamic per round; if no eligible peer remains after `LocalRT` filtering, the tick is idle and no audit is sent.
 
 ## 19. Acceptance Criteria for This Design
