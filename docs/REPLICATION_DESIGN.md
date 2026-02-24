@@ -50,7 +50,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(REPLICATION_FACTOR/2)+1` (`4`) |
 | `PAID_LIST_CLOSEST_X` | Maximum number of closest nodes tracking paid status for a key | `20` |
 | `PAID_LIST_CONFIRM_THRESHOLD` | Legacy reference value for full-size paid-list set; effective per-key threshold is `ConfirmNeeded(K)` | `11` (when `X_eff(K)=20`) |
-| `K_AUTH_OFFER` | Offer auth window (per key) | `12` |
 | `QUORUM_PROBE_FANOUT` | Peers queried per key during unknown-key verification round | `12` |
 | `TIER2_INTERVAL` | Neighbor sync cadence | random in `[90s, 180s]` |
 | `TIER3_INTERVAL` | Global verification cadence | `15 min` |
@@ -77,9 +76,8 @@ Parameter safety constraints (MUST hold):
 
 1. `1 <= QUORUM_THRESHOLD <= REPLICATION_FACTOR`.
 2. `QUORUM_THRESHOLD <= QUORUM_PROBE_FANOUT`.
-3. `QUORUM_PROBE_FANOUT >= CLOSE_GROUP_SIZE`.
-5. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(X_eff(K)/2)+1`.
-6. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
+3. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(X_eff(K)/2)+1`.
+4. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
 ## 5. Core Invariants (Must Hold)
 
@@ -169,7 +167,7 @@ Rules:
 
 For each offered key `K`, accept if either condition holds:
 
-1. Sender is in receiver-local top `K_AUTH_OFFER` nodes nearest `K`.
+1. Sender is in receiver-local top `PAID_LIST_CLOSEST_X` nodes nearest `K`.
 2. Key is PoP-authorized (fresh path), or key is already in receiver-local `PaidForList`.
 
 Notes:
@@ -554,5 +552,5 @@ The design is logically acceptable for implementation when:
 1. All invariants in Section 5 can be expressed as executable assertions.
 2. Every scenario in Section 18 has deterministic pass/fail expectations.
 3. Security-over-liveness tradeoffs are explicitly accepted by stakeholders.
-4. Parameter sensitivity (especially `K_AUTH_OFFER`, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
+4. Parameter sensitivity (especially, quorum, `PAID_LIST_*`, and suppression windows) has been reviewed with failure simulations.
 5. Audit-proof digest requirements are implemented and test-validated.
