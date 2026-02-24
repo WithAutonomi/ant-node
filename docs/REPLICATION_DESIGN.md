@@ -5,6 +5,7 @@
 ## 1. Purpose
 
 This document specifies replication behavior as a pure system design, independent of any language, framework, transport, or existing codebase.
+It is designed for Kademlia-style decentralized networks, and assumes Kademlia nearest-peer routing semantics.
 
 Primary goal: validate correctness, safety, and liveness of replication logic before implementation.
 
@@ -13,7 +14,6 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 ### In scope
 
 - Permanent record replication in a decentralized key-addressed network.
-- Pull-based repair (key offers + receiver fetch).
 - Churn-aware maintenance and proactive repair.
 - Admission control, quorum verification, and storage audits.
 
@@ -30,7 +30,6 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
-- `ResponsibleRange(N)`: max distance from node `N` within which `N` is willing to store replicated records.
 - `Holder`: node that stores a valid copy of a record.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
 - `PaidNotify(K)`: Tier 1 paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
@@ -39,7 +38,6 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `X_eff(K)`: effective paid-list consensus set size for key `K`, defined as `|ClosestX(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(X_eff(K)/2)+1`.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
-- `ClosestY(K)`: `PAYMENT_ACCEPT_CLOSEST_Y` nearest nodes to key `K` allowed to accept initial paid writes (`Y <= X`).
 
 ## 4. Tunable Parameters
 
@@ -51,7 +49,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `REPLICATION_FACTOR` | Target holder count per key | `7` |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(REPLICATION_FACTOR/2)+1` (`4`) |
 | `PAID_LIST_CLOSEST_X` | Maximum number of closest nodes tracking paid status for a key | `20` |
-| `PAYMENT_ACCEPT_CLOSEST_Y` | Number of closest nodes allowed to accept initial paid write | `7` |
 | `PAID_LIST_CONFIRM_THRESHOLD` | Legacy reference value for full-size paid-list set; effective per-key threshold is `ConfirmNeeded(K)` | `11` (when `X_eff(K)=20`) |
 | `K_AUTH_OFFER` | Offer auth window (per key) | `12` |
 | `QUORUM_PROBE_FANOUT` | Peers queried per key during unknown-key verification round | `12` |
@@ -81,7 +78,6 @@ Parameter safety constraints (MUST hold):
 1. `1 <= QUORUM_THRESHOLD <= REPLICATION_FACTOR`.
 2. `QUORUM_THRESHOLD <= QUORUM_PROBE_FANOUT`.
 3. `QUORUM_PROBE_FANOUT >= CLOSE_GROUP_SIZE`.
-4. `1 <= PAYMENT_ACCEPT_CLOSEST_Y <= PAID_LIST_CLOSEST_X`.
 5. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(X_eff(K)/2)+1`.
 6. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
