@@ -48,7 +48,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7` |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20` |
-| `QUORUM_PROBE_FANOUT` | Peers queried per key during unknown-key verification round | `12` |
 | `TIER2_INTERVAL` | Neighbor sync cadence | random in `[90s, 180s]` |
 | `TIER3_INTERVAL` | Global verification cadence | `15 min` |
 | `GLOBAL_REPL_COOLDOWN` | Min spacing between Tier 2 runs | `30s` |
@@ -73,9 +72,8 @@ All parameters are configurable. Values below are a reference profile used for l
 Parameter safety constraints (MUST hold):
 
 1. `1 <= QUORUM_THRESHOLD <= CLOSE_GROUP_SIZE`.
-2. `QUORUM_THRESHOLD <= QUORUM_PROBE_FANOUT`.
-3. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(PaidGroupSize(K)/2)+1`.
-4. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
+2. Effective paid-list authorization threshold is per-key dynamic: `ConfirmNeeded(K) = floor(PaidGroupSize(K)/2)+1`.
+3. If constraints are violated at runtime reconfiguration, node MUST reject the config and keep the previous valid config.
 
 ## 5. Core Invariants (Must Hold)
 
@@ -285,7 +283,7 @@ For each unknown key:
 1. Deduplicate key in pending-verification table.
 2. If `K` is already in local `PaidForList`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
 3. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
-4. Compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self).
+4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (including self).
 5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
 7. Send one verification request per peer in `VerifyTargets` and wait up to `QUORUM_RESPONSE_TIMEOUT`. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
@@ -435,7 +433,7 @@ A joining node performs active sync:
 
 1. Discover close-group peers.
 2. Request key lists and paid-list snapshots for its responsible range from those peers.
-3. For each discovered key `K`, compute `QuorumTargets` as up to `QUORUM_PROBE_FANOUT` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
+3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
 5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
 6. Fetch accepted keys with bootstrap concurrency.
