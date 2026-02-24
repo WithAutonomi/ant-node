@@ -113,11 +113,10 @@ Rules:
 3. Send fresh offers to remote target members only.
 4. Fresh offer MUST include PoP.
 5. Receiver MUST reject fresh path if PoP is missing or invalid.
-6. Fresh path MAY bypass normal fetch queue limits for low-latency propagation.
-7. A node that validates PoP for key `K` MUST add `K` to `PaidForList(self)`.
-8. In parallel with chunk propagation, sender MUST send `PaidNotify(K)` to every member of `PaidCloseGroup(K)` and include proof material sufficient for independent receiver verification.
-9. Sender MUST track per-peer `PaidNotify(K)` acknowledgment state for the current propagation pass and attempt each peer in `PaidCloseGroup(K)` once per pass (no immediate retry loop).
-10. Completion of paid-list propagation for a pass is defined per key as `acked_count == PaidGroupSize(K)`.
+6. A node that validates PoP for key `K` MUST add `K` to `PaidForList(self)`.
+7. In parallel with record propagation, sender MUST send `PaidNotify(K)` to every member of `PaidCloseGroup(K)` and include the PoP for receiver verification.
+8. Sender MUST track per-peer `PaidNotify(K)` acknowledgment state for the current propagation pass and attempt each peer in `PaidCloseGroup(K)` once per pass (no immediate retry loop).
+9. Completion of paid-list propagation for a pass is defined per key as `acked_count == PaidGroupSize(K)`.
 
 ### 6.2 Close-group Replication Repair
 
@@ -183,7 +182,7 @@ When handling an admitted unknown key `K` for close-group/global repair:
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
 3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
 4. If confirmations are below threshold, paid-list authorization fails for this verification round.
-5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from chunk presence alone.
+5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from record presence alone.
 6. If a node learns `K` is paid-authorized by majority, it MUST notify queried peers that answered unknown so they can re-check and converge.
 7. If paid-list checks show missing `PaidForList` entries among `PaidCloseGroup(K)`, node MUST enqueue `PaidNotify(K)` repair for missing peers in the next maintenance pass.
 
