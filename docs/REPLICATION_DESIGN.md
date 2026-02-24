@@ -95,20 +95,19 @@ Parameter safety constraints (MUST hold):
 6. `REPLICATION_FACTOR` is a target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
-9. No unbounded key-list transfer; each offer exchange MUST be resource-bounded.
-10. Bad-node decisions are local-only (no gossip reputation).
-11. Global replication prioritizes low-observed-replica records first.
-12. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
-13. Every Tier 2 offer exchange reaches a deterministic terminal state.
-14. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
-15. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
-16. Paid-list authorization is key-scoped and majority-based across `ClosestX(K)`, not node-global.
-17. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `ClosestX(K)` (plus short-lived transition slack).
-18. Tier 1 paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `ClosestX(K)` (reference profile: up to 20 peers when available), not a subset.
-19. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
-20. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `ClosestX(K)` until full coverage is restored or the key leaves maintenance scope.
-21. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`, and only after at least one responsible-range computation has completed.
-22. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
+9. Bad-node decisions are local-only (no gossip reputation).
+10. Global replication prioritizes low-observed-replica records first.
+11. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
+12. Every Tier 2 offer exchange reaches a deterministic terminal state.
+13. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
+14. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
+15. Paid-list authorization is key-scoped and majority-based across `ClosestX(K)`, not node-global.
+16. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `ClosestX(K)` (plus short-lived transition slack).
+17. Tier 1 paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `ClosestX(K)` (reference profile: up to 20 peers when available), not a subset.
+18. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
+19. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `ClosestX(K)` until full coverage is restored or the key leaves maintenance scope.
+20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`, and only after at least one responsible-range computation has completed.
+21. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 
 ## 6. Replication Tiers
 
