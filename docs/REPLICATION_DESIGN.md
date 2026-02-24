@@ -30,6 +30,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
+- `IsResponsible(N, K)`: true if `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `LocalRT(N) ∪ {N}`.
 - `Holder`: node that stores a valid copy of a record.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
 - `PaidNotify(K)`: fresh-replication paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
@@ -96,7 +97,7 @@ Parameter safety constraints (MUST hold):
 17. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 18. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
 19. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
-20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`, and only after at least one responsible-range computation has completed.
+20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
 21. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 
 ## 6. Replication Modes
@@ -312,25 +313,22 @@ A fetched record is written only if all checks pass:
 3. Authorization validity:
    - Fresh replication: valid PoP, or
    - Close-group/global repair: prior quorum-verified key or paid-list-authorized key.
-4. Responsible-range inclusion at write time.
+4. Responsibility check: `IsResponsible(self, K)` at write time.
 
-## 11. Responsible Range Logic
+## 11. Responsibility Check
 
-Periodic recalculation (example cadence: 15s):
+A node `N` is responsible for key `K` if `IsResponsible(N, K)` holds — that is, `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `LocalRT(N) ∪ {N}`.
 
-1. Estimate network size from routing-table density.
-2. Derive density-based distance budget.
-3. Compute responsible cutoff from density and close-group parameters.
-4. Lower-bound cutoff using distance to a nearby rank (for stability).
-5. Apply cutoff to:
-   - Accept/reject future replication writes.
-   - Background pruning eligibility.
-   - Paid-list retention eligibility (drop paid-list entries when node is no longer in `PaidCloseGroup(K)`, after transition slack).
+This check is evaluated per-key at decision points:
+
+1. Accept/reject incoming replication writes.
+2. Background pruning eligibility (prune stored records where node is no longer responsible).
+3. Paid-list retention eligibility (drop `PaidForList` entries for keys where node is no longer in `PaidCloseGroup(K)`).
 
 Effect:
 
-- Small network: larger per-node responsibility.
-- Large network: narrower per-node responsibility.
+- Small network: each node is responsible for more keys.
+- Large network: each node is responsible for fewer keys.
 
 ## 12. Scheduling and Capacity Rules
 
@@ -420,12 +418,11 @@ Failure conditions:
 
 Audit trigger and target selection:
 
-1. Node MUST NOT schedule storage-proof audits until both conditions hold: bootstrap is complete and `AUDIT_STARTUP_GRACE` has elapsed since bootstrap completion.
-2. Node MUST also wait for at least one responsible-range computation before the first audit scheduling tick; if unavailable, skip the tick.
-3. Audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
-4. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
-5. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
-6. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
+1. Node MUST NOT schedule storage-proof audits until bootstrap is complete and `AUDIT_STARTUP_GRACE` has elapsed since bootstrap completion.
+2. Audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
+3. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
+4. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
+5. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
 
 ## 16. New Node Bootstrap Logic
 
@@ -533,7 +530,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 29. Dynamic quorum threshold in undersized verification set:
    - With `|QuorumTargets|=3`, unknown-key presence quorum requires `QuorumNeeded(K)=2` confirmations (not 4).
 30. Audit start gate:
-   - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE` and before at least one responsible-range computation.
+   - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE`.
 31. Audit peer selection from sampled keys:
    - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
 32. Audit periodic cadence with jitter:
