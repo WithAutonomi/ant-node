@@ -45,28 +45,22 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 
 All parameters are configurable. Values below are a reference profile used for logic validation.
 
-| Parameter | Meaning | Reference |
-|---|---|---|
-| `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                |
+| Parameter | Meaning | Reference                           |
+|---|---|-------------------------------------|
+| `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                 |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
-| `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                               |
-| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `20`                               |
-| `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`             |
-| `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `30s`                              |
-| `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s`                              |
-| `RESTART_SUPPRESSION` | Rejoin suppression window | `90s`                              |
-| `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2`                                |
-| `FETCH_TIMEOUT` | Per-record fetch timeout | `20s`                              |
-| `PENDING_TIMEOUT` | Max queue residency | `15 min`                           |
-| `QUORUM_RETRY_BACKOFF` | Retry delay before repeating a previously rejected/failed hint path | `60s`                              |
-| `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5`                                |
-| `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                               |
-| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                            |
-| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`        |
-| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                |
-| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s`                               |
-| `BAD_NODE_WINDOW` | Window for failure counting | `5 min`                            |
-| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3`                                |
+| `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                                |
+| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `20`                                |
+| `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`              |
+| `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
+| `QUORUM_RETRY_BACKOFF` | Retry delay before repeating a previously rejected/failed hint path | `60s`                               |
+| `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
+| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                             |
+| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`         |
+| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
+| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s`                                |
+| `BAD_NODE_WINDOW` | Window for failure counting | `5 min`                             |
+| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3`                                 |
 
 Parameter safety constraints (MUST hold):
 
@@ -140,8 +134,6 @@ Rules:
 Rate control:
 
 - Skip neighbor sync if `NEIGHBOR_SYNC_COOLDOWN` not elapsed.
-- Do not sync same target within `PER_TARGET_DEDUP`.
-- Suppress triggers from remove+quick-readd patterns within `RESTART_SUPPRESSION`.
 
 ## 7. Authorization and Admission Rules
 
@@ -231,8 +223,8 @@ QueuedForFetch
   -> Fetching
 Fetching
   -> Stored
-  -> FetchRetryable     (timeout/error and retry count < MAX_FETCH_RETRIES and alternate sources remain)
-  -> FetchAbandoned     (retry count >= MAX_FETCH_RETRIES or no alternate sources)
+  -> FetchRetryable     (timeout/error, transport marks retryable, and alternate sources remain)
+  -> FetchAbandoned     (transport marks terminal failure or no alternate sources)
 FetchRetryable
   -> QueuedForFetch     (select next alternate source from verified source set)
 FetchAbandoned
@@ -252,8 +244,8 @@ Transition requirements:
 - `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or hint sender.
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
-- `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), retry count has not reached `MAX_FETCH_RETRIES`, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
-- `Fetching -> FetchAbandoned` when fetch fails and either retry count `>= MAX_FETCH_RETRIES` or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
+- `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), the transport classifies the attempt as retryable, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
+- `Fetching -> FetchAbandoned` when fetch fails and either the transport classifies failure as terminal or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
 - `FetchRetryable -> QueuedForFetch` selects the next untried verified source and re-enters the fetch queue without repeating quorum verification.
 - `QuorumFailed -> QuorumAbandoned` is immediate and terminal for this offer lifecycle. Key is forgotten and stops consuming probe resources. Requires a new offer to re-enter the pipeline.
 - `QuorumInconclusive -> QuorumAbandoned` is immediate and terminal for this offer lifecycle. Requires a new offer to re-enter the pipeline.
@@ -333,12 +325,11 @@ Queue model:
 Rules:
 
 1. Drive quorum checks with an adaptive worker budget that scales with backlog and observed network latency while respecting local CPU/memory/network guardrails.
-2. Enforce `MAX_PARALLEL_FETCH` (or bootstrap override).
+2. During bootstrap, enforce `MAX_PARALLEL_FETCH_BOOTSTRAP` as fetch concurrency cap; outside bootstrap, fetch concurrency is controlled by the adaptive budget from rule 1.
 3. Sort fetch candidates by relevance (e.g., nearest-first) before dequeue.
-4. Evict stale queued entries after `PENDING_TIMEOUT`.
-5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
-6. `PENDING_TIMEOUT` applies to total time since verification success (`QuorumVerified` or `PaidListVerified`), including retry cycles. A key that exhausts `PENDING_TIMEOUT` across retries transitions to `FetchAbandoned`.
-7. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
+4. Evict stale queued entries using implementation-defined queue-lifecycle policy.
+5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry decisions are transport-owned. Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
+6. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
 
 Capacity-managed mode (finite store):
 
@@ -480,7 +471,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 9. Fetch timeout with alternate source retry:
    - First source times out, key transitions to `FetchRetryable`, re-enters `QueuedForFetch` with next verified source, and succeeds. Verification is not re-run. Failed source receives one `ReplicationFailure`; successful alternate source clears stale failure attribution (rule 14.4).
 10. Fetch retry exhaustion:
-   - All verified sources fail or `MAX_FETCH_RETRIES` reached. Key transitions to `FetchAbandoned`. Each failed source receives one `ReplicationFailure`.
+   - All verified sources fail or transport classifies failure as terminal. Key transitions to `FetchAbandoned`. Each failed source receives one `ReplicationFailure`.
 11. Repeated true source failures:
    - Peer evicted exactly at threshold behavior.
 12. Bootstrap quorum aggregation:
