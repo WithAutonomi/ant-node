@@ -115,8 +115,7 @@ Rules:
 5. Receiver MUST reject fresh path if PoP is missing or invalid.
 6. A node that validates PoP for key `K` MUST add `K` to `PaidForList(self)`.
 7. In parallel with record propagation, sender MUST send `PaidNotify(K)` to every member of `PaidCloseGroup(K)` and include the PoP for receiver verification.
-8. Sender MUST track per-peer `PaidNotify(K)` acknowledgment state for the current propagation pass and attempt each peer in `PaidCloseGroup(K)` once per pass (no immediate retry loop).
-9. Completion of paid-list propagation for a pass is defined per key as `acked_count == PaidGroupSize(K)`.
+8. Sender sends `PaidNotify(K)` with PoP to each peer in `PaidCloseGroup(K)` once (fire-and-forget, no ack tracking or retry).
 
 ### 6.2 Close-group Replication Repair
 
@@ -190,24 +189,18 @@ When handling an admitted unknown key `K` for close-group/global repair:
 
 When fresh replication accepts a new key `K` with valid PoP:
 
-1. Sender MUST construct `PaidNotify(K)` containing key `K` and proof material required for receiver-side verification.
-2. Sender MUST target every identity in `PaidCloseGroup(K)` and attempt each target once for that notification pass (no immediate retry loop).
-3. Receiver MUST validate proof material before adding `K` to local `PaidForList`.
-4. Receiver MUST return one of: `NotifyAckVerified`, `NotifyRejectInvalidProof`, or `RejectedUnauthorized`.
-5. Sender counts completion for a target only on `NotifyAckVerified`.
-6. `NotifyRejectInvalidProof` is terminal for that attempt and MUST raise operator-visible error telemetry.
-7. Any non-ack outcome is terminal for that pass and MUST be emitted as operator-visible telemetry.
+1. Sender constructs `PaidNotify(K)` containing key `K` and PoP.
+2. Sender sends `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget, no ack tracking or retry).
+3. Receiver MUST validate PoP before adding `K` to local `PaidForList`; invalid PoP is silently dropped.
 
 ### 7.4 Paid-List Convergence Maintenance (Ongoing)
 
-Nodes that already treat key `K` as paid-authorized MUST help keep `PaidCloseGroup(K)` fully populated with `K` in `PaidForList`:
+Nodes that already treat key `K` as paid-authorized MUST help keep `PaidCloseGroup(K)` populated with `K` in `PaidForList`:
 
 1. Trigger on close-group repair cadence, topology changes affecting `PaidCloseGroup(K)`, and any observation that a `PaidCloseGroup(K)` peer reports unknown for paid key `K`.
-2. Compute current `PaidCloseGroup(K)` membership and probe paid-list presence.
-3. For each member missing `K`, send `PaidNotify(K)` repair with proof material and record per-peer ack state.
-4. Convergence completion for a maintenance pass is `acked_count == PaidGroupSize(K)`.
-5. If incomplete, keep key `K` in the convergence set and evaluate again on the next close-group repair or topology trigger (no dedicated retry loop/backoff).
-6. On topology churn, recompute membership and continue convergence on the new `PaidCloseGroup(K)` set.
+2. Compute current `PaidCloseGroup(K)` membership.
+3. For each member missing `K`, send `PaidNotify(K)` with PoP (fire-and-forget).
+4. On topology churn, recompute membership and continue on the new `PaidCloseGroup(K)` set.
 
 ### 7.5 Presence Probe Handling (Per Key)
 
@@ -336,7 +329,6 @@ Queue model:
 - `PendingVerify`: keys awaiting quorum result.
 - `FetchQueue`: presence-quorum-passed or paid-list-authorized keys waiting for fetch slot.
 - `InFlightFetch`: active downloads.
-- `PendingPaidNotify`: per-key map of `PaidCloseGroup(K)` notification ack state for fresh-replication propagation and ongoing paid-list convergence repair.
 
 Rules:
 
@@ -346,8 +338,7 @@ Rules:
 4. Evict stale queued entries after `PENDING_TIMEOUT`.
 5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
 6. `PENDING_TIMEOUT` applies to total time since verification success (`QuorumVerified` or `PaidListVerified`), including retry cycles. A key that exhausts `PENDING_TIMEOUT` across retries transitions to `FetchAbandoned`.
-7. `PendingPaidNotify` tracks a single pass outcome per key; pass completion is `acked_count == PaidGroupSize(K)`. Missing peers are evaluated again only on the next close-group repair or topology trigger.
-8. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
+7. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
 
 Capacity-managed mode (finite store):
 
@@ -516,25 +507,23 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Unknown key is rejected when paid confirmations are below threshold and presence quorum also fails.
 23. Paid-list cleanup after churn:
    - Node drops paid-list entries for keys where it is no longer in `PaidCloseGroup(K)`.
-24. Fresh-replication paid-list full propagation:
-   - Freshly accepted key sends `PaidNotify` to all peers in current `PaidCloseGroup(K)`; pass is propagation-complete only when all `PaidGroupSize(K)` peers acknowledge verified proof.
-25. Fresh-replication paid-list non-ack handling:
-   - Any non-ack outcome in a pass is terminal for that pass and raises operator-visible telemetry; no immediate retry loop is performed.
-26. Paid-list convergence repair:
-   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes detect missing peers and attempt repair on each close-group repair/topology convergence pass; per-pass completion uses `acked_count == PaidGroupSize(K)`.
-27. Dynamic paid-list threshold in undersized consensus set:
+24. Fresh-replication paid-list propagation:
+   - Freshly accepted key sends `PaidNotify` with PoP to all peers in current `PaidCloseGroup(K)` (fire-and-forget).
+25. Paid-list convergence repair:
+   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes detect missing peers and send `PaidNotify(K)` with PoP on each close-group repair/topology convergence pass (fire-and-forget).
+26. Dynamic paid-list threshold in undersized consensus set:
    - With `PaidGroupSize(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
-28. Single-round dual-evidence verification:
+27. Single-round dual-evidence verification:
    - For unknown key verification, implementation sends one request round to `VerifyTargets`; no second sequential quorum-probe round is issued after paid-list miss.
-29. Dynamic quorum threshold in undersized verification set:
+28. Dynamic quorum threshold in undersized verification set:
    - With `|QuorumTargets|=3`, unknown-key presence quorum requires `QuorumNeeded(K)=2` confirmations (not 4).
-30. Audit start gate:
+29. Audit start gate:
    - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE`.
-31. Audit peer selection from sampled keys:
+30. Audit peer selection from sampled keys:
    - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
-32. Audit periodic cadence with jitter:
+31. Audit periodic cadence with jitter:
    - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window (`5-10 min` in reference profile).
-33. Dynamic challenge size:
+32. Dynamic challenge size:
    - Challenged key count equals `|PeerKeySet(challenged_peer_id)|` and is dynamic per round; if no eligible peer remains after `LocalRT` filtering, the tick is idle and no audit is sent.
 
 ## 19. Acceptance Criteria for This Design
