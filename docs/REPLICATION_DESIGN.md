@@ -46,27 +46,25 @@ All parameters are configurable. Values below are a reference profile used for l
 
 | Parameter | Meaning | Reference |
 |---|---|---|
-| `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7` |
+| `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
-| `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20` |
-| `CLOSE_GROUP_REPAIR_INTERVAL` | Close-group repair cadence | random in `[90s, 180s]` |
-| `GLOBAL_REPAIR_INTERVAL` | Global repair cadence | `15 min` |
-| `GLOBAL_REPL_COOLDOWN` | Min spacing between close-group repair runs | `30s` |
-| `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s` |
-| `RESTART_SUPPRESSION` | Rejoin suppression window | `90s` |
-| `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2` |
-| `FETCH_TIMEOUT` | Per-record fetch timeout | `20s` |
-| `PENDING_TIMEOUT` | Max queue residency | `15 min` |
-| `QUORUM_RETRY_BACKOFF` | Retry delay for non-quorum sender retry paths (e.g., `AuthHint`) | `60s` |
-| `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5` |
-| `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20` |
-| `NETWORK_CYCLE_DEADLINE` | Max time to re-check all records | `4 days` |
-| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min` |
-| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]` |
-| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8` |
-| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s` |
-| `BAD_NODE_WINDOW` | Window for failure counting | `5 min` |
-| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3` |
+| `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                               |
+| `CLOSE_GROUP_REPAIR_INTERVAL` | Close-group repair cadence | random in `[10m, 20m]`             |
+| `CLOSE_GROUP_REPAIR_COOLDOWN` | Min spacing between close-group repair runs | `30s`                              |
+| `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s`                              |
+| `RESTART_SUPPRESSION` | Rejoin suppression window | `90s`                              |
+| `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2`                                |
+| `FETCH_TIMEOUT` | Per-record fetch timeout | `20s`                              |
+| `PENDING_TIMEOUT` | Max queue residency | `15 min`                           |
+| `QUORUM_RETRY_BACKOFF` | Retry delay for non-quorum sender retry paths (e.g., `AuthHint`) | `60s`                              |
+| `MAX_PARALLEL_FETCH` | Normal concurrent fetches | `5`                                |
+| `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                               |
+| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                            |
+| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`        |
+| `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                |
+| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s`                               |
+| `BAD_NODE_WINDOW` | Window for failure counting | `5 min`                            |
+| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3`                                |
 
 Parameter safety constraints (MUST hold):
 
@@ -77,7 +75,7 @@ Parameter safety constraints (MUST hold):
 ## 5. Core Invariants (Must Hold)
 
 1. A record is accepted only if it passes integrity and responsibility checks.
-2. Close-group and global repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
+2. Close-group repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
 3. Fresh replication bypasses presence quorum only when PoP is valid.
 4. Unauthorized offer keys are dropped per key (not per message).
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
@@ -85,19 +83,18 @@ Parameter safety constraints (MUST hold):
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
 9. Bad-node decisions are local-only (no gossip reputation).
-10. Global replication prioritizes low-observed-replica records first.
-11. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
-12. Every close-group repair offer exchange reaches a deterministic terminal state.
-13. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
-14. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
-15. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
-16. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
-17. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
-18. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
-19. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
-20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
-21. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
-22. Verification-request batching is mandatory for unknown-key close-group/global verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
+10. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
+11. Every close-group repair offer exchange reaches a deterministic terminal state.
+12. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
+13. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
+14. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
+15. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
+16. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
+17. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
+18. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
+19. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
+20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
+21. Verification-request batching is mandatory for unknown-key close-group verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 
 ## 6. Replication Modes
 
@@ -137,22 +134,9 @@ Rules:
 
 Rate control:
 
-- Skip close-group repair if `GLOBAL_REPL_COOLDOWN` not elapsed.
+- Skip close-group repair if `CLOSE_GROUP_REPAIR_COOLDOWN` not elapsed.
 - Do not send to same target within `PER_TARGET_DEDUP`.
 - Suppress triggers from remove+quick-readd patterns within `RESTART_SUPPRESSION`.
-
-### 6.3 Global Replication Repair
-
-Trigger: periodic timer (`GLOBAL_REPAIR_INTERVAL`).
-
-Rules:
-
-1. Select batch size paced to complete full local-key coverage within `NETWORK_CYCLE_DEADLINE`.
-2. Prioritize keys by last observed replica count (ascending).
-3. For each key, query close-group members for presence.
-4. Offer repair to members that report missing.
-5. Mark severe shortfall when observed holders `< QUORUM_THRESHOLD`.
-6. Severe shortfall raises priority only; it does not bypass admission, presence quorum, or paid-list safeguards.
 
 ## 7. Authorization and Admission Rules
 
@@ -173,7 +157,7 @@ Notes:
 
 ### 7.2 Paid-List Authorization (Per Key)
 
-When handling an admitted unknown key `K` for close-group/global repair:
+When handling an admitted unknown key `K` for close-group repair:
 
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
@@ -296,7 +280,7 @@ Verification request batching requirement:
 
 Security-liveness policy:
 
-- Close-group/global repair never stores without either presence quorum or paid-list authorization.
+- Close-group repair never stores without either presence quorum or paid-list authorization.
 - Fresh replication can store with valid PoP alone.
 - Therefore, below-quorum data is recoverable only if paid-list authorization can still be established.
 
@@ -308,7 +292,7 @@ A fetched record is written only if all checks pass:
 2. Content-address integrity (`hash(content) == key`).
 3. Authorization validity:
    - Fresh replication: valid PoP, or
-   - Close-group/global repair: prior quorum-verified key or paid-list-authorized key.
+   - Close-group repair: prior quorum-verified key or paid-list-authorized key.
 4. Responsibility check: `IsResponsible(self, K)` at write time.
 
 ## 11. Responsibility Check
@@ -446,8 +430,8 @@ Use this list to find design flaws before coding:
    - Could real topology loss be suppressed too long?
 5. Offer-set integrity:
    - How are duplicate keys, partial deliveries, and retries handled deterministically?
-6. Severe shortfall behavior:
-   - Is priority escalation enough, or are additional safeguards needed when holders fall below quorum?
+6. Close-group repair coverage:
+   - Under sustained backlog/churn, does close-group repair still revisit all local keys within an acceptable bound?
 7. Admission asymmetry:
    - Can two honest nodes disagree on `top K` enough to block propagation?
 8. Capacity fairness:
@@ -491,8 +475,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Node accepts only keys meeting multi-peer threshold.
 13. Responsible range shrink:
    - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
-14. Severe under-replication:
-   - Key is prioritized immediately in next global repair selection.
+14. Close-group repair coverage under backlog:
+   - Under load, each local key is eventually re-offered within expected close-group repair timing bounds.
 15. Partition and heal:
    - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
 16. Quorum responder timeout handling:
