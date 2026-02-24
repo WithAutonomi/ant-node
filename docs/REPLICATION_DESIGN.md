@@ -32,7 +32,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
 - `Holder`: node that stores a valid copy of a record.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
-- `PaidNotify(K)`: Tier 1 paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
+- `PaidNotify(K)`: fresh-replication paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
 - `PaidForList(N)`: in-memory set of keys node `N` currently believes are paid-authorized.
 - `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` that participate in paid-list consensus.
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
@@ -48,9 +48,9 @@ All parameters are configurable. Values below are a reference profile used for l
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7` |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20` |
-| `TIER2_INTERVAL` | Neighbor sync cadence | random in `[90s, 180s]` |
-| `TIER3_INTERVAL` | Global verification cadence | `15 min` |
-| `GLOBAL_REPL_COOLDOWN` | Min spacing between Tier 2 runs | `30s` |
+| `CLOSE_GROUP_REPAIR_INTERVAL` | Close-group repair cadence | random in `[90s, 180s]` |
+| `GLOBAL_REPAIR_INTERVAL` | Global repair cadence | `15 min` |
+| `GLOBAL_REPL_COOLDOWN` | Min spacing between close-group repair runs | `30s` |
 | `PER_TARGET_DEDUP` | Min spacing for same sender->target replication | `45s` |
 | `RESTART_SUPPRESSION` | Rejoin suppression window | `90s` |
 | `MAX_FETCH_RETRIES` | Max alternate-source fetch attempts per quorum pass | `2` |
@@ -78,8 +78,8 @@ Parameter safety constraints (MUST hold):
 ## 5. Core Invariants (Must Hold)
 
 1. A record is accepted only if it passes integrity and responsibility checks.
-2. Tier 2 and Tier 3 repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
-3. Tier 1 bypasses presence quorum only when PoP is valid.
+2. Close-group and global repair traffic requires either receiver-side presence quorum success or paid-list authorization success before fetch.
+3. Fresh replication bypasses presence quorum only when PoP is valid.
 4. Unauthorized offer keys are dropped per key (not per message).
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
 6. `CLOSE_GROUP_SIZE` is both the close-group width and the target holder count, not guaranteed send fanout.
@@ -88,20 +88,20 @@ Parameter safety constraints (MUST hold):
 9. Bad-node decisions are local-only (no gossip reputation).
 10. Global replication prioritizes low-observed-replica records first.
 11. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
-12. Every Tier 2 offer exchange reaches a deterministic terminal state.
+12. Every close-group repair offer exchange reaches a deterministic terminal state.
 13. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
 14. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
 15. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
 16. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
-17. Tier 1 paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
+17. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 18. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
 19. Paid-list convergence is maintained continuously: nodes that know key `K` is paid MUST help repair missing `PaidForList` entries across all peers in `PaidCloseGroup(K)` until full coverage is restored or the key leaves maintenance scope.
 20. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`, and only after at least one responsible-range computation has completed.
 21. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 
-## 6. Replication Tiers
+## 6. Replication Modes
 
-### Tier 1: Fresh Propagation (Immediate)
+### 6.1 Fresh Replication
 
 Trigger: node accepts a newly written record with valid PoP.
 
@@ -118,11 +118,11 @@ Rules:
 9. Sender MUST track per-peer `PaidNotify(K)` acknowledgment state for the current propagation pass and attempt each peer in `PaidCloseGroup(K)` once per pass (no immediate retry loop).
 10. Completion of paid-list propagation for a pass is defined per key as `acked_count == PaidGroupSize(K)`.
 
-### Tier 2: Neighbor Anti-Entropy (Periodic + Topology Events)
+### 6.2 Close-group Replication Repair
 
 Triggers:
 
-- Periodic randomized timer.
+- Periodic randomized timer (`CLOSE_GROUP_REPAIR_INTERVAL`).
 - Topology changes that are not suppressed as restart noise.
 
 Rules:
@@ -136,17 +136,17 @@ Rules:
 7. Receiver runs per-key admission rules before quorum logic.
 8. Receiver launches quorum checks exactly once per admitted unknown key in the offer set.
 9. Keys passing presence quorum or paid-list authorization are queued for fetch.
-10. During Tier 2 runs, nodes SHOULD also execute paid-list convergence maintenance for locally known paid keys by repairing missing `PaidForList` entries in `PaidCloseGroup(K)`.
+10. During close-group repair runs, nodes SHOULD also execute paid-list convergence maintenance for locally known paid keys by repairing missing `PaidForList` entries in `PaidCloseGroup(K)`.
 
 Rate control:
 
-- Skip Tier 2 if `GLOBAL_REPL_COOLDOWN` not elapsed.
+- Skip close-group repair if `GLOBAL_REPL_COOLDOWN` not elapsed.
 - Do not send to same target within `PER_TARGET_DEDUP`.
 - Suppress triggers from remove+quick-readd patterns within `RESTART_SUPPRESSION`.
 
-### Tier 3: Global Verification and Repair (Proactive)
+### 6.3 Global Replication Repair
 
-Trigger: periodic timer (`TIER3_INTERVAL`).
+Trigger: periodic timer (`GLOBAL_REPAIR_INTERVAL`).
 
 Rules:
 
@@ -176,7 +176,7 @@ Notes:
 
 ### 7.2 Paid-List Authorization (Per Key)
 
-When handling an admitted unknown key `K` for Tier 2/3 repair:
+When handling an admitted unknown key `K` for close-group/global repair:
 
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
@@ -186,9 +186,9 @@ When handling an admitted unknown key `K` for Tier 2/3 repair:
 6. If a node learns `K` is paid-authorized by majority, it MUST notify queried peers that answered unknown so they can re-check and converge.
 7. If paid-list checks show missing `PaidForList` entries among `PaidCloseGroup(K)`, node MUST enqueue `PaidNotify(K)` repair for missing peers in the next maintenance pass.
 
-### 7.3 Tier 1 Paid-List Notification (Per Key)
+### 7.3 Fresh-Replication Paid-List Notification (Per Key)
 
-When Tier 1 accepts a fresh key `K` with valid PoP:
+When fresh replication accepts a new key `K` with valid PoP:
 
 1. Sender MUST construct `PaidNotify(K)` containing key `K` and proof material required for receiver-side verification.
 2. Sender MUST target every identity in `PaidCloseGroup(K)` and attempt each target once for that notification pass (no immediate retry loop).
@@ -202,11 +202,11 @@ When Tier 1 accepts a fresh key `K` with valid PoP:
 
 Nodes that already treat key `K` as paid-authorized MUST help keep `PaidCloseGroup(K)` fully populated with `K` in `PaidForList`:
 
-1. Trigger on Tier 2 cadence, topology changes affecting `PaidCloseGroup(K)`, and any observation that a `PaidCloseGroup(K)` peer reports unknown for paid key `K`.
+1. Trigger on close-group repair cadence, topology changes affecting `PaidCloseGroup(K)`, and any observation that a `PaidCloseGroup(K)` peer reports unknown for paid key `K`.
 2. Compute current `PaidCloseGroup(K)` membership and probe paid-list presence.
 3. For each member missing `K`, send `PaidNotify(K)` repair with proof material and record per-peer ack state.
 4. Convergence completion for a maintenance pass is `acked_count == PaidGroupSize(K)`.
-5. If incomplete, keep key `K` in the convergence set and evaluate again on the next Tier 2 or topology trigger (no dedicated retry loop/backoff).
+5. If incomplete, keep key `K` in the convergence set and evaluate again on the next close-group repair or topology trigger (no dedicated retry loop/backoff).
 6. On topology churn, recompute membership and continue convergence on the new `PaidCloseGroup(K)` set.
 
 ### 7.5 Presence Probe Handling (Per Key)
@@ -299,8 +299,8 @@ Single-round requirement:
 
 Security-liveness policy:
 
-- Tier 2/3 never store without either presence quorum or paid-list authorization.
-- Tier 1 can store with valid PoP alone.
+- Close-group/global repair never stores without either presence quorum or paid-list authorization.
+- Fresh replication can store with valid PoP alone.
 - Therefore, below-quorum data is recoverable only if paid-list authorization can still be established.
 
 ## 10. Record Storage Validation
@@ -310,8 +310,8 @@ A fetched record is written only if all checks pass:
 1. Type/schema validity.
 2. Content-address integrity (`hash(content) == key`).
 3. Authorization validity:
-   - Tier 1: valid PoP, or
-   - Tier 2/3: prior quorum-verified key or paid-list-authorized key.
+   - Fresh replication: valid PoP, or
+   - Close-group/global repair: prior quorum-verified key or paid-list-authorized key.
 4. Responsible-range inclusion at write time.
 
 ## 11. Responsible Range Logic
@@ -339,7 +339,7 @@ Queue model:
 - `PendingVerify`: keys awaiting quorum result.
 - `FetchQueue`: presence-quorum-passed or paid-list-authorized keys waiting for fetch slot.
 - `InFlightFetch`: active downloads.
-- `PendingPaidNotify`: per-key map of `PaidCloseGroup(K)` notification ack state for Tier 1 propagation and ongoing paid-list convergence repair.
+- `PendingPaidNotify`: per-key map of `PaidCloseGroup(K)` notification ack state for fresh-replication propagation and ongoing paid-list convergence repair.
 
 Rules:
 
@@ -349,7 +349,7 @@ Rules:
 4. Evict stale queued entries after `PENDING_TIMEOUT`.
 5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
 6. `PENDING_TIMEOUT` applies to total time since verification success (`QuorumVerified` or `PaidListVerified`), including retry cycles. A key that exhausts `PENDING_TIMEOUT` across retries transitions to `FetchAbandoned`.
-7. `PendingPaidNotify` tracks a single pass outcome per key; pass completion is `acked_count == PaidGroupSize(K)`. Missing peers are evaluated again only on the next Tier 2 or topology trigger.
+7. `PendingPaidNotify` tracks a single pass outcome per key; pass completion is `acked_count == PaidGroupSize(K)`. Missing peers are evaluated again only on the next close-group repair or topology trigger.
 8. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
 
 Capacity-managed mode (finite store):
@@ -363,7 +363,7 @@ Capacity-managed mode (finite store):
 
 Maintain tracker for closest peers and classify topology events:
 
-- `Trigger`: genuine change, run Tier 2.
+- `Trigger`: genuine change, run close-group repair.
 - `Skip`: probable restart churn, suppress.
 - `Ignore`: far peers, no action.
 
@@ -478,9 +478,9 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Valid PoP propagates to target holders without quorum check.
 2. Fresh write invalid PoP:
    - Receiver rejects and does not enqueue fetch.
-3. Tier 2 unknown key quorum pass:
+3. Close-group repair unknown key quorum pass:
    - Key transitions to stored through full state machine.
-4. Tier 2 unknown key quorum fail:
+4. Close-group repair unknown key quorum fail:
    - Key transitions to `QuorumAbandoned` (then `Idle`) and is not fetched.
 5. Unauthorized offer sender:
    - Unauthorized keys dropped, authorized keys in same offer still processed.
@@ -501,7 +501,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 13. Responsible range shrink:
    - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
 14. Severe under-replication:
-   - Key is prioritized immediately in next Tier 3 selection.
+   - Key is prioritized immediately in next global repair selection.
 15. Partition and heal:
    - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
 16. Quorum responder timeout handling:
@@ -520,12 +520,12 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Unknown key is rejected when paid confirmations are below threshold and presence quorum also fails.
 23. Paid-list cleanup after churn:
    - Node drops paid-list entries for keys where it is no longer in `PaidCloseGroup(K)`.
-24. Tier 1 paid-list full propagation:
+24. Fresh-replication paid-list full propagation:
    - Freshly accepted key sends `PaidNotify` to all peers in current `PaidCloseGroup(K)`; pass is propagation-complete only when all `PaidGroupSize(K)` peers acknowledge verified proof.
-25. Tier 1 paid-list non-ack handling:
+25. Fresh-replication paid-list non-ack handling:
    - Any non-ack outcome in a pass is terminal for that pass and raises operator-visible telemetry; no immediate retry loop is performed.
 26. Paid-list convergence repair:
-   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes detect missing peers and attempt repair on each Tier 2/topology convergence pass; per-pass completion uses `acked_count == PaidGroupSize(K)`.
+   - For a known paid key with incomplete `PaidCloseGroup(K)` coverage, nodes detect missing peers and attempt repair on each close-group repair/topology convergence pass; per-pass completion uses `acked_count == PaidGroupSize(K)`.
 27. Dynamic paid-list threshold in undersized consensus set:
    - With `PaidGroupSize(K)=8`, paid-list authorization requires `ConfirmNeeded(K)=5` confirmations (not 11).
 28. Single-round dual-evidence verification:
