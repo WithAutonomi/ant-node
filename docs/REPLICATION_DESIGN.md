@@ -52,12 +52,12 @@ All parameters are configurable. Values below are a reference profile used for l
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                                |
 | `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `4`                                 |
-| `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`              |
+| `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10 min, 20 min]`        |
 | `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
-| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`         |
+| `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[30 min, 1 hour]`        |
 | `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
-| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s`                                |
+| `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
 | `BAD_NODE_WINDOW` | Window for failure counting | `5 min`                             |
 | `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3`                                 |
 
@@ -400,7 +400,7 @@ Audit trigger and target selection:
 
 1. Node MUST NOT schedule storage-proof audits until `BootstrapDrained(self)` is true.
 2. On the transition where `BootstrapDrained(self)` becomes true, node MUST execute one audit tick immediately.
-3. After the immediate start tick, audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
+3. After the immediate start tick, audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL`.
 4. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
 5. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
 6. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
@@ -517,7 +517,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 30. Audit peer selection from sampled keys:
    - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
 31. Audit periodic cadence with jitter:
-   - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window (`5-10 min` in reference profile).
+   - Consecutive audit ticks occur on randomized intervals bounded by configured `AUDIT_TICK_INTERVAL` window.
 32. Dynamic challenge size:
    - Challenged key count equals `|PeerKeySet(challenged_peer_id)|` and is dynamic per round; if no eligible peer remains after `LocalRT` filtering, the tick is idle and no audit is sent.
 33. Batched unknown-key verification:
