@@ -28,10 +28,10 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `Node`: participant with routing view, local store, and replication worker.
 - `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set (does not include `N` itself).
 - `SelfInclusiveRT(N)`: derived local view `LocalRT(N) ∪ {N}` used for responsibility-range and local membership evaluations that must treat `N` as a candidate.
-- `NeighborSyncOrder(N)`: deterministic cyclic ordering of authenticated peers in `LocalRT(N)` used for neighbor-sync scheduling.
-- `NeighborSyncCursor(N)`: persistent index into `NeighborSyncOrder(N)` indicating the next peer position to schedule.
-- `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)` (wrap-around allowed); periodic repair sync partners for `N`.
-- `NeighborSyncCycleComplete(N)`: event that fires when node `N` finishes one full traversal of `NeighborSyncOrder(N)` (every currently ordered peer scheduled once) and wraps to the cycle start.
+- `NeighborSyncOrder(N)`: deterministic cyclic ordering of peers, snapshotted from `LocalRT(N)` at the start of each round-robin cycle. The snapshot is stable for the entire cycle duration; mid-cycle changes to `LocalRT(N)` do not alter the current cycle's ordering.
+- `NeighborSyncCursor(N)`: index into the current `NeighborSyncOrder(N)` snapshot indicating the next peer position to schedule. Valid for the lifetime of the snapshot.
+- `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)`; periodic repair sync partners for `N`.
+- `NeighborSyncCycleComplete(N)`: event that fires when node `N` finishes one full traversal of the current `NeighborSyncOrder(N)` snapshot (every snapshotted peer scheduled once). Triggers post-cycle pruning (Section 11) and a fresh snapshot from current `LocalRT(N)` for the next cycle.
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
@@ -121,8 +121,8 @@ Triggers:
 
 Rules:
 
-1. Node computes/maintains `NeighborSyncOrder(self)` as a deterministic ordering of authenticated peers in `LocalRT(self)`.
-2. Node computes `NeighborSyncSet(self)` as the next up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers from `NeighborSyncOrder(self)` starting at `NeighborSyncCursor(self)` (wrap-around allowed).
+1. At the start of each round-robin cycle, node snapshots `NeighborSyncOrder(self)` as a deterministic ordering of authenticated peers from `LocalRT(self)` and resets `NeighborSyncCursor(self)` to `0`. The snapshot is fixed for the entire cycle; peers joining `LocalRT(self)` mid-cycle are not added to the current snapshot (they enter the next cycle's snapshot). Peers departing `LocalRT(self)` mid-cycle remain in the snapshot and are still sync targets.
+2. Node computes `NeighborSyncSet(self)` as the next up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers from `NeighborSyncOrder(self)` starting at `NeighborSyncCursor(self)`.
 3. Node initiates a bidirectional sync session with each peer in `NeighborSyncSet(self)` (or responds if peer initiated first).
 4. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
 5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
@@ -138,8 +138,8 @@ Rules:
 13. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
 14. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
 15. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
-16. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|` modulo `|NeighborSyncOrder(self)|`.
-17. When cursor advance in rule 16 completes a full round-robin traversal (`NeighborSyncCycleComplete(self)`), node MUST execute post-cycle responsibility pruning (Section 11).
+16. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|`.
+17. When `NeighborSyncCursor(self) >= |NeighborSyncOrder(self)|`, the cycle is complete (`NeighborSyncCycleComplete(self)`). Node MUST execute post-cycle responsibility pruning (Section 11), then take a fresh snapshot from current `LocalRT(self)` and reset the cursor to `0` to begin the next cycle.
 
 Rate control:
 
@@ -430,7 +430,7 @@ Audit trigger and target selection:
 
 A joining node performs active sync:
 
-1. Discover authenticated peers from `LocalRT(self)` and compute deterministic `NeighborSyncOrder(self)`.
+1. Discover authenticated peers from `LocalRT(self)` and snapshot deterministic `NeighborSyncOrder(self)` for the bootstrap cycle.
 2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
 3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
@@ -452,8 +452,8 @@ Use this list to find design flaws before coding:
    - Can strict admission + strict quorum prevent legitimate repair in sparse/partitioned states?
 2. Bootstrap incompleteness:
    - If enough neighbor-sync peers are unavailable, is there a deterministic retry strategy?
-3. Range oscillation:
-   - Can rapid responsible-range shifts cause thrash (store/prune/store loops)?
+3. Range oscillation (mitigated):
+   - Pruning runs only at cycle boundaries (`NeighborSyncCycleComplete`), not on every RT change. The snapshot-based cycle provides natural dampening against store/prune/store thrash from rapid responsible-range shifts. Residual risk: a cycle that completes during a transient partition may still prune prematurely.
 4. Restart suppression false negatives:
    - Could real topology loss be suppressed too long?
 5. Hint-set integrity:
@@ -546,18 +546,24 @@ Each scenario should assert exact expected outcomes and state transitions.
 34. Batched partial response semantics:
    - If a batched response omits key `K` or a peer times out, evidence for that peer/key pair is unresolved for `K` and does not count as an explicit negative vote.
 35. Neighbor-sync round-robin batch selection:
-   - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` peers and cycle through the full ordered peer set before repeating.
+   - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` peers from the cycle snapshot and cycle through the full snapshotted peer set before repeating.
 36. Post-cycle responsibility pruning:
    - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` are removed, and `PaidForList` entries where `self ∉ PaidCloseGroup(K)` are removed.
 37. Non-`LocalRT` inbound sync behavior:
    - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
-38. Quorum-derived paid-list authorization:
+38. Neighbor-sync snapshot stability under peer join:
+   - Peer `P` joins `LocalRT(self)` mid-cycle. `P` does not appear in the current `NeighborSyncOrder(self)` snapshot. After cycle completes and a new snapshot is taken, `P` is included in the next cycle's ordering.
+39. Neighbor-sync snapshot stability under peer departure:
+   - Peer `P` departs `LocalRT(self)` mid-cycle but remains in the current `NeighborSyncOrder(self)` snapshot. Node still attempts sync with `P` when cursor reaches them (sync may fail). `P` is not included in the next cycle's snapshot.
+40. Neighbor-sync cycle completion is guaranteed:
+   - Under arbitrary churn (peers joining and leaving mid-cycle), the cycle always terminates because the snapshot is fixed and cursor advances monotonically. Cycle completes when `NeighborSyncCursor >= |NeighborSyncOrder|`.
+41. Quorum-derived paid-list authorization:
    - Unknown key `K` passes presence quorum (`>= QuorumNeeded(K)` positives from `CloseGroup(K)`). Key is stored AND added to local `PaidForList(self)`. Node subsequently answers paid-list queries for `K` as "paid."
-39. Paid-list persistence across restart:
+42. Paid-list persistence across restart:
    - Node stores key `K` in `PaidForList`, restarts. After restart, `PaidForList` is loaded from stable storage and node correctly answers paid-list queries for `K` without re-verification.
-40. Paid-list cold-start recovery via replica majority:
+43. Paid-list cold-start recovery via replica majority:
    - Multiple nodes restart simultaneously and lose `PaidForList` (persistence corrupted). Key `K` has `>= QuorumNeeded(K)` replicas in the close group. During neighbor-sync verification, presence quorum passes and all verifying nodes re-derive `K` into their `PaidForList` via close-group replica majority.
-41. Paid-list unrecoverable below quorum:
+44. Paid-list unrecoverable below quorum:
    - Key `K` has only 1 replica (below quorum) and `PaidForList` is lost across all `PaidCloseGroup(K)` members. Key cannot be recovered via either presence quorum or paid-list majority — accepted as explicit security-over-liveness tradeoff.
 
 ## 19. Acceptance Criteria for This Design
