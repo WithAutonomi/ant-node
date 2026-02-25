@@ -37,6 +37,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
 - `IsResponsible(N, K)`: true if `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `SelfInclusiveRT(N)`.
 - `Holder`: node that stores a valid copy of a record.
+- `OutOfRangeCount(N, K)`: per-key counter tracking how many consecutive `NeighborSyncCycleComplete(N)` cycles key `K` has been evaluated as out of range on node `N`. Reset to `0` when `K` is in range.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
 - `PaidNotify(K)`: fresh-replication paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
 - `PaidForList(N)`: persistent set of keys node `N` currently believes are paid-authorized; MUST survive node restarts.
@@ -66,6 +67,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
 | `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status before penalties apply | `24h`                               |
+| `PRUNE_HYSTERESIS_CYCLES` | Consecutive out-of-range cycles required before pruning a key | `3`                                 |
 
 Parameter safety constraints (MUST hold):
 
@@ -96,7 +98,7 @@ Parameter safety constraints (MUST hold):
 19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
-22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: drop stored keys where `IsResponsible(self, K)` is false and drop paid-list keys where `self ∉ PaidCloseGroup(K)`.
+22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: increment `OutOfRangeCount` for keys where `IsResponsible(self, K)` is false or `self ∉ PaidCloseGroup(K)`, and delete only when the counter reaches `PRUNE_HYSTERESIS_CYCLES`. Reset counters for keys that are in range.
 23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `EigenTrust`.
 
 ## 6. Replication Modes
@@ -332,8 +334,12 @@ This check is evaluated per-key at decision points:
 
 Post-cycle responsibility pruning (triggered by `NeighborSyncCycleComplete(self)`):
 
-1. Recompute `IsResponsible(self, K)` for each locally stored key `K` using current `SelfInclusiveRT(self)`; delete records where false.
-2. Recompute `PaidCloseGroup(K)` membership for each key `K` in `PaidForList(self)` using current `SelfInclusiveRT(self)`; delete entries where `self ∉ PaidCloseGroup(K)`.
+1. For each locally stored key `K`, recompute `IsResponsible(self, K)` using current `SelfInclusiveRT(self)`:
+   a. If in range: reset `OutOfRangeCount(self, K)` to `0`.
+   b. If out of range: increment `OutOfRangeCount(self, K)`. Delete the record only when `OutOfRangeCount(self, K) >= PRUNE_HYSTERESIS_CYCLES`.
+2. For each key `K` in `PaidForList(self)`, recompute `PaidCloseGroup(K)` membership using current `SelfInclusiveRT(self)`:
+   a. If `self ∈ PaidCloseGroup(K)`: reset the key's out-of-range counter to `0`.
+   b. If `self ∉ PaidCloseGroup(K)`: increment the key's out-of-range counter. Delete the entry only when the counter reaches `PRUNE_HYSTERESIS_CYCLES`.
 3. This prune pass is local-state-only and MUST NOT require remote confirmations.
 
 Effect:
@@ -363,8 +369,8 @@ Capacity-managed mode (finite store):
 
 1. If full and new in-range key arrives, evict farthest out-of-range key if available.
 2. If no out-of-range key exists, reject new key.
-3. On each `NeighborSyncCycleComplete(self)`, prune keys that moved out of responsibility.
-4. `PaidForList` MUST be persisted to stable storage and SHOULD be bounded with paging/eviction policies; on each `NeighborSyncCycleComplete(self)`, keys outside `PaidCloseGroup(K)` are first candidates for removal.
+3. On each `NeighborSyncCycleComplete(self)`, prune keys that have reached `PRUNE_HYSTERESIS_CYCLES` consecutive out-of-range evaluations per Section 11.
+4. `PaidForList` MUST be persisted to stable storage and SHOULD be bounded with paging/eviction policies; on each `NeighborSyncCycleComplete(self)`, keys outside `PaidCloseGroup(K)` that have reached `PRUNE_HYSTERESIS_CYCLES` are first candidates for removal.
 
 ## 13. Churn and Topology Change Handling
 
@@ -469,7 +475,7 @@ Use this list to find design flaws before coding:
 2. Bootstrap incompleteness:
    - If enough neighbor-sync peers are unavailable, is there a deterministic retry strategy?
 3. Range oscillation (mitigated):
-   - Pruning runs only at cycle boundaries (`NeighborSyncCycleComplete`), not on every RT change. The snapshot-based cycle provides natural dampening against store/prune/store thrash from rapid responsible-range shifts. Residual risk: a cycle that completes during a transient partition may still prune prematurely.
+   - Pruning requires `PRUNE_HYSTERESIS_CYCLES` consecutive out-of-range evaluations before deletion. Combined with cycle-boundary-only evaluation, this prevents premature pruning during transient partitions: a key must be consistently out of range across multiple full cycles before it is deleted. A single partition-and-heal event resets the counter.
 4. Restart suppression false negatives:
    - Could real topology loss be suppressed too long?
 5. Hint-set integrity:
@@ -518,7 +524,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 12. Bootstrap quorum aggregation:
    - Node accepts only keys meeting multi-peer threshold.
 13. Responsible range shrink:
-   - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
+   - Out-of-range records begin accumulating `OutOfRangeCount`; they are pruned only after `PRUNE_HYSTERESIS_CYCLES` consecutive out-of-range evaluations. New in-range keys still accepted per capacity policy.
 14. Neighbor-sync coverage under backlog:
    - Under load, each local key is eventually re-hinted within expected neighbor-sync timing bounds as round-robin peer batches rotate through `LocalRT(self)`.
 15. Partition and heal:
@@ -563,8 +569,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - If a batched response omits key `K` or a peer times out, evidence for that peer/key pair is unresolved for `K` and does not count as an explicit negative vote.
 35. Neighbor-sync round-robin batch selection with cooldown skip:
    - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds scan forward from cursor, skip and remove cooldown peers, and sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` non-cooldown peers. Cycle completes when all snapshot peers have been synced, skipped (cooldown), or removed (unreachable).
-36. Post-cycle responsibility pruning:
-   - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` are removed, and `PaidForList` entries where `self ∉ PaidCloseGroup(K)` are removed.
+36. Post-cycle responsibility pruning with hysteresis:
+   - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `OutOfRangeCount` incremented but are deleted only when the counter reaches `PRUNE_HYSTERESIS_CYCLES`. Keys that are in range have their counter reset to `0`. Same logic applies to `PaidForList` entries where `self ∉ PaidCloseGroup(K)`.
 37. Non-`LocalRT` inbound sync behavior:
    - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
 38. Neighbor-sync snapshot stability under peer join:
@@ -591,6 +597,12 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Peer `P` first claimed bootstrapping 25 hours ago (`> BOOTSTRAP_CLAIM_GRACE_PERIOD`). On next sync or audit attempt where `P` still claims bootstrapping, node emits `BootstrapClaimAbuse` evidence to `EigenTrust` with `peer_id` and `BootstrapClaimFirstSeen` timestamp.
 49. Bootstrap claim cleared on normal response:
    - Peer `P` previously claimed bootstrapping. `P` later responds normally to a sync or audit request. Node clears `BootstrapClaimFirstSeen(self, P)`. No residual penalty tracking.
+50. Prune hysteresis prevents premature deletion:
+   - Key `K` goes out of range after cycle 1. `OutOfRangeCount(self, K)` increments to `1`. Key is NOT deleted. Same at cycle 2 (counter = `2`). At cycle 3 (counter = `PRUNE_HYSTERESIS_CYCLES` = `3`), key is deleted.
+51. Prune hysteresis counter reset on partition heal:
+   - Key `K` is out of range for 2 consecutive cycles (`OutOfRangeCount = 2`). Partition heals, peers return, `K` is back in range at cycle 3. Counter resets to `0`. Key is retained.
+52. Prune hysteresis applies to paid-list entries:
+   - `PaidForList` entry for key `K` where `self ∉ PaidCloseGroup(K)` follows the same hysteresis: counter increments per cycle, entry deleted only at `PRUNE_HYSTERESIS_CYCLES`, counter resets if `self` re-enters `PaidCloseGroup(K)`.
 
 ## 19. Acceptance Criteria for This Design
 
