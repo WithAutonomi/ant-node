@@ -39,7 +39,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `Holder`: node that stores a valid copy of a record.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
 - `PaidNotify(K)`: fresh-replication paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
-- `PaidForList(N)`: in-memory set of keys node `N` currently believes are paid-authorized.
+- `PaidForList(N)`: persistent set of keys node `N` currently believes are paid-authorized; MUST survive node restarts.
 - `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` that participate in paid-list consensus, evaluated from the querying node's local view using `SelfInclusiveRT(querying_node)`.
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
@@ -74,7 +74,7 @@ Parameter safety constraints (MUST hold):
 ## 5. Core Invariants (Must Hold)
 
 1. A record is accepted only if it passes integrity and responsibility checks.
-2. Neighbor-sync repair traffic passes verification only if either condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, or presence positives `>= QuorumNeeded(K)`.
+2. Neighbor-sync repair traffic passes verification only if any condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, presence positives `>= QuorumNeeded(K)`, or close-group replica majority (which also derives paid-list authorization).
 3. Fresh replication bypasses presence quorum only when PoP is valid.
 4. Neighbor-sync hints are accepted only from authenticated peers currently in `LocalRT(self)`; hints from peers outside `LocalRT(self)` are dropped.
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
@@ -82,12 +82,12 @@ Parameter safety constraints (MUST hold):
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
 9. Replication emits trust evidence/penalty signals to `EigenTrust`; trust-score thresholds and eviction decisions are outside replication logic.
-10. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
+10. Security policy is explicit: anti-injection may sacrifice recovery of data that is simultaneously below presence quorum AND has lost paid-list authorization (including derived authorization from close-group replica majority).
 11. Neighbor-sync scheduling is deterministic and round-robin, and every neighbor-sync hint exchange reaches a deterministic terminal state.
 12. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
 13. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
 14. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
-15. `PaidForList(N)` is memory-bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
+15. `PaidForList(N)` MUST be persisted to stable storage and is bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
 16. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 17. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
 18. Neighbor-sync paid hints are non-authoritative and carry no PoP; receivers MUST only whitelist by paid-list majority verification (`>= ConfirmNeeded(K)`), never by hint claims alone.
@@ -171,10 +171,11 @@ When handling an admitted unknown key `K` from neighbor sync:
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
 3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
-4. If confirmations are below threshold, paid-list authorization fails for this verification round.
-5. Nodes answering paid-list queries MUST answer from local paid-list state only; they MUST NOT infer paid status from record presence alone.
-6. If a node learns `K` is paid-authorized by majority, it SHOULD include `K` in outbound `PaidHintsForPeer` for relevant neighbors so peers can re-check and converge.
-7. Unknown paid hints that fail majority confirmation are dropped for this lifecycle and require a new hint/session to re-enter.
+4. If presence positives from `CloseGroup(K)` during the same verification round reach `>= QuorumNeeded(K)` (close-group replica majority), add `K` to local `PaidForList` and treat `K` as paid-authorized. Close-group replica majority constitutes derived evidence of prior authorization and serves as a paid-list recovery path after cold starts or persistence failures.
+5. If neither paid-list confirmations (rule 3) nor close-group replica majority (rule 4) nor presence quorum are met, paid-list authorization fails for this verification round.
+6. Nodes answering paid-list queries MUST answer from local `PaidForList` state only; they MUST NOT infer paid status from record presence alone. (Derived paid-list entries from rule 4 are added to `PaidForList` and are thereafter indistinguishable from PoP-derived entries when answering queries.)
+7. If a node learns `K` is paid-authorized by majority or close-group replica majority, it SHOULD include `K` in outbound `PaidHintsForPeer` for relevant neighbors so peers can re-check and converge.
+8. Unknown paid hints that fail majority confirmation are dropped for this lifecycle and require a new hint/session to re-enter.
 
 ### 7.3 Fresh-Replication Paid-List Notification (Per Key)
 
@@ -251,7 +252,7 @@ QuorumAbandoned
 Transition requirements:
 
 - `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
-- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources.
+- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources and add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization).
 - `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or hint sender.
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
@@ -273,7 +274,7 @@ For each unknown key:
 6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
 7. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
 8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
-9. Mark `QuorumVerified` and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`.
+9. Mark `QuorumVerified`, add `K` to local `PaidForList(self)`, and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`. Close-group replica majority constitutes derived paid-list evidence (Section 7.2 rule 4).
 10. Verification succeeds as soon as either step 8 or step 9 condition is met (logical OR).
 11. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
 12. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
@@ -354,7 +355,7 @@ Capacity-managed mode (finite store):
 1. If full and new in-range key arrives, evict farthest out-of-range key if available.
 2. If no out-of-range key exists, reject new key.
 3. On each `NeighborSyncCycleComplete(self)`, prune keys that moved out of responsibility.
-4. `PaidForList` is in-memory only and SHOULD be bounded with paging/eviction policies; on each `NeighborSyncCycleComplete(self)`, keys outside `PaidCloseGroup(K)` are first candidates for removal.
+4. `PaidForList` MUST be persisted to stable storage and SHOULD be bounded with paging/eviction policies; on each `NeighborSyncCycleComplete(self)`, keys outside `PaidCloseGroup(K)` are first candidates for removal.
 
 ## 13. Churn and Topology Change Handling
 
@@ -433,7 +434,7 @@ A joining node performs active sync:
 2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
 3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
-5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
+5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally. When a key meets presence quorum, also add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization per Section 7.2 rule 4).
 6. Fetch accepted keys with bootstrap concurrency.
 7. Fall back to normal concurrency after `BootstrapDrained(self)` is true.
 8. Set `BootstrapDrained(self)=true` only when both conditions hold:
@@ -469,8 +470,8 @@ Use this list to find design flaws before coding:
    - Could transient network issues create unfair `EigenTrust` penalties without sufficient dampening/evidence quality?
 11. Paid-list poisoning:
    - Can colluding nodes in `PaidCloseGroup(K)` falsely mark unpaid keys as paid?
-12. Paid-list cold-start:
-   - After broad restart, can paid-list snapshots be rebuilt deterministically before churn repair starts?
+12. Paid-list cold-start (mitigated):
+   - `PaidForList` is now persisted, surviving normal restarts. Close-group replica majority (Section 7.2 rule 4) provides a recovery path when persistence is corrupted or unavailable. Residual risk: keys below both presence quorum AND lost paid-list remain unrecoverable — accepted as explicit security-over-liveness tradeoff.
 
 ## 18. Pre-Implementation Test Matrix
 
@@ -550,6 +551,14 @@ Each scenario should assert exact expected outcomes and state transitions.
    - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` are removed, and `PaidForList` entries where `self ∉ PaidCloseGroup(K)` are removed.
 37. Non-`LocalRT` inbound sync behavior:
    - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
+38. Quorum-derived paid-list authorization:
+   - Unknown key `K` passes presence quorum (`>= QuorumNeeded(K)` positives from `CloseGroup(K)`). Key is stored AND added to local `PaidForList(self)`. Node subsequently answers paid-list queries for `K` as "paid."
+39. Paid-list persistence across restart:
+   - Node stores key `K` in `PaidForList`, restarts. After restart, `PaidForList` is loaded from stable storage and node correctly answers paid-list queries for `K` without re-verification.
+40. Paid-list cold-start recovery via replica majority:
+   - Multiple nodes restart simultaneously and lose `PaidForList` (persistence corrupted). Key `K` has `>= QuorumNeeded(K)` replicas in the close group. During neighbor-sync verification, presence quorum passes and all verifying nodes re-derive `K` into their `PaidForList` via close-group replica majority.
+41. Paid-list unrecoverable below quorum:
+   - Key `K` has only 1 replica (below quorum) and `PaidForList` is lost across all `PaidCloseGroup(K)` members. Key cannot be recovered via either presence quorum or paid-list majority — accepted as explicit security-over-liveness tradeoff.
 
 ## 19. Acceptance Criteria for This Design
 
