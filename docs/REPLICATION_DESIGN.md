@@ -26,19 +26,21 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 ## 3. System Model
 
 - `Node`: participant with routing view, local store, and replication worker.
-- `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set.
+- `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set (does not include `N` itself).
+- `SelfInclusiveRT(N)`: derived local view `LocalRT(N) ∪ {N}` used for responsibility-range and local membership evaluations that must treat `N` as a candidate.
 - `NeighborSyncOrder(N)`: deterministic cyclic ordering of authenticated peers in `LocalRT(N)` used for neighbor-sync scheduling.
 - `NeighborSyncCursor(N)`: persistent index into `NeighborSyncOrder(N)` indicating the next peer position to schedule.
 - `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)` (wrap-around allowed); periodic repair sync partners for `N`.
+- `NeighborSyncCycleComplete(N)`: event that fires when node `N` finishes one full traversal of `NeighborSyncOrder(N)` (every currently ordered peer scheduled once) and wraps to the cycle start.
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
-- `IsResponsible(N, K)`: true if `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `LocalRT(N) ∪ {N}`.
+- `IsResponsible(N, K)`: true if `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `SelfInclusiveRT(N)`.
 - `Holder`: node that stores a valid copy of a record.
 - `PoP`: verifiable proof that a record was authorized for initial storage/payment policy.
 - `PaidNotify(K)`: fresh-replication paid-list notification carrying key `K` plus PoP/payment proof material needed for receiver-side verification and whitelisting.
 - `PaidForList(N)`: in-memory set of keys node `N` currently believes are paid-authorized.
-- `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` that participate in paid-list consensus.
+- `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` that participate in paid-list consensus, evaluated from the querying node's local view using `SelfInclusiveRT(querying_node)`.
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
@@ -92,6 +94,7 @@ Parameter safety constraints (MUST hold):
 19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
+22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: drop stored keys where `IsResponsible(self, K)` is false and drop paid-list keys where `self ∉ PaidCloseGroup(K)`.
 
 ## 6. Replication Modes
 
@@ -133,6 +136,7 @@ Rules:
 11. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
 12. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
 13. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|` modulo `|NeighborSyncOrder(self)|`.
+14. When cursor advance in rule 13 completes a full round-robin traversal (`NeighborSyncCycleComplete(self)`), node MUST execute post-cycle responsibility pruning (Section 11).
 
 Rate control:
 
@@ -304,13 +308,19 @@ A fetched record is written only if all checks pass:
 
 ## 11. Responsibility Check
 
-A node `N` is responsible for key `K` if `IsResponsible(N, K)` holds — that is, `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `LocalRT(N) ∪ {N}`.
+A node `N` is responsible for key `K` if `IsResponsible(N, K)` holds — that is, `N` is among the `CLOSE_GROUP_SIZE` nearest nodes to `K` in `SelfInclusiveRT(N)`.
 
 This check is evaluated per-key at decision points:
 
 1. Accept/reject incoming replication writes.
-2. Background pruning eligibility (prune stored records where node is no longer responsible).
-3. Paid-list retention eligibility (drop `PaidForList` entries for keys where node is no longer in `PaidCloseGroup(K)`).
+2. Post-cycle pruning eligibility (prune stored records where node is no longer responsible).
+3. Post-cycle paid-list retention eligibility (drop `PaidForList` entries for keys where node is no longer in `PaidCloseGroup(K)`).
+
+Post-cycle responsibility pruning (triggered by `NeighborSyncCycleComplete(self)`):
+
+1. Recompute `IsResponsible(self, K)` for each locally stored key `K` using current `SelfInclusiveRT(self)`; delete records where false.
+2. Recompute `PaidCloseGroup(K)` membership for each key `K` in `PaidForList(self)` using current `SelfInclusiveRT(self)`; delete entries where `self ∉ PaidCloseGroup(K)`.
+3. This prune pass is local-state-only and MUST NOT require remote confirmations.
 
 Effect:
 
@@ -333,13 +343,14 @@ Rules:
 4. Evict stale queued entries using implementation-defined queue-lifecycle policy.
 5. On fetch failure, mark source as tried and transition per `FetchRetryable`/`FetchAbandoned` rules (Section 8). Retry decisions are transport-owned. Retry fetches reuse the verified source set from the original verification pass and do not consume additional verification slots.
 6. Storage-audit scheduling and target selection MUST follow Section 15 trigger rules.
+7. Responsibility/paid-list prune passes MUST run on `NeighborSyncCycleComplete(self)` per Section 11.
 
 Capacity-managed mode (finite store):
 
 1. If full and new in-range key arrives, evict farthest out-of-range key if available.
 2. If no out-of-range key exists, reject new key.
-3. Periodically prune keys that moved out of responsibility.
-4. `PaidForList` is in-memory only and SHOULD be bounded with paging/eviction policies; keys outside `PaidCloseGroup(K)` are first candidates for removal.
+3. On each `NeighborSyncCycleComplete(self)`, prune keys that moved out of responsibility.
+4. `PaidForList` is in-memory only and SHOULD be bounded with paging/eviction policies; on each `NeighborSyncCycleComplete(self)`, keys outside `PaidCloseGroup(K)` are first candidates for removal.
 
 ## 13. Churn and Topology Change Handling
 
@@ -531,6 +542,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - If a batched response omits key `K` or a peer times out, evidence for that peer/key pair is unresolved for `K` and does not count as an explicit negative vote.
 35. Neighbor-sync round-robin batch selection:
    - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` peers and cycle through the full ordered peer set before repeating.
+36. Post-cycle responsibility pruning:
+   - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` are removed, and `PaidForList` entries where `self ∉ PaidCloseGroup(K)` are removed.
 
 ## 19. Acceptance Criteria for This Design
 
