@@ -94,7 +94,7 @@ Parameter safety constraints (MUST hold):
 15. `PaidForList(N)` MUST be persisted to stable storage and is bounded: node `N` tracks only keys for which `N` is in `PaidCloseGroup(K)` (plus short-lived transition slack).
 16. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 17. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
-18. Neighbor-sync paid hints are non-authoritative and carry no PoP; receivers MUST only whitelist by paid-list majority verification (`>= ConfirmNeeded(K)`), never by hint claims alone.
+18. Neighbor-sync paid hints are non-authoritative and carry no PoP; receivers MUST only whitelist by paid-list majority verification (`>= ConfirmNeeded(K)`), never by hint claims alone, and paid-hint-only processing MUST NOT enqueue record fetch.
 19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
@@ -142,11 +142,11 @@ Rules:
    - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (`receiver ∈ CloseGroup(K)` in sender view).
    - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (`receiver ∈ PaidCloseGroup(K)` in sender view).
 8. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
-9. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
+9. Receiver treats hint sets as unordered collections and deduplicates repeated keys. If a key appears in both `ReplicaHintsForPeer` and `PaidHintsForPeer` in the same session, receiver MUST keep only the replica-hint entry and drop the paid-hint duplicate (single-pipeline processing).
 10. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
 11. Receiver launches quorum checks exactly once per admitted unknown replica key.
-12. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
-13. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
+12. Only admitted unknown replica keys that pass presence quorum or paid-list authorization are queued for fetch.
+13. Receiver processes unknown paid hints via Section 7.2 majority checks in a paid-list pipeline: successful checks may update `PaidForList(self)` but MUST NOT queue record fetch. If the same key is also present in replica hints, rule 9 drops the paid-hint duplicate and fetch behavior is governed only by the replica-hint pipeline.
 14. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
 15. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
 16. After each round, node sets `NeighborSyncCursor(self)` to the position after the last scanned peer in the (possibly shrunk) snapshot. Peers removed during scanning (cooldown or unreachable) do not occupy cursor positions — the cursor reflects the snapshot's state after removals.
@@ -166,7 +166,7 @@ For each hinted key `K`, receiver accepts the hint into verification only if bot
 1. Sender is authenticated and currently in `LocalRT(self)`.
 2. Key is relevant to the receiver:
    - Replica hint: receiver is currently responsible (`IsResponsible(self, K)`) or key already exists in local store/pending pipeline.
-   - Paid hint: receiver is currently in `PaidCloseGroup(K)` (or key is already in local `PaidForList` pending cleanup).
+   - Paid hint: receiver is currently in `PaidCloseGroup(K)` (or key is already in local `PaidForList` pending cleanup). This admission is paid-list-tracking only and does not make the key fetch-eligible by itself.
 
 Notes:
 
@@ -174,6 +174,8 @@ Notes:
 - Hints from peers outside current `LocalRT(self)` are dropped immediately.
 - For inbound sync sessions from peers outside `LocalRT(self)`, receiver may send outbound hints but does not accept inbound hints.
 - Mixed hint sets are valid: process admitted keys, drop non-admitted keys.
+- Cross-set precedence is strict: if key `K` is present in both admitted replica hints and admitted paid hints, process `K` only in the replica-hint pipeline and drop the paid-hint duplicate.
+- Admitted paid hints can update `PaidForList(self)` after verification but never enqueue record fetch. If the same key is also in replica hints, the paid-hint duplicate is discarded and fetch eligibility is decided only by the replica-hint pipeline.
 - Receiver MAY return rejected-key metadata to help sender avoid repeating obviously invalid hints in immediate subsequent sync attempts.
 
 ### 7.2 Paid-List Authorization (Per Key)
@@ -182,12 +184,13 @@ When handling an admitted unknown key `K` from neighbor sync:
 
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
-3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList`, treat `K` as paid-authorized, and record any peers that also report current presence as fetch candidates.
+3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList` and treat `K` as paid-authorized.
 4. If presence positives from `CloseGroup(K)` during the same verification round reach `>= QuorumNeeded(K)` (close-group replica majority), add `K` to local `PaidForList` and treat `K` as paid-authorized. Close-group replica majority constitutes derived evidence of prior authorization and serves as a paid-list recovery path after cold starts or persistence failures.
-5. If neither paid-list confirmations (rule 3) nor close-group replica majority (rule 4) nor presence quorum are met, paid-list authorization fails for this verification round.
-6. Nodes answering paid-list queries MUST answer from local `PaidForList` state only; they MUST NOT infer paid status from record presence alone. (Derived paid-list entries from rule 4 are added to `PaidForList` and are thereafter indistinguishable from PoP-derived entries when answering queries.)
-7. If a node learns `K` is paid-authorized by majority or close-group replica majority, it SHOULD include `K` in outbound `PaidHintsForPeer` for relevant neighbors so peers can re-check and converge.
-8. Unknown paid hints that fail majority confirmation are dropped for this lifecycle and require a new hint/session to re-enter.
+5. Fetch gating is strict: only keys in the admitted replica-hint pipeline are fetch-eligible. Keys admitted only via paid hints MUST NOT be queued for fetch, even when rules 1, 3, or 4 succeed.
+6. If neither paid-list confirmations (rule 3) nor close-group replica majority (rule 4) nor presence quorum are met, paid-list authorization fails for this verification round.
+7. Nodes answering paid-list queries MUST answer from local `PaidForList` state only; they MUST NOT infer paid status from record presence alone. (Derived paid-list entries from rule 4 are added to `PaidForList` and are thereafter indistinguishable from PoP-derived entries when answering queries.)
+8. If a node learns `K` is paid-authorized by majority or close-group replica majority, it SHOULD include `K` in outbound `PaidHintsForPeer` for relevant neighbors so peers can re-check and converge.
+9. Unknown paid hints that fail majority confirmation are dropped for this lifecycle and require a new hint/session to re-enter.
 
 ### 7.3 Fresh-Replication Paid-List Notification (Per Key)
 
@@ -242,7 +245,8 @@ PendingVerify
 QuorumVerified
   -> QueuedForFetch
 PaidListVerified
-  -> QueuedForFetch
+  -> QueuedForFetch     (admitted replica-hint pipeline only)
+  -> Idle               (paid-hint-only pipeline; `PaidForList` updated)
 QueuedForFetch
   -> Fetching
 Fetching
@@ -263,9 +267,11 @@ QuorumAbandoned
 
 Transition requirements:
 
-- `OfferReceived -> PendingVerify` only for unknown, admitted, in-range keys.
-- `PendingVerify -> QuorumVerified` only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources and add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization).
-- `PendingVerify -> PaidListVerified` only if paid confirmations from the same verification round reach `>= ConfirmNeeded(K)`. On success, mark key as paid-authorized locally and record fetch candidates from positive presence hints and/or hint sender.
+- `OfferReceived -> PendingVerify` only for unknown admitted keys: replica-hint keys must satisfy replica relevance (`IsResponsible(self, K)` or already local/pending), and paid-hint-only keys must satisfy paid relevance (`self ∈ PaidCloseGroup(K)` or already in local `PaidForList` pending cleanup).
+- `PendingVerify -> QuorumVerified` only for keys in the admitted replica-hint pipeline, and only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources and add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization).
+- `PendingVerify -> PaidListVerified` if paid confirmations from the current verification round reach `>= ConfirmNeeded(K)`, or if a paid-hint-only key reaches presence quorum in the same round (derived paid-list authorization). On success, mark key as paid-authorized locally.
+- `PaidListVerified -> QueuedForFetch` only for keys in the admitted replica-hint pipeline.
+- `PaidListVerified -> Idle` for keys admitted only via paid hints (no record fetch).
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
 - `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), the transport classifies the attempt as retryable, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
@@ -279,18 +285,26 @@ Transition requirements:
 For each unknown key:
 
 1. Deduplicate key in pending-verification table.
-2. If `K` is already in local `PaidForList`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
-3. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
-4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self).
-5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
-6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
-7. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
-8. Mark `PaidListVerified` and queue for fetch as soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`.
-9. Mark `QuorumVerified`, add `K` to local `PaidForList(self)`, and queue for fetch as soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`. Close-group replica majority constitutes derived paid-list evidence (Section 7.2 rule 4).
-10. Verification succeeds as soon as either step 8 or step 9 condition is met (logical OR).
-11. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
-12. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
-13. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
+2. Determine fetch eligibility from admission context:
+   - Apply cross-set precedence first (Section 6.2 rule 9): a key present in both hint sets is treated as replica-hint pipeline only.
+   - `FetchEligible = true` only if `K` is in the admitted replica-hint pipeline.
+   - `FetchEligible = false` for paid-hint-only keys.
+3. If `K` is already in local `PaidForList`:
+   - If `FetchEligible`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
+   - If not `FetchEligible`, mark `PaidListVerified` and terminate the lifecycle (`PaidListVerified -> Idle`) without fetch.
+4. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
+5. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self).
+6. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
+7. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
+8. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
+9. As soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`, add `K` to local `PaidForList(self)` and mark `PaidListVerified`.
+10. As soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`, add `K` to local `PaidForList(self)` (derived paid-list authorization; Section 7.2 rule 4). If `FetchEligible`, mark `QuorumVerified`; otherwise mark `PaidListVerified`.
+11. Verification succeeds as soon as either step 9 or step 10 condition is met (logical OR).
+12. If verification succeeded and `FetchEligible`, enqueue fetch using verified sources (positive presence responders and/or authenticated hint sender).
+13. If verification succeeded and `FetchEligible = false`, terminate lifecycle without fetch (`PaidListVerified -> Idle`).
+14. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
+15. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
+16. On `QuorumFailed` or `QuorumInconclusive`, transition immediately to `QuorumAbandoned` (no automatic quorum retry/backoff).
 
 Undersized verification-set behavior:
 
@@ -459,10 +473,10 @@ A joining node performs active sync:
 
 1. Node MUST initiate peer discovery closest to its own address and wait until `LocalRT(self)` is at least partially populated before proceeding. Without a sufficiently populated routing table, the node cannot accurately evaluate `IsResponsible(self, K)`, `CloseGroup(K)`, or `PaidCloseGroup(K)`, which would cause incorrect admission decisions and quorum target selection during bootstrap.
 2. Snapshot deterministic `NeighborSyncOrder(self)` from the populated `LocalRT(self)` for the bootstrap cycle.
-3. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
+3. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time. If the same key appears in both hint types, collapse to replica-hint processing only.
 4. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 5. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
-6. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally. When a key meets presence quorum, also add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization per Section 7.2 rule 4).
+6. Aggregate key-presence reports and accept only replica-hint-discovered keys observed from `>= QuorumNeeded(K)` peers, or replica-hint-discovered keys that are now paid-authorized locally. Keys discovered only via paid hints are never accepted for fetch; they only update `PaidForList`. When a key meets presence quorum, also add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization per Section 7.2 rule 4).
 7. Fetch accepted keys with bootstrap concurrency.
 8. Fall back to normal concurrency after `BootstrapDrained(self)` is true.
 9. Set `BootstrapDrained(self)=true` only when both conditions hold:
@@ -520,7 +534,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 7. Out-of-range key hint:
    - Key rejected regardless of quorum.
 8. Duplicate and retry safety:
-   - Duplicate keys and repeated hints do not create invalid acceptance or duplicate queue/fetch work.
+   - Duplicate keys and repeated hints do not create invalid acceptance or duplicate queue/fetch work. If the same key appears in both replica and paid hints in one session, receiver collapses to replica-hint pipeline only.
 9. Fetch timeout with alternate source retry:
    - First source times out, key transitions to `FetchRetryable`, re-enters `QueuedForFetch` with next verified source, and succeeds. Verification is not re-run. Failed source receives one `ReplicationFailure`; successful alternate source clears stale failure attribution (rule 14.4).
 10. Fetch retry exhaustion:
@@ -544,11 +558,11 @@ Each scenario should assert exact expected outcomes and state transitions.
 19. Audit per-key digest mismatch with confirmed responsibility:
    - Peer `P` is challenged on keys `{K1, K2, K3}`. `P` returns per-key digests: `K1` matches, `K2` mismatches, `K3` absent. Challenger runs responsibility confirmation for failed keys `{K2, K3}`: `P` appears in fresh lookup for `K2` but not `K3`. `AuditFailure` is emitted for `{K2}` only. Trust-penalty signal is emitted only when `RepairOpportunity(P, {K2})` is also true.
 20. Paid-list local hit:
-   - Unknown key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
+   - Admitted unknown replica key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
 21. Paid-list majority confirmation:
-   - Unknown key not in local paid list is accepted only after `>= ConfirmNeeded(K)` confirmations from `PaidCloseGroup(K)`.
+   - Admitted unknown replica key not in local paid list is accepted for fetch only after `>= ConfirmNeeded(K)` confirmations from `PaidCloseGroup(K)`. For a paid-hint-only key, the same confirmation updates `PaidForList` but does not enqueue fetch.
 22. Paid-list rejection:
-   - Unknown key is rejected when paid confirmations are below threshold and presence quorum also fails.
+   - Admitted unknown replica key is rejected when paid confirmations are below threshold and presence quorum also fails.
 23. Paid-list cleanup after churn:
    - Node drops paid-list entries for keys where it is no longer in `PaidCloseGroup(K)`.
 24. Fresh-replication paid-list propagation:
