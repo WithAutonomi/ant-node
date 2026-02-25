@@ -40,6 +40,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
+- `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when bootstrap peer requests are finished (response or timeout) and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
 
 ## 4. Tunable Parameters
 
@@ -54,7 +55,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`              |
 | `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
-| `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                             |
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`         |
 | `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `5s`                                |
@@ -87,7 +87,7 @@ Parameter safety constraints (MUST hold):
 16. Fresh-replication paid-list propagation is mandatory: sender MUST attempt `PaidNotify(K)` delivery to every peer in `PaidCloseGroup(K)` (reference profile: up to 20 peers when available), not a subset.
 17. A `PaidNotify(K)` only whitelists key `K` after receiver-side proof verification succeeds; sender assertions never whitelist by themselves.
 18. Neighbor-sync paid hints are non-authoritative and carry no PoP; receivers MUST only whitelist by paid-list majority verification (`>= ConfirmNeeded(K)`), never by hint claims alone.
-19. Storage-proof audits start only after bootstrap completion plus `AUDIT_STARTUP_GRACE`.
+19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 
@@ -398,11 +398,12 @@ Failure conditions:
 
 Audit trigger and target selection:
 
-1. Node MUST NOT schedule storage-proof audits until bootstrap is complete and `AUDIT_STARTUP_GRACE` has elapsed since bootstrap completion.
-2. Audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
-3. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
-4. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
-5. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
+1. Node MUST NOT schedule storage-proof audits until `BootstrapDrained(self)` is true.
+2. On the transition where `BootstrapDrained(self)` becomes true, node MUST execute one audit tick immediately.
+3. After the immediate start tick, audit scheduler runs periodically at randomized `AUDIT_TICK_INTERVAL` (reference profile: jittered in `[5 min, 10 min]`).
+4. Per tick, node MUST run the round-construction flow in steps 2-8 above (sample local keys, lookup closest peers, filter by `LocalRT(self)`, build per-peer key sets, then choose one random peer).
+5. Node MUST NOT issue storage-proof audits to peers outside the round-construction output set for that tick.
+6. If round construction yields no eligible peer, node records an idle audit tick and waits for the next tick (no forced random target).
 
 ## 16. New Node Bootstrap Logic
 
@@ -414,7 +415,11 @@ A joining node performs active sync:
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
 5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
 6. Fetch accepted keys with bootstrap concurrency.
-7. Fall back to normal concurrency after bootstrap drains.
+7. Fall back to normal concurrency after `BootstrapDrained(self)` is true.
+8. Set `BootstrapDrained(self)=true` only when both conditions hold:
+   - bootstrap peer requests from step 2 have all completed (response or timeout), and
+   - bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
+9. Transition `BootstrapDrained(self): false -> true` opens the audit start gate in Section 15.
 
 This compresses quorum formation into one bootstrap round instead of waiting for multiple periodic cycles.
 
@@ -508,7 +513,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 28. Dynamic quorum threshold in undersized verification set:
    - With `|QuorumTargets|=3`, unknown-key presence quorum requires `QuorumNeeded(K)=2` confirmations (not 4).
 29. Audit start gate:
-   - Node does not schedule audits before `bootstrap_complete + AUDIT_STARTUP_GRACE`.
+   - Node does not schedule audits before `BootstrapDrained(self)`; first audit tick fires immediately when `BootstrapDrained(self)` transitions to true.
 30. Audit peer selection from sampled keys:
    - Scheduler samples up to `AUDIT_BATCH_SIZE` local keys, performs closest-peer lookups, filters peers by `LocalRT(self)`, builds `PeerKeySet` from those lookup results only, and selects one random peer to audit.
 31. Audit periodic cadence with jitter:
