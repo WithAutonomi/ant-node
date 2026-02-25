@@ -76,7 +76,7 @@ Parameter safety constraints (MUST hold):
 1. A record is accepted only if it passes integrity and responsibility checks.
 2. Neighbor-sync repair traffic passes verification only if either condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, or presence positives `>= QuorumNeeded(K)`.
 3. Fresh replication bypasses presence quorum only when PoP is valid.
-4. Neighbor-sync hints from peers outside the active `NeighborSyncSet(self)` are dropped.
+4. Neighbor-sync hints are accepted only from authenticated peers currently in `LocalRT(self)`; hints from peers outside `LocalRT(self)` are dropped.
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
 6. `CLOSE_GROUP_SIZE` is both the close-group width and the target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
@@ -124,19 +124,22 @@ Rules:
 1. Node computes/maintains `NeighborSyncOrder(self)` as a deterministic ordering of authenticated peers in `LocalRT(self)`.
 2. Node computes `NeighborSyncSet(self)` as the next up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers from `NeighborSyncOrder(self)` starting at `NeighborSyncCursor(self)` (wrap-around allowed).
 3. Node initiates a bidirectional sync session with each peer in `NeighborSyncSet(self)` (or responds if peer initiated first).
-4. In each session, both sides send peer-targeted hint sets:
+4. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
+5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
+6. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
+7. In each session, sender-side hint construction uses peer-targeted sets:
    - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (`receiver ∈ CloseGroup(K)` in sender view).
    - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (`receiver ∈ PaidCloseGroup(K)` in sender view).
-5. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
-6. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
-7. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
-8. Receiver launches quorum checks exactly once per admitted unknown replica key.
-9. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
-10. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
-11. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
-12. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
-13. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|` modulo `|NeighborSyncOrder(self)|`.
-14. When cursor advance in rule 13 completes a full round-robin traversal (`NeighborSyncCycleComplete(self)`), node MUST execute post-cycle responsibility pruning (Section 11).
+8. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
+9. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
+10. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
+11. Receiver launches quorum checks exactly once per admitted unknown replica key.
+12. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
+13. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
+14. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
+15. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
+16. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|` modulo `|NeighborSyncOrder(self)|`.
+17. When cursor advance in rule 16 completes a full round-robin traversal (`NeighborSyncCycleComplete(self)`), node MUST execute post-cycle responsibility pruning (Section 11).
 
 Rate control:
 
@@ -148,7 +151,7 @@ Rate control:
 
 For each hinted key `K`, receiver accepts the hint into verification only if both conditions hold:
 
-1. Sender is authenticated and currently in `NeighborSyncSet(self)`.
+1. Sender is authenticated and currently in `LocalRT(self)`.
 2. Key is relevant to the receiver:
    - Replica hint: receiver is currently responsible (`IsResponsible(self, K)`) or key already exists in local store/pending pipeline.
    - Paid hint: receiver is currently in `PaidCloseGroup(K)` (or key is already in local `PaidForList` pending cleanup).
@@ -156,7 +159,8 @@ For each hinted key `K`, receiver accepts the hint into verification only if bot
 Notes:
 
 - Authorization decision is local-route-state only.
-- Hints from non-neighbor-sync peers are dropped immediately.
+- Hints from peers outside current `LocalRT(self)` are dropped immediately.
+- For inbound sync sessions from peers outside `LocalRT(self)`, receiver may send outbound hints but does not accept inbound hints.
 - Mixed hint sets are valid: process admitted keys, drop non-admitted keys.
 - Receiver MAY return rejected-key metadata to help sender avoid repeating obviously invalid hints in immediate subsequent sync attempts.
 
@@ -456,7 +460,7 @@ Use this list to find design flaws before coding:
 6. Neighbor-sync coverage:
    - Under sustained backlog/churn, do neighbor sync rounds still revisit all relevant keys within an acceptable bound?
 7. Admission asymmetry:
-   - Can two honest nodes disagree on neighbor-sync membership enough to delay propagation?
+   - Can temporary disagreement about `LocalRT` membership between honest nodes delay propagation?
 8. Capacity fairness:
    - Can nearest-first plus finite capacity starve less-near but still responsible keys?
 9. Audit bias:
@@ -481,7 +485,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 4. Neighbor-sync unknown key quorum fail:
    - Key transitions to `QuorumAbandoned` (then `Idle`) and is not fetched.
 5. Unauthorized sync peer:
-   - Hints from non-`NeighborSyncSet(self)` peer are dropped and do not enter verification.
+   - Hints from peers not in `LocalRT(self)` are dropped and do not enter verification.
 6. Presence probe response shape:
    - Presence responses are only `Present` or `Absent`; there are no `RejectedUnauthorized`/`RejectedBusy` presence codes.
 7. Out-of-range key hint:
@@ -505,7 +509,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 16. Quorum responder timeout handling:
    - No-response/timeouts are unresolved and can yield `QuorumInconclusive`, which is terminal for that offer lifecycle (`QuorumAbandoned` -> `Idle`).
 17. Neighbor-sync admission asymmetry:
-   - When two honest nodes temporarily disagree on `NeighborSyncSet` membership, propagation resumes after topology refresh without relaxing admission policy.
+   - When two honest nodes temporarily disagree on `LocalRT` membership, hints are accepted only once sender is present in receiver `LocalRT`; before that, inbound sync is outbound-only at the receiver.
 18. Invalid runtime config:
    - Node rejects configs violating parameter safety constraints.
 19. Audit digest mismatch:
@@ -544,6 +548,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` peers and cycle through the full ordered peer set before repeating.
 36. Post-cycle responsibility pruning:
    - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` are removed, and `PaidForList` entries where `self ∉ PaidCloseGroup(K)` are removed.
+37. Non-`LocalRT` inbound sync behavior:
+   - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
 
 ## 19. Acceptance Criteria for This Design
 
