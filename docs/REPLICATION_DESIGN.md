@@ -44,7 +44,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
-- `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when bootstrap peer requests are finished (response or timeout) and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
+- `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when peer discovery closest to `N`'s own address has populated `LocalRT(N)`, bootstrap peer requests are finished (response or timeout), and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
 - `RepairOpportunity(P, KSet)`: evidence that peer `P` has previously received replication hints/offers for keys in `KSet` and had at least one subsequent neighbor-sync cycle to repair before audit evaluation.
 - `BootstrapClaimFirstSeen(N, P)`: timestamp when node `N` first observed peer `P` responding with a bootstrapping claim to a sync or audit request. Reset when `P` stops claiming bootstrap status.
 - `EigenTrust`: trust subsystem that consumes replication evidence events, updates peer trust scores, and applies peer-eviction policy.
@@ -445,17 +445,18 @@ Audit trigger and target selection:
 
 A joining node performs active sync:
 
-1. Discover authenticated peers from `LocalRT(self)` and snapshot deterministic `NeighborSyncOrder(self)` for the bootstrap cycle.
-2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
-3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
-4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
-5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally. When a key meets presence quorum, also add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization per Section 7.2 rule 4).
-6. Fetch accepted keys with bootstrap concurrency.
-7. Fall back to normal concurrency after `BootstrapDrained(self)` is true.
-8. Set `BootstrapDrained(self)=true` only when both conditions hold:
-   - bootstrap peer requests from step 2 have all completed (response or timeout), and
+1. Node MUST initiate peer discovery closest to its own address and wait until `LocalRT(self)` is at least partially populated before proceeding. Without a sufficiently populated routing table, the node cannot accurately evaluate `IsResponsible(self, K)`, `CloseGroup(K)`, or `PaidCloseGroup(K)`, which would cause incorrect admission decisions and quorum target selection during bootstrap.
+2. Snapshot deterministic `NeighborSyncOrder(self)` from the populated `LocalRT(self)` for the bootstrap cycle.
+3. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
+4. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
+5. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
+6. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally. When a key meets presence quorum, also add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization per Section 7.2 rule 4).
+7. Fetch accepted keys with bootstrap concurrency.
+8. Fall back to normal concurrency after `BootstrapDrained(self)` is true.
+9. Set `BootstrapDrained(self)=true` only when both conditions hold:
+   - bootstrap peer requests from step 3 have all completed (response or timeout), and
    - bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
-9. Transition `BootstrapDrained(self): false -> true` opens the audit start gate in Section 15.
+10. Transition `BootstrapDrained(self): false -> true` opens the audit start gate in Section 15.
 
 This compresses quorum formation into one bootstrap round instead of waiting for multiple periodic cycles.
 
