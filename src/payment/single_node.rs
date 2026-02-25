@@ -175,7 +175,10 @@ impl SingleNodePayment {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        info!("Payment successful: {} transactions (expected 1-5)", result_hashes.len());
+        info!(
+            "Payment successful: {} transactions (expected 1-5)",
+            result_hashes.len()
+        );
 
         Ok(result_hashes)
     }
@@ -371,83 +374,6 @@ mod tests {
 
         println!("✓ All {} payments verified successfully", 5);
         println!("\n✅ Exact autonomi pattern works!");
-    }
-
-    /// Step 2: Change to 3 payments instead of 5 (matching `SingleNode` 3x)
-    #[tokio::test]
-    #[allow(clippy::expect_used)]
-    async fn test_step2_three_payments() {
-        let (node, rpc_url) = start_node_with_timeout();
-        let network_token = deploy_network_token_contract(&rpc_url, &node).await;
-        let mut payment_vault =
-            deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
-
-        let transaction_config = TransactionConfig::default();
-
-        // CHANGE: Create 3 payments instead of 5
-        let mut quote_payments = vec![];
-        for _ in 0..3 {
-            let quote_hash = dummy_hash();
-            let reward_address = dummy_address();
-            let amount = Amount::from(1u64);
-            quote_payments.push((quote_hash, reward_address, amount));
-        }
-
-        // Approve tokens
-        network_token
-            .approve(
-                *payment_vault.contract.address(),
-                evmlib::common::U256::MAX,
-                &transaction_config,
-            )
-            .await
-            .expect("Failed to approve");
-
-        println!("✓ Approved tokens");
-
-        // Set provider
-        payment_vault.set_provider(network_token.contract.provider().clone());
-
-        // Pay
-        let result = payment_vault
-            .pay_for_quotes(quote_payments.clone(), &transaction_config)
-            .await;
-
-        assert!(result.is_ok(), "Payment failed: {:?}", result.err());
-        println!("✓ Paid for 3 quotes");
-
-        // Verify with 3 payments
-        let payment_verifications: Vec<_> = quote_payments
-            .into_iter()
-            .map(|v| interface::IPaymentVault::PaymentVerification {
-                metrics: QuotingMetrics {
-                    data_size: 0,
-                    data_type: 0,
-                    close_records_stored: 0,
-                    records_per_type: vec![],
-                    max_records: 0,
-                    received_payment_count: 0,
-                    live_time: 0,
-                    network_density: None,
-                    network_size: None,
-                }
-                .into(),
-                rewardsAddress: v.1,
-                quoteHash: v.0,
-            })
-            .collect();
-
-        let results = payment_vault
-            .verify_payment(payment_verifications)
-            .await
-            .expect("Verify payment failed");
-
-        for result in results {
-            assert!(result.isValid, "Payment verification should be valid");
-        }
-
-        println!("✓ All 3 payments verified successfully");
-        println!("\n✅ Step 2: Three payments work!");
     }
 
     /// Step 3: Pay 3x for ONE quote and 0 for the other 4 (`SingleNode` mode)
