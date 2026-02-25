@@ -127,12 +127,14 @@ impl QuoteGenerator {
             signature,
         };
 
-        debug!(
-            "Generated quote for {} (size: {}, type: {})",
-            hex::encode(content),
-            data_size,
-            data_type
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Generated quote for {} (size: {}, type: {})",
+                hex::encode(content),
+                data_size,
+                data_type
+            );
+        }
 
         Ok(quote)
     }
@@ -174,11 +176,13 @@ impl QuoteGenerator {
 pub fn verify_quote_content(quote: &PaymentQuote, expected_content: &XorName) -> bool {
     // Check content matches
     if quote.content.0 != *expected_content {
-        debug!(
-            "Quote content mismatch: expected {}, got {}",
-            hex::encode(expected_content),
-            hex::encode(quote.content.0)
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Quote content mismatch: expected {}, got {}",
+                hex::encode(expected_content),
+                hex::encode(quote.content.0)
+            );
+        }
         return false;
     }
     true

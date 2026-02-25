@@ -4,6 +4,15 @@
 //! 1. Check LRU cache for already-verified data
 //! 2. Require and verify EVM/Arbitrum payment for new data
 //!
+//! # Default Policy
+//!
+//! **Production nodes require payment by default.**
+//!
+//! - `PaymentVerifierConfig::default()` has `evm.enabled = true`
+//! - `PaymentConfig::default()` has `enabled = true`
+//! - Test environments can disable via CLI flag `--disable-payment-verification`
+//! - Test utilities explicitly disable EVM verification for unit tests
+//!
 //! # Architecture
 //!
 //! ```text

@@ -298,11 +298,12 @@ impl AntProtocol {
 
     /// Store a chunk directly to local storage (bypasses payment verification).
     ///
-    /// This is useful for testing or when payment has been verified elsewhere.
+    /// TEST ONLY - This method bypasses payment verification and should only be used in tests.
     ///
     /// # Errors
     ///
     /// Returns an error if storage fails or content doesn't match address.
+    #[cfg(test)]
     pub async fn put_local(&self, address: &[u8; 32], content: &[u8]) -> Result<bool> {
         self.storage.put(address, content).await
     }
@@ -357,15 +358,8 @@ mod tests {
         let content = b"hello world";
         let address = LmdbStorage::compute_address(content);
 
-        // Create PUT request - with empty payment proof (EVM disabled)
-        let put_request = ChunkPutRequest::with_payment(
-            address,
-            content.to_vec(),
-            rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-                peer_quotes: vec![],
-            })
-            .unwrap(),
-        );
+        // Create PUT request - no payment proof needed (EVM disabled in test)
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 1,
             body: ChunkMessageBody::PutRequest(put_request),
@@ -451,14 +445,8 @@ mod tests {
         let content = b"test content";
         let wrong_address = [0xFF; 32]; // Wrong address
 
-        let put_request = ChunkPutRequest::with_payment(
-            wrong_address,
-            content.to_vec(),
-            rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-                peer_quotes: vec![],
-            })
-            .unwrap(),
-        );
+        // No payment proof needed (EVM disabled in test)
+        let put_request = ChunkPutRequest::new(wrong_address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 20,
             body: ChunkMessageBody::PutRequest(put_request),
@@ -521,15 +509,8 @@ mod tests {
         let content = b"duplicate content";
         let address = LmdbStorage::compute_address(content);
 
-        // Store first time
-        let put_request = ChunkPutRequest::with_payment(
-            address,
-            content.to_vec(),
-            rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-                peer_quotes: vec![],
-            })
-            .unwrap(),
-        );
+        // Store first time - no payment proof needed (EVM disabled in test)
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
         let put_msg = ChunkMessage {
             request_id: 40,
             body: ChunkMessageBody::PutRequest(put_request),

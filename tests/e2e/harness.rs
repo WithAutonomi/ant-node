@@ -104,6 +104,17 @@ impl TestHarness {
         Self::setup_with_evm_and_config(TestNetworkConfig::default()).await
     }
 
+    /// Create and start a test network with Anvil EVM testnet (alias for `setup_with_evm`).
+    ///
+    /// Use this for tests that require payment verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the network or Anvil fails to start.
+    pub async fn setup_with_payments() -> Result<Self> {
+        Self::setup_with_evm().await
+    }
+
     /// Create and start a test network with Anvil EVM testnet and custom config.
     ///
     /// # Arguments
@@ -178,6 +189,16 @@ impl TestHarness {
     #[must_use]
     pub fn test_node(&self, index: usize) -> Option<&TestNode> {
         self.network.node(index)
+    }
+
+    /// Access a specific test node mutably.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The node index (0-based)
+    #[must_use]
+    pub fn test_node_mut(&mut self, index: usize) -> Option<&mut TestNode> {
+        self.network.node_mut(index)
     }
 
     /// Get a random non-bootstrap node.

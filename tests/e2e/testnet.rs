@@ -15,6 +15,7 @@
 
 use ant_evm::RewardsAddress;
 use bytes::Bytes;
+use evmlib::wallet::Wallet;
 use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
@@ -22,7 +23,7 @@ use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
 };
-use saorsa_node::client::{send_and_await_chunk_response, DataChunk, XorName};
+use saorsa_node::client::{send_and_await_chunk_response, DataChunk, QuantumClient, XorName};
 use saorsa_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -205,6 +206,7 @@ impl Default for TestNetworkConfig {
 
         // Random port in isolated range to avoid collisions in parallel tests.
         // Ensure we have room for DEFAULT_NODE_COUNT consecutive ports.
+        // Calculation: base_port + (DEFAULT_NODE_COUNT - 1) must be < TEST_PORT_RANGE_MAX
         // Safety: DEFAULT_NODE_COUNT (25) fits in u16.
         #[allow(clippy::cast_possible_truncation)]
         let max_base_port = TEST_PORT_RANGE_MAX.saturating_sub(DEFAULT_NODE_COUNT as u16);
@@ -324,6 +326,12 @@ pub struct TestNode {
     /// ANT protocol handler (`AntProtocol`) for processing chunk PUT/GET requests.
     pub ant_protocol: Option<Arc<AntProtocol>>,
 
+    /// `QuantumClient` for payment-enabled operations.
+    pub client: Option<Arc<QuantumClient>>,
+
+    /// EVM wallet for payment operations.
+    pub wallet: Option<Wallet>,
+
     /// Is this a bootstrap node?
     pub is_bootstrap: bool,
 
@@ -341,6 +349,51 @@ pub struct TestNode {
 }
 
 impl TestNode {
+    /// Set wallet for payment tests.
+    ///
+    /// This updates the node's wallet and creates a new `QuantumClient` configured
+    /// with the P2P node for network operations.
+    pub fn set_wallet(&mut self, wallet: Wallet) {
+        self.wallet = Some(wallet);
+
+        // Create a new QuantumClient with the P2P node if available
+        if let Some(ref p2p_node) = self.p2p_node {
+            let client = QuantumClient::with_defaults().with_node(Arc::clone(p2p_node));
+            self.client = Some(Arc::new(client));
+        }
+    }
+
+    /// Store a chunk using the `QuantumClient` (with payment).
+    ///
+    /// This is the payment-enabled variant that uses the `QuantumClient` to handle
+    /// quote requests, payments, and chunk storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not configured or the store operation fails.
+    pub async fn store_chunk_with_payment(&self, data: &[u8]) -> Result<XorName> {
+        let client = self.client.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+
+        client
+            .put_chunk(Bytes::from(data.to_vec()))
+            .await
+            .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
+    }
+
+    /// Retrieve a chunk using the `QuantumClient`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not configured or the retrieval fails.
+    pub async fn get_chunk_with_client(&self, address: &XorName) -> Result<Option<DataChunk>> {
+        let client = self.client.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+
+        client
+            .get_chunk(address)
+            .await
+            .map_err(|e| TestnetError::Retrieval(format!("Client GET error: {e}")))
+    }
+
     /// Check if this node is running.
     pub async fn is_running(&self) -> bool {
         matches!(
@@ -391,16 +444,11 @@ impl TestNode {
         // Compute content address
         let address = Self::compute_chunk_address(data);
 
-        // Create PUT request with empty payment proof (EVM disabled in tests)
-        let empty_payment = rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-            peer_quotes: vec![],
-        })
-        .map_err(|e| {
-            TestnetError::Serialization(format!("Failed to serialize payment proof: {e}"))
-        })?;
-
+        // Create PUT request WITHOUT payment proof (EVM disabled in tests)
+        // When EVM verification is disabled, we send None instead of an empty proof
+        // to avoid triggering the fail-secure rejection in PaymentVerifier
         let request_id: u64 = rand::thread_rng().gen();
-        let request = ChunkPutRequest::with_payment(address, data.to_vec(), empty_payment);
+        let request = ChunkPutRequest::new(address, data.to_vec());
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
@@ -551,17 +599,11 @@ impl TestNode {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
         let target_peer_id = target_peer_id.to_string();
 
-        // Create PUT request
+        // Create PUT request WITHOUT payment proof (EVM disabled in tests)
         let address = Self::compute_chunk_address(data);
-        let empty_payment = rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-            peer_quotes: vec![],
-        })
-        .map_err(|e| {
-            TestnetError::Serialization(format!("Failed to serialize payment proof: {e}"))
-        })?;
 
         let request_id: u64 = rand::thread_rng().gen();
-        let request = ChunkPutRequest::with_payment(address, data.to_vec(), empty_payment);
+        let request = ChunkPutRequest::new(address, data.to_vec());
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
@@ -936,6 +978,8 @@ impl TestNetwork {
             data_dir,
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
+            client: None,
+            wallet: None,
             is_bootstrap,
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,

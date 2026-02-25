@@ -56,6 +56,24 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building saorsa-node with config: {:?}", self.config);
 
+        // Validate production requirements
+        if self.config.network_mode == NetworkMode::Production && !self.config.payment.enabled {
+            return Err(Error::Config(
+                "CRITICAL: Payment verification is REQUIRED in production mode. \
+                 Remove 'enabled = false' from config or --disable-payment-verification flag."
+                    .to_string(),
+            ));
+        }
+
+        // Warn if payment disabled in any mode
+        if !self.config.payment.enabled {
+            warn!("⚠️  ⚠️  ⚠️");
+            warn!("⚠️  PAYMENT VERIFICATION DISABLED");
+            warn!("⚠️  This should ONLY be used for testing!");
+            warn!("⚠️  All storage requests will be accepted for FREE");
+            warn!("⚠️  ⚠️  ⚠️");
+        }
+
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Self::resolve_identity(&mut self.config).await?;
         let peer_id = node_id_to_peer_id(identity.node_id());

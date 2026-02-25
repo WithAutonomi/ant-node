@@ -120,10 +120,12 @@ impl QuantumClient {
     ///
     /// Returns an error if the network operation fails.
     pub async fn get_chunk(&self, address: &XorName) -> Result<Option<DataChunk>> {
-        debug!(
-            "Querying saorsa network for chunk: {}",
-            hex::encode(address)
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Querying saorsa network for chunk: {}",
+                hex::encode(address)
+            );
+        }
 
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
@@ -160,18 +162,22 @@ impl QuantumClient {
                     if addr == *address {
                         let computed = crate::client::compute_address(&content);
                         if computed == addr {
-                            debug!(
-                                "Found chunk {} on saorsa network ({} bytes)",
-                                hex::encode(addr),
-                                content.len()
-                            );
+                            if tracing::enabled!(tracing::Level::DEBUG) {
+                                debug!(
+                                    "Found chunk {} on saorsa network ({} bytes)",
+                                    hex::encode(addr),
+                                    content.len()
+                                );
+                            }
                             Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
                         } else {
-                            warn!(
-                                "Peer returned chunk {} with invalid content hash {}",
-                                addr_hex,
-                                hex::encode(computed)
-                            );
+                            if tracing::enabled!(tracing::Level::WARN) {
+                                warn!(
+                                    "Peer returned chunk {} with invalid content hash {}",
+                                    addr_hex,
+                                    hex::encode(computed)
+                                );
+                            }
                             Some(Err(Error::InvalidChunk(format!(
                                 "Invalid chunk content: expected hash {}, got {}",
                                 addr_hex,
@@ -179,11 +185,13 @@ impl QuantumClient {
                             ))))
                         }
                     } else {
-                        warn!(
-                            "Peer returned chunk {} but we requested {}",
-                            hex::encode(addr),
-                            addr_hex
-                        );
+                        if tracing::enabled!(tracing::Level::WARN) {
+                            warn!(
+                                "Peer returned chunk {} but we requested {}",
+                                hex::encode(addr),
+                                addr_hex
+                            );
+                        }
                         Some(Err(Error::InvalidChunk(format!(
                             "Mismatched chunk address: expected {}, got {}",
                             addr_hex,
@@ -268,17 +276,21 @@ impl QuantumClient {
             timeout,
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
-                    info!(
-                        "Chunk stored at address: {} ({} bytes)",
-                        hex::encode(addr),
-                        content_len
-                    );
+                    if tracing::enabled!(tracing::Level::INFO) {
+                        info!(
+                            "Chunk stored at address: {} ({} bytes)",
+                            hex::encode(addr),
+                            content_len
+                        );
+                    }
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
                     address: addr,
                 }) => {
-                    info!("Chunk already exists at address: {}", hex::encode(addr));
+                    if tracing::enabled!(tracing::Level::INFO) {
+                        info!("Chunk already exists at address: {}", hex::encode(addr));
+                    }
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
@@ -316,10 +328,12 @@ impl QuantumClient {
     ///
     /// Returns an error if the network operation fails.
     pub async fn exists(&self, address: &XorName) -> Result<bool> {
-        debug!(
-            "Checking existence on saorsa network: {}",
-            hex::encode(address)
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Checking existence on saorsa network: {}",
+                hex::encode(address)
+            );
+        }
         self.get_chunk(address).await.map(|opt| opt.is_some())
     }
 
@@ -347,11 +361,13 @@ impl QuantumClient {
             })
             .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
 
-        debug!(
-            "Selected closest peer {} for target {}",
-            closest.peer_id,
-            hex::encode(target)
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Selected closest peer {} for target {}",
+                closest.peer_id,
+                hex::encode(target)
+            );
+        }
 
         Ok(closest.peer_id)
     }

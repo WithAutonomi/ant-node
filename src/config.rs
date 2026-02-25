@@ -193,11 +193,18 @@ pub enum EvmNetworkConfig {
 
 /// Payment verification configuration.
 ///
+/// **Production nodes require payment by default.**
+///
 /// All new data requires EVM payment on Arbitrum. The cache stores
 /// previously verified payments to avoid redundant lookups.
+///
+/// To disable payment verification (test/dev only):
+/// - Use CLI flag: `--disable-payment-verification`
+/// - Or set `enabled = false` in config file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentConfig {
     /// Enable payment verification.
+    /// **Default: true (payment required).**
     #[serde(default = "default_payment_enabled")]
     pub enabled: bool,
 
@@ -497,4 +504,25 @@ fn default_testnet_bootstrap() -> Vec<SocketAddr> {
         // saorsa-bootstrap-2 (Digital Ocean SFO3)
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(164, 92, 111, 156), 12000)),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_requires_payment() {
+        let config = PaymentConfig::default();
+        assert!(config.enabled, "Payment must be enabled by default");
+    }
+
+    #[test]
+    fn test_default_evm_verifier_enabled() {
+        use crate::payment::EvmVerifierConfig;
+        let config = EvmVerifierConfig::default();
+        assert!(
+            config.enabled,
+            "EVM verification must be enabled by default"
+        );
+    }
 }

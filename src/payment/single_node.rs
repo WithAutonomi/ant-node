@@ -76,10 +76,8 @@ impl SingleNodePayment {
         quotes_with_prices.sort_by_key(|(_, price)| *price);
 
         // Get median price and calculate 3x
-        let median_price = quotes_with_prices
-            .get(MEDIAN_INDEX)
-            .ok_or_else(|| Error::Payment("Missing median quote".to_string()))?
-            .1;
+        // Safe: we validated length == REQUIRED_QUOTES above, so MEDIAN_INDEX (2) is in bounds
+        let median_price = quotes_with_prices[MEDIAN_INDEX].1;
         let enhanced_price = median_price
             .checked_mul(Amount::from(3u64))
             .ok_or_else(|| {
@@ -120,7 +118,7 @@ impl SingleNodePayment {
     /// Get the median quote that receives payment.
     ///
     /// This always returns a valid reference since the array is fixed-size
-    /// and `MEDIAN_INDEX` is guaranteed to be in bounds.
+    /// and `MEDIAN_INDEX` (2) is guaranteed to be in bounds for a 5-element array.
     #[must_use]
     pub fn paid_quote(&self) -> &QuotePaymentInfo {
         &self.quotes[MEDIAN_INDEX]
@@ -154,29 +152,23 @@ impl SingleNodePayment {
             },
         )?;
 
-        // Collect transaction hashes for all quotes
-        // Note: wallet may not return tx_hash for zero-amount payments
-        let result_hashes: Vec<_> = self
-            .quotes
-            .iter()
-            .filter_map(|quote_info| {
-                if let Some(&tx_hash) = tx_hashes.get(&quote_info.quote_hash) {
-                    Some(Ok(tx_hash))
-                } else if quote_info.amount != Amount::ZERO {
-                    // Non-zero amount should have a transaction hash
-                    Some(Err(Error::Payment(format!(
-                        "Missing transaction hash for non-zero quote {} (amount: {})",
-                        quote_info.quote_hash, quote_info.amount
-                    ))))
-                } else {
-                    // Zero-amount payments may not get a transaction
-                    None
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Collect transaction hashes only for non-zero amount quotes
+        // Zero-amount quotes don't generate on-chain transactions
+        let mut result_hashes = Vec::new();
+        for quote_info in &self.quotes {
+            if quote_info.amount > Amount::ZERO {
+                let tx_hash = tx_hashes.get(&quote_info.quote_hash).ok_or_else(|| {
+                    Error::Payment(format!(
+                        "Missing transaction hash for non-zero quote {}",
+                        quote_info.quote_hash
+                    ))
+                })?;
+                result_hashes.push(*tx_hash);
+            }
+        }
 
         info!(
-            "Payment successful: {} transactions (expected 1-5)",
+            "Payment successful: {} on-chain transactions",
             result_hashes.len()
         );
 
@@ -206,6 +198,9 @@ impl SingleNodePayment {
         owned_quote_hash: Option<QuoteHash>,
     ) -> Result<Amount> {
         // Use zero metrics for verification (contract doesn't validate them)
+        // Note: QuotingMetrics is from external crate and contains Vec<(u32, u32)>,
+        // so it cannot be Copy. We must clone for each quote.
+        // Performance impact: negligible - Vec is empty so clones are cheap (no heap data)
         let zero_metrics = QuotingMetrics {
             data_size: 0,
             data_type: 0,
@@ -219,6 +214,7 @@ impl SingleNodePayment {
         };
 
         // Build payment digest for all 5 quotes
+        // Each quote needs an owned QuotingMetrics (tuple requires ownership)
         let payment_digest: Vec<_> = self
             .quotes
             .iter()
@@ -273,6 +269,7 @@ mod tests {
     use evmlib::transaction_config::TransactionConfig;
     use evmlib::utils::{dummy_address, dummy_hash};
     use reqwest::Url;
+    use serial_test::serial;
 
     /// Start an Anvil node with increased timeout for CI environments.
     ///
@@ -298,10 +295,11 @@ mod tests {
         (anvil, url)
     }
 
-    /// Step 1: Exact copy of autonomi's `test_verify_payment_on_local`
+    /// Test: Standard 5-quote payment verification (autonomi baseline)
     #[tokio::test]
+    #[serial]
     #[allow(clippy::expect_used)]
-    async fn test_exact_copy_of_autonomi_verify_payment() {
+    async fn test_standard_five_quote_payment() {
         // Use autonomi's setup pattern with increased timeout for CI
         let (node, rpc_url) = start_node_with_timeout();
         let network_token = deploy_network_token_contract(&rpc_url, &node).await;
@@ -373,13 +371,14 @@ mod tests {
         }
 
         println!("✓ All {} payments verified successfully", 5);
-        println!("\n✅ Exact autonomi pattern works!");
+        println!("\n✅ Standard 5-quote payment works!");
     }
 
-    /// Step 3: Pay 3x for ONE quote and 0 for the other 4 (`SingleNode` mode)
+    /// Test: `SingleNode` payment strategy (1 real + 4 dummy payments)
     #[tokio::test]
+    #[serial]
     #[allow(clippy::expect_used)]
-    async fn test_step3_single_node_payment_pattern() {
+    async fn test_single_node_payment_strategy() {
         let (node, rpc_url) = start_node_with_timeout();
         let network_token = deploy_network_token_contract(&rpc_url, &node).await;
         let mut payment_vault =
@@ -463,12 +462,13 @@ mod tests {
             println!("  Dummy payment {}: valid={}", i + 1, result.isValid);
         }
 
-        println!("\n✅ Step 3: SingleNode pattern (1 real + 4 dummy) works!");
+        println!("\n✅ SingleNode payment strategy works!");
     }
 
-    /// Step 4: Complete `SingleNode` payment flow with real quotes
+    /// Test: Complete `SingleNode` flow with real contract prices
     #[tokio::test]
-    async fn test_step4_complete_single_node_payment_flow() -> Result<()> {
+    #[serial]
+    async fn test_single_node_with_real_prices() -> Result<()> {
         use evmlib::testnet::Testnet;
         use evmlib::wallet::Wallet;
         use std::time::SystemTime;
@@ -514,12 +514,19 @@ mod tests {
             };
 
             // Get market price for this quote
+            // PERF-004: Clone required - payment_vault::get_market_price (external API from evmlib)
+            // takes ownership of Vec<QuotingMetrics>. We need quoting_metrics again below for
+            // PaymentQuote construction, so the clone is unavoidable.
             let prices = payment_vault::get_market_price(&network, vec![quoting_metrics.clone()])
                 .await
                 .map_err(|e| Error::Payment(format!("Failed to get market price: {e}")))?;
 
             let price = prices.first().ok_or_else(|| {
-                Error::Payment("Empty price list from get_market_price".to_string())
+                Error::Payment(format!(
+                    "Empty price list from get_market_price for quote {}: expected at least 1 price but got {} elements",
+                    i,
+                    prices.len()
+                ))
             })?;
 
             let quote = PaymentQuote {
@@ -550,7 +557,13 @@ mod tests {
         let median_amount = payment
             .quotes
             .get(MEDIAN_INDEX)
-            .ok_or_else(|| Error::Payment("Missing median quote".to_string()))?
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Index out of bounds: tried to access median index {} but quotes array has {} elements",
+                    MEDIAN_INDEX,
+                    payment.quotes.len()
+                ))
+            })?
             .amount;
         assert_eq!(
             payment.total_amount(),
@@ -571,7 +584,13 @@ mod tests {
         let median_quote = payment
             .quotes
             .get(MEDIAN_INDEX)
-            .ok_or_else(|| Error::Payment("Missing median quote".to_string()))?;
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Index out of bounds: tried to access median index {} but quotes array has {} elements",
+                    MEDIAN_INDEX,
+                    payment.quotes.len()
+                ))
+            })?;
         let median_quote_hash = median_quote.quote_hash;
         let verified_amount = payment.verify(&network, Some(median_quote_hash)).await?;
 
@@ -581,7 +600,7 @@ mod tests {
         );
 
         println!("✓ Payment verified: {verified_amount} atto");
-        println!("\n✅ Step 4: Complete SingleNode flow with real quotes works!");
+        println!("\n✅ Complete SingleNode flow with real prices works!");
 
         Ok(())
     }

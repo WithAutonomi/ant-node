@@ -207,6 +207,58 @@ impl TestAnvil {
         Ok(())
     }
 
+    /// Create a wallet funded with test tokens.
+    ///
+    /// This creates a wallet using one of Anvil's pre-funded test accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if wallet creation fails.
+    pub async fn create_funded_wallet(&self) -> Result<evmlib::wallet::Wallet> {
+        use evmlib::testnet::Testnet;
+        use evmlib::wallet::Wallet;
+
+        // Start a new Anvil testnet with deployed contracts
+        let testnet = Testnet::new().await;
+        let network = testnet.to_network();
+
+        // Use the default Anvil account (pre-funded)
+        let private_key = testnet.default_wallet_private_key();
+        let wallet = Wallet::new_from_private_key(network, &private_key)
+            .map_err(|e| AnvilError::Startup(format!("Failed to create funded wallet: {e}")))?;
+
+        debug!("Created funded wallet with address: {}", wallet.address());
+        Ok(wallet)
+    }
+
+    /// Create an empty wallet (for testing insufficient funds).
+    ///
+    /// This creates a wallet with a random private key that has no balance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if wallet creation fails.
+    pub async fn create_empty_wallet(&self) -> Result<evmlib::wallet::Wallet> {
+        use evmlib::testnet::Testnet;
+        use evmlib::wallet::Wallet;
+
+        // Start a new Anvil testnet to get the network configuration
+        let testnet = Testnet::new().await;
+        let network = testnet.to_network();
+
+        // Generate a random private key (no funds)
+        let random_key = format!("0x{}", hex::encode(rand::random::<[u8; 32]>()));
+
+        let wallet = Wallet::new_from_private_key(network, &random_key)
+            .map_err(|e| AnvilError::Startup(format!("Failed to create empty wallet: {e}")))?;
+
+        debug!(
+            "Created empty wallet (no funds) with address: {}",
+            wallet.address()
+        );
+        Ok(wallet)
+    }
+
     /// Shutdown the Anvil testnet.
     pub async fn shutdown(&mut self) {
         if self.running {

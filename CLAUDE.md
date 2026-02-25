@@ -47,6 +47,19 @@ RUST_LOG=debug cargo run --release -- --listen 0.0.0.0:10000
 - No `panic!()` - Return `Result` instead
 - **Exception**: Test code may use these for assertions
 
+### Payment Verification Policy
+**Production nodes require payment by default.**
+
+- All new chunk storage requires EVM payment verification on Arbitrum
+- Payment verification is **enabled by default** via `PaymentConfig::default()`
+- Test environments can disable payment via:
+  - CLI flag: `--disable-payment-verification`
+  - Config: `PaymentVerifierConfig { evm: EvmVerifierConfig { enabled: false, .. }, .. }`
+- Previously-paid chunks are cached and do not require re-verification
+- Test utilities (e.g., `create_test_protocol()`) explicitly disable EVM verification
+
+See `src/payment/verifier.rs` for implementation details.
+
 ---
 
 ## 🚨 CRITICAL: Saorsa Network Infrastructure & Port Isolation

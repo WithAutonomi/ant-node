@@ -7,7 +7,8 @@ use crate::error::{Error, Result};
 use crate::payment::cache::{VerifiedCache, XorName};
 use ant_evm::ProofOfPayment;
 use evmlib::Network as EvmNetwork;
-use tracing::{debug, info, warn};
+use futures::future::try_join_all;
+use tracing::{debug, info};
 
 /// Configuration for EVM payment verification.
 #[derive(Debug, Clone)]
@@ -116,15 +117,19 @@ impl PaymentVerifier {
     pub fn check_payment_required(&self, xorname: &XorName) -> PaymentStatus {
         // Check LRU cache (fast path)
         if self.cache.contains(xorname) {
-            debug!("Data {} found in verified cache", hex::encode(xorname));
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                debug!("Data {} found in verified cache", hex::encode(xorname));
+            }
             return PaymentStatus::CachedAsVerified;
         }
 
         // Not in cache - payment required
-        debug!(
-            "Data {} not in cache - payment required",
-            hex::encode(xorname)
-        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Data {} not in cache - payment required",
+                hex::encode(xorname)
+            );
+        }
         PaymentStatus::PaymentRequired
     }
 
@@ -162,38 +167,62 @@ impl PaymentVerifier {
             }
             PaymentStatus::PaymentRequired => {
                 // Payment is required - verify the proof
-                match payment_proof {
-                    Some(proof) => {
-                        if proof.is_empty() {
-                            return Err(Error::Payment("Empty payment proof".to_string()));
+                if let Some(proof) = payment_proof {
+                    if proof.is_empty() {
+                        return Err(Error::Payment("Empty payment proof".to_string()));
+                    }
+                    if proof.len() < 32 {
+                        return Err(Error::Payment(format!(
+                            "Payment proof too small: {} bytes (min 32)",
+                            proof.len()
+                        )));
+                    }
+                    if proof.len() > 10_240 {
+                        return Err(Error::Payment(format!(
+                            "Payment proof too large: {} bytes (max 10KB)",
+                            proof.len()
+                        )));
+                    }
+
+                    // Deserialize the ProofOfPayment
+                    let payment: ProofOfPayment = rmp_serde::from_slice(proof).map_err(|e| {
+                        Error::Payment(format!("Failed to deserialize payment proof: {e}"))
+                    })?;
+
+                    // Verify the payment using EVM
+                    self.verify_evm_payment(xorname, &payment).await?;
+
+                    // Cache the verified xorname
+                    self.cache.insert(*xorname);
+
+                    Ok(PaymentStatus::PaymentVerified)
+                } else {
+                    // No payment provided
+                    // Test mode: Allow storage without payment when EVM is disabled
+                    // This is safe because verify_evm_payment() will reject any provided proofs
+                    if !self.config.evm.enabled {
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            debug!(
+                                "Test mode: Allowing storage without payment (EVM disabled): {}",
+                                hex::encode(xorname)
+                            );
                         }
-
-                        // Deserialize the ProofOfPayment
-                        let payment: ProofOfPayment =
-                            rmp_serde::from_slice(proof).map_err(|e| {
-                                Error::Payment(format!("Failed to deserialize payment proof: {e}"))
-                            })?;
-
-                        // Verify the payment using EVM
-                        self.verify_evm_payment(xorname, &payment).await?;
-
-                        // Cache the verified xorname
+                        // Cache it so subsequent requests don't re-check
                         self.cache.insert(*xorname);
+                        return Ok(PaymentStatus::PaymentVerified);
+                    }
 
-                        Ok(PaymentStatus::PaymentVerified)
-                    }
-                    None => {
-                        // No payment provided
-                        Err(Error::Payment(format!(
-                            "Payment required for new data {}",
-                            hex::encode(xorname)
-                        )))
-                    }
+                    // Production: Payment required
+                    Err(Error::Payment(format!(
+                        "Payment required for new data {}",
+                        hex::encode(xorname)
+                    )))
                 }
             }
             PaymentStatus::PaymentVerified => {
-                // This shouldn't happen from check_payment_required
-                Ok(status)
+                unreachable!(
+                    "check_payment_required only returns CachedAsVerified or PaymentRequired"
+                )
             }
         }
     }
@@ -218,33 +247,58 @@ impl PaymentVerifier {
 
     /// Verify an EVM payment proof.
     ///
-    /// This verifies that:
+    /// This is production-only verification that ALWAYS validates payment proofs.
+    /// It verifies that:
     /// 1. All quote signatures are valid
     /// 2. The payment was made on-chain
+    ///
+    /// Test environments should disable EVM at the `verify_payment` level,
+    /// not bypass verification here.
     async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
-        debug!(
-            "Verifying EVM payment for {} with {} quotes",
-            hex::encode(xorname),
-            payment.peer_quotes.len()
-        );
-
-        // Skip EVM verification if disabled
-        if !self.config.evm.enabled {
-            warn!("EVM verification disabled - accepting payment without on-chain check");
-            return Ok(());
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Verifying EVM payment for {} with {} quotes",
+                hex::encode(xorname),
+                payment.peer_quotes.len()
+            );
         }
 
-        // Verify quote signatures first (doesn't require network)
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let peer_id = encoded_peer_id
-                .to_peer_id()
-                .map_err(|e| Error::Payment(format!("Invalid peer ID in payment proof: {e}")))?;
+        // Production-only verification - EVM must be enabled to call this function
+        if !self.config.evm.enabled {
+            return Err(Error::Payment(
+                "EVM verification is disabled - cannot verify payment".to_string(),
+            ));
+        }
 
-            if !quote.check_is_signed_by_claimed_peer(peer_id) {
-                return Err(Error::Payment(format!(
-                    "Quote signature invalid for peer {peer_id}"
-                )));
-            }
+        // Verify quote signatures in parallel (doesn't require network).
+        // Each signature verification is CPU-bound and independent, so we can parallelize.
+        let verification_futures: Vec<_> = payment
+            .peer_quotes
+            .iter()
+            .map(|(encoded_peer_id, quote)| {
+                let encoded_peer_id = encoded_peer_id.clone();
+                let quote = quote.clone();
+                tokio::task::spawn_blocking(move || {
+                    let peer_id = encoded_peer_id.to_peer_id().map_err(|e| {
+                        Error::Payment(format!("Invalid peer ID in payment proof: {e}"))
+                    })?;
+
+                    if !quote.check_is_signed_by_claimed_peer(peer_id) {
+                        return Err(Error::Payment(format!(
+                            "Quote signature invalid for peer {peer_id}"
+                        )));
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        // Wait for all verifications to complete and propagate any errors
+        for result in try_join_all(verification_futures)
+            .await
+            .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
+        {
+            result?;
         }
 
         // Get the payment digest for on-chain verification
@@ -266,7 +320,9 @@ impl PaymentVerifier {
         .await
         {
             Ok(_amount) => {
-                info!("EVM payment verified for {}", hex::encode(xorname));
+                if tracing::enabled!(tracing::Level::INFO) {
+                    info!("EVM payment verified for {}", hex::encode(xorname));
+                }
                 Ok(())
             }
             Err(evmlib::contract::payment_vault::error::Error::PaymentInvalid) => {
@@ -327,9 +383,14 @@ mod tests {
         let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
-        // Should fail without payment proof
+        // Test mode (EVM disabled): Should SUCCEED without payment proof
+        // This allows tests to run without needing real EVM payments
         let result = verifier.verify_payment(&xorname, None).await;
-        assert!(result.is_err());
+        assert!(result.is_ok(), "Expected Ok in test mode, got: {result:?}");
+        assert_eq!(
+            result.expect("should succeed"),
+            PaymentStatus::PaymentVerified
+        );
     }
 
     #[tokio::test]
@@ -337,17 +398,25 @@ mod tests {
         let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
-        // Create a valid (but empty) ProofOfPayment
+        // Create a properly-sized proof that will pass size validation
+        // but fail EVM verification (since EVM is disabled)
         let proof = ProofOfPayment {
             peer_quotes: vec![],
         };
-        let proof_bytes = rmp_serde::to_vec(&proof).expect("should serialize");
+        let mut proof_bytes = rmp_serde::to_vec(&proof).expect("should serialize");
+        // Pad to at least 32 bytes to pass size validation
+        proof_bytes.resize(32, 0);
 
-        // Should succeed with a valid proof when EVM verification is disabled
-        // Note: With EVM verification disabled, even empty proofs pass
+        // Should FAIL because EVM verification is disabled (fail-secure behavior)
+        // We fixed the security hole - EVM disabled now rejects all payments
         let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
-        assert!(result.is_ok(), "Expected Ok, got: {result:?}");
-        assert_eq!(result.expect("verified"), PaymentStatus::PaymentVerified);
+        assert!(result.is_err(), "Expected Err, got: {result:?}");
+        let err = result.expect_err("should be error");
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("EVM verification is disabled"),
+            "Expected error to contain 'EVM verification is disabled', got: {err_msg}"
+        );
     }
 
     #[tokio::test]

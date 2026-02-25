@@ -218,6 +218,18 @@ cd /opt/communitas
 ./communitas-headless --listen 0.0.0.0:11000 --bootstrap
 ```
 
+## Production Configuration
+
+Before deploying, create `/etc/saorsa/production.toml` based on the template in `config/production.toml`:
+
+```bash
+sudo mkdir -p /etc/saorsa
+sudo cp config/production.toml /etc/saorsa/production.toml
+sudo nano /etc/saorsa/production.toml  # Set your rewards_address
+```
+
+**CRITICAL**: Ensure `payment.enabled = true` in the config file.
+
 ## Systemd Service Templates
 
 ### ant-quic Bootstrap Service
@@ -248,7 +260,8 @@ After=network.target
 [Service]
 Type=simple
 User=root
-ExecStart=/opt/saorsa-node/saorsa-node --listen 0.0.0.0:10000 --bootstrap
+ExecStart=/opt/saorsa-node/saorsa-node --config /etc/saorsa/production.toml --listen 0.0.0.0:10000 --bootstrap
+# CRITICAL: DO NOT add --disable-payment-verification flag in production
 Restart=always
 RestartSec=10
 

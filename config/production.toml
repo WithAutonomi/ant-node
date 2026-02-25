@@ -1,0 +1,58 @@
+# Production Configuration for saorsa-node
+#
+# ⚠️  CRITICAL SECURITY REQUIREMENTS:
+# - payment.enabled MUST be true in production
+# - evm_network MUST be "arbitrum-one" (not testnet)
+# - DO NOT use --disable-payment-verification flag
+#
+# This template provides secure defaults for production deployment.
+
+[network]
+# Listen address for P2P connections
+# Production nodes should use port range 10000-10999
+listen = "0.0.0.0:10000"
+
+# Set to true ONLY for bootstrap/genesis nodes
+bootstrap = false
+
+# Network mode (do not change in production)
+mode = "production"
+
+[storage]
+# Root directory for chunk storage
+root_dir = "/var/lib/saorsa-node"
+
+# Maximum chunk size (1 MiB)
+max_chunk_size = 1048576
+
+# LMDB maximum database size (32 GiB default)
+# Increase if you expect to store more data
+max_db_size_bytes = 34359738368
+
+[payment]
+# ⚠️  DO NOT MODIFY THIS IN PRODUCTION ⚠️
+# Payment verification MUST be enabled for production nodes
+enabled = true
+
+# Payment cache capacity (number of verified payments to cache)
+cache_capacity = 100000
+
+# Your Arbitrum address for receiving storage payments
+# REQUIRED: Set this to your Arbitrum wallet address
+rewards_address = "0xYOUR_ARBITRUM_ADDRESS_HERE"
+
+# EVM network configuration
+[payment.evm_network]
+# MUST be "arbitrum-one" for production (not testnet)
+network = "arbitrum-one"
+
+# Payment metrics HTTP server port (optional)
+# metrics_port = 9090
+
+[logging]
+# Log level: trace, debug, info, warn, error
+# Use "info" for production, "debug" for troubleshooting
+level = "info"
+
+# Log format: "json" for structured logging, "text" for human-readable
+format = "json"
