@@ -50,7 +50,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                 |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                                |
-| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `20`                                |
+| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `4`                                 |
 | `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`              |
 | `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
