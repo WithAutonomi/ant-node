@@ -41,6 +41,8 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
 - `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when bootstrap peer requests are finished (response or timeout) and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
+- `RepairOpportunity(P, KSet)`: evidence that peer `P` has previously received replication hints/offers for keys in `KSet` and had at least one subsequent neighbor-sync cycle to repair before audit evaluation.
+- `EigenTrust`: trust subsystem that consumes replication evidence events, updates peer trust scores, and applies peer-eviction policy.
 
 ## 4. Tunable Parameters
 
@@ -58,8 +60,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[30 min, 1 hour]`        |
 | `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
-| `BAD_NODE_WINDOW` | Window for failure counting | `5 min`                             |
-| `BAD_NODE_THRESHOLD` | Failures needed for eviction | `3`                                 |
 
 Parameter safety constraints (MUST hold):
 
@@ -77,7 +77,7 @@ Parameter safety constraints (MUST hold):
 6. `CLOSE_GROUP_SIZE` is both the close-group width and the target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
-9. Bad-node decisions are local-only (no gossip reputation).
+9. Replication emits trust evidence/penalty signals to `EigenTrust`; trust-score thresholds and eviction decisions are outside replication logic.
 10. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
 11. Every neighbor-sync hint exchange reaches a deterministic terminal state.
 12. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
@@ -244,7 +244,7 @@ Transition requirements:
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
 - `Fetching -> FetchRetryable` when fetch fails (timeout, corrupt response, connection error), the transport classifies the attempt as retryable, and at least one untried verified source remains. Mark the failed source as tried so it is not selected again.
-- `Fetching -> FetchAbandoned` when fetch fails and either the transport classifies failure as terminal or all verified sources have been tried. Record a `ReplicationFailure` against the failed source(s).
+- `Fetching -> FetchAbandoned` when fetch fails and either the transport classifies failure as terminal or all verified sources have been tried. Emit `ReplicationFailure` evidence for the failed source(s).
 - `FetchRetryable -> QueuedForFetch` selects the next untried verified source and re-enters the fetch queue without repeating quorum verification.
 - `QuorumFailed -> QuorumAbandoned` is immediate and terminal for this offer lifecycle. Key is forgotten and stops consuming probe resources. Requires a new offer to re-enter the pipeline.
 - `QuorumInconclusive -> QuorumAbandoned` is immediate and terminal for this offer lifecycle. Requires a new offer to re-enter the pipeline.
@@ -347,21 +347,22 @@ Maintain tracker for closest peers and classify topology events:
 
 Goal: avoid replication storms from restart noise while still reacting to real topology shifts.
 
-## 14. Bad Node Detection and Eviction
+## 14. Failure Evidence and EigenTrust Integration
 
-Failure events include:
+Failure evidence types include:
 
-- Fetch timeout failures.
-- Audit failures (timeout, missing items, malformed response, or `AuditDigest` mismatch).
+- `ReplicationFailure`: failed fetch attempt from a source peer.
+- `AuditFailure`: timeout, missing items, malformed response, or `AuditDigest` mismatch.
 
 Rules:
 
-1. Track failures per peer over rolling `BAD_NODE_WINDOW`.
-2. Evict peer at `BAD_NODE_THRESHOLD` failures.
-3. Purge pending work assigned to evicted peer.
-4. Do not penalize stale failures if key already succeeded via another source (including via fetch retry from an alternate holder).
-5. Never gossip reputation; eviction is local.
-6. A `ReplicationFailure` is recorded per peer per failed fetch attempt, not per key. If a key requires two retries from two different peers before succeeding on the third, each of the two failed peers receives one failure event.
+1. Replication MUST emit failure evidence to the local `EigenTrust` subsystem; trust-score computation is out of scope for replication.
+2. Replication MUST NOT apply threshold-based peer eviction; eviction/quarantine decisions are owned by `EigenTrust` policy.
+3. A `ReplicationFailure` is emitted per peer per failed fetch attempt, not per key. If a key requires two retries from two different peers before succeeding on the third, each of the two failed peers emits one failure event.
+4. Replication SHOULD mark fetch-failure evidence as stale/low-confidence if the key later succeeds via an alternate verified source.
+5. On audit failure, replication MUST emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, and failure reason.
+6. Replication MUST emit a trust-penalty signal to `EigenTrust` for audit failure when `RepairOpportunity(challenged_peer_id, PeerKeySet(challenged_peer_id))` is true.
+7. Final trust-score updates and any eventual peer eviction are determined by `EigenTrust`, not by replication logic.
 
 ## 15. Storage Audit Protocol (Anti-Outsourcing)
 
@@ -446,7 +447,7 @@ Use this list to find design flaws before coding:
 9. Audit bias:
    - Are audit targets selected fairly, or can adversaries avoid frequent challenge?
 10. Failure attribution:
-   - Could transient network issues misclassify healthy peers as bad without dampening?
+   - Could transient network issues create unfair `EigenTrust` penalties without sufficient dampening/evidence quality?
 11. Paid-list poisoning:
    - Can colluding nodes in `PaidCloseGroup(K)` falsely mark unpaid keys as paid?
 12. Paid-list cold-start:
@@ -476,8 +477,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - First source times out, key transitions to `FetchRetryable`, re-enters `QueuedForFetch` with next verified source, and succeeds. Verification is not re-run. Failed source receives one `ReplicationFailure`; successful alternate source clears stale failure attribution (rule 14.4).
 10. Fetch retry exhaustion:
    - All verified sources fail or transport classifies failure as terminal. Key transitions to `FetchAbandoned`. Each failed source receives one `ReplicationFailure`.
-11. Repeated true source failures:
-   - Peer evicted exactly at threshold behavior.
+11. Repeated confirmed failures:
+   - Replication emits failure evidence and trust-penalty signals to `EigenTrust`; eviction decisions are made by `EigenTrust` policy rather than replication thresholds.
 12. Bootstrap quorum aggregation:
    - Node accepts only keys meeting multi-peer threshold.
 13. Responsible range shrink:
@@ -493,7 +494,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 18. Invalid runtime config:
    - Node rejects configs violating parameter safety constraints.
 19. Audit digest mismatch:
-   - Challenge fails when `AuditDigest` mismatches, even if response format is syntactically valid.
+   - Challenge fails when `AuditDigest` mismatches, even if response format is syntactically valid; replication emits `AuditFailure` evidence and emits a trust-penalty signal to `EigenTrust` only when `RepairOpportunity(...)` is true.
 20. Paid-list local hit:
    - Unknown key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
 21. Paid-list majority confirmation:
