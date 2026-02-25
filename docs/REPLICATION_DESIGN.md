@@ -280,7 +280,7 @@ For each unknown key:
 1. Deduplicate key in pending-verification table.
 2. If `K` is already in local `PaidForList`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
 3. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
-4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (including self).
+4. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self).
 5. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 6. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
 7. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
