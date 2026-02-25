@@ -46,6 +46,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
 - `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when bootstrap peer requests are finished (response or timeout) and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
 - `RepairOpportunity(P, KSet)`: evidence that peer `P` has previously received replication hints/offers for keys in `KSet` and had at least one subsequent neighbor-sync cycle to repair before audit evaluation.
+- `BootstrapClaimFirstSeen(N, P)`: timestamp when node `N` first observed peer `P` responding with a bootstrapping claim to a sync or audit request. Reset when `P` stops claiming bootstrap status.
 - `EigenTrust`: trust subsystem that consumes replication evidence events, updates peer trust scores, and applies peer-eviction policy.
 
 ## 4. Tunable Parameters
@@ -64,6 +65,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[30 min, 1 hour]`        |
 | `AUDIT_BATCH_SIZE` | Max local keys sampled per audit round (also max challenge items) | `8`                                 |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
+| `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status before penalties apply | `24h`                               |
 
 Parameter safety constraints (MUST hold):
 
@@ -95,6 +97,7 @@ Parameter safety constraints (MUST hold):
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys and filtered through local authenticated routing state (`LocalRT(self)`); random global peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: drop stored keys where `IsResponsible(self, K)` is false and drop paid-list keys where `self ∉ PaidCloseGroup(K)`.
+23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `EigenTrust`.
 
 ## 6. Replication Modes
 
@@ -126,7 +129,9 @@ Rules:
    a. If a candidate peer is on per-peer cooldown (`NEIGHBOR_SYNC_COOLDOWN` not elapsed since last successful sync with that peer), remove the peer from `NeighborSyncOrder(self)` and continue scanning.
    b. Otherwise, add the peer to `NeighborSyncSet(self)`.
    c. Stop when `|NeighborSyncSet(self)| = NEIGHBOR_SYNC_PEER_COUNT` or no unscanned peers remain in the snapshot.
-3. Node initiates sync with each peer in `NeighborSyncSet(self)`. If a peer is unreachable (connection failure/timeout), remove it from `NeighborSyncOrder(self)` and attempt to fill the vacated slot by resuming the scan from where rule 2 left off.
+3. Node initiates sync with each peer in `NeighborSyncSet(self)`. If a peer cannot be synced, remove it from `NeighborSyncOrder(self)` and attempt to fill the vacated slot by resuming the scan from where rule 2 left off. A peer cannot be synced if:
+   a. Unreachable (connection failure/timeout).
+   b. Peer responds with a bootstrapping claim. On first observation, record `BootstrapClaimFirstSeen(self, peer)`. If `now - BootstrapClaimFirstSeen(self, peer) <= BOOTSTRAP_CLAIM_GRACE_PERIOD`, accept the claim and skip without penalty. If the grace period has elapsed, emit `BootstrapClaimAbuse` evidence to `EigenTrust` and skip.
 4. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
 5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
 6. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
@@ -377,6 +382,7 @@ Failure evidence types include:
 
 - `ReplicationFailure`: failed fetch attempt from a source peer.
 - `AuditFailure`: timeout, missing items, malformed response, or `AuditDigest` mismatch.
+- `BootstrapClaimAbuse`: peer continues claiming bootstrap status after `BOOTSTRAP_CLAIM_GRACE_PERIOD` has elapsed since `BootstrapClaimFirstSeen`.
 
 Rules:
 
@@ -386,7 +392,9 @@ Rules:
 4. Replication SHOULD mark fetch-failure evidence as stale/low-confidence if the key later succeeds via an alternate verified source.
 5. On audit failure, replication MUST emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, and failure reason.
 6. Replication MUST emit a trust-penalty signal to `EigenTrust` for audit failure when `RepairOpportunity(challenged_peer_id, PeerKeySet(challenged_peer_id))` is true.
-7. Final trust-score updates and any eventual peer eviction are determined by `EigenTrust`, not by replication logic.
+7. On bootstrap claim past grace period, replication MUST emit `BootstrapClaimAbuse` evidence with `peer_id` and `BootstrapClaimFirstSeen` timestamp. Evidence is emitted on each sync or audit attempt where the peer claims bootstrapping after `BOOTSTRAP_CLAIM_GRACE_PERIOD`.
+8. When a peer that previously claimed bootstrap status stops claiming it (responds normally to sync or audit), node MUST clear `BootstrapClaimFirstSeen(self, peer)`.
+9. Final trust-score updates and any eventual peer eviction are determined by `EigenTrust`, not by replication logic.
 
 ## 15. Storage Audit Protocol (Anti-Outsourcing)
 
@@ -400,8 +408,10 @@ Challenge-response for claimed holders:
 6. Challenger removes peers with empty `PeerKeySet(P)`. If no peers remain, the audit tick is idle.
 7. Challenger selects one peer uniformly at random from remaining peers as `challenged_peer_id`.
 8. Challenger sends that peer an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
-9. Target computes and returns one `AuditDigest` as `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
-10. Challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
+9. Target responds with either an `AuditDigest` or a bootstrapping claim:
+   a. `AuditDigest`: `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
+   b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period. Audit tick ends (no `AuditDigest` verification).
+10. On `AuditDigest` response, challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
 
 Audit-proof requirements:
 
@@ -420,6 +430,7 @@ Audit challenge bound:
 Failure conditions:
 
 - Timeout, missing items, malformed response, or `AuditDigest` mismatch.
+- Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD` (emits `BootstrapClaimAbuse`, not `AuditFailure`).
 
 Audit trigger and target selection:
 
@@ -571,6 +582,14 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Multiple nodes restart simultaneously and lose `PaidForList` (persistence corrupted). Key `K` has `>= QuorumNeeded(K)` replicas in the close group. During neighbor-sync verification, presence quorum passes and all verifying nodes re-derive `K` into their `PaidForList` via close-group replica majority.
 45. Paid-list unrecoverable below quorum:
    - Key `K` has only 1 replica (below quorum) and `PaidForList` is lost across all `PaidCloseGroup(K)` members. Key cannot be recovered via either presence quorum or paid-list majority — accepted as explicit security-over-liveness tradeoff.
+46. Bootstrap claim within grace period (sync):
+   - Peer `P` responds with bootstrapping claim during sync. Node records `BootstrapClaimFirstSeen(self, P)`. `P` is removed from `NeighborSyncOrder(self)` and slot is filled from next peer. No penalty emitted.
+47. Bootstrap claim within grace period (audit):
+   - Challenged peer responds with bootstrapping claim during audit. Node records `BootstrapClaimFirstSeen`. Audit tick ends without `AuditFailure`. No penalty emitted.
+48. Bootstrap claim abuse after grace period:
+   - Peer `P` first claimed bootstrapping 25 hours ago (`> BOOTSTRAP_CLAIM_GRACE_PERIOD`). On next sync or audit attempt where `P` still claims bootstrapping, node emits `BootstrapClaimAbuse` evidence to `EigenTrust` with `peer_id` and `BootstrapClaimFirstSeen` timestamp.
+49. Bootstrap claim cleared on normal response:
+   - Peer `P` previously claimed bootstrapping. `P` later responds normally to a sync or audit request. Node clears `BootstrapClaimFirstSeen(self, P)`. No residual penalty tracking.
 
 ## 19. Acceptance Criteria for This Design
 
