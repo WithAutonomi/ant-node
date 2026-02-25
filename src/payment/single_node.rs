@@ -25,12 +25,15 @@ const MEDIAN_INDEX: usize = 2;
 
 /// Single node payment structure for a chunk.
 ///
-/// Contains 5 quotes where only the median-priced one receives payment (3x),
+/// Contains exactly 5 quotes where only the median-priced one receives payment (3x),
 /// and the other 4 have `Amount::ZERO`.
+///
+/// The fixed-size array ensures compile-time enforcement of the 5-quote requirement,
+/// making the median index (2) always valid.
 #[derive(Debug, Clone)]
 pub struct SingleNodePayment {
-    /// All 5 quotes (sorted by price)
-    pub quotes: Vec<QuotePaymentInfo>,
+    /// All 5 quotes (sorted by price) - fixed size ensures median index is always valid
+    pub quotes: [QuotePaymentInfo; REQUIRED_QUOTES],
 }
 
 /// Information about a single quote payment
@@ -49,18 +52,18 @@ pub struct QuotePaymentInfo {
 impl SingleNodePayment {
     /// Create a `SingleNode` payment from 5 quotes and their prices.
     ///
-    /// The quotes should already be sorted by price (cheapest first).
+    /// The quotes are automatically sorted by price (cheapest first).
     /// The median (index 2) gets 3x its quote price.
     /// The other 4 get `Amount::ZERO`.
     ///
     /// # Arguments
     ///
-    /// * `quotes_with_prices` - Vec of (`PaymentQuote`, Amount) tuples, sorted by price
+    /// * `quotes_with_prices` - Vec of (`PaymentQuote`, Amount) tuples (will be sorted internally)
     ///
     /// # Errors
     ///
     /// Returns error if not exactly 5 quotes are provided.
-    pub fn from_quotes(quotes_with_prices: Vec<(PaymentQuote, Amount)>) -> Result<Self> {
+    pub fn from_quotes(mut quotes_with_prices: Vec<(PaymentQuote, Amount)>) -> Result<Self> {
         if quotes_with_prices.len() != REQUIRED_QUOTES {
             return Err(Error::Payment(format!(
                 "SingleNode payment requires exactly {} quotes, got {}",
@@ -68,6 +71,9 @@ impl SingleNodePayment {
                 quotes_with_prices.len()
             )));
         }
+
+        // Sort by price (cheapest first) to ensure correct median selection
+        quotes_with_prices.sort_by_key(|(_, price)| *price);
 
         // Get median price and calculate 3x
         let median_price = quotes_with_prices
@@ -81,7 +87,8 @@ impl SingleNodePayment {
             })?;
 
         // Build quote payment info for all 5 quotes
-        let quotes = quotes_with_prices
+        // Use try_from to convert Vec to fixed-size array
+        let quotes_vec: Vec<QuotePaymentInfo> = quotes_with_prices
             .into_iter()
             .enumerate()
             .map(|(idx, (quote, _))| QuotePaymentInfo {
@@ -96,6 +103,11 @@ impl SingleNodePayment {
             })
             .collect();
 
+        // Convert Vec to array - we already validated length is REQUIRED_QUOTES
+        let quotes: [QuotePaymentInfo; REQUIRED_QUOTES] = quotes_vec
+            .try_into()
+            .map_err(|_| Error::Payment("Failed to convert quotes to fixed array".to_string()))?;
+
         Ok(Self { quotes })
     }
 
@@ -105,10 +117,13 @@ impl SingleNodePayment {
         self.quotes.iter().map(|q| q.amount).sum()
     }
 
-    /// Get the median quote that receives payment
+    /// Get the median quote that receives payment.
+    ///
+    /// This always returns a valid reference since the array is fixed-size
+    /// and `MEDIAN_INDEX` is guaranteed to be in bounds.
     #[must_use]
-    pub fn paid_quote(&self) -> Option<&QuotePaymentInfo> {
-        self.quotes.get(MEDIAN_INDEX)
+    pub fn paid_quote(&self) -> &QuotePaymentInfo {
+        &self.quotes[MEDIAN_INDEX]
     }
 
     /// Pay for all quotes on-chain using the wallet.
@@ -239,20 +254,46 @@ impl SingleNodePayment {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::node_bindings::{Anvil, AnvilInstance};
     use evmlib::contract::payment_vault::interface;
     use evmlib::quoting_metrics::QuotingMetrics;
-    use evmlib::testnet::{
-        deploy_data_payments_contract, deploy_network_token_contract, start_node,
-    };
+    use evmlib::testnet::{deploy_data_payments_contract, deploy_network_token_contract};
     use evmlib::transaction_config::TransactionConfig;
     use evmlib::utils::{dummy_address, dummy_hash};
+    use reqwest::Url;
+
+    /// Start an Anvil node with increased timeout for CI environments.
+    ///
+    /// The default timeout is 10 seconds which can be insufficient in CI.
+    /// This helper uses a 60-second timeout and random port assignment
+    /// to handle slower CI environments and parallel test execution.
+    #[allow(clippy::expect_used)]
+    fn start_node_with_timeout() -> (AnvilInstance, Url) {
+        const ANVIL_TIMEOUT_MS: u64 = 60_000; // 60 seconds for CI
+
+        let host = std::env::var("ANVIL_IP_ADDR").unwrap_or_else(|_| "localhost".to_string());
+
+        // Use port 0 to let the OS assign a random available port.
+        // This prevents port conflicts when running tests in parallel.
+        let anvil = Anvil::new()
+            .timeout(ANVIL_TIMEOUT_MS)
+            .try_spawn()
+            .expect(&format!(
+                "Could not spawn Anvil node after {ANVIL_TIMEOUT_MS}ms"
+            ));
+
+        let url = Url::parse(&format!("http://{host}:{}", anvil.port()))
+            .expect("Failed to parse Anvil URL");
+
+        (anvil, url)
+    }
 
     /// Step 1: Exact copy of autonomi's `test_verify_payment_on_local`
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn test_exact_copy_of_autonomi_verify_payment() {
-        // Use autonomi's setup pattern
-        let (node, rpc_url) = start_node();
+        // Use autonomi's setup pattern with increased timeout for CI
+        let (node, rpc_url) = start_node_with_timeout();
         let network_token = deploy_network_token_contract(&rpc_url, &node).await;
         let mut payment_vault =
             deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
@@ -329,7 +370,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn test_step2_three_payments() {
-        let (node, rpc_url) = start_node();
+        let (node, rpc_url) = start_node_with_timeout();
         let network_token = deploy_network_token_contract(&rpc_url, &node).await;
         let mut payment_vault =
             deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
@@ -406,7 +447,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)]
     async fn test_step3_single_node_payment_pattern() {
-        let (node, rpc_url) = start_node();
+        let (node, rpc_url) = start_node_with_timeout();
         let network_token = deploy_network_token_contract(&rpc_url, &node).await;
         let mut payment_vault =
             deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
@@ -560,17 +601,17 @@ mod tests {
             quotes_with_prices.push((quote, *price));
         }
 
-        // Sort by price (as autonomi does)
-        quotes_with_prices.sort_by_key(|(_, price)| *price);
+        println!("✓ Got 5 real quotes from contract");
 
-        let median_price = quotes_with_prices
-            .get(MEDIAN_INDEX)
-            .ok_or_else(|| Error::Payment("Missing median quote".to_string()))?
-            .1;
-        println!("✓ Got 5 real quotes from contract, median price: {median_price} atto");
-
-        // Create SingleNode payment
+        // Create SingleNode payment (will sort internally and select median)
         let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
+
+        let median_price = payment
+            .paid_quote()
+            .amount
+            .checked_div(Amount::from(3u64))
+            .ok_or_else(|| Error::Payment("Failed to calculate median price".to_string()))?;
+        println!("✓ Sorted and selected median price: {median_price} atto");
 
         assert_eq!(payment.quotes.len(), REQUIRED_QUOTES);
         let median_amount = payment
