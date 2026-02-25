@@ -185,7 +185,7 @@ When handling an admitted unknown key `K` from neighbor sync:
 1. If `K` is already in local `PaidForList`, paid-list authorization succeeds immediately.
 2. Otherwise run the single verification round defined in Section 9 and collect paid-list responses from peers in `PaidCloseGroup(K)` (same round as presence evidence; no separate paid-list-only round).
 3. If paid confirmations from `PaidCloseGroup(K)` are `>= ConfirmNeeded(K)`, add `K` to local `PaidForList` and treat `K` as paid-authorized.
-4. If presence positives from `CloseGroup(K)` during the same verification round reach `>= QuorumNeeded(K)` (close-group replica majority), add `K` to local `PaidForList` and treat `K` as paid-authorized. Close-group replica majority constitutes derived evidence of prior authorization and serves as a paid-list recovery path after cold starts or persistence failures.
+4. If presence positives from `QuorumTargets` (the node's local approximation of `CloseGroup(K)`, computed in Section 9 step 5) during the same verification round reach `>= QuorumNeeded(K)` (close-group replica majority), add `K` to local `PaidForList` and treat `K` as paid-authorized. Close-group replica majority constitutes derived evidence of prior authorization and serves as a paid-list recovery path after cold starts or persistence failures.
 5. Fetch gating is strict: only keys in the admitted replica-hint pipeline are fetch-eligible. Keys admitted only via paid hints MUST NOT be queued for fetch, even when rules 1, 3, or 4 succeed.
 6. If neither paid-list confirmations (rule 3) nor close-group replica majority (rule 4) nor presence quorum are met, paid-list authorization fails for this verification round.
 7. Nodes answering paid-list queries MUST answer from local `PaidForList` state only; they MUST NOT infer paid status from record presence alone. (Derived paid-list entries from rule 4 are added to `PaidForList` and are thereafter indistinguishable from PoP-derived entries when answering queries.)
@@ -602,7 +602,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 41. Neighbor-sync cycle completion is guaranteed:
    - Under arbitrary churn, cooldowns, and unreachable peers, the cycle always terminates because the snapshot can only shrink (removals) and the cursor advances monotonically. Cycle completes when `NeighborSyncCursor >= |NeighborSyncOrder|`.
 42. Quorum-derived paid-list authorization:
-   - Unknown key `K` passes presence quorum (`>= QuorumNeeded(K)` positives from `CloseGroup(K)`). Key is stored AND added to local `PaidForList(self)`. Node subsequently answers paid-list queries for `K` as "paid."
+   - Unknown key `K` passes presence quorum (`>= QuorumNeeded(K)` positives from `QuorumTargets`). Key is stored AND added to local `PaidForList(self)`. Node subsequently answers paid-list queries for `K` as "paid."
 43. Paid-list persistence across restart:
    - Node stores key `K` in `PaidForList`, restarts. After restart, `PaidForList` is loaded from stable storage and node correctly answers paid-list queries for `K` without re-verification.
 44. Paid-list cold-start recovery via replica majority:
