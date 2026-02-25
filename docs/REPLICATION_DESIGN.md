@@ -100,6 +100,7 @@ Parameter safety constraints (MUST hold):
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
 22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: for keys where `IsResponsible(self, K)` is false or `self ∉ PaidCloseGroup(K)`, record `OutOfRangeFirstSeen` if not already set, and delete only when `now - OutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`. Clear `OutOfRangeFirstSeen` for keys that are back in range.
 23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `EigenTrust`.
+24. Audit trust-penalty signals require responsibility confirmation: on audit failure, challenger MUST perform fresh network closest-peer lookups for each challenged key and only penalize the peer for keys where it is confirmed responsible by the network.
 
 ## 6. Replication
 
@@ -387,7 +388,7 @@ Goal: avoid replication storms from restart noise while still reacting to real t
 Failure evidence types include:
 
 - `ReplicationFailure`: failed fetch attempt from a source peer.
-- `AuditFailure`: timeout, missing items, malformed response, or `AuditDigest` mismatch.
+- `AuditFailure`: timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence (emitted per confirmed failed key).
 - `BootstrapClaimAbuse`: peer continues claiming bootstrap status after `BOOTSTRAP_CLAIM_GRACE_PERIOD` has elapsed since `BootstrapClaimFirstSeen`.
 
 Rules:
@@ -396,8 +397,8 @@ Rules:
 2. Replication MUST NOT apply threshold-based peer eviction; eviction/quarantine decisions are owned by `EigenTrust` policy.
 3. A `ReplicationFailure` is emitted per peer per failed fetch attempt, not per key. If a key requires two retries from two different peers before succeeding on the third, each of the two failed peers emits one failure event.
 4. Replication SHOULD mark fetch-failure evidence as stale/low-confidence if the key later succeeds via an alternate verified source.
-5. On audit failure, replication MUST emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, and failure reason.
-6. Replication MUST emit a trust-penalty signal to `EigenTrust` for audit failure when `RepairOpportunity(challenged_peer_id, PeerKeySet(challenged_peer_id))` is true.
+5. On audit failure, replication MUST first run the responsibility confirmation (Section 15 step 11). If the confirmed failure set is non-empty, emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, confirmed failure keys, and failure reason. If the confirmed failure set is empty, no `AuditFailure` is emitted.
+6. Replication MUST emit a trust-penalty signal to `EigenTrust` for audit failure only when both conditions hold: the confirmed failure set from responsibility confirmation is non-empty (Section 15 step 11d) AND `RepairOpportunity(challenged_peer_id, confirmed_failure_keys)` is true.
 7. On bootstrap claim past grace period, replication MUST emit `BootstrapClaimAbuse` evidence with `peer_id` and `BootstrapClaimFirstSeen` timestamp. Evidence is emitted on each sync or audit attempt where the peer claims bootstrapping after `BOOTSTRAP_CLAIM_GRACE_PERIOD`.
 8. When a peer that previously claimed bootstrap status stops claiming it (responds normally to sync or audit), node MUST clear `BootstrapClaimFirstSeen(self, peer)`.
 9. Final trust-score updates and any eventual peer eviction are determined by `EigenTrust`, not by replication logic.
@@ -414,19 +415,24 @@ Challenge-response for claimed holders:
 6. Challenger removes peers with empty `PeerKeySet(P)`. If no peers remain, the audit tick is idle.
 7. Challenger selects one peer uniformly at random from remaining peers as `challenged_peer_id`.
 8. Challenger sends that peer an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
-9. Target responds with either an `AuditDigest` or a bootstrapping claim:
-   a. `AuditDigest`: `H(nonce || challenged_peer_id || record_bytes_1 || ... || record_bytes_n)`, where `record_bytes_i` is the full raw bytes of challenged record `i` in challenge order.
-   b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period. Audit tick ends (no `AuditDigest` verification).
-10. On `AuditDigest` response, challenger recomputes expected `AuditDigest` from local copies and verifies equality before deadline.
+9. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
+   a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = H(nonce || challenged_peer_id || K_i || record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
+   b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period. Audit tick ends (no digest verification).
+10. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
+11. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
+    a. For each failed key `K` in `PeerKeySet(challenged_peer_id)`, perform a fresh network closest-peer lookup for `K`.
+    b. If `challenged_peer_id` does not appear in the fresh lookup result for key `K`, remove `K` from the failure set (peer is not currently responsible).
+    c. If the filtered failure set is empty after all lookups, discard the audit failure entirely — no `AuditFailure` evidence or trust-penalty signal is emitted.
+    d. If the filtered failure set is non-empty, emit per-key `AuditFailure` evidence scoped to the confirmed failed keys only.
 
 Audit-proof requirements:
 
-1. Challenger MUST hold a local copy of each challenged record to recompute `AuditDigest`. Audit selection is therefore limited to records the challenger stores.
-2. Records are opaque bytes for replication; audit digest construction MUST operate over raw record bytes (no schema dependency) and be deterministic.
-3. `AuditDigest` input MUST be exactly ordered concatenation: `nonce`, then challenged node public peer id (`challenged_peer_id`), then full bytes of each challenged record in challenge order.
-4. `AuditDigest` MUST include full record bytes for every challenged record; key-only digests are invalid.
+1. Challenger MUST hold a local copy of each challenged record to recompute per-key digests. Audit selection is therefore limited to records the challenger stores.
+2. Records are opaque bytes for replication; digest construction MUST operate over raw record bytes (no schema dependency) and be deterministic.
+3. Each `AuditKeyDigest(K_i)` input MUST be exactly: `H(nonce || challenged_peer_id || K_i || record_bytes_i)`. Including `K_i` binds each digest to its specific key and prevents digest reordering attacks.
+4. Each `AuditKeyDigest` MUST include full record bytes; key-only digests are invalid.
 5. Nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
-6. Responses are invalid if the receiver cannot recompute `AuditDigest` from `nonce`, `challenged_peer_id`, and the challenged records' full bytes.
+6. Responses MUST include exactly one digest entry per challenged key in challenge order. A response is invalid if it has fewer or more entries than challenged keys.
 
 Audit challenge bound:
 
@@ -435,7 +441,7 @@ Audit challenge bound:
 
 Failure conditions:
 
-- Timeout, missing items, malformed response, or `AuditDigest` mismatch.
+- Timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 11) before penalty.
 - Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD` (emits `BootstrapClaimAbuse`, not `AuditFailure`).
 
 Audit trigger and target selection:
@@ -535,8 +541,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - When two honest nodes temporarily disagree on `LocalRT` membership, hints are accepted only once sender is present in receiver `LocalRT`; before that, inbound sync is outbound-only at the receiver.
 18. Invalid runtime config:
    - Node rejects configs violating parameter safety constraints.
-19. Audit digest mismatch:
-   - Challenge fails when `AuditDigest` mismatches, even if response format is syntactically valid; replication emits `AuditFailure` evidence and emits a trust-penalty signal to `EigenTrust` only when `RepairOpportunity(...)` is true.
+19. Audit per-key digest mismatch with confirmed responsibility:
+   - Peer `P` is challenged on keys `{K1, K2, K3}`. `P` returns per-key digests: `K1` matches, `K2` mismatches, `K3` absent. Challenger runs responsibility confirmation for failed keys `{K2, K3}`: `P` appears in fresh lookup for `K2` but not `K3`. `AuditFailure` is emitted for `{K2}` only. Trust-penalty signal is emitted only when `RepairOpportunity(P, {K2})` is also true.
 20. Paid-list local hit:
    - Unknown key with local paid-list entry bypasses presence quorum and enters fetch pipeline.
 21. Paid-list majority confirmation:
@@ -603,6 +609,12 @@ Each scenario should assert exact expected outcomes and state transitions.
    - Key `K` goes out of range at time `T`. `OutOfRangeFirstSeen` is set to `T`. At `T + 4h`, partition heals, peers return, `K` is back in range. `OutOfRangeFirstSeen` is cleared. Key is retained. If `K` later goes out of range again, the clock restarts from zero.
 52. Prune hysteresis applies to paid-list entries:
    - `PaidForList` entry for key `K` where `self ∉ PaidCloseGroup(K)` follows the same time-based hysteresis: `OutOfRangeFirstSeen` is recorded, entry deleted only when `now - OutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`, timestamp cleared if `self` re-enters `PaidCloseGroup(K)`.
+53. Audit partial per-key failure with mixed responsibility:
+   - Peer `P` is challenged on `{K1, K2, K3}`. Per-key digests: `K1` matches, `K2` and `K3` mismatch. Responsibility confirmation: `P` is confirmed responsible for `K2` but not `K3`. `AuditFailure` is emitted for `{K2}` only. `K3` is discarded — no penalty for a key the network confirms `P` is not responsible for. `K1` passed digest verification and is not part of the failure set.
+54. Audit per-key digest all pass:
+   - Peer `P` is challenged on `{K1, K2, K3}`. `P` returns per-key digests for all three keys, all match challenger's expected values. Audit passes — no failure set, no responsibility confirmation needed, no evidence emitted.
+55. Audit per-key failure with no confirmed responsibility:
+   - Peer `P` is challenged on `{K1, K2}`. Per-key digests: both mismatch. Responsibility confirmation: `P` does not appear in fresh lookup results for either key. Entire audit failure is discarded — no `AuditFailure` evidence emitted, no trust-penalty signal.
 
 ## 19. Acceptance Criteria for This Design
 
