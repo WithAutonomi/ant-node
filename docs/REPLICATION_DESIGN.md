@@ -270,7 +270,7 @@ Transition requirements:
 
 - `OfferReceived -> PendingVerify` only for unknown admitted keys: replica-hint keys must satisfy replica relevance (`IsResponsible(self, K)` or already local/pending), and paid-hint-only keys must satisfy paid relevance (`self ∈ PaidCloseGroup(K)` or already in local `PaidForList` pending cleanup).
 - `PendingVerify -> QuorumVerified` only for keys in the admitted replica-hint pipeline, and only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources and add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization).
-- `PendingVerify -> PaidListVerified` if paid confirmations from the current verification round reach `>= ConfirmNeeded(K)`, or if a paid-hint-only key reaches presence quorum in the same round (derived paid-list authorization). On success, mark key as paid-authorized locally.
+- `PendingVerify -> PaidListVerified` if paid confirmations from the current verification round reach `>= ConfirmNeeded(K)`, or if a paid-hint-only key reaches presence quorum in the same round (derived paid-list authorization). On success, mark key as paid-authorized locally and record peers that responded `Present` as verified fetch sources.
 - `PaidListVerified -> QueuedForFetch` only for keys in the admitted replica-hint pipeline.
 - `PaidListVerified -> Idle` for keys admitted only via paid hints (no record fetch).
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
@@ -291,17 +291,17 @@ For each unknown key:
    - `FetchEligible = true` only if `K` is in the admitted replica-hint pipeline.
    - `FetchEligible = false` for paid-hint-only keys.
 3. If `K` is already in local `PaidForList`:
-   - If `FetchEligible`, mark `PaidListVerified` and queue for fetch immediately (no network verification round required).
+   - If `FetchEligible`, mark `PaidListVerified`. Run a presence-only probe to `QuorumTargets` to discover holders (no paid-list or authorization verification needed). Enqueue fetch using peers that responded `Present`; if no peer responds `Present`, transition to `FetchAbandoned`.
    - If not `FetchEligible`, mark `PaidListVerified` and terminate the lifecycle (`PaidListVerified -> Idle`) without fetch.
 4. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
 5. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self).
 6. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 7. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
 8. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
-9. As soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`, add `K` to local `PaidForList(self)` and mark `PaidListVerified`.
+9. As soon as paid confirmations from `PaidTargets` reach `>= ConfirmNeeded(K)`, add `K` to local `PaidForList(self)` and mark `PaidListVerified`. Fetch sources are peers from the same round that responded `Present` (not all paid-confirming peers).
 10. As soon as presence positives from `QuorumTargets` reach `>= QuorumNeeded(K)`, add `K` to local `PaidForList(self)` (derived paid-list authorization; Section 7.2 rule 4). If `FetchEligible`, mark `QuorumVerified`; otherwise mark `PaidListVerified`.
 11. Verification succeeds as soon as either step 9 or step 10 condition is met (logical OR).
-12. If verification succeeded and `FetchEligible`, enqueue fetch using verified sources (positive presence responders and/or authenticated hint sender).
+12. If verification succeeded and `FetchEligible`, enqueue fetch using verified sources (peers that responded `Present` during the verification round). The hint sender is a fetch source only if it also responded `Present`; non-holder forwarders are excluded to avoid false `ReplicationFailure` evidence.
 13. If verification succeeded and `FetchEligible = false`, terminate lifecycle without fetch (`PaidListVerified -> Idle`).
 14. Fail fast and mark `QuorumFailed` only when both conditions are impossible in this round: `(paid_yes + paid_unresolved < ConfirmNeeded(K))` AND `(quorum_positive + quorum_unresolved < QuorumNeeded(K))`.
 15. If the verification-round deadline expires with neither success nor fail-fast, mark `QuorumInconclusive`.
