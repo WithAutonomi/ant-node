@@ -53,7 +53,6 @@ All parameters are configurable. Values below are a reference profile used for l
 | `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `20`                                |
 | `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10m, 20m]`              |
 | `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
-| `QUORUM_RETRY_BACKOFF` | Retry delay before repeating a previously rejected/failed hint path | `60s`                               |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
 | `AUDIT_STARTUP_GRACE` | Delay after bootstrap completion before audit scheduling can start | `5 min`                             |
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[5 min, 10 min]`         |
@@ -151,7 +150,7 @@ Notes:
 - Authorization decision is local-route-state only.
 - Hints from non-neighbor-sync peers are dropped immediately.
 - Mixed hint sets are valid: process admitted keys, drop non-admitted keys.
-- Receiver MAY return rejected-key metadata to help sender avoid repeating obviously invalid hints; sender SHOULD apply `QUORUM_RETRY_BACKOFF` before repeating the same rejected path.
+- Receiver MAY return rejected-key metadata to help sender avoid repeating obviously invalid hints in immediate subsequent sync attempts.
 
 ### 7.2 Paid-List Authorization (Per Key)
 
