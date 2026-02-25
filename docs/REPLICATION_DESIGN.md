@@ -27,7 +27,9 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 
 - `Node`: participant with routing view, local store, and replication worker.
 - `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set.
-- `NeighborSyncSet(N)`: up to `NEIGHBOR_SYNC_PEER_COUNT` peers nearest to node `N` in `LocalRT(N)`; periodic repair sync partners for `N`.
+- `NeighborSyncOrder(N)`: deterministic cyclic ordering of authenticated peers in `LocalRT(N)` used for neighbor-sync scheduling.
+- `NeighborSyncCursor(N)`: persistent index into `NeighborSyncOrder(N)` indicating the next peer position to schedule.
+- `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)` (wrap-around allowed); periodic repair sync partners for `N`.
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
@@ -53,7 +55,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                 |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                                |
-| `NEIGHBOR_SYNC_PEER_COUNT` | Number of closest local-RT peers synced per repair round | `4`                                 |
+| `NEIGHBOR_SYNC_PEER_COUNT` | Number of local-RT peers synced concurrently per round-robin repair round | `4`                                 |
 | `NEIGHBOR_SYNC_INTERVAL` | Neighbor sync cadence | random in `[10 min, 20 min]`        |
 | `NEIGHBOR_SYNC_COOLDOWN` | Min spacing between neighbor sync rounds | `1h`                                |
 | `MAX_PARALLEL_FETCH_BOOTSTRAP` | Bootstrap concurrent fetches | `20`                                |
@@ -72,14 +74,14 @@ Parameter safety constraints (MUST hold):
 1. A record is accepted only if it passes integrity and responsibility checks.
 2. Neighbor-sync repair traffic passes verification only if either condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, or presence positives `>= QuorumNeeded(K)`.
 3. Fresh replication bypasses presence quorum only when PoP is valid.
-4. Neighbor-sync hints from non-`NeighborSyncSet(self)` peers are dropped.
+4. Neighbor-sync hints from peers outside the active `NeighborSyncSet(self)` are dropped.
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
 6. `CLOSE_GROUP_SIZE` is both the close-group width and the target holder count, not guaranteed send fanout.
 7. Receiver stores only records in its current responsible range.
 8. Queue dedup prevents duplicate pending/fetch work for same key.
 9. Replication emits trust evidence/penalty signals to `EigenTrust`; trust-score thresholds and eviction decisions are outside replication logic.
 10. Security policy is explicit: anti-injection may sacrifice recovery of below-quorum non-PoP data.
-11. Every neighbor-sync hint exchange reaches a deterministic terminal state.
+11. Neighbor-sync scheduling is deterministic and round-robin, and every neighbor-sync hint exchange reaches a deterministic terminal state.
 12. Presence no-response/timeout is unresolved (neutral), not an explicit negative vote.
 13. A failed fetch retries from alternate verified sources before abandoning. Verification evidence is preserved across fetch retries.
 14. Paid-list authorization is key-scoped and majority-based across `PaidCloseGroup(K)`, not node-global.
@@ -116,19 +118,21 @@ Triggers:
 
 Rules:
 
-1. Node computes `NeighborSyncSet(self)` as the up to `NEIGHBOR_SYNC_PEER_COUNT` closest peers to self from `LocalRT(self)`.
-2. Node initiates a bidirectional sync session with each peer in `NeighborSyncSet(self)` (or responds if peer initiated first).
-3. In each session, both sides send peer-targeted hint sets:
+1. Node computes/maintains `NeighborSyncOrder(self)` as a deterministic ordering of authenticated peers in `LocalRT(self)`.
+2. Node computes `NeighborSyncSet(self)` as the next up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers from `NeighborSyncOrder(self)` starting at `NeighborSyncCursor(self)` (wrap-around allowed).
+3. Node initiates a bidirectional sync session with each peer in `NeighborSyncSet(self)` (or responds if peer initiated first).
+4. In each session, both sides send peer-targeted hint sets:
    - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (`receiver ∈ CloseGroup(K)` in sender view).
    - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (`receiver ∈ PaidCloseGroup(K)` in sender view).
-4. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
-5. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
-6. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
-7. Receiver launches quorum checks exactly once per admitted unknown replica key.
-8. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
-9. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
-10. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
-11. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
+5. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
+6. Receiver treats hint sets as unordered collections and deduplicates repeated keys.
+7. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
+8. Receiver launches quorum checks exactly once per admitted unknown replica key.
+9. Replica keys passing presence quorum or paid-list authorization are queued for fetch.
+10. Receiver processes unknown paid hints via Section 7.2 majority checks; paid hints never directly whitelist keys.
+11. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
+12. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
+13. After each round, if `|NeighborSyncOrder(self)| > 0`, node advances `NeighborSyncCursor(self)` by `|NeighborSyncSet(self)|` modulo `|NeighborSyncOrder(self)|`.
 
 Rate control:
 
@@ -339,7 +343,7 @@ Capacity-managed mode (finite store):
 
 ## 13. Churn and Topology Change Handling
 
-Maintain tracker for closest peers and classify topology events:
+Maintain tracker for neighbor-sync eligibility/order and classify topology events:
 
 - `Trigger`: genuine change, run neighbor sync.
 - `Skip`: probable restart churn, suppress.
@@ -410,8 +414,8 @@ Audit trigger and target selection:
 
 A joining node performs active sync:
 
-1. Discover up to `NEIGHBOR_SYNC_PEER_COUNT` closest peers to self from `LocalRT(self)`.
-2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) from those peers.
+1. Discover authenticated peers from `LocalRT(self)` and compute deterministic `NeighborSyncOrder(self)`.
+2. Request replica hints (keys peers think self should hold) and paid hints (keys peers think self should track) in round-robin batches of up to `NEIGHBOR_SYNC_PEER_COUNT` peers at a time.
 3. For each discovered key `K`, compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self), and compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 4. Aggregate paid-list reports and add key `K` to local `PaidForList` only if paid reports are `>= ConfirmNeeded(K)`.
 5. Aggregate key-presence reports and accept keys observed from `>= QuorumNeeded(K)` peers, or keys that are now paid-authorized locally.
@@ -484,7 +488,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 13. Responsible range shrink:
    - Out-of-range records become prune candidates; new in-range keys still accepted per capacity policy.
 14. Neighbor-sync coverage under backlog:
-   - Under load, each local key is eventually re-hinted within expected neighbor-sync timing bounds.
+   - Under load, each local key is eventually re-hinted within expected neighbor-sync timing bounds as round-robin peer batches rotate through `LocalRT(self)`.
 15. Partition and heal:
    - Confirm below-quorum recovery succeeds when paid-list authorization survives, and fails when it cannot be re-established.
 16. Quorum responder timeout handling:
@@ -525,6 +529,8 @@ Each scenario should assert exact expected outcomes and state transitions.
    - When multiple unknown keys share a target peer, implementation MUST send one batched verification request (not separate per-key requests); responses must still be keyed per key with binary presence semantics (and paid-list presence where applicable).
 34. Batched partial response semantics:
    - If a batched response omits key `K` or a peer times out, evidence for that peer/key pair is unresolved for `K` and does not count as an explicit negative vote.
+35. Neighbor-sync round-robin batch selection:
+   - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` peers and cycle through the full ordered peer set before repeating.
 
 ## 19. Acceptance Criteria for This Design
 
