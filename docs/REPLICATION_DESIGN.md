@@ -83,7 +83,7 @@ Parameter safety constraints (MUST hold):
 ## 5. Core Invariants (Must Hold)
 
 1. A record is accepted only if it passes integrity and responsibility checks.
-2. Neighbor-sync repair traffic passes verification only if any condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, presence positives `>= QuorumNeeded(K)`, or close-group replica majority (which also derives paid-list authorization).
+2. Neighbor-sync repair traffic passes verification only if either condition holds: paid confirmations `>= ConfirmNeeded(K)` across `PaidCloseGroup(K)`, or presence positives `>= QuorumNeeded(K)` from `QuorumTargets` (which also derives paid-list authorization via close-group replica majority).
 3. Fresh replication bypasses presence quorum only when PoP is valid.
 4. Neighbor-sync hints are accepted only from authenticated peers currently in `LocalRT(self)`; hints from peers outside `LocalRT(self)` are dropped.
 5. Presence probes return only binary key-presence evidence (`Present` or `Absent`).
