@@ -250,7 +250,8 @@ PendingVerify
 QuorumVerified
   -> QueuedForFetch
 PaidListVerified
-  -> QueuedForFetch     (admitted replica-hint pipeline only)
+  -> QueuedForFetch     (admitted replica-hint pipeline only; at least one source responded Present)
+  -> FetchAbandoned     (admitted replica-hint pipeline; no peer responded Present — indicates possible data loss, see note below)
   -> Idle               (paid-hint-only pipeline; `PaidForList` updated)
 QueuedForFetch
   -> Fetching
@@ -275,7 +276,8 @@ Transition requirements:
 - `OfferReceived -> PendingVerify` only for unknown admitted keys: replica-hint keys must satisfy replica relevance (`IsResponsible(self, K)` or already local/pending), and paid-hint-only keys must satisfy paid relevance (`self ∈ PaidCloseGroup(K)` or already in local `PaidForList` pending cleanup).
 - `PendingVerify -> QuorumVerified` only for keys in the admitted replica-hint pipeline, and only if presence positives from the current verification round reach `>= QuorumNeeded(K)`. On success, record the set of positive responders as verified fetch sources and add `K` to local `PaidForList(self)` (close-group replica majority derives paid-list authorization).
 - `PendingVerify -> PaidListVerified` if paid confirmations from the current verification round reach `>= ConfirmNeeded(K)`, or if a paid-hint-only key reaches presence quorum in the same round (derived paid-list authorization). On success, mark key as paid-authorized locally and record peers that responded `Present` as verified fetch sources.
-- `PaidListVerified -> QueuedForFetch` only for keys in the admitted replica-hint pipeline.
+- `PaidListVerified -> QueuedForFetch` only for keys in the admitted replica-hint pipeline and only when at least one peer responded `Present` (verified fetch source exists).
+- `PaidListVerified -> FetchAbandoned` for keys in the admitted replica-hint pipeline when the presence-only probe completes with zero `Present` responses (no fetch source available). This transition is abnormal: paid-list authorization implies the record was previously stored, so zero holders suggests severe churn or data loss. Implementations SHOULD log this at warning level. Key is forgotten and requires a new offer to re-enter.
 - `PaidListVerified -> Idle` for keys admitted only via paid hints (no record fetch).
 - `PendingVerify -> QuorumInconclusive` when neither quorum nor paid-list success is reached and unresolved outcomes (timeout/no-response) keep both outcomes undecidable in this round.
 - `Fetching -> Stored` only after all storage validation checks pass.
