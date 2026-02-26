@@ -296,11 +296,11 @@ For each unknown key:
    - Apply cross-set precedence first (Section 6.2 rule 9): a key present in both hint sets is treated as replica-hint pipeline only.
    - `FetchEligible = true` only if `K` is in the admitted replica-hint pipeline.
    - `FetchEligible = false` for paid-hint-only keys.
-3. If `K` is already in local `PaidForList`:
+3. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` in `LocalRT(self)` (excluding self).
+4. If `K` is already in local `PaidForList`:
    - If `FetchEligible`, mark `PaidListVerified`. Run a presence-only probe to `QuorumTargets` to discover holders (no paid-list or authorization verification needed). Enqueue fetch using peers that responded `Present`; if no peer responds `Present`, transition to `FetchAbandoned`.
    - If not `FetchEligible`, mark `PaidListVerified` and terminate the lifecycle (`PaidListVerified -> Idle`) without fetch.
-4. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
-5. Compute `QuorumTargets` as up to `CLOSE_GROUP_SIZE` nearest known peers for `K` (excluding self).
+5. Otherwise compute `PaidTargets = PaidCloseGroup(K)`.
 6. Compute `QuorumNeeded(K) = min(QUORUM_THRESHOLD, floor(|QuorumTargets|/2)+1)`.
 7. Compute `VerifyTargets = PaidTargets ∪ QuorumTargets`.
 8. Send verification requests to peers in `VerifyTargets` and continue the round until either success/fail-fast is reached or a local adaptive verification deadline for this round expires. Responses carry binary presence semantics (Section 7.6); peers in `PaidTargets` also return paid-list presence for `K`.
