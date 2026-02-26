@@ -144,8 +144,8 @@ Rules:
 5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
 6. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
 7. In each session, sender-side hint construction uses peer-targeted sets:
-   - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (`receiver ∈ CloseGroup(K)` in sender view).
-   - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (`receiver ∈ PaidCloseGroup(K)` in sender view).
+   - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (receiver is among the `CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
+   - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (receiver is among the `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
 8. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
 9. Receiver treats hint sets as unordered collections and deduplicates repeated keys. If a key appears in both `ReplicaHintsForPeer` and `PaidHintsForPeer` in the same session, receiver MUST keep only the replica-hint entry and drop the paid-hint duplicate (single-pipeline processing).
 10. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
