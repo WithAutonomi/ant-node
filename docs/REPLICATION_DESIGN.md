@@ -46,7 +46,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `PaidCloseGroup(K)`: `PAID_LIST_CLOSE_GROUP_SIZE` nearest nodes to key `K` that participate in paid-list consensus, evaluated from the querying node's local view using `SelfInclusiveRT(querying_node)`.
 - `PaidGroupSize(K)`: effective paid-list consensus set size for key `K`, defined as `|PaidCloseGroup(K)|`.
 - `ConfirmNeeded(K)`: dynamic paid-list confirmation count for key `K`, defined as `floor(PaidGroupSize(K)/2)+1`.
-- `QuorumTargets(K)`: locally computed approximation of the close group for key `K` used as the candidate peer set for presence checks.
+- `QuorumTargets(K)`: up to `CLOSE_GROUP_SIZE` nearest known peers for key `K` in `LocalRT(self)`, excluding `self`; used as the candidate peer set for presence checks.
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
 - `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when peer discovery closest to `N`'s own address has populated `LocalRT(N)`, bootstrap peer requests are finished (response or timeout), and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
 - `RepairOpportunity(P, KSet)`: evidence that peer `P` has previously received replication hints/offers for keys in `KSet` and had at least one subsequent neighbor-sync cycle to repair before audit evaluation.
