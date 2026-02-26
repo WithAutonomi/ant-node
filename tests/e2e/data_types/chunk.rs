@@ -390,7 +390,8 @@ mod tests {
         }
 
         // Recreate AntProtocol from the same data directory (simulates restart)
-        let new_protocol = TestNetwork::create_ant_protocol(&data_dir)
+        // Pass false for payment_enforcement (disabled for this test)
+        let new_protocol = TestNetwork::create_ant_protocol(&data_dir, false, None)
             .await
             .expect("Failed to recreate AntProtocol");
         {
@@ -630,6 +631,61 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
+    /// Create an `AntProtocol` with EVM verification enabled, backed by an Anvil testnet.
+    ///
+    /// Returns (protocol, `temp_dir`, testnet). The testnet must be kept alive for the
+    /// duration of the test so Anvil doesn't shut down.
+    async fn create_evm_enabled_protocol(
+        test_name: &str,
+    ) -> color_eyre::Result<(
+        saorsa_node::storage::AntProtocol,
+        std::path::PathBuf,
+        evmlib::testnet::Testnet,
+    )> {
+        use ant_evm::RewardsAddress;
+        use evmlib::testnet::Testnet;
+        use saorsa_node::payment::{
+            EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+            QuotingMetricsTracker,
+        };
+        use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+        use std::sync::Arc;
+
+        let testnet = Testnet::new().await;
+        let network = testnet.to_network();
+
+        let temp_dir = std::env::temp_dir().join(format!("{test_name}_{}", rand::random::<u64>()));
+        tokio::fs::create_dir_all(&temp_dir).await?;
+
+        let storage = LmdbStorage::new(LmdbStorageConfig {
+            root_dir: temp_dir.clone(),
+            verify_on_read: true,
+            max_chunks: 0,
+            max_map_size: 0,
+        })
+        .await?;
+
+        let payment_verifier = PaymentVerifier::new(PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                enabled: true,
+                network,
+            },
+            cache_capacity: 100,
+        });
+
+        let rewards_address = RewardsAddress::new([0x01; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        let protocol = AntProtocol::new(
+            Arc::new(storage),
+            Arc::new(payment_verifier),
+            Arc::new(quote_generator),
+        );
+
+        Ok((protocol, temp_dir, testnet))
+    }
+
     /// Test: Chunk is rejected without payment when EVM verification is enabled.
     ///
     /// This test verifies that payment enforcement actually works by:
@@ -639,58 +695,13 @@ mod tests {
     /// 4. Confirming the chunk was NOT stored
     #[tokio::test(flavor = "multi_thread")]
     async fn test_chunk_rejected_without_payment() -> color_eyre::Result<()> {
-        use ant_evm::RewardsAddress;
-        use evmlib::testnet::Testnet;
         use saorsa_node::ant_protocol::{
             ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
             ChunkPutResponse,
         };
-        use saorsa_node::payment::{
-            EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
-            QuotingMetricsTracker,
-        };
-        use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-        use std::sync::Arc;
 
-        // Start Anvil testnet for EVM network
-        let testnet = Testnet::new().await;
-        let network = testnet.to_network();
-
-        // Create a temporary directory for storage
-        let temp_dir =
-            std::env::temp_dir().join(format!("test_payment_rejection_{}", rand::random::<u64>()));
-        tokio::fs::create_dir_all(&temp_dir).await?;
-
-        // Create LMDB storage
-        let storage_config = LmdbStorageConfig {
-            root_dir: temp_dir.clone(),
-            verify_on_read: true,
-            max_chunks: 0,
-            max_map_size: 0,
-        };
-        let storage = LmdbStorage::new(storage_config).await?;
-
-        // Create payment verifier with EVM ENABLED
-        let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: true, // Enable EVM verification
-                network,
-            },
-            cache_capacity: 100,
-        };
-        let payment_verifier = PaymentVerifier::new(payment_config);
-
-        // Create quote generator
-        let rewards_address = RewardsAddress::new([0x01; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
-
-        // Create protocol handler with EVM enabled
-        let protocol = AntProtocol::new(
-            Arc::new(storage),
-            Arc::new(payment_verifier),
-            Arc::new(quote_generator),
-        );
+        let (protocol, temp_dir, _testnet) =
+            create_evm_enabled_protocol("test_payment_rejection").await?;
 
         // Create test data
         let data = b"test data that should be rejected without payment";
@@ -734,10 +745,9 @@ mod tests {
                 eprintln!("✓ Chunk rejected with Error: {err:?}");
             }
             other => {
-                assert!(
-                    false,
+                return Err(color_eyre::eyre::eyre!(
                     "Expected PaymentRequired or Error response, got: {other:?}"
-                );
+                ));
             }
         }
 
@@ -759,10 +769,9 @@ mod tests {
                 eprintln!("✓ Confirmed chunk was NOT stored (GET returned NotFound)");
             }
             other => {
-                assert!(
-                    false,
+                return Err(color_eyre::eyre::eyre!(
                     "Expected NotFound response (chunk should not be stored), got: {other:?}"
-                );
+                ));
             }
         }
 

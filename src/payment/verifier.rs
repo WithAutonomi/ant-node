@@ -4,7 +4,7 @@
 //! All new data requires EVM payment on Arbitrum (no free tier).
 
 use crate::error::{Error, Result};
-use crate::payment::cache::{VerifiedCache, XorName};
+use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use ant_evm::ProofOfPayment;
 use evmlib::Network as EvmNetwork;
 use futures::future::try_join_all;
@@ -166,7 +166,19 @@ impl PaymentVerifier {
                 Ok(status)
             }
             PaymentStatus::PaymentRequired => {
-                // Payment is required - verify the proof
+                // Test/devnet mode: EVM disabled - accept with or without proof
+                if !self.config.evm.enabled {
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(
+                            "Test mode: Allowing storage without EVM verification (EVM disabled): {}",
+                            hex::encode(xorname)
+                        );
+                    }
+                    self.cache.insert(*xorname);
+                    return Ok(PaymentStatus::PaymentVerified);
+                }
+
+                // Production mode: EVM enabled - verify the proof
                 if let Some(proof) = payment_proof {
                     if proof.is_empty() {
                         return Err(Error::Payment("Empty payment proof".to_string()));
@@ -197,39 +209,22 @@ impl PaymentVerifier {
 
                     Ok(PaymentStatus::PaymentVerified)
                 } else {
-                    // No payment provided
-                    // Test mode: Allow storage without payment when EVM is disabled
-                    // This is safe because verify_evm_payment() will reject any provided proofs
-                    if !self.config.evm.enabled {
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                            debug!(
-                                "Test mode: Allowing storage without payment (EVM disabled): {}",
-                                hex::encode(xorname)
-                            );
-                        }
-                        // Cache it so subsequent requests don't re-check
-                        self.cache.insert(*xorname);
-                        return Ok(PaymentStatus::PaymentVerified);
-                    }
-
-                    // Production: Payment required
+                    // No payment provided in production mode
                     Err(Error::Payment(format!(
                         "Payment required for new data {}",
                         hex::encode(xorname)
                     )))
                 }
             }
-            PaymentStatus::PaymentVerified => {
-                unreachable!(
-                    "check_payment_required only returns CachedAsVerified or PaymentRequired"
-                )
-            }
+            PaymentStatus::PaymentVerified => Err(Error::Payment(
+                "Unexpected PaymentVerified status from check_payment_required".to_string(),
+            )),
         }
     }
 
     /// Get cache statistics.
     #[must_use]
-    pub fn cache_stats(&self) -> crate::payment::cache::CacheStats {
+    pub fn cache_stats(&self) -> CacheStats {
         self.cache.stats()
     }
 
@@ -398,8 +393,7 @@ mod tests {
         let verifier = create_test_verifier();
         let xorname = [1u8; 32];
 
-        // Create a properly-sized proof that will pass size validation
-        // but fail EVM verification (since EVM is disabled)
+        // Create a properly-sized proof
         let proof = ProofOfPayment {
             peer_quotes: vec![],
         };
@@ -407,15 +401,13 @@ mod tests {
         // Pad to at least 32 bytes to pass size validation
         proof_bytes.resize(32, 0);
 
-        // Should FAIL because EVM verification is disabled (fail-secure behavior)
-        // We fixed the security hole - EVM disabled now rejects all payments
+        // EVM disabled (test/devnet mode): should SUCCEED even with a proof present.
+        // When EVM is disabled, the verifier skips on-chain checks and accepts storage.
         let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
-        assert!(result.is_err(), "Expected Err, got: {result:?}");
-        let err = result.expect_err("should be error");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("EVM verification is disabled"),
-            "Expected error to contain 'EVM verification is disabled', got: {err_msg}"
+        assert!(result.is_ok(), "Expected Ok in test mode, got: {result:?}");
+        assert_eq!(
+            result.expect("should succeed"),
+            PaymentStatus::PaymentVerified
         );
     }
 

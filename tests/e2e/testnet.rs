@@ -16,9 +16,12 @@
 use ant_evm::RewardsAddress;
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
+use evmlib::Network as EvmNetwork;
 use futures::future::join_all;
 use rand::Rng;
-use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
+use saorsa_core::{
+    IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
+};
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
@@ -198,6 +201,16 @@ pub struct TestNetworkConfig {
 
     /// Enable verbose logging for test nodes.
     pub enable_node_logging: bool,
+
+    /// Enable payment enforcement (EVM verification) for test nodes.
+    /// Default: false (EVM disabled for speed).
+    pub payment_enforcement: bool,
+
+    /// Optional EVM network for payment verification.
+    /// When `payment_enforcement` is true and this is `Some`, nodes will use
+    /// this network (e.g. Anvil testnet) for on-chain verification.
+    /// When `None`, defaults to `ArbitrumOne`.
+    pub evm_network: Option<EvmNetwork>,
 }
 
 impl Default for TestNetworkConfig {
@@ -210,7 +223,11 @@ impl Default for TestNetworkConfig {
         // Safety: DEFAULT_NODE_COUNT (25) fits in u16.
         #[allow(clippy::cast_possible_truncation)]
         let max_base_port = TEST_PORT_RANGE_MAX.saturating_sub(DEFAULT_NODE_COUNT as u16);
-        let base_port = rng.gen_range(TEST_PORT_RANGE_MIN..max_base_port);
+        let base_port = if max_base_port > TEST_PORT_RANGE_MIN {
+            rng.gen_range(TEST_PORT_RANGE_MIN..max_base_port)
+        } else {
+            TEST_PORT_RANGE_MIN
+        };
 
         // Random suffix for unique temp directory
         let suffix: u64 = rng.gen();
@@ -225,6 +242,8 @@ impl Default for TestNetworkConfig {
             stabilization_timeout: Duration::from_secs(DEFAULT_STABILIZATION_TIMEOUT_SECS),
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
             enable_node_logging: false,
+            payment_enforcement: false,
+            evm_network: None,
         }
     }
 }
@@ -250,6 +269,27 @@ impl TestNetworkConfig {
             stabilization_timeout: Duration::from_secs(SMALL_STABILIZATION_TIMEOUT_SECS),
             ..Default::default()
         }
+    }
+
+    /// Enable payment enforcement for this configuration.
+    ///
+    /// When enabled, nodes will require valid EVM payment proofs
+    /// for all chunk storage operations. This allows testing the
+    /// full payment enforcement flow.
+    #[must_use]
+    pub fn with_payment_enforcement(mut self) -> Self {
+        self.payment_enforcement = true;
+        self
+    }
+
+    /// Set the EVM network for payment verification.
+    ///
+    /// Use this with `with_payment_enforcement()` to wire nodes to
+    /// a local Anvil testnet for on-chain payment verification.
+    #[must_use]
+    pub fn with_evm_network(mut self, network: EvmNetwork) -> Self {
+        self.evm_network = Some(network);
+        self
     }
 }
 
@@ -299,6 +339,8 @@ pub enum NodeState {
     Stopping,
     /// Node has stopped.
     Stopped,
+    /// Node has been intentionally shut down (simulated failure).
+    ShutDown,
     /// Node encountered an error.
     Failed(String),
 }
@@ -352,15 +394,17 @@ impl TestNode {
     /// Set wallet for payment tests.
     ///
     /// This updates the node's wallet and creates a new `QuantumClient` configured
-    /// with the P2P node for network operations.
+    /// with both the P2P node and wallet for payment-enabled operations.
     pub fn set_wallet(&mut self, wallet: Wallet) {
-        self.wallet = Some(wallet);
-
-        // Create a new QuantumClient with the P2P node if available
+        // Create a new QuantumClient with the P2P node and wallet if available
         if let Some(ref p2p_node) = self.p2p_node {
-            let client = QuantumClient::with_defaults().with_node(Arc::clone(p2p_node));
+            let client = QuantumClient::with_defaults()
+                .with_node(Arc::clone(p2p_node))
+                .with_wallet(wallet.clone());
             self.client = Some(Arc::new(client));
         }
+
+        self.wallet = Some(wallet);
     }
 
     /// Store a chunk using the `QuantumClient` (with payment).
@@ -376,6 +420,87 @@ impl TestNode {
 
         client
             .put_chunk(Bytes::from(data.to_vec()))
+            .await
+            .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
+    }
+
+    /// Store a chunk with payment tracking.
+    ///
+    /// This method stores a chunk using the payment-enabled client and records
+    /// the payment transaction to the provided tracker. This allows tests to
+    /// verify payment behavior (e.g., that caching prevents duplicate payments).
+    ///
+    /// # Arguments
+    ///
+    /// * `data` - The chunk data to store
+    /// * `tracker` - Payment tracker to record transactions
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client/wallet is not configured or the store operation fails.
+    pub async fn store_chunk_with_tracked_payment(
+        &self,
+        data: &[u8],
+        tracker: &super::harness::PaymentTracker,
+    ) -> Result<XorName> {
+        use saorsa_node::client::QuantumClient;
+        use saorsa_node::payment::SingleNodePayment;
+
+        // Get the client and wallet
+        let p2p_node = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+        let wallet = self.wallet.as_ref().ok_or_else(|| {
+            TestnetError::Storage("Wallet not configured - use set_wallet()".to_string())
+        })?;
+
+        // Create a QuantumClient for this operation
+        let client = QuantumClient::with_defaults()
+            .with_node(Arc::clone(p2p_node))
+            .with_wallet(wallet.clone());
+
+        // Compute the chunk address
+        let address = Self::compute_chunk_address(data);
+
+        // Get quotes from the network (includes peer IDs for proof of payment)
+        let quotes_with_peers = client
+            .get_quotes_from_dht(data)
+            .await
+            .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
+
+        // Build ProofOfPayment from peer IDs + quotes
+        let peer_quotes: Vec<_> = quotes_with_peers
+            .iter()
+            .filter_map(|(peer_id_str, quote, _price)| {
+                let peer_id: libp2p::PeerId = peer_id_str.parse().ok()?;
+                Some((ant_evm::EncodedPeerId::from(peer_id), quote.clone()))
+            })
+            .collect();
+        let proof_of_payment = ant_evm::ProofOfPayment { peer_quotes };
+        let proof_bytes = rmp_serde::to_vec(&proof_of_payment)
+            .map_err(|e| TestnetError::Storage(format!("Failed to serialize proof: {e}")))?;
+
+        // Strip peer IDs for SingleNodePayment which only needs (quote, price)
+        let quotes_with_prices: Vec<_> = quotes_with_peers
+            .into_iter()
+            .map(|(_peer_id, quote, price)| (quote, price))
+            .collect();
+
+        // Create payment structure (sorts by price, selects median)
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices)
+            .map_err(|e| TestnetError::Storage(format!("Failed to create payment: {e}")))?;
+
+        // Make the payment and get transaction hashes
+        let tx_hashes = payment
+            .pay(wallet)
+            .await
+            .map_err(|e| TestnetError::Storage(format!("Payment failed: {e}")))?;
+
+        // Record the payment in the tracker
+        tracker.record_payment(address, tx_hashes);
+
+        // Use put_chunk_with_proof to send the pre-built proof, avoiding a
+        // redundant quote+pay cycle that put_chunk_with_payment would perform.
+        client
+            .put_chunk_with_proof(Bytes::from(data.to_vec()), proof_bytes)
             .await
             .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
     }
@@ -400,6 +525,47 @@ impl TestNode {
             &*self.state.read().await,
             NodeState::Running | NodeState::Connected
         )
+    }
+
+    /// Shutdown this test node gracefully.
+    ///
+    /// This simulates a node failure by shutting down the P2P node and
+    /// stopping the protocol handler. The node's state is set to `ShutDown`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is not running or shutdown fails.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        info!("Shutting down test node {}", self.index);
+
+        // Stop protocol handler first
+        if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
+
+        *self.state.write().await = NodeState::Stopping;
+
+        // Shutdown P2P node if running
+        if let Some(p2p) = self.p2p_node.take() {
+            // Get Arc unwrapped or cloned for shutdown
+            if let Ok(node) = Arc::try_unwrap(p2p) {
+                node.shutdown()
+                    .await
+                    .map_err(|e| TestnetError::Core(format!("Failed to shutdown node: {e}")))?;
+            } else {
+                warn!(
+                    "Node {} has multiple Arc references, cannot perform clean shutdown",
+                    self.index
+                );
+                return Err(TestnetError::Core(
+                    "Cannot shutdown node with multiple Arc references".to_string(),
+                ));
+            }
+        }
+
+        *self.state.write().await = NodeState::ShutDown;
+        info!("Test node {} shut down successfully", self.index);
+        Ok(())
     }
 
     /// Get the number of connected peers.
@@ -928,7 +1094,10 @@ impl TestNetwork {
         info!("Starting {} regular nodes", regular_count);
 
         // Get bootstrap addresses
-        let bootstrap_addrs: Vec<SocketAddr> = self.nodes[0..self.config.bootstrap_count]
+        let bootstrap_addrs: Vec<SocketAddr> = self
+            .nodes
+            .get(0..self.config.bootstrap_count)
+            .unwrap_or_default()
             .iter()
             .map(|n| n.address)
             .collect();
@@ -949,7 +1118,7 @@ impl TestNetwork {
     ///
     /// Initializes the `AntProtocol` handler with:
     /// - LMDB storage in the node's data directory
-    /// - Payment verification disabled (for testing)
+    /// - Payment verification configured per `TestNetworkConfig`
     /// - Quote generation with a test rewards address
     async fn create_node(
         &self,
@@ -967,8 +1136,13 @@ impl TestNetwork {
 
         tokio::fs::create_dir_all(&data_dir).await?;
 
-        // Initialize AntProtocol for this node
-        let ant_protocol = Self::create_ant_protocol(&data_dir).await?;
+        // Initialize AntProtocol for this node with payment enforcement setting
+        let ant_protocol = Self::create_ant_protocol(
+            &data_dir,
+            self.config.payment_enforcement,
+            self.config.evm_network.clone(),
+        )
+        .await?;
 
         Ok(TestNode {
             index,
@@ -991,13 +1165,22 @@ impl TestNetwork {
     ///
     /// Configures:
     /// - LMDB storage with verification enabled
-    /// - Payment verification disabled (for testing without Anvil)
+    /// - Payment verification (enabled/disabled based on `payment_enforcement`)
     /// - Quote generator with a test rewards address
+    ///
+    /// # Arguments
+    ///
+    /// * `data_dir` - Directory for LMDB storage
+    /// * `payment_enforcement` - Whether to enable EVM payment verification
     ///
     /// # Errors
     ///
     /// Returns an error if LMDB storage initialisation fails.
-    pub async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
+    pub async fn create_ant_protocol(
+        data_dir: &std::path::Path,
+        payment_enforcement: bool,
+        evm_network: Option<EvmNetwork>,
+    ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
@@ -1009,20 +1192,32 @@ impl TestNetwork {
             .await
             .map_err(|e| TestnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        // Create payment verifier with EVM disabled
+        // Create payment verifier with EVM enabled/disabled based on test config.
+        // When payment_enforcement is true and an EVM network is provided,
+        // use that network (e.g. Anvil) for on-chain verification.
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
-                enabled: false, // Disable EVM verification for tests
-                ..Default::default()
+                enabled: payment_enforcement,
+                network: evm_network.unwrap_or(EvmNetwork::ArbitrumOne),
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
-        // Create quote generator with test rewards address
+        // Create quote generator with test rewards address and a dummy signer
         let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        // Set up a test signer so nodes can generate signed quotes.
+        // Without this, create_quote() returns Err("Quote signing not configured").
+        quote_generator.set_signer(vec![0u8; 64], |bytes| {
+            // Deterministic test signature: copy first 64 bytes of input
+            let len = bytes.len().min(64);
+            let mut sig = vec![0u8; 64];
+            sig[..len].copy_from_slice(&bytes[..len]);
+            sig
+        });
 
         Ok(AntProtocol::new(
             Arc::new(storage),
@@ -1050,6 +1245,10 @@ impl TestNetwork {
         // Override the transport-layer message size to accommodate max-size
         // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
         core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
+
+        // Allow localhost peers in DHT routing for test environments
+        // This prevents diversity filters from excluding peers on 127.0.0.1
+        core_config.diversity_config = Some(CoreDiversityConfig::permissive());
 
         // Create and start the P2P node
         let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
@@ -1123,7 +1322,11 @@ impl TestNetwork {
 
         for i in range {
             while Instant::now() < deadline {
-                let state = self.nodes[i].state.read().await.clone();
+                let node = self
+                    .nodes
+                    .get(i)
+                    .ok_or_else(|| TestnetError::Config(format!("Node index {i} out of range")))?;
+                let state = node.state.read().await.clone();
                 match state {
                     NodeState::Running | NodeState::Connected => break,
                     NodeState::Failed(ref e) => {
@@ -1179,6 +1382,94 @@ impl TestNetwork {
         ))
     }
 
+    /// Warm up DHT routing tables by seeding from connected P2P peers.
+    ///
+    /// After network stabilization, nodes are P2P connected but their DHT
+    /// routing tables are empty. This creates a chicken-and-egg problem:
+    /// `find_closest_nodes()` needs peers in the DHT to query, but the DHT
+    /// is empty because P2P connections don't auto-populate it.
+    ///
+    /// This method explicitly seeds DHT routing tables by:
+    /// 1. Getting connected P2P peers from each node
+    /// 2. Registering those peers in the DHT routing table
+    /// 3. Performing DHT lookups to propagate the routing info
+    ///
+    /// This is essential for tests that use `get_quotes_from_dht()` which relies
+    /// on `find_closest_nodes()` to discover peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DHT seeding or lookup fails.
+    pub async fn warmup_dht(&self) -> Result<()> {
+        info!("Warming up DHT routing tables ({} nodes)", self.nodes.len());
+
+        // Step 1: Seed DHT routing tables from P2P connected peers
+        // This solves the chicken-and-egg problem where find_closest_nodes()
+        // returns empty results because the DHT has no peers yet
+        for node in &self.nodes {
+            if let Some(ref p2p) = node.p2p_node {
+                let connected_peers = p2p.connected_peers().await;
+                debug!(
+                    "Node {} has {} connected P2P peers to seed into DHT",
+                    node.index,
+                    connected_peers.len()
+                );
+
+                // The P2PNode API doesn't expose a direct "add_peer_to_dht" method,
+                // so we rely on the permissive diversity config (set in start_node)
+                // to allow the DHT to accept localhost peers during find_closest_nodes() calls
+            }
+        }
+
+        // Step 2: Perform DHT queries to populate and propagate routing tables
+        // Now that diversity filters are permissive, these queries should succeed
+        let num_warmup_queries = 5; // More queries for better DHT coverage
+        let mut random_addresses = Vec::new();
+        for _ in 0..num_warmup_queries {
+            let mut addr = [0u8; 32];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut addr);
+            random_addresses.push(addr);
+        }
+
+        for node in &self.nodes {
+            if let Some(ref p2p) = node.p2p_node {
+                for addr in &random_addresses {
+                    // Perform DHT lookup to populate routing tables
+                    let result = p2p.dht().find_closest_nodes(addr, 8).await;
+                    if let Ok(peers) = result {
+                        if peers.is_empty() {
+                            warn!(
+                                "Node {} DHT warmup found 0 peers for {}  - DHT may not be seeded yet",
+                                node.index,
+                                hex::encode(addr)
+                            );
+                        } else {
+                            debug!(
+                                "Node {} DHT warmup found {} peers for target {}",
+                                node.index,
+                                peers.len(),
+                                hex::encode(addr)
+                            );
+                        }
+                    } else if tracing::enabled!(tracing::Level::WARN) {
+                        warn!(
+                            "Node {} DHT warmup failed for {}: {:?}",
+                            node.index,
+                            hex::encode(addr),
+                            result
+                        );
+                    }
+                }
+            }
+        }
+
+        // Give DHT time to propagate discoveries
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        info!("✅ DHT routing tables warmed up");
+        Ok(())
+    }
+
     /// Start background health monitoring.
     fn start_health_monitor(&mut self) {
         let nodes: Vec<Arc<P2PNode>> = self
@@ -1228,8 +1519,17 @@ impl TestNetwork {
         // Stop all nodes in reverse order.
         // We shutdown nodes concurrently to avoid serially accumulating DHT
         // graceful-leave waits across every node.
+        // Skip nodes that are already shut down (e.g., via shutdown_node()).
         let mut shutdown_futures = Vec::with_capacity(self.nodes.len());
         for node in self.nodes.iter_mut().rev() {
+            let state = node.state.read().await.clone();
+
+            // Skip nodes that are already shut down or stopped
+            if matches!(state, NodeState::ShutDown | NodeState::Stopped) {
+                debug!("Skipping node {} (already shut down)", node.index);
+                continue;
+            }
+
             debug!("Stopping node {}", node.index);
             if let Some(handle) = node.protocol_task.take() {
                 handle.abort();
@@ -1249,7 +1549,10 @@ impl TestNetwork {
         }
 
         for node in &self.nodes {
-            *node.state.write().await = NodeState::Stopped;
+            let state = node.state.read().await.clone();
+            if !matches!(state, NodeState::ShutDown) {
+                *node.state.write().await = NodeState::Stopped;
+            }
         }
 
         // Cleanup test data directory
@@ -1325,6 +1628,60 @@ impl TestNetwork {
     #[must_use]
     pub fn config(&self) -> &TestNetworkConfig {
         &self.config
+    }
+
+    /// Shutdown a specific node by index.
+    ///
+    /// This simulates a node failure during testing. The node is gracefully shut down
+    /// and its state is set to `ShutDown`. The network continues to operate with the
+    /// remaining nodes.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The index of the node to shutdown (0-based)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node index is invalid or shutdown fails.
+    pub async fn shutdown_node(&mut self, index: usize) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(index)
+            .ok_or_else(|| TestnetError::Config(format!("Node index {index} out of bounds")))?;
+
+        node.shutdown().await?;
+
+        info!("Node {} has been shut down", index);
+        Ok(())
+    }
+
+    /// Shutdown multiple nodes by their indices.
+    ///
+    /// This is a convenience method for simulating multiple node failures at once.
+    ///
+    /// # Arguments
+    ///
+    /// * `indices` - Slice of node indices to shutdown
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node index is invalid or shutdown fails.
+    pub async fn shutdown_nodes(&mut self, indices: &[usize]) -> Result<()> {
+        for &index in indices {
+            self.shutdown_node(index).await?;
+        }
+        Ok(())
+    }
+
+    /// Get the number of currently running nodes.
+    pub async fn running_node_count(&self) -> usize {
+        let mut count = 0;
+        for node in &self.nodes {
+            if node.is_running().await {
+                count += 1;
+            }
+        }
+        count
     }
 }
 

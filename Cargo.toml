@@ -39,6 +39,7 @@ saorsa-pqc = "0.4.0"
 ant-evm = "0.1.19"
 evmlib = "0.4.7"
 xor_name = "5"
+libp2p = "0.56"  # For PeerId in payment proofs
 
 # Caching - LRU cache for verified XorNames
 lru = "0.16.3"

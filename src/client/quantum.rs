@@ -8,7 +8,8 @@
 //! Chunks are the only data type supported:
 //! - **Content-addressed**: Address = SHA256(content)
 //! - **Immutable**: Once stored, content cannot change
-//! - **Paid**: All storage requires EVM payment on Arbitrum
+//! - **Paid**: Storage requires EVM payment on Arbitrum when a wallet is configured;
+//!   devnets with EVM disabled accept unpaid puts
 //!
 //! ## Security Features
 //!
@@ -17,13 +18,17 @@
 //! - **ChaCha20-Poly1305**: Symmetric encryption for data at rest
 
 use super::chunk_protocol::send_and_await_chunk_response;
-use super::data_types::{DataChunk, XorName};
+use super::data_types::{compute_address, DataChunk, XorName};
 use crate::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse,
+    ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse,
 };
 use crate::error::{Error, Result};
+use crate::payment::SingleNodePayment;
+use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
+use evmlib::wallet::Wallet;
+use libp2p::PeerId;
 use saorsa_core::P2PNode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -35,6 +40,9 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Number of closest peers to consider for chunk routing.
 const CLOSE_GROUP_SIZE: usize = 8;
+
+/// Number of quotes required for payment (matches `SingleNodePayment` requirement).
+const REQUIRED_QUOTES: usize = 5;
 
 /// Default number of replicas for data redundancy.
 const DEFAULT_REPLICA_COUNT: u8 = 4;
@@ -71,10 +79,12 @@ impl Default for QuantumConfig {
 ///
 /// Chunks are content-addressed: the address is the SHA256 hash of the content.
 /// This ensures data integrity - if the content matches the address, the data
-/// is authentic. All chunk storage requires EVM payment on Arbitrum.
+/// is authentic. When a wallet is configured, chunk storage requires EVM payment
+/// on Arbitrum. Without a wallet, chunks can be stored on devnets with EVM disabled.
 pub struct QuantumClient {
     config: QuantumConfig,
     p2p_node: Option<Arc<P2PNode>>,
+    wallet: Option<Arc<Wallet>>,
     next_request_id: AtomicU64,
 }
 
@@ -86,6 +96,7 @@ impl QuantumClient {
         Self {
             config,
             p2p_node: None,
+            wallet: None,
             next_request_id: AtomicU64::new(1),
         }
     }
@@ -100,6 +111,13 @@ impl QuantumClient {
     #[must_use]
     pub fn with_node(mut self, node: Arc<P2PNode>) -> Self {
         self.p2p_node = Some(node);
+        self
+    }
+
+    /// Set the wallet for payment operations.
+    #[must_use]
+    pub fn with_wallet(mut self, wallet: Wallet) -> Self {
+        self.wallet = Some(Arc::new(wallet));
         self
     }
 
@@ -159,32 +177,7 @@ impl QuantumClient {
                     address: addr,
                     content,
                 }) => {
-                    if addr == *address {
-                        let computed = crate::client::compute_address(&content);
-                        if computed == addr {
-                            if tracing::enabled!(tracing::Level::DEBUG) {
-                                debug!(
-                                    "Found chunk {} on saorsa network ({} bytes)",
-                                    hex::encode(addr),
-                                    content.len()
-                                );
-                            }
-                            Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
-                        } else {
-                            if tracing::enabled!(tracing::Level::WARN) {
-                                warn!(
-                                    "Peer returned chunk {} with invalid content hash {}",
-                                    addr_hex,
-                                    hex::encode(computed)
-                                );
-                            }
-                            Some(Err(Error::InvalidChunk(format!(
-                                "Invalid chunk content: expected hash {}, got {}",
-                                addr_hex,
-                                hex::encode(computed)
-                            ))))
-                        }
-                    } else {
+                    if addr != *address {
                         if tracing::enabled!(tracing::Level::WARN) {
                             warn!(
                                 "Peer returned chunk {} but we requested {}",
@@ -192,12 +185,35 @@ impl QuantumClient {
                                 addr_hex
                             );
                         }
-                        Some(Err(Error::InvalidChunk(format!(
-                            "Mismatched chunk address: expected {}, got {}",
-                            addr_hex,
+                        return Some(Err(Error::InvalidChunk(format!(
+                            "Mismatched chunk address: expected {addr_hex}, got {}",
                             hex::encode(addr)
-                        ))))
+                        ))));
                     }
+
+                    let computed = compute_address(&content);
+                    if computed != addr {
+                        if tracing::enabled!(tracing::Level::WARN) {
+                            warn!(
+                                "Peer returned chunk {} with invalid content hash {}",
+                                addr_hex,
+                                hex::encode(computed)
+                            );
+                        }
+                        return Some(Err(Error::InvalidChunk(format!(
+                            "Invalid chunk content: expected hash {addr_hex}, got {}",
+                            hex::encode(computed)
+                        ))));
+                    }
+
+                    if tracing::enabled!(tracing::Level::DEBUG) {
+                        debug!(
+                            "Found chunk {} on saorsa network ({} bytes)",
+                            hex::encode(addr),
+                            content.len()
+                        );
+                    }
+                    Some(Ok(Some(DataChunk::new(addr, Bytes::from(content)))))
                 }
                 ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { .. }) => {
                     debug!("Chunk {} not found on saorsa network", addr_hex);
@@ -218,11 +234,14 @@ impl QuantumClient {
         .await
     }
 
-    /// Store a chunk on the saorsa network via ANT protocol.
+    /// Store a chunk on the saorsa network with full payment workflow.
     ///
-    /// The chunk address is computed as SHA256(content), ensuring content-addressing.
-    /// Sends a `ChunkPutRequest` to a connected peer and waits for the
-    /// `ChunkPutResponse`.
+    /// This method implements the complete payment flow:
+    /// 1. Request quotes from 5 closest nodes via DHT
+    /// 2. Sort quotes by price and select median (index 2)
+    /// 3. Pay median node 3x on Arbitrum, send 0 atto to other 4
+    /// 4. Create `ProofOfPayment` with all 5 quotes
+    /// 5. Send chunk with payment proof to storage nodes
     ///
     /// # Arguments
     ///
@@ -234,27 +253,83 @@ impl QuantumClient {
     ///
     /// # Errors
     ///
-    /// Returns an error if the store operation fails.
-    pub async fn put_chunk(&self, content: Bytes) -> Result<XorName> {
-        debug!("Storing chunk on saorsa network ({} bytes)", content.len());
+    /// Returns an error if:
+    /// - Wallet is not configured
+    /// - Quote collection fails
+    /// - Payment fails
+    /// - Storage operation fails
+    pub async fn put_chunk_with_payment(&self, content: Bytes) -> Result<XorName> {
+        info!("Storing chunk with payment ({} bytes)", content.len());
 
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
-        // Compute content address using SHA-256 (before peer selection so we can route by it)
-        let address = crate::client::compute_address(&content);
+        let Some(ref wallet) = self.wallet else {
+            return Err(Error::Payment(
+                "Wallet not configured - use with_wallet() to enable payments".to_string(),
+            ));
+        };
 
+        // Compute content address
+        let address = compute_address(&content);
+        let content_size = content.len();
+        let data_size = u64::try_from(content_size)
+            .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
+
+        // Step 1: Request quotes from network nodes via DHT
+        let quotes_with_peers = self
+            .get_quotes_from_dht_for_address(&address, data_size)
+            .await?;
+
+        if quotes_with_peers.len() != REQUIRED_QUOTES {
+            return Err(Error::Payment(format!(
+                "Expected {REQUIRED_QUOTES} quotes but received {}",
+                quotes_with_peers.len()
+            )));
+        }
+
+        // Step 2: Create ProofOfPayment BEFORE creating SingleNodePayment
+        // (which consumes quotes_with_prices)
+        // ProofOfPayment requires Vec<(EncodedPeerId, PaymentQuote)>
+        // Use the actual peer IDs from the DHT quote responses
+        let peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> = quotes_with_peers
+            .iter()
+            .map(|(peer_id_str, quote, _price)| {
+                let peer_id: PeerId = peer_id_str
+                    .parse()
+                    .map_err(|e| Error::Payment(format!("Invalid peer ID '{peer_id_str}': {e}")))?;
+                Ok((EncodedPeerId::from(peer_id), quote.clone()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let proof_of_payment = ProofOfPayment { peer_quotes };
+
+        // Step 3: Create SingleNodePayment (sorts by price, selects median, pays 3x)
+        // Strip the peer IDs for SingleNodePayment which only needs (quote, price)
+        let quotes_with_prices: Vec<(PaymentQuote, Amount)> = quotes_with_peers
+            .into_iter()
+            .map(|(_peer_id, quote, price)| (quote, price))
+            .collect();
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
+
+        info!(
+            "Payment prepared: {} atto total (3x median price)",
+            payment.total_amount()
+        );
+
+        // Step 4: Pay on-chain
+        let _tx_hashes = payment.pay(wallet).await?;
+        info!("Payment successful on Arbitrum");
+
+        let payment_proof = rmp_serde::to_vec(&proof_of_payment)
+            .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
+
+        // Step 5: Send chunk with payment proof to storage node
         let target_peer = Self::pick_target_peer(node, &address).await?;
 
-        // Create PUT request with empty payment proof
-        let empty_payment = rmp_serde::to_vec(&ant_evm::ProofOfPayment {
-            peer_quotes: vec![],
-        })
-        .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
-
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let request = ChunkPutRequest::with_payment(address, content.to_vec(), empty_payment);
+        let request = ChunkPutRequest::with_payment(address, content.to_vec(), payment_proof);
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
@@ -264,7 +339,6 @@ impl QuantumClient {
             .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
 
         let timeout = Duration::from_secs(self.config.timeout_secs);
-        let content_len = content.len();
         let addr_hex = hex::encode(address);
         let timeout_secs = self.config.timeout_secs;
 
@@ -276,21 +350,195 @@ impl QuantumClient {
             timeout,
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
-                    if tracing::enabled!(tracing::Level::INFO) {
-                        info!(
-                            "Chunk stored at address: {} ({} bytes)",
-                            hex::encode(addr),
-                            content_len
-                        );
-                    }
+                    info!(
+                        "Chunk stored at address: {} ({} bytes)",
+                        hex::encode(addr),
+                        content_size
+                    );
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
                     address: addr,
                 }) => {
-                    if tracing::enabled!(tracing::Level::INFO) {
-                        info!("Chunk already exists at address: {}", hex::encode(addr));
-                    }
+                    info!("Chunk already exists at address: {}", hex::encode(addr));
+                    Some(Ok(addr))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
+                    Some(Err(Error::Network(format!("Payment required: {message}"))))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => Some(Err(
+                    Error::Network(format!("Remote PUT error for {addr_hex}: {e}")),
+                )),
+                _ => None,
+            },
+            |e| Error::Network(format!("Failed to send PUT to peer {target_peer}: {e}")),
+            || {
+                Error::Network(format!(
+                    "Timeout waiting for store response for {addr_hex} after {timeout_secs}s"
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Store a chunk with a pre-built payment proof, skipping the internal payment flow.
+    ///
+    /// Use this when you have already obtained quotes and paid on-chain externally
+    /// (e.g. via [`SingleNodePayment::pay`]) and want to avoid a redundant payment cycle.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The data to store
+    /// * `proof` - A serialised [`ProofOfPayment`] (msgpack bytes)
+    ///
+    /// # Returns
+    ///
+    /// The `XorName` address where the chunk was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - P2P node is not configured
+    /// - No remote peers found near the target address
+    /// - Storage operation fails
+    pub async fn put_chunk_with_proof(&self, content: Bytes, proof: Vec<u8>) -> Result<XorName> {
+        let Some(ref node) = self.p2p_node else {
+            return Err(Error::Network("P2P node not configured".into()));
+        };
+
+        let address = compute_address(&content);
+        let content_size = content.len();
+
+        let target_peer = Self::pick_target_peer(node, &address).await?;
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request = ChunkPutRequest::with_payment(address, content.to_vec(), proof);
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::PutRequest(request),
+        };
+        let message_bytes = message
+            .encode()
+            .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
+
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let addr_hex = hex::encode(address);
+        let timeout_secs = self.config.timeout_secs;
+
+        send_and_await_chunk_response(
+            node,
+            &target_peer,
+            message_bytes,
+            request_id,
+            timeout,
+            |body| match body {
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
+                    info!(
+                        "Chunk stored at address: {} ({} bytes)",
+                        hex::encode(addr),
+                        content_size
+                    );
+                    Some(Ok(addr))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
+                    address: addr,
+                }) => {
+                    info!("Chunk already exists at address: {}", hex::encode(addr));
+                    Some(Ok(addr))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
+                    Some(Err(Error::Network(format!("Payment required: {message}"))))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => Some(Err(
+                    Error::Network(format!("Remote PUT error for {addr_hex}: {e}")),
+                )),
+                _ => None,
+            },
+            |e| Error::Network(format!("Failed to send PUT to peer {target_peer}: {e}")),
+            || {
+                Error::Network(format!(
+                    "Timeout waiting for store response for {addr_hex} after {timeout_secs}s"
+                ))
+            },
+        )
+        .await
+    }
+
+    /// Store a chunk on the saorsa network.
+    ///
+    /// Behavior depends on whether a wallet is configured:
+    /// - **With wallet**: Delegates to [`put_chunk_with_payment`](Self::put_chunk_with_payment)
+    ///   for the full payment flow (quotes, on-chain payment, proof).
+    /// - **Without wallet**: Sends a simple `ChunkPutRequest` without payment proof.
+    ///   This works on devnets where EVM payment verification is disabled.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The data to store
+    ///
+    /// # Returns
+    ///
+    /// The `XorName` address where the chunk was stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - P2P node is not configured
+    /// - No remote peers found near the target address
+    /// - The storage operation fails
+    /// - Payment is required but no wallet is configured
+    pub async fn put_chunk(&self, content: Bytes) -> Result<XorName> {
+        if self.wallet.is_some() {
+            return self.put_chunk_with_payment(content).await;
+        }
+
+        // No wallet configured - store without payment (works when EVM is disabled on nodes)
+        info!(
+            "Storing chunk without payment ({} bytes) - no wallet configured",
+            content.len()
+        );
+
+        let Some(ref node) = self.p2p_node else {
+            return Err(Error::Network("P2P node not configured".into()));
+        };
+
+        let address = compute_address(&content);
+        let content_size = content.len();
+        let target_peer = Self::pick_target_peer(node, &address).await?;
+
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let request = ChunkPutRequest::new(address, content.to_vec());
+        let message = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::PutRequest(request),
+        };
+        let message_bytes = message
+            .encode()
+            .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
+
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+        let addr_hex = hex::encode(address);
+        let timeout_secs = self.config.timeout_secs;
+
+        send_and_await_chunk_response(
+            node,
+            &target_peer,
+            message_bytes,
+            request_id,
+            timeout,
+            |body| match body {
+                ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
+                    info!(
+                        "Chunk stored at address: {} ({} bytes)",
+                        hex::encode(addr),
+                        content_size
+                    );
+                    Some(Ok(addr))
+                }
+                ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
+                    address: addr,
+                }) => {
+                    info!("Chunk already exists at address: {}", hex::encode(addr));
                     Some(Ok(addr))
                 }
                 ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
@@ -370,6 +618,237 @@ impl QuantumClient {
         }
 
         Ok(closest.peer_id)
+    }
+
+    /// Get quotes from DHT peers for chunk storage.
+    ///
+    /// Computes the content address and requests quotes from the closest peers.
+    /// Collects exactly `REQUIRED_QUOTES` quotes.
+    ///
+    /// # Arguments
+    ///
+    /// * `content` - The chunk data to get quotes for
+    ///
+    /// # Returns
+    ///
+    /// A vector of (`peer_id`, `PaymentQuote`, `Amount`) tuples containing the quoting peer's ID,
+    /// the quote, and its price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - DHT lookup fails
+    /// - Failed to collect enough quotes
+    /// - Quote deserialization fails
+    pub async fn get_quotes_from_dht(
+        &self,
+        content: &[u8],
+    ) -> Result<Vec<(String, PaymentQuote, Amount)>> {
+        let address = compute_address(content);
+        let data_size = u64::try_from(content.len())
+            .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
+        self.get_quotes_from_dht_for_address(&address, data_size)
+            .await
+    }
+
+    /// Get quotes from DHT peers for chunk storage using a pre-computed address.
+    ///
+    /// Queries the DHT for the closest peers to the chunk address and requests
+    /// storage quotes from them. Collects exactly `REQUIRED_QUOTES` quotes.
+    ///
+    /// # Arguments
+    ///
+    /// * `address` - The pre-computed `XorName` address for the chunk
+    /// * `data_size` - The size of the chunk data in bytes
+    ///
+    /// # Returns
+    ///
+    /// A vector of (`peer_id`, `PaymentQuote`, `Amount`) tuples containing the quoting peer's ID,
+    /// the quote, and its price.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - DHT lookup fails
+    /// - Failed to collect enough quotes
+    /// - Quote deserialization fails
+    #[allow(clippy::too_many_lines)]
+    async fn get_quotes_from_dht_for_address(
+        &self,
+        address: &XorName,
+        data_size: u64,
+    ) -> Result<Vec<(String, PaymentQuote, Amount)>> {
+        let Some(ref node) = self.p2p_node else {
+            return Err(Error::Network("P2P node not configured".into()));
+        };
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Requesting {} quotes from DHT for chunk {} (size: {})",
+                REQUIRED_QUOTES,
+                hex::encode(address),
+                data_size
+            );
+        }
+
+        let local_peer_id = node.peer_id();
+        let local_transport_id = node.transport_peer_id();
+
+        // Find closest peers via DHT
+        let closest_nodes = node
+            .dht()
+            .find_closest_nodes(address, CLOSE_GROUP_SIZE)
+            .await
+            .map_err(|e| Error::Network(format!("DHT closest-nodes lookup failed: {e}")))?;
+
+        // Filter out self and collect remote peers
+        let mut remote_peers: Vec<String> = closest_nodes
+            .into_iter()
+            .filter(|n| {
+                n.peer_id != *local_peer_id
+                    && local_transport_id
+                        .as_ref()
+                        .map_or(true, |tid| n.peer_id != *tid)
+            })
+            .map(|n| n.peer_id)
+            .collect();
+
+        // Fallback to connected_peers() if DHT has insufficient peers
+        // This handles the case where DHT routing tables are still warming up
+        if remote_peers.len() < REQUIRED_QUOTES {
+            warn!(
+                "DHT returned only {} peers for {}, falling back to connected_peers()",
+                remote_peers.len(),
+                hex::encode(address)
+            );
+
+            let connected = node.connected_peers().await;
+            debug!("Found {} connected P2P peers for fallback", connected.len());
+
+            // Add connected peers that aren't already in remote_peers
+            for peer_id in connected {
+                if !remote_peers.contains(&peer_id) {
+                    remote_peers.push(peer_id);
+                }
+            }
+
+            if remote_peers.len() < REQUIRED_QUOTES {
+                return Err(Error::Network(format!(
+                    "Insufficient peers for quotes: found {} (DHT + P2P fallback), need {}",
+                    remote_peers.len(),
+                    REQUIRED_QUOTES
+                )));
+            }
+
+            info!(
+                "Fallback successful: now have {} peers for quote requests",
+                remote_peers.len()
+            );
+        }
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            debug!(
+                "Found {} remote peers, requesting quotes from first {}",
+                remote_peers.len(),
+                REQUIRED_QUOTES
+            );
+        }
+
+        // Request quotes from first REQUIRED_QUOTES peers
+        let mut quotes_with_peers = Vec::new();
+        let timeout = Duration::from_secs(self.config.timeout_secs);
+
+        for peer_id in &remote_peers {
+            let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+            let request = ChunkQuoteRequest::new(*address, data_size);
+            let message = ChunkMessage {
+                request_id,
+                body: ChunkMessageBody::QuoteRequest(request),
+            };
+
+            let message_bytes = message
+                .encode()
+                .map_err(|e| Error::Network(format!("Failed to encode quote request: {e}")))?;
+
+            // Send request and await response
+            let quote_result = send_and_await_chunk_response(
+                node,
+                peer_id,
+                message_bytes,
+                request_id,
+                timeout,
+                |body| match body {
+                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote }) => {
+                        // Deserialize the quote
+                        match rmp_serde::from_slice::<PaymentQuote>(&quote) {
+                            Ok(payment_quote) => {
+                                // TODO: Extract actual price from quote once a dedicated
+                                // price/cost field is added to PaymentQuote. Currently using
+                                // close_records_stored as a placeholder metric.
+                                let stored = match u64::try_from(
+                                    payment_quote.quoting_metrics.close_records_stored,
+                                ) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        return Some(Err(Error::Payment(format!(
+                                            "Price conversion overflow: {e}"
+                                        ))));
+                                    }
+                                };
+                                let price = Amount::from(stored);
+                                if tracing::enabled!(tracing::Level::DEBUG) {
+                                    debug!("Received quote from {}: price = {}", peer_id, price);
+                                }
+                                Some(Ok((payment_quote, price)))
+                            }
+                            Err(e) => Some(Err(Error::Network(format!(
+                                "Failed to deserialize quote from {peer_id}: {e}"
+                            )))),
+                        }
+                    }
+                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+                        Error::Network(format!("Quote error from {peer_id}: {e}")),
+                    )),
+                    _ => None,
+                },
+                |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
+                || Error::Network(format!("Timeout waiting for quote from {peer_id}")),
+            )
+            .await;
+
+            match quote_result {
+                Ok((quote, price)) => {
+                    quotes_with_peers.push((peer_id.clone(), quote, price));
+                }
+                Err(e) => {
+                    warn!("Failed to get quote from {peer_id}: {e}");
+                    // Continue trying other peers
+                }
+            }
+
+            // Stop if we have enough quotes
+            if quotes_with_peers.len() >= REQUIRED_QUOTES {
+                break;
+            }
+        }
+
+        if quotes_with_peers.len() < REQUIRED_QUOTES {
+            return Err(Error::Network(format!(
+                "Failed to collect enough quotes: got {}, need {}",
+                quotes_with_peers.len(),
+                REQUIRED_QUOTES
+            )));
+        }
+
+        if tracing::enabled!(tracing::Level::INFO) {
+            info!(
+                "Collected {} quotes for chunk {}",
+                quotes_with_peers.len(),
+                hex::encode(address)
+            );
+        }
+
+        Ok(quotes_with_peers)
     }
 }
 

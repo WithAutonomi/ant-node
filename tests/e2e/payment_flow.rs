@@ -1,21 +1,24 @@
 //! E2E tests for payment-enabled chunk storage across multiple nodes.
 //!
-//! **Status**: These tests validate the payment infrastructure but currently
-//! work in test mode (EVM verification disabled) since the full quote/payment
-//! protocol requires additional implementation.
+//! These tests validate the full payment workflow for chunk storage:
 //!
-//! **When fully implemented, the workflow will be**:
-//! 1. Client requests quotes from network nodes via DHT
-//! 2. Client calculates median price and pays on Arbitrum
-//! 3. Client sends chunk with payment proof to nodes
-//! 4. Nodes verify payment on-chain before storing
-//! 5. Chunk is retrievable from the network
+//! **Payment Workflow**:
+//! 1. Client requests quotes from 5 network nodes via DHT
+//! 2. Client sorts quotes by price and selects median
+//! 3. Client pays median node 3x on Arbitrum (`SingleNode` payment strategy)
+//! 4. Client sends 0 atto to the other 4 nodes for verification
+//! 5. Client sends chunk with `ProofOfPayment` to storage nodes
+//! 6. Nodes verify payment on-chain before storing (when EVM verification enabled)
+//! 7. Chunk is retrievable from the network
 //!
-//! **Current test coverage**:
-//! - Network setup with EVM testnet
+//! **Test Coverage**:
+//! - Network setup with 10-node test network and Anvil EVM testnet
 //! - Wallet creation and funding
-//! - Client configuration
-//! - Basic storage operations (without quotes/payment in test mode)
+//! - Quote collection from DHT peers
+//! - Median price calculation and `SingleNode` payment
+//! - On-chain payment verification
+//! - Payment cache preventing duplicate payments
+//! - Network resilience with node failures
 //!
 //! **Network Setup**: Uses a 10-node test network (need 8+ for `CLOSE_GROUP_SIZE`).
 
@@ -24,6 +27,7 @@ use bytes::Bytes;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use saorsa_node::client::QuantumClient;
+use saorsa_node::payment::SingleNodePayment;
 use serial_test::serial;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -88,6 +92,11 @@ async fn init_testnet_and_evm() -> Result<PaymentTestEnv, Box<dyn std::error::Er
         total_connections
     );
 
+    // Warm up DHT routing tables for quote collection
+    info!("Warming up DHT routing tables...");
+    harness.warmup_dht().await?;
+    info!("DHT warmup complete");
+
     Ok(PaymentTestEnv { harness, testnet })
 }
 
@@ -117,8 +126,7 @@ async fn test_client_pays_and_stores_on_network() -> Result<(), Box<dyn std::err
 
     info!("Client configured with funded wallet");
 
-    // Store a chunk via test node (bypasses quote/payment for now)
-    // TODO: Once quote protocol is fully implemented, use client.put_chunk()
+    // Store a chunk using the payment-enabled client
     let test_data = b"Test data for payment E2E flow";
     info!("Storing {} bytes", test_data.len());
 
@@ -126,7 +134,7 @@ async fn test_client_pays_and_stores_on_network() -> Result<(), Box<dyn std::err
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk(test_data)
+        .store_chunk_with_payment(test_data)
         .await?;
     info!("Chunk stored successfully at: {}", hex::encode(address));
 
@@ -185,8 +193,7 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
 
     info!("Created 3 clients with independent funded wallets");
 
-    // Store chunks concurrently (using test method for now)
-    // TODO: Once quote protocol works, use client.put_chunk()
+    // Store chunks concurrently using payment-enabled client
     let mut addresses = Vec::new();
     for i in 0..3 {
         let data = format!("Data from client {i}");
@@ -194,7 +201,7 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
             .harness
             .test_node(i)
             .ok_or_else(|| format!("Node {i} not found"))?
-            .store_chunk(data.as_bytes())
+            .store_chunk_with_payment(data.as_bytes())
             .await?;
         info!("Client {} stored chunk at: {}", i, hex::encode(address));
         addresses.push(address);
@@ -238,13 +245,28 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
 async fn test_payment_required_enforcement() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting E2E payment test: payment enforcement validation");
 
-    // TODO: This test requires payment-enabled nodes (EVM verification on)
-    // Current test infrastructure disables EVM verification for speed
-    // Future: Add TestHarnessConfig::with_payment_enforcement() to create
-    // nodes with EVM verification enabled
+    // Start Anvil EVM testnet first
+    let testnet = Testnet::new().await;
+    info!("Anvil testnet started");
 
-    // Initialize test environment (network + EVM)
-    let env = init_testnet_and_evm().await?;
+    // Setup 10-node network with payment enforcement enabled
+    let harness = TestHarness::setup_with_evm_and_config(
+        super::testnet::TestNetworkConfig::small().with_payment_enforcement(),
+    )
+    .await?;
+
+    info!("10-node test network started with payment enforcement");
+
+    // Wait for network to stabilize (10 nodes need more time)
+    sleep(Duration::from_secs(5)).await;
+
+    let total_connections = harness.total_connections().await;
+    info!(
+        "Payment test environment ready: {} total connections",
+        total_connections
+    );
+
+    let env = PaymentTestEnv { harness, testnet };
 
     // Try to store without wallet (should fail)
     let client_without_wallet =
@@ -293,7 +315,7 @@ async fn test_large_chunk_payment_flow() -> Result<(), Box<dyn std::error::Error
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk(&large_data)
+        .store_chunk_with_payment(&large_data)
         .await?;
     info!("Large chunk stored at: {}", hex::encode(address));
 
@@ -350,30 +372,60 @@ async fn test_payment_cache_prevents_double_payment() -> Result<(), Box<dyn std:
 
     let test_data = b"Test data for cache validation";
 
-    // First store
+    // Get the payment tracker from the harness
+    let tracker = env.harness.payment_tracker();
+
+    // Compute the expected address so we can query payment count
+    let expected_address = saorsa_node::compute_address(test_data);
+
+    // Verify no payments made yet
+    assert_eq!(
+        tracker.payment_count(&expected_address),
+        0,
+        "Should have 0 payments before storing"
+    );
+
+    // First store with payment tracking
     let address1 = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk(test_data)
+        .store_chunk_with_tracked_payment(test_data, tracker)
         .await?;
     info!("First store: {}", hex::encode(address1));
 
-    // Second store of same data - should return AlreadyExists
+    // Verify exactly 1 payment was made
+    assert_eq!(
+        tracker.payment_count(&address1),
+        1,
+        "Should have exactly 1 payment after first store"
+    );
+
+    // Second store of same data with payment tracking
     let address2 = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk(test_data)
+        .store_chunk_with_tracked_payment(test_data, tracker)
         .await?;
     info!("Second store: {}", hex::encode(address2));
 
     assert_eq!(address1, address2, "Same data should produce same address");
 
-    // TODO: Track and verify only one on-chain payment was made
-    // This requires adding payment tracking to the test harness
+    // CRITICAL: Verify still only 1 payment (cache prevented duplicate payment)
+    assert_eq!(
+        tracker.payment_count(&address1),
+        1,
+        "Should still have exactly 1 payment after second store (cache should prevent duplicate)"
+    );
 
-    info!("✅ Payment cache validation complete");
+    // Verify no duplicate payments across all chunks
+    assert!(
+        !tracker.has_duplicate_payments(),
+        "Payment cache should prevent duplicate payments"
+    );
+
+    info!("✅ Payment cache validation complete: confirmed single payment for duplicate store");
 
     env.teardown().await?;
     Ok(())
@@ -393,20 +445,72 @@ async fn test_quote_collection_via_dht() -> Result<(), Box<dyn std::error::Error
     // Initialize test environment (network + EVM)
     let env = init_testnet_and_evm().await?;
 
-    // TODO: Implement quote request/response protocol
-    // This test is a placeholder for when the DHT quote protocol is implemented
-    //
-    // Expected flow:
-    // 1. Client sends quote request to DHT (closest peers to chunk address)
-    // 2. Nodes respond with quotes containing:
-    //    - Quote hash
-    //    - Rewards address
-    //    - Price (from quoting metrics)
-    //    - Signature
-    // 3. Client collects 5 quotes
-    // 4. Client sorts by price and selects median
+    // Create a client connected to node 0
+    let client =
+        QuantumClient::with_defaults().with_node(env.harness.node(0).ok_or("Node 0 not found")?);
 
-    info!("Quote collection test - waiting for DHT quote protocol implementation");
+    // Prepare test data
+    let test_data = b"Test data for quote collection";
+    info!("Requesting quotes for {} bytes", test_data.len());
+
+    // Request quotes from DHT peers
+    let quotes_with_prices = client.get_quotes_from_dht(test_data).await?;
+
+    // Validate we got exactly 5 quotes (REQUIRED_QUOTES)
+    assert_eq!(
+        quotes_with_prices.len(),
+        5,
+        "Should collect exactly 5 quotes"
+    );
+
+    info!(
+        "✅ Successfully collected {} quotes from DHT",
+        quotes_with_prices.len()
+    );
+
+    // Validate each quote has a price and peer ID
+    for (i, (peer_id, quote, price)) in quotes_with_prices.iter().enumerate() {
+        info!(
+            "Quote {}: peer = {peer_id}, price = {} atto, address = {}",
+            i + 1,
+            price,
+            quote.rewards_address
+        );
+
+        // Verify quote content matches our data
+        let address = saorsa_node::compute_address(test_data);
+        assert_eq!(
+            quote.content.0, address,
+            "Quote content address should match computed address"
+        );
+    }
+
+    // Create SingleNodePayment to test median selection (strip peer IDs)
+    let quotes_for_payment: Vec<_> = quotes_with_prices
+        .into_iter()
+        .map(|(_peer_id, quote, price)| (quote, price))
+        .collect();
+    let payment = SingleNodePayment::from_quotes(quotes_for_payment)?;
+
+    info!("✅ Successfully created SingleNodePayment from quotes");
+    info!("   Total payment amount: {} atto", payment.total_amount());
+    info!(
+        "   Paid quote (median): {} atto",
+        payment.paid_quote().amount
+    );
+
+    // Verify only the median quote has a non-zero amount
+    let non_zero_quotes = payment
+        .quotes
+        .iter()
+        .filter(|q| q.amount > ant_evm::Amount::ZERO)
+        .count();
+    assert_eq!(
+        non_zero_quotes, 1,
+        "Only median quote should have non-zero amount"
+    );
+
+    info!("✅ Quote collection and median selection validated");
 
     env.teardown().await?;
     Ok(())
@@ -433,21 +537,65 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
         .ok_or("Node 0 not found")?
         .set_wallet(wallet);
 
-    // TODO: Simulate node failures (shutdown nodes 5-7)
-    // Then verify storage still succeeds with remaining nodes
+    // Verify initial network has all nodes running
+    let initial_count = env.harness.running_node_count().await;
+    info!("Initial network has {} running nodes", initial_count);
+    assert_eq!(initial_count, 10, "Should start with 10 nodes");
 
-    // For now, just verify basic storage works
+    // Simulate node failures by shutting down nodes 5, 6, and 7
+    info!("Simulating node failures: shutting down nodes 5, 6, 7");
+    env.harness.shutdown_nodes(&[5, 6, 7]).await?;
+
+    // Wait for network to adapt to failures
+    sleep(Duration::from_secs(2)).await;
+
+    // Verify nodes are shut down
+    let remaining_count = env.harness.running_node_count().await;
+    info!("After failures: {} running nodes remain", remaining_count);
+    assert_eq!(
+        remaining_count, 7,
+        "Should have 7 nodes after shutting down 3"
+    );
+
+    // Store a chunk with the remaining nodes (7 nodes still > 5 needed for quotes)
     let test_data = b"Resilience test data";
     let address = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk(test_data)
+        .store_chunk_with_payment(test_data)
         .await?;
 
     info!(
-        "Stored chunk despite simulated failures: {}",
+        "Successfully stored chunk despite simulated failures: {}",
         hex::encode(address)
+    );
+
+    // Verify chunk is retrievable from the storing node
+    sleep(Duration::from_millis(500)).await;
+
+    let retrieved = env
+        .harness
+        .test_node(0)
+        .ok_or("Node 0 not found")?
+        .get_chunk(&address)
+        .await?;
+
+    assert!(
+        retrieved.is_some(),
+        "Chunk should be retrievable despite node failures"
+    );
+
+    let chunk = retrieved.ok_or("Chunk not found")?;
+    assert_eq!(
+        chunk.content.as_ref(),
+        test_data,
+        "Retrieved data should match original"
+    );
+
+    info!(
+        "✅ Network resilience validated: storage succeeds with {} nodes after 3 failures",
+        remaining_count
     );
 
     env.teardown().await?;
