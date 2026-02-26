@@ -328,7 +328,7 @@ impl QuantumClient {
     /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest nodes to the target
     /// address and returns the single closest remote peer (excluding ourselves).
     async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<String> {
-        let local_peer_id = node.peer_id();
+        let local_peer_id_hex = node.peer_id().clone();
         let local_transport_id = node.transport_peer_id();
 
         let closest_nodes = node
@@ -340,7 +340,7 @@ impl QuantumClient {
         let closest = closest_nodes
             .into_iter()
             .find(|n| {
-                n.peer_id != *local_peer_id
+                n.peer_id != local_peer_id_hex
                     && local_transport_id
                         .as_ref()
                         .map_or(true, |tid| n.peer_id != *tid)

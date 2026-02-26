@@ -58,9 +58,9 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Self::resolve_identity(&mut self.config).await?;
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let node_id = identity.node_id().clone();
 
-        info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+        info!(node_id = %node_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -73,7 +73,8 @@ impl NodeBuilder {
 
         // Convert our config to saorsa-core's config, injecting our stable peer_id
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id);
+        core_config.peer_id = Some(node_id.to_hex());
+        core_config.node_identity = Some(Arc::new(identity));
         debug!("Core config: {:?}", core_config);
 
         // Initialize saorsa-core's P2PNode

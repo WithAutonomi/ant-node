@@ -564,7 +564,15 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
+        // Load the node identity for app-level message signing
+        let identity = NodeIdentity::load_from_file(
+            &node.data_dir.join(crate::config::NODE_IDENTITY_FILENAME),
+        )
+        .await
+        .map_err(|e| DevnetError::Core(format!("Failed to load node identity: {e}")))?;
+
         core_config.peer_id = Some(node.peer_id.clone());
+        core_config.node_identity = Some(Arc::new(identity));
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;

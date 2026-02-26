@@ -40,9 +40,15 @@ pub async fn send_and_await_chunk_response<T, E>(
     // Subscribe before sending so we don't miss the response
     let mut events = node.subscribe_events();
 
-    let target_peer_id = target_peer.to_string();
+    // Validate the target peer ID is a valid hex-encoded NodeId
+    let _target_node_id = match saorsa_core::identity::NodeId::from_hex(target_peer) {
+        Ok(id) => id,
+        Err(e) => return Err(send_error(format!("Invalid target peer ID: {e}"))),
+    };
 
-    node.send_message(&target_peer_id, CHUNK_PROTOCOL_ID, message_bytes)
+    // send_message accepts &PeerId (= &String); target_peer is the hex NodeId string
+    // which the transport layer will resolve via the app→transport mapping.
+    node.send_message(&target_peer.to_string(), CHUNK_PROTOCOL_ID, message_bytes)
         .await
         .map_err(|e| send_error(e.to_string()))?;
 
@@ -55,7 +61,7 @@ pub async fn send_and_await_chunk_response<T, E>(
                 topic,
                 source,
                 data,
-            })) if topic == CHUNK_PROTOCOL_ID && source == target_peer_id => {
+            })) if topic == CHUNK_PROTOCOL_ID && source == target_peer => {
                 let response = match ChunkMessage::decode(&data) {
                     Ok(r) => r,
                     Err(e) => {
