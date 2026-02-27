@@ -291,7 +291,7 @@ pub enum NodeState {
 #[allow(dead_code)]
 pub struct DevnetNode {
     index: usize,
-    node_id: String,
+    label: String,
     peer_id: String,
     port: u16,
     address: SocketAddr,
@@ -532,7 +532,7 @@ impl Devnet {
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
         let peer_id = identity.peer_id().to_hex();
-        let node_id = format!("devnet_node_{index}");
+        let label = format!("devnet_node_{index}");
         let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
 
         tokio::fs::create_dir_all(&data_dir).await?;
@@ -546,7 +546,7 @@ impl Devnet {
 
         Ok(DevnetNode {
             index,
-            node_id,
+            label,
             peer_id,
             port,
             address,
