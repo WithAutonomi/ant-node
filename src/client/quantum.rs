@@ -28,6 +28,7 @@ use crate::payment::SingleNodePayment;
 use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
+use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
 use saorsa_core::P2PNode;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -289,28 +290,24 @@ impl QuantumClient {
             )));
         }
 
-        // Step 2: Create ProofOfPayment BEFORE creating SingleNodePayment
-        // (which consumes quotes_with_prices)
-        // ProofOfPayment requires Vec<(EncodedPeerId, PaymentQuote)>
-        // Use the actual peer IDs from the DHT quote responses
-        let peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> = quotes_with_peers
-            .iter()
-            .map(|(peer_id_str, quote, _price)| {
-                let peer_id: PeerId = peer_id_str
-                    .parse()
-                    .map_err(|e| Error::Payment(format!("Invalid peer ID '{peer_id_str}': {e}")))?;
-                Ok((EncodedPeerId::from(peer_id), quote.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        // Step 2: Build both peer_quotes (for ProofOfPayment) and quotes_with_prices
+        // (for SingleNodePayment) in a single pass, avoiding a redundant clone.
+        let mut peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> =
+            Vec::with_capacity(quotes_with_peers.len());
+        let mut quotes_with_prices: Vec<(PaymentQuote, Amount)> =
+            Vec::with_capacity(quotes_with_peers.len());
+
+        for (peer_id_str, quote, price) in quotes_with_peers {
+            let peer_id: PeerId = peer_id_str
+                .parse()
+                .map_err(|e| Error::Payment(format!("Invalid peer ID '{peer_id_str}': {e}")))?;
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            quotes_with_prices.push((quote, price));
+        }
 
         let proof_of_payment = ProofOfPayment { peer_quotes };
 
         // Step 3: Create SingleNodePayment (sorts by price, selects median, pays 3x)
-        // Strip the peer IDs for SingleNodePayment which only needs (quote, price)
-        let quotes_with_prices: Vec<(PaymentQuote, Amount)> = quotes_with_peers
-            .into_iter()
-            .map(|(_peer_id, quote, price)| (quote, price))
-            .collect();
         let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
 
         info!(
@@ -754,9 +751,12 @@ impl QuantumClient {
             );
         }
 
-        // Request quotes from first REQUIRED_QUOTES peers
-        let mut quotes_with_peers = Vec::new();
+        // Request quotes from all peers concurrently
+        // Collect the first REQUIRED_QUOTES successful responses
         let timeout = Duration::from_secs(self.config.timeout_secs);
+
+        // Create futures for all quote requests concurrently
+        let mut quote_futures = FuturesUnordered::new();
 
         for peer_id in &remote_peers {
             let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
@@ -766,69 +766,95 @@ impl QuantumClient {
                 body: ChunkMessageBody::QuoteRequest(request),
             };
 
-            let message_bytes = message
-                .encode()
-                .map_err(|e| Error::Network(format!("Failed to encode quote request: {e}")))?;
+            let message_bytes = match message.encode() {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("Failed to encode quote request for {peer_id}: {e}");
+                    continue;
+                }
+            };
 
-            // Send request and await response
-            let quote_result = send_and_await_chunk_response(
-                node,
-                peer_id,
-                message_bytes,
-                request_id,
-                timeout,
-                |body| match body {
-                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote }) => {
-                        // Deserialize the quote
-                        match rmp_serde::from_slice::<PaymentQuote>(&quote) {
-                            Ok(payment_quote) => {
-                                // TODO: Extract actual price from quote once a dedicated
-                                // price/cost field is added to PaymentQuote. Currently using
-                                // close_records_stored as a placeholder metric.
-                                let stored = match u64::try_from(
-                                    payment_quote.quoting_metrics.close_records_stored,
-                                ) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        return Some(Err(Error::Payment(format!(
-                                            "Price conversion overflow: {e}"
-                                        ))));
+            // Clone necessary data for the async task
+            let peer_id_clone = peer_id.clone();
+            let node_clone = node.clone();
+
+            // Create a future for this quote request
+            let quote_future = async move {
+                let quote_result = send_and_await_chunk_response(
+                    &node_clone,
+                    &peer_id_clone,
+                    message_bytes,
+                    request_id,
+                    timeout,
+                    |body| match body {
+                        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success { quote }) => {
+                            // Deserialize the quote
+                            match rmp_serde::from_slice::<PaymentQuote>(&quote) {
+                                Ok(payment_quote) => {
+                                    // TODO: Extract actual price from quote once a dedicated
+                                    // price/cost field is added to PaymentQuote. Currently using
+                                    // close_records_stored as a placeholder metric.
+                                    let stored = match u64::try_from(
+                                        payment_quote.quoting_metrics.close_records_stored,
+                                    ) {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            return Some(Err(Error::Payment(format!(
+                                                "Price conversion overflow: {e}"
+                                            ))));
+                                        }
+                                    };
+                                    let price = Amount::from(stored);
+                                    if tracing::enabled!(tracing::Level::DEBUG) {
+                                        debug!(
+                                            "Received quote from {}: price = {}",
+                                            peer_id_clone, price
+                                        );
                                     }
-                                };
-                                let price = Amount::from(stored);
-                                if tracing::enabled!(tracing::Level::DEBUG) {
-                                    debug!("Received quote from {}: price = {}", peer_id, price);
+                                    Some(Ok((payment_quote, price)))
                                 }
-                                Some(Ok((payment_quote, price)))
+                                Err(e) => Some(Err(Error::Network(format!(
+                                    "Failed to deserialize quote from {peer_id_clone}: {e}"
+                                )))),
                             }
-                            Err(e) => Some(Err(Error::Network(format!(
-                                "Failed to deserialize quote from {peer_id}: {e}"
-                            )))),
                         }
-                    }
-                    ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
-                        Error::Network(format!("Quote error from {peer_id}: {e}")),
-                    )),
-                    _ => None,
-                },
-                |e| Error::Network(format!("Failed to send quote request to {peer_id}: {e}")),
-                || Error::Network(format!("Timeout waiting for quote from {peer_id}")),
-            )
-            .await;
+                        ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(e)) => Some(Err(
+                            Error::Network(format!("Quote error from {peer_id_clone}: {e}")),
+                        )),
+                        _ => None,
+                    },
+                    |e| {
+                        Error::Network(format!(
+                            "Failed to send quote request to {peer_id_clone}: {e}"
+                        ))
+                    },
+                    || Error::Network(format!("Timeout waiting for quote from {peer_id_clone}")),
+                )
+                .await;
 
+                (peer_id_clone, quote_result)
+            };
+
+            quote_futures.push(quote_future);
+        }
+
+        // Collect quotes as they complete, stopping once we have REQUIRED_QUOTES
+        let mut quotes_with_peers = Vec::with_capacity(REQUIRED_QUOTES);
+
+        while let Some((peer_id, quote_result)) = quote_futures.next().await {
             match quote_result {
                 Ok((quote, price)) => {
-                    quotes_with_peers.push((peer_id.clone(), quote, price));
+                    quotes_with_peers.push((peer_id, quote, price));
+
+                    // Stop collecting once we have enough quotes
+                    if quotes_with_peers.len() >= REQUIRED_QUOTES {
+                        break;
+                    }
                 }
                 Err(e) => {
                     warn!("Failed to get quote from {peer_id}: {e}");
                     // Continue trying other peers
                 }
-            }
-
-            // Stop if we have enough quotes
-            if quotes_with_peers.len() >= REQUIRED_QUOTES {
-                break;
             }
         }
 

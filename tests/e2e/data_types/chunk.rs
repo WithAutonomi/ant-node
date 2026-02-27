@@ -63,7 +63,14 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{TestHarness, TestNetwork};
+    use ant_evm::RewardsAddress;
+    use evmlib::testnet::Testnet;
     use rand::seq::SliceRandom;
+    use saorsa_node::payment::{
+        EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+        QuotingMetricsTracker,
+    };
+    use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 
     /// Test 1: Content address computation is deterministic
     #[test]
@@ -453,10 +460,11 @@ mod tests {
             .await
             .expect("Failed to setup harness with payments");
 
-        // Get wallet from Anvil
+        // Get wallet from Anvil using shared testnet
+        let testnet = evmlib::testnet::Testnet::new().await;
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_funded_wallet()
+            .create_funded_wallet(&testnet)
             .await
             .expect("Failed to create funded wallet");
 
@@ -512,9 +520,10 @@ mod tests {
             .await
             .expect("Failed to setup harness");
 
+        let testnet = evmlib::testnet::Testnet::new().await;
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_funded_wallet()
+            .create_funded_wallet(&testnet)
             .await
             .expect("Failed to create wallet");
 
@@ -591,10 +600,11 @@ mod tests {
             .await
             .expect("Failed to setup harness");
 
-        // Create wallet with 0 balance
+        // Create wallet with 0 balance using shared testnet
+        let testnet = evmlib::testnet::Testnet::new().await;
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_empty_wallet()
+            .create_empty_wallet(&testnet)
             .await
             .expect("Failed to create empty wallet");
 
@@ -637,20 +647,7 @@ mod tests {
     /// duration of the test so Anvil doesn't shut down.
     async fn create_evm_enabled_protocol(
         test_name: &str,
-    ) -> color_eyre::Result<(
-        saorsa_node::storage::AntProtocol,
-        std::path::PathBuf,
-        evmlib::testnet::Testnet,
-    )> {
-        use ant_evm::RewardsAddress;
-        use evmlib::testnet::Testnet;
-        use saorsa_node::payment::{
-            EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
-            QuotingMetricsTracker,
-        };
-        use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-        use std::sync::Arc;
-
+    ) -> color_eyre::Result<(AntProtocol, std::path::PathBuf, Testnet)> {
         let testnet = Testnet::new().await;
         let network = testnet.to_network();
 

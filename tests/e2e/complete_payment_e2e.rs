@@ -30,9 +30,11 @@
 
 use super::harness::TestHarness;
 use super::testnet::TestNetworkConfig;
+use ant_evm::{EncodedPeerId, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
+use libp2p::PeerId;
 use saorsa_node::client::QuantumClient;
 use saorsa_node::payment::SingleNodePayment;
 use serial_test::serial;
@@ -235,6 +237,20 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     // =========================================================================
     info!("\n💰 STEP 4: Calculate payment (median selection)");
 
+    // Build ProofOfPayment from peer IDs + quotes BEFORE stripping peer IDs
+    let peer_quotes: Vec<_> = quotes_with_prices
+        .iter()
+        .map(|(peer_id_str, quote, _price)| {
+            let peer_id: PeerId = peer_id_str
+                .parse()
+                .map_err(|e| format!("Failed to parse peer ID '{peer_id_str}': {e}"))?;
+            Ok((EncodedPeerId::from(peer_id), quote.clone()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let proof_of_payment = ProofOfPayment { peer_quotes };
+    let proof_bytes = rmp_serde::to_vec(&proof_of_payment)
+        .map_err(|e| format!("Failed to serialize proof: {e}"))?;
+
     // Strip peer IDs for SingleNodePayment which only needs (quote, price)
     let quotes_for_payment: Vec<_> = quotes_with_prices
         .into_iter()
@@ -245,10 +261,12 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
 
     info!("✅ Payment calculation complete:");
     info!("   • Total payment: {} atto", payment.total_amount());
+    let paid = payment
+        .paid_quote()
+        .ok_or("Missing paid quote at median index")?;
     info!(
         "   • Paid quote (median): {} atto to {}",
-        payment.paid_quote().amount,
-        payment.paid_quote().rewards_address
+        paid.amount, paid.rewards_address
     );
     info!("   • Strategy: Pay median 3x, send 0 atto to other 4 nodes");
 
@@ -287,9 +305,10 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     // =========================================================================
     info!("\n💾 STEP 6: Store chunk with payment proof");
 
-    // The put_chunk() method internally creates ProofOfPayment and sends it with the chunk
+    // Use put_chunk_with_proof to send the pre-built proof from Steps 3-5,
+    // avoiding a redundant quote+pay cycle that put_chunk() would perform.
     let stored_address = client
-        .put_chunk(Bytes::from(test_data.to_vec()))
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
         .await
         .map_err(|e| format!("Failed to store chunk: {e}"))?;
 

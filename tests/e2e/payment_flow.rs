@@ -496,7 +496,10 @@ async fn test_quote_collection_via_dht() -> Result<(), Box<dyn std::error::Error
     info!("   Total payment amount: {} atto", payment.total_amount());
     info!(
         "   Paid quote (median): {} atto",
-        payment.paid_quote().amount
+        payment
+            .paid_quote()
+            .ok_or("Missing paid quote at median index")?
+            .amount
     );
 
     // Verify only the median quote has a non-zero amount

@@ -6,9 +6,23 @@
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use ant_evm::ProofOfPayment;
+use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
+use evmlib::contract::payment_vault::verify_data_payment;
 use evmlib::Network as EvmNetwork;
-use futures::future::try_join_all;
 use tracing::{debug, info};
+
+/// Minimum allowed size for a payment proof in bytes.
+///
+/// This minimum ensures the proof contains at least a basic cryptographic hash or identifier.
+/// Proofs smaller than this are rejected as they cannot contain sufficient payment information.
+const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
+
+/// Maximum allowed size for a payment proof in bytes (10 KB).
+///
+/// This limit prevents denial-of-service attacks through excessively large payment proofs
+/// and ensures reasonable memory usage during verification. Payment proofs should contain
+/// only essential data: quote signatures and payment references.
+const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 10_240;
 
 /// Configuration for EVM payment verification.
 #[derive(Debug, Clone)]
@@ -180,19 +194,18 @@ impl PaymentVerifier {
 
                 // Production mode: EVM enabled - verify the proof
                 if let Some(proof) = payment_proof {
-                    if proof.is_empty() {
-                        return Err(Error::Payment("Empty payment proof".to_string()));
-                    }
-                    if proof.len() < 32 {
+                    if proof.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
                         return Err(Error::Payment(format!(
-                            "Payment proof too small: {} bytes (min 32)",
-                            proof.len()
+                            "Payment proof too small: {} bytes (min {})",
+                            proof.len(),
+                            MIN_PAYMENT_PROOF_SIZE_BYTES
                         )));
                     }
-                    if proof.len() > 10_240 {
+                    if proof.len() > MAX_PAYMENT_PROOF_SIZE_BYTES {
                         return Err(Error::Payment(format!(
-                            "Payment proof too large: {} bytes (max 10KB)",
-                            proof.len()
+                            "Payment proof too large: {} bytes (max {} bytes)",
+                            proof.len(),
+                            MAX_PAYMENT_PROOF_SIZE_BYTES
                         )));
                     }
 
@@ -265,36 +278,28 @@ impl PaymentVerifier {
             ));
         }
 
-        // Verify quote signatures in parallel (doesn't require network).
-        // Each signature verification is CPU-bound and independent, so we can parallelize.
-        let verification_futures: Vec<_> = payment
-            .peer_quotes
-            .iter()
-            .map(|(encoded_peer_id, quote)| {
-                let encoded_peer_id = encoded_peer_id.clone();
-                let quote = quote.clone();
-                tokio::task::spawn_blocking(move || {
-                    let peer_id = encoded_peer_id.to_peer_id().map_err(|e| {
-                        Error::Payment(format!("Invalid peer ID in payment proof: {e}"))
-                    })?;
-
-                    if !quote.check_is_signed_by_claimed_peer(peer_id) {
-                        return Err(Error::Payment(format!(
-                            "Quote signature invalid for peer {peer_id}"
-                        )));
-                    }
-                    Ok(())
-                })
-            })
-            .collect();
-
-        // Wait for all verifications to complete and propagate any errors
-        for result in try_join_all(verification_futures)
-            .await
-            .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
-        {
-            result?;
+        if payment.peer_quotes.is_empty() {
+            return Err(Error::Payment("Payment has no quotes".to_string()));
         }
+
+        // Verify quote signatures in a single blocking task (doesn't require network).
+        // Signature verification is CPU-bound, so we run it off the async runtime.
+        let peer_quotes = payment.peer_quotes.clone();
+        tokio::task::spawn_blocking(move || {
+            for (encoded_peer_id, quote) in &peer_quotes {
+                let peer_id = encoded_peer_id.to_peer_id().map_err(|e| {
+                    Error::Payment(format!("Invalid peer ID in payment proof: {e}"))
+                })?;
+                if !quote.check_is_signed_by_claimed_peer(peer_id) {
+                    return Err(Error::Payment(format!(
+                        "Quote signature invalid for peer {peer_id}"
+                    )));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
         // Get the payment digest for on-chain verification
         let payment_digest = payment.digest();
@@ -307,12 +312,8 @@ impl PaymentVerifier {
         // Note: We pass empty owned_quote_hashes because we're not a node claiming payment,
         // we just want to verify the payment is valid
         let owned_quote_hashes = vec![];
-        match evmlib::contract::payment_vault::verify_data_payment(
-            &self.config.evm.network,
-            owned_quote_hashes,
-            payment_digest,
-        )
-        .await
+        match verify_data_payment(&self.config.evm.network, owned_quote_hashes, payment_digest)
+            .await
         {
             Ok(_amount) => {
                 if tracing::enabled!(tracing::Level::INFO) {
@@ -320,12 +321,10 @@ impl PaymentVerifier {
                 }
                 Ok(())
             }
-            Err(evmlib::contract::payment_vault::error::Error::PaymentInvalid) => {
-                Err(Error::Payment(format!(
-                    "Payment verification failed on-chain for {}",
-                    hex::encode(xorname)
-                )))
-            }
+            Err(PaymentVaultError::PaymentInvalid) => Err(Error::Payment(format!(
+                "Payment verification failed on-chain for {}",
+                hex::encode(xorname)
+            ))),
             Err(e) => Err(Error::Payment(format!(
                 "EVM verification error for {}: {e}",
                 hex::encode(xorname)
@@ -398,8 +397,8 @@ mod tests {
             peer_quotes: vec![],
         };
         let mut proof_bytes = rmp_serde::to_vec(&proof).expect("should serialize");
-        // Pad to at least 32 bytes to pass size validation
-        proof_bytes.resize(32, 0);
+        // Pad to minimum required size to pass validation
+        proof_bytes.resize(MIN_PAYMENT_PROOF_SIZE_BYTES, 0);
 
         // EVM disabled (test/devnet mode): should SUCCEED even with a proof present.
         // When EVM is disabled, the verifier skips on-chain checks and accepts storage.

@@ -3,6 +3,8 @@
 //! This module wraps the `evmlib::testnet::Testnet` to provide a local
 //! Anvil blockchain for testing payment verification.
 
+use evmlib::testnet::Testnet;
+use evmlib::wallet::Wallet;
 use std::time::Duration;
 use tracing::{debug, info};
 
@@ -214,12 +216,7 @@ impl TestAnvil {
     /// # Errors
     ///
     /// Returns an error if wallet creation fails.
-    pub async fn create_funded_wallet(&self) -> Result<evmlib::wallet::Wallet> {
-        use evmlib::testnet::Testnet;
-        use evmlib::wallet::Wallet;
-
-        // Start a new Anvil testnet with deployed contracts
-        let testnet = Testnet::new().await;
+    pub async fn create_funded_wallet(&self, testnet: &Testnet) -> Result<Wallet> {
         let network = testnet.to_network();
 
         // Use the default Anvil account (pre-funded)
@@ -238,12 +235,7 @@ impl TestAnvil {
     /// # Errors
     ///
     /// Returns an error if wallet creation fails.
-    pub async fn create_empty_wallet(&self) -> Result<evmlib::wallet::Wallet> {
-        use evmlib::testnet::Testnet;
-        use evmlib::wallet::Wallet;
-
-        // Start a new Anvil testnet to get the network configuration
-        let testnet = Testnet::new().await;
+    pub async fn create_empty_wallet(&self, testnet: &Testnet) -> Result<Wallet> {
         let network = testnet.to_network();
 
         // Generate a random private key (no funds)

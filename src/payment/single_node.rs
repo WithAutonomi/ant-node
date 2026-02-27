@@ -76,8 +76,14 @@ impl SingleNodePayment {
         quotes_with_prices.sort_by_key(|(_, price)| *price);
 
         // Get median price and calculate 3x
-        // Safe: we validated length == REQUIRED_QUOTES above, so MEDIAN_INDEX (2) is in bounds
-        let median_price = quotes_with_prices[MEDIAN_INDEX].1;
+        let median_price = quotes_with_prices
+            .get(MEDIAN_INDEX)
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Missing median quote at index {MEDIAN_INDEX}: expected {REQUIRED_QUOTES} quotes but get() failed"
+                ))
+            })?
+            .1;
         let enhanced_price = median_price
             .checked_mul(Amount::from(3u64))
             .ok_or_else(|| {
@@ -117,11 +123,11 @@ impl SingleNodePayment {
 
     /// Get the median quote that receives payment.
     ///
-    /// This always returns a valid reference since the array is fixed-size
-    /// and `MEDIAN_INDEX` (2) is guaranteed to be in bounds for a 5-element array.
+    /// Returns `None` only if the internal array is somehow shorter than `MEDIAN_INDEX`,
+    /// which should never happen since the array is fixed-size `[_; REQUIRED_QUOTES]`.
     #[must_use]
-    pub fn paid_quote(&self) -> &QuotePaymentInfo {
-        &self.quotes[MEDIAN_INDEX]
+    pub fn paid_quote(&self) -> Option<&QuotePaymentInfo> {
+        self.quotes.get(MEDIAN_INDEX)
     }
 
     /// Pay for all quotes on-chain using the wallet.
@@ -548,6 +554,7 @@ mod tests {
 
         let median_price = payment
             .paid_quote()
+            .ok_or_else(|| Error::Payment("Missing paid quote at median index".to_string()))?
             .amount
             .checked_div(Amount::from(3u64))
             .ok_or_else(|| Error::Payment("Failed to calculate median price".to_string()))?;

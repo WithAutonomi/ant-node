@@ -467,13 +467,16 @@ impl TestNode {
             .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
 
         // Build ProofOfPayment from peer IDs + quotes
+        // Parse all peer IDs and fail if any are malformed
         let peer_quotes: Vec<_> = quotes_with_peers
             .iter()
-            .filter_map(|(peer_id_str, quote, _price)| {
-                let peer_id: libp2p::PeerId = peer_id_str.parse().ok()?;
-                Some((ant_evm::EncodedPeerId::from(peer_id), quote.clone()))
+            .map(|(peer_id_str, quote, _price)| {
+                let peer_id: libp2p::PeerId = peer_id_str.parse().map_err(|e| {
+                    TestnetError::Storage(format!("Failed to parse peer ID '{peer_id_str}': {e}"))
+                })?;
+                Ok((ant_evm::EncodedPeerId::from(peer_id), quote.clone()))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let proof_of_payment = ant_evm::ProofOfPayment { peer_quotes };
         let proof_bytes = rmp_serde::to_vec(&proof_of_payment)
             .map_err(|e| TestnetError::Storage(format!("Failed to serialize proof: {e}")))?;
@@ -1198,7 +1201,7 @@ impl TestNetwork {
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 enabled: payment_enforcement,
-                network: evm_network.unwrap_or(EvmNetwork::ArbitrumOne),
+                network: evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest),
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
         };

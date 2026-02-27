@@ -9,7 +9,7 @@ use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
-use crate::payment::{PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
+use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
@@ -23,6 +23,7 @@ use saorsa_core::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -65,10 +66,24 @@ impl NodeBuilder {
             ));
         }
 
+        // Validate rewards address in production
+        if self.config.network_mode == NetworkMode::Production {
+            if let Some(ref addr) = self.config.payment.rewards_address {
+                if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() {
+                    return Err(Error::Config(
+                        "CRITICAL: Rewards address is not configured. \
+                         Set payment.rewards_address in config to your Arbitrum wallet address."
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+
         // Warn if payment disabled in any mode
         if !self.config.payment.enabled {
+            let mode = self.config.network_mode;
             warn!("⚠️  ⚠️  ⚠️");
-            warn!("⚠️  PAYMENT VERIFICATION DISABLED");
+            warn!("⚠️  PAYMENT VERIFICATION DISABLED (mode: {mode:?})");
             warn!("⚠️  This should ONLY be used for testing!");
             warn!("⚠️  All storage requests will be accepted for FREE");
             warn!("⚠️  ⚠️  ⚠️");
@@ -141,11 +156,12 @@ impl NodeBuilder {
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
         // Determine listen address based on port and IP version
+        let port = config.port;
         let listen_addr: SocketAddr = match config.ip_version {
-            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{}", config.port)
+            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{port}")
                 .parse()
                 .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
-            IpVersion::Ipv6 => format!("[::]:{}", config.port)
+            IpVersion::Ipv6 => format!("[::]:{port}")
                 .parse()
                 .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
         };
@@ -239,7 +255,9 @@ impl NodeBuilder {
                 Ok(identity)
             }
             1 => {
-                let dir = &identity_dirs[0];
+                let dir = identity_dirs
+                    .first()
+                    .ok_or_else(|| Error::Config("No identity dirs found".to_string()))?;
                 let identity = NodeIdentity::load_from_file(&dir.join(NODE_IDENTITY_FILENAME))
                     .await
                     .map_err(|e| Error::Startup(format!("Failed to load node identity: {e}")))?;
@@ -332,7 +350,7 @@ impl NodeBuilder {
             EvmNetworkConfig::ArbitrumSepolia => EvmNetwork::ArbitrumSepoliaTest,
         };
         let payment_config = PaymentVerifierConfig {
-            evm: crate::payment::EvmVerifierConfig {
+            evm: EvmVerifierConfig {
                 enabled: config.payment.enabled,
                 network: evm_network,
             },
@@ -617,6 +635,7 @@ impl RunningNode {
 
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
+        let semaphore = Arc::new(Semaphore::new(64));
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -630,7 +649,11 @@ impl RunningNode {
                         debug!("Received chunk protocol message from {}", source);
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
+                        let sem = semaphore.clone();
                         tokio::spawn(async move {
+                            let Ok(_permit) = sem.acquire().await else {
+                                return;
+                            };
                             match protocol.handle_message(&data).await {
                                 Ok(response) => {
                                     if let Err(e) = p2p
