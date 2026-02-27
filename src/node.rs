@@ -211,7 +211,7 @@ impl NodeBuilder {
                 let identity = NodeIdentity::generate().map_err(|e| {
                     Error::Startup(format!("Failed to generate node identity: {e}"))
                 })?;
-                let peer_id = node_id_to_peer_id(identity.node_id());
+                let peer_id = node_id_to_hex(identity.node_id());
                 let peer_dir = nodes_dir.join(&peer_id);
                 std::fs::create_dir_all(&peer_dir)?;
                 identity
@@ -379,8 +379,8 @@ impl NodeBuilder {
     }
 }
 
-/// Convert a `NodeId` to a hex-encoded `PeerId` string (full 64 hex chars).
-fn node_id_to_peer_id(node_id: &NodeId) -> String {
+/// Convert a `NodeId` to a hex-encoded string (full 64 hex chars).
+fn node_id_to_hex(node_id: &NodeId) -> String {
     hex::encode(node_id.0)
 }
 
@@ -761,7 +761,7 @@ mod tests {
         // Key file should exist
         assert!(tmp.path().join(NODE_IDENTITY_FILENAME).exists());
         // peer_id should be derivable from the identity
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let peer_id = node_id_to_hex(identity.node_id());
         assert_eq!(peer_id.len(), 64); // 32 bytes hex-encoded
     }
 
@@ -786,9 +786,9 @@ mod tests {
     }
 
     #[test]
-    fn test_node_id_to_peer_id_length() {
+    fn test_node_id_to_hex_length() {
         let id = NodeId::from_bytes([0x42; 32]);
-        let peer_id = node_id_to_peer_id(&id);
+        let peer_id = node_id_to_hex(&id);
         assert_eq!(peer_id.len(), 64); // 32 bytes = 64 hex chars
     }
 
@@ -802,7 +802,7 @@ mod tests {
 
         // First "boot": generate identity, save it in nodes/{peer_id}/
         let identity1 = NodeIdentity::generate().unwrap();
-        let peer_id1 = node_id_to_peer_id(identity1.node_id());
+        let peer_id1 = node_id_to_hex(identity1.node_id());
         let peer_dir = nodes_dir.join(&peer_id1);
         std::fs::create_dir_all(&peer_dir).unwrap();
         identity1
@@ -820,7 +820,7 @@ mod tests {
         let loaded = NodeIdentity::load_from_file(&identity_dirs[0].join(NODE_IDENTITY_FILENAME))
             .await
             .unwrap();
-        let peer_id2 = node_id_to_peer_id(loaded.node_id());
+        let peer_id2 = node_id_to_hex(loaded.node_id());
 
         assert_eq!(peer_id1, peer_id2, "peer_id must survive restart");
         assert_eq!(

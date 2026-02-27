@@ -329,7 +329,7 @@ impl QuantumClient {
     /// address and returns the single closest remote peer (excluding ourselves).
     async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<String> {
         let local_peer_id_hex = node.peer_id().clone();
-        let local_transport_id = node.transport_peer_id();
+        let local_channel_id = node.channel_id();
 
         let closest_nodes = node
             .dht()
@@ -341,9 +341,9 @@ impl QuantumClient {
             .into_iter()
             .find(|n| {
                 n.peer_id != local_peer_id_hex
-                    && local_transport_id
+                    && local_channel_id
                         .as_ref()
-                        .map_or(true, |tid| n.peer_id != *tid)
+                        .map_or(true, |cid| n.peer_id != *cid)
             })
             .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
 
