@@ -14,7 +14,7 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
-use saorsa_core::identity::{NodeId, NodeIdentity};
+use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
@@ -58,9 +58,9 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Self::resolve_identity(&mut self.config).await?;
-        let node_id = identity.node_id().clone();
+        let peer_id = identity.peer_id().clone();
 
-        info!(node_id = %node_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+        info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -73,7 +73,7 @@ impl NodeBuilder {
 
         // Convert our config to saorsa-core's config, injecting our stable peer_id
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(node_id.to_hex());
+        core_config.peer_id = Some(peer_id.to_hex());
         core_config.node_identity = Some(Arc::new(identity));
         debug!("Core config: {:?}", core_config);
 
@@ -211,7 +211,7 @@ impl NodeBuilder {
                 let identity = NodeIdentity::generate().map_err(|e| {
                     Error::Startup(format!("Failed to generate node identity: {e}"))
                 })?;
-                let peer_id = node_id_to_hex(identity.node_id());
+                let peer_id = peer_id_to_hex(identity.peer_id());
                 let peer_dir = nodes_dir.join(&peer_id);
                 std::fs::create_dir_all(&peer_dir)?;
                 identity
@@ -379,9 +379,9 @@ impl NodeBuilder {
     }
 }
 
-/// Convert a `NodeId` to a hex-encoded string (full 64 hex chars).
-fn node_id_to_hex(node_id: &NodeId) -> String {
-    hex::encode(node_id.0)
+/// Convert a `PeerId` to a hex-encoded string (full 64 hex chars).
+fn peer_id_to_hex(peer_id: &PeerId) -> String {
+    peer_id.to_hex()
 }
 
 /// A running saorsa node.
@@ -761,7 +761,7 @@ mod tests {
         // Key file should exist
         assert!(tmp.path().join(NODE_IDENTITY_FILENAME).exists());
         // peer_id should be derivable from the identity
-        let peer_id = node_id_to_hex(identity.node_id());
+        let peer_id = peer_id_to_hex(identity.peer_id());
         assert_eq!(peer_id.len(), 64); // 32 bytes hex-encoded
     }
 
@@ -782,13 +782,13 @@ mod tests {
         };
 
         let loaded = NodeBuilder::resolve_identity(&mut config).await.unwrap();
-        assert_eq!(loaded.node_id(), original.node_id());
+        assert_eq!(loaded.peer_id(), original.peer_id());
     }
 
     #[test]
-    fn test_node_id_to_hex_length() {
-        let id = NodeId::from_bytes([0x42; 32]);
-        let peer_id = node_id_to_hex(&id);
+    fn test_peer_id_to_hex_length() {
+        let id = PeerId::from_bytes([0x42; 32]);
+        let peer_id = peer_id_to_hex(&id);
         assert_eq!(peer_id.len(), 64); // 32 bytes = 64 hex chars
     }
 
@@ -802,7 +802,7 @@ mod tests {
 
         // First "boot": generate identity, save it in nodes/{peer_id}/
         let identity1 = NodeIdentity::generate().unwrap();
-        let peer_id1 = node_id_to_hex(identity1.node_id());
+        let peer_id1 = peer_id_to_hex(identity1.peer_id());
         let peer_dir = nodes_dir.join(&peer_id1);
         std::fs::create_dir_all(&peer_dir).unwrap();
         identity1
@@ -820,7 +820,7 @@ mod tests {
         let loaded = NodeIdentity::load_from_file(&identity_dirs[0].join(NODE_IDENTITY_FILENAME))
             .await
             .unwrap();
-        let peer_id2 = node_id_to_hex(loaded.node_id());
+        let peer_id2 = peer_id_to_hex(loaded.peer_id());
 
         assert_eq!(peer_id1, peer_id2, "peer_id must survive restart");
         assert_eq!(
@@ -872,8 +872,8 @@ mod tests {
         let identity2 = NodeBuilder::resolve_identity(&mut config2).await.unwrap();
 
         assert_eq!(
-            identity1.node_id(),
-            identity2.node_id(),
+            identity1.peer_id(),
+            identity2.peer_id(),
             "explicit --root-dir must yield stable identity"
         );
     }

@@ -17,6 +17,7 @@ use ant_evm::RewardsAddress;
 use bytes::Bytes;
 use futures::future::join_all;
 use rand::Rng;
+use saorsa_core::identity::node_identity::NodeIdentity;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -535,10 +536,8 @@ impl TestNode {
             .p2p_node
             .as_ref()
             .ok_or(TestnetError::NodeNotRunning)?;
-        let target_channel_id = target_p2p
-            .channel_id()
-            .ok_or_else(|| TestnetError::Core("No channel ID available".to_string()))?;
-        self.store_chunk_on_peer(&target_channel_id, data).await
+        let target_peer_id = target_p2p.peer_id().clone();
+        self.store_chunk_on_peer(&target_peer_id, data).await
     }
 
     /// Store a chunk on a remote peer via P2P using the peer's ID directly.
@@ -638,10 +637,8 @@ impl TestNode {
             .p2p_node
             .as_ref()
             .ok_or(TestnetError::NodeNotRunning)?;
-        let target_channel_id = target_p2p
-            .channel_id()
-            .ok_or_else(|| TestnetError::Core("No channel ID available".to_string()))?;
-        self.get_chunk_from_peer(&target_channel_id, address).await
+        let target_peer_id = target_p2p.peer_id().clone();
+        self.get_chunk_from_peer(&target_peer_id, address).await
     }
 
     /// Retrieve a chunk from a remote peer via P2P using the peer's ID directly.
@@ -1006,6 +1003,14 @@ impl TestNetwork {
         // Override the transport-layer message size to accommodate max-size
         // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
         core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
+        // Generate a node identity so auto identity announce works on connect.
+        let identity = NodeIdentity::generate().map_err(|e| {
+            TestnetError::Core(format!(
+                "Failed to generate identity for node {}: {e}",
+                node.index
+            ))
+        })?;
+        core_config.node_identity = Some(Arc::new(identity));
 
         // Create and start the P2P node
         let p2p_node = P2PNode::new(core_config).await.map_err(|e| {

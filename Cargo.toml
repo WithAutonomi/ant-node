@@ -173,3 +173,6 @@ assets = [
 
 [package.metadata.generate-rpm.requires]
 # Runtime dependencies auto-detected
+
+[patch.crates-io]
+saorsa-core = { path = "../saorsa-core" }
