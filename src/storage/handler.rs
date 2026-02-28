@@ -140,7 +140,7 @@ impl AntProtocol {
             });
         }
 
-        // 2. Verify content address matches SHA256(content)
+        // 2. Verify content address matches BLAKE3(content)
         let computed = crate::client::compute_address(&request.content);
         if computed != address {
             return ChunkPutResponse::Error(ProtocolError::AddressMismatch {

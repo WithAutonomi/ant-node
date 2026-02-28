@@ -7,7 +7,7 @@
 //!
 //! The chunk client provides:
 //!
-//! 1. **Content-addressed storage**: Chunk address = SHA256(content)
+//! 1. **Content-addressed storage**: Chunk address = BLAKE3(content)
 //! 2. **PQC security**: All data uses ML-KEM-768 and ML-DSA-65
 //! 3. **EVM payment**: Chunks are paid for on Arbitrum network
 //!

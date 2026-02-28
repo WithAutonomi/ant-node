@@ -23,7 +23,6 @@
 //! - Nodes are evenly distributed across the rollout window
 //! - The same node always upgrades at the same point in the window
 
-use sha2::{Digest, Sha256};
 use std::time::Duration;
 use tracing::debug;
 
@@ -45,12 +44,7 @@ impl StagedRollout {
     /// * `max_delay_hours` - Maximum rollout window (default: 24 hours)
     #[must_use]
     pub fn new(node_id: &[u8], max_delay_hours: u64) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(node_id);
-        let hash_result = hasher.finalize();
-
-        let mut node_id_hash = [0u8; 32];
-        node_id_hash.copy_from_slice(&hash_result);
+        let node_id_hash = *blake3::hash(node_id).as_bytes();
 
         Self {
             max_delay_hours,
@@ -133,20 +127,20 @@ impl StagedRollout {
         }
 
         // Include version in the hash for version-specific delays
-        let mut hasher = Sha256::new();
-        hasher.update(self.node_id_hash);
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.node_id_hash);
         hasher.update(version.to_string().as_bytes());
         let hash_result = hasher.finalize();
 
         let hash_value = u64::from_le_bytes([
-            hash_result[0],
-            hash_result[1],
-            hash_result[2],
-            hash_result[3],
-            hash_result[4],
-            hash_result[5],
-            hash_result[6],
-            hash_result[7],
+            hash_result.as_bytes()[0],
+            hash_result.as_bytes()[1],
+            hash_result.as_bytes()[2],
+            hash_result.as_bytes()[3],
+            hash_result.as_bytes()[4],
+            hash_result.as_bytes()[5],
+            hash_result.as_bytes()[6],
+            hash_result.as_bytes()[7],
         ]);
 
         let max_delay_secs = self.max_delay_hours * 3600;

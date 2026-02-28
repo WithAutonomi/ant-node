@@ -85,17 +85,14 @@ impl GraphEntryTestFixture {
     /// Compute graph entry address from owner and content.
     #[must_use]
     pub fn compute_address(owner: &[u8; 32], content: &[u8], parents: &[[u8; 32]]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(b"graph_entry:");
         hasher.update(owner);
         hasher.update(content);
         for parent in parents {
             hasher.update(parent);
         }
-        let hash = hasher.finalize();
-        let mut address = [0u8; 32];
-        address.copy_from_slice(&hash);
+        let address = *hasher.finalize().as_bytes();
         address
     }
 }

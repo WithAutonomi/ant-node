@@ -151,7 +151,7 @@ impl LmdbStorage {
     ///
     /// # Arguments
     ///
-    /// * `address` - Content address (should be SHA256 of content)
+    /// * `address` - Content address (should be BLAKE3 of content)
     /// * `content` - Chunk data
     ///
     /// # Returns
@@ -397,7 +397,7 @@ impl LmdbStorage {
         Ok(entries as u64)
     }
 
-    /// Compute content address (SHA256 hash).
+    /// Compute content address (BLAKE3 hash).
     #[must_use]
     pub fn compute_address(content: &[u8]) -> XorName {
         crate::client::compute_address(content)
@@ -551,11 +551,11 @@ mod tests {
 
     #[test]
     fn test_compute_address() {
-        // Known SHA256 hash of "hello world"
+        // Known BLAKE3 hash of "hello world"
         let content = b"hello world";
         let address = LmdbStorage::compute_address(content);
 
-        let expected_hex = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let expected_hex = "d74981efa70a0c880b8d8c1985d075dbcbf679b99a5f9914e5aaf96b831a9e24";
         assert_eq!(hex::encode(address), expected_hex);
     }
 

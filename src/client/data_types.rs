@@ -2,20 +2,13 @@
 //!
 //! This module provides the core data types for content-addressed chunk storage
 //! on the saorsa network. Chunks are immutable, content-addressed blobs where
-//! the address is the SHA256 hash of the content.
+//! the address is the BLAKE3 hash of the content.
 
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
-
-/// Compute the content address (SHA256 hash) for the given data.
+/// Compute the content address (BLAKE3 hash) for the given data.
 #[must_use]
 pub fn compute_address(content: &[u8]) -> XorName {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    let result = hasher.finalize();
-    let mut address = [0u8; 32];
-    address.copy_from_slice(&result);
-    address
+    *blake3::hash(content).as_bytes()
 }
 
 /// Compute the XOR distance between two 32-byte addresses.
@@ -46,7 +39,7 @@ pub fn peer_id_to_xor_name(peer_id: &str) -> Option<XorName> {
 
 /// A content-addressed identifier (32 bytes).
 ///
-/// The address is computed as SHA256(content) for chunks,
+/// The address is computed as BLAKE3(content) for chunks,
 /// ensuring content-addressed storage.
 pub type XorName = [u8; 32];
 
@@ -54,11 +47,11 @@ pub type XorName = [u8; 32];
 ///
 /// Chunks are the fundamental storage unit in saorsa. They are:
 /// - **Immutable**: Content cannot be changed after storage
-/// - **Content-addressed**: Address = SHA256(content)
+/// - **Content-addressed**: Address = BLAKE3(content)
 /// - **Paid**: Storage requires EVM payment on Arbitrum
 #[derive(Debug, Clone)]
 pub struct DataChunk {
-    /// The content-addressed identifier (SHA256 of content).
+    /// The content-addressed identifier (BLAKE3 of content).
     pub address: XorName,
     /// The raw data content.
     pub content: Bytes,
@@ -67,7 +60,7 @@ pub struct DataChunk {
 impl DataChunk {
     /// Create a new data chunk.
     ///
-    /// Note: This does NOT verify that address == SHA256(content).
+    /// Note: This does NOT verify that address == BLAKE3(content).
     /// Use `from_content` for automatic address computation.
     #[must_use]
     pub fn new(address: XorName, content: Bytes) -> Self {
@@ -87,7 +80,7 @@ impl DataChunk {
         self.content.len()
     }
 
-    /// Verify that the address matches SHA256(content).
+    /// Verify that the address matches BLAKE3(content).
     #[must_use]
     pub fn verify(&self) -> bool {
         self.address == compute_address(&self.content)
@@ -132,11 +125,11 @@ mod tests {
         let content = Bytes::from("hello world");
         let chunk = DataChunk::from_content(content.clone());
 
-        // SHA256 of "hello world"
+        // BLAKE3 of "hello world"
         let expected: [u8; 32] = [
-            0xb9, 0x4d, 0x27, 0xb9, 0x93, 0x4d, 0x3e, 0x08, 0xa5, 0x2e, 0x52, 0xd7, 0xda, 0x7d,
-            0xab, 0xfa, 0xc4, 0x84, 0xef, 0xe3, 0x7a, 0x53, 0x80, 0xee, 0x90, 0x88, 0xf7, 0xac,
-            0xe2, 0xef, 0xcd, 0xe9,
+            0xd7, 0x49, 0x81, 0xef, 0xa7, 0x0a, 0x0c, 0x88, 0x0b, 0x8d, 0x8c, 0x19, 0x85, 0xd0,
+            0x75, 0xdb, 0xcb, 0xf6, 0x79, 0xb9, 0x9a, 0x5f, 0x99, 0x14, 0xe5, 0xaa, 0xf9, 0x6b,
+            0x83, 0x1a, 0x9e, 0x24,
         ];
 
         assert_eq!(chunk.address, expected);

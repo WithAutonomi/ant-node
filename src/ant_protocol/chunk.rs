@@ -1,7 +1,7 @@
 //! Chunk message types for the ANT protocol.
 //!
 //! Chunks are immutable, content-addressed data blocks where the address
-//! is the SHA256 hash of the content. Maximum size is 4MB.
+//! is the BLAKE3 hash of the content. Maximum size is 4MB.
 //!
 //! This module defines the wire protocol messages for chunk operations
 //! using postcard serialization for compact, fast encoding.
@@ -101,7 +101,7 @@ impl ChunkMessage {
 /// Request to store a chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkPutRequest {
-    /// The content-addressed identifier (SHA256 of content).
+    /// The content-addressed identifier (BLAKE3 of content).
     pub address: XorName,
     /// The chunk data.
     pub content: Vec<u8>,

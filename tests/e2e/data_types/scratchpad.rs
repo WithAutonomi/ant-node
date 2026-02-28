@@ -64,14 +64,10 @@ impl ScratchpadTestFixture {
     /// Compute scratchpad address from owner public key.
     #[must_use]
     pub fn compute_address(owner: &[u8; 32]) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
+        let mut hasher = blake3::Hasher::new();
         hasher.update(b"scratchpad:");
         hasher.update(owner);
-        let hash = hasher.finalize();
-        let mut address = [0u8; 32];
-        address.copy_from_slice(&hash);
-        address
+        *hasher.finalize().as_bytes()
     }
 }
 

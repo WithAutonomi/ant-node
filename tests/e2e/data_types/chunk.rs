@@ -1,7 +1,7 @@
 //! Chunk data type E2E tests.
 //!
 //! Chunks are immutable, content-addressed data blocks (up to 4MB).
-//! The address is derived from the content hash (SHA256 -> `XorName`).
+//! The address is derived from the content hash (BLAKE3 -> `XorName`).
 //!
 //! ## Test Coverage
 //!
@@ -50,7 +50,7 @@ impl ChunkTestFixture {
         }
     }
 
-    /// Compute content address for data (SHA256 hash).
+    /// Compute content address for data (BLAKE3 hash).
     #[must_use]
     pub fn compute_address(data: &[u8]) -> [u8; 32] {
         saorsa_node::compute_address(data)
@@ -93,10 +93,10 @@ mod tests {
     #[test]
     fn test_empty_data_address() {
         let addr = ChunkTestFixture::compute_address(&[]);
-        // SHA256 of empty string is well-known
+        // BLAKE3 of empty string is well-known
         assert_eq!(
             hex::encode(addr),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
         );
     }
 
@@ -144,7 +144,7 @@ mod tests {
             .await
             .expect("Failed to store chunk");
 
-        // Verify the address is a valid SHA256 hash
+        // Verify the address is a valid BLAKE3 hash
         let expected_address = ChunkTestFixture::compute_address(&fixture.small);
         assert_eq!(
             address, expected_address,

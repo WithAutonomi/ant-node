@@ -6,7 +6,7 @@
 //! ## Data Model
 //!
 //! Chunks are the only data type supported:
-//! - **Content-addressed**: Address = SHA256(content)
+//! - **Content-addressed**: Address = BLAKE3(content)
 //! - **Immutable**: Once stored, content cannot change
 //! - **Paid**: All storage requires EVM payment on Arbitrum
 //!
@@ -24,6 +24,7 @@ use crate::ant_protocol::{
 };
 use crate::error::{Error, Result};
 use bytes::Bytes;
+use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -69,7 +70,7 @@ impl Default for QuantumConfig {
 ///
 /// ## Chunk Storage Model
 ///
-/// Chunks are content-addressed: the address is the SHA256 hash of the content.
+/// Chunks are content-addressed: the address is the BLAKE3 hash of the content.
 /// This ensures data integrity - if the content matches the address, the data
 /// is authentic. All chunk storage requires EVM payment on Arbitrum.
 pub struct QuantumClient {
@@ -110,7 +111,7 @@ impl QuantumClient {
     ///
     /// # Arguments
     ///
-    /// * `address` - The `XorName` address of the chunk (SHA256 of content)
+    /// * `address` - The `XorName` address of the chunk (BLAKE3 of content)
     ///
     /// # Returns
     ///
@@ -212,7 +213,7 @@ impl QuantumClient {
 
     /// Store a chunk on the saorsa network via ANT protocol.
     ///
-    /// The chunk address is computed as SHA256(content), ensuring content-addressing.
+    /// The chunk address is computed as BLAKE3(content), ensuring content-addressing.
     /// Sends a `ChunkPutRequest` to a connected peer and waits for the
     /// `ChunkPutResponse`.
     ///
@@ -234,7 +235,7 @@ impl QuantumClient {
             return Err(Error::Network("P2P node not configured".into()));
         };
 
-        // Compute content address using SHA-256 (before peer selection so we can route by it)
+        // Compute content address using BLAKE3 (before peer selection so we can route by it)
         let address = crate::client::compute_address(&content);
 
         let target_peer = Self::pick_target_peer(node, &address).await?;
@@ -327,8 +328,8 @@ impl QuantumClient {
     ///
     /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest nodes to the target
     /// address and returns the single closest remote peer (excluding ourselves).
-    async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<String> {
-        let local_peer_id = node.peer_id();
+    async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<PeerId> {
+        let local_hex = node.peer_id().to_hex();
 
         let closest_nodes = node
             .dht()
@@ -338,7 +339,7 @@ impl QuantumClient {
 
         let closest = closest_nodes
             .into_iter()
-            .find(|n| n.peer_id != local_peer_id)
+            .find(|n| n.peer_id != local_hex)
             .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
 
         debug!(
@@ -347,7 +348,8 @@ impl QuantumClient {
             hex::encode(target)
         );
 
-        Ok(closest.peer_id)
+        PeerId::from_hex(&closest.peer_id)
+            .map_err(|e| Error::Network(format!("Invalid peer ID from DHT: {e}")))
     }
 }
 

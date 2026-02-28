@@ -4,6 +4,7 @@
 //! generic function used by both [`super::QuantumClient`] and E2E test helpers.
 
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, CHUNK_PROTOCOL_ID};
+use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PEvent, P2PNode};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
@@ -29,7 +30,7 @@ use tracing::{debug, warn};
 #[allow(clippy::too_many_arguments)]
 pub async fn send_and_await_chunk_response<T, E>(
     node: &P2PNode,
-    target_peer: &str,
+    target_peer: &PeerId,
     message_bytes: Vec<u8>,
     request_id: u64,
     timeout: Duration,
@@ -40,14 +41,6 @@ pub async fn send_and_await_chunk_response<T, E>(
     // Subscribe before sending so we don't miss the response
     let mut events = node.subscribe_events();
 
-    // Validate the target peer ID is a valid hex-encoded PeerId
-    let _target_peer_id = match saorsa_core::identity::PeerId::from_hex(target_peer) {
-        Ok(id) => id,
-        Err(e) => return Err(send_error(format!("Invalid target peer ID: {e}"))),
-    };
-
-    // send_message accepts &str; target_peer is the hex PeerId string
-    // which the transport layer will resolve via the app→transport mapping.
     node.send_message(target_peer, CHUNK_PROTOCOL_ID, message_bytes)
         .await
         .map_err(|e| send_error(e.to_string()))?;
@@ -61,7 +54,7 @@ pub async fn send_and_await_chunk_response<T, E>(
                 topic,
                 source,
                 data,
-            })) if topic == CHUNK_PROTOCOL_ID && source == target_peer => {
+            })) if topic == CHUNK_PROTOCOL_ID && source.as_ref() == Some(target_peer) => {
                 let response = match ChunkMessage::decode(&data) {
                     Ok(r) => r,
                     Err(e) => {

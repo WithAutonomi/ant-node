@@ -64,7 +64,7 @@ async fn create_testnet_client() -> P2PNode {
     node
 }
 
-/// Compute content address (SHA256 hash).
+/// Compute content address (BLAKE3 hash).
 fn compute_address(data: &[u8]) -> XorName {
     saorsa_node::compute_address(data)
 }

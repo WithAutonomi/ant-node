@@ -607,17 +607,24 @@ impl Devnet {
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {} received chunk protocol message from {}",
+                                "Node {} received chunk protocol message from {:?}",
                                 node_index, source
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             tokio::spawn(async move {
+                                let Some(ref peer_id) = source else {
+                                    warn!(
+                                        "Node {} received unsigned chunk message, ignoring",
+                                        node_index
+                                    );
+                                    return;
+                                };
                                 match protocol.handle_message(&data).await {
                                     Ok(response) => {
                                         if let Err(e) = p2p
                                             .send_message(
-                                                &source,
+                                                peer_id,
                                                 CHUNK_PROTOCOL_ID,
                                                 response.to_vec(),
                                             )
@@ -625,7 +632,7 @@ impl Devnet {
                                         {
                                             warn!(
                                                 "Node {} failed to send response to {}: {}",
-                                                node_index, source, e
+                                                node_index, peer_id, e
                                             );
                                         }
                                     }

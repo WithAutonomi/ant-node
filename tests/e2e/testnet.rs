@@ -18,6 +18,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::identity::node_identity::NodeIdentity;
+use saorsa_core::identity::PeerId;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -360,7 +361,7 @@ impl TestNode {
     }
 
     /// Get the list of connected peer IDs.
-    pub async fn connected_peers(&self) -> Vec<String> {
+    pub async fn connected_peers(&self) -> Vec<PeerId> {
         if let Some(ref node) = self.p2p_node {
             node.connected_peers().await
         } else {
@@ -546,9 +547,8 @@ impl TestNode {
     ///
     /// Returns an error if this node is not running, the message cannot be
     /// sent, the response times out, or the remote peer reports an error.
-    pub async fn store_chunk_on_peer(&self, target_peer_id: &str, data: &[u8]) -> Result<XorName> {
+    pub async fn store_chunk_on_peer(&self, target_peer_id: &PeerId, data: &[u8]) -> Result<XorName> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_peer_id.to_string();
 
         // Create PUT request
         let address = Self::compute_chunk_address(data);
@@ -574,7 +574,7 @@ impl TestNode {
 
         send_and_await_chunk_response(
             p2p,
-            &target_peer_id,
+            target_peer_id,
             message_bytes,
             request_id,
             timeout,
@@ -649,11 +649,10 @@ impl TestNode {
     /// sent, the response times out, or the remote peer reports an error.
     pub async fn get_chunk_from_peer(
         &self,
-        target_peer_id: &str,
+        target_peer_id: &PeerId,
         address: &XorName,
     ) -> Result<Option<DataChunk>> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_peer_id.to_string();
 
         // Create GET request
         let request_id: u64 = rand::thread_rng().gen();
@@ -671,7 +670,7 @@ impl TestNode {
 
         send_and_await_chunk_response(
             p2p,
-            &target_peer_id,
+            target_peer_id,
             message_bytes,
             request_id,
             timeout,
@@ -713,7 +712,7 @@ impl TestNode {
         .await
     }
 
-    /// Compute content address for chunk data (SHA256 hash).
+    /// Compute content address for chunk data (BLAKE3 hash).
     #[must_use]
     pub fn compute_chunk_address(data: &[u8]) -> XorName {
         saorsa_node::compute_address(data)
@@ -1040,17 +1039,24 @@ impl TestNetwork {
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {} received chunk protocol message from {}",
+                                "Node {} received chunk protocol message from {:?}",
                                 node_index, source
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             tokio::spawn(async move {
+                                let Some(ref peer_id) = source else {
+                                    warn!(
+                                        "Node {} received unsigned chunk message, ignoring",
+                                        node_index
+                                    );
+                                    return;
+                                };
                                 match protocol.handle_message(&data).await {
                                     Ok(response) => {
                                         if let Err(e) = p2p
                                             .send_message(
-                                                &source,
+                                                peer_id,
                                                 CHUNK_PROTOCOL_ID,
                                                 response.to_vec(),
                                             )
@@ -1058,7 +1064,7 @@ impl TestNetwork {
                                         {
                                             warn!(
                                                 "Node {} failed to send response to {}: {}",
-                                                node_index, source, e
+                                                node_index, peer_id, e
                                             );
                                         }
                                     }

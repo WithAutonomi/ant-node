@@ -50,7 +50,9 @@ heed = "0.22"
 # Migration: Decrypt ant-node data (read-only)
 aes-gcm-siv = "0.11"
 hkdf = "0.12"
-sha2 = "0.10"
+
+# Hashing (aligned with saorsa-core)
+blake3 = "1"
 
 # Async runtime
 tokio = { version = "1.35", features = ["full", "signal"] }
