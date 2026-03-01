@@ -6,6 +6,7 @@ use bytes::Bytes;
 use clap::Parser;
 use cli::{Cli, ClientCommand};
 use saorsa_core::P2PNode;
+use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use saorsa_node::client::{QuantumClient, QuantumConfig, XorName};
 use saorsa_node::devnet::DevnetManifest;
 use saorsa_node::error::Error;
@@ -94,6 +95,7 @@ async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<
     core_config.listen_addrs = vec![core_config.listen_addr];
     core_config.enable_ipv6 = false;
     core_config.bootstrap_peers = bootstrap;
+    core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
 
     let node = P2PNode::new(core_config)
         .await

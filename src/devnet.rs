@@ -571,6 +571,7 @@ impl Devnet {
         core_config
             .bootstrap_peers
             .clone_from(&node.bootstrap_addrs);
+        core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
 
         let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
             DevnetError::Startup(format!("Failed to create node {}: {e}", node.index))

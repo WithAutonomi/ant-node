@@ -226,3 +226,4 @@ proptest-regressions/
 # Claude/AI assistant files
 .claude/
 .cache/
+/devnet-manifest.json
