@@ -72,6 +72,7 @@ semver = "1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 
 # Error handling
 thiserror = "2"

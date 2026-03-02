@@ -71,6 +71,21 @@ pub struct Cli {
     #[arg(long, value_enum, default_value = "info", env = "RUST_LOG")]
     pub log_level: CliLogLevel,
 
+    /// Log output format.
+    #[arg(long, value_enum, default_value = "text", env = "SAORSA_LOG_FORMAT")]
+    pub log_format: CliLogFormat,
+
+    /// Directory for log file output.
+    /// When set, logs are written to files in this directory instead of stdout.
+    /// Files rotate daily and are named saorsa-node.YYYY-MM-DD.log.
+    #[arg(long, env = "SAORSA_LOG_DIR")]
+    pub log_dir: Option<PathBuf>,
+
+    /// Maximum number of rotated log files to retain (only used with --log-dir).
+    /// Oldest files are deleted when this limit is reached. Rotation is daily.
+    #[arg(long, default_value = "7", env = "SAORSA_LOG_MAX_FILES")]
+    pub log_max_files: usize,
+
     /// Network mode (production, testnet, or development).
     /// Testnet mode uses relaxed IP diversity limits suitable for
     /// single-provider deployments with many nodes per IP.
@@ -145,6 +160,16 @@ pub enum CliLogLevel {
     Debug,
     /// Trace messages (verbose).
     Trace,
+}
+
+/// Log format CLI enum.
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+pub enum CliLogFormat {
+    /// Plain text output (default).
+    #[default]
+    Text,
+    /// Structured JSON output.
+    Json,
 }
 
 /// Network mode CLI enum.
