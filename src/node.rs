@@ -11,7 +11,9 @@ use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
+use crate::upgrade::{
+    upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
+};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::{NodeId, NodeIdentity};
@@ -280,17 +282,25 @@ impl NodeBuilder {
     }
 
     fn build_upgrade_monitor(config: &NodeConfig, node_id_seed: &[u8]) -> Arc<UpgradeMonitor> {
-        let monitor = UpgradeMonitor::new(
+        let mut monitor = UpgradeMonitor::new(
             config.upgrade.github_repo.clone(),
             config.upgrade.channel,
             config.upgrade.check_interval_hours,
         );
 
-        if config.upgrade.staged_rollout_hours > 0 {
-            Arc::new(monitor.with_staged_rollout(node_id_seed, config.upgrade.staged_rollout_hours))
-        } else {
-            Arc::new(monitor)
+        if let Ok(cache_dir) = upgrade_cache_dir() {
+            monitor = monitor.with_release_cache(ReleaseCache::new(
+                cache_dir,
+                std::time::Duration::from_secs(300),
+            ));
         }
+
+        if config.upgrade.staged_rollout_hours > 0 {
+            monitor =
+                monitor.with_staged_rollout(node_id_seed, config.upgrade.staged_rollout_hours);
+        }
+
+        Arc::new(monitor)
     }
 
     /// Build the ANT protocol handler from config.
@@ -424,6 +434,7 @@ impl RunningNode {
     /// # Errors
     ///
     /// Returns an error if the node encounters a fatal error.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(&mut self) -> Result<()> {
         info!("Starting saorsa-node");
 
@@ -433,10 +444,14 @@ impl RunningNode {
             .await
             .map_err(|e| Error::Startup(format!("Failed to start P2P node: {e}")))?;
 
-        info!(
-            "P2P node started, listening on {:?}",
-            self.p2p_node.listen_addrs().await
-        );
+        let listen_addrs = self.p2p_node.listen_addrs().await;
+        info!("P2P node started, listening on {:?}", listen_addrs);
+
+        // Extract the actual bound port (config port may be 0 = auto-select)
+        let actual_port = listen_addrs
+            .first()
+            .map_or(self.config.port, std::net::SocketAddr::port);
+        info!(port = actual_port, "Node is running on port: {}", actual_port);
 
         // Emit started event
         if let Err(e) = self.events_tx.send(NodeEvent::Started) {
@@ -453,7 +468,10 @@ impl RunningNode {
             let shutdown = self.shutdown.clone();
 
             tokio::spawn(async move {
-                let upgrader = AutoApplyUpgrader::new();
+                let mut upgrader = AutoApplyUpgrader::new();
+                if let Ok(cache_dir) = upgrade_cache_dir() {
+                    upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
+                }
 
                 loop {
                     tokio::select! {
@@ -461,39 +479,49 @@ impl RunningNode {
                             break;
                         }
                         result = monitor.check_for_updates() => {
-                            if let Ok(Some(upgrade_info)) = result {
-                                info!(
-                                    "Upgrade available: {} -> {}",
-                                    upgrader.current_version(),
-                                    upgrade_info.version
-                                );
+                            match result {
+                                Ok(Some(upgrade_info)) => {
+                                    info!(
+                                        "Upgrade available: {} -> {}",
+                                        upgrader.current_version(),
+                                        upgrade_info.version
+                                    );
 
-                                // Send notification event
-                                if let Err(e) = events_tx.send(NodeEvent::UpgradeAvailable {
-                                    version: upgrade_info.version.to_string(),
-                                }) {
-                                    warn!("Failed to send UpgradeAvailable event: {e}");
+                                    // Send notification event
+                                    if let Err(e) = events_tx.send(NodeEvent::UpgradeAvailable {
+                                        version: upgrade_info.version.to_string(),
+                                    }) {
+                                        warn!("Failed to send UpgradeAvailable event: {e}");
+                                    }
+
+                                    // Auto-apply the upgrade
+                                    info!("Starting auto-apply upgrade...");
+                                    match upgrader.apply_upgrade(&upgrade_info).await {
+                                        Ok(UpgradeResult::Success { version }) => {
+                                            info!("Upgrade to {} successful! Process will restart.", version);
+                                            // If we reach here, exec() failed or not supported
+                                        }
+                                        Ok(UpgradeResult::RolledBack { reason }) => {
+                                            warn!("Error during upgrade process: {}", reason);
+                                        }
+                                        Ok(UpgradeResult::NoUpgrade) => {
+                                            info!("Already running latest version");
+                                        }
+                                        Err(e) => {
+                                            error!("Error during upgrade process: {}", e);
+                                        }
+                                    }
                                 }
-
-                                // Auto-apply the upgrade
-                                info!("Starting auto-apply upgrade...");
-                                match upgrader.apply_upgrade(&upgrade_info).await {
-                                    Ok(UpgradeResult::Success { version }) => {
-                                        info!("Upgrade to {} successful! Process will restart.", version);
-                                        // If we reach here, exec() failed or not supported
-                                    }
-                                    Ok(UpgradeResult::RolledBack { reason }) => {
-                                        warn!("Upgrade rolled back: {}", reason);
-                                    }
-                                    Ok(UpgradeResult::NoUpgrade) => {
-                                        debug!("No upgrade needed");
-                                    }
-                                    Err(e) => {
-                                        error!("Critical upgrade error: {}", e);
-                                    }
+                                Ok(None) => {
+                                    info!("Already running latest version");
+                                }
+                                Err(e) => {
+                                    warn!("Error during upgrade process: {}", e);
                                 }
                             }
-                            // Wait for next check interval
+                            // Schedule next check
+                            let next_check = chrono::Utc::now() + chrono::Duration::from_std(monitor.check_interval()).unwrap_or_else(|_| chrono::Duration::hours(1));
+                            info!("Next upgrade check scheduled for {}", next_check.to_rfc3339());
                             tokio::time::sleep(monitor.check_interval()).await;
                         }
                     }

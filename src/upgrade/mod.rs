@@ -8,12 +8,18 @@
 //! - Auto-apply: download, extract, verify, replace, restart
 
 mod apply;
+mod binary_cache;
+mod cache_dir;
 mod monitor;
+mod release_cache;
 mod rollout;
 mod signature;
 
-pub use apply::AutoApplyUpgrader;
+pub use apply::{AutoApplyUpgrader, RESTART_EXIT_CODE};
+pub use binary_cache::BinaryCache;
+pub use cache_dir::upgrade_cache_dir;
 pub use monitor::{find_platform_asset, version_from_tag, Asset, GitHubRelease, UpgradeMonitor};
+pub use release_cache::ReleaseCache;
 pub use rollout::StagedRollout;
 pub use signature::{
     verify_binary_signature, verify_binary_signature_with_key, verify_from_file,
@@ -347,9 +353,9 @@ impl Upgrader {
 
     /// Whether the current platform supports in-place auto-upgrade.
     ///
-    /// On Windows, replacing a running executable is typically blocked by file locks.
+    /// Supported on Unix (via `exec()`) and Windows (via `self-replace` crate).
     const fn auto_upgrade_supported() -> bool {
-        !cfg!(windows)
+        true
     }
 }
 
@@ -687,11 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_upgrade_supported_flag_matches_platform() {
-        if cfg!(windows) {
-            assert!(!Upgrader::auto_upgrade_supported());
-        } else {
-            assert!(Upgrader::auto_upgrade_supported());
-        }
+    fn test_auto_upgrade_supported_on_all_platforms() {
+        assert!(Upgrader::auto_upgrade_supported());
     }
 }

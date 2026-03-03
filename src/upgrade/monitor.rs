@@ -9,6 +9,7 @@
 
 use crate::config::UpgradeChannel;
 use crate::error::{Error, Result};
+use crate::upgrade::release_cache::ReleaseCache;
 use crate::upgrade::rollout::StagedRollout;
 use crate::upgrade::UpgradeInfo;
 use semver::Version;
@@ -54,6 +55,8 @@ pub struct UpgradeMonitor {
     client: reqwest::Client,
     /// Staged rollout calculator (optional).
     staged_rollout: Option<StagedRollout>,
+    /// Disk cache for GitHub release metadata (shared across instances).
+    release_cache: Option<ReleaseCache>,
     /// When the current pending upgrade was first detected.
     pending_upgrade_detected: Option<Instant>,
     /// The version of the pending upgrade (for tracking rollout state).
@@ -89,9 +92,21 @@ impl UpgradeMonitor {
             current_version,
             client,
             staged_rollout: None,
+            release_cache: None,
             pending_upgrade_detected: None,
             pending_upgrade_version: None,
         }
+    }
+
+    /// Configure a shared disk cache for release metadata.
+    ///
+    /// When set, `check_for_updates` will consult the cache before hitting
+    /// the GitHub API.  Fresh results are written back so that other nodes
+    /// on the same machine can reuse them.
+    #[must_use]
+    pub fn with_release_cache(mut self, cache: ReleaseCache) -> Self {
+        self.release_cache = Some(cache);
+        self
     }
 
     /// Configure staged rollout for this monitor.
@@ -134,6 +149,7 @@ impl UpgradeMonitor {
             current_version,
             client,
             staged_rollout: None,
+            release_cache: None,
             pending_upgrade_detected: None,
             pending_upgrade_version: None,
         }
@@ -179,6 +195,22 @@ impl UpgradeMonitor {
     ///
     /// Returns an error if the GitHub API request fails.
     pub async fn check_for_updates(&self) -> Result<Option<UpgradeInfo>> {
+        // Try the shared disk cache first
+        if let Some(ref cache) = self.release_cache {
+            if let Some(cached_releases) = cache.read_if_valid(&self.repo) {
+                info!(
+                    "Using cached release info ({} releases)",
+                    cached_releases.len()
+                );
+                return Ok(select_upgrade_from_releases(
+                    &cached_releases,
+                    &self.current_version,
+                    self.channel,
+                ));
+            }
+            info!("No valid cache, fetching from API");
+        }
+
         let api_url = format!("https://api.github.com/repos/{}/releases", self.repo);
 
         debug!("Checking for updates from: {}", api_url);
@@ -202,6 +234,13 @@ impl UpgradeMonitor {
             .json()
             .await
             .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))?;
+
+        // Write fresh results to the shared cache for other nodes
+        if let Some(ref cache) = self.release_cache {
+            if let Err(e) = cache.write(&self.repo, &releases) {
+                warn!("Failed to write release cache: {e}");
+            }
+        }
 
         Ok(select_upgrade_from_releases(
             &releases,
@@ -234,6 +273,11 @@ impl UpgradeMonitor {
 
         // If staged rollout is not enabled, return immediately
         let Some(ref rollout) = self.staged_rollout else {
+            let restart_time = chrono::Utc::now();
+            info!(
+                "Node will stop/restart for upgrade at {}",
+                restart_time.to_rfc3339()
+            );
             return Ok(Some(info));
         };
 
@@ -249,11 +293,17 @@ impl UpgradeMonitor {
             self.pending_upgrade_version = Some(info.version.clone());
 
             let delay = rollout.calculate_delay_for_version(&info.version);
+            let restart_time = chrono::Utc::now()
+                + chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::hours(1));
             info!(
                 "New version {} detected. Staged rollout delay: {}h {}m",
                 info.version,
                 delay.as_secs() / 3600,
                 (delay.as_secs() % 3600) / 60
+            );
+            info!(
+                "Node will stop/restart for upgrade at {}",
+                restart_time.to_rfc3339()
             );
         }
 
