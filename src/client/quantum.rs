@@ -329,7 +329,7 @@ impl QuantumClient {
     /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest nodes to the target
     /// address and returns the single closest remote peer (excluding ourselves).
     async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<PeerId> {
-        let local_hex = node.peer_id().to_hex();
+        let local_peer_id = node.peer_id();
 
         let closest_nodes = node
             .dht()
@@ -339,7 +339,7 @@ impl QuantumClient {
 
         let closest = closest_nodes
             .into_iter()
-            .find(|n| n.peer_id != local_hex)
+            .find(|n| &n.peer_id != local_peer_id)
             .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
 
         debug!(
@@ -348,8 +348,7 @@ impl QuantumClient {
             hex::encode(target)
         );
 
-        PeerId::from_hex(&closest.peer_id)
-            .map_err(|e| Error::Network(format!("Invalid peer ID from DHT: {e}")))
+        Ok(closest.peer_id)
     }
 }
 

@@ -14,7 +14,7 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
-use saorsa_core::identity::{NodeIdentity, PeerId};
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
@@ -73,7 +73,7 @@ impl NodeBuilder {
 
         // Convert our config to saorsa-core's config, injecting our stable peer_id
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id.to_hex());
+        core_config.peer_id = Some(peer_id.clone());
         core_config.node_identity = Some(Arc::new(identity));
         debug!("Core config: {:?}", core_config);
 
@@ -211,7 +211,7 @@ impl NodeBuilder {
                 let identity = NodeIdentity::generate().map_err(|e| {
                     Error::Startup(format!("Failed to generate node identity: {e}"))
                 })?;
-                let peer_id = peer_id_to_hex(identity.peer_id());
+                let peer_id = identity.peer_id().to_hex();
                 let peer_dir = nodes_dir.join(&peer_id);
                 std::fs::create_dir_all(&peer_dir)?;
                 identity
@@ -377,11 +377,6 @@ impl NodeBuilder {
             }
         }
     }
-}
-
-/// Convert a `PeerId` to a hex-encoded string (full 64 hex chars).
-fn peer_id_to_hex(peer_id: &PeerId) -> String {
-    peer_id.to_hex()
 }
 
 /// A running saorsa node.
@@ -655,6 +650,7 @@ impl RunningNode {
 mod tests {
     use super::*;
     use crate::config::NODES_SUBDIR;
+    use saorsa_core::identity::PeerId;
 
     #[test]
     fn test_build_upgrade_monitor_staged_rollout_enabled() {
@@ -765,7 +761,7 @@ mod tests {
         // Key file should exist
         assert!(tmp.path().join(NODE_IDENTITY_FILENAME).exists());
         // peer_id should be derivable from the identity
-        let peer_id = peer_id_to_hex(identity.peer_id());
+        let peer_id = identity.peer_id().to_hex();
         assert_eq!(peer_id.len(), 64); // 32 bytes hex-encoded
     }
 
@@ -792,8 +788,7 @@ mod tests {
     #[test]
     fn test_peer_id_to_hex_length() {
         let id = PeerId::from_bytes([0x42; 32]);
-        let peer_id = peer_id_to_hex(&id);
-        assert_eq!(peer_id.len(), 64); // 32 bytes = 64 hex chars
+        assert_eq!(id.to_hex().len(), 64); // 32 bytes = 64 hex chars
     }
 
     /// Simulates a node restart: first run creates identity in a scoped subdir
@@ -806,7 +801,7 @@ mod tests {
 
         // First "boot": generate identity, save it in nodes/{peer_id}/
         let identity1 = NodeIdentity::generate().unwrap();
-        let peer_id1 = peer_id_to_hex(identity1.peer_id());
+        let peer_id1 = identity1.peer_id().to_hex();
         let peer_dir = nodes_dir.join(&peer_id1);
         std::fs::create_dir_all(&peer_dir).unwrap();
         identity1
@@ -824,7 +819,7 @@ mod tests {
         let loaded = NodeIdentity::load_from_file(&identity_dirs[0].join(NODE_IDENTITY_FILENAME))
             .await
             .unwrap();
-        let peer_id2 = peer_id_to_hex(loaded.peer_id());
+        let peer_id2 = loaded.peer_id().to_hex();
 
         assert_eq!(peer_id1, peer_id2, "peer_id must survive restart");
         assert_eq!(

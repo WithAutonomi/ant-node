@@ -547,7 +547,11 @@ impl TestNode {
     ///
     /// Returns an error if this node is not running, the message cannot be
     /// sent, the response times out, or the remote peer reports an error.
-    pub async fn store_chunk_on_peer(&self, target_peer_id: &PeerId, data: &[u8]) -> Result<XorName> {
+    pub async fn store_chunk_on_peer(
+        &self,
+        target_peer_id: &PeerId,
+        data: &[u8],
+    ) -> Result<XorName> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
 
         // Create PUT request
