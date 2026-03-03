@@ -282,18 +282,17 @@ impl PaymentVerifier {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
 
-        // Verify quote signatures in a single blocking task (doesn't require network).
+        // Verify quote signatures using ML-DSA-65 (post-quantum).
+        // We use our own verification instead of ant-evm's check_is_signed_by_claimed_peer()
+        // which only supports Ed25519/libp2p signatures.
         // Signature verification is CPU-bound, so we run it off the async runtime.
         let peer_quotes = payment.peer_quotes.clone();
         tokio::task::spawn_blocking(move || {
-            for (encoded_peer_id, quote) in &peer_quotes {
-                let peer_id = encoded_peer_id.to_peer_id().map_err(|e| {
-                    Error::Payment(format!("Invalid peer ID in payment proof: {e}"))
-                })?;
-                if !quote.check_is_signed_by_claimed_peer(peer_id) {
-                    return Err(Error::Payment(format!(
-                        "Quote signature invalid for peer {peer_id}"
-                    )));
+            for (_encoded_peer_id, quote) in &peer_quotes {
+                if !crate::payment::quote::verify_quote_signature(quote) {
+                    return Err(Error::Payment(
+                        "Quote ML-DSA-65 signature verification failed".to_string(),
+                    ));
                 }
             }
             Ok(())
@@ -436,5 +435,45 @@ mod tests {
         assert!(PaymentStatus::CachedAsVerified.is_cached());
         assert!(!PaymentStatus::PaymentVerified.is_cached());
         assert!(!PaymentStatus::PaymentRequired.is_cached());
+    }
+
+    #[tokio::test]
+    async fn test_verifier_caches_after_successful_verification() {
+        let verifier = create_test_verifier();
+        let xorname = [42u8; 32];
+
+        // Not yet cached — should require payment
+        assert_eq!(
+            verifier.check_payment_required(&xorname),
+            PaymentStatus::PaymentRequired
+        );
+
+        // Verify payment (EVM disabled, so it succeeds and caches)
+        let result = verifier.verify_payment(&xorname, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.expect("verified"), PaymentStatus::PaymentVerified);
+
+        // Now the xorname should be cached
+        assert_eq!(
+            verifier.check_payment_required(&xorname),
+            PaymentStatus::CachedAsVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_verifier_rejects_without_proof_when_evm_enabled() {
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                enabled: true,
+                network: EvmNetwork::ArbitrumOne,
+            },
+            cache_capacity: 100,
+        };
+        let verifier = PaymentVerifier::new(config);
+        let xorname = [99u8; 32];
+
+        // EVM enabled + no proof provided => should return an error
+        let result = verifier.verify_payment(&xorname, None).await;
+        assert!(result.is_err());
     }
 }

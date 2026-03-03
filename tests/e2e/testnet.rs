@@ -1139,11 +1139,17 @@ impl TestNetwork {
 
         tokio::fs::create_dir_all(&data_dir).await?;
 
+        // Generate an ML-DSA-65 identity for this test node's quote signing
+        let identity = saorsa_core::identity::NodeIdentity::generate().map_err(|e| {
+            TestnetError::Core(format!("Failed to generate test node identity: {e}"))
+        })?;
+
         // Initialize AntProtocol for this node with payment enforcement setting
         let ant_protocol = Self::create_ant_protocol(
             &data_dir,
             self.config.payment_enforcement,
             self.config.evm_network.clone(),
+            &identity,
         )
         .await?;
 
@@ -1183,6 +1189,7 @@ impl TestNetwork {
         data_dir: &std::path::Path,
         payment_enforcement: bool,
         evm_network: Option<EvmNetwork>,
+        identity: &saorsa_core::identity::NodeIdentity,
     ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
@@ -1207,19 +1214,25 @@ impl TestNetwork {
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
-        // Create quote generator with test rewards address and a dummy signer
+        // Create quote generator with ML-DSA-65 signing from the test node's identity
         let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
         let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        // Set up a test signer so nodes can generate signed quotes.
-        // Without this, create_quote() returns Err("Quote signing not configured").
-        quote_generator.set_signer(vec![0u8; 64], |bytes| {
-            // Deterministic test signature: copy first 64 bytes of input
-            let len = bytes.len().min(64);
-            let mut sig = vec![0u8; 64];
-            sig[..len].copy_from_slice(&bytes[..len]);
-            sig
+        // Wire ML-DSA-65 signing so quotes are properly signed and verifiable
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
+            use saorsa_pqc::pqc::types::MlDsaSecretKey;
+            use saorsa_pqc::pqc::MlDsaOperations;
+
+            let Ok(sk) = MlDsaSecretKey::from_bytes(&sk_bytes) else {
+                return vec![];
+            };
+            let ml_dsa = saorsa_core::MlDsa65::new();
+            ml_dsa
+                .sign(&sk, msg)
+                .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
         });
 
         Ok(AntProtocol::new(

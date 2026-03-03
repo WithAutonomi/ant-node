@@ -24,6 +24,7 @@ use crate::ant_protocol::{
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse,
 };
 use crate::error::{Error, Result};
+use crate::payment::single_node::REQUIRED_QUOTES;
 use crate::payment::SingleNodePayment;
 use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
@@ -31,6 +32,7 @@ use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
 use saorsa_core::P2PNode;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +43,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// Number of closest peers to consider for chunk routing.
 const CLOSE_GROUP_SIZE: usize = 8;
-
-/// Number of quotes required for payment (matches `SingleNodePayment` requirement).
-const REQUIRED_QUOTES: usize = 5;
 
 /// Default number of replicas for data redundancy.
 const DEFAULT_REPLICA_COUNT: u8 = 4;
@@ -335,45 +334,14 @@ impl QuantumClient {
             .encode()
             .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        let addr_hex = hex::encode(address);
-        let timeout_secs = self.config.timeout_secs;
-
-        send_and_await_chunk_response(
+        Self::send_put_and_await(
             node,
             &target_peer,
             message_bytes,
             request_id,
-            timeout,
-            |body| match body {
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
-                    info!(
-                        "Chunk stored at address: {} ({} bytes)",
-                        hex::encode(addr),
-                        content_size
-                    );
-                    Some(Ok(addr))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
-                    address: addr,
-                }) => {
-                    info!("Chunk already exists at address: {}", hex::encode(addr));
-                    Some(Ok(addr))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
-                    Some(Err(Error::Network(format!("Payment required: {message}"))))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => Some(Err(
-                    Error::Network(format!("Remote PUT error for {addr_hex}: {e}")),
-                )),
-                _ => None,
-            },
-            |e| Error::Network(format!("Failed to send PUT to peer {target_peer}: {e}")),
-            || {
-                Error::Network(format!(
-                    "Timeout waiting for store response for {addr_hex} after {timeout_secs}s"
-                ))
-            },
+            self.config.timeout_secs,
+            hex::encode(address),
+            content_size,
         )
         .await
     }
@@ -418,45 +386,14 @@ impl QuantumClient {
             .encode()
             .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        let addr_hex = hex::encode(address);
-        let timeout_secs = self.config.timeout_secs;
-
-        send_and_await_chunk_response(
+        Self::send_put_and_await(
             node,
             &target_peer,
             message_bytes,
             request_id,
-            timeout,
-            |body| match body {
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
-                    info!(
-                        "Chunk stored at address: {} ({} bytes)",
-                        hex::encode(addr),
-                        content_size
-                    );
-                    Some(Ok(addr))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists {
-                    address: addr,
-                }) => {
-                    info!("Chunk already exists at address: {}", hex::encode(addr));
-                    Some(Ok(addr))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::PaymentRequired { message }) => {
-                    Some(Err(Error::Network(format!("Payment required: {message}"))))
-                }
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(e)) => Some(Err(
-                    Error::Network(format!("Remote PUT error for {addr_hex}: {e}")),
-                )),
-                _ => None,
-            },
-            |e| Error::Network(format!("Failed to send PUT to peer {target_peer}: {e}")),
-            || {
-                Error::Network(format!(
-                    "Timeout waiting for store response for {addr_hex} after {timeout_secs}s"
-                ))
-            },
+            self.config.timeout_secs,
+            hex::encode(address),
+            content_size,
         )
         .await
     }
@@ -513,22 +450,43 @@ impl QuantumClient {
             .encode()
             .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
 
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        let addr_hex = hex::encode(address);
-        let timeout_secs = self.config.timeout_secs;
-
-        send_and_await_chunk_response(
+        Self::send_put_and_await(
             node,
             &target_peer,
+            message_bytes,
+            request_id,
+            self.config.timeout_secs,
+            hex::encode(address),
+            content_size,
+        )
+        .await
+    }
+
+    /// Send a PUT request and await the response.
+    ///
+    /// Shared helper for all three PUT methods to avoid duplicating the
+    /// response-matching logic.
+    async fn send_put_and_await(
+        node: &P2PNode,
+        target_peer: &str,
+        message_bytes: Vec<u8>,
+        request_id: u64,
+        timeout_secs: u64,
+        addr_hex: String,
+        content_size: usize,
+    ) -> Result<XorName> {
+        let timeout = Duration::from_secs(timeout_secs);
+        send_and_await_chunk_response(
+            node,
+            target_peer,
             message_bytes,
             request_id,
             timeout,
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
                     info!(
-                        "Chunk stored at address: {} ({} bytes)",
+                        "Chunk stored at address: {} ({content_size} bytes)",
                         hex::encode(addr),
-                        content_size
                     );
                     Some(Ok(addr))
                 }
@@ -723,8 +681,9 @@ impl QuantumClient {
             debug!("Found {} connected P2P peers for fallback", connected.len());
 
             // Add connected peers that aren't already in remote_peers
+            let existing: HashSet<String> = remote_peers.iter().cloned().collect();
             for peer_id in connected {
-                if !remote_peers.contains(&peer_id) {
+                if !existing.contains(&peer_id) {
                     remote_peers.push(peer_id);
                 }
             }
@@ -791,20 +750,15 @@ impl QuantumClient {
                             // Deserialize the quote
                             match rmp_serde::from_slice::<PaymentQuote>(&quote) {
                                 Ok(payment_quote) => {
-                                    // TODO: Extract actual price from quote once a dedicated
-                                    // price/cost field is added to PaymentQuote. Currently using
-                                    // close_records_stored as a placeholder metric.
-                                    let stored = match u64::try_from(
-                                        payment_quote.quoting_metrics.close_records_stored,
-                                    ) {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            return Some(Err(Error::Payment(format!(
-                                                "Price conversion overflow: {e}"
+                                    let data_size_val = payment_quote.quoting_metrics.data_size.max(1);
+                                    let price = match u64::try_from(data_size_val) {
+                                        Ok(val) => Amount::from(val),
+                                        Err(_) => {
+                                            return Some(Err(Error::Network(format!(
+                                                "Quote data_size too large to convert: {data_size_val}"
                                             ))));
                                         }
                                     };
-                                    let price = Amount::from(stored);
                                     if tracing::enabled!(tracing::Level::DEBUG) {
                                         debug!(
                                             "Received quote from {}: price = {}",

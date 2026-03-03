@@ -471,6 +471,87 @@ mod tests {
         println!("\n✅ SingleNode payment strategy works!");
     }
 
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_from_quotes_median_selection() {
+        use std::time::SystemTime;
+        use xor_name::XorName;
+
+        let prices: Vec<u64> = vec![50, 30, 10, 40, 20];
+        let mut quotes_with_prices = Vec::new();
+
+        for price in &prices {
+            let quote = PaymentQuote {
+                content: XorName::random(&mut rand::thread_rng()),
+                timestamp: SystemTime::now(),
+                quoting_metrics: QuotingMetrics {
+                    data_size: 1024,
+                    data_type: 0,
+                    close_records_stored: 0,
+                    records_per_type: vec![(0, 10)],
+                    max_records: 1000,
+                    received_payment_count: 5,
+                    live_time: 3600,
+                    network_density: None,
+                    network_size: Some(100),
+                },
+                rewards_address: RewardsAddress::new([1u8; 20]),
+                pub_key: vec![],
+                signature: vec![],
+            };
+            quotes_with_prices.push((quote, Amount::from(*price)));
+        }
+
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices).unwrap();
+
+        // After sorting by price: 10, 20, 30, 40, 50
+        // Median (index 2) = 30, paid amount = 3 * 30 = 90
+        let median_quote = payment.quotes.get(MEDIAN_INDEX).unwrap();
+        assert_eq!(median_quote.amount, Amount::from(90u64));
+
+        // Other 4 quotes should have Amount::ZERO
+        for (i, q) in payment.quotes.iter().enumerate() {
+            if i != MEDIAN_INDEX {
+                assert_eq!(q.amount, Amount::ZERO);
+            }
+        }
+
+        // Total should be 3 * median price = 90
+        assert_eq!(payment.total_amount(), Amount::from(90u64));
+    }
+
+    #[test]
+    fn test_from_quotes_wrong_count() {
+        use std::time::SystemTime;
+        use xor_name::XorName;
+
+        let mut quotes_with_prices = Vec::new();
+        for _ in 0..3 {
+            let quote = PaymentQuote {
+                content: XorName::random(&mut rand::thread_rng()),
+                timestamp: SystemTime::now(),
+                quoting_metrics: QuotingMetrics {
+                    data_size: 1024,
+                    data_type: 0,
+                    close_records_stored: 0,
+                    records_per_type: vec![(0, 10)],
+                    max_records: 1000,
+                    received_payment_count: 5,
+                    live_time: 3600,
+                    network_density: None,
+                    network_size: Some(100),
+                },
+                rewards_address: RewardsAddress::new([1u8; 20]),
+                pub_key: vec![],
+                signature: vec![],
+            };
+            quotes_with_prices.push((quote, Amount::from(10u64)));
+        }
+
+        let result = SingleNodePayment::from_quotes(quotes_with_prices);
+        assert!(result.is_err());
+    }
+
     /// Test: Complete `SingleNode` flow with real contract prices
     #[tokio::test]
     #[serial]

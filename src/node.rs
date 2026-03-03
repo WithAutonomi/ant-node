@@ -15,11 +15,14 @@ use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::{NodeId, NodeIdentity};
+use saorsa_core::MlDsa65;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
     ProductionConfig as CoreProductionConfig,
 };
+use saorsa_pqc::pqc::types::MlDsaSecretKey;
+use saorsa_pqc::pqc::MlDsaOperations;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -132,7 +135,9 @@ impl NodeBuilder {
 
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
-            Some(Arc::new(Self::build_ant_protocol(&self.config).await?))
+            Some(Arc::new(
+                Self::build_ant_protocol(&self.config, &identity).await?,
+            ))
         } else {
             info!("Chunk storage disabled");
             None
@@ -332,7 +337,11 @@ impl NodeBuilder {
     /// Build the ANT protocol handler from config.
     ///
     /// Initializes LMDB storage, payment verifier, and quote generator.
-    async fn build_ant_protocol(config: &NodeConfig) -> Result<AntProtocol> {
+    /// Wires ML-DSA-65 signing from the node's identity into the quote generator.
+    async fn build_ant_protocol(
+        config: &NodeConfig,
+        identity: &NodeIdentity,
+    ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: config.root_dir.clone(),
@@ -358,16 +367,37 @@ impl NodeBuilder {
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
-        // Create quote generator
+        // Create quote generator with ML-DSA-65 signing
         let rewards_address = match config.payment.rewards_address {
             Some(ref addr) => parse_rewards_address(addr)?,
             None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
         };
         let metrics_tracker = QuotingMetricsTracker::new(DEFAULT_MAX_QUOTING_RECORDS, 0);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        // Wire ML-DSA-65 signing from node identity
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
+            let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
+                Ok(sk) => sk,
+                Err(e) => {
+                    tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
+                    return vec![];
+                }
+            };
+            let ml_dsa = MlDsa65::new();
+            match ml_dsa.sign(&sk, msg) {
+                Ok(sig) => sig.as_bytes().to_vec(),
+                Err(e) => {
+                    tracing::error!("ML-DSA-65 signing failed: {e}");
+                    vec![]
+                }
+            }
+        });
 
         info!(
-            "ANT protocol handler initialized (protocol={})",
+            "ANT protocol handler initialized with ML-DSA-65 signing (protocol={})",
             CHUNK_PROTOCOL_ID
         );
 

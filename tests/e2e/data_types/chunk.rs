@@ -289,32 +289,6 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
-    // =========================================================================
-    // Tests requiring additional infrastructure (not yet implemented)
-    // =========================================================================
-
-    /// Test 9: Chunk replication across nodes.
-    ///
-    /// Store on one node, retrieve from a different node.
-    #[test]
-    #[ignore = "TODO: Cross-node DHT replication not yet working in saorsa-core"]
-    fn test_chunk_replication() {
-        // TODO: Implement when saorsa-core DHT replication is fixed
-        // - Store chunk on node 0
-        // - Retrieve from nodes 1-4
-        // - Verify data matches
-    }
-
-    /// Test: Payment verification for chunk storage.
-    #[test]
-    #[ignore = "Requires Anvil EVM testnet integration"]
-    fn test_chunk_payment_verification() {
-        // TODO: Implement with TestHarness and TestAnvil
-        // - Create payment proof via Anvil
-        // - Store chunk with payment proof
-        // - Verify payment was validated
-    }
-
     /// Test 8: Reject oversized chunk (> 4MB).
     ///
     /// Chunks have a maximum size of 4MB. Attempting to store a larger
@@ -398,9 +372,12 @@ mod tests {
 
         // Recreate AntProtocol from the same data directory (simulates restart)
         // Pass false for payment_enforcement (disabled for this test)
-        let new_protocol = TestNetwork::create_ant_protocol(&data_dir, false, None)
-            .await
-            .expect("Failed to recreate AntProtocol");
+        let restart_identity = saorsa_core::identity::NodeIdentity::generate()
+            .expect("Failed to generate identity for restart");
+        let new_protocol =
+            TestNetwork::create_ant_protocol(&data_dir, false, None, &restart_identity)
+                .await
+                .expect("Failed to recreate AntProtocol");
         {
             let node = harness
                 .network_mut()
@@ -435,13 +412,6 @@ mod tests {
             .expect("Failed to teardown harness");
     }
 
-    /// Test: ML-DSA-65 signature on chunk.
-    #[test]
-    #[ignore = "Requires signature verification infrastructure"]
-    fn test_chunk_signature_verification() {
-        // TODO: Verify chunk is signed with ML-DSA-65 when stored
-    }
-
     // =========================================================================
     // Payment E2E Tests
     // =========================================================================
@@ -460,12 +430,10 @@ mod tests {
             .await
             .expect("Failed to setup harness with payments");
 
-        // Get wallet from Anvil using shared testnet
-        let testnet = evmlib::testnet::Testnet::new().await;
+        // Get wallet from Anvil
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_funded_wallet(&testnet)
-            .await
+            .create_funded_wallet()
             .expect("Failed to create funded wallet");
 
         // Setup client with wallet
@@ -520,11 +488,9 @@ mod tests {
             .await
             .expect("Failed to setup harness");
 
-        let testnet = evmlib::testnet::Testnet::new().await;
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_funded_wallet(&testnet)
-            .await
+            .create_funded_wallet()
             .expect("Failed to create wallet");
 
         harness
@@ -600,12 +566,10 @@ mod tests {
             .await
             .expect("Failed to setup harness");
 
-        // Create wallet with 0 balance using shared testnet
-        let testnet = evmlib::testnet::Testnet::new().await;
+        // Create wallet with 0 balance
         let anvil = harness.anvil().expect("Anvil should be running");
         let wallet = anvil
-            .create_empty_wallet(&testnet)
-            .await
+            .create_empty_wallet()
             .expect("Failed to create empty wallet");
 
         harness

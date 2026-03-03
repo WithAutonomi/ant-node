@@ -5,6 +5,8 @@ mod cli;
 use bytes::Bytes;
 use clap::Parser;
 use cli::{Cli, ClientCommand};
+use evmlib::wallet::Wallet;
+use evmlib::Network as EvmNetwork;
 use saorsa_core::P2PNode;
 use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use saorsa_node::client::{QuantumClient, QuantumConfig, XorName};
@@ -40,12 +42,28 @@ async fn main() -> color_eyre::Result<()> {
 
     let bootstrap = resolve_bootstrap(&cli)?;
     let node = create_client_node(bootstrap).await?;
-    let client = QuantumClient::new(QuantumConfig {
+    let mut client = QuantumClient::new(QuantumConfig {
         timeout_secs: cli.timeout_secs,
         replica_count: DEFAULT_CLIENT_REPLICA_COUNT,
         encrypt_data: false,
     })
     .with_node(node);
+
+    if let Some(ref key) = cli.private_key {
+        let network = match cli.evm_network.as_str() {
+            "arbitrum-one" => EvmNetwork::ArbitrumOne,
+            "arbitrum-sepolia" => EvmNetwork::ArbitrumSepoliaTest,
+            other => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Unsupported EVM network: {other}. Use 'arbitrum-one' or 'arbitrum-sepolia'."
+                ));
+            }
+        };
+        let wallet = Wallet::new_from_private_key(network, key)
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to create wallet: {e}"))?;
+        info!("Wallet configured for payments on {}", cli.evm_network);
+        client = client.with_wallet(wallet);
+    }
 
     match cli.command {
         ClientCommand::Put { file } => {

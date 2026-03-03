@@ -10,6 +10,9 @@
 use crate::error::Result;
 use crate::payment::metrics::QuotingMetricsTracker;
 use ant_evm::{PaymentQuote, QuotingMetrics, RewardsAddress};
+use saorsa_core::MlDsa65;
+use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSignature};
+use saorsa_pqc::pqc::MlDsaOperations;
 use std::time::SystemTime;
 use tracing::debug;
 
@@ -162,7 +165,7 @@ impl QuoteGenerator {
     }
 }
 
-/// Verify a payment quote signature.
+/// Verify a payment quote's content address and ML-DSA-65 signature.
 ///
 /// # Arguments
 ///
@@ -171,7 +174,7 @@ impl QuoteGenerator {
 ///
 /// # Returns
 ///
-/// `true` if the content matches (signature verification requires public key).
+/// `true` if the content matches and the ML-DSA-65 signature is valid.
 #[must_use]
 pub fn verify_quote_content(quote: &PaymentQuote, expected_content: &XorName) -> bool {
     // Check content matches
@@ -186,6 +189,58 @@ pub fn verify_quote_content(quote: &PaymentQuote, expected_content: &XorName) ->
         return false;
     }
     true
+}
+
+/// Verify that a payment quote has a valid ML-DSA-65 signature.
+///
+/// This replaces ant-evm's `check_is_signed_by_claimed_peer()` which only
+/// handles Ed25519/libp2p signatures. Saorsa uses ML-DSA-65 post-quantum
+/// signatures for quote signing.
+///
+/// # Arguments
+///
+/// * `quote` - The quote to verify
+///
+/// # Returns
+///
+/// `true` if the ML-DSA-65 signature is valid for the quote's content.
+#[must_use]
+pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
+    // Parse public key from quote
+    let pub_key = match MlDsaPublicKey::from_bytes(&quote.pub_key) {
+        Ok(pk) => pk,
+        Err(e) => {
+            debug!("Failed to parse ML-DSA-65 public key from quote: {e}");
+            return false;
+        }
+    };
+
+    // Parse signature from quote
+    let signature = match MlDsaSignature::from_bytes(&quote.signature) {
+        Ok(sig) => sig,
+        Err(e) => {
+            debug!("Failed to parse ML-DSA-65 signature from quote: {e}");
+            return false;
+        }
+    };
+
+    // Get the bytes that were signed
+    let bytes = quote.bytes_for_sig();
+
+    // Verify using saorsa's ML-DSA-65 implementation
+    let ml_dsa = MlDsa65::new();
+    match ml_dsa.verify(&pub_key, &bytes, &signature) {
+        Ok(valid) => {
+            if !valid {
+                debug!("ML-DSA-65 quote signature verification failed");
+            }
+            valid
+        }
+        Err(e) => {
+            debug!("ML-DSA-65 verification error: {e}");
+            false
+        }
+    }
 }
 
 #[cfg(test)]
@@ -251,5 +306,56 @@ mod tests {
         let content = [42u8; 32];
         let result = generator.create_quote(content, 1024, 0);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_quote_signature_round_trip_real_keys() {
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keypair generation");
+
+        let rewards_address = RewardsAddress::new([2u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let sk_bytes = secret_key.as_bytes().to_vec();
+        generator.set_signer(pub_key_bytes, move |msg| {
+            let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("secret key parse");
+            let ml_dsa = MlDsa65::new();
+            ml_dsa.sign(&sk, msg).expect("signing").as_bytes().to_vec()
+        });
+
+        let content = [7u8; 32];
+        let quote = generator
+            .create_quote(content, 2048, 0)
+            .expect("create quote");
+
+        // Valid signature should verify
+        assert!(verify_quote_signature(&quote));
+
+        // Tamper with the signature — flip a byte
+        let mut tampered_quote = quote;
+        if let Some(byte) = tampered_quote.signature.first_mut() {
+            *byte ^= 0xFF;
+        }
+        assert!(!verify_quote_signature(&tampered_quote));
+    }
+
+    #[test]
+    fn test_empty_signature_fails_verification() {
+        let generator = create_test_generator();
+        let content = [42u8; 32];
+
+        let quote = generator
+            .create_quote(content, 1024, 0)
+            .expect("create quote");
+
+        // The dummy signer produces a 64-byte fake signature, not a valid
+        // ML-DSA-65 signature (3309 bytes), so verification must fail.
+        assert!(!verify_quote_signature(&quote));
     }
 }

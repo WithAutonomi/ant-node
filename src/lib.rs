@@ -47,8 +47,6 @@ pub mod error;
 pub mod event;
 pub mod node;
 pub mod payment;
-#[cfg(test)]
-mod probe;
 pub mod storage;
 pub mod upgrade;
 

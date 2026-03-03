@@ -13,7 +13,10 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
+use saorsa_core::MlDsa65;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
+use saorsa_pqc::pqc::types::MlDsaSecretKey;
+use saorsa_pqc::pqc::MlDsaOperations;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -317,25 +320,23 @@ impl Devnet {
             ));
         }
 
+        let node_count = config.node_count;
+        let node_count_u16 = u16::try_from(node_count).map_err(|_| {
+            DevnetError::Config(format!("Node count {node_count} exceeds u16::MAX"))
+        })?;
+
         if config.base_port == 0 {
             let mut rng = rand::thread_rng();
-            let node_count_u16 = u16::try_from(config.node_count).map_err(|_| {
-                DevnetError::Config(format!("Node count {} exceeds u16::MAX", config.node_count))
-            })?;
             let max_base_port = DEVNET_PORT_RANGE_MAX.saturating_sub(node_count_u16);
             config.base_port = rng.gen_range(DEVNET_PORT_RANGE_MIN..max_base_port);
         }
 
-        let node_count_u16 = u16::try_from(config.node_count).map_err(|_| {
-            DevnetError::Config(format!("Node count {} exceeds u16::MAX", config.node_count))
-        })?;
-        let max_port = config
-            .base_port
+        let base_port = config.base_port;
+        let max_port = base_port
             .checked_add(node_count_u16)
             .ok_or_else(|| {
                 DevnetError::Config(format!(
-                    "Port range overflow: base_port {} + node_count {} exceeds u16::MAX",
-                    config.base_port, config.node_count
+                    "Port range overflow: base_port {base_port} + node_count {node_count} exceeds u16::MAX"
                 ))
             })?;
         if max_port > DEVNET_PORT_RANGE_MAX {
@@ -467,7 +468,16 @@ impl Devnet {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        let bootstrap_addrs: Vec<SocketAddr> = self.nodes[0..self.config.bootstrap_count]
+        let bootstrap_addrs: Vec<SocketAddr> = self
+            .nodes
+            .get(0..self.config.bootstrap_count)
+            .ok_or_else(|| {
+                DevnetError::Config(format!(
+                    "Bootstrap count {} exceeds nodes length {}",
+                    self.config.bootstrap_count,
+                    self.nodes.len()
+                ))
+            })?
             .iter()
             .map(|n| n.address)
             .collect();
@@ -507,7 +517,7 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to save node identity: {e}")))?;
 
-        let ant_protocol = Self::create_ant_protocol(&data_dir).await?;
+        let ant_protocol = Self::create_ant_protocol(&data_dir, &identity).await?;
 
         Ok(DevnetNode {
             index,
@@ -525,7 +535,10 @@ impl Devnet {
         })
     }
 
-    async fn create_ant_protocol(data_dir: &std::path::Path) -> Result<AntProtocol> {
+    async fn create_ant_protocol(
+        data_dir: &std::path::Path,
+        identity: &NodeIdentity,
+    ) -> Result<AntProtocol> {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
@@ -548,7 +561,28 @@ impl Devnet {
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
         let metrics_tracker =
             QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
-        let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        // Wire ML-DSA-65 signing from the devnet node's identity
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
+            let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
+                Ok(sk) => sk,
+                Err(e) => {
+                    tracing::error!("Devnet: Failed to deserialize ML-DSA-65 secret key: {e}");
+                    return vec![];
+                }
+            };
+            let ml_dsa = MlDsa65::new();
+            match ml_dsa.sign(&sk, msg) {
+                Ok(sig) => sig.as_bytes().to_vec(),
+                Err(e) => {
+                    tracing::error!("Devnet: ML-DSA-65 signing failed: {e}");
+                    vec![]
+                }
+            }
+        });
 
         Ok(AntProtocol::new(
             Arc::new(storage),
@@ -573,13 +607,15 @@ impl Devnet {
             .clone_from(&node.bootstrap_addrs);
         core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
 
-        let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
-            DevnetError::Startup(format!("Failed to create node {}: {e}", node.index))
-        })?;
+        let index = node.index;
+        let p2p_node = P2PNode::new(core_config)
+            .await
+            .map_err(|e| DevnetError::Startup(format!("Failed to create node {index}: {e}")))?;
 
-        p2p_node.start().await.map_err(|e| {
-            DevnetError::Startup(format!("Failed to start node {}: {e}", node.index))
-        })?;
+        p2p_node
+            .start()
+            .await
+            .map_err(|e| DevnetError::Startup(format!("Failed to start node {index}: {e}")))?;
 
         node.p2p_node = Some(Arc::new(p2p_node));
         *node.state.write().await = NodeState::Running;
@@ -642,7 +678,13 @@ impl Devnet {
 
         for i in range {
             while Instant::now() < deadline {
-                let state = self.nodes[i].state.read().await.clone();
+                let node = self.nodes.get(i).ok_or_else(|| {
+                    DevnetError::Config(format!(
+                        "Node index {i} out of bounds (len: {})",
+                        self.nodes.len()
+                    ))
+                })?;
+                let state = node.state.read().await.clone();
                 match state {
                     NodeState::Running | NodeState::Connected => break,
                     NodeState::Failed(ref e) => {
