@@ -743,6 +743,9 @@ impl QuantumClient {
                             // Deserialize the quote
                             match rmp_serde::from_slice::<PaymentQuote>(&quote) {
                                 Ok(payment_quote) => {
+                                    // TODO: PaymentQuote lacks a dedicated price field.
+                                    // Using data_size as a placeholder price until the
+                                    // upstream ant-evm crate exposes real pricing.
                                     let data_size_val = payment_quote.quoting_metrics.data_size.max(1);
                                     let price = match u64::try_from(data_size_val) {
                                         Ok(val) => Amount::from(val),

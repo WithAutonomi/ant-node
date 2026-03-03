@@ -377,21 +377,6 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     }
 
     // =========================================================================
-    // STEP 9: Verify payment was recorded (if using tracked payment)
-    // =========================================================================
-    info!("\n📊 STEP 9: Verify payment tracking");
-
-    let tracker = env.harness.payment_tracker();
-    let payment_count = tracker.payment_count(&stored_address);
-
-    info!("   • Payments recorded: {}", payment_count);
-    info!("   • Unique chunks paid: {}", tracker.unique_chunk_count());
-    info!(
-        "   • Total payments made: {}",
-        tracker.total_payment_count()
-    );
-
-    // =========================================================================
     // TEST COMPLETE
     // =========================================================================
     info!("\n═══════════════════════════════════════════════════════════════");

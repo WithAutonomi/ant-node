@@ -68,14 +68,22 @@ impl NodeBuilder {
 
         // Validate rewards address in production
         if self.config.network_mode == NetworkMode::Production {
-            if let Some(ref addr) = self.config.payment.rewards_address {
-                if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() {
+            match self.config.payment.rewards_address {
+                None => {
                     return Err(Error::Config(
                         "CRITICAL: Rewards address is not configured. \
                          Set payment.rewards_address in config to your Arbitrum wallet address."
                             .to_string(),
                     ));
                 }
+                Some(ref addr) if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() => {
+                    return Err(Error::Config(
+                        "CRITICAL: Rewards address is not configured. \
+                         Set payment.rewards_address in config to your Arbitrum wallet address."
+                            .to_string(),
+                    ));
+                }
+                Some(_) => {}
             }
         }
 

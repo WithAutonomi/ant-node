@@ -92,10 +92,7 @@ async fn init_testnet_and_evm() -> Result<PaymentTestEnv, Box<dyn std::error::Er
         total_connections
     );
 
-    // Warm up DHT routing tables for quote collection
-    info!("Warming up DHT routing tables...");
-    harness.warmup_dht().await?;
-    info!("DHT warmup complete");
+    // DHT warmup already performed by setup_with_evm_and_config()
 
     Ok(PaymentTestEnv { harness, testnet })
 }

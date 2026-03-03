@@ -1398,47 +1398,25 @@ impl TestNetwork {
         ))
     }
 
-    /// Warm up DHT routing tables by seeding from connected P2P peers.
+    /// Warm up DHT routing tables by performing random lookups.
     ///
     /// After network stabilization, nodes are P2P connected but their DHT
-    /// routing tables are empty. This creates a chicken-and-egg problem:
-    /// `find_closest_nodes()` needs peers in the DHT to query, but the DHT
-    /// is empty because P2P connections don't auto-populate it.
-    ///
-    /// This method explicitly seeds DHT routing tables by:
-    /// 1. Getting connected P2P peers from each node
-    /// 2. Registering those peers in the DHT routing table
-    /// 3. Performing DHT lookups to propagate the routing info
+    /// routing tables may be sparse. Performing random lookups forces DHT
+    /// query traffic that populates and propagates routing information
+    /// across the network.
     ///
     /// This is essential for tests that use `get_quotes_from_dht()` which relies
     /// on `find_closest_nodes()` to discover peers.
     ///
     /// # Errors
     ///
-    /// Returns an error if DHT seeding or lookup fails.
+    /// Returns an error if DHT lookup fails.
     pub async fn warmup_dht(&self) -> Result<()> {
         info!("Warming up DHT routing tables ({} nodes)", self.nodes.len());
 
-        // Step 1: Seed DHT routing tables from P2P connected peers
-        // This solves the chicken-and-egg problem where find_closest_nodes()
-        // returns empty results because the DHT has no peers yet
-        for node in &self.nodes {
-            if let Some(ref p2p) = node.p2p_node {
-                let connected_peers = p2p.connected_peers().await;
-                debug!(
-                    "Node {} has {} connected P2P peers to seed into DHT",
-                    node.index,
-                    connected_peers.len()
-                );
-
-                // The P2PNode API doesn't expose a direct "add_peer_to_dht" method,
-                // so we rely on the permissive diversity config (set in start_node)
-                // to allow the DHT to accept localhost peers during find_closest_nodes() calls
-            }
-        }
-
-        // Step 2: Perform DHT queries to populate and propagate routing tables
-        // Now that diversity filters are permissive, these queries should succeed
+        // Perform DHT queries to populate and propagate routing tables.
+        // The permissive diversity config (set in start_node) allows the DHT
+        // to accept localhost peers during these find_closest_nodes() calls.
         let num_warmup_queries = 5; // More queries for better DHT coverage
         let mut random_addresses = Vec::new();
         for _ in 0..num_warmup_queries {
@@ -1455,7 +1433,7 @@ impl TestNetwork {
                     if let Ok(peers) = result {
                         if peers.is_empty() {
                             warn!(
-                                "Node {} DHT warmup found 0 peers for {}  - DHT may not be seeded yet",
+                                "Node {} DHT warmup found 0 peers for {} - DHT may not be seeded yet",
                                 node.index,
                                 hex::encode(addr)
                             );

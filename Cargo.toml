@@ -112,10 +112,6 @@ path = "tests/e2e/mod.rs"
 default = []
 # Enable additional diagnostics for development
 dev = []
-# EXPERIMENTAL: Allow placeholder pricing using close_records_stored.
-# DO NOT ENABLE IN PRODUCTION - this is a temporary workaround until
-# PaymentQuote has a dedicated price field.
-experimental-placeholder-pricing = []
 
 [profile.release]
 lto = true

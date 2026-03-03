@@ -37,9 +37,9 @@ enabled = true
 # Payment cache capacity (number of verified payments to cache)
 cache_capacity = 100000
 
-# Your Arbitrum address for receiving storage payments
-# REQUIRED: Set this to your Arbitrum wallet address
-rewards_address = "0xYOUR_ARBITRUM_ADDRESS_HERE"
+# REQUIRED: You MUST set this to your Arbitrum wallet address BEFORE running in production.
+# DO NOT leave this empty or use the placeholder value.
+rewards_address = ""
 
 # EVM network configuration
 [payment.evm_network]

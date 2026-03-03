@@ -17,12 +17,12 @@ use tracing::{debug, info};
 /// Proofs smaller than this are rejected as they cannot contain sufficient payment information.
 const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 
-/// Maximum allowed size for a payment proof in bytes (10 KB).
+/// Maximum allowed size for a payment proof in bytes (100 KB).
 ///
-/// This limit prevents denial-of-service attacks through excessively large payment proofs
-/// and ensures reasonable memory usage during verification. Payment proofs should contain
-/// only essential data: quote signatures and payment references.
-const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 10_240;
+/// A `ProofOfPayment` with 5 ML-DSA-65 quotes can reach ~30 KB (each quote carries a
+/// ~1,952-byte public key and a 3,309-byte signature plus metadata). 100 KB provides
+/// headroom for future fields while still capping memory during verification.
+const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 102_400;
 
 /// Configuration for EVM payment verification.
 #[derive(Debug, Clone)]
