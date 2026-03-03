@@ -15,14 +15,11 @@ use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::{NodeId, NodeIdentity};
-use saorsa_core::MlDsa65;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
     ProductionConfig as CoreProductionConfig,
 };
-use saorsa_pqc::pqc::types::MlDsaSecretKey;
-use saorsa_pqc::pqc::MlDsaOperations;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -376,25 +373,7 @@ impl NodeBuilder {
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from node identity
-        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
-        let sk_bytes = identity.secret_key_bytes().to_vec();
-        quote_generator.set_signer(pub_key_bytes, move |msg| {
-            let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
-                Ok(sk) => sk,
-                Err(e) => {
-                    tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
-                    return vec![];
-                }
-            };
-            let ml_dsa = MlDsa65::new();
-            match ml_dsa.sign(&sk, msg) {
-                Ok(sig) => sig.as_bytes().to_vec(),
-                Err(e) => {
-                    tracing::error!("ML-DSA-65 signing failed: {e}");
-                    vec![]
-                }
-            }
-        });
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity);
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={})",
@@ -418,7 +397,7 @@ impl NodeBuilder {
 
         // Create cache directory
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            warn!("Failed to create bootstrap cache directory: {}", e);
+            warn!("Failed to create bootstrap cache directory: {e}");
             return None;
         }
 
@@ -437,7 +416,7 @@ impl NodeBuilder {
                 Some(manager)
             }
             Err(e) => {
-                warn!("Failed to initialize bootstrap cache: {}", e);
+                warn!("Failed to initialize bootstrap cache: {e}");
                 None
             }
         }
@@ -547,13 +526,13 @@ impl RunningNode {
                                         // If we reach here, exec() failed or not supported
                                     }
                                     Ok(UpgradeResult::RolledBack { reason }) => {
-                                        warn!("Upgrade rolled back: {}", reason);
+                                        warn!("Upgrade rolled back: {reason}");
                                     }
                                     Ok(UpgradeResult::NoUpgrade) => {
                                         debug!("No upgrade needed");
                                     }
                                     Err(e) => {
-                                        error!("Critical upgrade error: {}", e);
+                                        error!("Critical upgrade error: {e}");
                                     }
                                 }
                             }
@@ -580,7 +559,7 @@ impl RunningNode {
                     );
                 }
                 Err(e) => {
-                    debug!("Failed to get bootstrap cache stats: {}", e);
+                    debug!("Failed to get bootstrap cache stats: {e}");
                 }
             }
         }
@@ -690,14 +669,11 @@ impl RunningNode {
                                         .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec())
                                         .await
                                     {
-                                        warn!(
-                                            "Failed to send protocol response to {}: {}",
-                                            source, e
-                                        );
+                                        warn!("Failed to send protocol response to {source}: {e}");
                                     }
                                 }
                                 Err(e) => {
-                                    warn!("Protocol handler error: {}", e);
+                                    warn!("Protocol handler error: {e}");
                                 }
                             }
                         });

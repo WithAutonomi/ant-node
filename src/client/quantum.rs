@@ -32,7 +32,6 @@ use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
 use saorsa_core::P2PNode;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,10 +138,8 @@ impl QuantumClient {
     /// Returns an error if the network operation fails.
     pub async fn get_chunk(&self, address: &XorName) -> Result<Option<DataChunk>> {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                "Querying saorsa network for chunk: {}",
-                hex::encode(address)
-            );
+            let addr_hex = hex::encode(address);
+            debug!("Querying saorsa network for chunk: {addr_hex}");
         }
 
         let Some(ref node) = self.p2p_node else {
@@ -259,7 +256,8 @@ impl QuantumClient {
     /// - Payment fails
     /// - Storage operation fails
     pub async fn put_chunk_with_payment(&self, content: Bytes) -> Result<XorName> {
-        info!("Storing chunk with payment ({} bytes)", content.len());
+        let content_len = content.len();
+        info!("Storing chunk with payment ({content_len} bytes)");
 
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
@@ -427,10 +425,8 @@ impl QuantumClient {
         }
 
         // No wallet configured - store without payment (works when EVM is disabled on nodes)
-        info!(
-            "Storing chunk without payment ({} bytes) - no wallet configured",
-            content.len()
-        );
+        let content_len = content.len();
+        info!("Storing chunk without payment ({content_len} bytes) - no wallet configured");
 
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
@@ -638,11 +634,9 @@ impl QuantumClient {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
+            let addr_hex = hex::encode(address);
             debug!(
-                "Requesting {} quotes from DHT for chunk {} (size: {})",
-                REQUIRED_QUOTES,
-                hex::encode(address),
-                data_size
+                "Requesting {REQUIRED_QUOTES} quotes from DHT for chunk {addr_hex} (size: {data_size})"
             );
         }
 
@@ -681,9 +675,8 @@ impl QuantumClient {
             debug!("Found {} connected P2P peers for fallback", connected.len());
 
             // Add connected peers that aren't already in remote_peers
-            let existing: HashSet<String> = remote_peers.iter().cloned().collect();
             for peer_id in connected {
-                if !existing.contains(&peer_id) {
+                if !remote_peers.contains(&peer_id) {
                     remote_peers.push(peer_id);
                 }
             }
@@ -761,8 +754,7 @@ impl QuantumClient {
                                     };
                                     if tracing::enabled!(tracing::Level::DEBUG) {
                                         debug!(
-                                            "Received quote from {}: price = {}",
-                                            peer_id_clone, price
+                                            "Received quote from {peer_id_clone}: price = {price}"
                                         );
                                     }
                                     Some(Ok((payment_quote, price)))
@@ -821,11 +813,9 @@ impl QuantumClient {
         }
 
         if tracing::enabled!(tracing::Level::INFO) {
-            info!(
-                "Collected {} quotes for chunk {}",
-                quotes_with_peers.len(),
-                hex::encode(address)
-            );
+            let quote_count = quotes_with_peers.len();
+            let addr_hex = hex::encode(address);
+            info!("Collected {quote_count} quotes for chunk {addr_hex}");
         }
 
         Ok(quotes_with_peers)

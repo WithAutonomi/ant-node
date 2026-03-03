@@ -13,10 +13,7 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::MlDsa65;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
-use saorsa_pqc::pqc::types::MlDsaSecretKey;
-use saorsa_pqc::pqc::MlDsaOperations;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
@@ -413,7 +410,7 @@ impl Devnet {
             shutdown_futures.push(async move {
                 if let Some(p2p) = p2p_node {
                     if let Err(e) = p2p.shutdown().await {
-                        warn!("Error shutting down node {}: {}", node_index, e);
+                        warn!("Error shutting down node {node_index}: {e}");
                     }
                 }
                 *node_state.write().await = NodeState::Stopped;
@@ -423,7 +420,7 @@ impl Devnet {
 
         if self.config.cleanup_data_dir {
             if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
-                warn!("Failed to cleanup devnet data directory: {}", e);
+                warn!("Failed to cleanup devnet data directory: {e}");
             }
         }
 
@@ -564,25 +561,7 @@ impl Devnet {
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from the devnet node's identity
-        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
-        let sk_bytes = identity.secret_key_bytes().to_vec();
-        quote_generator.set_signer(pub_key_bytes, move |msg| {
-            let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
-                Ok(sk) => sk,
-                Err(e) => {
-                    tracing::error!("Devnet: Failed to deserialize ML-DSA-65 secret key: {e}");
-                    return vec![];
-                }
-            };
-            let ml_dsa = MlDsa65::new();
-            match ml_dsa.sign(&sk, msg) {
-                Ok(sig) => sig.as_bytes().to_vec(),
-                Err(e) => {
-                    tracing::error!("Devnet: ML-DSA-65 signing failed: {e}");
-                    vec![]
-                }
-            }
-        });
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity);
 
         Ok(AntProtocol::new(
             Arc::new(storage),
@@ -635,8 +614,7 @@ impl Devnet {
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {} received chunk protocol message from {}",
-                                node_index, source
+                                "Node {node_index} received chunk protocol message from {source}"
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
@@ -652,13 +630,12 @@ impl Devnet {
                                             .await
                                         {
                                             warn!(
-                                                "Node {} failed to send response to {}: {}",
-                                                node_index, source, e
+                                                "Node {node_index} failed to send response to {source}: {e}"
                                             );
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Node {} protocol handler error: {}", node_index, e);
+                                        warn!("Node {node_index} protocol handler error: {e}");
                                     }
                                 }
                             });

@@ -186,4 +186,76 @@ mod tests {
         assert!(!config.has_rewards_address());
         assert!(config.is_mainnet());
     }
+
+    #[test]
+    fn test_uppercase_0x_prefix() {
+        let address = "0X742d35Cc6634C0532925a3b844Bc9e7595916Da2";
+        let result = parse_rewards_address(address);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_empty_string() {
+        let result = parse_rewards_address("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_just_0x_prefix() {
+        let result = parse_rewards_address("0x");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(err_msg.contains("length"));
+    }
+
+    #[test]
+    fn test_address_with_spaces() {
+        let result = parse_rewards_address("0x 742d35Cc6634C0532925a3b844Bc9e7595916Da");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_rewards_address_none() {
+        let config = WalletConfig::new(None, EvmNetworkConfig::ArbitrumOne).expect("valid config");
+        assert!(config.get_rewards_address().is_none());
+    }
+
+    #[test]
+    fn test_get_rewards_address_some() {
+        let config = WalletConfig::new(
+            Some("0x742d35Cc6634C0532925a3b844Bc9e7595916Da2"),
+            EvmNetworkConfig::ArbitrumOne,
+        )
+        .expect("valid config");
+        assert!(config.get_rewards_address().is_some());
+    }
+
+    #[test]
+    fn test_all_zeros_address() {
+        let address = "0x0000000000000000000000000000000000000000";
+        let result = parse_rewards_address(address);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_all_ff_address() {
+        let address = "0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+        let result = parse_rewards_address(address);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_too_long_address() {
+        let address = "0x742d35Cc6634C0532925a3b844Bc9e7595916Da2a";
+        let result = parse_rewards_address(address);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(err_msg.contains("length"));
+    }
+
+    #[test]
+    fn test_wallet_config_invalid_address() {
+        let result = WalletConfig::new(Some("invalid"), EvmNetworkConfig::ArbitrumOne);
+        assert!(result.is_err());
+    }
 }

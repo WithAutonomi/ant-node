@@ -20,6 +20,23 @@ use tracing::info;
 /// Required number of quotes for `SingleNode` payment (matches `CLOSE_GROUP_SIZE`)
 pub const REQUIRED_QUOTES: usize = 5;
 
+/// Create zero-valued `QuotingMetrics` for payment verification.
+///
+/// The contract doesn't validate metric values, so we use zeroes.
+fn zero_quoting_metrics() -> QuotingMetrics {
+    QuotingMetrics {
+        data_size: 0,
+        data_type: 0,
+        close_records_stored: 0,
+        records_per_type: vec![],
+        max_records: 0,
+        received_payment_count: 0,
+        live_time: 0,
+        network_density: None,
+        network_size: None,
+    }
+}
+
 /// Index of the median-priced node after sorting
 const MEDIAN_INDEX: usize = 2;
 
@@ -203,28 +220,12 @@ impl SingleNodePayment {
         network: &EvmNetwork,
         owned_quote_hash: Option<QuoteHash>,
     ) -> Result<Amount> {
-        // Use zero metrics for verification (contract doesn't validate them)
-        // Note: QuotingMetrics is from external crate and contains Vec<(u32, u32)>,
-        // so it cannot be Copy. We must clone for each quote.
-        // Performance impact: negligible - Vec is empty so clones are cheap (no heap data)
-        let zero_metrics = QuotingMetrics {
-            data_size: 0,
-            data_type: 0,
-            close_records_stored: 0,
-            records_per_type: vec![],
-            max_records: 0,
-            received_payment_count: 0,
-            live_time: 0,
-            network_density: None,
-            network_size: None,
-        };
-
         // Build payment digest for all 5 quotes
         // Each quote needs an owned QuotingMetrics (tuple requires ownership)
         let payment_digest: Vec<_> = self
             .quotes
             .iter()
-            .map(|q| (q.quote_hash, zero_metrics.clone(), q.rewards_address))
+            .map(|q| (q.quote_hash, zero_quoting_metrics(), q.rewards_address))
             .collect();
 
         // Mark owned quotes
@@ -271,11 +272,35 @@ mod tests {
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use evmlib::contract::payment_vault::interface;
     use evmlib::quoting_metrics::QuotingMetrics;
-    use evmlib::testnet::{deploy_data_payments_contract, deploy_network_token_contract};
+    use evmlib::testnet::{deploy_data_payments_contract, deploy_network_token_contract, Testnet};
     use evmlib::transaction_config::TransactionConfig;
     use evmlib::utils::{dummy_address, dummy_hash};
+    use evmlib::wallet::Wallet;
     use reqwest::Url;
     use serial_test::serial;
+    use std::time::SystemTime;
+    use xor_name::XorName;
+
+    fn make_test_quote(rewards_addr_seed: u8) -> PaymentQuote {
+        PaymentQuote {
+            content: XorName::random(&mut rand::thread_rng()),
+            timestamp: SystemTime::now(),
+            quoting_metrics: QuotingMetrics {
+                data_size: 1024,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 1000,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            rewards_address: RewardsAddress::new([rewards_addr_seed; 20]),
+            pub_key: vec![],
+            signature: vec![],
+        }
+    }
 
     /// Start an Anvil node with increased timeout for CI environments.
     ///
@@ -350,18 +375,7 @@ mod tests {
         let payment_verifications: Vec<_> = quote_payments
             .into_iter()
             .map(|v| interface::IPaymentVault::PaymentVerification {
-                metrics: QuotingMetrics {
-                    data_size: 0,
-                    data_type: 0,
-                    close_records_stored: 0,
-                    records_per_type: vec![],
-                    max_records: 0,
-                    received_payment_count: 0,
-                    live_time: 0,
-                    network_density: None,
-                    network_size: None,
-                }
-                .into(),
+                metrics: zero_quoting_metrics().into(),
                 rewardsAddress: v.1,
                 quoteHash: v.0,
             })
@@ -376,7 +390,7 @@ mod tests {
             assert!(result.isValid, "Payment verification should be valid");
         }
 
-        println!("✓ All {} payments verified successfully", 5);
+        println!("✓ All 5 payments verified successfully");
         println!("\n✅ Standard 5-quote payment works!");
     }
 
@@ -434,18 +448,7 @@ mod tests {
         let payment_verifications: Vec<_> = quote_payments
             .into_iter()
             .map(|v| interface::IPaymentVault::PaymentVerification {
-                metrics: QuotingMetrics {
-                    data_size: 0,
-                    data_type: 0,
-                    close_records_stored: 0,
-                    records_per_type: vec![],
-                    max_records: 0,
-                    received_payment_count: 0,
-                    live_time: 0,
-                    network_density: None,
-                    network_size: None,
-                }
-                .into(),
+                metrics: zero_quoting_metrics().into(),
                 rewardsAddress: v.1,
                 quoteHash: v.0,
             })
@@ -474,9 +477,6 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_from_quotes_median_selection() {
-        use std::time::SystemTime;
-        use xor_name::XorName;
-
         let prices: Vec<u64> = vec![50, 30, 10, 40, 20];
         let mut quotes_with_prices = Vec::new();
 
@@ -522,45 +522,92 @@ mod tests {
 
     #[test]
     fn test_from_quotes_wrong_count() {
-        use std::time::SystemTime;
-        use xor_name::XorName;
-
-        let mut quotes_with_prices = Vec::new();
-        for _ in 0..3 {
-            let quote = PaymentQuote {
-                content: XorName::random(&mut rand::thread_rng()),
-                timestamp: SystemTime::now(),
-                quoting_metrics: QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: 0,
-                    records_per_type: vec![(0, 10)],
-                    max_records: 1000,
-                    received_payment_count: 5,
-                    live_time: 3600,
-                    network_density: None,
-                    network_size: Some(100),
-                },
-                rewards_address: RewardsAddress::new([1u8; 20]),
-                pub_key: vec![],
-                signature: vec![],
-            };
-            quotes_with_prices.push((quote, Amount::from(10u64)));
-        }
-
-        let result = SingleNodePayment::from_quotes(quotes_with_prices);
+        let quotes: Vec<_> = (0..3)
+            .map(|_| (make_test_quote(1), Amount::from(10u64)))
+            .collect();
+        let result = SingleNodePayment::from_quotes(quotes);
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_from_quotes_zero_quotes() {
+        let result = SingleNodePayment::from_quotes(vec![]);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(err_msg.contains("exactly 5"));
+    }
+
+    #[test]
+    fn test_from_quotes_one_quote() {
+        let result =
+            SingleNodePayment::from_quotes(vec![(make_test_quote(1), Amount::from(10u64))]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn test_from_quotes_six_quotes() {
+        let quotes: Vec<_> = (0..6)
+            .map(|_| (make_test_quote(1), Amount::from(10u64)))
+            .collect();
+        let result = SingleNodePayment::from_quotes(quotes);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(err_msg.contains("exactly 5"));
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_paid_quote_returns_median() {
+        let quotes: Vec<_> = (0..5u8)
+            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+            .collect();
+
+        let payment = SingleNodePayment::from_quotes(quotes).unwrap();
+        let paid = payment.paid_quote().unwrap();
+
+        // The paid quote should have a non-zero amount
+        assert!(paid.amount > Amount::ZERO);
+
+        // Total amount should equal the paid quote's amount
+        assert_eq!(payment.total_amount(), paid.amount);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_all_quotes_have_distinct_addresses() {
+        let quotes: Vec<_> = (0..5u8)
+            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+            .collect();
+
+        let payment = SingleNodePayment::from_quotes(quotes).unwrap();
+
+        // Verify all 5 quotes are present (sorting doesn't lose data)
+        let mut addresses: Vec<_> = payment.quotes.iter().map(|q| q.rewards_address).collect();
+        addresses.sort();
+        addresses.dedup();
+        assert_eq!(addresses.len(), 5);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_total_amount_equals_3x_median() {
+        let prices = [100u64, 200, 300, 400, 500];
+        let quotes: Vec<_> = prices
+            .iter()
+            .map(|price| (make_test_quote(1), Amount::from(*price)))
+            .collect();
+
+        let payment = SingleNodePayment::from_quotes(quotes).unwrap();
+        // Sorted: 100, 200, 300, 400, 500 — median = 300, total = 3 * 300 = 900
+        assert_eq!(payment.total_amount(), Amount::from(900u64));
     }
 
     /// Test: Complete `SingleNode` flow with real contract prices
     #[tokio::test]
     #[serial]
     async fn test_single_node_with_real_prices() -> Result<()> {
-        use evmlib::testnet::Testnet;
-        use evmlib::wallet::Wallet;
-        use std::time::SystemTime;
-        use xor_name::XorName;
-
         // Setup testnet
         let testnet = Testnet::new().await;
         let network = testnet.to_network();

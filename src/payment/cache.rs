@@ -26,7 +26,7 @@ pub struct VerifiedCache {
 }
 
 /// Cache statistics for monitoring.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct CacheStats {
     /// Number of cache hits.
     pub hits: u64,
@@ -102,7 +102,7 @@ impl VerifiedCache {
     /// Get current cache statistics.
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        self.stats.lock().clone()
+        *self.stats.lock()
     }
 
     /// Get the current number of entries in the cache.
@@ -130,6 +130,7 @@ impl Default for VerifiedCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -213,5 +214,110 @@ mod tests {
 
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_with_capacity_zero_defaults_to_one() {
+        let cache = VerifiedCache::with_capacity(0);
+        // Should be able to store at least 1 element
+        cache.insert([1u8; 32]);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_default_impl() {
+        let cache = VerifiedCache::default();
+        assert!(cache.is_empty());
+        cache.insert([1u8; 32]);
+        assert!(cache.contains(&[1u8; 32]));
+    }
+
+    #[test]
+    fn test_hit_rate_zero_total() {
+        let stats = CacheStats::default();
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_hit_rate_all_hits() {
+        let stats = CacheStats {
+            hits: 10,
+            misses: 0,
+            additions: 0,
+        };
+        assert!((stats.hit_rate() - 100.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_hit_rate_all_misses() {
+        let stats = CacheStats {
+            hits: 0,
+            misses: 10,
+            additions: 0,
+        };
+        assert!(stats.hit_rate().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_clear_does_not_reset_stats() {
+        let cache = VerifiedCache::new();
+        cache.insert([1u8; 32]);
+        let _ = cache.contains(&[1u8; 32]); // hit
+        let _ = cache.contains(&[2u8; 32]); // miss
+
+        cache.clear();
+
+        // Stats should persist after clear
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.additions, 1);
+    }
+
+    #[test]
+    fn test_concurrent_insert_and_contains() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let cache = Arc::new(VerifiedCache::with_capacity(1000));
+        let mut handles = Vec::new();
+
+        // 10 threads inserting
+        for i in 0..10u8 {
+            let c = cache.clone();
+            handles.push(thread::spawn(move || {
+                let xorname = [i; 32];
+                c.insert(xorname);
+            }));
+        }
+
+        // 10 threads checking
+        for i in 0..10u8 {
+            let c = cache.clone();
+            handles.push(thread::spawn(move || {
+                let xorname = [i; 32];
+                let _ = c.contains(&xorname);
+            }));
+        }
+
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        // All 10 should have been inserted
+        assert_eq!(cache.len(), 10);
+    }
+
+    #[test]
+    fn test_cache_stats_copy() {
+        let stats = CacheStats {
+            hits: 5,
+            misses: 3,
+            additions: 8,
+        };
+        let stats2 = stats; // Copy
+        assert_eq!(stats.hits, stats2.hits);
+        assert_eq!(stats.misses, stats2.misses);
+        assert_eq!(stats.additions, stats2.additions);
     }
 }

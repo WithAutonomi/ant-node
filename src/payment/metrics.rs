@@ -86,7 +86,7 @@ impl QuotingMetricsTracker {
     /// Record a payment received.
     pub fn record_payment(&self) {
         let count = self.received_payment_count.fetch_add(1, Ordering::SeqCst) + 1;
-        debug!("Payment received, total count: {}", count);
+        debug!("Payment received, total count: {count}");
         self.persist();
     }
 
@@ -166,7 +166,7 @@ impl QuotingMetricsTracker {
 
             if let Ok(bytes) = rmp_serde::to_vec(&data) {
                 if let Err(e) = std::fs::write(path, bytes) {
-                    warn!("Failed to persist metrics: {}", e);
+                    warn!("Failed to persist metrics: {e}");
                 }
             }
         }
@@ -259,5 +259,98 @@ mod tests {
         let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
         assert_eq!(tracker.payment_count(), 2);
         assert_eq!(tracker.records_stored(), 1);
+    }
+
+    #[test]
+    fn test_live_time_hours() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        // Just started, so live_time should be 0 hours
+        assert_eq!(tracker.live_time_hours(), 0);
+    }
+
+    #[test]
+    fn test_set_network_size() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        tracker.set_network_size(1000);
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.network_size, Some(1000));
+    }
+
+    #[test]
+    fn test_records_per_type_multiple_types() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+
+        tracker.record_store(0);
+        tracker.record_store(0);
+        tracker.record_store(1);
+        tracker.record_store(2);
+        tracker.record_store(1);
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.records_per_type.len(), 3);
+
+        // Verify per-type counts
+        let type_0 = metrics.records_per_type.iter().find(|(t, _)| *t == 0);
+        let type_1 = metrics.records_per_type.iter().find(|(t, _)| *t == 1);
+        let type_2 = metrics.records_per_type.iter().find(|(t, _)| *t == 2);
+
+        assert_eq!(type_0.expect("type 0 exists").1, 2);
+        assert_eq!(type_1.expect("type 1 exists").1, 2);
+        assert_eq!(type_2.expect("type 2 exists").1, 1);
+    }
+
+    #[test]
+    fn test_persistence_round_trip_with_types() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("metrics_types.bin");
+
+        {
+            let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+            tracker.record_store(0);
+            tracker.record_store(0);
+            tracker.record_store(1);
+            tracker.record_payment();
+        }
+
+        let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+        assert_eq!(tracker.payment_count(), 1);
+        assert_eq!(tracker.records_stored(), 3); // 2 type-0 + 1 type-1
+
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.records_per_type.len(), 2);
+    }
+
+    #[test]
+    fn test_with_persistence_nonexistent_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("nonexistent_subdir").join("metrics.bin");
+
+        // Should not panic — just starts with defaults
+        let tracker = QuotingMetricsTracker::with_persistence(1000, &path);
+        assert_eq!(tracker.payment_count(), 0);
+        assert_eq!(tracker.records_stored(), 0);
+    }
+
+    #[test]
+    fn test_max_records_zero() {
+        let tracker = QuotingMetricsTracker::new(0, 0);
+        let metrics = tracker.get_metrics(1024, 0);
+        assert_eq!(metrics.max_records, 0);
+    }
+
+    #[test]
+    fn test_get_metrics_passes_data_params() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics = tracker.get_metrics(4096, 3);
+        assert_eq!(metrics.data_size, 4096);
+        assert_eq!(metrics.data_type, 3);
+    }
+
+    #[test]
+    fn test_default_network_size() {
+        let tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics = tracker.get_metrics(0, 0);
+        assert_eq!(metrics.network_size, Some(500));
     }
 }

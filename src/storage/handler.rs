@@ -130,7 +130,8 @@ impl AntProtocol {
     /// Handle a PUT request.
     async fn handle_put(&self, request: ChunkPutRequest) -> ChunkPutResponse {
         let address = request.address;
-        debug!("Handling PUT request for {}", hex::encode(address));
+        let addr_hex = hex::encode(address);
+        debug!("Handling PUT request for {addr_hex}");
 
         // 1. Validate chunk size
         if request.content.len() > MAX_CHUNK_SIZE {
@@ -152,7 +153,7 @@ impl AntProtocol {
         // 3. Check if already exists (idempotent success)
         match self.storage.exists(&address) {
             Ok(true) => {
-                debug!("Chunk {} already exists", hex::encode(address));
+                debug!("Chunk {addr_hex} already exists");
                 return ChunkPutResponse::AlreadyExists { address };
             }
             Err(e) => {
@@ -186,17 +187,14 @@ impl AntProtocol {
         // 5. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
-                info!(
-                    "Stored chunk {} ({} bytes)",
-                    hex::encode(address),
-                    request.content.len()
-                );
+                let content_len = request.content.len();
+                info!("Stored chunk {addr_hex} ({content_len} bytes)");
                 // Record the store in metrics
                 self.quote_generator.record_store(DATA_TYPE_CHUNK);
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {
-                warn!("Failed to store chunk {}: {}", hex::encode(address), e);
+                warn!("Failed to store chunk {addr_hex}: {e}");
                 ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
@@ -205,23 +203,21 @@ impl AntProtocol {
     /// Handle a GET request.
     async fn handle_get(&self, request: ChunkGetRequest) -> ChunkGetResponse {
         let address = request.address;
-        debug!("Handling GET request for {}", hex::encode(address));
+        let addr_hex = hex::encode(address);
+        debug!("Handling GET request for {addr_hex}");
 
         match self.storage.get(&address).await {
             Ok(Some(content)) => {
-                debug!(
-                    "Retrieved chunk {} ({} bytes)",
-                    hex::encode(address),
-                    content.len()
-                );
+                let content_len = content.len();
+                debug!("Retrieved chunk {addr_hex} ({content_len} bytes)");
                 ChunkGetResponse::Success { address, content }
             }
             Ok(None) => {
-                debug!("Chunk {} not found", hex::encode(address));
+                debug!("Chunk {addr_hex} not found");
                 ChunkGetResponse::NotFound { address }
             }
             Err(e) => {
-                warn!("Failed to retrieve chunk {}: {}", hex::encode(address), e);
+                warn!("Failed to retrieve chunk {addr_hex}: {e}");
                 ChunkGetResponse::Error(ProtocolError::StorageFailed(e.to_string()))
             }
         }
@@ -229,11 +225,9 @@ impl AntProtocol {
 
     /// Handle a quote request.
     fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
-        debug!(
-            "Handling quote request for {} (size: {})",
-            hex::encode(request.address),
-            request.data_size
-        );
+        let addr_hex = hex::encode(request.address);
+        let data_size = request.data_size;
+        debug!("Handling quote request for {addr_hex} (size: {data_size})");
 
         // Validate data size - data_size is u64, cast carefully and reject overflow
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
@@ -563,5 +557,137 @@ mod tests {
 
         let retrieved = protocol.get_local(&address).await.expect("get local");
         assert_eq!(retrieved, Some(content.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_put_populates_payment_cache() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"cache test content";
+        let address = LmdbStorage::compute_address(content);
+
+        // Before PUT: cache should be empty
+        let stats_before = protocol.payment_cache_stats();
+        assert_eq!(stats_before.additions, 0);
+
+        // PUT (EVM disabled — verifier will auto-accept and cache)
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
+        let put_msg = ChunkMessage {
+            request_id: 100,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let response_bytes = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode");
+
+        if let ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. }) = response.body {
+            // expected
+        } else {
+            panic!("expected success, got: {response:?}");
+        }
+
+        // After PUT: cache should have the xorname
+        let stats_after = protocol.payment_cache_stats();
+        assert_eq!(stats_after.additions, 1);
+    }
+
+    #[tokio::test]
+    async fn test_put_same_chunk_twice_hits_cache() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"duplicate cache test";
+        let address = LmdbStorage::compute_address(content);
+
+        // First PUT
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
+        let put_msg = ChunkMessage {
+            request_id: 110,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put 1");
+
+        // Second PUT — should return AlreadyExists (checked in storage before payment)
+        let response_bytes = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put 2");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode");
+
+        if let ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists { .. }) = response.body
+        {
+            // expected — storage check comes before payment check
+        } else {
+            panic!("expected AlreadyExists, got: {response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_payment_cache_stats_returns_correct_values() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let stats = protocol.payment_cache_stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 0);
+        assert_eq!(stats.additions, 0);
+
+        // Store a chunk to trigger payment verification
+        let content = b"stats test";
+        let address = LmdbStorage::compute_address(content);
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
+        let put_msg = ChunkMessage {
+            request_id: 120,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put");
+
+        let stats = protocol.payment_cache_stats();
+        // Should have 1 miss (first lookup) + 1 addition (after verify)
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.additions, 1);
+    }
+
+    #[tokio::test]
+    async fn test_storage_stats() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let stats = protocol.storage_stats();
+        assert_eq!(stats.chunks_stored, 0);
+    }
+
+    #[tokio::test]
+    async fn test_handle_unexpected_response_message() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        // Send a PutResponse as if it were a request
+        let msg = ChunkMessage {
+            request_id: 200,
+            body: ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: [0u8; 32] }),
+        };
+        let msg_bytes = msg.encode().expect("encode");
+
+        let response_bytes = protocol
+            .handle_message(&msg_bytes)
+            .await
+            .expect("handle msg");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode");
+
+        if let ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::Internal(
+            msg,
+        ))) = response.body
+        {
+            assert!(msg.contains("Unexpected"));
+        } else {
+            panic!("expected Internal error, got: {response:?}");
+        }
     }
 }

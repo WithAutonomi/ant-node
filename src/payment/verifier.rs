@@ -348,6 +348,17 @@ mod tests {
         PaymentVerifier::new(config)
     }
 
+    fn create_evm_enabled_verifier() -> PaymentVerifier {
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                enabled: true,
+                network: EvmNetwork::ArbitrumOne,
+            },
+            cache_capacity: 100,
+        };
+        PaymentVerifier::new(config)
+    }
+
     #[test]
     fn test_payment_required_for_new_data() {
         let verifier = create_test_verifier();
@@ -462,18 +473,170 @@ mod tests {
 
     #[tokio::test]
     async fn test_verifier_rejects_without_proof_when_evm_enabled() {
-        let config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                enabled: true,
-                network: EvmNetwork::ArbitrumOne,
-            },
-            cache_capacity: 100,
-        };
-        let verifier = PaymentVerifier::new(config);
+        let verifier = create_evm_enabled_verifier();
         let xorname = [99u8; 32];
 
         // EVM enabled + no proof provided => should return an error
         let result = verifier.verify_payment(&xorname, None).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_proof_too_small() {
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [1u8; 32];
+
+        // Proof smaller than MIN_PAYMENT_PROOF_SIZE_BYTES
+        let small_proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
+        let result = verifier.verify_payment(&xorname, Some(&small_proof)).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("too small"),
+            "Error should mention 'too small': {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proof_too_large() {
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [2u8; 32];
+
+        // Proof larger than MAX_PAYMENT_PROOF_SIZE_BYTES
+        let large_proof = vec![0u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
+        let result = verifier.verify_payment(&xorname, Some(&large_proof)).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("too large"),
+            "Error should mention 'too large': {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proof_at_min_boundary() {
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [3u8; 32];
+
+        // Exactly MIN_PAYMENT_PROOF_SIZE_BYTES — passes size check, but
+        // will fail deserialization (not valid msgpack)
+        let boundary_proof = vec![0xFFu8; MIN_PAYMENT_PROOF_SIZE_BYTES];
+        let result = verifier
+            .verify_payment(&xorname, Some(&boundary_proof))
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail deser"));
+        assert!(
+            err_msg.contains("deserialize"),
+            "Error should mention deserialization: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_proof_at_max_boundary() {
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [4u8; 32];
+
+        // Exactly MAX_PAYMENT_PROOF_SIZE_BYTES — passes size check, but
+        // will fail deserialization
+        let boundary_proof = vec![0xFFu8; MAX_PAYMENT_PROOF_SIZE_BYTES];
+        let result = verifier
+            .verify_payment(&xorname, Some(&boundary_proof))
+            .await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail deser"));
+        assert!(
+            err_msg.contains("deserialize"),
+            "Error should mention deserialization: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_msgpack_proof() {
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [5u8; 32];
+
+        // Valid size but garbage bytes — should fail deserialization
+        let garbage = vec![0xAB; 64];
+        let result = verifier.verify_payment(&xorname, Some(&garbage)).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(err_msg.contains("deserialize"));
+    }
+
+    #[test]
+    fn test_evm_enabled_getter() {
+        let verifier = create_test_verifier();
+        assert!(!verifier.evm_enabled());
+
+        let verifier = create_evm_enabled_verifier();
+        assert!(verifier.evm_enabled());
+    }
+
+    #[test]
+    fn test_cache_len_getter() {
+        let verifier = create_test_verifier();
+        assert_eq!(verifier.cache_len(), 0);
+
+        verifier.cache.insert([10u8; 32]);
+        assert_eq!(verifier.cache_len(), 1);
+
+        verifier.cache.insert([20u8; 32]);
+        assert_eq!(verifier.cache_len(), 2);
+    }
+
+    #[test]
+    fn test_cache_stats_after_operations() {
+        let verifier = create_test_verifier();
+        let xorname = [7u8; 32];
+
+        // Miss
+        verifier.check_payment_required(&xorname);
+        let stats = verifier.cache_stats();
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.hits, 0);
+
+        // Insert and hit
+        verifier.cache.insert(xorname);
+        verifier.check_payment_required(&xorname);
+        let stats = verifier.cache_stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 1);
+        assert_eq!(stats.additions, 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_verify_payment() {
+        let verifier = std::sync::Arc::new(create_test_verifier());
+        let mut handles = Vec::new();
+
+        for i in 0..10u8 {
+            let v = verifier.clone();
+            handles.push(tokio::spawn(async move {
+                let xorname = [i; 32];
+                v.verify_payment(&xorname, None).await
+            }));
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task panicked");
+            assert!(result.is_ok());
+        }
+
+        // All 10 should be cached
+        assert_eq!(verifier.cache_len(), 10);
+    }
+
+    #[test]
+    fn test_default_config() {
+        let config = PaymentVerifierConfig::default();
+        assert!(config.evm.enabled);
+        assert_eq!(config.cache_capacity, 100_000);
+    }
+
+    #[test]
+    fn test_default_evm_config() {
+        let config = EvmVerifierConfig::default();
+        assert!(config.enabled);
     }
 }

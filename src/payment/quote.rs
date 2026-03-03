@@ -11,7 +11,7 @@ use crate::error::Result;
 use crate::payment::metrics::QuotingMetricsTracker;
 use ant_evm::{PaymentQuote, QuotingMetrics, RewardsAddress};
 use saorsa_core::MlDsa65;
-use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSignature};
+use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use saorsa_pqc::pqc::MlDsaOperations;
 use std::time::SystemTime;
 use tracing::debug;
@@ -243,11 +243,46 @@ pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
     }
 }
 
+/// Wire ML-DSA-65 signing from a node identity into a `QuoteGenerator`.
+///
+/// This is the shared setup used by both production nodes and devnet nodes
+/// to configure quote signing from a `NodeIdentity`.
+///
+/// # Arguments
+///
+/// * `generator` - The quote generator to configure
+/// * `identity` - The node identity providing signing keys
+pub fn wire_ml_dsa_signer(
+    generator: &mut QuoteGenerator,
+    identity: &saorsa_core::identity::NodeIdentity,
+) {
+    let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+    let sk_bytes = identity.secret_key_bytes().to_vec();
+    generator.set_signer(pub_key_bytes, move |msg| {
+        let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
+            Ok(sk) => sk,
+            Err(e) => {
+                tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
+                return vec![];
+            }
+        };
+        let ml_dsa = MlDsa65::new();
+        match ml_dsa.sign(&sk, msg) {
+            Ok(sig) => sig.as_bytes().to_vec(),
+            Err(e) => {
+                tracing::error!("ML-DSA-65 signing failed: {e}");
+                vec![]
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
+    use saorsa_pqc::pqc::types::MlDsaSecretKey;
 
     fn create_test_generator() -> QuoteGenerator {
         let rewards_address = RewardsAddress::new([1u8; 20]);
@@ -310,10 +345,6 @@ mod tests {
 
     #[test]
     fn test_quote_signature_round_trip_real_keys() {
-        use saorsa_core::MlDsa65;
-        use saorsa_pqc::pqc::types::MlDsaSecretKey;
-        use saorsa_pqc::pqc::MlDsaOperations;
-
         let ml_dsa = MlDsa65::new();
         let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keypair generation");
 
@@ -357,5 +388,130 @@ mod tests {
         // The dummy signer produces a 64-byte fake signature, not a valid
         // ML-DSA-65 signature (3309 bytes), so verification must fail.
         assert!(!verify_quote_signature(&quote));
+    }
+
+    #[test]
+    fn test_rewards_address_getter() {
+        let addr = RewardsAddress::new([42u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let generator = QuoteGenerator::new(addr, metrics_tracker);
+
+        assert_eq!(*generator.rewards_address(), addr);
+    }
+
+    #[test]
+    fn test_current_metrics() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(500, 50);
+        let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        let metrics = generator.current_metrics();
+        assert_eq!(metrics.max_records, 500);
+        assert_eq!(metrics.close_records_stored, 50);
+        assert_eq!(metrics.data_size, 0);
+        assert_eq!(metrics.data_type, 0);
+    }
+
+    #[test]
+    fn test_record_payment_delegation() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        generator.record_payment();
+        generator.record_payment();
+
+        let metrics = generator.current_metrics();
+        assert_eq!(metrics.received_payment_count, 2);
+    }
+
+    #[test]
+    fn test_record_store_delegation() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        generator.record_store(0);
+        generator.record_store(1);
+        generator.record_store(0);
+
+        let metrics = generator.current_metrics();
+        assert_eq!(metrics.close_records_stored, 3);
+    }
+
+    #[test]
+    fn test_create_quote_different_data_types() {
+        let generator = create_test_generator();
+        let content = [10u8; 32];
+
+        // Data type 0 (chunk)
+        let q0 = generator.create_quote(content, 1024, 0).expect("type 0");
+        assert_eq!(q0.quoting_metrics.data_type, 0);
+
+        // Data type 1
+        let q1 = generator.create_quote(content, 512, 1).expect("type 1");
+        assert_eq!(q1.quoting_metrics.data_type, 1);
+
+        // Data type 2
+        let q2 = generator.create_quote(content, 256, 2).expect("type 2");
+        assert_eq!(q2.quoting_metrics.data_type, 2);
+    }
+
+    #[test]
+    fn test_create_quote_zero_size() {
+        let generator = create_test_generator();
+        let content = [11u8; 32];
+
+        let quote = generator.create_quote(content, 0, 0).expect("zero size");
+        assert_eq!(quote.quoting_metrics.data_size, 0);
+    }
+
+    #[test]
+    fn test_create_quote_large_size() {
+        let generator = create_test_generator();
+        let content = [12u8; 32];
+
+        let quote = generator
+            .create_quote(content, 10_000_000, 0)
+            .expect("large size");
+        assert_eq!(quote.quoting_metrics.data_size, 10_000_000);
+    }
+
+    #[test]
+    fn test_verify_quote_signature_empty_pub_key() {
+        let quote = PaymentQuote {
+            content: xor_name::XorName([0u8; 32]),
+            timestamp: SystemTime::now(),
+            quoting_metrics: ant_evm::QuotingMetrics {
+                data_size: 0,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 0,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            rewards_address: RewardsAddress::new([0u8; 20]),
+            pub_key: vec![],
+            signature: vec![],
+        };
+
+        // Empty pub key should fail parsing
+        assert!(!verify_quote_signature(&quote));
+    }
+
+    #[test]
+    fn test_can_sign_after_set_signer() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        assert!(!generator.can_sign());
+
+        generator.set_signer(vec![0u8; 32], |_| vec![0u8; 32]);
+
+        assert!(generator.can_sign());
     }
 }
