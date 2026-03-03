@@ -48,4 +48,4 @@ mod handler;
 
 pub use crate::ant_protocol::XorName;
 pub use disk::{DiskStorage, DiskStorageConfig, StorageStats};
-pub use handler::AntProtocol;
+pub use handler::{AntProtocol, NewChunkStored};

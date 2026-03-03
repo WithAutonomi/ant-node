@@ -31,12 +31,27 @@ use crate::ant_protocol::{
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID,
     DATA_TYPE_CHUNK, MAX_CHUNK_SIZE,
 };
+use crate::client::XorName;
 use crate::error::Result;
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::storage::disk::DiskStorage;
 use bytes::Bytes;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+/// Notification emitted when a new chunk is successfully stored.
+///
+/// Consumed by the replication subsystem to trigger fresh replication.
+#[derive(Debug, Clone)]
+pub struct NewChunkStored {
+    /// Content-addressed key (SHA256 of content).
+    pub key: XorName,
+    /// Raw content bytes.
+    pub content: Vec<u8>,
+    /// Proof-of-payment bytes from the PUT request.
+    pub payment_proof: Vec<u8>,
+}
 
 /// ANT protocol handler.
 ///
@@ -49,6 +64,8 @@ pub struct AntProtocol {
     payment_verifier: Arc<PaymentVerifier>,
     /// Quote generator for creating storage quotes.
     quote_generator: Arc<QuoteGenerator>,
+    /// Channel to notify about newly stored chunks (for replication).
+    new_chunk_tx: Option<mpsc::UnboundedSender<NewChunkStored>>,
 }
 
 impl AntProtocol {
@@ -69,7 +86,26 @@ impl AntProtocol {
             storage,
             payment_verifier,
             quote_generator,
+            new_chunk_tx: None,
         }
+    }
+
+    /// Set the new-chunk notification channel for replication.
+    ///
+    /// When set, a [`NewChunkStored`] notification is sent after every
+    /// successful PUT of a new chunk.
+    #[must_use]
+    pub fn with_new_chunk_notifier(mut self, tx: mpsc::UnboundedSender<NewChunkStored>) -> Self {
+        self.new_chunk_tx = Some(tx);
+        self
+    }
+
+    /// Get a reference to the underlying disk storage.
+    ///
+    /// Used by the replication subsystem to store replicated records.
+    #[must_use]
+    pub fn storage(&self) -> &Arc<DiskStorage> {
+        &self.storage
     }
 
     /// Get the protocol identifier.
@@ -178,13 +214,27 @@ impl AntProtocol {
         // 5. Store to disk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
+                let content_len = request.content.len();
                 info!(
-                    "Stored chunk {} ({} bytes)",
-                    hex::encode(address),
-                    request.content.len()
+                    "Stored chunk {} ({content_len} bytes)",
+                    hex::encode(address)
                 );
                 // Record the store in metrics
                 self.quote_generator.record_store(DATA_TYPE_CHUNK);
+                // Notify replication subsystem about new chunk
+                if let Some(ref tx) = self.new_chunk_tx {
+                    let notification = NewChunkStored {
+                        key: address,
+                        content: request.content,
+                        payment_proof: request.payment_proof.unwrap_or_default(),
+                    };
+                    if tx.send(notification).is_err() {
+                        warn!(
+                            "Replication notifier dropped for chunk {}",
+                            hex::encode(address)
+                        );
+                    }
+                }
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {

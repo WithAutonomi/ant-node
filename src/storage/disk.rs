@@ -343,10 +343,112 @@ impl DiskStorage {
         crate::client::compute_address(content)
     }
 
+    /// List all stored chunk addresses.
+    ///
+    /// Walks the sharded directory structure and returns every stored address.
+    /// Uses `spawn_blocking` to avoid blocking the async runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory walk fails.
+    pub async fn list_keys(&self) -> Result<Vec<XorName>> {
+        let chunks_dir = self.config.root_dir.join("chunks");
+        spawn_blocking(move || Self::collect_chunk_addresses(&chunks_dir))
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to list keys (join): {e}")))?
+    }
+
+    /// Read raw bytes for a chunk without content verification.
+    ///
+    /// Used by storage audits to compute digests without the overhead
+    /// of verifying the content hash (the audit itself will validate).
+    ///
+    /// # Returns
+    ///
+    /// `Some(bytes)` if the chunk exists, `None` if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file read fails.
+    pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        let chunk_path = self.chunk_path(address);
+
+        if !chunk_path.exists() {
+            return Ok(None);
+        }
+
+        let content = fs::read(&chunk_path)
+            .await
+            .map_err(|e| Error::Storage(format!("Failed to read raw chunk: {e}")))?;
+
+        Ok(Some(content))
+    }
+
     /// Get the root directory.
     #[must_use]
     pub fn root_dir(&self) -> &Path {
         &self.config.root_dir
+    }
+
+    /// Walk sharded directories and collect all stored chunk addresses.
+    fn collect_chunk_addresses(chunks_dir: &Path) -> Result<Vec<XorName>> {
+        let mut addresses = Vec::new();
+
+        if !chunks_dir.exists() {
+            return Ok(addresses);
+        }
+
+        // Walk {chunks_dir}/{xx}/{yy}/{address}.chunk
+        for shard1_entry in std::fs::read_dir(chunks_dir)
+            .map_err(|e| Error::Storage(format!("Failed to read chunks dir: {e}")))?
+        {
+            let shard1_path = shard1_entry
+                .map_err(|e| Error::Storage(format!("Failed to read shard1 entry: {e}")))?
+                .path();
+            if !shard1_path.is_dir() {
+                continue;
+            }
+            for shard2_entry in std::fs::read_dir(&shard1_path)
+                .map_err(|e| Error::Storage(format!("Failed to read shard2 dir: {e}")))?
+            {
+                let shard2_path = shard2_entry
+                    .map_err(|e| Error::Storage(format!("Failed to read shard2 entry: {e}")))?
+                    .path();
+                if !shard2_path.is_dir() {
+                    continue;
+                }
+                for chunk_entry in std::fs::read_dir(&shard2_path)
+                    .map_err(|e| Error::Storage(format!("Failed to read chunk dir: {e}")))?
+                {
+                    let chunk_path = chunk_entry
+                        .map_err(|e| Error::Storage(format!("Failed to read chunk entry: {e}")))?
+                        .path();
+                    if let Some(addr) = Self::parse_chunk_address(&chunk_path) {
+                        addresses.push(addr);
+                    }
+                }
+            }
+        }
+
+        Ok(addresses)
+    }
+
+    /// Parse a chunk address from a `.chunk` file path.
+    ///
+    /// Expected filename format: `{64-hex-chars}.chunk`.
+    fn parse_chunk_address(path: &Path) -> Option<XorName> {
+        let ext = path.extension()?.to_str()?;
+        if ext != "chunk" {
+            return None;
+        }
+        let stem = path.file_stem()?.to_str()?;
+        let bytes = hex::decode(stem).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&bytes);
+        Some(addr)
     }
 
     fn count_existing_chunks(dir: &Path) -> std::io::Result<u64> {
@@ -583,5 +685,90 @@ mod tests {
 
         let stats = storage.stats();
         assert_eq!(stats.current_chunks, 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_keys_empty() {
+        let (storage, _temp) = create_test_storage().await;
+        let keys = storage.list_keys().await.expect("list keys");
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_keys_returns_all_stored() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let content1 = b"chunk alpha";
+        let content2 = b"chunk beta";
+        let content3 = b"chunk gamma";
+        let addr1 = DiskStorage::compute_address(content1);
+        let addr2 = DiskStorage::compute_address(content2);
+        let addr3 = DiskStorage::compute_address(content3);
+
+        storage.put(&addr1, content1).await.expect("put 1");
+        storage.put(&addr2, content2).await.expect("put 2");
+        storage.put(&addr3, content3).await.expect("put 3");
+
+        let mut keys = storage.list_keys().await.expect("list keys");
+        keys.sort_unstable();
+
+        let mut expected = vec![addr1, addr2, addr3];
+        expected.sort_unstable();
+
+        assert_eq!(keys, expected);
+    }
+
+    #[tokio::test]
+    async fn test_list_keys_after_delete() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let content1 = b"to keep";
+        let content2 = b"to delete";
+        let addr1 = DiskStorage::compute_address(content1);
+        let addr2 = DiskStorage::compute_address(content2);
+
+        storage.put(&addr1, content1).await.expect("put 1");
+        storage.put(&addr2, content2).await.expect("put 2");
+        storage.delete(&addr2).await.expect("delete");
+
+        let keys = storage.list_keys().await.expect("list keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0], addr1);
+    }
+
+    #[tokio::test]
+    async fn test_get_raw_returns_bytes() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let content = b"raw bytes test";
+        let address = DiskStorage::compute_address(content);
+        storage.put(&address, content).await.expect("put");
+
+        let raw = storage.get_raw(&address).await.expect("get_raw");
+        assert_eq!(raw, Some(content.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_get_raw_not_found() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let missing = [0xDE; 32];
+        let raw = storage.get_raw(&missing).await.expect("get_raw");
+        assert!(raw.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_raw_no_verification() {
+        // get_raw should return content even if verify_on_read is enabled,
+        // because it skips verification (unlike get()).
+        let (storage, _temp) = create_test_storage().await;
+
+        let content = b"some audit content";
+        let address = DiskStorage::compute_address(content);
+        storage.put(&address, content).await.expect("put");
+
+        // get_raw always succeeds (no verification step)
+        let raw = storage.get_raw(&address).await.expect("get_raw");
+        assert_eq!(raw.unwrap().len(), content.len());
     }
 }

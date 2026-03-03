@@ -49,6 +49,7 @@ pub mod node;
 pub mod payment;
 #[cfg(test)]
 mod probe;
+pub mod replication;
 pub mod storage;
 pub mod upgrade;
 

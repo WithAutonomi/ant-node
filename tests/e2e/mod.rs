@@ -47,6 +47,9 @@ mod integration_tests;
 #[cfg(test)]
 mod live_testnet;
 
+#[cfg(test)]
+mod replication;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};

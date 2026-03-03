@@ -52,6 +52,10 @@ pub enum Error {
     #[error("invalid chunk: {0}")]
     InvalidChunk(String),
 
+    /// Replication error.
+    #[error("replication error: {0}")]
+    Replication(String),
+
     /// Node is shutting down.
     #[error("node is shutting down")]
     ShuttingDown,

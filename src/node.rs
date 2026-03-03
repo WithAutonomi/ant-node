@@ -1,16 +1,21 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::client::{peer_id_to_xor_name, XorName};
 use crate::config::{EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig};
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
-use crate::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
+use crate::replication::fresh;
+use crate::replication::paid_list::PaidForList;
+use crate::replication::protocol::{ReplicationBody, ReplicationMessage, REPLICATION_PROTOCOL_ID};
+use crate::storage::{AntProtocol, DiskStorage, DiskStorageConfig, NewChunkStored};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
+use parking_lot::RwLock;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
@@ -19,7 +24,7 @@ use saorsa_core::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -86,12 +91,30 @@ impl NodeBuilder {
             None
         };
 
+        // Create new-chunk notification channel for replication
+        let (new_chunk_tx, new_chunk_rx) = mpsc::unbounded_channel();
+
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
-            Some(Arc::new(Self::build_ant_protocol(&self.config).await?))
+            let protocol = Self::build_ant_protocol(&self.config)
+                .await?
+                .with_new_chunk_notifier(new_chunk_tx);
+            Some(Arc::new(protocol))
         } else {
             info!("Chunk storage disabled");
             None
+        };
+
+        // Initialize PaidForList for replication
+        let paid_list = match PaidForList::load(&self.config.root_dir) {
+            Ok(list) => {
+                info!("PaidForList loaded ({} keys)", list.len());
+                Some(Arc::new(RwLock::new(list)))
+            }
+            Err(e) => {
+                warn!("Failed to load PaidForList, replication degraded: {e}");
+                None
+            }
         };
 
         let node = RunningNode {
@@ -105,6 +128,11 @@ impl NodeBuilder {
             bootstrap_manager,
             ant_protocol,
             protocol_task: None,
+            replication_task: None,
+            fresh_replication_task: None,
+            paid_list,
+            routing_view: Arc::new(RwLock::new(Vec::new())),
+            new_chunk_rx: Some(new_chunk_rx),
         };
 
         Ok(node)
@@ -283,6 +311,16 @@ pub struct RunningNode {
     ant_protocol: Option<Arc<AntProtocol>>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// Replication protocol routing background task.
+    replication_task: Option<JoinHandle<()>>,
+    /// Fresh replication trigger background task.
+    fresh_replication_task: Option<JoinHandle<()>>,
+    /// Shared `PaidForList` for replication (Section 5.15).
+    paid_list: Option<Arc<RwLock<PaidForList>>>,
+    /// Live routing view: connected peers and their XOR names.
+    routing_view: Arc<RwLock<Vec<(String, XorName)>>>,
+    /// Receiver for new-chunk notifications from the storage handler.
+    new_chunk_rx: Option<mpsc::UnboundedReceiver<NewChunkStored>>,
 }
 
 impl RunningNode {
@@ -329,65 +367,12 @@ impl RunningNode {
             warn!("Failed to send Started event: {e}");
         }
 
-        // Start protocol message routing (P2P → AntProtocol → P2P response)
+        // Start protocol and replication message routing
         self.start_protocol_routing();
+        self.start_replication_routing();
+        self.start_fresh_replication_trigger();
 
-        // Start upgrade monitor if enabled
-        if let Some(ref monitor) = self.upgrade_monitor {
-            let monitor = Arc::clone(monitor);
-            let events_tx = self.events_tx.clone();
-            let mut shutdown_rx = self.shutdown_rx.clone();
-
-            tokio::spawn(async move {
-                let upgrader = AutoApplyUpgrader::new();
-
-                loop {
-                    tokio::select! {
-                        _ = shutdown_rx.changed() => {
-                            if *shutdown_rx.borrow() {
-                                break;
-                            }
-                        }
-                        result = monitor.check_for_updates() => {
-                            if let Ok(Some(upgrade_info)) = result {
-                                info!(
-                                    "Upgrade available: {} -> {}",
-                                    upgrader.current_version(),
-                                    upgrade_info.version
-                                );
-
-                                // Send notification event
-                                if let Err(e) = events_tx.send(NodeEvent::UpgradeAvailable {
-                                    version: upgrade_info.version.to_string(),
-                                }) {
-                                    warn!("Failed to send UpgradeAvailable event: {e}");
-                                }
-
-                                // Auto-apply the upgrade
-                                info!("Starting auto-apply upgrade...");
-                                match upgrader.apply_upgrade(&upgrade_info).await {
-                                    Ok(UpgradeResult::Success { version }) => {
-                                        info!("Upgrade to {} successful! Process will restart.", version);
-                                        // If we reach here, exec() failed or not supported
-                                    }
-                                    Ok(UpgradeResult::RolledBack { reason }) => {
-                                        warn!("Upgrade rolled back: {}", reason);
-                                    }
-                                    Ok(UpgradeResult::NoUpgrade) => {
-                                        debug!("No upgrade needed");
-                                    }
-                                    Err(e) => {
-                                        error!("Critical upgrade error: {}", e);
-                                    }
-                                }
-                            }
-                            // Wait for next check interval
-                            tokio::time::sleep(monitor.check_interval()).await;
-                        }
-                    }
-                }
-            });
-        }
+        self.start_upgrade_monitor();
 
         info!("Node running, waiting for shutdown signal");
 
@@ -412,6 +397,23 @@ impl RunningNode {
         // Stop protocol routing task
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
+        }
+
+        // Stop replication tasks and flush PaidForList
+        for handle in [
+            self.replication_task.take(),
+            self.fresh_replication_task.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            handle.abort();
+        }
+        if let Some(ref paid_list) = self.paid_list {
+            let flush_result = paid_list.write().flush();
+            if let Err(e) = flush_result {
+                warn!("Failed to flush PaidForList on shutdown: {e}");
+            }
         }
 
         // Shutdown P2P node
@@ -481,6 +483,62 @@ impl RunningNode {
         Ok(())
     }
 
+    /// Start the upgrade monitor background task if enabled.
+    fn start_upgrade_monitor(&self) {
+        let Some(ref monitor) = self.upgrade_monitor else {
+            return;
+        };
+        let monitor = Arc::clone(monitor);
+        let events_tx = self.events_tx.clone();
+        let mut shutdown_rx = self.shutdown_rx.clone();
+
+        tokio::spawn(async move {
+            let upgrader = AutoApplyUpgrader::new();
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    result = monitor.check_for_updates() => {
+                        if let Ok(Some(upgrade_info)) = result {
+                            info!(
+                                "Upgrade available: {} -> {}",
+                                upgrader.current_version(),
+                                upgrade_info.version
+                            );
+
+                            if let Err(e) = events_tx.send(NodeEvent::UpgradeAvailable {
+                                version: upgrade_info.version.to_string(),
+                            }) {
+                                warn!("Failed to send UpgradeAvailable event: {e}");
+                            }
+
+                            info!("Starting auto-apply upgrade...");
+                            match upgrader.apply_upgrade(&upgrade_info).await {
+                                Ok(UpgradeResult::Success { version }) => {
+                                    info!("Upgrade to {} successful! Process will restart.", version);
+                                }
+                                Ok(UpgradeResult::RolledBack { reason }) => {
+                                    warn!("Upgrade rolled back: {}", reason);
+                                }
+                                Ok(UpgradeResult::NoUpgrade) => {
+                                    debug!("No upgrade needed");
+                                }
+                                Err(e) => {
+                                    error!("Critical upgrade error: {}", e);
+                                }
+                            }
+                        }
+                        tokio::time::sleep(monitor.check_interval()).await;
+                    }
+                }
+            }
+        });
+    }
+
     /// Start the protocol message routing background task.
     ///
     /// Subscribes to P2P events and routes incoming chunk protocol messages
@@ -531,10 +589,253 @@ impl RunningNode {
         info!("Protocol message routing started");
     }
 
+    /// Start the replication protocol routing background task.
+    ///
+    /// Subscribes to P2P events and routes incoming replication messages
+    /// to the fresh replication handlers (Section 6.1).
+    fn start_replication_routing(&mut self) {
+        let storage = match self.ant_protocol {
+            Some(ref p) => Arc::clone(p.storage()),
+            None => return,
+        };
+        let paid_list = match self.paid_list {
+            Some(ref p) => Arc::clone(p),
+            None => return,
+        };
+
+        let self_id = self.p2p_node.peer_id().clone();
+        let Some(self_xor) = peer_id_to_xor_name(&self_id) else {
+            warn!("Cannot derive XOR name from peer ID, replication disabled");
+            return;
+        };
+
+        let routing_view = Arc::clone(&self.routing_view);
+        let mut events = self.p2p_node.subscribe_events();
+        let p2p = Arc::clone(&self.p2p_node);
+
+        self.replication_task = Some(tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let P2PEvent::Message {
+                    topic,
+                    source,
+                    data,
+                } = event
+                else {
+                    continue;
+                };
+                if topic != REPLICATION_PROTOCOL_ID {
+                    continue;
+                }
+                let msg = match ReplicationMessage::decode(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!("Failed to decode replication message from {source}: {e}");
+                        continue;
+                    }
+                };
+                dispatch_replication_msg(
+                    msg,
+                    &source,
+                    &self_id,
+                    &self_xor,
+                    &storage,
+                    &paid_list,
+                    &routing_view,
+                    &p2p,
+                );
+            }
+        }));
+        info!("Replication protocol routing started");
+    }
+
+    /// Start the fresh replication trigger background task.
+    ///
+    /// Receives [`NewChunkStored`] notifications from the storage handler
+    /// and sends `FreshOffer`/`PaidNotify` to the appropriate peers.
+    fn start_fresh_replication_trigger(&mut self) {
+        let Some(mut new_chunk_rx) = self.new_chunk_rx.take() else {
+            return;
+        };
+
+        let self_id = self.p2p_node.peer_id().clone();
+        let Some(self_xor) = peer_id_to_xor_name(&self_id) else {
+            return;
+        };
+
+        let routing_view = Arc::clone(&self.routing_view);
+        let p2p = Arc::clone(&self.p2p_node);
+
+        self.fresh_replication_task = Some(tokio::spawn(async move {
+            while let Some(notification) = new_chunk_rx.recv().await {
+                let rt_snapshot = routing_view.read().clone();
+                let plan = fresh::plan_fresh_replication(
+                    &self_id,
+                    &self_xor,
+                    &notification.key,
+                    &rt_snapshot,
+                );
+
+                let key_hex = hex::encode(notification.key);
+                let offer_count = plan.offer_targets.len();
+                let notify_count = plan.notify_only_targets.len();
+
+                if offer_count == 0 && notify_count == 0 {
+                    debug!("No replication targets for chunk {key_hex} (empty routing view)");
+                    continue;
+                }
+
+                debug!(
+                    "Fresh replication for {key_hex}: {} offers, {} notifies",
+                    offer_count, notify_count
+                );
+
+                // Send FreshOffer to close group peers
+                for target in &plan.offer_targets {
+                    let offer = ReplicationMessage {
+                        request_id: 0, // fire-and-forget, no correlation needed
+                        body: ReplicationBody::FreshOffer(
+                            crate::replication::protocol::FreshOfferRequest {
+                                key: notification.key,
+                                content: notification.content.clone(),
+                                proof_of_payment: notification.payment_proof.clone(),
+                            },
+                        ),
+                    };
+                    if let Ok(bytes) = offer.encode() {
+                        let p2p = Arc::clone(&p2p);
+                        let target = target.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = p2p
+                                .send_message(&target, REPLICATION_PROTOCOL_ID, bytes)
+                                .await
+                            {
+                                warn!("Failed to send FreshOffer to {target}: {e}");
+                            }
+                        });
+                    }
+                }
+
+                // Send PaidNotify to wider paid-close-group peers
+                for target in &plan.notify_only_targets {
+                    let notify = ReplicationMessage {
+                        request_id: 0,
+                        body: ReplicationBody::PaidNotify(
+                            crate::replication::protocol::PaidNotifyRequest {
+                                key: notification.key,
+                                proof_of_payment: notification.payment_proof.clone(),
+                            },
+                        ),
+                    };
+                    if let Ok(bytes) = notify.encode() {
+                        let p2p = Arc::clone(&p2p);
+                        let target = target.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = p2p
+                                .send_message(&target, REPLICATION_PROTOCOL_ID, bytes)
+                                .await
+                            {
+                                warn!("Failed to send PaidNotify to {target}: {e}");
+                            }
+                        });
+                    }
+                }
+            }
+        }));
+        info!("Fresh replication trigger started");
+    }
+
     /// Request the node to shut down.
     pub fn shutdown(&self) {
         if let Err(e) = self.shutdown_tx.send(true) {
             warn!("Failed to send shutdown signal: {e}");
+        }
+    }
+}
+
+/// Dispatch a decoded replication message to the appropriate handler.
+///
+/// Extracted from `start_replication_routing` to keep that method within
+/// the clippy line-count limit.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_replication_msg(
+    msg: ReplicationMessage,
+    source: &str,
+    self_id: &str,
+    self_xor: &XorName,
+    storage: &Arc<DiskStorage>,
+    paid_list: &Arc<RwLock<PaidForList>>,
+    routing_view: &Arc<RwLock<Vec<(String, XorName)>>>,
+    p2p: &Arc<P2PNode>,
+) {
+    let request_id = msg.request_id;
+    match msg.body {
+        ReplicationBody::FreshOffer(request) => {
+            let storage = Arc::clone(storage);
+            let paid_list = Arc::clone(paid_list);
+            let routing_view = Arc::clone(routing_view);
+            let p2p = Arc::clone(p2p);
+            let self_id = self_id.to_owned();
+            let self_xor = *self_xor;
+            let source = source.to_owned();
+
+            tokio::spawn(async move {
+                let rt_snapshot = routing_view.read().clone();
+                let response = fresh::handle_fresh_offer(
+                    &self_id,
+                    &self_xor,
+                    &request,
+                    &rt_snapshot,
+                    &storage,
+                )
+                .await;
+
+                if matches!(
+                    response,
+                    crate::replication::protocol::FreshOfferResponse::Accepted { .. }
+                ) {
+                    paid_list.write().add(request.key);
+                }
+
+                let reply = ReplicationMessage {
+                    request_id,
+                    body: ReplicationBody::FreshOfferResponse(response),
+                };
+                if let Ok(bytes) = reply.encode() {
+                    if let Err(e) = p2p
+                        .send_message(&source, REPLICATION_PROTOCOL_ID, bytes)
+                        .await
+                    {
+                        warn!("Failed to send FreshOffer response to {source}: {e}");
+                    }
+                }
+            });
+        }
+        ReplicationBody::PaidNotify(request) => {
+            let rt_snapshot = routing_view.read().clone();
+            let response = {
+                let mut pl = paid_list.write();
+                fresh::handle_paid_notify(self_id, self_xor, &request, &rt_snapshot, &mut pl)
+            };
+
+            let reply = ReplicationMessage {
+                request_id,
+                body: ReplicationBody::PaidNotifyResponse(response),
+            };
+            if let Ok(bytes) = reply.encode() {
+                let p2p = Arc::clone(p2p);
+                let source = source.to_owned();
+                tokio::spawn(async move {
+                    if let Err(e) = p2p
+                        .send_message(&source, REPLICATION_PROTOCOL_ID, bytes)
+                        .await
+                    {
+                        warn!("Failed to send PaidNotify response to {source}: {e}");
+                    }
+                });
+            }
+        }
+        _ => {
+            debug!("Ignoring unhandled replication message variant from {source}");
         }
     }
 }

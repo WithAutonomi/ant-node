@@ -1138,7 +1138,7 @@ impl TestNetwork {
                     () = tokio::time::sleep(check_interval) => {
                         // Check each node's health
                         for (i, node) in nodes.iter().enumerate() {
-                            if !node.is_running().await {
+                            if !node.is_running() {
                                 warn!("Node {} appears unhealthy", i);
                             }
                         }
