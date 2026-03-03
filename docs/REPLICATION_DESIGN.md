@@ -59,6 +59,7 @@ All parameters are configurable. Values below are a reference profile used for l
 
 | Parameter | Meaning | Reference                           |
 |---|---|-------------------------------------|
+| `K_BUCKET_SIZE` | Maximum number of peers per k-bucket in the Kademlia routing table | `20`                                |
 | `CLOSE_GROUP_SIZE` | Close-group width and target holder count per key | `7`                                 |
 | `QUORUM_THRESHOLD` | Full-network target for required positive presence votes (effective per-key threshold is `QuorumNeeded(K)`) | `floor(CLOSE_GROUP_SIZE/2)+1` (`4`) |
 | `PAID_LIST_CLOSE_GROUP_SIZE` | Maximum number of closest nodes tracking paid status for a key | `20`                                |
