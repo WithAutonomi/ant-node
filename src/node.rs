@@ -281,7 +281,7 @@ impl NodeBuilder {
         Ok(dirs)
     }
 
-    fn build_upgrade_monitor(config: &NodeConfig, node_id_seed: &[u8]) -> Arc<UpgradeMonitor> {
+    fn build_upgrade_monitor(config: &NodeConfig, node_id_seed: &[u8]) -> UpgradeMonitor {
         let mut monitor = UpgradeMonitor::new(
             config.upgrade.github_repo.clone(),
             config.upgrade.channel,
@@ -300,7 +300,7 @@ impl NodeBuilder {
                 monitor.with_staged_rollout(node_id_seed, config.upgrade.staged_rollout_hours);
         }
 
-        Arc::new(monitor)
+        monitor
     }
 
     /// Build the ANT protocol handler from config.
@@ -400,7 +400,7 @@ pub struct RunningNode {
     shutdown: CancellationToken,
     events_tx: NodeEventsSender,
     events_rx: Option<NodeEventsChannel>,
-    upgrade_monitor: Option<Arc<UpgradeMonitor>>,
+    upgrade_monitor: Option<UpgradeMonitor>,
     /// Bootstrap cache manager for persistent peer storage.
     bootstrap_manager: Option<BootstrapManager>,
     /// ANT protocol handler for chunk storage.
@@ -462,12 +462,12 @@ impl RunningNode {
         self.start_protocol_routing();
 
         // Start upgrade monitor if enabled
-        if let Some(ref monitor) = self.upgrade_monitor {
-            let monitor = Arc::clone(monitor);
+        if let Some(monitor) = self.upgrade_monitor.take() {
             let events_tx = self.events_tx.clone();
             let shutdown = self.shutdown.clone();
 
             tokio::spawn(async move {
+                let mut monitor = monitor;
                 let mut upgrader = AutoApplyUpgrader::new();
                 if let Ok(cache_dir) = upgrade_cache_dir() {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
@@ -478,7 +478,7 @@ impl RunningNode {
                         () = shutdown.cancelled() => {
                             break;
                         }
-                        result = monitor.check_for_updates() => {
+                        result = monitor.check_for_ready_upgrade() => {
                             match result {
                                 Ok(Some(upgrade_info)) => {
                                     info!(
