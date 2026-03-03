@@ -425,7 +425,7 @@ impl RunningNode {
     ///
     /// Returns an error if the node encounters a fatal error.
     pub async fn run(&mut self) -> Result<()> {
-        info!("Starting saorsa-node");
+        info!("Node runtime loop starting");
 
         // Start the P2P node
         self.p2p_node
@@ -433,10 +433,8 @@ impl RunningNode {
             .await
             .map_err(|e| Error::Startup(format!("Failed to start P2P node: {e}")))?;
 
-        info!(
-            "P2P node started, listening on {:?}",
-            self.p2p_node.listen_addrs().await
-        );
+        let addrs = self.p2p_node.listen_addrs().await;
+        info!(listen_addrs = ?addrs, "P2P node started");
 
         // Emit started event
         if let Err(e) = self.events_tx.send(NodeEvent::Started) {
@@ -463,9 +461,9 @@ impl RunningNode {
                         result = monitor.check_for_updates() => {
                             if let Ok(Some(upgrade_info)) = result {
                                 info!(
-                                    "Upgrade available: {} -> {}",
-                                    upgrader.current_version(),
-                                    upgrade_info.version
+                                    current_version = %upgrader.current_version(),
+                                    new_version = %upgrade_info.version,
+                                    "Upgrade available"
                                 );
 
                                 // Send notification event
@@ -479,7 +477,7 @@ impl RunningNode {
                                 info!("Starting auto-apply upgrade...");
                                 match upgrader.apply_upgrade(&upgrade_info).await {
                                     Ok(UpgradeResult::Success { version }) => {
-                                        info!("Upgrade to {} successful! Process will restart.", version);
+                                        info!(version = %version, "Upgrade successful, process will restart");
                                         // If we reach here, exec() failed or not supported
                                     }
                                     Ok(UpgradeResult::RolledBack { reason }) => {

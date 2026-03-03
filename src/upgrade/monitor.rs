@@ -250,10 +250,10 @@ impl UpgradeMonitor {
 
             let delay = rollout.calculate_delay_for_version(&info.version);
             info!(
-                "New version {} detected. Staged rollout delay: {}h {}m",
-                info.version,
-                delay.as_secs() / 3600,
-                (delay.as_secs() % 3600) / 60
+                new_version = %info.version,
+                delay_hours = delay.as_secs() / 3600,
+                delay_minutes = (delay.as_secs() % 3600) / 60,
+                "New version detected, staged rollout delay calculated"
             );
         }
 
@@ -269,8 +269,8 @@ impl UpgradeMonitor {
 
         if elapsed >= delay {
             info!(
-                "Staged rollout delay elapsed. Ready to upgrade to version {}",
-                info.version
+                version = %info.version,
+                "Staged rollout delay elapsed, ready to upgrade"
             );
             Ok(Some(info))
         } else {
@@ -343,8 +343,9 @@ impl UpgradeMonitor {
         let sig_asset = release.assets.iter().find(|a| a.name == sig_name)?;
 
         info!(
-            "New version available: {} -> {}",
-            self.current_version, latest_version
+            current_version = %self.current_version,
+            new_version = %latest_version,
+            "New version available"
         );
 
         Some(UpgradeInfo {
