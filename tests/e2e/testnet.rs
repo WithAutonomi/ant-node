@@ -885,7 +885,6 @@ impl TestNetwork {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
         info!("Starting {} regular nodes", regular_count);
 
-        // Get bootstrap addresses
         let bootstrap_addrs: Vec<SocketAddr> = self.nodes[0..self.config.bootstrap_count]
             .iter()
             .map(|n| n.address)
