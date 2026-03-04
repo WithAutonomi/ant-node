@@ -106,10 +106,9 @@ impl PaymentVerifier {
     pub fn new(config: PaymentVerifierConfig) -> Self {
         let cache = VerifiedCache::with_capacity(config.cache_capacity);
 
-        info!(
-            "Payment verifier initialized (cache_capacity={}, evm_enabled={})",
-            config.cache_capacity, config.evm.enabled
-        );
+        let cache_capacity = config.cache_capacity;
+        let evm_enabled = config.evm.enabled;
+        info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm_enabled={evm_enabled})");
 
         Self { cache, config }
     }
@@ -264,11 +263,9 @@ impl PaymentVerifier {
     /// not bypass verification here.
     async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                "Verifying EVM payment for {} with {} quotes",
-                hex::encode(xorname),
-                payment.peer_quotes.len()
-            );
+            let xorname_hex = hex::encode(xorname);
+            let quote_count = payment.peer_quotes.len();
+            debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
         }
 
         // Production-only verification - EVM must be enabled to call this function

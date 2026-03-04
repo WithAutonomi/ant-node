@@ -131,12 +131,8 @@ impl QuoteGenerator {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            debug!(
-                "Generated quote for {} (size: {}, type: {})",
-                hex::encode(content),
-                data_size,
-                data_type
-            );
+            let content_hex = hex::encode(content);
+            debug!("Generated quote for {content_hex} (size: {data_size}, type: {data_type})");
         }
 
         Ok(quote)

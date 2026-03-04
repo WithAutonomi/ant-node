@@ -42,6 +42,7 @@
 
 mod cache;
 pub mod metrics;
+pub mod pricing;
 pub mod quote;
 pub mod single_node;
 mod verifier;
@@ -49,6 +50,7 @@ pub mod wallet;
 
 pub use cache::{CacheStats, VerifiedCache};
 pub use metrics::QuotingMetricsTracker;
+pub use pricing::calculate_price;
 pub use quote::{verify_quote_content, wire_ml_dsa_signer, QuoteGenerator, XorName};
 pub use single_node::SingleNodePayment;
 pub use verifier::{EvmVerifierConfig, PaymentStatus, PaymentVerifier, PaymentVerifierConfig};

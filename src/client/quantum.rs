@@ -25,13 +25,14 @@ use crate::ant_protocol::{
 };
 use crate::error::{Error, Result};
 use crate::payment::single_node::REQUIRED_QUOTES;
-use crate::payment::SingleNodePayment;
+use crate::payment::{calculate_price, SingleNodePayment};
 use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
 use libp2p::PeerId;
 use saorsa_core::P2PNode;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -674,9 +675,10 @@ impl QuantumClient {
             let connected = node.connected_peers().await;
             debug!("Found {} connected P2P peers for fallback", connected.len());
 
-            // Add connected peers that aren't already in remote_peers
+            // Add connected peers that aren't already in remote_peers (O(1) dedup via HashSet)
+            let existing: HashSet<String> = remote_peers.iter().cloned().collect();
             for peer_id in connected {
-                if !remote_peers.contains(&peer_id) {
+                if !existing.contains(&peer_id) {
                     remote_peers.push(peer_id);
                 }
             }
@@ -743,18 +745,7 @@ impl QuantumClient {
                             // Deserialize the quote
                             match rmp_serde::from_slice::<PaymentQuote>(&quote) {
                                 Ok(payment_quote) => {
-                                    // TODO: PaymentQuote lacks a dedicated price field.
-                                    // Using data_size as a placeholder price until the
-                                    // upstream ant-evm crate exposes real pricing.
-                                    let data_size_val = payment_quote.quoting_metrics.data_size.max(1);
-                                    let price = match u64::try_from(data_size_val) {
-                                        Ok(val) => Amount::from(val),
-                                        Err(_) => {
-                                            return Some(Err(Error::Network(format!(
-                                                "Quote data_size too large to convert: {data_size_val}"
-                                            ))));
-                                        }
-                                    };
+                                    let price = calculate_price(&payment_quote.quoting_metrics);
                                     if tracing::enabled!(tracing::Level::DEBUG) {
                                         debug!(
                                             "Received quote from {peer_id_clone}: price = {price}"
