@@ -193,7 +193,7 @@ impl NodeBuilder {
         // Enable IPv6 if configured
         core_config.enable_ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
 
-        // Add bootstrap peers
+        // Add bootstrap peers.
         core_config.bootstrap_peers.clone_from(&config.bootstrap);
 
         // Forward max_message_size to the transport layer.
