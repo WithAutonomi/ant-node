@@ -496,7 +496,7 @@ impl Devnet {
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
-        let peer_id = identity.peer_id().clone();
+        let peer_id = *identity.peer_id();
         let label = format!("devnet_node_{index}");
         let data_dir = self
             .config
@@ -575,7 +575,7 @@ impl Devnet {
         .await
         .map_err(|e| DevnetError::Core(format!("Failed to load node identity: {e}")))?;
 
-        core_config.peer_id = Some(node.peer_id.clone());
+        core_config.peer_id = Some(node.peer_id);
         core_config.node_identity = Some(Arc::new(identity));
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];

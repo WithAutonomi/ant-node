@@ -58,7 +58,7 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Self::resolve_identity(&mut self.config).await?;
-        let peer_id = identity.peer_id().clone();
+        let peer_id = *identity.peer_id();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
@@ -73,7 +73,7 @@ impl NodeBuilder {
 
         // Convert our config to saorsa-core's config, injecting our stable peer_id
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id.clone());
+        core_config.peer_id = Some(peer_id);
         core_config.node_identity = Some(Arc::new(identity));
         debug!("Core config: {:?}", core_config);
 
