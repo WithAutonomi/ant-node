@@ -189,8 +189,9 @@ impl AntProtocol {
             Ok(_) => {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
-                // Record the store in metrics
+                // Record the store and payment in metrics
                 self.quote_generator.record_store(DATA_TYPE_CHUNK);
+                self.quote_generator.record_payment();
                 ChunkPutResponse::Success { address }
             }
             Err(e) => {

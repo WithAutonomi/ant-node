@@ -1,6 +1,6 @@
 //! Node implementation - thin wrapper around saorsa-core's `P2PNode`.
 
-use crate::ant_protocol::CHUNK_PROTOCOL_ID;
+use crate::ant_protocol::{CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE};
 use crate::config::{
     default_nodes_dir, default_root_dir, EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig,
     NODE_IDENTITY_FILENAME,
@@ -28,8 +28,13 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-/// Maximum number of records for quoting metrics.
-const DEFAULT_MAX_QUOTING_RECORDS: usize = 100_000;
+/// Node storage capacity limit (5 GB).
+///
+/// Used to derive `max_records` for the quoting metrics pricing curve.
+/// A node advertises `NODE_STORAGE_LIMIT_BYTES / MAX_CHUNK_SIZE` as
+/// its maximum record count, giving the pricing algorithm a meaningful
+/// fullness ratio instead of a hardcoded constant.
+pub const NODE_STORAGE_LIMIT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Default rewards address when none is configured (20-byte zero address).
 const DEFAULT_REWARDS_ADDRESS: [u8; 20] = [0u8; 20];
@@ -377,7 +382,10 @@ impl NodeBuilder {
             Some(ref addr) => parse_rewards_address(addr)?,
             None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
         };
-        let metrics_tracker = QuotingMetricsTracker::new(DEFAULT_MAX_QUOTING_RECORDS, 0);
+        // Safe: 5GB fits in usize on all supported 64-bit platforms.
+        #[allow(clippy::cast_possible_truncation)]
+        let max_records = (NODE_STORAGE_LIMIT_BYTES as usize) / MAX_CHUNK_SIZE;
+        let metrics_tracker = QuotingMetricsTracker::new(max_records, 0);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from node identity
@@ -613,8 +621,7 @@ impl RunningNode {
                     break;
                 }
                 _ = sighup.recv() => {
-                    info!("Received SIGHUP, could reload config here");
-                    // TODO: Implement config reload on SIGHUP
+                    info!("Received SIGHUP (config reload not yet supported)");
                 }
             }
         }

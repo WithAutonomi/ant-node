@@ -20,26 +20,18 @@ pub struct PaymentProof {
     pub tx_hashes: Vec<TxHash>,
 }
 
-/// Deserialize proof bytes, supporting both the new `PaymentProof` format
-/// and the legacy `ProofOfPayment`-only format.
+/// Deserialize proof bytes from the `PaymentProof` format.
 ///
-/// Returns `(ProofOfPayment, Vec<TxHash>)` — the `tx_hashes` vec is empty when
-/// deserializing the legacy format.
+/// Returns `(ProofOfPayment, Vec<TxHash>)`.
 ///
 /// # Errors
 ///
-/// Returns an error if neither format can be deserialized from the bytes.
+/// Returns an error if the bytes cannot be deserialized.
 pub fn deserialize_proof(
     bytes: &[u8],
 ) -> std::result::Result<(ProofOfPayment, Vec<TxHash>), rmp_serde::decode::Error> {
-    // Try new format first
-    if let Ok(proof) = rmp_serde::from_slice::<PaymentProof>(bytes) {
-        return Ok((proof.proof_of_payment, proof.tx_hashes));
-    }
-
-    // Fall back to legacy format (bare ProofOfPayment without tx_hashes)
-    let legacy = rmp_serde::from_slice::<ProofOfPayment>(bytes)?;
-    Ok((legacy, vec![]))
+    let proof = rmp_serde::from_slice::<PaymentProof>(bytes)?;
+    Ok((proof.proof_of_payment, proof.tx_hashes))
 }
 
 #[cfg(test)]
@@ -112,19 +104,6 @@ mod tests {
 
         assert_eq!(pop.peer_quotes.len(), 1);
         assert!(hashes.is_empty());
-    }
-
-    #[test]
-    fn test_backward_compat_legacy_proof_of_payment() {
-        // Serialize the legacy format (bare ProofOfPayment)
-        let legacy = make_proof_of_payment();
-        let bytes = rmp_serde::to_vec(&legacy).unwrap();
-
-        // deserialize_proof should still work, returning empty tx_hashes
-        let (pop, hashes) = deserialize_proof(&bytes).unwrap();
-
-        assert_eq!(pop.peer_quotes.len(), 1);
-        assert!(hashes.is_empty(), "Legacy format should have no tx hashes");
     }
 
     #[test]

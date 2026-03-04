@@ -104,8 +104,9 @@ const TEST_PAYMENT_CACHE_CAPACITY: usize = 1000;
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
-/// Max records for quoting metrics (test value).
-const TEST_MAX_RECORDS: usize = 100_000;
+/// Max records for quoting metrics (derived from node storage limit / max chunk size).
+const TEST_MAX_RECORDS: usize = (saorsa_node::node::NODE_STORAGE_LIMIT_BYTES as usize)
+    / saorsa_node::ant_protocol::MAX_CHUNK_SIZE;
 
 /// Initial records for quoting metrics (test value).
 const TEST_INITIAL_RECORDS: usize = 1000;

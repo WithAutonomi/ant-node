@@ -150,7 +150,7 @@ impl QuotingMetricsTracker {
             max_records: self.max_records,
             received_payment_count: self.received_payment_count.load(Ordering::SeqCst),
             live_time: self.live_time_hours(),
-            network_density: None, // TODO: Calculate from DHT
+            network_density: None, // Not used in pricing; reserved for future DHT range filtering
             network_size: Some(self.network_size.load(Ordering::SeqCst)),
         }
     }

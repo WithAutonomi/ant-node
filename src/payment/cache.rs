@@ -9,7 +9,6 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 /// `XorName` type - 32-byte content hash.
-/// TODO: Import from saorsa-core or ant-protocol when available.
 pub type XorName = [u8; 32];
 
 /// Default cache capacity (100,000 entries = 3.2MB memory).
