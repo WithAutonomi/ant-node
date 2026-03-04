@@ -273,12 +273,8 @@ impl PaymentVerifier {
             debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
         }
 
-        // Production-only verification - EVM must be enabled to call this function
-        if !self.config.evm.enabled {
-            return Err(Error::Payment(
-                "EVM verification is disabled - cannot verify payment".to_string(),
-            ));
-        }
+        // Invariant: this function is only called when EVM is enabled (checked by verify_payment)
+        debug_assert!(self.config.evm.enabled);
 
         if payment.peer_quotes.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));

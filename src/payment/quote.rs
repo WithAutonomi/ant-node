@@ -254,14 +254,14 @@ pub fn wire_ml_dsa_signer(
 ) {
     let pub_key_bytes = identity.public_key().as_bytes().to_vec();
     let sk_bytes = identity.secret_key_bytes().to_vec();
+    let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
+        Ok(sk) => sk,
+        Err(e) => {
+            tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
+            return;
+        }
+    };
     generator.set_signer(pub_key_bytes, move |msg| {
-        let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
-            Ok(sk) => sk,
-            Err(e) => {
-                tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
-                return vec![];
-            }
-        };
         let ml_dsa = MlDsa65::new();
         match ml_dsa.sign(&sk, msg) {
             Ok(sig) => sig.as_bytes().to_vec(),

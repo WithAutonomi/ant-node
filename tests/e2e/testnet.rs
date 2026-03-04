@@ -444,19 +444,18 @@ impl TestNode {
         data: &[u8],
         tracker: &super::harness::PaymentTracker,
     ) -> Result<XorName> {
-        use saorsa_node::client::QuantumClient;
         use saorsa_node::payment::SingleNodePayment;
 
-        // Get the client and wallet
-        let p2p_node = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+        // Reuse the client created by set_wallet()
+        let client = self.client.as_ref().ok_or_else(|| {
+            TestnetError::Storage(
+                "Client not configured - use set_wallet() to create a payment-enabled client"
+                    .to_string(),
+            )
+        })?;
         let wallet = self.wallet.as_ref().ok_or_else(|| {
             TestnetError::Storage("Wallet not configured - use set_wallet()".to_string())
         })?;
-
-        // Create a QuantumClient for this operation
-        let client = QuantumClient::with_defaults()
-            .with_node(Arc::clone(p2p_node))
-            .with_wallet(wallet.clone());
 
         // Compute the chunk address
         let address = Self::compute_chunk_address(data);
@@ -1221,13 +1220,20 @@ impl TestNetwork {
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable
         let pub_key_bytes = identity.public_key().as_bytes().to_vec();
         let sk_bytes = identity.secret_key_bytes().to_vec();
-        quote_generator.set_signer(pub_key_bytes, move |msg| {
+        let sk = {
             use saorsa_pqc::pqc::types::MlDsaSecretKey;
+            match MlDsaSecretKey::from_bytes(&sk_bytes) {
+                Ok(sk) => sk,
+                Err(e) => {
+                    return Err(TestnetError::Core(format!(
+                        "Failed to deserialize ML-DSA-65 secret key: {e}"
+                    )));
+                }
+            }
+        };
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
             use saorsa_pqc::pqc::MlDsaOperations;
 
-            let Ok(sk) = MlDsaSecretKey::from_bytes(&sk_bytes) else {
-                return vec![];
-            };
             let ml_dsa = saorsa_core::MlDsa65::new();
             ml_dsa
                 .sign(&sk, msg)

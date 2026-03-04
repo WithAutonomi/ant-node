@@ -682,9 +682,9 @@ impl QuantumClient {
             debug!("Found {} connected P2P peers for fallback", connected.len());
 
             // Add connected peers that aren't already in remote_peers (O(1) dedup via HashSet)
-            let existing: HashSet<String> = remote_peers.iter().cloned().collect();
+            let mut existing: HashSet<String> = remote_peers.iter().cloned().collect();
             for peer_id in connected {
-                if !existing.contains(&peer_id) {
+                if existing.insert(peer_id.clone()) {
                     remote_peers.push(peer_id);
                 }
             }
