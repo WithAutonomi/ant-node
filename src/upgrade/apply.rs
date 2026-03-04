@@ -75,11 +75,28 @@ impl AutoApplyUpgrader {
 
     /// Get the path to the currently running binary.
     ///
+    /// On Linux, `/proc/self/exe` may have a `" (deleted)"` suffix when the on-disk binary has
+    /// been replaced by another node's upgrade. This function strips that suffix so that backup
+    /// creation, binary replacement, and restart all target the correct on-disk path.
+    ///
     /// # Errors
     ///
     /// Returns an error if the binary path cannot be determined.
     pub fn current_binary_path() -> Result<PathBuf> {
-        env::current_exe().map_err(|e| Error::Upgrade(format!("Cannot determine binary path: {e}")))
+        let path =
+            env::current_exe().map_err(|e| Error::Upgrade(format!("Cannot determine binary path: {e}")))?;
+
+        #[cfg(unix)]
+        {
+            let path_str = path.to_string_lossy();
+            if path_str.ends_with(" (deleted)") {
+                let cleaned = path_str.trim_end_matches(" (deleted)");
+                debug!("Stripped '(deleted)' suffix from binary path: {cleaned}");
+                return Ok(PathBuf::from(cleaned));
+            }
+        }
+
+        Ok(path)
     }
 
     /// Perform the complete auto-apply upgrade workflow.
