@@ -532,6 +532,30 @@ impl RunningNode {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
                 }
 
+                // Add randomized jitter before the first upgrade check to prevent all nodes
+                // from hitting the GitHub API simultaneously when started together.
+                // Uses ±5% of the check interval, matching the autonomi project's approach.
+                {
+                    let interval_secs = monitor.check_interval().as_secs();
+                    let variance = interval_secs / 20; // 5%
+                    let jitter_secs = if variance > 0 {
+                        use rand::Rng;
+                        rand::thread_rng().gen_range(0..=variance * 2)
+                    } else {
+                        0
+                    };
+                    let jitter_duration = std::time::Duration::from_secs(jitter_secs);
+                    let first_check_time = chrono::Utc::now()
+                        + chrono::Duration::from_std(jitter_duration)
+                            .unwrap_or_else(|_| chrono::Duration::minutes(1));
+                    info!(
+                        "First upgrade check scheduled for {} (jitter: {}s)",
+                        first_check_time.to_rfc3339(),
+                        jitter_secs
+                    );
+                    tokio::time::sleep(jitter_duration).await;
+                }
+
                 loop {
                     tokio::select! {
                         () = shutdown.cancelled() => {
