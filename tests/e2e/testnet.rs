@@ -28,7 +28,7 @@ use saorsa_node::ant_protocol::{
 };
 use saorsa_node::client::{send_and_await_chunk_response, DataChunk, QuantumClient, XorName};
 use saorsa_node::payment::{
-    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
+    EvmVerifierConfig, PaymentProof, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
 use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
@@ -466,26 +466,16 @@ impl TestNode {
             .await
             .map_err(|e| TestnetError::Storage(format!("Failed to get quotes: {e}")))?;
 
-        // Build ProofOfPayment from peer IDs + quotes
-        // Parse all peer IDs and fail if any are malformed
-        let peer_quotes: Vec<_> = quotes_with_peers
-            .iter()
-            .map(|(peer_id_str, quote, _price)| {
-                let peer_id: libp2p::PeerId = peer_id_str.parse().map_err(|e| {
-                    TestnetError::Storage(format!("Failed to parse peer ID '{peer_id_str}': {e}"))
-                })?;
-                Ok((ant_evm::EncodedPeerId::from(peer_id), quote.clone()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let proof_of_payment = ant_evm::ProofOfPayment { peer_quotes };
-        let proof_bytes = rmp_serde::to_vec(&proof_of_payment)
-            .map_err(|e| TestnetError::Storage(format!("Failed to serialize proof: {e}")))?;
-
-        // Strip peer IDs for SingleNodePayment which only needs (quote, price)
-        let quotes_with_prices: Vec<_> = quotes_with_peers
-            .into_iter()
-            .map(|(_peer_id, quote, price)| (quote, price))
-            .collect();
+        // Collect peer_quotes and strip peer IDs for SingleNodePayment
+        let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
+        let mut quotes_with_prices: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
+        for (peer_id_str, quote, price) in quotes_with_peers {
+            let peer_id: libp2p::PeerId = peer_id_str.parse().map_err(|e| {
+                TestnetError::Storage(format!("Failed to parse peer ID '{peer_id_str}': {e}"))
+            })?;
+            peer_quotes.push((ant_evm::EncodedPeerId::from(peer_id), quote.clone()));
+            quotes_with_prices.push((quote, price));
+        }
 
         // Create payment structure (sorts by price, selects median)
         let payment = SingleNodePayment::from_quotes(quotes_with_prices)
@@ -498,7 +488,15 @@ impl TestNode {
             .map_err(|e| TestnetError::Storage(format!("Payment failed: {e}")))?;
 
         // Record the payment in the tracker
-        tracker.record_payment(address, tx_hashes);
+        tracker.record_payment(address, tx_hashes.clone());
+
+        // Build proof AFTER payment with tx hashes included
+        let proof = PaymentProof {
+            proof_of_payment: ant_evm::ProofOfPayment { peer_quotes },
+            tx_hashes,
+        };
+        let proof_bytes = rmp_serde::to_vec(&proof)
+            .map_err(|e| TestnetError::Storage(format!("Failed to serialize proof: {e}")))?;
 
         // Use put_chunk_with_proof to send the pre-built proof, avoiding a
         // redundant quote+pay cycle that put_chunk_with_payment would perform.

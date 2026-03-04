@@ -25,7 +25,7 @@ use crate::ant_protocol::{
 };
 use crate::error::{Error, Result};
 use crate::payment::single_node::REQUIRED_QUOTES;
-use crate::payment::{calculate_price, SingleNodePayment};
+use crate::payment::{calculate_price, PaymentProof, SingleNodePayment};
 use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
@@ -288,8 +288,8 @@ impl QuantumClient {
             )));
         }
 
-        // Step 2: Build both peer_quotes (for ProofOfPayment) and quotes_with_prices
-        // (for SingleNodePayment) in a single pass, avoiding a redundant clone.
+        // Step 2: Split quotes into peer_quotes (for ProofOfPayment) and
+        // quotes_with_prices (for SingleNodePayment) in a single pass.
         let mut peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> =
             Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_with_prices: Vec<(PaymentQuote, Amount)> =
@@ -303,8 +303,6 @@ impl QuantumClient {
             quotes_with_prices.push((quote, price));
         }
 
-        let proof_of_payment = ProofOfPayment { peer_quotes };
-
         // Step 3: Create SingleNodePayment (sorts by price, selects median, pays 3x)
         let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
 
@@ -313,14 +311,22 @@ impl QuantumClient {
             payment.total_amount()
         );
 
-        // Step 4: Pay on-chain
-        let _tx_hashes = payment.pay(wallet).await?;
-        info!("Payment successful on Arbitrum");
+        // Step 4: Pay on-chain — capture transaction hashes
+        let tx_hashes = payment.pay(wallet).await?;
+        info!(
+            "Payment successful on Arbitrum ({} transactions)",
+            tx_hashes.len()
+        );
 
-        let payment_proof = rmp_serde::to_vec(&proof_of_payment)
+        // Step 5: Build proof AFTER payment succeeds, including tx hashes
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment { peer_quotes },
+            tx_hashes,
+        };
+        let payment_proof = rmp_serde::to_vec(&proof)
             .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
 
-        // Step 5: Send chunk with payment proof to storage node
+        // Step 6: Send chunk with payment proof to storage node
         let target_peer = Self::pick_target_peer(node, &address).await?;
 
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);

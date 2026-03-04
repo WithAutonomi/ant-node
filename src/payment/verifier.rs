@@ -5,6 +5,7 @@
 
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
+use crate::payment::proof::deserialize_proof;
 use ant_evm::ProofOfPayment;
 use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
 use evmlib::contract::payment_vault::verify_data_payment;
@@ -208,10 +209,14 @@ impl PaymentVerifier {
                         )));
                     }
 
-                    // Deserialize the ProofOfPayment
-                    let payment: ProofOfPayment = rmp_serde::from_slice(proof).map_err(|e| {
+                    // Deserialize the proof (supports both new PaymentProof and legacy ProofOfPayment)
+                    let (payment, tx_hashes) = deserialize_proof(proof).map_err(|e| {
                         Error::Payment(format!("Failed to deserialize payment proof: {e}"))
                     })?;
+
+                    if !tx_hashes.is_empty() {
+                        debug!("Proof includes {} transaction hash(es)", tx_hashes.len());
+                    }
 
                     // Verify the payment using EVM
                     self.verify_evm_payment(xorname, &payment).await?;

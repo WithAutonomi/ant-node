@@ -36,7 +36,7 @@ use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
 use libp2p::PeerId;
 use saorsa_node::client::QuantumClient;
-use saorsa_node::payment::SingleNodePayment;
+use saorsa_node::payment::{PaymentProof, SingleNodePayment};
 use serial_test::serial;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -237,25 +237,16 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     // =========================================================================
     info!("\n💰 STEP 4: Calculate payment (median selection)");
 
-    // Build ProofOfPayment from peer IDs + quotes BEFORE stripping peer IDs
-    let peer_quotes: Vec<_> = quotes_with_prices
-        .iter()
-        .map(|(peer_id_str, quote, _price)| {
-            let peer_id: PeerId = peer_id_str
-                .parse()
-                .map_err(|e| format!("Failed to parse peer ID '{peer_id_str}': {e}"))?;
-            Ok((EncodedPeerId::from(peer_id), quote.clone()))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let proof_of_payment = ProofOfPayment { peer_quotes };
-    let proof_bytes = rmp_serde::to_vec(&proof_of_payment)
-        .map_err(|e| format!("Failed to serialize proof: {e}"))?;
-
-    // Strip peer IDs for SingleNodePayment which only needs (quote, price)
-    let quotes_for_payment: Vec<_> = quotes_with_prices
-        .into_iter()
-        .map(|(_peer_id, quote, price)| (quote, price))
-        .collect();
+    // Collect peer_quotes and strip peer IDs for SingleNodePayment
+    let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
+    let mut quotes_for_payment: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
+    for (peer_id_str, quote, price) in quotes_with_prices {
+        let peer_id: PeerId = peer_id_str
+            .parse()
+            .map_err(|e| format!("Failed to parse peer ID '{peer_id_str}': {e}"))?;
+        peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        quotes_for_payment.push((quote, price));
+    }
     let payment = SingleNodePayment::from_quotes(quotes_for_payment)
         .map_err(|e| format!("Failed to create payment: {e}"))?;
 
@@ -291,22 +282,29 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .await
         .map_err(|e| format!("Payment failed: {e}"))?;
 
+    assert!(
+        !tx_hashes.is_empty(),
+        "Expected at least one transaction hash from payment"
+    );
+
     info!("✅ On-chain payment succeeded:");
     for (i, tx) in tx_hashes.iter().enumerate() {
-        if tx.is_empty() {
-            info!("   • Transaction {}: <empty> (0 atto payment)", i + 1);
-        } else {
-            info!("   • Transaction {}: {}", i + 1, hex::encode(tx));
-        }
+        info!("   • Transaction {}: {}", i + 1, hex::encode(tx));
     }
+
+    // Build proof AFTER payment with tx hashes included
+    let proof = PaymentProof {
+        proof_of_payment: ProofOfPayment { peer_quotes },
+        tx_hashes,
+    };
+    let proof_bytes =
+        rmp_serde::to_vec(&proof).map_err(|e| format!("Failed to serialize proof: {e}"))?;
 
     // =========================================================================
     // STEP 6: Store chunk with payment proof
     // =========================================================================
     info!("\n💾 STEP 6: Store chunk with payment proof");
 
-    // Use put_chunk_with_proof to send the pre-built proof from Steps 3-5,
-    // avoiding a redundant quote+pay cycle that put_chunk() would perform.
     let stored_address = client
         .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
         .await
