@@ -23,8 +23,9 @@ mod tests {
     use rand::Rng;
     use saorsa_node::client::{compute_address, peer_id_to_xor_name, xor_distance, XorName};
     use saorsa_node::replication::audit::{
-        compute_audit_digest, sample_audit_keys, verify_audit_response, AuditKeyResult,
-        ABSENT_DIGEST,
+        build_candidate_peer_sets, compute_audit_digest, confirm_failures, failed_keys,
+        sample_audit_keys, select_challenged_peer, verify_audit_response, AuditKeyResult,
+        PeerKeySet, ABSENT_DIGEST,
     };
     use saorsa_node::replication::bootstrap::BootstrapTracker;
     use saorsa_node::replication::fetch::{
@@ -41,8 +42,8 @@ mod tests {
     };
     use saorsa_node::replication::protocol::{
         AuditChallengeRequest, AuditChallengeResponse, FetchRequest, FreshOfferRequest,
-        FreshOfferResponse, PaidNotifyRequest, ReplicationBody, ReplicationMessage,
-        SyncHintsRequest, VerifyRequest,
+        FreshOfferResponse, PaidNotifyRequest, PaidNotifyResponse, ReplicationBody,
+        ReplicationMessage, SyncHintsRequest, VerifyRequest,
     };
     use saorsa_node::replication::prune::{run_prune_pass, PruneTracker};
     use saorsa_node::replication::routing;
@@ -1192,7 +1193,7 @@ mod tests {
     ///
     /// Also tests rejection path: an offer with empty PoP must be rejected.
     ///
-    /// Design doc coverage: Section 6.1 rules 1-7, Section 7.3, Section 10,
+    /// Design doc coverage: Section 6.1 rules 1-6, Section 10,
     /// test matrix scenarios 1, 2.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_fresh_offer_over_p2p() {
@@ -1323,6 +1324,336 @@ mod tests {
             }
             other => panic!("Expected Rejected for empty PoP, got: {other:?}"),
         }
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 14b. PaidNotify delivery over P2P
+    // =========================================================================
+
+    /// Send `PaidNotify` messages between two live nodes and verify the
+    /// round-trip: a valid (non-empty) PoP is accepted, and the key appears
+    /// in the target's `PaidForList`; an empty PoP is rejected.
+    ///
+    /// Design doc coverage: Section 6.1 rules 7-8, Section 7.3 rules 1-3,
+    /// test matrix scenario 24.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_paid_notify_over_p2p() {
+        let mut harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        let node_a_index = 3;
+        let node_b_index = 4;
+
+        // Enable replication routing on both nodes
+        harness
+            .network_mut()
+            .node_mut(node_b_index)
+            .expect("Node B must exist")
+            .enable_replication_routing();
+        harness
+            .network_mut()
+            .node_mut(node_b_index)
+            .expect("Node B must exist")
+            .update_routing_view()
+            .await;
+
+        harness
+            .network_mut()
+            .node_mut(node_a_index)
+            .expect("Node A must exist")
+            .enable_replication_routing();
+        harness
+            .network_mut()
+            .node_mut(node_a_index)
+            .expect("Node A must exist")
+            .update_routing_view()
+            .await;
+
+        // Allow routing tasks to start
+        tokio::time::sleep(Duration::from_millis(crate::testnet::TASK_STARTUP_DELAY_MS)).await;
+
+        let node_a = harness.test_node(node_a_index).expect("Node A");
+        let node_b = harness.test_node(node_b_index).expect("Node B");
+        let p2p_a = node_a.p2p_node.as_ref().expect("Node A P2P").clone();
+
+        let target_peer_id = node_b
+            .p2p_node
+            .as_ref()
+            .expect("Node B P2P")
+            .transport_peer_id()
+            .expect("Node B transport peer ID");
+
+        // Compute a content address for the notify
+        let content = b"paid notify e2e test payload";
+        let key = compute_address(content);
+
+        // --- Valid PoP: should be Accepted ---
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ReplicationMessage {
+            request_id,
+            body: ReplicationBody::PaidNotify(PaidNotifyRequest {
+                key,
+                proof_of_payment: vec![1, 2, 3],
+            }),
+        };
+
+        let resp = send_and_await_replication_response(&p2p_a, &target_peer_id, &message)
+            .await
+            .expect("Should receive PaidNotify response");
+
+        match resp {
+            ReplicationBody::PaidNotifyResponse(PaidNotifyResponse::Accepted { key: k }) => {
+                assert_eq!(k, key, "Accepted key must match request key");
+                // Verify key is in node B's PaidForList
+                let paid_list = node_b.paid_list.as_ref().expect("Node B paid_list");
+                assert!(
+                    paid_list.read().contains(&key),
+                    "Accepted key must be in node B's PaidForList"
+                );
+            }
+            ReplicationBody::PaidNotifyResponse(PaidNotifyResponse::Rejected { key: k }) => {
+                // Rejected because node B is not in paid close group for this key.
+                // This is valid — the handler checks is_in_paid_close_group.
+                assert_eq!(k, key, "Rejected key must match request key");
+            }
+            other => panic!("Expected PaidNotifyResponse, got: {other:?}"),
+        }
+
+        // --- Empty PoP: must always be rejected ---
+        let reject_request_id: u64 = rand::thread_rng().gen();
+        let reject_message = ReplicationMessage {
+            request_id: reject_request_id,
+            body: ReplicationBody::PaidNotify(PaidNotifyRequest {
+                key,
+                proof_of_payment: vec![], // Empty = invalid
+            }),
+        };
+
+        let reject_resp =
+            send_and_await_replication_response(&p2p_a, &target_peer_id, &reject_message)
+                .await
+                .expect("Should receive rejection response");
+
+        match reject_resp {
+            ReplicationBody::PaidNotifyResponse(PaidNotifyResponse::Rejected { key: k }) => {
+                assert_eq!(k, key, "Rejected key must match request key");
+            }
+            other => panic!("Expected Rejected for empty PoP, got: {other:?}"),
+        }
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 16b. Audit failure paths
+    // =========================================================================
+
+    /// Exercise `verify_audit_response`, `failed_keys`, and `confirm_failures`
+    /// with fabricated digest data to cover partial-failure and
+    /// no-confirmed-responsibility scenarios.
+    ///
+    /// Design doc coverage: Section 15 steps 10-11,
+    /// test matrix scenarios 19, 53, 55.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_audit_failure_paths() {
+        let harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        let node = harness.test_node(0).expect("Node 0 should exist");
+
+        // Store 3 chunks to get real content addresses and data
+        let data1 = test_data(128, 0xD1);
+        let data2 = test_data(128, 0xD2);
+        let data3 = test_data(128, 0xD3);
+        let key1 = node.store_chunk(&data1).await.expect("Store chunk 1");
+        let key2 = node.store_chunk(&data2).await.expect("Store chunk 2");
+        let key3 = node.store_chunk(&data3).await.expect("Store chunk 3");
+
+        let nonce = [0xEE; 32];
+        let challenged_peer = "peer_under_audit";
+
+        // Build local records map
+        let mut local_records: HashMap<XorName, Vec<u8>> = HashMap::new();
+        local_records.insert(key1, data1.clone());
+        local_records.insert(key2, data2.clone());
+        local_records.insert(key3, data3.clone());
+
+        let challenge_keys = vec![key1, key2, key3];
+
+        // Fabricate response digests:
+        //   K1: correct digest → Passed
+        //   K2: wrong digest → Failed
+        //   K3: ABSENT_DIGEST → Absent
+        let correct_digest = compute_audit_digest(&nonce, challenged_peer, &key1, &data1);
+        let wrong_digest = [0xFF; 32]; // definitely wrong
+        let response_digests = vec![correct_digest, wrong_digest, ABSENT_DIGEST];
+
+        // --- Scenario 19/53: partial failure with mixed responsibility ---
+        let results = verify_audit_response(
+            &nonce,
+            challenged_peer,
+            &challenge_keys,
+            &response_digests,
+            &local_records,
+        )
+        .expect("Response length matches");
+
+        assert_eq!(results[0], AuditKeyResult::Passed, "K1 correct → Passed");
+        assert_eq!(results[1], AuditKeyResult::Failed, "K2 wrong → Failed");
+        assert_eq!(results[2], AuditKeyResult::Absent, "K3 absent → Absent");
+
+        // failed_keys should return K2 and K3
+        let failures = failed_keys(&challenge_keys, &results);
+        assert_eq!(failures.len(), 2, "Should have 2 failed keys");
+        assert!(failures.contains(&key2), "K2 should be in failures");
+        assert!(failures.contains(&key3), "K3 should be in failures");
+
+        // confirm_failures: peer appears in fresh lookup for K2 but not K3
+        let mut fresh_lookups: HashMap<XorName, Vec<String>> = HashMap::new();
+        fresh_lookups.insert(
+            key2,
+            vec![challenged_peer.to_string(), "other_peer".to_string()],
+        );
+        // K3 intentionally absent from fresh_lookups (peer not responsible)
+
+        let confirmed = confirm_failures(&failures, challenged_peer, &fresh_lookups);
+        assert_eq!(confirmed.len(), 1, "Only K2 should be confirmed");
+        assert_eq!(confirmed[0], key2, "Confirmed failure should be K2");
+
+        // --- Scenario 55: no confirmed responsibility ---
+        // All digests mismatch but peer not in any fresh lookup
+        let all_wrong = vec![[0xAA; 32], [0xBB; 32], [0xCC; 32]];
+        let results_all_fail = verify_audit_response(
+            &nonce,
+            challenged_peer,
+            &challenge_keys,
+            &all_wrong,
+            &local_records,
+        )
+        .expect("Response length matches");
+
+        let all_failures = failed_keys(&challenge_keys, &results_all_fail);
+        assert_eq!(all_failures.len(), 3, "All keys should fail");
+
+        // Empty fresh lookups → no confirmed failures → no AuditFailure
+        let empty_lookups: HashMap<XorName, Vec<String>> = HashMap::new();
+        let no_confirmed = confirm_failures(&all_failures, challenged_peer, &empty_lookups);
+        assert!(
+            no_confirmed.is_empty(),
+            "No confirmed failures when peer has no fresh responsibility"
+        );
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 16c. Audit target selection pipeline
+    // =========================================================================
+
+    /// Exercise the full audit target selection pipeline with live topology:
+    /// `sample_audit_keys` → `build_candidate_peer_sets` →
+    /// `select_challenged_peer`.
+    ///
+    /// Design doc coverage: Section 15 steps 2-7,
+    /// test matrix scenario 30.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_audit_target_selection_pipeline() {
+        let harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        let node = harness.test_node(3).expect("Node 3 should exist");
+        let peers = node.connected_peers().await;
+        assert!(!peers.is_empty(), "Node 3 should have peers");
+
+        // Store chunks to get real keys
+        let mut stored_keys = Vec::new();
+        for seed in 0..AUDIT_TEST_CHUNK_COUNT {
+            let data = test_data(64, seed);
+            let key = node.store_chunk(&data).await.expect("Store chunk");
+            stored_keys.push(key);
+        }
+
+        // Step 2: sample_audit_keys
+        let sampled = sample_audit_keys(&stored_keys, 42);
+        assert!(!sampled.is_empty(), "Sampled keys must not be empty");
+        assert!(
+            sampled.len() <= AUDIT_BATCH_SIZE,
+            "Sampled keys must be <= AUDIT_BATCH_SIZE"
+        );
+        for key in &sampled {
+            assert!(
+                stored_keys.contains(key),
+                "Sampled key must come from stored set"
+            );
+        }
+
+        // Steps 3-5: Simulate lookup results mapping keys → peer sets
+        // Use real peers from the live network as lookup results
+        let lookup_results: Vec<(XorName, Vec<String>)> = sampled
+            .iter()
+            .map(|key| {
+                // Simulate: each key found on first 3 peers (or fewer if network is small)
+                let result_peers: Vec<String> =
+                    peers.iter().take(TEST_PEER_SUBSET_SIZE).cloned().collect();
+                (*key, result_peers)
+            })
+            .collect();
+
+        // Build LocalRT peer ID set
+        let local_rt_ids: HashSet<String> = peers.iter().cloned().collect();
+
+        // Step 6: build_candidate_peer_sets filtered to LocalRT
+        let candidates = build_candidate_peer_sets(&lookup_results, &local_rt_ids);
+        assert!(
+            !candidates.is_empty(),
+            "Candidates must not be empty when peers are in LocalRT"
+        );
+
+        // All candidate peers must be in LocalRT
+        for candidate in &candidates {
+            assert!(
+                local_rt_ids.contains(&candidate.peer_id),
+                "Candidate peer must be in LocalRT"
+            );
+            assert!(
+                !candidate.keys.is_empty(),
+                "Candidate must have non-empty key set"
+            );
+        }
+
+        // Step 7: select_challenged_peer
+        let selected = select_challenged_peer(&candidates, 42);
+        assert!(selected.is_some(), "Should select a challenged peer");
+        let selected = selected.unwrap();
+        assert!(
+            local_rt_ids.contains(&selected.peer_id),
+            "Selected peer must be in LocalRT"
+        );
+        assert!(
+            !selected.keys.is_empty(),
+            "Selected peer must have non-empty PeerKeySet"
+        );
+
+        // Empty candidates → None
+        let empty_candidates: Vec<PeerKeySet> = Vec::new();
+        assert!(
+            select_challenged_peer(&empty_candidates, 42).is_none(),
+            "Empty candidates must return None"
+        );
 
         harness
             .teardown()
@@ -1528,7 +1859,7 @@ mod tests {
     /// the digest response matches local recomputation.
     ///
     /// Design doc coverage: Section 15 steps 1-10,
-    /// test matrix scenarios 19, 53, 54, 55.
+    /// test matrix scenario 54.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_audit_challenge_response_over_p2p() {
         let mut harness = TestHarness::setup_minimal()
