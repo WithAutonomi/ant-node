@@ -18,10 +18,13 @@
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use crate::testnet::send_and_await_replication_response;
     use crate::TestHarness;
-    use saorsa_node::client::{compute_address, xor_distance, XorName};
+    use rand::Rng;
+    use saorsa_node::client::{compute_address, peer_id_to_xor_name, xor_distance, XorName};
     use saorsa_node::replication::audit::{
         compute_audit_digest, sample_audit_keys, verify_audit_response, AuditKeyResult,
+        ABSENT_DIGEST,
     };
     use saorsa_node::replication::bootstrap::BootstrapTracker;
     use saorsa_node::replication::fetch::{
@@ -31,13 +34,15 @@ mod tests {
     use saorsa_node::replication::neighbor_sync::hints::{
         admit_hint, compute_hints_for_peer, deduplicate_hints, AdmissionResult,
     };
+    use saorsa_node::replication::neighbor_sync::session::{process_session, SessionDirection};
     use saorsa_node::replication::paid_list::PaidForList;
     use saorsa_node::replication::params::{
         AUDIT_BATCH_SIZE, CLOSE_GROUP_SIZE, PAID_LIST_CLOSE_GROUP_SIZE,
     };
     use saorsa_node::replication::protocol::{
-        AuditChallengeRequest, FetchRequest, FreshOfferRequest, PaidNotifyRequest, ReplicationBody,
-        ReplicationMessage, SyncHintsRequest, VerifyRequest,
+        AuditChallengeRequest, AuditChallengeResponse, FetchRequest, FreshOfferRequest,
+        FreshOfferResponse, PaidNotifyRequest, ReplicationBody, ReplicationMessage,
+        SyncHintsRequest, VerifyRequest,
     };
     use saorsa_node::replication::prune::{run_prune_pass, PruneTracker};
     use saorsa_node::replication::routing;
@@ -1170,6 +1175,492 @@ mod tests {
 
         // Verify key is preserved through transitions
         assert_eq!(state.key(), Some(&key));
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 14. Fresh offer delivery over P2P
+    // =========================================================================
+
+    /// Send a `FreshOffer` message between two live nodes and verify the
+    /// round-trip: the receiver either accepts and stores the chunk, or
+    /// rejects with a valid reason.
+    ///
+    /// Also tests rejection path: an offer with empty PoP must be rejected.
+    ///
+    /// Design doc coverage: Section 6.1 rules 1-7, Section 7.3, Section 10,
+    /// test matrix scenarios 1, 2.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_fresh_offer_over_p2p() {
+        let mut harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        // Enable replication routing on nodes 3 and 4
+        let node_a_index = 3;
+        let node_b_index = 4;
+
+        harness
+            .network_mut()
+            .node_mut(node_b_index)
+            .expect("Node B must exist")
+            .enable_replication_routing();
+        harness
+            .network_mut()
+            .node_mut(node_b_index)
+            .expect("Node B must exist")
+            .update_routing_view()
+            .await;
+
+        // Also enable on node A so it can receive if needed
+        harness
+            .network_mut()
+            .node_mut(node_a_index)
+            .expect("Node A must exist")
+            .enable_replication_routing();
+        harness
+            .network_mut()
+            .node_mut(node_a_index)
+            .expect("Node A must exist")
+            .update_routing_view()
+            .await;
+
+        // Allow routing tasks to start
+        tokio::time::sleep(Duration::from_millis(crate::testnet::TASK_STARTUP_DELAY_MS)).await;
+
+        let node_a = harness.test_node(node_a_index).expect("Node A");
+        let node_b = harness.test_node(node_b_index).expect("Node B");
+        let p2p_a = node_a.p2p_node.as_ref().expect("Node A P2P").clone();
+
+        let target_peer_id = node_b
+            .p2p_node
+            .as_ref()
+            .expect("Node B P2P")
+            .transport_peer_id()
+            .expect("Node B transport peer ID");
+
+        // Store chunk data locally on node A, compute content address
+        let content = b"fresh offer e2e test payload";
+        let key = compute_address(content);
+
+        // Build FreshOfferRequest with valid (non-empty) PoP
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ReplicationMessage {
+            request_id,
+            body: ReplicationBody::FreshOffer(FreshOfferRequest {
+                key,
+                content: content.to_vec(),
+                proof_of_payment: vec![1, 2, 3],
+            }),
+        };
+
+        let resp = send_and_await_replication_response(&p2p_a, &target_peer_id, &message)
+            .await
+            .expect("Should receive replication response");
+
+        // The receiver may accept (if responsible) or reject (if not responsible)
+        match resp {
+            ReplicationBody::FreshOfferResponse(FreshOfferResponse::Accepted { key: k }) => {
+                assert_eq!(k, key, "Accepted key must match request key");
+                // Verify chunk is stored on node B via its existing storage
+                let b_storage = node_b
+                    .ant_protocol
+                    .as_ref()
+                    .expect("Node B AntProtocol")
+                    .storage();
+                assert!(
+                    b_storage.exists(&key),
+                    "Accepted chunk must exist in node B storage"
+                );
+                // Verify key is in node B's PaidForList
+                let paid_list = node_b.paid_list.as_ref().expect("Node B paid_list");
+                assert!(
+                    paid_list.read().contains(&key),
+                    "Accepted key must be in node B's PaidForList"
+                );
+            }
+            ReplicationBody::FreshOfferResponse(FreshOfferResponse::Rejected {
+                key: k,
+                reason,
+            }) => {
+                assert_eq!(k, key, "Rejected key must match request key");
+                assert!(
+                    !reason.is_empty(),
+                    "Rejection reason must not be empty, got: {reason}"
+                );
+            }
+            other => panic!("Expected FreshOfferResponse, got: {other:?}"),
+        }
+
+        // Test rejection: send FreshOffer with empty PoP (must always be rejected)
+        let reject_request_id: u64 = rand::thread_rng().gen();
+        let reject_message = ReplicationMessage {
+            request_id: reject_request_id,
+            body: ReplicationBody::FreshOffer(FreshOfferRequest {
+                key,
+                content: content.to_vec(),
+                proof_of_payment: vec![], // Empty = invalid
+            }),
+        };
+
+        let reject_resp =
+            send_and_await_replication_response(&p2p_a, &target_peer_id, &reject_message)
+                .await
+                .expect("Should receive rejection response");
+
+        match reject_resp {
+            ReplicationBody::FreshOfferResponse(FreshOfferResponse::Rejected {
+                reason, ..
+            }) => {
+                assert!(
+                    reason.contains("proof of payment"),
+                    "Empty PoP rejection reason should mention proof of payment, got: {reason}"
+                );
+            }
+            other => panic!("Expected Rejected for empty PoP, got: {other:?}"),
+        }
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 15. Neighbor-sync session with cross-node topology
+    // =========================================================================
+
+    /// Exercise the full neighbor-sync session logic using two live nodes'
+    /// real P2P peer IDs and routing tables.
+    ///
+    /// Not sent over P2P because `SyncHints` dispatch isn't wired in `node.rs`,
+    /// but uses real topology from two live nodes, which is significantly more
+    /// realistic than existing single-node tests.
+    ///
+    /// Design doc coverage: Section 6.2 rules 4-9, Section 7.1,
+    /// test matrix scenarios 5, 7, 8, 37.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_neighbor_sync_session_cross_node() {
+        let harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        let node_a = harness.test_node(3).expect("Node 3 should exist");
+        let node_b = harness.test_node(4).expect("Node 4 should exist");
+
+        let peers_a = node_a.connected_peers().await;
+        let peers_b = node_b.connected_peers().await;
+        assert!(
+            peers_a.len() >= MIN_PEERS_FOR_HINT_TEST,
+            "Node A needs at least {MIN_PEERS_FOR_HINT_TEST} peers"
+        );
+        assert!(
+            peers_b.len() >= MIN_PEERS_FOR_HINT_TEST,
+            "Node B needs at least {MIN_PEERS_FOR_HINT_TEST} peers"
+        );
+
+        // Build routing tables using production peer_id_to_xor_name (hex decode)
+        // Fall back to SHA256 hash for peer IDs that aren't hex-encoded
+        let rt_a: Vec<(String, XorName)> = peers_a
+            .iter()
+            .map(|id| {
+                let xor = peer_id_to_xor_name(id).unwrap_or_else(|| compute_address(id.as_bytes()));
+                (id.clone(), xor)
+            })
+            .collect();
+        let rt_b: Vec<(String, XorName)> = peers_b
+            .iter()
+            .map(|id| {
+                let xor = peer_id_to_xor_name(id).unwrap_or_else(|| compute_address(id.as_bytes()));
+                (id.clone(), xor)
+            })
+            .collect();
+
+        let id_a = &node_a.node_id;
+        let xor_a = peer_id_to_xor_name(id_a).unwrap_or_else(|| compute_address(id_a.as_bytes()));
+        let id_b = &node_b.node_id;
+        let xor_b = peer_id_to_xor_name(id_b).unwrap_or_else(|| compute_address(id_b.as_bytes()));
+
+        // Store distinct chunks on each node
+        let data_a1 = test_data(64, 0xA1);
+        let data_a2 = test_data(64, 0xA2);
+        let key_a1 = node_a.store_chunk(&data_a1).await.expect("Store A1");
+        let key_a2 = node_a.store_chunk(&data_a2).await.expect("Store A2");
+        let local_keys_a = vec![key_a1, key_a2];
+
+        let data_b1 = test_data(64, 0xB1);
+        let data_b2 = test_data(64, 0xB2);
+        let key_b1 = node_b.store_chunk(&data_b1).await.expect("Store B1");
+        let key_b2 = node_b.store_chunk(&data_b2).await.expect("Store B2");
+        let local_keys_b = vec![key_b1, key_b2];
+
+        // Node A computes hints for B
+        let hints_a_for_b = compute_hints_for_peer(
+            id_a,
+            &xor_a,
+            id_b,
+            &rt_a,
+            &local_keys_a,
+            &local_keys_a, // Same keys in paid list for simplicity
+        );
+
+        // Cross-set dedup: no key in both replica and paid
+        for key in &hints_a_for_b.replica_hints {
+            assert!(
+                !hints_a_for_b.paid_hints.contains(key),
+                "Cross-set dedup violated: key in both replica and paid hints"
+            );
+        }
+
+        // Node B processes session with A's hints
+        let session_b = process_session(
+            id_b,
+            &xor_b,
+            id_a,
+            &rt_b,
+            &local_keys_b,
+            &local_keys_b,
+            &hints_a_for_b.replica_hints,
+            &hints_a_for_b.paid_hints,
+            &|_| false, // nothing is local/pending on B for A's keys
+            &|_| false, // nothing in B's paid list for A's keys
+        );
+
+        // Verify direction is correct
+        let a_in_b_rt = rt_b.iter().any(|(id, _)| id == id_a);
+        if a_in_b_rt {
+            assert_eq!(
+                session_b.direction,
+                SessionDirection::Bidirectional,
+                "Peer in LocalRT should produce Bidirectional session"
+            );
+        } else {
+            assert_eq!(
+                session_b.direction,
+                SessionDirection::OutboundOnly,
+                "Peer not in LocalRT should produce OutboundOnly session"
+            );
+            // Outbound-only sessions admit zero keys
+            assert!(
+                session_b.admitted.is_empty(),
+                "OutboundOnly session should admit no keys"
+            );
+        }
+
+        // Cross-set dedup on admitted keys: no key in both replica and paid
+        let replica_admitted: HashSet<XorName> = session_b
+            .admitted
+            .iter()
+            .filter(|a| a.pipeline == HintPipeline::Replica)
+            .map(|a| a.key)
+            .collect();
+        let paid_admitted: HashSet<XorName> = session_b
+            .admitted
+            .iter()
+            .filter(|a| a.pipeline == HintPipeline::PaidOnly)
+            .map(|a| a.key)
+            .collect();
+        assert!(
+            replica_admitted.is_disjoint(&paid_admitted),
+            "Admitted keys must not appear in both replica and paid pipelines"
+        );
+
+        // Bidirectional admitted replica keys pass is_responsible,
+        // paid keys pass is_in_paid_close_group
+        for admitted in &session_b.admitted {
+            match admitted.pipeline {
+                HintPipeline::Replica => {
+                    assert!(
+                        routing::is_responsible(id_b, &xor_b, &admitted.key, &rt_b),
+                        "Admitted replica key must pass is_responsible"
+                    );
+                }
+                HintPipeline::PaidOnly => {
+                    assert!(
+                        routing::is_in_paid_close_group(id_b, &xor_b, &admitted.key, &rt_b),
+                        "Admitted paid key must pass is_in_paid_close_group"
+                    );
+                }
+            }
+        }
+
+        // Reverse direction: B computes hints for A, A processes session
+        let hints_b_for_a =
+            compute_hints_for_peer(id_b, &xor_b, id_a, &rt_b, &local_keys_b, &local_keys_b);
+
+        let session_a = process_session(
+            id_a,
+            &xor_a,
+            id_b,
+            &rt_a,
+            &local_keys_a,
+            &local_keys_a,
+            &hints_b_for_a.replica_hints,
+            &hints_b_for_a.paid_hints,
+            &|_| false,
+            &|_| false,
+        );
+
+        // Same direction invariants
+        let b_in_a_rt = rt_a.iter().any(|(id, _)| id == id_b);
+        if b_in_a_rt {
+            assert_eq!(session_a.direction, SessionDirection::Bidirectional);
+        } else {
+            assert_eq!(session_a.direction, SessionDirection::OutboundOnly);
+            assert!(session_a.admitted.is_empty());
+        }
+
+        harness
+            .teardown()
+            .await
+            .expect("Failed to teardown harness");
+    }
+
+    // =========================================================================
+    // 16. Audit challenge-response over P2P
+    // =========================================================================
+
+    /// Send an `AuditChallenge` to a node that holds chunks and verify
+    /// the digest response matches local recomputation.
+    ///
+    /// Design doc coverage: Section 15 steps 1-10,
+    /// test matrix scenarios 19, 53, 54, 55.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_audit_challenge_response_over_p2p() {
+        let mut harness = TestHarness::setup_minimal()
+            .await
+            .expect("Failed to setup test harness");
+
+        let node_a_index = 3;
+        let node_b_index = 4;
+
+        // Enable replication routing on node B (the audit target)
+        harness
+            .network_mut()
+            .node_mut(node_b_index)
+            .expect("Node B must exist")
+            .enable_replication_routing();
+
+        // Allow routing task to start
+        tokio::time::sleep(Duration::from_millis(crate::testnet::TASK_STARTUP_DELAY_MS)).await;
+
+        let node_a = harness.test_node(node_a_index).expect("Node A");
+        let node_b = harness.test_node(node_b_index).expect("Node B");
+        let p2p_a = node_a.p2p_node.as_ref().expect("Node A P2P").clone();
+
+        let target_peer_id = node_b
+            .p2p_node
+            .as_ref()
+            .expect("Node B P2P")
+            .transport_peer_id()
+            .expect("Node B transport peer ID");
+
+        // Store 3 known chunks on node B's local storage
+        let chunk_count: usize = 3;
+        let mut stored_keys = Vec::with_capacity(chunk_count);
+        let mut stored_content: HashMap<XorName, Vec<u8>> = HashMap::new();
+
+        for seed in 0..chunk_count {
+            #[allow(clippy::cast_possible_truncation)]
+            let data = test_data(128, 0xC0 + seed as u8);
+            let key = node_b.store_chunk(&data).await.expect("Store chunk on B");
+            stored_keys.push(key);
+            stored_content.insert(key, data);
+        }
+
+        // Create an absent key (never stored)
+        let absent_key = compute_address(b"this chunk does not exist on node B");
+        assert!(
+            !stored_keys.contains(&absent_key),
+            "Absent key must not collide with stored keys"
+        );
+
+        // Construct AuditChallengeRequest: 3 present + 1 absent = 4 keys
+        let nonce: [u8; 32] = rand::thread_rng().gen();
+        let challenge_id: u64 = rand::thread_rng().gen();
+        let challenge_keys_count: usize = 4;
+        let mut challenge_keys = stored_keys.clone();
+        challenge_keys.push(absent_key);
+        assert_eq!(challenge_keys.len(), challenge_keys_count);
+
+        let request_id: u64 = rand::thread_rng().gen();
+        let message = ReplicationMessage {
+            request_id,
+            body: ReplicationBody::AuditChallenge(AuditChallengeRequest {
+                challenge_id,
+                nonce,
+                keys: challenge_keys.clone(),
+            }),
+        };
+
+        let resp = send_and_await_replication_response(&p2p_a, &target_peer_id, &message)
+            .await
+            .expect("Should receive audit response");
+
+        // Assert response is Digests with correct challenge_id
+        let digests = match resp {
+            ReplicationBody::AuditResponse(AuditChallengeResponse::Digests {
+                challenge_id: cid,
+                digests,
+            }) => {
+                assert_eq!(cid, challenge_id, "Challenge ID must be echoed in response");
+                digests
+            }
+            other => panic!("Expected AuditResponse::Digests, got: {other:?}"),
+        };
+
+        // Assert digest count matches key count
+        assert_eq!(
+            digests.len(),
+            challenge_keys_count,
+            "Digest count must match challenge key count"
+        );
+
+        // Verify using verify_audit_response: 3 Passed, 1 Absent
+        let results = verify_audit_response(
+            &nonce,
+            &target_peer_id,
+            &challenge_keys,
+            &digests,
+            &stored_content,
+        )
+        .expect("Audit response should have matching lengths");
+
+        // First 3 keys are present on B and we have local copies → Passed
+        for (i, result) in results.iter().enumerate().take(chunk_count) {
+            assert_eq!(
+                *result,
+                AuditKeyResult::Passed,
+                "Key {i} should pass audit verification"
+            );
+        }
+
+        // Last key is absent on B → Absent
+        assert_eq!(
+            results[chunk_count],
+            AuditKeyResult::Absent,
+            "Absent key should return Absent result"
+        );
+
+        // Assert absent key returned ABSENT_DIGEST
+        assert_eq!(
+            digests[chunk_count], ABSENT_DIGEST,
+            "Absent key digest must be ABSENT_DIGEST ([0u8; 32])"
+        );
+
+        // Manually recompute one digest and verify it matches
+        let verify_key = &challenge_keys[0];
+        let verify_content = stored_content.get(verify_key).expect("Content for key 0");
+        let expected_digest =
+            compute_audit_digest(&nonce, &target_peer_id, verify_key, verify_content);
+        assert_eq!(
+            digests[0], expected_digest,
+            "Manually recomputed digest must match network response"
+        );
 
         harness
             .teardown()

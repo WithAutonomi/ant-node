@@ -21,16 +21,24 @@ use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
 };
-use saorsa_node::client::{send_and_await_chunk_response, DataChunk, XorName};
+use saorsa_node::client::{peer_id_to_xor_name, send_and_await_chunk_response, DataChunk, XorName};
 use saorsa_node::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
+};
+use saorsa_node::replication::audit::compute_audit_digest;
+use saorsa_node::replication::fresh;
+use saorsa_node::replication::paid_list::PaidForList;
+use saorsa_node::replication::protocol::{
+    AuditChallengeResponse, FreshOfferResponse, ReplicationBody, ReplicationMessage,
+    REPLICATION_PROTOCOL_ID,
 };
 use saorsa_node::storage::{AntProtocol, DiskStorage, DiskStorageConfig};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
@@ -331,6 +339,15 @@ pub struct TestNode {
     /// Populated once the node starts and the protocol router is spawned.
     /// Dropped (and aborted) during teardown so tests don't leave tasks behind.
     protocol_task: Option<JoinHandle<()>>,
+
+    /// Paid-for list for replication protocol tests.
+    pub paid_list: Option<Arc<parking_lot::RwLock<PaidForList>>>,
+
+    /// Routing view: connected peers as `(peer_id, XorName)` pairs.
+    pub routing_view: Arc<parking_lot::RwLock<Vec<(String, XorName)>>>,
+
+    /// Replication protocol handler background task handle.
+    replication_task: Option<JoinHandle<()>>,
 }
 
 impl TestNode {
@@ -714,6 +731,234 @@ impl TestNode {
     pub fn compute_chunk_address(data: &[u8]) -> XorName {
         saorsa_node::compute_address(data)
     }
+
+    // =========================================================================
+    // Replication Protocol Helpers
+    // =========================================================================
+
+    /// Populate `routing_view` from the node's connected peers.
+    ///
+    /// Converts each transport peer ID to an `XorName` via hex-decode
+    /// (matching the production `peer_id_to_xor_name`). Peers with
+    /// non-hex-decodable IDs are silently skipped.
+    pub async fn update_routing_view(&self) {
+        let peers = self.connected_peers().await;
+        let mut view = Vec::with_capacity(peers.len());
+        for peer_id in &peers {
+            if let Some(xor) = peer_id_to_xor_name(peer_id) {
+                view.push((peer_id.clone(), xor));
+            }
+        }
+        *self.routing_view.write() = view;
+    }
+
+    /// Enable replication protocol message handling on this node.
+    ///
+    /// Spawns a background task that subscribes to P2P events filtered by
+    /// `REPLICATION_PROTOCOL_ID` and handles `FreshOffer`, `PaidNotify`,
+    /// and `AuditChallenge` messages using production replication logic.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node is not running or `PaidForList` cannot be loaded.
+    pub fn enable_replication_routing(&mut self) {
+        // Abort any previously spawned replication task to avoid duplicates
+        if let Some(old) = self.replication_task.take() {
+            old.abort();
+        }
+
+        let p2p = self
+            .p2p_node
+            .as_ref()
+            .expect("Node must be running")
+            .clone();
+
+        let paid_list = PaidForList::load(&self.data_dir).expect("Failed to load PaidForList");
+        let paid_list = Arc::new(parking_lot::RwLock::new(paid_list));
+        self.paid_list = Some(Arc::clone(&paid_list));
+
+        let storage = self
+            .ant_protocol
+            .as_ref()
+            .expect("AntProtocol must exist")
+            .storage()
+            .clone();
+
+        let routing_view = Arc::clone(&self.routing_view);
+        let node_index = self.index;
+
+        // Derive self XOR name from transport peer ID
+        let self_peer_id = p2p
+            .transport_peer_id()
+            .expect("Transport peer ID must be available");
+        let self_xor = peer_id_to_xor_name(&self_peer_id)
+            .unwrap_or_else(|| saorsa_node::compute_address(self_peer_id.as_bytes()));
+
+        let mut events = p2p.subscribe_events();
+
+        self.replication_task = Some(tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let P2PEvent::Message {
+                    topic,
+                    source,
+                    data,
+                } = event
+                else {
+                    continue;
+                };
+                if topic != REPLICATION_PROTOCOL_ID {
+                    continue;
+                }
+
+                let msg = match ReplicationMessage::decode(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            "Node {} failed to decode replication message: {e}",
+                            node_index
+                        );
+                        continue;
+                    }
+                };
+
+                let request_id = msg.request_id;
+                let response_body = match msg.body {
+                    ReplicationBody::FreshOffer(req) => {
+                        let local_rt = routing_view.read().clone();
+                        let resp = fresh::handle_fresh_offer(
+                            &self_peer_id,
+                            &self_xor,
+                            &req,
+                            &local_rt,
+                            &storage,
+                        )
+                        .await;
+                        // On accept, add key to paid list
+                        if matches!(resp, FreshOfferResponse::Accepted { .. }) {
+                            paid_list.write().add(req.key);
+                        }
+                        ReplicationBody::FreshOfferResponse(resp)
+                    }
+                    ReplicationBody::PaidNotify(req) => {
+                        let local_rt = routing_view.read().clone();
+                        let resp = fresh::handle_paid_notify(
+                            &self_peer_id,
+                            &self_xor,
+                            &req,
+                            &local_rt,
+                            &mut paid_list.write(),
+                        );
+                        ReplicationBody::PaidNotifyResponse(resp)
+                    }
+                    ReplicationBody::AuditChallenge(req) => {
+                        let mut digests = Vec::with_capacity(req.keys.len());
+                        for key in &req.keys {
+                            match storage.get_raw(key).await {
+                                Ok(Some(raw)) => {
+                                    digests.push(compute_audit_digest(
+                                        &req.nonce,
+                                        &self_peer_id,
+                                        key,
+                                        &raw,
+                                    ));
+                                }
+                                _ => {
+                                    digests.push(saorsa_node::replication::audit::ABSENT_DIGEST);
+                                }
+                            }
+                        }
+                        ReplicationBody::AuditResponse(AuditChallengeResponse::Digests {
+                            challenge_id: req.challenge_id,
+                            digests,
+                        })
+                    }
+                    _ => {
+                        debug!("Node {} ignoring unhandled replication variant", node_index);
+                        continue;
+                    }
+                };
+
+                let response = ReplicationMessage {
+                    request_id,
+                    body: response_body,
+                };
+                if let Ok(bytes) = response.encode() {
+                    if let Err(e) = p2p
+                        .send_message(&source, REPLICATION_PROTOCOL_ID, bytes)
+                        .await
+                    {
+                        warn!(
+                            "Node {} failed to send replication response: {e}",
+                            node_index
+                        );
+                    }
+                }
+            }
+        }));
+    }
+}
+
+/// Default timeout for replication protocol round-trips (seconds).
+const DEFAULT_REPLICATION_TIMEOUT_SECS: u64 = 10;
+
+/// Delay to allow spawned background tasks to start polling (milliseconds).
+pub const TASK_STARTUP_DELAY_MS: u64 = 100;
+
+/// Send a replication protocol message and await a matching response.
+///
+/// Same subscribe-send-poll pattern as `send_and_await_chunk_response`,
+/// but for `ReplicationMessage` on `REPLICATION_PROTOCOL_ID`.
+pub async fn send_and_await_replication_response(
+    node: &P2PNode,
+    target_peer: &str,
+    message: &ReplicationMessage,
+) -> std::result::Result<ReplicationBody, TestnetError> {
+    let mut events = node.subscribe_events();
+
+    let request_id = message.request_id;
+    let target_peer_owned = target_peer.to_string();
+    let message_bytes = message.encode().map_err(|e| {
+        TestnetError::Serialization(format!("Failed to encode replication message: {e}"))
+    })?;
+
+    node.send_message(&target_peer_owned, REPLICATION_PROTOCOL_ID, message_bytes)
+        .await
+        .map_err(|e| TestnetError::Core(format!("Failed to send replication message: {e}")))?;
+
+    let timeout = Duration::from_secs(DEFAULT_REPLICATION_TIMEOUT_SECS);
+    let deadline = Instant::now() + timeout;
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, events.recv()).await {
+            Ok(Ok(P2PEvent::Message {
+                topic,
+                source,
+                data,
+            })) if topic == REPLICATION_PROTOCOL_ID && source == target_peer_owned => {
+                let resp = match ReplicationMessage::decode(&data) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Failed to decode replication response, skipping: {e}");
+                        continue;
+                    }
+                };
+                if resp.request_id != request_id {
+                    continue;
+                }
+                return Ok(resp.body);
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(RecvError::Lagged(skipped))) => {
+                debug!("Replication events lagged by {skipped} messages, continuing");
+            }
+            Ok(Err(RecvError::Closed)) | Err(_) => break,
+        }
+    }
+
+    Err(TestnetError::Core(format!(
+        "Timeout waiting for replication response after {DEFAULT_REPLICATION_TIMEOUT_SECS}s"
+    )))
 }
 
 /// Manages a network of test nodes.
@@ -933,6 +1178,9 @@ impl TestNetwork {
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
             protocol_task: None,
+            paid_list: None,
+            routing_view: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            replication_task: None,
         })
     }
 
@@ -1168,6 +1416,9 @@ impl TestNetwork {
         // Stop all nodes in reverse order
         for node in self.nodes.iter_mut().rev() {
             debug!("Stopping node {}", node.index);
+            if let Some(handle) = node.replication_task.take() {
+                handle.abort();
+            }
             if let Some(handle) = node.protocol_task.take() {
                 handle.abort();
             }
