@@ -71,6 +71,7 @@ impl CompletePaymentTestEnv {
 
         // Warm up DHT routing tables (essential for quote collection)
         harness.warmup_dht().await?;
+        sleep(Duration::from_secs(5)).await;
 
         // Create funded wallet from the SAME Anvil instance
         let private_key = testnet.default_wallet_private_key();
@@ -197,7 +198,7 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     // Store chunk with payment proof — nodes WILL verify on-chain
     // Retry with backoff: DHT routing tables may not be fully stabilized yet
     let mut stored_address = None;
-    for attempt in 1..=5 {
+    for attempt in 1..=8 {
         match client
             .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
             .await
@@ -208,15 +209,18 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
                 break;
             }
             Err(e) => {
-                warn!("Storage attempt {attempt}/5 failed: {e}");
-                if attempt < 5 {
-                    sleep(Duration::from_secs(3)).await;
+                warn!("Storage attempt {attempt}/8 failed: {e}");
+                if attempt < 8 {
+                    if attempt == 4 {
+                        let _ = env.harness.warmup_dht().await;
+                    }
+                    sleep(Duration::from_secs(5)).await;
                 }
             }
         }
     }
     let stored_address =
-        stored_address.ok_or("Storage MUST succeed with valid payment proof after 5 attempts")?;
+        stored_address.ok_or("Storage MUST succeed with valid payment proof after 8 attempts")?;
 
     assert_eq!(
         stored_address, expected_address,

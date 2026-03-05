@@ -31,7 +31,7 @@ use saorsa_node::payment::SingleNodePayment;
 use serial_test::serial;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Test environment containing both the test network and EVM testnet.
 struct PaymentTestEnv {
@@ -101,6 +101,7 @@ async fn init_testnet_and_evm() -> Result<PaymentTestEnv, Box<dyn std::error::Er
 
     // Warm up DHT routing tables (essential for quote collection and chunk routing)
     harness.warmup_dht().await?;
+    sleep(Duration::from_secs(5)).await;
     info!("Payment test environment ready");
 
     Ok(PaymentTestEnv { harness, testnet })
@@ -383,13 +384,33 @@ async fn test_idempotent_chunk_storage() -> Result<(), Box<dyn std::error::Error
 
     let test_data = b"Test data for idempotent storage";
 
-    // First store
-    let address1 = env
-        .harness
-        .test_node(0)
-        .ok_or("Node 0 not found")?
-        .store_chunk_with_payment(test_data)
-        .await?;
+    // First store — retry to allow DHT to stabilize
+    let mut address1 = None;
+    for attempt in 1..=8 {
+        info!("First store attempt {attempt}/8...");
+        match env
+            .harness
+            .test_node(0)
+            .ok_or("Node 0 not found")?
+            .store_chunk_with_payment(test_data)
+            .await
+        {
+            Ok(addr) => {
+                address1 = Some(addr);
+                break;
+            }
+            Err(e) => {
+                warn!("First store attempt {attempt}/8 failed: {e}");
+                if attempt < 8 {
+                    if attempt == 4 {
+                        let _ = env.harness.warmup_dht().await;
+                    }
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+    let address1 = address1.ok_or("First store MUST succeed after 8 attempts")?;
     info!("First store: {}", hex::encode(address1));
 
     // Second store of same data — node should respond with AlreadyExists
