@@ -14,7 +14,7 @@ Build a **pure quantum-proof network node** (`saorsa-node`) that:
 
 **Clean separation of concerns:**
 - **saorsa-node** = Pure quantum-proof node (no legacy baggage)
-- **saorsa-client** = Bridge layer (reads old network, writes new network)
+- **saorsa-cli** = Client layer (file/chunk operations with EVM payments)
 - **Auto-migration** = Nodes discover and upload local ant-node data
 - **Dual IP DHT** = IPv4 and IPv6 close groups for resilience
 
@@ -34,8 +34,8 @@ This avoids the complexity of bridge nodes by pushing migration logic to:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │   ┌─────────────┐         ┌─────────────────┐                  │
-│   │ ant-network │ ◄─────► │  saorsa-client  │                  │
-│   │ (classical) │  read   │  (bridge layer) │                  │
+│   │ ant-network │ ◄─────► │   saorsa-cli    │                  │
+│   │ (classical) │  read   │ (client layer)  │                  │
 │   └─────────────┘         └────────┬────────┘                  │
 │                                    │ write                      │
 │                                    ▼                            │
@@ -451,7 +451,7 @@ pub struct NodeLifecycle {
 
 ### 1. Node Architecture: Pure Quantum-Proof (No Legacy)
 - **No libp2p** - saorsa-node is clean, uses only ant-quic + saorsa-core
-- **Client is the bridge** - saorsa-client handles reading from ant-network
+- **Client is the bridge** - saorsa-cli handles reading from ant-network
 - **Node auto-migrates** - scans local ant-node data and uploads to network
 - **Rationale**: Simpler node, cleaner security model, easier maintenance
 

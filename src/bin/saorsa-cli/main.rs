@@ -2,18 +2,21 @@
 
 mod cli;
 
+use bytes::Bytes;
 use clap::Parser;
-use cli::{Cli, CliCommand, FileAction};
+use cli::{ChunkAction, Cli, CliCommand, FileAction};
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::P2PNode;
+use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
 use saorsa_node::client::{
     create_manifest, deserialize_manifest, reassemble_file, serialize_manifest, split_file,
     QuantumClient, QuantumConfig, XorName,
 };
 use saorsa_node::devnet::DevnetManifest;
 use saorsa_node::error::Error;
-use std::path::Path;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
@@ -40,16 +43,18 @@ async fn main() -> color_eyre::Result<()> {
     // Resolve private key from SECRET_KEY env var (check early, before network bootstrap)
     let private_key = std::env::var("SECRET_KEY").ok();
 
-    // Fail fast if upload requires SECRET_KEY but it's not set
-    if matches!(
+    // Fail fast if storage operations require SECRET_KEY but it's not set
+    let needs_wallet = matches!(
         cli.command,
         CliCommand::File {
             action: FileAction::Upload { .. }
+        } | CliCommand::Chunk {
+            action: ChunkAction::Put { .. }
         }
-    ) && private_key.is_none()
-    {
+    );
+    if needs_wallet && private_key.is_none() {
         return Err(color_eyre::eyre::eyre!(
-            "SECRET_KEY environment variable required for file upload (payment)"
+            "SECRET_KEY environment variable required for storage operations (payment)"
         ));
     }
 
@@ -79,6 +84,14 @@ async fn main() -> color_eyre::Result<()> {
             }
             FileAction::Download { address, output } => {
                 handle_download(&client, &address, output.as_deref()).await?;
+            }
+        },
+        CliCommand::Chunk { action } => match action {
+            ChunkAction::Put { file } => {
+                handle_chunk_put(&client, file).await?;
+            }
+            ChunkAction::Get { address, output } => {
+                handle_chunk_get(&client, &address, output).await?;
             }
         },
     }
@@ -204,6 +217,59 @@ async fn handle_download(
     Ok(())
 }
 
+async fn handle_chunk_put(client: &QuantumClient, file: Option<PathBuf>) -> color_eyre::Result<()> {
+    let content = read_input(file)?;
+    info!("Storing single chunk ({} bytes)", content.len());
+
+    let (address, tx_hashes) = client.put_chunk_with_payment(Bytes::from(content)).await?;
+    let hex_addr = hex::encode(address);
+    info!("Chunk stored at {hex_addr}");
+
+    println!("{hex_addr}");
+    let tx_strs: Vec<String> = tx_hashes.iter().map(|tx| format!("{tx:?}")).collect();
+    println!("TX_HASHES={}", tx_strs.join(","));
+
+    Ok(())
+}
+
+async fn handle_chunk_get(
+    client: &QuantumClient,
+    address: &str,
+    output: Option<PathBuf>,
+) -> color_eyre::Result<()> {
+    let addr = parse_address(address)?;
+    info!("Retrieving chunk {address}");
+
+    let result = client.get_chunk(&addr).await?;
+    match result {
+        Some(chunk) => {
+            if let Some(path) = output {
+                std::fs::write(&path, &chunk.content)?;
+                info!("Chunk saved to {}", path.display());
+            } else {
+                use std::io::Write;
+                std::io::stdout().write_all(&chunk.content)?;
+            }
+        }
+        None => {
+            return Err(color_eyre::eyre::eyre!(
+                "Chunk not found for address {address}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn read_input(file: Option<PathBuf>) -> color_eyre::Result<Vec<u8>> {
+    if let Some(path) = file {
+        return Ok(std::fs::read(path)?);
+    }
+    let mut buf = Vec::new();
+    std::io::stdin().read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 fn resolve_evm_network(
     evm_network: &str,
     manifest: Option<&DevnetManifest>,
@@ -272,6 +338,7 @@ async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<
     core_config.listen_addrs = vec![core_config.listen_addr];
     core_config.enable_ipv6 = false;
     core_config.bootstrap_peers = bootstrap;
+    core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
 
     let node = P2PNode::new(core_config)
         .await

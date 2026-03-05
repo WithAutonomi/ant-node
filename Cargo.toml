@@ -27,10 +27,6 @@ name = "saorsa-devnet"
 path = "src/bin/saorsa-devnet/main.rs"
 
 [[bin]]
-name = "saorsa-client"
-path = "src/bin/saorsa-client/main.rs"
-
-[[bin]]
 name = "saorsa-cli"
 path = "src/bin/saorsa-cli/main.rs"
 

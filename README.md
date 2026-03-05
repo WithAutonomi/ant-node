@@ -983,7 +983,7 @@ RUST_LOG=saorsa_node=debug,saorsa_core=debug ./saorsa-node
 |---------|-------------|------------|
 | **saorsa-core** | Core networking and security library | [github.com/dirvine/saorsa-core](https://github.com/dirvine/saorsa-core) |
 | **saorsa-pqc** | Post-quantum cryptography primitives | [github.com/dirvine/saorsa-pqc](https://github.com/dirvine/saorsa-pqc) |
-| **saorsa-client** | Client library for applications | [github.com/dirvine/saorsa-client](https://github.com/dirvine/saorsa-client) |
+| **saorsa-cli** | Unified CLI for file and chunk operations with EVM payments | Built into saorsa-node |
 
 ---
 

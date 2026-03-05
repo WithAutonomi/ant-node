@@ -37,10 +37,33 @@ pub struct Cli {
 /// CLI commands.
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
-    /// File operations.
+    /// File operations (multi-chunk upload/download with EVM payment).
     File {
         #[command(subcommand)]
         action: FileAction,
+    },
+    /// Single-chunk operations (low-level put/get without file splitting).
+    Chunk {
+        #[command(subcommand)]
+        action: ChunkAction,
+    },
+}
+
+/// Chunk subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ChunkAction {
+    /// Store a single chunk. Reads from FILE or stdin.
+    Put {
+        /// Input file (reads from stdin if omitted).
+        file: Option<PathBuf>,
+    },
+    /// Retrieve a single chunk. Writes to FILE or stdout.
+    Get {
+        /// Hex-encoded chunk address (64 hex chars).
+        address: String,
+        /// Output file (writes to stdout if omitted).
+        #[arg(long, short)]
+        output: Option<PathBuf>,
     },
 }
 
@@ -63,7 +86,7 @@ pub enum FileAction {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -119,5 +142,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(cli.evm_network, "local");
+    }
+
+    #[test]
+    fn test_parse_chunk_put() {
+        let cli = Cli::try_parse_from([
+            "saorsa-cli",
+            "--bootstrap",
+            "127.0.0.1:10000",
+            "chunk",
+            "put",
+            "/tmp/test.txt",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            CliCommand::Chunk {
+                action: ChunkAction::Put { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_get() {
+        let cli = Cli::try_parse_from([
+            "saorsa-cli",
+            "--bootstrap",
+            "127.0.0.1:10000",
+            "chunk",
+            "get",
+            "abcd1234",
+            "--output",
+            "/tmp/out.bin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            CliCommand::Chunk {
+                action: ChunkAction::Get { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn test_parse_chunk_put_stdin() {
+        let cli = Cli::try_parse_from([
+            "saorsa-cli",
+            "--bootstrap",
+            "127.0.0.1:10000",
+            "chunk",
+            "put",
+        ])
+        .unwrap();
+        if let CliCommand::Chunk {
+            action: ChunkAction::Put { file },
+        } = cli.command
+        {
+            assert!(file.is_none());
+        } else {
+            panic!("Expected Chunk Put");
+        }
     }
 }

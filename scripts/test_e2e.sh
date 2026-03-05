@@ -90,7 +90,6 @@ echo ""
 
 SAORSA_DEVNET="${PROJECT_DIR}/target/release/saorsa-devnet"
 SAORSA_CLI="${PROJECT_DIR}/target/release/saorsa-cli"
-SAORSA_CLIENT="${PROJECT_DIR}/target/release/saorsa-client"
 
 if [ ! -f "${SAORSA_DEVNET}" ]; then
     echo "ERROR: saorsa-devnet binary not found at ${SAORSA_DEVNET}"
@@ -368,38 +367,24 @@ fi
 
 echo ""
 
-# Step 7: Test server-side payment rejection
-echo "=== Step 7: Server-side payment rejection test ==="
-echo "  Sending chunk WITHOUT payment proof to EVM-enabled nodes..."
-echo "  (Using saorsa-client without --private-key: sends raw PUT, no payment)"
+# Step 7: Test chunk put rejection without wallet
+echo "=== Step 7: Chunk put rejection without wallet ==="
+echo "  Attempting chunk put WITHOUT SECRET_KEY (should fail at client)..."
+echo "test data for rejection e2e" > /tmp/saorsa_rejection_test_${TEST_RUN_ID}.txt
+CHUNK_REJECT_OUTPUT=$("${SAORSA_CLI}" \
+    --devnet-manifest "${MANIFEST_FILE}" \
+    --evm-network local \
+    --timeout-secs 10 \
+    --log-level error \
+    chunk put /tmp/saorsa_rejection_test_${TEST_RUN_ID}.txt 2>&1 || true)
 
-# saorsa-client without --private-key sends a ChunkPutRequest with no payment proof.
-# The EVM-enabled node should reject it with "Payment required" or "payment failed".
-if [ -f "${SAORSA_CLIENT}" ]; then
-    echo "test data for server-side rejection e2e" > /tmp/saorsa_rejection_test_${TEST_RUN_ID}.txt
-    SERVER_REJECT_OUTPUT=$("${SAORSA_CLIENT}" \
-        --devnet-manifest "${MANIFEST_FILE}" \
-        --timeout-secs 30 \
-        --log-level error \
-        put --file /tmp/saorsa_rejection_test_${TEST_RUN_ID}.txt 2>&1 || true)
+CLEAN_CHUNK_OUTPUT=$(echo "${CHUNK_REJECT_OUTPUT}" | strip_ansi)
 
-    # Strip ANSI codes before pattern matching (color-eyre embeds ANSI in error text)
-    CLEAN_SERVER_OUTPUT=$(echo "${SERVER_REJECT_OUTPUT}" | strip_ansi)
-
-    # Check for specific payment rejection patterns from the node protocol:
-    #   - "Payment required" (ChunkPutResponse::PaymentRequired)
-    #   - "payment failed" (ProtocolError::PaymentFailed)
-    if echo "${CLEAN_SERVER_OUTPUT}" | grep -qi "Payment required\|payment failed\|PaymentRequired\|PaymentFailed"; then
-        pass "Server-side payment rejection (node rejects unpaid PUT)"
-    elif echo "${CLEAN_SERVER_OUTPUT}" | grep -qi "timeout\|connect"; then
-        fail "Server-side payment rejection" "Network timeout (could not reach nodes)"
-        echo "  Output: $(echo "${CLEAN_SERVER_OUTPUT}" | tail -5)"
-    else
-        fail "Server-side payment rejection" "Expected 'Payment required' or 'payment failed' error from node"
-        echo "  Output: $(echo "${CLEAN_SERVER_OUTPUT}" | tail -5)"
-    fi
+if echo "${CLEAN_CHUNK_OUTPUT}" | grep -qi "SECRET_KEY\|wallet\|payment"; then
+    pass "Chunk put rejection without wallet"
 else
-    echo "  WARNING: saorsa-client binary not found, skipping server-side rejection test"
+    fail "Chunk put rejection" "Expected wallet/payment error"
+    echo "  Output: $(echo "${CLEAN_CHUNK_OUTPUT}" | tail -5)"
 fi
 
 echo ""
