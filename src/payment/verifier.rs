@@ -6,6 +6,7 @@
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::deserialize_proof;
+use crate::payment::quote::verify_quote_content;
 use ant_evm::ProofOfPayment;
 use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
 use evmlib::contract::payment_vault::verify_data_payment;
@@ -278,6 +279,19 @@ impl PaymentVerifier {
 
         if payment.peer_quotes.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
+        }
+
+        // Verify that ALL quotes were issued for the correct content address.
+        // This prevents an attacker from paying for chunk A and reusing
+        // that proof to store chunks B, C, D, etc.
+        for (_encoded_peer_id, quote) in &payment.peer_quotes {
+            if !verify_quote_content(quote, xorname) {
+                return Err(Error::Payment(format!(
+                    "Quote content address mismatch: expected {}, got {}",
+                    hex::encode(xorname),
+                    hex::encode(quote.content.0)
+                )));
+            }
         }
 
         // Verify quote signatures using ML-DSA-65 (post-quantum).
@@ -636,5 +650,64 @@ mod tests {
     fn test_default_evm_config() {
         let config = EvmVerifierConfig::default();
         assert!(config.enabled);
+    }
+
+    #[tokio::test]
+    async fn test_content_address_mismatch_rejected() {
+        use crate::payment::proof::PaymentProof;
+        use ant_evm::{EncodedPeerId, PaymentQuote, QuotingMetrics, RewardsAddress};
+        use libp2p::identity::Keypair;
+        use libp2p::PeerId;
+        use std::time::SystemTime;
+
+        let verifier = create_evm_enabled_verifier();
+
+        // The xorname we're trying to store
+        let target_xorname = [0xAAu8; 32];
+
+        // Create a quote for a DIFFERENT xorname
+        let wrong_xorname = [0xBBu8; 32];
+        let quote = PaymentQuote {
+            content: xor_name::XorName(wrong_xorname),
+            timestamp: SystemTime::now(),
+            quoting_metrics: QuotingMetrics {
+                data_size: 1024,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 1000,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            rewards_address: RewardsAddress::new([1u8; 20]),
+            pub_key: vec![0u8; 64],
+            signature: vec![0u8; 64],
+        };
+
+        let keypair = Keypair::generate_ed25519();
+        let peer_id = PeerId::from_public_key(&keypair.public());
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::from(peer_id), quote)],
+        };
+
+        let proof = PaymentProof {
+            proof_of_payment: payment,
+            tx_hashes: vec![],
+        };
+
+        let proof_bytes = rmp_serde::to_vec(&proof).expect("serialize proof");
+
+        let result = verifier
+            .verify_payment(&target_xorname, Some(&proof_bytes))
+            .await;
+
+        assert!(result.is_err(), "Should reject mismatched content address");
+        let err_msg = format!("{}", result.expect_err("should be error"));
+        assert!(
+            err_msg.contains("content address mismatch"),
+            "Error should mention 'content address mismatch': {err_msg}"
+        );
     }
 }

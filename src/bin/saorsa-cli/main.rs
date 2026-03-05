@@ -37,6 +37,22 @@ async fn main() -> color_eyre::Result<()> {
 
     info!("saorsa-cli v{}", env!("CARGO_PKG_VERSION"));
 
+    // Resolve private key from SECRET_KEY env var (check early, before network bootstrap)
+    let private_key = std::env::var("SECRET_KEY").ok();
+
+    // Fail fast if upload requires SECRET_KEY but it's not set
+    if matches!(
+        cli.command,
+        CliCommand::File {
+            action: FileAction::Upload { .. }
+        }
+    ) && private_key.is_none()
+    {
+        return Err(color_eyre::eyre::eyre!(
+            "SECRET_KEY environment variable required for file upload (payment)"
+        ));
+    }
+
     let (bootstrap, manifest) = resolve_bootstrap(&cli)?;
     let node = create_client_node(bootstrap).await?;
 
@@ -47,9 +63,6 @@ async fn main() -> color_eyre::Result<()> {
         encrypt_data: false,
     })
     .with_node(node);
-
-    // Resolve private key from SECRET_KEY env var
-    let private_key = std::env::var("SECRET_KEY").ok();
 
     if let Some(ref key) = private_key {
         let network = resolve_evm_network(&cli.evm_network, manifest.as_ref())?;
@@ -62,7 +75,7 @@ async fn main() -> color_eyre::Result<()> {
     match cli.command {
         CliCommand::File { action } => match action {
             FileAction::Upload { path } => {
-                handle_upload(&client, &path, private_key.is_some()).await?;
+                handle_upload(&client, &path).await?;
             }
             FileAction::Download { address, output } => {
                 handle_download(&client, &address, output.as_deref()).await?;
@@ -73,17 +86,7 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn handle_upload(
-    client: &QuantumClient,
-    path: &Path,
-    has_wallet: bool,
-) -> color_eyre::Result<()> {
-    if !has_wallet {
-        return Err(color_eyre::eyre::eyre!(
-            "SECRET_KEY environment variable required for file upload (payment)"
-        ));
-    }
-
+async fn handle_upload(client: &QuantumClient, path: &Path) -> color_eyre::Result<()> {
     let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
     let file_content = std::fs::read(path)?;
     let file_size = file_content.len();
