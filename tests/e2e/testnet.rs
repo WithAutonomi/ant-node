@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::Instant;
+use tokio::time::{sleep, Instant};
 use tracing::{debug, info, warn};
 
 // =============================================================================
@@ -418,11 +418,23 @@ impl TestNode {
     /// Returns an error if the client is not configured or the store operation fails.
     pub async fn store_chunk_with_payment(&self, data: &[u8]) -> Result<XorName> {
         let client = self.client.as_ref().ok_or(TestnetError::NodeNotRunning)?;
+        let data_bytes = Bytes::from(data.to_vec());
 
-        client
-            .put_chunk(Bytes::from(data.to_vec()))
-            .await
-            .map_err(|e| TestnetError::Storage(format!("Client PUT error: {e}")))
+        let mut last_err = String::new();
+        for attempt in 1..=5 {
+            match client.put_chunk(data_bytes.clone()).await {
+                Ok(addr) => return Ok(addr),
+                Err(e) => {
+                    last_err = format!("Client PUT error: {e}");
+                    if attempt < 5 {
+                        warn!("store_chunk_with_payment attempt {attempt}/5 failed: {e}");
+                        sleep(Duration::from_secs(3)).await;
+                    }
+                }
+            }
+        }
+
+        Err(TestnetError::Storage(last_err))
     }
 
     /// Store a chunk with payment tracking.

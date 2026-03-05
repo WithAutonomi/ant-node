@@ -384,33 +384,13 @@ async fn test_idempotent_chunk_storage() -> Result<(), Box<dyn std::error::Error
 
     let test_data = b"Test data for idempotent storage";
 
-    // First store — retry to allow DHT to stabilize
-    let mut address1 = None;
-    for attempt in 1..=8 {
-        info!("First store attempt {attempt}/8...");
-        match env
-            .harness
-            .test_node(0)
-            .ok_or("Node 0 not found")?
-            .store_chunk_with_payment(test_data)
-            .await
-        {
-            Ok(addr) => {
-                address1 = Some(addr);
-                break;
-            }
-            Err(e) => {
-                warn!("First store attempt {attempt}/8 failed: {e}");
-                if attempt < 8 {
-                    if attempt == 4 {
-                        let _ = env.harness.warmup_dht().await;
-                    }
-                    sleep(Duration::from_secs(5)).await;
-                }
-            }
-        }
-    }
-    let address1 = address1.ok_or("First store MUST succeed after 8 attempts")?;
+    // First store
+    let address1 = env
+        .harness
+        .test_node(0)
+        .ok_or("Node 0 not found")?
+        .store_chunk_with_payment(test_data)
+        .await?;
     info!("First store: {}", hex::encode(address1));
 
     // Second store of same data — node should respond with AlreadyExists
@@ -605,9 +585,7 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
             Err(e) => {
                 warn!("Storage attempt {attempt}/10 failed: {e}");
                 if attempt < 10 {
-                    if attempt == 4 || attempt == 7 {
-                        let _ = env.harness.warmup_dht().await;
-                    }
+                    let _ = env.harness.warmup_dht().await;
                     sleep(Duration::from_secs(10)).await;
                 }
             }

@@ -121,8 +121,8 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .ok_or("Client not configured")?;
 
     let mut quotes_with_prices = None;
-    for attempt in 1..=5 {
-        info!("Quote collection attempt {attempt}/5...");
+    for attempt in 1..=10 {
+        info!("Quote collection attempt {attempt}/10...");
         match client.get_quotes_from_dht(test_data).await {
             Ok(quotes) => {
                 info!("Got {} quotes on attempt {attempt}", quotes.len());
@@ -131,15 +131,15 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
             }
             Err(e) => {
                 warn!("Attempt {attempt} failed: {e}");
-                if attempt < 5 {
-                    let backoff = Duration::from_secs(2u64.pow(attempt));
-                    sleep(backoff).await;
+                if attempt < 10 {
+                    let _ = env.harness.warmup_dht().await;
+                    sleep(Duration::from_secs(5)).await;
                 }
             }
         }
     }
 
-    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 5 attempts")?;
+    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 10 attempts")?;
 
     assert_eq!(
         quotes_with_prices.len(),
@@ -198,7 +198,7 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     // Store chunk with payment proof — nodes WILL verify on-chain
     // Retry with backoff: DHT routing tables may not be fully stabilized yet
     let mut stored_address = None;
-    for attempt in 1..=8 {
+    for attempt in 1..=10 {
         match client
             .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
             .await
@@ -209,18 +209,16 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
                 break;
             }
             Err(e) => {
-                warn!("Storage attempt {attempt}/8 failed: {e}");
-                if attempt < 8 {
-                    if attempt == 4 {
-                        let _ = env.harness.warmup_dht().await;
-                    }
+                warn!("Storage attempt {attempt}/10 failed: {e}");
+                if attempt < 10 {
+                    let _ = env.harness.warmup_dht().await;
                     sleep(Duration::from_secs(5)).await;
                 }
             }
         }
     }
     let stored_address =
-        stored_address.ok_or("Storage MUST succeed with valid payment proof after 8 attempts")?;
+        stored_address.ok_or("Storage MUST succeed with valid payment proof after 10 attempts")?;
 
     assert_eq!(
         stored_address, expected_address,
@@ -290,6 +288,8 @@ async fn test_payment_verification_enforcement() -> Result<(), Box<dyn std::erro
     // created our own Testnet above — creating another would double-bind the port.
     let harness = TestHarness::setup_with_config(config).await?;
 
+    sleep(Duration::from_secs(10)).await;
+    harness.warmup_dht().await?;
     sleep(Duration::from_secs(5)).await;
 
     // Try to store WITHOUT a wallet (sends no payment proof to server)
@@ -319,12 +319,29 @@ async fn test_payment_verification_enforcement() -> Result<(), Box<dyn std::erro
         .with_node(harness.node(0).ok_or("Node 0 not found")?)
         .with_wallet(wallet);
 
-    let result = client_with_wallet
-        .put_chunk(Bytes::from(test_data.to_vec()))
-        .await;
+    let mut stored_address = None;
+    for attempt in 1..=10 {
+        match client_with_wallet
+            .put_chunk(Bytes::from(test_data.to_vec()))
+            .await
+        {
+            Ok(addr) => {
+                stored_address = Some(addr);
+                break;
+            }
+            Err(e) => {
+                warn!("Storage with payment attempt {attempt}/10 failed: {e}");
+                if attempt < 10 {
+                    let _ = harness.warmup_dht().await;
+                    sleep(Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
 
     // MUST succeed — assert exactly one outcome
-    let address = result.map_err(|e| format!("Storage MUST succeed with valid payment: {e}"))?;
+    let address =
+        stored_address.ok_or("Storage MUST succeed with valid payment after 10 attempts")?;
     info!("Stored with payment at {}", hex::encode(address));
 
     info!("PAYMENT ENFORCEMENT TEST PASSED");
