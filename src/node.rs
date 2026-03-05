@@ -73,7 +73,6 @@ impl NodeBuilder {
 
         // Convert our config to saorsa-core's config, injecting our stable peer_id
         let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id);
         core_config.node_identity = Some(Arc::new(identity));
         debug!("Core config: {:?}", core_config);
 
