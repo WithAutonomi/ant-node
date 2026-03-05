@@ -5,6 +5,20 @@
 //! - Filling up → price increases logarithmically
 //! - Nearly full → price spikes (ln(x) as x→0)
 //! - At capacity → returns `MIN_PRICE` (overflow protection)
+//!
+//! ## Design Rationale: Capacity-Based Pricing
+//!
+//! Pricing is based on node **fullness** (percentage of storage capacity used),
+//! not on a fixed cost-per-byte. This design mirrors the autonomi
+//! `MerklePaymentVault` on-chain contract and creates natural load balancing:
+//!
+//! - **Empty nodes** charge the minimum floor price, attracting new data
+//! - **Nearly full nodes** charge exponentially more via the logarithmic curve
+//! - **This pushes clients toward emptier nodes**, distributing data across the network
+//!
+//! A flat cost-per-byte model would not incentivize distribution — all nodes would
+//! charge the same regardless of remaining capacity. The logarithmic curve ensures
+//! the network self-balances as nodes fill up.
 
 use ant_evm::{Amount, QuotingMetrics};
 

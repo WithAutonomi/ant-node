@@ -262,8 +262,11 @@ impl PaymentVerifier {
     ///
     /// This is production-only verification that ALWAYS validates payment proofs.
     /// It verifies that:
-    /// 1. All quote signatures are valid
-    /// 2. The payment was made on-chain
+    /// 1. All quotes target the correct content address (xorname binding)
+    /// 2. All quote ML-DSA-65 signatures are valid (offloaded to a blocking
+    ///    thread via `spawn_blocking` since post-quantum signature verification
+    ///    is CPU-intensive)
+    /// 3. The payment was made on-chain via the EVM payment vault contract
     ///
     /// Test environments should disable EVM at the `verify_payment` level,
     /// not bypass verification here.
@@ -653,6 +656,65 @@ mod tests {
     fn test_default_evm_config() {
         let config = EvmVerifierConfig::default();
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_real_ml_dsa_proof_size_within_limits() {
+        use crate::payment::metrics::QuotingMetricsTracker;
+        use crate::payment::proof::PaymentProof;
+        use crate::payment::quote::{QuoteGenerator, XorName};
+        use alloy::primitives::FixedBytes;
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+
+        for i in 0..5u8 {
+            let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+
+            let rewards_address = RewardsAddress::new([i; 20]);
+            let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+            let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let sk_bytes = secret_key.as_bytes().to_vec();
+            generator.set_signer(pub_key_bytes, move |msg| {
+                let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("sk parse");
+                let ml_dsa = MlDsa65::new();
+                ml_dsa.sign(&sk, msg).expect("sign").as_bytes().to_vec()
+            });
+
+            let content: XorName = [i; 32];
+            let quote = generator.create_quote(content, 4096, 0).expect("quote");
+
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote));
+        }
+
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment { peer_quotes },
+            tx_hashes: vec![FixedBytes::from([0xABu8; 32])],
+        };
+
+        let proof_bytes = rmp_serde::to_vec(&proof).expect("serialize");
+
+        // 5 ML-DSA-65 quotes with ~1952-byte pub keys and ~3309-byte signatures
+        // should produce a proof in the 20-60 KB range
+        assert!(
+            proof_bytes.len() > 20_000,
+            "Real 5-quote ML-DSA proof should be > 20 KB, got {} bytes",
+            proof_bytes.len()
+        );
+        assert!(
+            proof_bytes.len() < MAX_PAYMENT_PROOF_SIZE_BYTES,
+            "Real 5-quote ML-DSA proof ({} bytes) should fit within {} byte limit",
+            proof_bytes.len(),
+            MAX_PAYMENT_PROOF_SIZE_BYTES
+        );
     }
 
     #[tokio::test]
