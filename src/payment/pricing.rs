@@ -57,14 +57,8 @@ pub fn calculate_price(metrics: &QuotingMetrics) -> Amount {
         return min_price;
     }
 
-    // Calculate total cost units: sum of (count) for each record type.
-    // In the contract each type has cost_unit = DEFAULT_COST_UNIT (all equal),
-    // so total_cost_units is simply the total number of records.
-    let total_records: u64 = metrics
-        .records_per_type
-        .iter()
-        .map(|(_, count)| u64::from(*count))
-        .sum();
+    // Use close_records_stored as the authoritative record count for pricing.
+    let total_records = metrics.close_records_stored as u64;
 
     let max_records = metrics.max_records as f64;
 
@@ -110,6 +104,10 @@ pub fn calculate_price(metrics: &QuotingMetrics) -> Amount {
     // Scale by data_size (larger data costs proportionally more)
     let data_size_factor = metrics.data_size.max(1) as f64;
     let scaled_price = price * data_size_factor;
+
+    if !scaled_price.is_finite() {
+        return min_price;
+    }
 
     // Convert to Amount (U256), floor at MIN_PRICE
     let price_u64 = if scaled_price > u64::MAX as f64 {

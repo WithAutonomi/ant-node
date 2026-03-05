@@ -7,7 +7,7 @@
 //! capabilities from saorsa-core. This module provides the interface
 //! and will be fully integrated when the node is initialized.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::payment::metrics::QuotingMetricsTracker;
 use ant_evm::{PaymentQuote, QuotingMetrics, RewardsAddress};
 use saorsa_core::MlDsa65;
@@ -86,11 +86,11 @@ impl QuoteGenerator {
         let sign_fn = self
             .sign_fn
             .as_ref()
-            .ok_or_else(|| crate::error::Error::Payment("Signer not set".to_string()))?;
+            .ok_or_else(|| Error::Payment("Signer not set".to_string()))?;
         let test_msg = b"saorsa-signing-probe";
         let test_sig = sign_fn(test_msg);
         if test_sig.is_empty() {
-            return Err(crate::error::Error::Payment(
+            return Err(Error::Payment(
                 "ML-DSA-65 signing probe failed: empty signature produced".to_string(),
             ));
         }
@@ -118,9 +118,10 @@ impl QuoteGenerator {
         data_size: usize,
         data_type: u32,
     ) -> Result<PaymentQuote> {
-        let sign_fn = self.sign_fn.as_ref().ok_or_else(|| {
-            crate::error::Error::Payment("Quote signing not configured".to_string())
-        })?;
+        let sign_fn = self
+            .sign_fn
+            .as_ref()
+            .ok_or_else(|| Error::Payment("Quote signing not configured".to_string()))?;
 
         let timestamp = SystemTime::now();
 
@@ -140,6 +141,11 @@ impl QuoteGenerator {
 
         // Sign the bytes
         let signature = sign_fn(&bytes);
+        if signature.is_empty() {
+            return Err(Error::Payment(
+                "Signing produced empty signature".to_string(),
+            ));
+        }
 
         let quote = PaymentQuote {
             content: xor_name,
@@ -279,17 +285,14 @@ pub fn wire_ml_dsa_signer(
 ) -> Result<()> {
     let pub_key_bytes = identity.public_key().as_bytes().to_vec();
     let sk_bytes = identity.secret_key_bytes().to_vec();
-    let sk = MlDsaSecretKey::from_bytes(&sk_bytes).map_err(|e| {
-        crate::error::Error::Crypto(format!("Failed to deserialize ML-DSA-65 secret key: {e}"))
-    })?;
-    generator.set_signer(pub_key_bytes, move |msg| {
-        let ml_dsa = MlDsa65::new();
-        match ml_dsa.sign(&sk, msg) {
-            Ok(sig) => sig.as_bytes().to_vec(),
-            Err(e) => {
-                tracing::error!("ML-DSA-65 signing failed: {e}");
-                vec![]
-            }
+    let sk = MlDsaSecretKey::from_bytes(&sk_bytes)
+        .map_err(|e| Error::Crypto(format!("Failed to deserialize ML-DSA-65 secret key: {e}")))?;
+    let ml_dsa = MlDsa65::new();
+    generator.set_signer(pub_key_bytes, move |msg| match ml_dsa.sign(&sk, msg) {
+        Ok(sig) => sig.as_bytes().to_vec(),
+        Err(e) => {
+            tracing::error!("ML-DSA-65 signing failed: {e}");
+            vec![]
         }
     });
     generator.probe_signer()?;

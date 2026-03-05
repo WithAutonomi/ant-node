@@ -6,10 +6,10 @@
 use lru::LruCache;
 use parking_lot::Mutex;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// `XorName` type - 32-byte content hash.
-pub type XorName = [u8; 32];
+pub use super::quote::XorName;
 
 /// Default cache capacity (100,000 entries = 3.2MB memory).
 const DEFAULT_CACHE_CAPACITY: usize = 100_000;
@@ -21,7 +21,9 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 #[derive(Clone)]
 pub struct VerifiedCache {
     inner: Arc<Mutex<LruCache<XorName, ()>>>,
-    stats: Arc<Mutex<CacheStats>>,
+    hits: Arc<AtomicU64>,
+    misses: Arc<AtomicU64>,
+    additions: Arc<AtomicU64>,
 }
 
 /// Cache statistics for monitoring.
@@ -68,7 +70,9 @@ impl VerifiedCache {
         let cap = NonZeroUsize::new(effective_capacity).unwrap_or(NonZeroUsize::MIN);
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(cap))),
-            stats: Arc::new(Mutex::new(CacheStats::default())),
+            hits: Arc::new(AtomicU64::new(0)),
+            misses: Arc::new(AtomicU64::new(0)),
+            additions: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -79,13 +83,11 @@ impl VerifiedCache {
     pub fn contains(&self, xorname: &XorName) -> bool {
         let found = self.inner.lock().get(xorname).is_some();
 
-        let mut stats = self.stats.lock();
         if found {
-            stats.hits += 1;
+            self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            stats.misses += 1;
+            self.misses.fetch_add(1, Ordering::Relaxed);
         }
-        drop(stats);
 
         found
     }
@@ -95,13 +97,17 @@ impl VerifiedCache {
     /// This should be called after verifying that data exists on the autonomi network.
     pub fn insert(&self, xorname: XorName) {
         self.inner.lock().put(xorname, ());
-        self.stats.lock().additions += 1;
+        self.additions.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get current cache statistics.
     #[must_use]
     pub fn stats(&self) -> CacheStats {
-        *self.stats.lock()
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            additions: self.additions.load(Ordering::Relaxed),
+        }
     }
 
     /// Get the current number of entries in the cache.

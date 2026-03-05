@@ -81,11 +81,10 @@ impl SingleNodePayment {
     ///
     /// Returns error if not exactly 5 quotes are provided.
     pub fn from_quotes(mut quotes_with_prices: Vec<(PaymentQuote, Amount)>) -> Result<Self> {
-        if quotes_with_prices.len() != REQUIRED_QUOTES {
+        let len = quotes_with_prices.len();
+        if len != REQUIRED_QUOTES {
             return Err(Error::Payment(format!(
-                "SingleNode payment requires exactly {} quotes, got {}",
-                REQUIRED_QUOTES,
-                quotes_with_prices.len()
+                "SingleNode payment requires exactly {REQUIRED_QUOTES} quotes, got {len}"
             )));
         }
 

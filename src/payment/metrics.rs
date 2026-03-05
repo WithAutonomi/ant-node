@@ -12,6 +12,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+/// Number of operations between disk persists (debounce).
+const PERSIST_INTERVAL: usize = 10;
+
 /// Tracker for quoting metrics.
 ///
 /// Maintains state that influences quote pricing, including payment history,
@@ -32,6 +35,8 @@ pub struct QuotingMetricsTracker {
     persist_path: Option<PathBuf>,
     /// Estimated network size.
     network_size: AtomicU64,
+    /// Operations since last persist (for debouncing disk I/O).
+    ops_since_persist: AtomicUsize,
 }
 
 impl QuotingMetricsTracker {
@@ -51,6 +56,7 @@ impl QuotingMetricsTracker {
             start_time: Instant::now(),
             persist_path: None,
             network_size: AtomicU64::new(500), // Conservative default
+            ops_since_persist: AtomicUsize::new(0),
         }
     }
 
@@ -87,7 +93,7 @@ impl QuotingMetricsTracker {
     pub fn record_payment(&self) {
         let count = self.received_payment_count.fetch_add(1, Ordering::SeqCst) + 1;
         debug!("Payment received, total count: {count}");
-        self.persist();
+        self.maybe_persist();
     }
 
     /// Record data stored.
@@ -102,13 +108,13 @@ impl QuotingMetricsTracker {
         {
             let mut records = self.records_per_type.write();
             if let Some(entry) = records.iter_mut().find(|(t, _)| *t == data_type) {
-                entry.1 += 1;
+                entry.1 = entry.1.saturating_add(1);
             } else {
                 records.push((data_type, 1));
             }
         }
 
-        self.persist();
+        self.maybe_persist();
     }
 
     /// Get the number of payments received.
@@ -155,6 +161,14 @@ impl QuotingMetricsTracker {
         }
     }
 
+    /// Debounced persist: only writes to disk every `PERSIST_INTERVAL` operations.
+    fn maybe_persist(&self) {
+        let ops = self.ops_since_persist.fetch_add(1, Ordering::Relaxed);
+        if ops % PERSIST_INTERVAL == 0 {
+            self.persist();
+        }
+    }
+
     /// Persist metrics to disk.
     fn persist(&self) {
         if let Some(ref path) = self.persist_path {
@@ -176,6 +190,12 @@ impl QuotingMetricsTracker {
     fn load_from_disk(path: &std::path::Path) -> Option<PersistedMetrics> {
         let bytes = std::fs::read(path).ok()?;
         rmp_serde::from_slice(&bytes).ok()
+    }
+}
+
+impl Drop for QuotingMetricsTracker {
+    fn drop(&mut self) {
+        self.persist();
     }
 }
 

@@ -78,10 +78,10 @@ pub fn parse_rewards_address(address: &str) -> Result<RewardsAddress> {
         )));
     }
 
-    if address.len() != 42 {
+    let len = address.len();
+    if len != 42 {
         return Err(Error::Payment(format!(
-            "Invalid rewards address length: expected 42 characters, got {}",
-            address.len()
+            "Invalid rewards address length: expected 42 characters, got {len}",
         )));
     }
 

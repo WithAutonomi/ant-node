@@ -6,7 +6,8 @@
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::deserialize_proof;
-use crate::payment::quote::verify_quote_content;
+use crate::payment::quote::{verify_quote_content, verify_quote_signature};
+use crate::payment::single_node::REQUIRED_QUOTES;
 use ant_evm::ProofOfPayment;
 use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
 use evmlib::contract::payment_vault::verify_data_payment;
@@ -195,18 +196,15 @@ impl PaymentVerifier {
 
                 // Production mode: EVM enabled - verify the proof
                 if let Some(proof) = payment_proof {
-                    if proof.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
+                    let proof_len = proof.len();
+                    if proof_len < MIN_PAYMENT_PROOF_SIZE_BYTES {
                         return Err(Error::Payment(format!(
-                            "Payment proof too small: {} bytes (min {})",
-                            proof.len(),
-                            MIN_PAYMENT_PROOF_SIZE_BYTES
+                            "Payment proof too small: {proof_len} bytes (min {MIN_PAYMENT_PROOF_SIZE_BYTES})"
                         )));
                     }
-                    if proof.len() > MAX_PAYMENT_PROOF_SIZE_BYTES {
+                    if proof_len > MAX_PAYMENT_PROOF_SIZE_BYTES {
                         return Err(Error::Payment(format!(
-                            "Payment proof too large: {} bytes (max {} bytes)",
-                            proof.len(),
-                            MAX_PAYMENT_PROOF_SIZE_BYTES
+                            "Payment proof too large: {proof_len} bytes (max {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes)"
                         )));
                     }
 
@@ -284,6 +282,26 @@ impl PaymentVerifier {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
 
+        let quote_count = payment.peer_quotes.len();
+        if quote_count != REQUIRED_QUOTES {
+            return Err(Error::Payment(format!(
+                "Payment must have exactly {REQUIRED_QUOTES} quotes, got {quote_count}"
+            )));
+        }
+
+        // Check for duplicate peer IDs
+        {
+            let mut seen: Vec<&ant_evm::EncodedPeerId> = Vec::with_capacity(quote_count);
+            for (encoded_peer_id, _) in &payment.peer_quotes {
+                if seen.contains(&encoded_peer_id) {
+                    return Err(Error::Payment(format!(
+                        "Duplicate peer ID in payment quotes: {encoded_peer_id:?}"
+                    )));
+                }
+                seen.push(encoded_peer_id);
+            }
+        }
+
         // Verify that ALL quotes were issued for the correct content address.
         // This prevents an attacker from paying for chunk A and reusing
         // that proof to store chunks B, C, D, etc.
@@ -307,7 +325,7 @@ impl PaymentVerifier {
         let peer_quotes = payment.peer_quotes.clone();
         tokio::task::spawn_blocking(move || {
             for (encoded_peer_id, quote) in &peer_quotes {
-                if !crate::payment::quote::verify_quote_signature(quote) {
+                if !verify_quote_signature(quote) {
                     return Err(Error::Payment(
                         format!("Quote ML-DSA-65 signature verification failed for peer {encoded_peer_id:?}"),
                     ));
@@ -751,11 +769,14 @@ mod tests {
             signature: vec![0u8; 64],
         };
 
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = PeerId::from_public_key(&keypair.public());
-        let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::from(peer_id), quote)],
-        };
+        // Build 5 quotes with distinct peer IDs (required by REQUIRED_QUOTES enforcement)
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = Keypair::generate_ed25519();
+            let peer_id = PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+        let payment = ProofOfPayment { peer_quotes };
 
         let proof = PaymentProof {
             proof_of_payment: payment,
