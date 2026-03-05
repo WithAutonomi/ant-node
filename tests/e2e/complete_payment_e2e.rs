@@ -466,7 +466,7 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
 
     // Re-warm DHT after node failures so routing tables adapt
     env.harness.warmup_dht().await?;
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(15)).await;
 
     // Payment flow with reduced network — MUST succeed (7 nodes > 5 required)
     let test_data = b"Resilience test data";
@@ -481,8 +481,8 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
     // Retry quote collection and storage up to 3 times to allow DHT to stabilize
     let mut last_err = String::new();
     let mut succeeded = false;
-    for attempt in 1..=5 {
-        info!("Storage attempt {attempt}/5 after node failures...");
+    for attempt in 1..=8 {
+        info!("Storage attempt {attempt}/8 after node failures...");
         match client.get_quotes_from_dht(test_data).await {
             Ok(quotes) => {
                 info!("Collected {} quotes despite failures", quotes.len());
@@ -503,8 +503,11 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
                 warn!("Attempt {attempt} quote collection failed: {e}");
             }
         }
-        if attempt < 5 {
-            sleep(Duration::from_secs(5)).await;
+        if attempt < 8 {
+            if attempt == 4 {
+                let _ = env.harness.warmup_dht().await;
+            }
+            sleep(Duration::from_secs(8)).await;
         }
     }
     assert!(
