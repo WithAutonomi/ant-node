@@ -4,7 +4,7 @@ mod cli;
 
 use clap::Parser;
 use cli::Cli;
-use saorsa_node::devnet::{Devnet, DevnetConfig, DevnetManifest};
+use saorsa_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -53,6 +53,46 @@ async fn main() -> color_eyre::Result<()> {
         config.stabilization_timeout = std::time::Duration::from_secs(timeout_secs);
     }
 
+    // Start Anvil and deploy contracts if EVM is enabled
+    let evm_info = if cli.enable_evm {
+        info!("Starting local Anvil blockchain for EVM payment enforcement...");
+        let testnet = evmlib::testnet::Testnet::new().await;
+        let network = testnet.to_network();
+        let wallet_key = testnet.default_wallet_private_key();
+
+        let (rpc_url, token_addr, payments_addr) = match &network {
+            evmlib::Network::Custom(custom) => (
+                custom.rpc_url_http.to_string(),
+                format!("{:?}", custom.payment_token_address),
+                format!("{:?}", custom.data_payments_address),
+            ),
+            _ => {
+                return Err(color_eyre::eyre::eyre!(
+                    "Anvil testnet returned non-Custom network"
+                ))
+            }
+        };
+
+        config.enable_evm = true;
+        config.evm_network = Some(network);
+
+        info!("Anvil blockchain running at {rpc_url}");
+        info!("Funded wallet private key: {wallet_key}");
+
+        // Keep testnet alive by leaking it (it will be cleaned up on process exit)
+        // This is necessary because AnvilInstance stops Anvil when dropped
+        std::mem::forget(testnet);
+
+        Some(DevnetEvmInfo {
+            rpc_url,
+            wallet_private_key: wallet_key,
+            payment_token_address: token_addr,
+            data_payments_address: payments_addr,
+        })
+    } else {
+        None
+    };
+
     let mut devnet = Devnet::new(config).await?;
     devnet.start().await?;
 
@@ -62,6 +102,7 @@ async fn main() -> color_eyre::Result<()> {
         bootstrap: devnet.bootstrap_addrs(),
         data_dir: devnet.config().data_dir.clone(),
         created_at: chrono::Utc::now().to_rfc3339(),
+        evm: evm_info,
     };
 
     let json = serde_json::to_string_pretty(&manifest)?;

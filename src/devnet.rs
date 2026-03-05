@@ -11,6 +11,7 @@ use crate::payment::{
 };
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use ant_evm::RewardsAddress;
+use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{NodeConfig as CoreNodeConfig, P2PEvent, P2PNode};
@@ -160,6 +161,15 @@ pub struct DevnetConfig {
 
     /// Whether to remove the data directory on shutdown.
     pub cleanup_data_dir: bool,
+
+    /// Enable EVM payment enforcement on all nodes.
+    /// When true, nodes will require valid on-chain payment proofs.
+    pub enable_evm: bool,
+
+    /// Optional EVM network for payment verification.
+    /// When `enable_evm` is true and this is `Some`, nodes will use
+    /// this network (e.g. Anvil testnet) for on-chain verification.
+    pub evm_network: Option<EvmNetwork>,
 }
 
 impl Default for DevnetConfig {
@@ -180,6 +190,8 @@ impl Default for DevnetConfig {
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
             enable_node_logging: false,
             cleanup_data_dir: true,
+            enable_evm: false,
+            evm_network: None,
         }
     }
 }
@@ -221,6 +233,22 @@ pub struct DevnetManifest {
     pub data_dir: PathBuf,
     /// Creation time in RFC3339.
     pub created_at: String,
+    /// EVM configuration (present when EVM payment enforcement is enabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evm: Option<DevnetEvmInfo>,
+}
+
+/// EVM configuration info included in the devnet manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DevnetEvmInfo {
+    /// Anvil RPC URL.
+    pub rpc_url: String,
+    /// Funded wallet private key (hex-encoded with 0x prefix).
+    pub wallet_private_key: String,
+    /// Payment token contract address.
+    pub payment_token_address: String,
+    /// Data payments contract address.
+    pub data_payments_address: String,
 }
 
 /// Network state for devnet startup lifecycle.
@@ -514,7 +542,7 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to save node identity: {e}")))?;
 
-        let ant_protocol = Self::create_ant_protocol(&data_dir, &identity).await?;
+        let ant_protocol = Self::create_ant_protocol(&data_dir, &identity, &self.config).await?;
 
         Ok(DevnetNode {
             index,
@@ -535,6 +563,7 @@ impl Devnet {
     async fn create_ant_protocol(
         data_dir: &std::path::Path,
         identity: &NodeIdentity,
+        config: &DevnetConfig,
     ) -> Result<AntProtocol> {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
@@ -546,11 +575,23 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
 
-        let payment_config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
+        let evm_config = if config.enable_evm {
+            EvmVerifierConfig {
+                enabled: true,
+                network: config
+                    .evm_network
+                    .clone()
+                    .unwrap_or(EvmNetwork::ArbitrumOne),
+            }
+        } else {
+            EvmVerifierConfig {
                 enabled: false,
                 ..Default::default()
-            },
+            }
+        };
+
+        let payment_config = PaymentVerifierConfig {
+            evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);

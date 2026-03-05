@@ -30,6 +30,10 @@ path = "src/bin/saorsa-devnet/main.rs"
 name = "saorsa-client"
 path = "src/bin/saorsa-client/main.rs"
 
+[[bin]]
+name = "saorsa-cli"
+path = "src/bin/saorsa-cli/main.rs"
+
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.12.1"
@@ -40,6 +44,7 @@ ant-evm = "0.1.19"
 evmlib = "0.4.7"
 xor_name = "5"
 libp2p = "0.56"  # For PeerId in payment proofs
+multihash = "0.19"  # For identity multihash in PeerId construction
 
 # Caching - LRU cache for verified XorNames
 lru = "0.16.3"

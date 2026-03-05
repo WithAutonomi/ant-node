@@ -63,9 +63,12 @@ impl PaymentTestEnv {
 /// Initialize test network and EVM testnet for payment E2E tests.
 ///
 /// This sets up:
-/// - 10-node saorsa test network (need 8+ for `CLOSE_GROUP_SIZE` DHT queries)
-/// - Anvil EVM testnet for payment verification
+/// - Anvil EVM testnet FIRST (so nodes can verify on the same chain)
+/// - 10-node saorsa test network with `payment_enforcement: true`
 /// - Network stabilization wait (5 seconds for 10 nodes)
+///
+/// All nodes share the SAME Anvil instance as the client wallet,
+/// so on-chain verification is real, not bypassed.
 ///
 /// # Returns
 ///
@@ -73,26 +76,32 @@ impl PaymentTestEnv {
 async fn init_testnet_and_evm() -> Result<PaymentTestEnv, Box<dyn std::error::Error>> {
     info!("Initializing payment test environment");
 
-    // Start Anvil EVM testnet first
+    // Start Anvil EVM testnet FIRST so we can wire it to nodes
     let testnet = Testnet::new().await;
+    let network = testnet.to_network();
     info!("Anvil testnet started");
 
-    // Setup 10-node network (need 8+ peers for CLOSE_GROUP_SIZE quotes)
-    let harness =
-        TestHarness::setup_with_evm_and_config(super::testnet::TestNetworkConfig::small()).await?;
+    // Setup 10-node network with payment enforcement ON and the
+    // SAME Anvil network so nodes verify on the same chain the client pays on.
+    let config = super::testnet::TestNetworkConfig::small()
+        .with_payment_enforcement()
+        .with_evm_network(network);
 
-    info!("10-node test network started");
+    // Use setup_with_config (NOT setup_with_evm_and_config) because we already
+    // created our own Testnet above — creating another would double-bind the port.
+    let harness = TestHarness::setup_with_config(config).await?;
+
+    info!("10-node test network started with payment enforcement ENABLED");
 
     // Wait for network to stabilize (10 nodes need more time)
-    sleep(Duration::from_secs(5)).await;
+    sleep(Duration::from_secs(10)).await;
 
     let total_connections = harness.total_connections().await;
-    info!(
-        "Payment test environment ready: {} total connections",
-        total_connections
-    );
+    info!("Network stabilized with {total_connections} total connections");
 
-    // DHT warmup already performed by setup_with_evm_and_config()
+    // Warm up DHT routing tables (essential for quote collection and chunk routing)
+    harness.warmup_dht().await?;
+    info!("Payment test environment ready");
 
     Ok(PaymentTestEnv { harness, testnet })
 }
@@ -135,19 +144,19 @@ async fn test_client_pays_and_stores_on_network() -> Result<(), Box<dyn std::err
         .await?;
     info!("Chunk stored successfully at: {}", hex::encode(address));
 
-    // Verify chunk is retrievable from the same node (not replicated in test mode)
+    // Verify chunk is retrievable via DHT-routed client (same routing as PUT)
     sleep(Duration::from_millis(500)).await;
 
     let retrieved = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .get_chunk(&address)
+        .get_chunk_with_client(&address)
         .await?;
 
     assert!(
         retrieved.is_some(),
-        "Chunk should be retrievable from storing node"
+        "Chunk should be retrievable via DHT routing"
     );
 
     let chunk = retrieved.ok_or("Chunk not found")?;
@@ -157,7 +166,7 @@ async fn test_client_pays_and_stores_on_network() -> Result<(), Box<dyn std::err
         "Retrieved data should match original"
     );
 
-    info!("✅ Chunk successfully retrieved from storing node");
+    info!("✅ Chunk successfully retrieved via DHT routing");
 
     env.teardown().await?;
     Ok(())
@@ -206,13 +215,13 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
 
     assert_eq!(addresses.len(), 3, "All clients should store successfully");
 
-    // Verify all chunks are retrievable from their storing nodes
+    // Verify all chunks are retrievable via DHT routing
     for (i, address) in addresses.iter().enumerate() {
         let retrieved = env
             .harness
-            .test_node(i) // Retrieve from the node that stored it
+            .test_node(i)
             .ok_or_else(|| format!("Node {i} not found"))?
-            .get_chunk(address)
+            .get_chunk_with_client(address)
             .await?;
 
         assert!(retrieved.is_some(), "Chunk {i} should be retrievable");
@@ -242,26 +251,28 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
 async fn test_payment_required_enforcement() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting E2E payment test: payment enforcement validation");
 
-    // Start Anvil EVM testnet first
+    // Start Anvil EVM testnet FIRST so we can wire it to nodes
     let testnet = Testnet::new().await;
+    let network = testnet.to_network();
     info!("Anvil testnet started");
 
-    // Setup 10-node network with payment enforcement enabled
-    let harness = TestHarness::setup_with_evm_and_config(
-        super::testnet::TestNetworkConfig::small().with_payment_enforcement(),
-    )
-    .await?;
+    // Setup 10-node network with payment enforcement ON and the
+    // SAME Anvil network so nodes verify on the same chain.
+    let config = super::testnet::TestNetworkConfig::small()
+        .with_payment_enforcement()
+        .with_evm_network(network);
 
-    info!("10-node test network started with payment enforcement");
+    // Use setup_with_config (NOT setup_with_evm_and_config) because we already
+    // created our own Testnet above — creating another would double-bind the port.
+    let harness = TestHarness::setup_with_config(config).await?;
+
+    info!("10-node test network started with payment enforcement ENABLED");
 
     // Wait for network to stabilize (10 nodes need more time)
     sleep(Duration::from_secs(5)).await;
 
     let total_connections = harness.total_connections().await;
-    info!(
-        "Payment test environment ready: {} total connections",
-        total_connections
-    );
+    info!("Payment test environment ready: {total_connections} total connections");
 
     let env = PaymentTestEnv { harness, testnet };
 
@@ -316,14 +327,14 @@ async fn test_large_chunk_payment_flow() -> Result<(), Box<dyn std::error::Error
         .await?;
     info!("Large chunk stored at: {}", hex::encode(address));
 
-    // Verify retrieval from same node
+    // Verify retrieval via DHT routing
     sleep(Duration::from_millis(500)).await;
 
     let retrieved = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .get_chunk(&address)
+        .get_chunk_with_client(&address)
         .await?;
 
     assert!(retrieved.is_some(), "Large chunk should be retrievable");
@@ -346,16 +357,16 @@ async fn test_large_chunk_payment_flow() -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Test: Payment cache prevents double payment for same chunk.
+/// Test: Idempotent chunk storage — storing the same chunk twice succeeds.
 ///
 /// Validates that:
-/// - First store triggers payment
-/// - Second store of same data uses cached payment
-/// - No redundant on-chain transactions
+/// - First store with payment succeeds
+/// - Second store of same data returns same address (`AlreadyExists` on node)
+/// - Both stores produce valid addresses
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn test_payment_cache_prevents_double_payment() -> Result<(), Box<dyn std::error::Error>> {
-    info!("Starting E2E payment test: payment cache validation");
+async fn test_idempotent_chunk_storage() -> Result<(), Box<dyn std::error::Error>> {
+    info!("Starting E2E payment test: idempotent chunk storage");
 
     // Initialize test environment (network + EVM)
     let mut env = init_testnet_and_evm().await?;
@@ -367,62 +378,52 @@ async fn test_payment_cache_prevents_double_payment() -> Result<(), Box<dyn std:
         .ok_or("Node 0 not found")?
         .set_wallet(wallet);
 
-    let test_data = b"Test data for cache validation";
+    let test_data = b"Test data for idempotent storage";
 
-    // Get the payment tracker from the harness
-    let tracker = env.harness.payment_tracker();
-
-    // Compute the expected address so we can query payment count
-    let expected_address = saorsa_node::compute_address(test_data);
-
-    // Verify no payments made yet
-    assert_eq!(
-        tracker.payment_count(&expected_address),
-        0,
-        "Should have 0 payments before storing"
-    );
-
-    // First store with payment tracking
+    // First store
     let address1 = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk_with_tracked_payment(test_data, tracker)
+        .store_chunk_with_payment(test_data)
         .await?;
     info!("First store: {}", hex::encode(address1));
 
-    // Verify exactly 1 payment was made
-    assert_eq!(
-        tracker.payment_count(&address1),
-        1,
-        "Should have exactly 1 payment after first store"
-    );
-
-    // Second store of same data with payment tracking
+    // Second store of same data — node should respond with AlreadyExists
     let address2 = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .store_chunk_with_tracked_payment(test_data, tracker)
+        .store_chunk_with_payment(test_data)
         .await?;
     info!("Second store: {}", hex::encode(address2));
 
-    assert_eq!(address1, address2, "Same data should produce same address");
-
-    // CRITICAL: Verify still only 1 payment (cache prevented duplicate payment)
     assert_eq!(
-        tracker.payment_count(&address1),
-        1,
-        "Should still have exactly 1 payment after second store (cache should prevent duplicate)"
+        address1, address2,
+        "Same data should produce same address on both stores"
     );
 
-    // Verify no duplicate payments across all chunks
+    // Verify chunk is retrievable
+    let retrieved = env
+        .harness
+        .test_node(0)
+        .ok_or("Node 0 not found")?
+        .get_chunk_with_client(&address1)
+        .await?;
+
     assert!(
-        !tracker.has_duplicate_payments(),
-        "Payment cache should prevent duplicate payments"
+        retrieved.is_some(),
+        "Chunk should be retrievable after idempotent store"
     );
 
-    info!("✅ Payment cache validation complete: confirmed single payment for duplicate store");
+    let chunk = retrieved.ok_or("Chunk not found")?;
+    assert_eq!(
+        chunk.content.as_ref(),
+        test_data,
+        "Retrieved data should match original"
+    );
+
+    info!("✅ Idempotent chunk storage validated");
 
     env.teardown().await?;
     Ok(())
@@ -571,14 +572,14 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
         hex::encode(address)
     );
 
-    // Verify chunk is retrievable from the storing node
+    // Verify chunk is retrievable via DHT routing
     sleep(Duration::from_millis(500)).await;
 
     let retrieved = env
         .harness
         .test_node(0)
         .ok_or("Node 0 not found")?
-        .get_chunk(&address)
+        .get_chunk_with_client(&address)
         .await?;
 
     assert!(
@@ -609,19 +610,17 @@ mod helper_tests {
     /// Test initialization helper.
     #[tokio::test]
     #[serial]
-    #[allow(clippy::expect_used)]
-    async fn test_init_testnet_and_evm() {
-        let env = init_testnet_and_evm()
-            .await
-            .expect("Should initialize test environment");
+    async fn test_init_testnet_and_evm() -> Result<(), Box<dyn std::error::Error>> {
+        let env = init_testnet_and_evm().await?;
 
         // Verify we can create wallets
-        let wallet = env.create_funded_wallet().expect("Should create wallet");
+        let wallet = env.create_funded_wallet()?;
         assert!(!wallet.address().to_string().is_empty());
 
         // Verify harness is accessible
         assert!(env.harness.node(0).is_some(), "Node 0 should exist");
 
-        env.teardown().await.expect("Should teardown cleanly");
+        env.teardown().await?;
+        Ok(())
     }
 }

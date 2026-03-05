@@ -119,7 +119,7 @@ mod tests {
         data_type: u32,
     ) -> QuotingMetrics {
         let records_per_type = if records_stored > 0 {
-            vec![(data_type, records_stored as u32)]
+            vec![(data_type, u32::try_from(records_stored).unwrap_or(u32::MAX))]
         } else {
             vec![]
         };

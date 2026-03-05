@@ -30,7 +30,6 @@ use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
-use libp2p::PeerId;
 use saorsa_core::P2PNode;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,7 +255,10 @@ impl QuantumClient {
     /// - Quote collection fails
     /// - Payment fails
     /// - Storage operation fails
-    pub async fn put_chunk_with_payment(&self, content: Bytes) -> Result<XorName> {
+    pub async fn put_chunk_with_payment(
+        &self,
+        content: Bytes,
+    ) -> Result<(XorName, Vec<evmlib::common::TxHash>)> {
         let content_len = content.len();
         info!("Storing chunk with payment ({content_len} bytes)");
 
@@ -296,10 +298,8 @@ impl QuantumClient {
             Vec::with_capacity(quotes_with_peers.len());
 
         for (peer_id_str, quote, price) in quotes_with_peers {
-            let peer_id: PeerId = peer_id_str
-                .parse()
-                .map_err(|e| Error::Payment(format!("Invalid peer ID '{peer_id_str}': {e}")))?;
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)?;
+            peer_quotes.push((encoded_peer_id, quote.clone()));
             quotes_with_prices.push((quote, price));
         }
 
@@ -321,7 +321,7 @@ impl QuantumClient {
         // Step 5: Build proof AFTER payment succeeds, including tx hashes
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
-            tx_hashes,
+            tx_hashes: tx_hashes.clone(),
         };
         let payment_proof = rmp_serde::to_vec(&proof)
             .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
@@ -339,7 +339,7 @@ impl QuantumClient {
             .encode()
             .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
 
-        Self::send_put_and_await(
+        let stored_address = Self::send_put_and_await(
             node,
             &target_peer,
             message_bytes,
@@ -348,7 +348,9 @@ impl QuantumClient {
             hex::encode(address),
             content_size,
         )
-        .await
+        .await?;
+
+        Ok((stored_address, tx_hashes))
     }
 
     /// Store a chunk with a pre-built payment proof, skipping the internal payment flow.
@@ -428,7 +430,8 @@ impl QuantumClient {
     /// - Payment is required but no wallet is configured
     pub async fn put_chunk(&self, content: Bytes) -> Result<XorName> {
         if self.wallet.is_some() {
-            return self.put_chunk_with_payment(content).await;
+            let (address, _tx_hashes) = self.put_chunk_with_payment(content).await?;
+            return Ok(address);
         }
 
         // No wallet configured - store without payment (works when EVM is disabled on nodes)
@@ -822,6 +825,39 @@ impl QuantumClient {
     }
 }
 
+/// Identity multihash code (stores raw bytes without hashing).
+const MULTIHASH_IDENTITY_CODE: u64 = 0x00;
+
+/// Convert a hex-encoded 32-byte saorsa-core node ID to an [`EncodedPeerId`].
+///
+/// Saorsa-core peer IDs are 64-character hex strings representing 32 raw bytes.
+/// libp2p `PeerId` expects a multihash-encoded identity. This function bridges the two
+/// formats by wrapping the raw bytes in an identity multihash (code 0x00) and then
+/// converting to `EncodedPeerId` via `From<PeerId>`.
+///
+/// # Errors
+///
+/// Returns an error if the hex string is invalid or the peer ID cannot be constructed.
+pub fn hex_node_id_to_encoded_peer_id(hex_id: &str) -> Result<EncodedPeerId> {
+    let raw_bytes = hex::decode(hex_id)
+        .map_err(|e| Error::Payment(format!("Invalid hex peer ID '{hex_id}': {e}")))?;
+
+    let multihash =
+        multihash::Multihash::<64>::wrap(MULTIHASH_IDENTITY_CODE, &raw_bytes).map_err(|e| {
+            Error::Payment(format!(
+                "Failed to create multihash for peer '{hex_id}': {e}"
+            ))
+        })?;
+
+    let peer_id = libp2p::PeerId::from_multihash(multihash).map_err(|_| {
+        Error::Payment(format!(
+            "Failed to create PeerId from multihash for peer '{hex_id}'"
+        ))
+    })?;
+
+    Ok(EncodedPeerId::from(peer_id))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -867,5 +903,29 @@ mod tests {
 
         let result = client.exists(&address).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hex_node_id_to_encoded_peer_id_valid() {
+        // A valid 32-byte hex-encoded node ID (64 hex chars)
+        let hex_id = "80b6427dc1b0490ffe743d39a4d4d68c252f5053f6234a9154cfb017f92a1399";
+        let result = hex_node_id_to_encoded_peer_id(hex_id);
+        assert!(
+            result.is_ok(),
+            "Should convert valid hex node ID: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_hex_node_id_to_encoded_peer_id_invalid_hex() {
+        let result = hex_node_id_to_encoded_peer_id("not-valid-hex");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_hex_node_id_to_encoded_peer_id_all_zeros() {
+        let hex_id = "0000000000000000000000000000000000000000000000000000000000000000";
+        let result = hex_node_id_to_encoded_peer_id(hex_id);
+        assert!(result.is_ok());
     }
 }

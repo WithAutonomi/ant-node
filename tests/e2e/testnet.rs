@@ -105,8 +105,8 @@ const TEST_PAYMENT_CACHE_CAPACITY: usize = 1000;
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
 /// Max records for quoting metrics (derived from node storage limit / max chunk size).
-const TEST_MAX_RECORDS: usize = (saorsa_node::node::NODE_STORAGE_LIMIT_BYTES as usize)
-    / saorsa_node::ant_protocol::MAX_CHUNK_SIZE;
+/// 5 GB / 4 MB = 1280 records.
+const TEST_MAX_RECORDS: usize = 1280;
 
 /// Initial records for quoting metrics (test value).
 const TEST_INITIAL_RECORDS: usize = 1000;
@@ -470,10 +470,11 @@ impl TestNode {
         let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_with_prices: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
         for (peer_id_str, quote, price) in quotes_with_peers {
-            let peer_id: libp2p::PeerId = peer_id_str.parse().map_err(|e| {
-                TestnetError::Storage(format!("Failed to parse peer ID '{peer_id_str}': {e}"))
-            })?;
-            peer_quotes.push((ant_evm::EncodedPeerId::from(peer_id), quote.clone()));
+            let encoded_peer_id = saorsa_node::client::hex_node_id_to_encoded_peer_id(&peer_id_str)
+                .map_err(|e| {
+                    TestnetError::Storage(format!("Failed to convert peer ID '{peer_id_str}': {e}"))
+                })?;
+            peer_quotes.push((encoded_peer_id, quote.clone()));
             quotes_with_prices.push((quote, price));
         }
 
@@ -544,24 +545,16 @@ impl TestNode {
             handle.abort();
         }
 
+        // Drop client to release its Arc<P2PNode> reference
+        self.client = None;
+
         *self.state.write().await = NodeState::Stopping;
 
         // Shutdown P2P node if running
         if let Some(p2p) = self.p2p_node.take() {
-            // Get Arc unwrapped or cloned for shutdown
-            if let Ok(node) = Arc::try_unwrap(p2p) {
-                node.shutdown()
-                    .await
-                    .map_err(|e| TestnetError::Core(format!("Failed to shutdown node: {e}")))?;
-            } else {
-                warn!(
-                    "Node {} has multiple Arc references, cannot perform clean shutdown",
-                    self.index
-                );
-                return Err(TestnetError::Core(
-                    "Cannot shutdown node with multiple Arc references".to_string(),
-                ));
-            }
+            p2p.shutdown()
+                .await
+                .map_err(|e| TestnetError::Core(format!("Failed to shutdown node: {e}")))?;
         }
 
         *self.state.write().await = NodeState::ShutDown;

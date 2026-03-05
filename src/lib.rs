@@ -55,11 +55,12 @@ pub use ant_protocol::{
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
 pub use client::{
-    compute_address, peer_id_to_xor_name, xor_distance, DataChunk, QuantumClient, QuantumConfig,
-    XorName,
+    compute_address, create_manifest, deserialize_manifest, peer_id_to_xor_name, reassemble_file,
+    serialize_manifest, split_file, xor_distance, DataChunk, FileManifest, QuantumClient,
+    QuantumConfig, XorName,
 };
 pub use config::{BootstrapCacheConfig, NodeConfig, StorageConfig};
-pub use devnet::{Devnet, DevnetConfig, DevnetManifest};
+pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
 pub use node::{NodeBuilder, RunningNode};

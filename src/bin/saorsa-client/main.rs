@@ -34,13 +34,13 @@ async fn main() -> color_eyre::Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
     tracing_subscriber::registry()
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .with(filter)
         .init();
 
     info!("saorsa-client v{}", env!("CARGO_PKG_VERSION"));
 
-    let bootstrap = resolve_bootstrap(&cli)?;
+    let (bootstrap, manifest) = resolve_bootstrap(&cli)?;
     let node = create_client_node(bootstrap).await?;
     let mut client = QuantumClient::new(QuantumConfig {
         timeout_secs: cli.timeout_secs,
@@ -49,16 +49,14 @@ async fn main() -> color_eyre::Result<()> {
     })
     .with_node(node);
 
-    if let Some(ref key) = cli.private_key {
-        let network = match cli.evm_network.as_str() {
-            "arbitrum-one" => EvmNetwork::ArbitrumOne,
-            "arbitrum-sepolia" => EvmNetwork::ArbitrumSepoliaTest,
-            other => {
-                return Err(color_eyre::eyre::eyre!(
-                    "Unsupported EVM network: {other}. Use 'arbitrum-one' or 'arbitrum-sepolia'."
-                ));
-            }
-        };
+    // Resolve private key: CLI flag > SECRET_KEY env var
+    let private_key = cli
+        .private_key
+        .clone()
+        .or_else(|| std::env::var("SECRET_KEY").ok());
+
+    if let Some(ref key) = private_key {
+        let network = resolve_evm_network(&cli.evm_network, manifest.as_ref())?;
         let wallet = Wallet::new_from_private_key(network, key)
             .map_err(|e| color_eyre::eyre::eyre!("Failed to create wallet: {e}"))?;
         info!("Wallet configured for payments on {}", cli.evm_network);
@@ -88,15 +86,59 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-fn resolve_bootstrap(cli: &Cli) -> color_eyre::Result<Vec<std::net::SocketAddr>> {
+fn resolve_evm_network(
+    evm_network: &str,
+    manifest: Option<&DevnetManifest>,
+) -> color_eyre::Result<EvmNetwork> {
+    match evm_network {
+        "arbitrum-one" => Ok(EvmNetwork::ArbitrumOne),
+        "arbitrum-sepolia" => Ok(EvmNetwork::ArbitrumSepoliaTest),
+        "local" => {
+            // Build Custom network from manifest EVM info
+            if let Some(m) = manifest {
+                if let Some(ref evm) = m.evm {
+                    let rpc_url: reqwest::Url = evm
+                        .rpc_url
+                        .parse()
+                        .map_err(|e| color_eyre::eyre::eyre!("Invalid RPC URL: {e}"))?;
+                    let token_addr: evmlib::common::Address = evm
+                        .payment_token_address
+                        .parse()
+                        .map_err(|e| color_eyre::eyre::eyre!("Invalid token address: {e}"))?;
+                    let payments_addr: evmlib::common::Address = evm
+                        .data_payments_address
+                        .parse()
+                        .map_err(|e| color_eyre::eyre::eyre!("Invalid payments address: {e}"))?;
+                    return Ok(EvmNetwork::Custom(evmlib::CustomNetwork {
+                        rpc_url_http: rpc_url,
+                        payment_token_address: token_addr,
+                        data_payments_address: payments_addr,
+                        merkle_payments_address: None,
+                    }));
+                }
+            }
+            Err(color_eyre::eyre::eyre!(
+                "EVM network 'local' requires --devnet-manifest with EVM info"
+            ))
+        }
+        other => Err(color_eyre::eyre::eyre!(
+            "Unsupported EVM network: {other}. Use 'arbitrum-one', 'arbitrum-sepolia', or 'local'."
+        )),
+    }
+}
+
+fn resolve_bootstrap(
+    cli: &Cli,
+) -> color_eyre::Result<(Vec<std::net::SocketAddr>, Option<DevnetManifest>)> {
     if !cli.bootstrap.is_empty() {
-        return Ok(cli.bootstrap.clone());
+        return Ok((cli.bootstrap.clone(), None));
     }
 
     if let Some(ref manifest_path) = cli.devnet_manifest {
         let data = std::fs::read_to_string(manifest_path)?;
         let manifest: DevnetManifest = serde_json::from_str(&data)?;
-        return Ok(manifest.bootstrap);
+        let bootstrap = manifest.bootstrap.clone();
+        return Ok((bootstrap, Some(manifest)));
     }
 
     Err(color_eyre::eyre::eyre!(
@@ -129,8 +171,7 @@ fn parse_address(address: &str) -> color_eyre::Result<XorName> {
     let bytes = hex::decode(address)?;
     if bytes.len() != XORNAME_BYTE_LEN {
         return Err(color_eyre::eyre::eyre!(
-            "Invalid address length: expected {} bytes, got {}",
-            XORNAME_BYTE_LEN,
+            "Invalid address length: expected {XORNAME_BYTE_LEN} bytes, got {}",
             bytes.len()
         ));
     }

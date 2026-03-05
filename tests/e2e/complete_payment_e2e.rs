@@ -1,7 +1,7 @@
 //! Complete E2E test proving the payment protocol works on live nodes.
 //!
-//! This test validates the **entire chunk upload + payment + verification flow**
-//! across a real P2P network with multiple live nodes:
+//! **All payment tests in this file use `payment_enforcement: true`.**
+//! Nodes verify payments on-chain via Anvil before storing chunks.
 //!
 //! ## Test Flow
 //!
@@ -13,29 +13,14 @@
 //! 6. **Verification**: Nodes verify payment on-chain before storing
 //! 7. **Retrieval**: Retrieve chunk from storing node to prove storage succeeded
 //! 8. **Cross-Node**: Retrieve chunk from a DIFFERENT node (tests replication)
-//!
-//! ## What This Proves
-//!
-//! - ✅ DHT peer discovery works
-//! - ✅ Quote request/response protocol works over P2P
-//! - ✅ Payment calculation (median selection) works correctly
-//! - ✅ EVM payment succeeds on Anvil testnet
-//! - ✅ `ProofOfPayment` serialization/deserialization works
-//! - ✅ Nodes verify payment proofs before storing
-//! - ✅ LMDB storage persists chunks correctly
-//! - ✅ Chunk retrieval works from storing node
-//! - ✅ (Optional) Cross-node retrieval tests replication
-//!
-//! This is the **definitive test** that the payment protocol is production-ready.
 
 use super::harness::TestHarness;
 use super::testnet::TestNetworkConfig;
-use ant_evm::{EncodedPeerId, ProofOfPayment};
+use ant_evm::ProofOfPayment;
 use bytes::Bytes;
 use evmlib::testnet::Testnet;
 use evmlib::wallet::Wallet;
-use libp2p::PeerId;
-use saorsa_node::client::QuantumClient;
+use saorsa_node::client::{hex_node_id_to_encoded_peer_id, QuantumClient};
 use saorsa_node::payment::{PaymentProof, SingleNodePayment};
 use serial_test::serial;
 use std::time::Duration;
@@ -43,64 +28,54 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 /// Test environment for complete E2E payment flow.
+///
+/// All nodes have `payment_enforcement: true` and use the same Anvil
+/// instance as the client wallet, so on-chain verification is real.
 struct CompletePaymentTestEnv {
-    /// Test harness managing the saorsa node network
     harness: TestHarness,
-    /// Anvil EVM testnet for payment verification (kept alive to prevent Anvil drop)
+    /// Kept alive to prevent Anvil process from being dropped
     _testnet: Testnet,
-    /// Funded wallet for client payments
     wallet: Wallet,
 }
 
 impl CompletePaymentTestEnv {
-    /// Initialize complete payment test environment.
+    /// Initialize complete payment test environment with enforcement enabled.
     ///
-    /// Sets up:
-    /// - 10-node saorsa test network (enough for 5 closest DHT peers)
-    /// - Anvil EVM testnet
-    /// - Funded wallet for client
+    /// Nodes and client share the SAME Anvil instance so on-chain
+    /// verification is real, not bypassed.
     async fn setup() -> Result<Self, Box<dyn std::error::Error>> {
         info!("Setting up complete payment E2E test environment");
 
-        // Start Anvil EVM testnet first
+        // Start Anvil EVM testnet FIRST so we can wire it to nodes
         let testnet = Testnet::new().await;
+        let network = testnet.to_network();
         info!("Anvil testnet started");
 
-        // Setup 10-node network.
-        // EVM verification is disabled on nodes (payment_enforcement: false) so that
-        // the verifier accepts proofs without on-chain checks. The client still goes
-        // through the full quote -> pay -> attach-proof flow via the wallet.
-        let harness = TestHarness::setup_with_evm_and_config(TestNetworkConfig::small()).await?;
+        // Setup 10-node network with payment enforcement ON and the
+        // SAME Anvil network so nodes verify on the same chain the client pays on.
+        // Use setup_with_config (NOT setup_with_evm_and_config) because we already
+        // created our own Testnet above — creating another would double-bind the port.
+        let config = TestNetworkConfig::small()
+            .with_payment_enforcement()
+            .with_evm_network(network.clone());
 
-        info!("10-node test network started");
+        let harness = TestHarness::setup_with_config(config).await?;
+
+        info!("10-node test network started with payment enforcement ENABLED");
 
         // Wait for network to stabilize
-        info!("⏳ Waiting for network to stabilize...");
         sleep(Duration::from_secs(10)).await;
 
         let total_connections = harness.total_connections().await;
-        info!(
-            "✅ Network stabilized with {} total connections",
-            total_connections
-        );
-
-        // Verify all nodes can see each other
-        for i in 0..10 {
-            if let Some(node) = harness.test_node(i) {
-                let peer_count = node.peer_count().await;
-                info!("   Node {} has {} peers", i, peer_count);
-            }
-        }
+        info!("Network stabilized with {total_connections} total connections");
 
         // Warm up DHT routing tables (essential for quote collection)
-        info!("⏳ Warming up DHT routing tables...");
         harness.warmup_dht().await?;
 
-        // Create funded wallet from Anvil
-        let network = testnet.to_network();
+        // Create funded wallet from the SAME Anvil instance
         let private_key = testnet.default_wallet_private_key();
         let wallet = Wallet::new_from_private_key(network, &private_key)?;
-        info!("✅ Created funded wallet: {}", wallet.address());
+        info!("Created funded wallet: {}", wallet.address());
 
         Ok(Self {
             harness,
@@ -109,33 +84,21 @@ impl CompletePaymentTestEnv {
         })
     }
 
-    /// Teardown the test environment.
     async fn teardown(self) -> Result<(), Box<dyn std::error::Error>> {
         self.harness.teardown().await?;
         Ok(())
     }
 }
 
-/// **DEFINITIVE E2E TEST**: Complete chunk upload + payment + verification flow.
+/// Complete chunk upload + payment + on-chain verification + retrieval flow.
 ///
-/// This test proves the entire payment protocol works on live nodes:
-/// 1. Quote collection from DHT
-/// 2. Payment calculation and execution
-/// 3. Chunk storage with payment proof
-/// 4. Payment verification on nodes
-/// 5. Chunk retrieval
+/// Nodes have `payment_enforcement: true`. The payment is verified on-chain.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 #[allow(clippy::too_many_lines)]
 async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::error::Error>> {
-    info!("═══════════════════════════════════════════════════════════════");
-    info!("  COMPLETE E2E PAYMENT TEST - LIVE NODES");
-    info!("═══════════════════════════════════════════════════════════════");
+    info!("COMPLETE E2E PAYMENT TEST - LIVE NODES (enforcement ON)");
 
-    // =========================================================================
-    // STEP 1: Initialize test environment
-    // =========================================================================
-    info!("\n📦 STEP 1: Initialize test environment");
     let mut env = CompletePaymentTestEnv::setup().await?;
 
     // Configure client node (node 0) with wallet
@@ -144,27 +107,10 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .ok_or("Node 0 not found")?
         .set_wallet(env.wallet.clone());
 
-    info!("✅ Client configured with wallet");
-
-    // =========================================================================
-    // STEP 2: Prepare test data
-    // =========================================================================
-    info!("\n📝 STEP 2: Prepare test data");
     let test_data = b"Complete E2E payment test data - proving the protocol works!";
-    info!("   Data size: {} bytes", test_data.len());
-
-    // Compute expected address
     let expected_address = saorsa_node::compute_address(test_data);
-    info!(
-        "   Expected chunk address: {}",
-        hex::encode(expected_address)
-    );
 
-    // =========================================================================
-    // STEP 3: Request quotes from DHT peers
-    // =========================================================================
-    info!("\n💬 STEP 3: Request quotes from DHT peers");
-
+    // Request quotes from DHT peers with retries
     let client = env
         .harness
         .test_node(0)
@@ -173,95 +119,48 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .as_ref()
         .ok_or("Client not configured")?;
 
-    // Debug: Check peer count before quote collection
-    let client_peer_count = env
-        .harness
-        .test_node(0)
-        .ok_or("Node 0 not found")?
-        .peer_count()
-        .await;
-    info!(
-        "   Client node has {} connected peers before quote collection",
-        client_peer_count
-    );
-
-    // Retry quote collection with exponential backoff (DHT may need time to propagate)
     let mut quotes_with_prices = None;
     for attempt in 1..=5 {
-        info!("   Quote collection attempt {}/5...", attempt);
+        info!("Quote collection attempt {attempt}/5...");
         match client.get_quotes_from_dht(test_data).await {
             Ok(quotes) => {
-                info!("   ✅ Got {} quotes on attempt {}", quotes.len(), attempt);
+                info!("Got {} quotes on attempt {attempt}", quotes.len());
                 quotes_with_prices = Some(quotes);
                 break;
             }
             Err(e) => {
-                warn!("   Attempt {} failed: {}", attempt, e);
+                warn!("Attempt {attempt} failed: {e}");
                 if attempt < 5 {
                     let backoff = Duration::from_secs(2u64.pow(attempt));
-                    info!("   Retrying after {:?}...", backoff);
                     sleep(backoff).await;
                 }
             }
         }
     }
 
-    let quotes_with_prices =
-        quotes_with_prices.ok_or_else(|| "Failed to get quotes after 5 attempts".to_string())?;
+    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 5 attempts")?;
 
-    info!(
-        "✅ Received {} quotes from network",
-        quotes_with_prices.len()
-    );
-
-    // Verify we got exactly 5 quotes
     assert_eq!(
         quotes_with_prices.len(),
         5,
         "Should receive exactly 5 quotes (REQUIRED_QUOTES)"
     );
 
-    // Log quote details
-    info!("   Quote details:");
-    for (i, (peer_id, quote, price)) in quotes_with_prices.iter().enumerate() {
-        info!(
-            "   • Quote {}: {} atto from {} (peer: {peer_id})",
-            i + 1,
-            price,
-            quote.rewards_address
-        );
-    }
-
-    // =========================================================================
-    // STEP 4: Calculate payment (sort by price, select median)
-    // =========================================================================
-    info!("\n💰 STEP 4: Calculate payment (median selection)");
-
-    // Collect peer_quotes and strip peer IDs for SingleNodePayment
+    // Calculate payment (sort by price, select median)
     let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     let mut quotes_for_payment: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     for (peer_id_str, quote, price) in quotes_with_prices {
-        let peer_id: PeerId = peer_id_str
-            .parse()
-            .map_err(|e| format!("Failed to parse peer ID '{peer_id_str}': {e}"))?;
-        peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)
+            .map_err(|e| format!("Failed to convert peer ID '{peer_id_str}': {e}"))?;
+        peer_quotes.push((encoded_peer_id, quote.clone()));
         quotes_for_payment.push((quote, price));
     }
     let payment = SingleNodePayment::from_quotes(quotes_for_payment)
         .map_err(|e| format!("Failed to create payment: {e}"))?;
 
-    info!("✅ Payment calculation complete:");
-    info!("   • Total payment: {} atto", payment.total_amount());
-    let paid = payment
-        .paid_quote()
-        .ok_or("Missing paid quote at median index")?;
-    info!(
-        "   • Paid quote (median): {} atto to {}",
-        paid.amount, paid.rewards_address
-    );
-    info!("   • Strategy: Pay median 3x, send 0 atto to other 4 nodes");
+    info!("Payment total: {} atto", payment.total_amount());
 
-    // Verify payment structure
+    // Verify only median quote has non-zero amount
     let non_zero_quotes = payment
         .quotes
         .iter()
@@ -272,11 +171,7 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         "Only median quote should have non-zero amount"
     );
 
-    // =========================================================================
-    // STEP 5: Make on-chain payment
-    // =========================================================================
-    info!("\n⛓️  STEP 5: Make on-chain payment (Anvil testnet)");
-
+    // Make on-chain payment
     let tx_hashes = payment
         .pay(&env.wallet)
         .await
@@ -286,11 +181,10 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         !tx_hashes.is_empty(),
         "Expected at least one transaction hash from payment"
     );
-
-    info!("✅ On-chain payment succeeded:");
-    for (i, tx) in tx_hashes.iter().enumerate() {
-        info!("   • Transaction {}: {}", i + 1, hex::encode(tx));
-    }
+    info!(
+        "On-chain payment succeeded: {} transactions",
+        tx_hashes.len()
+    );
 
     // Build proof AFTER payment with tx hashes included
     let proof = PaymentProof {
@@ -300,29 +194,19 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     let proof_bytes =
         rmp_serde::to_vec(&proof).map_err(|e| format!("Failed to serialize proof: {e}"))?;
 
-    // =========================================================================
-    // STEP 6: Store chunk with payment proof
-    // =========================================================================
-    info!("\n💾 STEP 6: Store chunk with payment proof");
-
+    // Store chunk with payment proof — nodes WILL verify on-chain
     let stored_address = client
         .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
         .await
-        .map_err(|e| format!("Failed to store chunk: {e}"))?;
+        .map_err(|e| format!("Storage MUST succeed with valid payment proof: {e}"))?;
 
-    info!("✅ Chunk stored successfully:");
-    info!("   • Address: {}", hex::encode(stored_address));
     assert_eq!(
         stored_address, expected_address,
         "Stored address should match computed address"
     );
+    info!("Chunk stored at {}", hex::encode(stored_address));
 
-    // =========================================================================
-    // STEP 7: Verify chunk is retrievable from storing node
-    // =========================================================================
-    info!("\n🔍 STEP 7: Verify chunk retrieval from storing node");
-
-    // Wait for storage to persist
+    // Verify chunk is retrievable
     sleep(Duration::from_millis(500)).await;
 
     let retrieved = client
@@ -330,28 +214,16 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .await
         .map_err(|e| format!("Failed to retrieve chunk: {e}"))?;
 
-    assert!(
-        retrieved.is_some(),
-        "Chunk should be retrievable from storing node"
-    );
-
-    let chunk = retrieved.ok_or("Chunk not found")?;
+    let chunk = retrieved.ok_or("Chunk should be retrievable from storing node")?;
     assert_eq!(
         chunk.content.as_ref(),
         test_data,
         "Retrieved data should match original"
     );
 
-    info!("✅ Chunk successfully retrieved:");
-    info!("   • Size: {} bytes", chunk.content.len());
-    info!("   • Content verified: matches original data");
+    info!("Chunk retrieved and verified");
 
-    // =========================================================================
-    // STEP 8: Verify chunk is retrievable from a DIFFERENT node
-    // =========================================================================
-    info!("\n🔀 STEP 8: Test cross-node retrieval (replication)");
-
-    // Try to retrieve from node 1 (different from storing node 0)
+    // Try cross-node retrieval (may not work without replication)
     let node1_chunk = env
         .harness
         .test_node(1)
@@ -360,88 +232,64 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         .await?;
 
     if let Some(chunk) = node1_chunk {
-        info!("✅ Cross-node retrieval succeeded!");
-        info!("   • Retrieved from node 1 (different from storing node)");
-        info!("   • Size: {} bytes", chunk.content.len());
         assert_eq!(
             chunk.content.as_ref(),
             test_data,
             "Cross-node data should match original"
         );
+        info!("Cross-node retrieval succeeded");
     } else {
-        warn!("⚠️  Cross-node retrieval failed (not replicated yet)");
-        warn!("   This is expected in test mode without DHT replication");
-        info!("   ℹ️  Production nodes would replicate via DHT close groups");
+        info!("Cross-node retrieval: not replicated yet (expected in test mode)");
     }
 
-    // =========================================================================
-    // TEST COMPLETE
-    // =========================================================================
-    info!("\n═══════════════════════════════════════════════════════════════");
-    info!("  ✅ COMPLETE E2E PAYMENT TEST PASSED");
-    info!("═══════════════════════════════════════════════════════════════");
-    info!("\nProven capabilities:");
-    info!("  ✅ DHT peer discovery");
-    info!("  ✅ Quote collection protocol");
-    info!("  ✅ Median price calculation");
-    info!("  ✅ On-chain payment (Arbitrum/Anvil)");
-    info!("  ✅ Payment proof serialization");
-    info!("  ✅ Chunk storage with payment");
-    info!("  ✅ LMDB persistence");
-    info!("  ✅ Chunk retrieval");
-    info!("\nThe payment protocol is PRODUCTION READY! 🎉");
+    info!("COMPLETE E2E PAYMENT TEST PASSED (enforcement ON)");
 
     env.teardown().await?;
     Ok(())
 }
 
-/// Test: Payment flow with EVM verification ENABLED.
+/// Test: Nodes reject unpaid chunks when `payment_enforcement: true`.
 ///
-/// This test validates that when payment enforcement is enabled,
-/// nodes properly verify payments on-chain before storing chunks.
+/// Validates server-side enforcement: the NODE rejects, not the client.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_payment_verification_enforcement() -> Result<(), Box<dyn std::error::Error>> {
-    info!("═══════════════════════════════════════════════════════════════");
-    info!("  PAYMENT VERIFICATION ENFORCEMENT TEST");
-    info!("═══════════════════════════════════════════════════════════════");
+    info!("PAYMENT ENFORCEMENT TEST (enforcement ON)");
 
-    // Start Anvil testnet
+    // Start Anvil and wire it to nodes
     let testnet = Testnet::new().await;
-    info!("✅ Anvil testnet started");
+    let network = testnet.to_network();
 
-    // Setup network WITH payment enforcement enabled
-    let harness = TestHarness::setup_with_evm_and_config(
-        TestNetworkConfig::small().with_payment_enforcement(),
-    )
-    .await?;
+    let config = TestNetworkConfig::small()
+        .with_payment_enforcement()
+        .with_evm_network(network.clone());
 
-    info!("✅ 10-node network started with PAYMENT ENFORCEMENT ENABLED");
+    // Use setup_with_config (NOT setup_with_evm_and_config) because we already
+    // created our own Testnet above — creating another would double-bind the port.
+    let harness = TestHarness::setup_with_config(config).await?;
 
-    // Wait for network stabilization
     sleep(Duration::from_secs(5)).await;
 
-    // Try to store WITHOUT a wallet (should fail)
+    // Try to store WITHOUT a wallet (sends no payment proof to server)
     let client =
         QuantumClient::with_defaults().with_node(harness.node(0).ok_or("Node 0 not found")?);
 
     let test_data = b"This should be rejected without payment";
     let result = client.put_chunk(Bytes::from(test_data.to_vec())).await;
 
-    info!("\n📋 Testing storage without payment:");
-    if result.is_err() {
-        info!("✅ Storage correctly REJECTED without payment");
-        let error_msg = result
-            .as_ref()
-            .err()
-            .map_or_else(|| "Unknown".to_string(), ToString::to_string);
-        info!("   Error: {}", error_msg);
-    } else {
-        return Err("Storage should have been rejected without payment!".into());
-    }
+    // MUST be rejected — assert exactly one outcome
+    assert!(
+        result.is_err(),
+        "Storage MUST fail without payment when enforcement is enabled"
+    );
+    let error_msg = format!("{}", result.as_ref().err().ok_or("Expected error")?);
+    info!("Rejected as expected: {error_msg}");
+    assert!(
+        error_msg.to_lowercase().contains("payment"),
+        "Error must be payment-related, got: {error_msg}"
+    );
 
-    // Now try WITH a wallet and payment
-    let network = testnet.to_network();
+    // Now try WITH wallet and full payment flow — MUST succeed
     let private_key = testnet.default_wallet_private_key();
     let wallet = Wallet::new_from_private_key(network, &private_key)?;
 
@@ -449,29 +297,120 @@ async fn test_payment_verification_enforcement() -> Result<(), Box<dyn std::erro
         .with_node(harness.node(0).ok_or("Node 0 not found")?)
         .with_wallet(wallet);
 
-    info!("\n💰 Testing storage WITH payment:");
-    // Note: This will likely fail because the nodes need actual EVM verification
-    // which requires the full quote->pay->verify flow. For now we just test
-    // that the rejection logic works.
     let result = client_with_wallet
         .put_chunk(Bytes::from(test_data.to_vec()))
         .await;
 
-    match result {
-        Ok(_) => {
-            info!("✅ Storage succeeded with payment");
-        }
-        Err(e) => {
-            info!("⚠️  Storage failed even with wallet (expected in strict test mode)");
-            info!("   Error: {}", e);
-            info!("   Note: Full payment verification requires complete quote->pay->verify flow");
+    // MUST succeed — assert exactly one outcome
+    let address = result.map_err(|e| format!("Storage MUST succeed with valid payment: {e}"))?;
+    info!("Stored with payment at {}", hex::encode(address));
+
+    info!("PAYMENT ENFORCEMENT TEST PASSED");
+
+    harness.teardown().await?;
+    Ok(())
+}
+
+/// Test: Forged ML-DSA-65 signature rejection.
+///
+/// Gets valid quotes, makes real payment, builds proof, CORRUPTS the
+/// signature bytes, sends to EVM-enabled node, asserts rejection.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+#[allow(clippy::too_many_lines)]
+async fn test_forged_signature_rejection() -> Result<(), Box<dyn std::error::Error>> {
+    info!("FORGED SIGNATURE REJECTION TEST (enforcement ON)");
+
+    let testnet = Testnet::new().await;
+    let network = testnet.to_network();
+
+    let config = TestNetworkConfig::small()
+        .with_payment_enforcement()
+        .with_evm_network(network.clone());
+
+    // Use setup_with_config (NOT setup_with_evm_and_config) because we already
+    // created our own Testnet above — creating another would double-bind the port.
+    let harness = TestHarness::setup_with_config(config).await?;
+
+    sleep(Duration::from_secs(10)).await;
+    harness.warmup_dht().await?;
+
+    // Create client with wallet
+    let private_key = testnet.default_wallet_private_key();
+    let wallet = Wallet::new_from_private_key(network, &private_key)?;
+    let client = QuantumClient::with_defaults()
+        .with_node(harness.node(0).ok_or("Node 0 not found")?)
+        .with_wallet(wallet.clone());
+
+    let test_data = b"Forged signature test data";
+
+    // Get quotes from DHT
+    let mut quotes_with_prices = None;
+    for attempt in 1..=5 {
+        match client.get_quotes_from_dht(test_data).await {
+            Ok(quotes) => {
+                quotes_with_prices = Some(quotes);
+                break;
+            }
+            Err(e) => {
+                warn!("Quote attempt {attempt} failed: {e}");
+                if attempt < 5 {
+                    sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                }
+            }
         }
     }
 
-    info!("\n═══════════════════════════════════════════════════════════════");
-    info!("  ✅ PAYMENT ENFORCEMENT TEST PASSED");
-    info!("═══════════════════════════════════════════════════════════════");
-    info!("\nProven: Nodes properly reject chunks without payment when enforcement is enabled");
+    let quotes_with_prices = quotes_with_prices.ok_or("Failed to get quotes after 5 attempts")?;
+
+    // Build peer_quotes and payment
+    let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
+    let mut quotes_for_payment: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
+    for (peer_id_str, quote, price) in quotes_with_prices {
+        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)
+            .map_err(|e| format!("Failed to convert peer ID '{peer_id_str}': {e}"))?;
+        peer_quotes.push((encoded_peer_id, quote.clone()));
+        quotes_for_payment.push((quote, price));
+    }
+
+    let payment = SingleNodePayment::from_quotes(quotes_for_payment)
+        .map_err(|e| format!("Failed to create payment: {e}"))?;
+
+    // Pay on-chain (real payment)
+    let tx_hashes = payment
+        .pay(&wallet)
+        .await
+        .map_err(|e| format!("Payment failed: {e}"))?;
+
+    // CORRUPT the signature on the first quote
+    let mut forged_quotes = peer_quotes.clone();
+    if let Some((_peer_id, ref mut quote)) = forged_quotes.first_mut() {
+        // Flip all signature bytes to corrupt it
+        for byte in &mut quote.signature {
+            *byte = byte.wrapping_add(1);
+        }
+    }
+
+    // Build proof with forged signature
+    let forged_proof = PaymentProof {
+        proof_of_payment: ProofOfPayment {
+            peer_quotes: forged_quotes,
+        },
+        tx_hashes,
+    };
+    let forged_proof_bytes = rmp_serde::to_vec(&forged_proof)
+        .map_err(|e| format!("Failed to serialize forged proof: {e}"))?;
+
+    // Try to store with forged proof — MUST be rejected
+    let result = client
+        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), forged_proof_bytes)
+        .await;
+
+    assert!(result.is_err(), "Storage MUST fail with forged signature");
+    let error_msg = format!("{}", result.as_ref().err().ok_or("Expected error")?);
+    info!("Forged signature rejected: {error_msg}");
+
+    info!("FORGED SIGNATURE REJECTION TEST PASSED");
 
     harness.teardown().await?;
     Ok(())
@@ -484,9 +423,7 @@ async fn test_payment_verification_enforcement() -> Result<(), Box<dyn std::erro
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Error>> {
-    info!("═══════════════════════════════════════════════════════════════");
-    info!("  PAYMENT FLOW RESILIENCE TEST");
-    info!("═══════════════════════════════════════════════════════════════");
+    info!("PAYMENT FLOW RESILIENCE TEST (enforcement ON)");
 
     let mut env = CompletePaymentTestEnv::setup().await?;
 
@@ -498,22 +435,18 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
 
     // Verify initial network
     let initial_count = env.harness.running_node_count().await;
-    info!("Initial network: {} running nodes", initial_count);
     assert_eq!(initial_count, 10);
 
     // Simulate failures - shutdown 3 nodes
-    info!("\n⚠️  Simulating node failures (shutting down nodes 5, 6, 7)");
+    info!("Simulating node failures (shutting down nodes 5, 6, 7)");
     env.harness.shutdown_nodes(&[5, 6, 7]).await?;
 
     sleep(Duration::from_secs(2)).await;
 
     let remaining_count = env.harness.running_node_count().await;
-    info!("After failures: {} running nodes", remaining_count);
     assert_eq!(remaining_count, 7);
 
-    // Now try the payment flow with reduced network
-    info!("\n💬 Requesting quotes from reduced network (7 nodes)");
-
+    // Payment flow with reduced network — MUST succeed (7 nodes > 5 required)
     let test_data = b"Resilience test data";
     let client = env
         .harness
@@ -525,31 +458,15 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
 
     let quotes_result = client.get_quotes_from_dht(test_data).await;
 
-    match quotes_result {
-        Ok(quotes) => {
-            info!(
-                "✅ Successfully collected {} quotes despite failures",
-                quotes.len()
-            );
-            info!("   Network is resilient!");
+    let quotes =
+        quotes_result.map_err(|e| format!("Quote collection MUST succeed with 7 nodes: {e}"))?;
+    info!("Collected {} quotes despite failures", quotes.len());
 
-            // Try to store
-            let result = client.put_chunk(Bytes::from(test_data.to_vec())).await;
-            if result.is_ok() {
-                info!("✅ Storage succeeded with reduced network");
-            } else {
-                info!("⚠️  Storage failed (may need more peers for full flow)");
-            }
-        }
-        Err(e) => {
-            warn!("⚠️  Quote collection failed with reduced network: {}", e);
-            info!("   This is expected if we don't have enough peers for DHT queries");
-        }
-    }
+    let result = client.put_chunk(Bytes::from(test_data.to_vec())).await;
+    let _address = result.map_err(|e| format!("Storage MUST succeed with reduced network: {e}"))?;
+    info!("Storage succeeded with reduced network");
 
-    info!("\n═══════════════════════════════════════════════════════════════");
-    info!("  ✅ RESILIENCE TEST COMPLETE");
-    info!("═══════════════════════════════════════════════════════════════");
+    info!("RESILIENCE TEST PASSED");
 
     env.teardown().await?;
     Ok(())

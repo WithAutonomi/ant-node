@@ -1,7 +1,8 @@
 //! Live testnet tests for load testing and data verification.
 //!
-//! These tests connect to the live 200-node testnet for comprehensive testing.
+//! These tests connect to the live saorsa testnet for comprehensive testing.
 //! They are designed to be run via shell scripts that set environment variables.
+//! When environment variables are not set, the tests skip gracefully.
 
 #![allow(
     clippy::unwrap_used,
@@ -92,13 +93,18 @@ fn generate_chunk(index: usize, size_kb: usize) -> Vec<u8> {
 /// Load test: store thousands of chunks on the testnet.
 ///
 /// Environment variables:
+/// - `SAORSA_TEST_LIVE`: Must be set to "true" to run this test
 /// - `SAORSA_TEST_CHUNK_COUNT`: Number of chunks to store (default: 1000)
 /// - `SAORSA_TEST_CHUNK_SIZE_KB`: Size of each chunk in KB (default: 1)
 /// - `SAORSA_TEST_CONCURRENCY`: Concurrent operations (default: 10)
 /// - `SAORSA_TEST_ADDRESSES_FILE`: File to write chunk addresses to
 #[tokio::test]
-#[ignore = "Live testnet test - run via load-test.sh"]
 async fn run_load_test() {
+    if env::var("SAORSA_TEST_LIVE").as_deref() != Ok("true") {
+        println!("Skipping: SAORSA_TEST_LIVE not set to 'true'");
+        return;
+    }
+
     let chunk_count: usize = env::var("SAORSA_TEST_CHUNK_COUNT")
         .unwrap_or_else(|_| "1000".to_string())
         .parse()
@@ -211,11 +217,16 @@ async fn run_load_test() {
 /// Verify chunks: check that all stored chunks are retrievable.
 ///
 /// Environment variables:
+/// - `SAORSA_TEST_LIVE`: Must be set to "true" to run this test
 /// - `SAORSA_TEST_ADDRESSES_FILE`: File containing chunk addresses to verify
 /// - `SAORSA_TEST_SAMPLE_SIZE`: Number of chunks to sample (default: all)
 #[tokio::test]
-#[ignore = "Live testnet test - run via churn-verify.sh"]
 async fn run_verify_chunks() {
+    if env::var("SAORSA_TEST_LIVE").as_deref() != Ok("true") {
+        println!("Skipping: SAORSA_TEST_LIVE not set to 'true'");
+        return;
+    }
+
     let addresses_file =
         env::var("SAORSA_TEST_ADDRESSES_FILE").expect("SAORSA_TEST_ADDRESSES_FILE not set");
 
@@ -346,8 +357,9 @@ async fn run_verify_chunks() {
 ///
 /// This test stores a moderate number of chunks and immediately verifies
 /// they can be retrieved from different parts of the network.
+///
+/// Set `SAORSA_TEST_EXTERNAL=true` to run this test.
 #[tokio::test]
-#[ignore = "Live testnet test - requires SAORSA_TEST_EXTERNAL=true"]
 async fn run_comprehensive_data_tests() {
     if env::var("SAORSA_TEST_EXTERNAL").is_err() {
         println!("Skipping: SAORSA_TEST_EXTERNAL not set");
