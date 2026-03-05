@@ -389,7 +389,7 @@ impl NodeBuilder {
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from node identity
-        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity);
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)?;
 
         info!(
             "ANT protocol handler initialized with ML-DSA-65 signing (protocol={})",

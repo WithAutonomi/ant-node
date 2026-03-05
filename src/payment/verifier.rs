@@ -284,10 +284,10 @@ impl PaymentVerifier {
         // Verify that ALL quotes were issued for the correct content address.
         // This prevents an attacker from paying for chunk A and reusing
         // that proof to store chunks B, C, D, etc.
-        for (_encoded_peer_id, quote) in &payment.peer_quotes {
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
             if !verify_quote_content(quote, xorname) {
                 return Err(Error::Payment(format!(
-                    "Quote content address mismatch: expected {}, got {}",
+                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {}, got {}",
                     hex::encode(xorname),
                     hex::encode(quote.content.0)
                 )));
@@ -297,13 +297,16 @@ impl PaymentVerifier {
         // Verify quote signatures using ML-DSA-65 (post-quantum).
         // We use our own verification instead of ant-evm's check_is_signed_by_claimed_peer()
         // which only supports Ed25519/libp2p signatures.
+        // TODO: Verify that quote.pub_key belongs to encoded_peer_id.
+        // Currently we verify the signature is valid for the pub_key IN the quote,
+        // but don't verify that pub_key actually belongs to the claimed peer.
         // Signature verification is CPU-bound, so we run it off the async runtime.
         let peer_quotes = payment.peer_quotes.clone();
         tokio::task::spawn_blocking(move || {
-            for (_encoded_peer_id, quote) in &peer_quotes {
+            for (encoded_peer_id, quote) in &peer_quotes {
                 if !crate::payment::quote::verify_quote_signature(quote) {
                     return Err(Error::Payment(
-                        "Quote ML-DSA-65 signature verification failed".to_string(),
+                        format!("Quote ML-DSA-65 signature verification failed for peer {encoded_peer_id:?}"),
                     ));
                 }
             }

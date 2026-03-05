@@ -77,6 +77,26 @@ impl QuoteGenerator {
         self.sign_fn.is_some()
     }
 
+    /// Probe the signer with test data to verify it produces a non-empty signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no signer is set or if signing produces an empty signature.
+    pub fn probe_signer(&self) -> Result<()> {
+        let sign_fn = self
+            .sign_fn
+            .as_ref()
+            .ok_or_else(|| crate::error::Error::Payment("Signer not set".to_string()))?;
+        let test_msg = b"saorsa-signing-probe";
+        let test_sig = sign_fn(test_msg);
+        if test_sig.is_empty() {
+            return Err(crate::error::Error::Payment(
+                "ML-DSA-65 signing probe failed: empty signature produced".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Generate a payment quote for storing data.
     ///
     /// # Arguments
@@ -248,19 +268,20 @@ pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
 ///
 /// * `generator` - The quote generator to configure
 /// * `identity` - The node identity providing signing keys
+///
+/// # Errors
+///
+/// Returns an error if the secret key cannot be deserialized or if the
+/// signing probe (a test signature at startup) fails.
 pub fn wire_ml_dsa_signer(
     generator: &mut QuoteGenerator,
     identity: &saorsa_core::identity::NodeIdentity,
-) {
+) -> Result<()> {
     let pub_key_bytes = identity.public_key().as_bytes().to_vec();
     let sk_bytes = identity.secret_key_bytes().to_vec();
-    let sk = match MlDsaSecretKey::from_bytes(&sk_bytes) {
-        Ok(sk) => sk,
-        Err(e) => {
-            tracing::error!("Failed to deserialize ML-DSA-65 secret key: {e}");
-            return;
-        }
-    };
+    let sk = MlDsaSecretKey::from_bytes(&sk_bytes).map_err(|e| {
+        crate::error::Error::Crypto(format!("Failed to deserialize ML-DSA-65 secret key: {e}"))
+    })?;
     generator.set_signer(pub_key_bytes, move |msg| {
         let ml_dsa = MlDsa65::new();
         match ml_dsa.sign(&sk, msg) {
@@ -271,6 +292,8 @@ pub fn wire_ml_dsa_signer(
             }
         }
     });
+    generator.probe_signer()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,5 +532,42 @@ mod tests {
         generator.set_signer(vec![0u8; 32], |_| vec![0u8; 32]);
 
         assert!(generator.can_sign());
+    }
+
+    #[test]
+    fn test_wire_ml_dsa_signer_returns_ok_with_valid_identity() {
+        let identity = saorsa_core::identity::NodeIdentity::generate().expect("keypair generation");
+        let rewards_address = RewardsAddress::new([3u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        let result = wire_ml_dsa_signer(&mut generator, &identity);
+        assert!(
+            result.is_ok(),
+            "wire_ml_dsa_signer should succeed: {result:?}"
+        );
+        assert!(generator.can_sign());
+    }
+
+    #[test]
+    fn test_probe_signer_fails_without_signer() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        let result = generator.probe_signer();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_probe_signer_fails_with_empty_signature() {
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+
+        generator.set_signer(vec![0u8; 32], |_| vec![]);
+
+        let result = generator.probe_signer();
+        assert!(result.is_err());
     }
 }

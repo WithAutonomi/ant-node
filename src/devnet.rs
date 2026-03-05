@@ -602,7 +602,8 @@ impl Devnet {
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from the devnet node's identity
-        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity);
+        crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)
+            .map_err(|e| DevnetError::Startup(format!("Failed to wire ML-DSA-65 signer: {e}")))?;
 
         Ok(AntProtocol::new(
             Arc::new(storage),

@@ -195,10 +195,28 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
         rmp_serde::to_vec(&proof).map_err(|e| format!("Failed to serialize proof: {e}"))?;
 
     // Store chunk with payment proof — nodes WILL verify on-chain
-    let stored_address = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes)
-        .await
-        .map_err(|e| format!("Storage MUST succeed with valid payment proof: {e}"))?;
+    // Retry with backoff: DHT routing tables may not be fully stabilized yet
+    let mut stored_address = None;
+    for attempt in 1..=5 {
+        match client
+            .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
+            .await
+        {
+            Ok(addr) => {
+                info!("Chunk stored on attempt {attempt}");
+                stored_address = Some(addr);
+                break;
+            }
+            Err(e) => {
+                warn!("Storage attempt {attempt}/5 failed: {e}");
+                if attempt < 5 {
+                    sleep(Duration::from_secs(3)).await;
+                }
+            }
+        }
+    }
+    let stored_address =
+        stored_address.ok_or("Storage MUST succeed with valid payment proof after 5 attempts")?;
 
     assert_eq!(
         stored_address, expected_address,

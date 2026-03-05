@@ -181,8 +181,10 @@ pub mod test_accounts {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_anvil_creation() {
         let anvil = TestAnvil::new().await.unwrap();
         let _network = anvil.to_network();

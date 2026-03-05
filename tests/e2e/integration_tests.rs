@@ -307,11 +307,15 @@ async fn test_quantum_client_chunk_round_trip() {
     let client = QuantumClient::new(config).with_node(Arc::clone(&node));
 
     // ── PUT ──────────────────────────────────────────────────────────────
+    // Nodes use payment_enforcement: false, so we send a dummy proof via
+    // put_chunk_with_proof() (put_chunk() requires a wallet since the
+    // client-side early-rejection fix).
     let content = Bytes::from("quantum client e2e test payload");
+    let dummy_proof = vec![0u8; 64];
     let address = client
-        .put_chunk(content.clone())
+        .put_chunk_with_proof(content.clone(), dummy_proof)
         .await
-        .expect("QuantumClient::put_chunk should succeed");
+        .expect("QuantumClient::put_chunk_with_proof should succeed");
 
     // Address must equal SHA256(content)
     let expected_address = saorsa_node::compute_address(&content);
