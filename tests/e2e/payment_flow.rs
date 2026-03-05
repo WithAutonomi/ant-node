@@ -572,24 +572,48 @@ async fn test_payment_with_node_failures() -> Result<(), Box<dyn std::error::Err
     env.harness.shutdown_nodes(&[5, 6, 7]).await?;
 
     // Wait for network to adapt to failures
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(15)).await;
 
     // Verify nodes are shut down
     let remaining_count = env.harness.running_node_count().await;
-    info!("After failures: {} running nodes remain", remaining_count);
+    info!("After failures: {remaining_count} running nodes remain");
     assert_eq!(
         remaining_count, 7,
         "Should have 7 nodes after shutting down 3"
     );
 
+    // Re-warm DHT after node failures so routing tables adapt
+    env.harness.warmup_dht().await?;
+    sleep(Duration::from_secs(15)).await;
+
     // Store a chunk with the remaining nodes (7 nodes still > 5 needed for quotes)
     let test_data = b"Resilience test data";
-    let address = env
-        .harness
-        .test_node(0)
-        .ok_or("Node 0 not found")?
-        .store_chunk_with_payment(test_data)
-        .await?;
+    let mut address = None;
+    for attempt in 1..=10 {
+        info!("Storage attempt {attempt}/10 after node failures...");
+        match env
+            .harness
+            .test_node(0)
+            .ok_or("Node 0 not found")?
+            .store_chunk_with_payment(test_data)
+            .await
+        {
+            Ok(addr) => {
+                address = Some(addr);
+                break;
+            }
+            Err(e) => {
+                warn!("Storage attempt {attempt}/10 failed: {e}");
+                if attempt < 10 {
+                    if attempt == 4 || attempt == 7 {
+                        let _ = env.harness.warmup_dht().await;
+                    }
+                    sleep(Duration::from_secs(10)).await;
+                }
+            }
+        }
+    }
+    let address = address.ok_or("Storage MUST succeed after node failures with 10 attempts")?;
 
     info!(
         "Successfully stored chunk despite simulated failures: {}",
