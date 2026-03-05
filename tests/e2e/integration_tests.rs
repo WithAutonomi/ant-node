@@ -12,6 +12,7 @@ use super::{NetworkState, TestHarness, TestNetwork, TestNetworkConfig};
 use bytes::Bytes;
 use saorsa_core::P2PEvent;
 use saorsa_node::client::{QuantumClient, QuantumConfig};
+use serial_test::serial;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -109,6 +110,7 @@ async fn test_custom_network_config() {
 
 /// Test network with EVM testnet.
 #[tokio::test]
+#[serial]
 async fn test_network_with_evm() {
     // TestNetworkConfig automatically generates unique ports and data dirs
     let harness = TestHarness::setup_with_evm()

@@ -199,6 +199,9 @@ async fn test_multiple_clients_concurrent_payments() -> Result<(), Box<dyn std::
 
     info!("Created 3 clients with independent funded wallets");
 
+    // Extra stabilization after wallet setup
+    sleep(Duration::from_secs(3)).await;
+
     // Store chunks concurrently using payment-enabled client
     let mut addresses = Vec::new();
     for i in 0..3 {

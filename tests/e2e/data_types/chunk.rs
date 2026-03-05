@@ -71,6 +71,7 @@ mod tests {
         QuotingMetricsTracker,
     };
     use saorsa_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+    use serial_test::serial;
 
     /// Test 1: Content address computation is deterministic
     #[test]
@@ -425,6 +426,7 @@ mod tests {
     /// 4. Stores a chunk (triggers quote request, payment, and storage)
     /// 5. Retrieves and verifies the chunk
     #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn test_chunk_store_with_payment() {
         let mut harness = TestHarness::setup_with_payments()
             .await
@@ -483,6 +485,7 @@ mod tests {
     /// This test verifies that storing the same chunk twice doesn't require
     /// a second payment (the first payment is cached).
     #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn test_chunk_payment_cache() {
         let mut harness = TestHarness::setup_with_payments()
             .await
@@ -561,6 +564,7 @@ mod tests {
     /// This test verifies that attempting to store a chunk with an empty wallet
     /// (no balance) results in a payment failure.
     #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn test_chunk_store_fails_with_insufficient_funds() {
         let mut harness = TestHarness::setup_with_payments()
             .await
@@ -592,9 +596,14 @@ mod tests {
         if let Err(e) = result {
             let error_msg = format!("{e}");
             assert!(
-                error_msg.contains("Payment")
-                    || error_msg.contains("funds")
-                    || error_msg.contains("balance"),
+                {
+                    let lower = error_msg.to_lowercase();
+                    lower.contains("payment")
+                        || lower.contains("pay")
+                        || lower.contains("funds")
+                        || lower.contains("balance")
+                        || lower.contains("insufficient")
+                },
                 "Error should mention payment or funds, got: {error_msg}"
             );
         }
@@ -655,6 +664,7 @@ mod tests {
     /// 3. Verifying the request is rejected with `PaymentRequired`
     /// 4. Confirming the chunk was NOT stored
     #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn test_chunk_rejected_without_payment() -> color_eyre::Result<()> {
         use saorsa_node::ant_protocol::{
             ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,

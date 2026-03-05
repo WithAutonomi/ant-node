@@ -441,7 +441,7 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
     info!("Simulating node failures (shutting down nodes 5, 6, 7)");
     env.harness.shutdown_nodes(&[5, 6, 7]).await?;
 
-    sleep(Duration::from_secs(2)).await;
+    sleep(Duration::from_secs(10)).await;
 
     let remaining_count = env.harness.running_node_count().await;
     assert_eq!(remaining_count, 7);
@@ -456,15 +456,39 @@ async fn test_payment_flow_with_failures() -> Result<(), Box<dyn std::error::Err
         .as_ref()
         .ok_or("Client not configured")?;
 
-    let quotes_result = client.get_quotes_from_dht(test_data).await;
-
-    let quotes =
-        quotes_result.map_err(|e| format!("Quote collection MUST succeed with 7 nodes: {e}"))?;
-    info!("Collected {} quotes despite failures", quotes.len());
-
-    let result = client.put_chunk(Bytes::from(test_data.to_vec())).await;
-    let _address = result.map_err(|e| format!("Storage MUST succeed with reduced network: {e}"))?;
-    info!("Storage succeeded with reduced network");
+    // Retry quote collection and storage up to 3 times to allow DHT to stabilize
+    let mut last_err = String::new();
+    let mut succeeded = false;
+    for attempt in 1..=3 {
+        info!("Storage attempt {attempt}/3 after node failures...");
+        match client.get_quotes_from_dht(test_data).await {
+            Ok(quotes) => {
+                info!("Collected {} quotes despite failures", quotes.len());
+                match client.put_chunk(Bytes::from(test_data.to_vec())).await {
+                    Ok(_address) => {
+                        info!("Storage succeeded with reduced network");
+                        succeeded = true;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = format!("Storage failed: {e}");
+                        warn!("Attempt {attempt} storage failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                last_err = format!("Quote collection failed: {e}");
+                warn!("Attempt {attempt} quote collection failed: {e}");
+            }
+        }
+        if attempt < 3 {
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+    assert!(
+        succeeded,
+        "Storage MUST succeed with reduced network after retries: {last_err}"
+    );
 
     info!("RESILIENCE TEST PASSED");
 

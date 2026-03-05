@@ -407,11 +407,9 @@ impl QuantumClient {
 
     /// Store a chunk on the saorsa network.
     ///
-    /// Behavior depends on whether a wallet is configured:
-    /// - **With wallet**: Delegates to [`put_chunk_with_payment`](Self::put_chunk_with_payment)
-    ///   for the full payment flow (quotes, on-chain payment, proof).
-    /// - **Without wallet**: Sends a simple `ChunkPutRequest` without payment proof.
-    ///   This works on devnets where EVM payment verification is disabled.
+    /// Requires a wallet to be configured. Delegates to
+    /// [`put_chunk_with_payment`](Self::put_chunk_with_payment) for the full
+    /// payment flow (quotes, on-chain payment, proof).
     ///
     /// # Arguments
     ///
@@ -424,48 +422,21 @@ impl QuantumClient {
     /// # Errors
     ///
     /// Returns an error if:
+    /// - No wallet is configured
     /// - P2P node is not configured
     /// - No remote peers found near the target address
     /// - The storage operation fails
-    /// - Payment is required but no wallet is configured
     pub async fn put_chunk(&self, content: Bytes) -> Result<XorName> {
         if self.wallet.is_some() {
             let (address, _tx_hashes) = self.put_chunk_with_payment(content).await?;
             return Ok(address);
         }
 
-        // No wallet configured - store without payment (works when EVM is disabled on nodes)
-        let content_len = content.len();
-        info!("Storing chunk without payment ({content_len} bytes) - no wallet configured");
-
-        let Some(ref node) = self.p2p_node else {
-            return Err(Error::Network("P2P node not configured".into()));
-        };
-
-        let address = compute_address(&content);
-        let content_size = content.len();
-        let target_peer = Self::pick_target_peer(node, &address).await?;
-
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let request = ChunkPutRequest::new(address, content.to_vec());
-        let message = ChunkMessage {
-            request_id,
-            body: ChunkMessageBody::PutRequest(request),
-        };
-        let message_bytes = message
-            .encode()
-            .map_err(|e| Error::Network(format!("Failed to encode PUT request: {e}")))?;
-
-        Self::send_put_and_await(
-            node,
-            &target_peer,
-            message_bytes,
-            request_id,
-            self.config.timeout_secs,
-            hex::encode(address),
-            content_size,
-        )
-        .await
+        Err(Error::Payment(
+            "No wallet configured — payment is required for chunk storage. \
+             Use --private-key or set SECRET_KEY to provide a wallet."
+                .to_string(),
+        ))
     }
 
     /// Send a PUT request and await the response.
