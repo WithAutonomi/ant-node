@@ -97,6 +97,12 @@ pub struct Cli {
     #[arg(long, short)]
     pub config: Option<PathBuf>,
 
+    /// Exit cleanly on upgrade instead of spawning a new process.
+    /// Use when running under a service manager (systemd, launchd, Windows Service)
+    /// that will restart the process automatically.
+    #[arg(long)]
+    pub stop_on_upgrade: bool,
+
     /// Disable persistent bootstrap cache.
     #[arg(long)]
     pub disable_bootstrap_cache: bool,
@@ -209,6 +215,7 @@ impl Cli {
 
         // Upgrade config
         config.upgrade.channel = self.upgrade_channel.into();
+        config.upgrade.stop_on_upgrade = self.stop_on_upgrade;
 
         // Payment config
         config.payment = PaymentConfig {

@@ -37,6 +37,8 @@ pub struct AutoApplyUpgrader {
     client: reqwest::Client,
     /// Shared binary cache (optional).
     binary_cache: Option<BinaryCache>,
+    /// When true, exit cleanly for service manager restart instead of spawning.
+    stop_on_upgrade: bool,
 }
 
 impl AutoApplyUpgrader {
@@ -54,6 +56,7 @@ impl AutoApplyUpgrader {
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
             binary_cache: None,
+            stop_on_upgrade: false,
         }
     }
 
@@ -64,6 +67,16 @@ impl AutoApplyUpgrader {
     #[must_use]
     pub fn with_binary_cache(mut self, cache: BinaryCache) -> Self {
         self.binary_cache = Some(cache);
+        self
+    }
+
+    /// Configure the upgrader to exit cleanly instead of spawning a new process.
+    ///
+    /// When enabled, the node exits after applying an upgrade, relying on an
+    /// external service manager (systemd, launchd, Windows Service) to restart it.
+    #[must_use]
+    pub fn with_stop_on_upgrade(mut self, stop: bool) -> Self {
+        self.stop_on_upgrade = stop;
         self
     }
 
@@ -215,7 +228,7 @@ impl AutoApplyUpgrader {
         );
 
         // Step 7: Trigger restart
-        Self::trigger_restart(&current_binary)?;
+        self.trigger_restart(&current_binary)?;
 
         Ok(UpgradeResult::Success {
             version: info.version.clone(),
@@ -418,43 +431,63 @@ impl AutoApplyUpgrader {
         Ok(())
     }
 
-    /// Trigger a restart of the node process.
+    /// Trigger a restart of the node process after a successful upgrade.
     ///
-    /// On Unix, uses `exec()` to replace the current process.
-    /// On Windows, exits with [`RESTART_EXIT_CODE`] so the service manager
-    /// can restart the process.
-    fn trigger_restart(binary_path: &Path) -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
+    /// **Service manager mode** (`stop_on_upgrade = true`):
+    /// Exit cleanly and let the service manager (systemd, launchd, Windows Service)
+    /// restart the process. On Unix exits with code 0; on Windows exits with
+    /// [`RESTART_EXIT_CODE`] (100) because `WinSW` uses `RestartPolicy::OnFailure`.
+    ///
+    /// **Standalone mode** (`stop_on_upgrade = false`):
+    /// Spawn the new binary as a child process with the same arguments, then exit.
+    /// This ensures continuity when no service manager is present.
+    fn trigger_restart(&self, binary_path: &Path) -> Result<()> {
+        if self.stop_on_upgrade {
+            // Service manager mode: exit and let the service manager restart us
+            #[cfg(unix)]
+            {
+                info!("Exiting with code 0 for service manager restart");
+                std::process::exit(0);
+            }
 
-            // Collect current args (skip the binary name)
+            #[cfg(windows)]
+            {
+                let _ = binary_path;
+                info!(
+                    "Exiting with code {} to signal service manager restart",
+                    RESTART_EXIT_CODE
+                );
+                std::process::exit(RESTART_EXIT_CODE);
+            }
+
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = binary_path;
+                warn!("Auto-restart not supported on this platform. Please restart manually.");
+                Ok(())
+            }
+        } else {
+            // Standalone mode: spawn new process then exit
             let args: Vec<String> = env::args().skip(1).collect();
 
-            info!("Executing restart: {} {:?}", binary_path.display(), args);
-
-            // exec() replaces the current process
-            let err = std::process::Command::new(binary_path).args(&args).exec();
-
-            // If we get here, exec failed
-            Err(Error::Upgrade(format!("Failed to exec new binary: {err}")))
-        }
-
-        #[cfg(windows)]
-        {
-            let _ = binary_path;
             info!(
-                "Exiting with code {} to signal service manager restart",
-                RESTART_EXIT_CODE
+                "Spawning new process: {} {:?}",
+                binary_path.display(),
+                args
             );
-            std::process::exit(RESTART_EXIT_CODE);
-        }
 
-        #[cfg(not(any(unix, windows)))]
-        {
-            let _ = binary_path;
-            warn!("Auto-restart not supported on this platform. Please restart manually.");
-            Ok(())
+            std::process::Command::new(binary_path)
+                .args(&args)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .map_err(|e| {
+                    Error::Upgrade(format!("Failed to spawn new binary: {e}"))
+                })?;
+
+            info!("New process spawned, exiting old process");
+            std::process::exit(0);
         }
     }
 }

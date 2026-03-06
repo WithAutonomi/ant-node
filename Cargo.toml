@@ -184,6 +184,7 @@ assets = [
     { source = "target/release/saorsa-node", dest = "/usr/bin/saorsa-node", mode = "755" },
     { source = "target/release/saorsa-keygen", dest = "/usr/bin/saorsa-keygen", mode = "755" },
     { source = "README.md", dest = "/usr/share/doc/saorsa-node/README.md", mode = "644" },
+    { source = "systemd/saorsa-node.service", dest = "/usr/lib/systemd/system/saorsa-node.service", mode = "644" },
 ]
 
 [package.metadata.generate-rpm.requires]

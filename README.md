@@ -19,12 +19,13 @@ saorsa-node is the next-generation node software for the Autonomi decentralized 
 7. [Migration from ant-node](#migration-from-ant-node)
 8. [Development Status](#development-status)
 9. [Auto-Upgrade System](#auto-upgrade-system)
-10. [Architecture](#architecture)
-11. [Quick Start](#quick-start)
-12. [CLI Reference](#cli-reference)
-13. [Configuration](#configuration)
-14. [Security Considerations](#security-considerations)
-15. [Related Projects](#related-projects)
+10. [Running as a Service](#running-as-a-service)
+11. [Architecture](#architecture)
+12. [Quick Start](#quick-start)
+13. [CLI Reference](#cli-reference)
+14. [Configuration](#configuration)
+15. [Security Considerations](#security-considerations)
+16. [Related Projects](#related-projects)
 
 ---
 
@@ -729,6 +730,79 @@ check_interval_hours = 1
 github_repo = "saorsa-labs/saorsa-node"
 # max_random_delay_hours = 24  # For staged rollout
 ```
+
+---
+
+## Running as a Service
+
+For production deployments, run saorsa-node under a service manager so it restarts automatically after upgrades.
+
+### systemd (Linux)
+
+A service file is included at `systemd/saorsa-node.service` and installed automatically by RPM/DEB packages.
+
+```bash
+# Install and enable
+sudo cp systemd/saorsa-node.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now saorsa-node
+```
+
+Key settings:
+- `--stop-on-upgrade` tells the node to exit cleanly after applying an upgrade
+- `Restart=always` ensures systemd restarts the node after the upgrade exit
+- Security hardening (NoNewPrivileges, ProtectSystem, etc.) is pre-configured
+
+### launchd (macOS)
+
+Create a plist at `~/Library/LaunchAgents/com.saorsa.node.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.saorsa.node</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/saorsa-node</string>
+        <string>--stop-on-upgrade</string>
+    </array>
+    <key>KeepAlive</key>
+    <true/>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+```
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.saorsa.node.plist
+```
+
+### Windows Service
+
+Use [WinSW](https://github.com/winsw/winsw) or [NSSM](https://nssm.cc/) to wrap saorsa-node as a Windows service.
+
+With WinSW, create `saorsa-node-service.xml`:
+
+```xml
+<service>
+  <id>saorsa-node</id>
+  <name>Saorsa Node</name>
+  <executable>C:\saorsa\saorsa-node.exe</executable>
+  <arguments>--stop-on-upgrade</arguments>
+  <onfailure action="restart" delay="5 sec"/>
+</service>
+```
+
+The node exits with code 100 on upgrade, which WinSW treats as a failure and restarts.
+
+### Standalone Mode (No Service Manager)
+
+Without `--stop-on-upgrade`, the node spawns the upgraded binary as a new process before exiting. This is the default behavior and requires no service manager.
 
 ---
 
