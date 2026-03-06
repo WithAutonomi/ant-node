@@ -8,9 +8,9 @@ Wants=network-online.target
 Type=simple
 User=saorsa
 Group=saorsa
-ExecStart=/usr/bin/saorsa-node --config /etc/saorsa/config.toml
+ExecStart=/usr/bin/saorsa-node --config /etc/saorsa/config.toml --stop-on-upgrade
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
+Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
 

@@ -491,10 +491,12 @@ impl RunningNode {
         if let Some(monitor) = self.upgrade_monitor.take() {
             let events_tx = self.events_tx.clone();
             let shutdown = self.shutdown.clone();
+            let stop_on_upgrade = self.config.upgrade.stop_on_upgrade;
 
             tokio::spawn(async move {
                 let mut monitor = monitor;
-                let mut upgrader = AutoApplyUpgrader::new();
+                let mut upgrader = AutoApplyUpgrader::new()
+                    .with_stop_on_upgrade(stop_on_upgrade);
                 if let Ok(cache_dir) = upgrade_cache_dir() {
                     upgrader = upgrader.with_binary_cache(BinaryCache::new(cache_dir));
                 }
