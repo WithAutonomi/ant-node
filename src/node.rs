@@ -14,7 +14,7 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
-use saorsa_core::identity::{NodeId, NodeIdentity};
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
@@ -104,7 +104,7 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Self::resolve_identity(&mut self.config).await?;
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
@@ -117,9 +117,8 @@ impl NodeBuilder {
         // Create event channel
         let (events_tx, events_rx) = create_event_channel();
 
-        // Convert our config to saorsa-core's config, injecting our stable peer_id
-        let mut core_config = Self::build_core_config(&self.config)?;
-        core_config.peer_id = Some(peer_id);
+        // Convert our config to saorsa-core's config
+        let core_config = Self::build_core_config(&self.config)?;
         debug!("Core config: {:?}", core_config);
 
         // Initialize saorsa-core's P2PNode
@@ -259,7 +258,7 @@ impl NodeBuilder {
                 let identity = NodeIdentity::generate().map_err(|e| {
                     Error::Startup(format!("Failed to generate node identity: {e}"))
                 })?;
-                let peer_id = node_id_to_peer_id(identity.node_id());
+                let peer_id = identity.peer_id().to_hex();
                 let peer_dir = nodes_dir.join(&peer_id);
                 std::fs::create_dir_all(&peer_dir)?;
                 identity
@@ -363,6 +362,12 @@ impl NodeBuilder {
             .await
             .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
 
+        // Parse rewards address first (needed by both verifier and quote generator)
+        let rewards_address = match config.payment.rewards_address {
+            Some(ref addr) => parse_rewards_address(addr)?,
+            None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
+        };
+
         // Create payment verifier
         let evm_network = match config.payment.evm_network {
             EvmNetworkConfig::ArbitrumOne => EvmNetwork::ArbitrumOne,
@@ -374,14 +379,9 @@ impl NodeBuilder {
                 network: evm_network,
             },
             cache_capacity: config.payment.cache_capacity,
+            local_rewards_address: Some(rewards_address),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-
-        // Create quote generator with ML-DSA-65 signing
-        let rewards_address = match config.payment.rewards_address {
-            Some(ref addr) => parse_rewards_address(addr)?,
-            None => RewardsAddress::new(DEFAULT_REWARDS_ADDRESS),
-        };
         // Safe: 5GB fits in usize on all supported 64-bit platforms.
         #[allow(clippy::cast_possible_truncation)]
         let max_records = (NODE_STORAGE_LIMIT_BYTES as usize) / MAX_CHUNK_SIZE;
@@ -437,11 +437,6 @@ impl NodeBuilder {
             }
         }
     }
-}
-
-/// Convert a `NodeId` to a hex-encoded `PeerId` string (full 64 hex chars).
-fn node_id_to_peer_id(node_id: &NodeId) -> String {
-    hex::encode(node_id.0)
 }
 
 /// A running saorsa node.
@@ -665,12 +660,12 @@ impl RunningNode {
             while let Ok(event) = events.recv().await {
                 if let P2PEvent::Message {
                     topic,
-                    source,
+                    source: Some(source),
                     data,
                 } = event
                 {
                     if topic == CHUNK_PROTOCOL_ID {
-                        debug!("Received chunk protocol message from {}", source);
+                        debug!("Received chunk protocol message from {source}");
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
@@ -820,7 +815,7 @@ mod tests {
         // Key file should exist
         assert!(tmp.path().join(NODE_IDENTITY_FILENAME).exists());
         // peer_id should be derivable from the identity
-        let peer_id = node_id_to_peer_id(identity.node_id());
+        let peer_id = identity.peer_id().to_hex();
         assert_eq!(peer_id.len(), 64); // 32 bytes hex-encoded
     }
 
@@ -841,14 +836,14 @@ mod tests {
         };
 
         let loaded = NodeBuilder::resolve_identity(&mut config).await.unwrap();
-        assert_eq!(loaded.node_id(), original.node_id());
+        assert_eq!(loaded.peer_id(), original.peer_id());
     }
 
     #[test]
-    fn test_node_id_to_peer_id_length() {
-        let id = NodeId::from_bytes([0x42; 32]);
-        let peer_id = node_id_to_peer_id(&id);
-        assert_eq!(peer_id.len(), 64); // 32 bytes = 64 hex chars
+    fn test_peer_id_hex_length() {
+        let id = saorsa_core::identity::PeerId::from_bytes([0x42; 32]);
+        let hex = id.to_hex();
+        assert_eq!(hex.len(), 64); // 32 bytes = 64 hex chars
     }
 
     /// Simulates a node restart: first run creates identity in a scoped subdir
@@ -861,7 +856,7 @@ mod tests {
 
         // First "boot": generate identity, save it in nodes/{peer_id}/
         let identity1 = NodeIdentity::generate().unwrap();
-        let peer_id1 = node_id_to_peer_id(identity1.node_id());
+        let peer_id1 = identity1.peer_id().to_hex();
         let peer_dir = nodes_dir.join(&peer_id1);
         std::fs::create_dir_all(&peer_dir).unwrap();
         identity1
@@ -879,7 +874,7 @@ mod tests {
         let loaded = NodeIdentity::load_from_file(&identity_dirs[0].join(NODE_IDENTITY_FILENAME))
             .await
             .unwrap();
-        let peer_id2 = node_id_to_peer_id(loaded.node_id());
+        let peer_id2 = loaded.peer_id().to_hex();
 
         assert_eq!(peer_id1, peer_id2, "peer_id must survive restart");
         assert_eq!(
@@ -931,8 +926,8 @@ mod tests {
         let identity2 = NodeBuilder::resolve_identity(&mut config2).await.unwrap();
 
         assert_eq!(
-            identity1.node_id(),
-            identity2.node_id(),
+            identity1.peer_id(),
+            identity2.peer_id(),
             "explicit --root-dir must yield stable identity"
         );
     }

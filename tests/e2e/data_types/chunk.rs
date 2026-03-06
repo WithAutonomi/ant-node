@@ -641,6 +641,7 @@ mod tests {
                 network,
             },
             cache_capacity: 100,
+            local_rewards_address: None,
         });
 
         let rewards_address = RewardsAddress::new([0x01; 20]);

@@ -216,7 +216,7 @@ async fn test_node_to_node_messaging() {
         !peers.is_empty(),
         "Node 3 should have at least one connected peer"
     );
-    let target_peer_id = peers[0].clone();
+    let target_peer_id = *peers.first().expect("Should have at least one peer");
 
     let sender_p2p = sender.p2p_node.as_ref().expect("Node 3 should be running");
 

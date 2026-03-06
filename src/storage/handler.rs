@@ -335,6 +335,7 @@ mod tests {
                 ..Default::default()
             },
             cache_capacity: 100,
+            local_rewards_address: None,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
 

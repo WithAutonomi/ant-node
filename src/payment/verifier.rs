@@ -8,10 +8,12 @@ use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::deserialize_proof;
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
 use crate::payment::single_node::REQUIRED_QUOTES;
-use ant_evm::ProofOfPayment;
+use ant_evm::{ProofOfPayment, RewardsAddress};
 use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
 use evmlib::contract::payment_vault::verify_data_payment;
 use evmlib::Network as EvmNetwork;
+use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
+use std::time::SystemTime;
 use tracing::{debug, info};
 
 /// Minimum allowed size for a payment proof in bytes.
@@ -26,6 +28,14 @@ const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 /// ~1,952-byte public key and a 3,309-byte signature plus metadata). 100 KB provides
 /// headroom for future fields while still capping memory during verification.
 const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 102_400;
+
+/// Maximum age of a payment quote before it's considered expired (24 hours).
+/// Prevents replaying old cheap quotes against nearly-full nodes.
+const QUOTE_MAX_AGE_SECS: u64 = 86_400;
+
+/// Maximum allowed clock skew for quote timestamps (60 seconds).
+/// Accounts for NTP synchronization differences between P2P nodes.
+const QUOTE_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
 
 /// Configuration for EVM payment verification.
 #[derive(Debug, Clone)]
@@ -55,6 +65,9 @@ pub struct PaymentVerifierConfig {
     pub evm: EvmVerifierConfig,
     /// Cache capacity (number of `XorName` values to cache).
     pub cache_capacity: usize,
+    /// Local node's rewards address.
+    /// When set, the verifier rejects payments that don't include this node as a recipient.
+    pub local_rewards_address: Option<RewardsAddress>,
 }
 
 impl Default for PaymentVerifierConfig {
@@ -62,6 +75,7 @@ impl Default for PaymentVerifierConfig {
         Self {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100_000,
+            local_rewards_address: None,
         }
     }
 }
@@ -275,53 +289,15 @@ impl PaymentVerifier {
             debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
         }
 
-        // Invariant: this function is only called when EVM is enabled (checked by verify_payment)
         debug_assert!(self.config.evm.enabled);
 
-        if payment.peer_quotes.is_empty() {
-            return Err(Error::Payment("Payment has no quotes".to_string()));
-        }
+        Self::validate_quote_structure(payment)?;
+        Self::validate_quote_content(payment, xorname)?;
+        Self::validate_quote_timestamps(payment)?;
+        Self::validate_peer_bindings(payment)?;
+        self.validate_local_recipient(payment)?;
 
-        let quote_count = payment.peer_quotes.len();
-        if quote_count != REQUIRED_QUOTES {
-            return Err(Error::Payment(format!(
-                "Payment must have exactly {REQUIRED_QUOTES} quotes, got {quote_count}"
-            )));
-        }
-
-        // Check for duplicate peer IDs
-        {
-            let mut seen: Vec<&ant_evm::EncodedPeerId> = Vec::with_capacity(quote_count);
-            for (encoded_peer_id, _) in &payment.peer_quotes {
-                if seen.contains(&encoded_peer_id) {
-                    return Err(Error::Payment(format!(
-                        "Duplicate peer ID in payment quotes: {encoded_peer_id:?}"
-                    )));
-                }
-                seen.push(encoded_peer_id);
-            }
-        }
-
-        // Verify that ALL quotes were issued for the correct content address.
-        // This prevents an attacker from paying for chunk A and reusing
-        // that proof to store chunks B, C, D, etc.
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            if !verify_quote_content(quote, xorname) {
-                return Err(Error::Payment(format!(
-                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {}, got {}",
-                    hex::encode(xorname),
-                    hex::encode(quote.content.0)
-                )));
-            }
-        }
-
-        // Verify quote signatures using ML-DSA-65 (post-quantum).
-        // We use our own verification instead of ant-evm's check_is_signed_by_claimed_peer()
-        // which only supports Ed25519/libp2p signatures.
-        // TODO: Verify that quote.pub_key belongs to encoded_peer_id.
-        // Currently we verify the signature is valid for the pub_key IN the quote,
-        // but don't verify that pub_key actually belongs to the claimed peer.
-        // Signature verification is CPU-bound, so we run it off the async runtime.
+        // Verify quote signatures (CPU-bound, run off async runtime)
         let peer_quotes = payment.peer_quotes.clone();
         tokio::task::spawn_blocking(move || {
             for (encoded_peer_id, quote) in &peer_quotes {
@@ -336,16 +312,12 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        // Get the payment digest for on-chain verification
+        // Verify on-chain payment
         let payment_digest = payment.digest();
-
         if payment_digest.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
 
-        // Verify on-chain payment
-        // Note: We pass empty owned_quote_hashes because we're not a node claiming payment,
-        // we just want to verify the payment is valid
         let owned_quote_hashes = vec![];
         match verify_data_payment(&self.config.evm.network, owned_quote_hashes, payment_digest)
             .await
@@ -366,6 +338,126 @@ impl PaymentVerifier {
             ))),
         }
     }
+
+    /// Validate quote count, uniqueness, and basic structure.
+    fn validate_quote_structure(payment: &ProofOfPayment) -> Result<()> {
+        if payment.peer_quotes.is_empty() {
+            return Err(Error::Payment("Payment has no quotes".to_string()));
+        }
+
+        let quote_count = payment.peer_quotes.len();
+        if quote_count != REQUIRED_QUOTES {
+            return Err(Error::Payment(format!(
+                "Payment must have exactly {REQUIRED_QUOTES} quotes, got {quote_count}"
+            )));
+        }
+
+        let mut seen: Vec<&ant_evm::EncodedPeerId> = Vec::with_capacity(quote_count);
+        for (encoded_peer_id, _) in &payment.peer_quotes {
+            if seen.contains(&encoded_peer_id) {
+                return Err(Error::Payment(format!(
+                    "Duplicate peer ID in payment quotes: {encoded_peer_id:?}"
+                )));
+            }
+            seen.push(encoded_peer_id);
+        }
+
+        Ok(())
+    }
+
+    /// Verify all quotes target the correct content address.
+    fn validate_quote_content(payment: &ProofOfPayment, xorname: &XorName) -> Result<()> {
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if !verify_quote_content(quote, xorname) {
+                return Err(Error::Payment(format!(
+                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {}, got {}",
+                    hex::encode(xorname),
+                    hex::encode(quote.content.0)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify quote freshness — reject stale or excessively future quotes.
+    fn validate_quote_timestamps(payment: &ProofOfPayment) -> Result<()> {
+        let now = SystemTime::now();
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            match now.duration_since(quote.timestamp) {
+                Ok(age) => {
+                    if age.as_secs() > QUOTE_MAX_AGE_SECS {
+                        return Err(Error::Payment(format!(
+                            "Quote from peer {encoded_peer_id:?} expired: age {}s exceeds max {QUOTE_MAX_AGE_SECS}s",
+                            age.as_secs()
+                        )));
+                    }
+                }
+                Err(_) => {
+                    if let Ok(skew) = quote.timestamp.duration_since(now) {
+                        if skew.as_secs() > QUOTE_CLOCK_SKEW_TOLERANCE_SECS {
+                            return Err(Error::Payment(format!(
+                                "Quote from peer {encoded_peer_id:?} has timestamp {}s in the future \
+                                 (exceeds {QUOTE_CLOCK_SKEW_TOLERANCE_SECS}s tolerance)",
+                                skew.as_secs()
+                            )));
+                        }
+                    } else {
+                        return Err(Error::Payment(format!(
+                            "Quote from peer {encoded_peer_id:?} has invalid timestamp"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
+    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
+                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
+
+            let libp2p_peer_id = encoded_peer_id
+                .to_peer_id()
+                .map_err(|e| Error::Payment(format!("Invalid encoded peer ID: {e}")))?;
+            let peer_id_bytes = libp2p_peer_id.to_bytes();
+            let raw_peer_bytes = if peer_id_bytes.len() > 2 {
+                &peer_id_bytes[2..]
+            } else {
+                return Err(Error::Payment(format!(
+                    "Invalid encoded peer ID: too short ({} bytes)",
+                    peer_id_bytes.len()
+                )));
+            };
+
+            if expected_peer_id.as_bytes() != raw_peer_bytes {
+                return Err(Error::Payment(format!(
+                    "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
+                     BLAKE3(pub_key) = {}, peer_id = {}",
+                    expected_peer_id.to_hex(),
+                    hex::encode(raw_peer_bytes)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify this node is among the paid recipients.
+    fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
+        if let Some(ref local_addr) = self.config.local_rewards_address {
+            let is_recipient = payment
+                .peer_quotes
+                .iter()
+                .any(|(_, quote)| quote.rewards_address == *local_addr);
+            if !is_recipient {
+                return Err(Error::Payment(
+                    "Payment proof does not include this node as a recipient".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -380,6 +472,7 @@ mod tests {
                 ..Default::default()
             },
             cache_capacity: 100,
+            local_rewards_address: None,
         };
         PaymentVerifier::new(config)
     }
@@ -391,6 +484,7 @@ mod tests {
                 network: EvmNetwork::ArbitrumOne,
             },
             cache_capacity: 100,
+            local_rewards_address: None,
         };
         PaymentVerifier::new(config)
     }
@@ -794,6 +888,306 @@ mod tests {
         assert!(
             err_msg.contains("content address mismatch"),
             "Error should mention 'content address mismatch': {err_msg}"
+        );
+    }
+
+    /// Helper: create a fake quote with the given xorname and timestamp.
+    fn make_fake_quote(
+        xorname: [u8; 32],
+        timestamp: SystemTime,
+        rewards_address: RewardsAddress,
+    ) -> ant_evm::PaymentQuote {
+        use ant_evm::{PaymentQuote, QuotingMetrics};
+
+        PaymentQuote {
+            content: xor_name::XorName(xorname),
+            timestamp,
+            quoting_metrics: QuotingMetrics {
+                data_size: 1024,
+                data_type: 0,
+                close_records_stored: 0,
+                records_per_type: vec![],
+                max_records: 1000,
+                received_payment_count: 0,
+                live_time: 0,
+                network_density: None,
+                network_size: None,
+            },
+            rewards_address,
+            pub_key: vec![0u8; 64],
+            signature: vec![0u8; 64],
+        }
+    }
+
+    /// Helper: wrap quotes into a serialized `PaymentProof`.
+    fn serialize_proof(
+        peer_quotes: Vec<(ant_evm::EncodedPeerId, ant_evm::PaymentQuote)>,
+    ) -> Vec<u8> {
+        use crate::payment::proof::PaymentProof;
+
+        let proof = PaymentProof {
+            proof_of_payment: ProofOfPayment { peer_quotes },
+            tx_hashes: vec![],
+        };
+        rmp_serde::to_vec(&proof).expect("serialize proof")
+    }
+
+    #[tokio::test]
+    async fn test_expired_quote_rejected() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use std::time::Duration;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xCCu8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Create a quote that's 25 hours old (exceeds 24-hour max)
+        let old_timestamp = SystemTime::now() - Duration::from_secs(25 * 3600);
+        let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        assert!(result.is_err(), "Should reject expired quote");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("expired"),
+            "Error should mention 'expired': {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_future_timestamp_rejected() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use std::time::Duration;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xDDu8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Create a quote with a timestamp 1 hour in the future
+        let future_timestamp = SystemTime::now() + Duration::from_secs(3600);
+        let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        assert!(result.is_err(), "Should reject future-timestamped quote");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("future"),
+            "Error should mention 'future': {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quote_within_clock_skew_tolerance_accepted() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use std::time::Duration;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xD1u8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Quote 30 seconds in the future — within 60s tolerance
+        let future_timestamp = SystemTime::now() + Duration::from_secs(30);
+        let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        // Should NOT fail at timestamp check (will fail later at pub_key binding)
+        let err_msg = format!("{}", result.expect_err("should fail at later check"));
+        assert!(
+            !err_msg.contains("future"),
+            "Should pass timestamp check (within tolerance), but got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quote_just_beyond_clock_skew_tolerance_rejected() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use std::time::Duration;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xD2u8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Quote 120 seconds in the future — exceeds 60s tolerance
+        let future_timestamp = SystemTime::now() + Duration::from_secs(120);
+        let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        assert!(
+            result.is_err(),
+            "Should reject quote beyond clock skew tolerance"
+        );
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("future"),
+            "Error should mention 'future': {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_quote_23h_old_still_accepted() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use std::time::Duration;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xD3u8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Quote 23 hours old — within 24h max age
+        let old_timestamp = SystemTime::now() - Duration::from_secs(23 * 3600);
+        let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        // Should NOT fail at timestamp check (will fail later at pub_key binding)
+        let err_msg = format!("{}", result.expect_err("should fail at later check"));
+        assert!(
+            !err_msg.contains("expired"),
+            "Should pass expiry check (23h < 24h), but got: {err_msg}"
+        );
+    }
+
+    /// Helper: build an `EncodedPeerId` that matches the BLAKE3 hash of an ML-DSA public key.
+    fn encoded_peer_id_for_pub_key(pub_key: &[u8]) -> ant_evm::EncodedPeerId {
+        let saorsa_peer_id = peer_id_from_public_key_bytes(pub_key).expect("valid ML-DSA pub key");
+        // Wrap raw 32-byte peer ID in identity multihash format: [0x00, length, ...bytes]
+        let raw = saorsa_peer_id.as_bytes();
+        let mut multihash_bytes = Vec::with_capacity(2 + raw.len());
+        multihash_bytes.push(0x00); // identity multihash code
+                                    // PeerId is always 32 bytes, safely fits in u8
+        multihash_bytes.push(u8::try_from(raw.len()).unwrap_or(32));
+        multihash_bytes.extend_from_slice(raw);
+        let libp2p_peer_id =
+            libp2p::PeerId::from_bytes(&multihash_bytes).expect("valid multihash peer ID");
+        ant_evm::EncodedPeerId::from(libp2p_peer_id)
+    }
+
+    #[tokio::test]
+    async fn test_local_not_in_paid_set_rejected() {
+        use ant_evm::RewardsAddress;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        // Verifier with a local rewards address set
+        let local_addr = RewardsAddress::new([0xAAu8; 20]);
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                enabled: true,
+                network: EvmNetwork::ArbitrumOne,
+            },
+            cache_capacity: 100,
+            local_rewards_address: Some(local_addr),
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let xorname = [0xEEu8; 32];
+        // Quotes pay a DIFFERENT rewards address
+        let other_addr = RewardsAddress::new([0xBBu8; 20]);
+
+        // Use real ML-DSA keys so the pub_key→peer_id binding check passes
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+
+            let mut quote = make_fake_quote(xorname, SystemTime::now(), other_addr);
+            quote.pub_key = pub_key_bytes;
+
+            peer_quotes.push((encoded, quote));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        assert!(result.is_err(), "Should reject payment not addressed to us");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("does not include this node as a recipient"),
+            "Error should mention recipient rejection: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wrong_peer_binding_rejected() {
+        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let verifier = create_evm_enabled_verifier();
+        let xorname = [0xFFu8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+
+        // Generate a real ML-DSA keypair so pub_key is valid
+        let ml_dsa = MlDsa65::new();
+        let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+
+        // Create a quote with a real pub_key but attach it to a random peer ID
+        // whose identity multihash does NOT match BLAKE3(pub_key)
+        let mut quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
+        quote.pub_key = pub_key_bytes;
+
+        // Use random ed25519 peer IDs — they won't match BLAKE3(pub_key)
+        let mut peer_quotes = Vec::new();
+        for _ in 0..5 {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+        }
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+
+        assert!(result.is_err(), "Should reject wrong peer binding");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("pub_key does not belong to claimed peer"),
+            "Error should mention binding mismatch: {err_msg}"
         );
     }
 }

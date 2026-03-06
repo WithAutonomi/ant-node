@@ -151,7 +151,7 @@ async fn test_complete_payment_flow_live_nodes() -> Result<(), Box<dyn std::erro
     let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     let mut quotes_for_payment: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     for (peer_id_str, quote, price) in quotes_with_prices {
-        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Failed to convert peer ID '{peer_id_str}': {e}"))?;
         peer_quotes.push((encoded_peer_id, quote.clone()));
         quotes_for_payment.push((quote, price));
@@ -406,7 +406,7 @@ async fn test_forged_signature_rejection() -> Result<(), Box<dyn std::error::Err
     let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     let mut quotes_for_payment: Vec<_> = Vec::with_capacity(quotes_with_prices.len());
     for (peer_id_str, quote, price) in quotes_with_prices {
-        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Failed to convert peer ID '{peer_id_str}': {e}"))?;
         peer_quotes.push((encoded_peer_id, quote.clone()));
         quotes_for_payment.push((quote, price));

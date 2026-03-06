@@ -30,6 +30,7 @@ use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
+use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -297,8 +298,8 @@ impl QuantumClient {
         let mut quotes_with_prices: Vec<(PaymentQuote, Amount)> =
             Vec::with_capacity(quotes_with_peers.len());
 
-        for (peer_id_str, quote, price) in quotes_with_peers {
-            let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id_str)?;
+        for (peer_id, quote, price) in quotes_with_peers {
+            let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id.to_hex())?;
             peer_quotes.push((encoded_peer_id, quote.clone()));
             quotes_with_prices.push((quote, price));
         }
@@ -445,7 +446,7 @@ impl QuantumClient {
     /// response-matching logic.
     async fn send_put_and_await(
         node: &P2PNode,
-        target_peer: &str,
+        target_peer: &PeerId,
         message_bytes: Vec<u8>,
         request_id: u64,
         timeout_secs: u64,
@@ -521,9 +522,8 @@ impl QuantumClient {
     ///
     /// Queries the DHT for the `CLOSE_GROUP_SIZE` closest nodes to the target
     /// address and returns the single closest remote peer (excluding ourselves).
-    async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<String> {
+    async fn pick_target_peer(node: &P2PNode, target: &XorName) -> Result<PeerId> {
         let local_peer_id = node.peer_id();
-        let local_transport_id = node.transport_peer_id();
 
         let closest_nodes = node
             .dht()
@@ -533,12 +533,7 @@ impl QuantumClient {
 
         let closest = closest_nodes
             .into_iter()
-            .find(|n| {
-                n.peer_id != *local_peer_id
-                    && local_transport_id
-                        .as_ref()
-                        .map_or(true, |tid| n.peer_id != *tid)
-            })
+            .find(|n| n.peer_id != *local_peer_id)
             .ok_or_else(|| Error::Network("No remote peers found near target address".into()))?;
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -575,7 +570,7 @@ impl QuantumClient {
     pub async fn get_quotes_from_dht(
         &self,
         content: &[u8],
-    ) -> Result<Vec<(String, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
         let address = compute_address(content);
         let data_size = u64::try_from(content.len())
             .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
@@ -609,7 +604,7 @@ impl QuantumClient {
         &self,
         address: &XorName,
         data_size: u64,
-    ) -> Result<Vec<(String, PaymentQuote, Amount)>> {
+    ) -> Result<Vec<(PeerId, PaymentQuote, Amount)>> {
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
         };
@@ -622,7 +617,6 @@ impl QuantumClient {
         }
 
         let local_peer_id = node.peer_id();
-        let local_transport_id = node.transport_peer_id();
 
         // Find closest peers via DHT
         let closest_nodes = node
@@ -632,14 +626,9 @@ impl QuantumClient {
             .map_err(|e| Error::Network(format!("DHT closest-nodes lookup failed: {e}")))?;
 
         // Filter out self and collect remote peers
-        let mut remote_peers: Vec<String> = closest_nodes
+        let mut remote_peers: Vec<PeerId> = closest_nodes
             .into_iter()
-            .filter(|n| {
-                n.peer_id != *local_peer_id
-                    && local_transport_id
-                        .as_ref()
-                        .map_or(true, |tid| n.peer_id != *tid)
-            })
+            .filter(|n| n.peer_id != *local_peer_id)
             .map(|n| n.peer_id)
             .collect();
 
@@ -656,9 +645,9 @@ impl QuantumClient {
             debug!("Found {} connected P2P peers for fallback", connected.len());
 
             // Add connected peers that aren't already in remote_peers (O(1) dedup via HashSet)
-            let mut existing: HashSet<String> = remote_peers.iter().cloned().collect();
+            let mut existing: HashSet<PeerId> = remote_peers.iter().copied().collect();
             for peer_id in connected {
-                if existing.insert(peer_id.clone()) {
+                if existing.insert(peer_id) {
                     remote_peers.push(peer_id);
                 }
             }
@@ -709,7 +698,7 @@ impl QuantumClient {
             };
 
             // Clone necessary data for the async task
-            let peer_id_clone = peer_id.clone();
+            let peer_id_clone = *peer_id;
             let node_clone = node.clone();
 
             // Create a future for this quote request

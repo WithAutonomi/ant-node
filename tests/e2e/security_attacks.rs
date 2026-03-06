@@ -266,7 +266,14 @@ async fn test_attack_proof_too_large() -> Result<(), Box<dyn std::error::Error>>
 async fn get_quotes_with_retries(
     client: &QuantumClient,
     test_data: &[u8],
-) -> Result<Vec<(String, ant_evm::PaymentQuote, ant_evm::Amount)>, String> {
+) -> Result<
+    Vec<(
+        saorsa_core::identity::PeerId,
+        ant_evm::PaymentQuote,
+        ant_evm::Amount,
+    )>,
+    String,
+> {
     let mut last_err = String::new();
     for attempt in 1..=5u32 {
         match client.get_quotes_from_dht(test_data).await {
@@ -289,13 +296,17 @@ async fn get_quotes_with_retries(
 /// Helper: build a valid proof from quotes + wallet payment.
 /// Returns (`proof_bytes`, `tx_hashes`).
 async fn build_valid_proof(
-    quotes_with_prices: Vec<(String, ant_evm::PaymentQuote, ant_evm::Amount)>,
+    quotes_with_prices: Vec<(
+        saorsa_core::identity::PeerId,
+        ant_evm::PaymentQuote,
+        ant_evm::Amount,
+    )>,
     wallet: &Wallet,
 ) -> Result<(Vec<u8>, Vec<evmlib::common::TxHash>), Box<dyn std::error::Error>> {
     let mut peer_quotes = Vec::with_capacity(quotes_with_prices.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes_with_prices.len());
     for (peer_id_str, quote, price) in quotes_with_prices {
-        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Peer ID conversion failed: {e}"))?;
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
@@ -335,7 +346,7 @@ async fn test_attack_forged_ml_dsa_signature() -> Result<(), Box<dyn std::error:
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     for (peer_id_str, quote, price) in quotes {
-        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Peer ID conversion failed: {e}"))?;
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));
@@ -498,7 +509,7 @@ async fn test_attack_zero_amount_payment() -> Result<(), Box<dyn std::error::Err
     // Build peer_quotes from real quotes but skip on-chain payment
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     for (peer_id_str, quote, _price) in quotes {
-        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Peer ID conversion failed: {e}"))?;
         peer_quotes.push((encoded, quote));
     }
@@ -546,7 +557,7 @@ async fn test_attack_fabricated_tx_hash() -> Result<(), Box<dyn std::error::Erro
     // Build peer_quotes from real quotes
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     for (peer_id_str, quote, _price) in quotes {
-        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Peer ID conversion failed: {e}"))?;
         peer_quotes.push((encoded, quote));
     }
@@ -669,7 +680,7 @@ async fn test_attack_corrupted_public_key() -> Result<(), Box<dyn std::error::Er
     let mut peer_quotes = Vec::with_capacity(quotes.len());
     let mut quotes_for_payment = Vec::with_capacity(quotes.len());
     for (peer_id_str, quote, price) in quotes {
-        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str)
+        let encoded = hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
             .map_err(|e| format!("Peer ID conversion failed: {e}"))?;
         peer_quotes.push((encoded, quote.clone()));
         quotes_for_payment.push((quote, price));

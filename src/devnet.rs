@@ -531,7 +531,7 @@ impl Devnet {
         // Generate identity first so we can use peer_id as the directory name
         let identity = NodeIdentity::generate()
             .map_err(|e| DevnetError::Core(format!("Failed to generate node identity: {e}")))?;
-        let peer_id = hex::encode(identity.node_id().0);
+        let peer_id = identity.peer_id().to_hex();
         let node_id = format!("devnet_node_{index}");
         let data_dir = self.config.data_dir.join(NODES_SUBDIR).join(&peer_id);
 
@@ -593,6 +593,7 @@ impl Devnet {
         let payment_config = PaymentVerifierConfig {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
+            local_rewards_address: None,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
@@ -619,7 +620,6 @@ impl Devnet {
         let mut core_config = CoreNodeConfig::new()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
 
-        core_config.peer_id = Some(node.peer_id.clone());
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
@@ -650,7 +650,7 @@ impl Devnet {
                 while let Ok(event) = events.recv().await {
                     if let P2PEvent::Message {
                         topic,
-                        source,
+                        source: Some(source),
                         data,
                     } = event
                     {

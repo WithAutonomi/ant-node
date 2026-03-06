@@ -1,58 +1,70 @@
 # Production Configuration for saorsa-node
 #
-# ⚠️  CRITICAL SECURITY REQUIREMENTS:
-# - payment.enabled MUST be true in production
-# - evm_network MUST be "arbitrum-one" (not testnet)
-# - DO NOT use --disable-payment-verification flag
-#
-# This template provides secure defaults for production deployment.
+# This file matches the NodeConfig struct schema.
+# See src/config.rs for all available fields and defaults.
 
-[network]
-# Listen address for P2P connections
-# Production nodes should use port range 10000-10999
-listen = "0.0.0.0:10000"
-
-# Set to true ONLY for bootstrap/genesis nodes
-bootstrap = false
-
-# Network mode (do not change in production)
-mode = "production"
-
-[storage]
-# Root directory for chunk storage
+# Root directory for node data
 root_dir = "/var/lib/saorsa-node"
 
-# Maximum chunk size (1 MiB)
-max_chunk_size = 1048576
+# Listening port (10000-10999 for production)
+port = 10000
 
-# LMDB maximum database size (32 GiB default)
-# Increase if you expect to store more data
-max_db_size_bytes = 34359738368
+# IP version: "ipv4", "ipv6", or "dual"
+ip_version = "dual"
 
+# Bootstrap peer addresses (socket addrs)
+bootstrap = []
+
+# Network mode: "production", "testnet", or "development"
+network_mode = "production"
+
+# Log level: "trace", "debug", "info", "warn", "error"
+log_level = "info"
+
+# Maximum application-layer message size in bytes (default: 5 MiB)
+# max_message_size = 5242880
+
+# --- Payment verification ---
+# Production nodes require payment by default.
 [payment]
-# ⚠️  DO NOT MODIFY THIS IN PRODUCTION ⚠️
-# Payment verification MUST be enabled for production nodes
+# DO NOT set enabled = false in production
 enabled = true
 
-# Payment cache capacity (number of verified payments to cache)
+# Cache capacity for verified content addresses
 cache_capacity = 100000
 
-# REQUIRED: You MUST set this to your Arbitrum wallet address BEFORE running in production.
-# DO NOT leave this empty or use the placeholder value.
-rewards_address = ""
+# REQUIRED: Set to your Arbitrum wallet address before running in production.
+# rewards_address = "0xYourAddressHere"
 
-# EVM network configuration
-[payment.evm_network]
-# MUST be "arbitrum-one" for production (not testnet)
-network = "arbitrum-one"
+# EVM network: "arbitrum-one" or "arbitrum-sepolia"
+evm_network = "arbitrum-one"
 
-# Payment metrics HTTP server port (optional)
-# metrics_port = 9090
+# Prometheus metrics port (0 to disable)
+metrics_port = 9100
 
-[logging]
-# Log level: trace, debug, info, warn, error
-# Use "info" for production, "debug" for troubleshooting
-level = "info"
+# --- Storage ---
+[storage]
+enabled = true
 
-# Log format: "json" for structured logging, "text" for human-readable
-format = "json"
+# Maximum number of chunks to store (0 = unlimited)
+max_chunks = 0
+
+# Verify content hash on read
+verify_on_read = true
+
+# Maximum LMDB database size in GiB (0 = default 32 GiB)
+db_size_gb = 0
+
+# --- Upgrade ---
+[upgrade]
+enabled = false
+channel = "stable"
+check_interval_hours = 1
+github_repo = "dirvine/saorsa-node"
+staged_rollout_hours = 1
+
+# --- Bootstrap cache ---
+[bootstrap_cache]
+enabled = true
+max_contacts = 10000
+stale_threshold_days = 7

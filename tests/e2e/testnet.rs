@@ -482,10 +482,13 @@ impl TestNode {
         let mut peer_quotes: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
         let mut quotes_with_prices: Vec<_> = Vec::with_capacity(quotes_with_peers.len());
         for (peer_id_str, quote, price) in quotes_with_peers {
-            let encoded_peer_id = saorsa_node::client::hex_node_id_to_encoded_peer_id(&peer_id_str)
-                .map_err(|e| {
-                    TestnetError::Storage(format!("Failed to convert peer ID '{peer_id_str}': {e}"))
-                })?;
+            let encoded_peer_id =
+                saorsa_node::client::hex_node_id_to_encoded_peer_id(&peer_id_str.to_hex())
+                    .map_err(|e| {
+                        TestnetError::Storage(format!(
+                            "Failed to convert peer ID '{peer_id_str}': {e}"
+                        ))
+                    })?;
             peer_quotes.push((encoded_peer_id, quote.clone()));
             quotes_with_prices.push((quote, price));
         }
@@ -584,7 +587,7 @@ impl TestNode {
     }
 
     /// Get the list of connected peer IDs.
-    pub async fn connected_peers(&self) -> Vec<String> {
+    pub async fn connected_peers(&self) -> Vec<saorsa_core::identity::PeerId> {
         if let Some(ref node) = self.p2p_node {
             node.connected_peers().await
         } else {
@@ -755,10 +758,8 @@ impl TestNode {
             .p2p_node
             .as_ref()
             .ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_p2p
-            .transport_peer_id()
-            .ok_or_else(|| TestnetError::Core("No transport peer ID available".to_string()))?;
-        self.store_chunk_on_peer(&target_peer_id, data).await
+        let target_peer_id = target_p2p.peer_id();
+        self.store_chunk_on_peer(target_peer_id, data).await
     }
 
     /// Store a chunk on a remote peer via P2P using the peer's ID directly.
@@ -767,9 +768,13 @@ impl TestNode {
     ///
     /// Returns an error if this node is not running, the message cannot be
     /// sent, the response times out, or the remote peer reports an error.
-    pub async fn store_chunk_on_peer(&self, target_peer_id: &str, data: &[u8]) -> Result<XorName> {
+    pub async fn store_chunk_on_peer(
+        &self,
+        target_peer_id: &saorsa_core::identity::PeerId,
+        data: &[u8],
+    ) -> Result<XorName> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_peer_id.to_string();
+        let target_peer_id = *target_peer_id;
 
         // Create PUT request WITHOUT payment proof (EVM disabled in tests)
         let address = Self::compute_chunk_address(data);
@@ -852,10 +857,8 @@ impl TestNode {
             .p2p_node
             .as_ref()
             .ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_p2p
-            .transport_peer_id()
-            .ok_or_else(|| TestnetError::Core("No transport peer ID available".to_string()))?;
-        self.get_chunk_from_peer(&target_peer_id, address).await
+        let target_peer_id = target_p2p.peer_id();
+        self.get_chunk_from_peer(target_peer_id, address).await
     }
 
     /// Retrieve a chunk from a remote peer via P2P using the peer's ID directly.
@@ -866,11 +869,11 @@ impl TestNode {
     /// sent, the response times out, or the remote peer reports an error.
     pub async fn get_chunk_from_peer(
         &self,
-        target_peer_id: &str,
+        target_peer_id: &saorsa_core::identity::PeerId,
         address: &XorName,
     ) -> Result<Option<DataChunk>> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
-        let target_peer_id = target_peer_id.to_string();
+        let target_peer_id = *target_peer_id;
 
         // Create GET request
         let request_id: u64 = rand::thread_rng().gen();
@@ -1214,6 +1217,7 @@ impl TestNetwork {
                 network: evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest),
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
+            local_rewards_address: None,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
@@ -1298,14 +1302,13 @@ impl TestNetwork {
                 while let Ok(event) = events.recv().await {
                     if let P2PEvent::Message {
                         topic,
-                        source,
+                        source: Some(source),
                         data,
                     } = event
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {} received chunk protocol message from {}",
-                                node_index, source
+                                "Node {node_index} received chunk protocol message from {source}"
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
@@ -1321,13 +1324,12 @@ impl TestNetwork {
                                             .await
                                         {
                                             warn!(
-                                                "Node {} failed to send response to {}: {}",
-                                                node_index, source, e
+                                                "Node {node_index} failed to send response to {source}: {e}"
                                             );
                                         }
                                     }
                                     Err(e) => {
-                                        warn!("Node {} protocol handler error: {}", node_index, e);
+                                        warn!("Node {node_index} protocol handler error: {e}");
                                     }
                                 }
                             });

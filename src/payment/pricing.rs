@@ -4,7 +4,7 @@
 //! - Empty node → price ≈ `MIN_PRICE` (floor)
 //! - Filling up → price increases logarithmically
 //! - Nearly full → price spikes (ln(x) as x→0)
-//! - At capacity → returns `MIN_PRICE` (overflow protection)
+//! - At capacity → returns `u64::MAX` (effectively refuses new data)
 //!
 //! ## Design Rationale: Capacity-Based Pricing
 //!
@@ -67,9 +67,9 @@ pub fn calculate_price(metrics: &QuotingMetrics) -> Amount {
     // Adding one record (cost_unit = 1 normalized)
     let r_upper = (total_records + 1) as f64 / max_records;
 
-    // Edge cases matching the contract
+    // At capacity: return maximum price to effectively refuse new data
     if r_lower >= 1.0 || r_upper >= 1.0 {
-        return min_price;
+        return Amount::from(u64::MAX);
     }
     if (r_upper - r_lower).abs() < f64::EPSILON {
         return min_price;
@@ -181,11 +181,11 @@ mod tests {
     }
 
     #[test]
-    fn test_full_node_returns_min_price() {
-        // At capacity (r_lower >= 1.0), overflow protection returns min_price
+    fn test_full_node_returns_max_price() {
+        // At capacity (r_lower >= 1.0), effectively refuse new data with max price
         let metrics = make_metrics(1000, 1000, 1024, 0);
         let price = calculate_price(&metrics);
-        assert_eq!(price, Amount::from(MIN_PRICE));
+        assert_eq!(price, Amount::from(u64::MAX));
     }
 
     #[test]
@@ -248,6 +248,40 @@ mod tests {
 
         // Same total records → same price
         assert_eq!(price_multi, price_single);
+    }
+
+    #[test]
+    fn test_price_at_95_percent() {
+        let metrics = make_metrics(950, 1000, 1024, 0);
+        let price = calculate_price(&metrics);
+        let min = Amount::from(MIN_PRICE);
+        assert!(
+            price > min,
+            "Price at 95% should be above minimum, got {price}"
+        );
+    }
+
+    #[test]
+    fn test_price_at_99_percent() {
+        let metrics = make_metrics(990, 1000, 1024, 0);
+        let price = calculate_price(&metrics);
+        let price_95 = calculate_price(&make_metrics(950, 1000, 1024, 0));
+        assert!(
+            price > price_95,
+            "Price at 99% ({price}) should exceed price at 95% ({price_95})"
+        );
+    }
+
+    #[test]
+    fn test_over_capacity_returns_max_price() {
+        // 1100 records stored but max is 1000 — over capacity
+        let metrics = make_metrics(1100, 1000, 1024, 0);
+        let price = calculate_price(&metrics);
+        assert_eq!(
+            price,
+            Amount::from(u64::MAX),
+            "Over-capacity should return max price"
+        );
     }
 
     #[test]
