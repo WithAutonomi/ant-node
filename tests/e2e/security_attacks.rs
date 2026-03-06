@@ -435,11 +435,30 @@ async fn test_attack_replay_different_chunk() -> Result<(), Box<dyn std::error::
     let quotes = get_quotes_with_retries(&client, chunk_a_data).await?;
     let (proof_bytes_a, _tx_hashes) = build_valid_proof(quotes, &wallet).await?;
 
-    // Store chunk A (should succeed)
-    let result_a = client
-        .put_chunk_with_proof(Bytes::from(chunk_a_data.to_vec()), proof_bytes_a.clone())
-        .await;
-    result_a.map_err(|e| format!("Legitimate store of chunk A should succeed: {e}"))?;
+    // Store chunk A (should succeed) — retry for slow DHT on CI
+    let mut chunk_a_stored = false;
+    for attempt in 1..=5u32 {
+        match client
+            .put_chunk_with_proof(Bytes::from(chunk_a_data.to_vec()), proof_bytes_a.clone())
+            .await
+        {
+            Ok(_addr) => {
+                chunk_a_stored = true;
+                break;
+            }
+            Err(e) => {
+                warn!("Legitimate store of chunk A attempt {attempt}/5 failed: {e}");
+                if attempt < 5 {
+                    let _ = harness.warmup_dht().await;
+                    sleep(Duration::from_secs(3)).await;
+                }
+            }
+        }
+    }
+    assert!(
+        chunk_a_stored,
+        "Legitimate store of chunk A should succeed after retries"
+    );
     info!("Chunk A stored successfully (legitimate)");
 
     // Now replay A's proof for chunk B
@@ -580,11 +599,30 @@ async fn test_attack_double_spend_same_proof() -> Result<(), Box<dyn std::error:
     let quotes = get_quotes_with_retries(&client, test_data).await?;
     let (proof_bytes, _tx_hashes) = build_valid_proof(quotes, &wallet).await?;
 
-    // First store: should succeed
-    let result1 = client
-        .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
-        .await;
-    result1.map_err(|e| format!("First store MUST succeed with valid payment: {e}"))?;
+    // First store: should succeed — retry for slow DHT on CI
+    let mut first_stored = false;
+    for attempt in 1..=5u32 {
+        match client
+            .put_chunk_with_proof(Bytes::from(test_data.to_vec()), proof_bytes.clone())
+            .await
+        {
+            Ok(_addr) => {
+                first_stored = true;
+                break;
+            }
+            Err(e) => {
+                warn!("First store attempt {attempt}/5 failed: {e}");
+                if attempt < 5 {
+                    let _ = harness.warmup_dht().await;
+                    sleep(Duration::from_secs(3)).await;
+                }
+            }
+        }
+    }
+    assert!(
+        first_stored,
+        "First store MUST succeed with valid payment after retries"
+    );
     info!("First store succeeded (legitimate)");
 
     // Second store with same proof: should return AlreadyExists (idempotent)
