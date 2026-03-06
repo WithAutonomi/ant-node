@@ -103,7 +103,7 @@ impl NodeBuilder {
         }
 
         // Resolve identity and root_dir (may update self.config.root_dir)
-        let identity = Self::resolve_identity(&mut self.config).await?;
+        let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
         let peer_id = identity.peer_id().to_hex();
 
         info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
@@ -118,7 +118,10 @@ impl NodeBuilder {
         let (events_tx, events_rx) = create_event_channel();
 
         // Convert our config to saorsa-core's config
-        let core_config = Self::build_core_config(&self.config)?;
+        let mut core_config = Self::build_core_config(&self.config)?;
+        // Inject the ML-DSA identity so the P2PNode's transport peer ID
+        // matches the pub_key embedded in payment quotes.
+        core_config.node_identity = Some(Arc::clone(&identity));
         debug!("Core config: {:?}", core_config);
 
         // Initialize saorsa-core's P2PNode

@@ -20,7 +20,8 @@ use evmlib::Network as EvmNetwork;
 use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::{
-    IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
+    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, NodeConfig as CoreNodeConfig,
+    P2PEvent, P2PNode,
 };
 use saorsa_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -383,6 +384,13 @@ pub struct TestNode {
 
     /// Bootstrap addresses this node connects to.
     pub bootstrap_addrs: Vec<SocketAddr>,
+
+    /// ML-DSA-65 identity used for quote signing.
+    ///
+    /// Stored so that `start_node` can inject the same identity into the
+    /// `P2PNode`, ensuring the transport-level peer ID matches the public
+    /// key embedded in payment quotes (`BLAKE3(pub_key)` == `peer_id`).
+    pub node_identity: Option<Arc<NodeIdentity>>,
 
     /// Protocol handler background task handle.
     ///
@@ -1146,9 +1154,10 @@ impl TestNetwork {
         tokio::fs::create_dir_all(&data_dir).await?;
 
         // Generate an ML-DSA-65 identity for this test node's quote signing
-        let identity = saorsa_core::identity::NodeIdentity::generate().map_err(|e| {
+        // AND for the P2PNode so BLAKE3(pub_key) == transport peer_id.
+        let identity = Arc::new(NodeIdentity::generate().map_err(|e| {
             TestnetError::Core(format!("Failed to generate test node identity: {e}"))
-        })?;
+        })?);
 
         // Initialize AntProtocol for this node with payment enforcement setting
         let ant_protocol = Self::create_ant_protocol(
@@ -1172,6 +1181,7 @@ impl TestNetwork {
             is_bootstrap,
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
+            node_identity: Some(identity),
             protocol_task: None,
         })
     }
@@ -1279,6 +1289,10 @@ impl TestNetwork {
         // Allow localhost peers in DHT routing for test environments
         // This prevents diversity filters from excluding peers on 127.0.0.1
         core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+
+        // Inject the ML-DSA identity so the P2PNode's transport peer ID
+        // matches the pub_key embedded in payment quotes.
+        core_config.node_identity.clone_from(&node.node_identity);
 
         // Create and start the P2P node
         let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
