@@ -32,7 +32,7 @@ path = "src/bin/saorsa-client/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.12.1"
+saorsa-core = "0.13.0"
 saorsa-pqc = "0.4.0"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -175,6 +175,3 @@ assets = [
 
 [package.metadata.generate-rpm.requires]
 # Runtime dependencies auto-detected
-
-[patch.crates-io]
-saorsa-core = { path = "../saorsa-core" }
