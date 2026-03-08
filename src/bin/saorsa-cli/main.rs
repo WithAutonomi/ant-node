@@ -339,6 +339,7 @@ async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<
     core_config.enable_ipv6 = false;
     core_config.bootstrap_peers = bootstrap;
     core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
+    core_config.mode = saorsa_core::NodeMode::Client;
 
     let node = P2PNode::new(core_config)
         .await
