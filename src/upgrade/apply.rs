@@ -108,6 +108,11 @@ impl AutoApplyUpgrader {
                     debug!("Stripped '(deleted)' suffix from invoked path: {cleaned}");
                     return Ok(PathBuf::from(cleaned));
                 }
+                // Canonicalize to an absolute path so that trigger_restart
+                // works even if the CWD has changed since startup.
+                if let Ok(canonical) = invoked.canonicalize() {
+                    return Ok(canonical);
+                }
                 return Ok(invoked.clone());
             }
         }
@@ -172,45 +177,24 @@ impl AutoApplyUpgrader {
 
         let version_str = info.version.to_string();
 
-        // Try the binary cache first
-        let extracted_binary = if let Some(ref cache) = self.binary_cache {
-            if let Some(cached_path) = cache.get_verified(&version_str) {
-                info!("Cached binary verified for version {}", version_str);
-                // Copy from cache (not move) to preserve for other nodes
-                let dest = temp_dir.path().join(
-                    cached_path
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("saorsa-node")),
-                );
-                if let Err(e) = fs::copy(&cached_path, &dest) {
-                    warn!("Failed to copy from cache, will re-download: {e}");
-                    self.download_verify_extract(info, temp_dir.path(), Some(cache))
-                        .await?
-                } else {
-                    dest
-                }
-            } else {
-                // Cache miss — acquire download lock, double-check, then download
-                self.download_verify_extract(info, temp_dir.path(), Some(cache))
-                    .await?
+        // Try the binary cache first; download/verify/extract errors are
+        // recoverable and result in RolledBack rather than a hard error.
+        let extracted_binary = match self
+            .resolve_upgrade_binary(info, temp_dir.path(), &version_str)
+            .await
+        {
+            Ok(path) => path,
+            Err(e) => {
+                warn!("Download/verify/extract failed: {e}");
+                return Ok(UpgradeResult::RolledBack {
+                    reason: format!("{e}"),
+                });
             }
-        } else {
-            // No cache configured — use the original download path
-            self.download_verify_extract(info, temp_dir.path(), None)
-                .await?
         };
-
-        // Handle RolledBack sentinel (empty path means a step failed gracefully)
-        if !extracted_binary.exists() {
-            // download_verify_extract already logged the issue
-            return Ok(UpgradeResult::RolledBack {
-                reason: "Download/verify/extract failed (see earlier logs)".to_string(),
-            });
-        }
 
         // Check if the on-disk binary has already been upgraded by a sibling service.
         // This prevents redundant backup/replace cycles when multiple nodes share one binary.
-        if let Some(disk_version) = on_disk_version(&current_binary) {
+        if let Some(disk_version) = on_disk_version(&current_binary).await {
             if disk_version == info.version {
                 info!(
                     "Binary already upgraded to {} by another service, skipping replacement",
@@ -303,12 +287,81 @@ impl AutoApplyUpgrader {
         Ok(())
     }
 
+    /// Resolve the upgrade binary, checking the cache first and falling back
+    /// to a full download/verify/extract cycle.
+    ///
+    /// On a cache miss the exclusive download lock is acquired (via
+    /// `spawn_blocking` to avoid blocking the tokio runtime), the cache is
+    /// re-checked, and if still missing the full download runs while the lock
+    /// is held so that only one node downloads per version.
+    async fn resolve_upgrade_binary(
+        &self,
+        info: &UpgradeInfo,
+        dest_dir: &Path,
+        version_str: &str,
+    ) -> Result<PathBuf> {
+        if let Some(ref cache) = self.binary_cache {
+            // Fast path — cache hit without locking
+            if let Some(cached_path) = cache.get_verified(version_str) {
+                info!("Cached binary verified for version {}", version_str);
+                let dest = dest_dir.join(
+                    cached_path
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("saorsa-node")),
+                );
+                if let Err(e) = fs::copy(&cached_path, &dest) {
+                    warn!("Failed to copy from cache, will re-download: {e}");
+                    return self
+                        .download_verify_extract(info, dest_dir, Some(cache))
+                        .await;
+                }
+                return Ok(dest);
+            }
+
+            // Cache miss — acquire exclusive download lock via spawn_blocking
+            // to avoid blocking the tokio runtime while waiting for the lock.
+            let cache_clone = cache.clone();
+            // Named `lock_guard` (not `_lock_guard`) so the compiler keeps it
+            // alive across the `.await` below — dropping it would release the
+            // file lock before the download completes.
+            let lock_guard =
+                tokio::task::spawn_blocking(move || cache_clone.acquire_download_lock())
+                    .await
+                    .map_err(|e| Error::Upgrade(format!("Lock task failed: {e}")))??;
+
+            // Re-check cache under the lock — another node may have populated it
+            if let Some(cached_path) = cache.get_verified(version_str) {
+                info!(
+                    "Cached binary became available under lock for version {}",
+                    version_str
+                );
+                let dest = dest_dir.join(
+                    cached_path
+                        .file_name()
+                        .unwrap_or_else(|| std::ffi::OsStr::new("saorsa-node")),
+                );
+                fs::copy(&cached_path, &dest)?;
+                return Ok(dest);
+            }
+
+            // Still missing — download while holding the lock
+            let result = self
+                .download_verify_extract(info, dest_dir, Some(cache))
+                .await;
+            drop(lock_guard);
+            result
+        } else {
+            self.download_verify_extract(info, dest_dir, None).await
+        }
+    }
+
     /// Download archive, verify signature, extract binary, and optionally
     /// store in the binary cache.
     ///
-    /// Returns the path to the extracted binary inside `dest_dir`.  On any
-    /// recoverable failure the path will not exist (caller checks
-    /// `.exists()`).
+    /// # Errors
+    ///
+    /// Returns an error if any step (download, signature verification,
+    /// extraction) fails.
     async fn download_verify_extract(
         &self,
         info: &UpgradeInfo,
@@ -320,35 +373,20 @@ impl AutoApplyUpgrader {
 
         // Step 1: Download archive
         info!("Downloading saorsa-node binary...");
-        if let Err(e) = self.download(&info.download_url, &archive_path).await {
-            warn!("Archive download failed: {e}");
-            return Ok(dest_dir.join("_failed_"));
-        }
+        self.download(&info.download_url, &archive_path).await?;
 
         // Step 2: Download signature
         info!("Downloading signature...");
-        if let Err(e) = self.download(&info.signature_url, &sig_path).await {
-            warn!("Signature download failed: {e}");
-            return Ok(dest_dir.join("_failed_"));
-        }
+        self.download(&info.signature_url, &sig_path).await?;
 
         // Step 3: Verify signature on archive BEFORE extraction
         info!("Verifying ML-DSA signature on archive...");
-        if let Err(e) = signature::verify_from_file(&archive_path, &sig_path) {
-            warn!("Signature verification failed: {e}");
-            return Ok(dest_dir.join("_failed_"));
-        }
+        signature::verify_from_file(&archive_path, &sig_path)?;
         info!("Archive signature verified successfully");
 
         // Step 4: Extract binary from verified archive
         info!("Extracting binary from archive...");
-        let extracted_binary = match Self::extract_binary(&archive_path, dest_dir) {
-            Ok(path) => path,
-            Err(e) => {
-                warn!("Extraction failed: {e}");
-                return Ok(dest_dir.join("_failed_"));
-            }
-        };
+        let extracted_binary = Self::extract_binary(&archive_path, dest_dir)?;
 
         // Store in binary cache if available
         if let Some(c) = cache {
@@ -412,13 +450,10 @@ impl AutoApplyUpgrader {
                 if name_str == "saorsa-node" || name_str == "saorsa-node.exe" {
                     debug!("Found binary in tar.gz archive: {}", path.display());
 
-                    // Read and write the binary
-                    let mut contents = Vec::new();
-                    entry
-                        .read_to_end(&mut contents)
-                        .map_err(|e| Error::Upgrade(format!("Failed to read binary: {e}")))?;
-
-                    fs::write(&extracted_binary, &contents)?;
+                    // Stream directly to disk to avoid large heap allocations
+                    let mut out = File::create(&extracted_binary)?;
+                    std::io::copy(&mut entry, &mut out)
+                        .map_err(|e| Error::Upgrade(format!("Failed to write binary: {e}")))?;
 
                     // Make executable on Unix
                     #[cfg(unix)]
@@ -467,12 +502,10 @@ impl AutoApplyUpgrader {
                 if name_str == "saorsa-node" || name_str == "saorsa-node.exe" {
                     debug!("Found binary in zip archive: {}", path.display());
 
-                    let mut contents = Vec::new();
-                    entry
-                        .read_to_end(&mut contents)
-                        .map_err(|e| Error::Upgrade(format!("Failed to read binary: {e}")))?;
-
-                    fs::write(&extracted_binary, &contents)?;
+                    // Stream directly to disk to avoid large heap allocations
+                    let mut out = File::create(&extracted_binary)?;
+                    std::io::copy(&mut entry, &mut out)
+                        .map_err(|e| Error::Upgrade(format!("Failed to write binary: {e}")))?;
 
                     // Make executable on Unix
                     #[cfg(unix)]
@@ -599,13 +632,21 @@ impl AutoApplyUpgrader {
 
 /// Run the on-disk binary with `--version` and parse the reported version.
 ///
-/// Returns `None` if the binary cannot be executed or the output cannot be parsed.
+/// Returns `None` if the binary cannot be executed, times out, or the output
+/// cannot be parsed.  Uses `tokio::process::Command` with a 5-second timeout
+/// to avoid blocking the async runtime.
+///
 /// Output format is expected to be "saorsa-node X.Y.Z" or "saorsa-node X.Y.Z-rc.N".
-fn on_disk_version(binary_path: &Path) -> Option<Version> {
-    let output = std::process::Command::new(binary_path)
-        .arg("--version")
-        .output()
-        .ok()?;
+async fn on_disk_version(binary_path: &Path) -> Option<Version> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::process::Command::new(binary_path)
+            .arg("--version")
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let version_str = stdout.trim().strip_prefix("saorsa-node ")?;
     Version::parse(version_str).ok()
@@ -729,8 +770,7 @@ mod tests {
     fn test_extract_binary_from_tar_gz_nested_path() {
         let dir = tempfile::tempdir().unwrap();
         let content = b"nested-binary";
-        let archive =
-            create_tar_gz_archive(dir.path(), "some/nested/path/saorsa-node", content);
+        let archive = create_tar_gz_archive(dir.path(), "some/nested/path/saorsa-node", content);
 
         let dest = tempfile::tempdir().unwrap();
         let result = AutoApplyUpgrader::extract_binary(&archive, dest.path());

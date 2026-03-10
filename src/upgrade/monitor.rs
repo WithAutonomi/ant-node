@@ -195,7 +195,7 @@ impl UpgradeMonitor {
     ///
     /// Returns an error if the GitHub API request fails.
     pub async fn check_for_updates(&self) -> Result<Option<UpgradeInfo>> {
-        // Try the shared disk cache first
+        // Try the shared disk cache first (lock-free fast path)
         if let Some(ref cache) = self.release_cache {
             if let Some(cached_releases) = cache.read_if_valid(&self.repo) {
                 info!(
@@ -208,40 +208,47 @@ impl UpgradeMonitor {
                     self.channel,
                 ));
             }
-            info!("No valid cache, fetching from API");
-        }
 
-        let api_url = format!("https://api.github.com/repos/{}/releases", self.repo);
+            // Cache stale/missing — acquire lock and re-check so only one
+            // node actually hits the GitHub API while the rest wait.
+            let cache_clone = cache.clone();
+            let repo_clone = self.repo.clone();
+            let (lock_guard, rechecked) =
+                tokio::task::spawn_blocking(move || cache_clone.lock_and_recheck(&repo_clone))
+                    .await
+                    .map_err(|e| Error::Upgrade(format!("Cache lock task failed: {e}")))??;
 
-        debug!("Checking for updates from: {}", api_url);
+            if let Some(cached_releases) = rechecked {
+                info!(
+                    "Using cached release info after lock ({} releases)",
+                    cached_releases.len()
+                );
+                return Ok(select_upgrade_from_releases(
+                    &cached_releases,
+                    &self.current_version,
+                    self.channel,
+                ));
+            }
 
-        let response = self
-            .client
-            .get(&api_url)
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await
-            .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
+            info!("No valid cache under lock, fetching from API");
 
-        if !response.status().is_success() {
-            return Err(Error::Network(format!(
-                "GitHub API returned status: {}",
-                response.status()
-            )));
-        }
+            // Fetch from API while holding the lock
+            let releases = self.fetch_releases_from_api().await?;
 
-        let releases: Vec<GitHubRelease> = response
-            .json()
-            .await
-            .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))?;
-
-        // Write fresh results to the shared cache for other nodes
-        if let Some(ref cache) = self.release_cache {
-            if let Err(e) = cache.write(&self.repo, &releases) {
+            // Write fresh results under the lock for other nodes
+            if let Err(e) = cache.write_under_lock(lock_guard, &self.repo, &releases) {
                 warn!("Failed to write release cache: {e}");
             }
+
+            return Ok(select_upgrade_from_releases(
+                &releases,
+                &self.current_version,
+                self.channel,
+            ));
         }
 
+        // No cache configured — fetch directly
+        let releases = self.fetch_releases_from_api().await?;
         Ok(select_upgrade_from_releases(
             &releases,
             &self.current_version,
@@ -333,6 +340,32 @@ impl UpgradeMonitor {
             );
             Ok(None)
         }
+    }
+
+    /// Fetch releases from the GitHub API.
+    async fn fetch_releases_from_api(&self) -> Result<Vec<GitHubRelease>> {
+        let api_url = format!("https://api.github.com/repos/{}/releases", self.repo);
+        debug!("Checking for updates from: {}", api_url);
+
+        let response = self
+            .client
+            .get(&api_url)
+            .header("Accept", "application/vnd.github+json")
+            .send()
+            .await
+            .map_err(|e| Error::Network(format!("GitHub API request failed: {e}")))?;
+
+        if !response.status().is_success() {
+            return Err(Error::Network(format!(
+                "GitHub API returned status: {}",
+                response.status()
+            )));
+        }
+
+        response
+            .json()
+            .await
+            .map_err(|e| Error::Network(format!("Failed to parse releases: {e}")))
     }
 
     /// Get the remaining time until this node should upgrade.

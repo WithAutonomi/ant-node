@@ -34,6 +34,11 @@ pub fn upgrade_cache_dir() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// Verify the function succeeds and returns a path ending in "upgrades".
+    ///
+    /// Note: this creates a real directory under the platform data dir.
+    /// Modifying env vars to isolate this requires `unsafe` (due to
+    /// `deny(unsafe_code)`), so we accept the minor side-effect.
     #[test]
     fn test_upgrade_cache_dir_returns_path() {
         let dir = upgrade_cache_dir().unwrap();

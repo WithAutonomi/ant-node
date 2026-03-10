@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use tracing::{debug, warn};
 
 /// On-disk cache for downloaded upgrade binaries.
+#[derive(Clone)]
 pub struct BinaryCache {
     /// Directory that holds cached binaries and metadata.
     cache_dir: PathBuf,
@@ -82,8 +83,9 @@ impl BinaryCache {
 
     /// Store a binary in the cache.
     ///
-    /// Computes the SHA-256 digest, copies the binary, and writes a
-    /// `.meta.json` sidecar file.
+    /// Uses a write-to-temp-then-rename strategy so that readers never
+    /// observe partially written files.  The metadata file is written last
+    /// so that `get_verified` only succeeds once both files are complete.
     ///
     /// # Errors
     ///
@@ -93,7 +95,14 @@ impl BinaryCache {
         let hash = sha256_file(source_path)?;
 
         let dest = self.cached_binary_path(version);
-        fs::copy(source_path, &dest)?;
+        let meta_path = self.meta_path(version);
+
+        // Write binary to a temp file then rename into place.
+        // Remove dest first on Windows where rename fails if it exists.
+        let tmp_bin = self.cache_dir.join(format!(".saorsa-node-{version}.tmp"));
+        fs::copy(source_path, &tmp_bin)?;
+        let _ = fs::remove_file(&dest);
+        fs::rename(&tmp_bin, &dest)?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -109,38 +118,42 @@ impl BinaryCache {
         let meta_json = serde_json::to_string(&meta)
             .map_err(|e| Error::Upgrade(format!("Failed to serialize binary cache meta: {e}")))?;
 
-        let meta_path = self.meta_path(version);
-        let mut f = File::create(&meta_path)?;
+        // Write metadata to a temp file then rename into place
+        let tmp_meta = self
+            .cache_dir
+            .join(format!(".saorsa-node-{version}.meta.tmp"));
+        let mut f = File::create(&tmp_meta)?;
         f.write_all(meta_json.as_bytes())?;
         f.sync_all()?;
+        drop(f);
+        let _ = fs::remove_file(&meta_path);
+        fs::rename(&tmp_meta, &meta_path)?;
 
         debug!("Cached binary for version {version} at {}", dest.display());
         Ok(())
     }
 
-    /// Execute `f` while holding an exclusive download lock.
+    /// Acquire an exclusive download lock and return the guard.
     ///
     /// This prevents multiple nodes from downloading the same archive
     /// concurrently — the first acquires the lock and downloads, the rest
     /// wait and then find the binary already cached.
     ///
+    /// The lock is released when the returned guard is dropped.
+    ///
+    /// **Note:** `lock_exclusive()` blocks the calling thread.  Callers in
+    /// async contexts should wrap this call in `tokio::task::spawn_blocking`.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the lock cannot be acquired or `f` fails.
-    pub fn with_download_lock<F, T>(&self, f: F) -> Result<T>
-    where
-        F: FnOnce() -> Result<T>,
-    {
+    /// Returns an error if the lock file cannot be created or acquired.
+    pub fn acquire_download_lock(&self) -> Result<DownloadLockGuard> {
         let lock_path = self.cache_dir.join("download.lock");
         let lock = File::create(&lock_path)
             .map_err(|e| Error::Upgrade(format!("Failed to create download lock: {e}")))?;
         lock.lock_exclusive()
             .map_err(|e| Error::Upgrade(format!("Failed to acquire download lock: {e}")))?;
-
-        let result = f();
-
-        drop(lock); // Dropping the file releases the exclusive lock
-        result
+        Ok(DownloadLockGuard { _file: lock })
     }
 
     // -- private helpers -----------------------------------------------------
@@ -153,6 +166,13 @@ impl BinaryCache {
         };
         self.cache_dir.join(name)
     }
+}
+
+/// RAII guard that holds an exclusive download lock.
+///
+/// The underlying file lock is released when this guard is dropped.
+pub struct DownloadLockGuard {
+    _file: File,
 }
 
 /// Compute the hex-encoded SHA-256 digest of a file.

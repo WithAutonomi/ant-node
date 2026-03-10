@@ -581,10 +581,23 @@ impl RunningNode {
                                     warn!("Error during upgrade process: {}", e);
                                 }
                             }
-                            // Schedule next check
-                            let next_check = chrono::Utc::now() + chrono::Duration::from_std(monitor.check_interval()).unwrap_or_else(|_| chrono::Duration::hours(1));
+                            // Schedule next check with jitter to prevent fleet re-alignment
+                            let base_interval = monitor.check_interval();
+                            let interval_secs = base_interval.as_secs();
+                            let variance = interval_secs / 20; // 5%
+                            let jittered_secs = if variance > 0 {
+                                use rand::Rng;
+                                let jitter = rand::thread_rng().gen_range(0..=variance * 2);
+                                interval_secs.saturating_sub(variance) + jitter
+                            } else {
+                                interval_secs
+                            };
+                            let jittered_duration = std::time::Duration::from_secs(jittered_secs);
+                            let next_check = chrono::Utc::now()
+                                + chrono::Duration::from_std(jittered_duration)
+                                    .unwrap_or_else(|_| chrono::Duration::hours(1));
                             info!("Next upgrade check scheduled for {}", next_check.to_rfc3339());
-                            tokio::time::sleep(monitor.check_interval()).await;
+                            tokio::time::sleep(jittered_duration).await;
                         }
                     }
                 }

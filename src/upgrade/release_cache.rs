@@ -16,6 +16,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
 /// On-disk cache for GitHub release metadata.
+#[derive(Clone)]
 pub struct ReleaseCache {
     /// Directory that holds the cache file and its lock.
     cache_dir: PathBuf,
@@ -145,6 +146,35 @@ impl ReleaseCache {
         )
     }
 
+    /// Acquire the exclusive cache lock, re-check the cache, and return
+    /// valid cached releases if another node populated them while we waited.
+    ///
+    /// Returns `Ok(Some(releases))` if a valid cache was found under the
+    /// lock, or `Ok(None)` if the cache is still stale/missing and the
+    /// caller should fetch from the network.  The returned
+    /// The returned lock guard must be held until after writing the fresh
+    /// data so that other nodes block rather than all hitting the API.
+    ///
+    /// **Note:** `lock_exclusive()` blocks the calling thread.  Callers in
+    /// async contexts should wrap this in `tokio::task::spawn_blocking`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the lock file cannot be created or acquired.
+    pub fn lock_and_recheck(
+        &self,
+        repo: &str,
+    ) -> Result<(ReleaseCacheLockGuard, Option<Vec<GitHubRelease>>)> {
+        let lock_path = self.lock_file();
+        let lock = File::create(&lock_path)
+            .map_err(|e| Error::Upgrade(format!("Failed to create release cache lock: {e}")))?;
+        lock.lock_exclusive()
+            .map_err(|e| Error::Upgrade(format!("Failed to acquire release cache lock: {e}")))?;
+
+        let cached = self.read_if_valid(repo);
+        Ok((ReleaseCacheLockGuard { _file: lock }, cached))
+    }
+
     /// Write releases to the cache, using an exclusive file lock to
     /// coordinate with other nodes on the same machine.
     ///
@@ -168,6 +198,22 @@ impl ReleaseCache {
         result
     }
 
+    /// Write releases to the cache while the caller already holds the
+    /// lock guard.  The guard is consumed to ensure the lock is released
+    /// after writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written.
+    pub fn write_under_lock(
+        &self,
+        _guard: ReleaseCacheLockGuard,
+        repo: &str,
+        releases: &[GitHubRelease],
+    ) -> Result<()> {
+        self.write_inner(repo, releases)
+    }
+
     // -- private helpers -----------------------------------------------------
 
     fn write_inner(&self, repo: &str, releases: &[GitHubRelease]) -> Result<()> {
@@ -185,14 +231,17 @@ impl ReleaseCache {
         let json = serde_json::to_string(&cached)
             .map_err(|e| Error::Upgrade(format!("Failed to serialize release cache: {e}")))?;
 
-        // Atomic write: temp file + rename
+        // Write to temp file then rename into place.
+        // Remove dest first on Windows where rename fails if it exists.
         let tmp_path = self.cache_dir.join("releases.json.tmp");
         {
             let mut f = File::create(&tmp_path)?;
             f.write_all(json.as_bytes())?;
             f.sync_all()?;
         }
-        fs::rename(&tmp_path, self.cache_file())?;
+        let cache_file = self.cache_file();
+        let _ = fs::remove_file(&cache_file);
+        fs::rename(&tmp_path, &cache_file)?;
 
         debug!("Wrote release cache ({} releases)", releases.len());
         Ok(())
@@ -205,6 +254,13 @@ impl ReleaseCache {
     fn lock_file(&self) -> PathBuf {
         self.cache_dir.join("releases.lock")
     }
+}
+
+/// RAII guard that holds an exclusive release cache lock.
+///
+/// The underlying file lock is released when this guard is dropped.
+pub struct ReleaseCacheLockGuard {
+    _file: File,
 }
 
 // ---------------------------------------------------------------------------

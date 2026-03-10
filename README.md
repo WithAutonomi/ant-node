@@ -724,11 +724,11 @@ saorsa-node --upgrade-channel beta
 
 ```toml
 [upgrade]
-enabled = true
 channel = "stable"
 check_interval_hours = 1
 github_repo = "saorsa-labs/saorsa-node"
-# max_random_delay_hours = 24  # For staged rollout
+stop_on_upgrade = false  # Set true when running under a service manager
+# staged_rollout_hours = 24  # For staged rollout
 ```
 
 ---
@@ -980,10 +980,11 @@ bootstrap = [
 ]
 
 [upgrade]
-enabled = true
+# Upgrades are always enabled; configure behavior here
 channel = "stable"
 check_interval_hours = 1
 github_repo = "saorsa-labs/saorsa-node"
+stop_on_upgrade = false
 
 [migration]
 auto_detect = true
