@@ -4,9 +4,7 @@
 //! multi-node networks on a single machine.
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
-use crate::config::{
-    default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME, TRANSPORT_ALLOW_LOOPBACK_ENV,
-};
+use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
 use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -390,9 +388,6 @@ impl Devnet {
     /// Returns `DevnetError::Startup` if any node fails to start, or
     /// `DevnetError::Stabilization` if the network does not stabilize within the timeout.
     pub async fn start(&mut self) -> Result<()> {
-        // Allow loopback connections — devnet nodes all run on 127.0.0.1.
-        std::env::set_var(TRANSPORT_ALLOW_LOOPBACK_ENV, "true");
-
         info!(
             "Starting devnet with {} nodes ({} bootstrap)",
             self.config.node_count, self.config.bootstrap_count
@@ -645,6 +640,8 @@ impl Devnet {
             .clone_from(&node.bootstrap_addrs);
         core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
+        // Devnet nodes all run on 127.0.0.1.
+        core_config.allow_loopback = true;
 
         let index = node.index;
         let p2p_node = P2PNode::new(core_config)

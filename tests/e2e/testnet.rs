@@ -29,7 +29,6 @@ use saorsa_node::ant_protocol::{
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
 };
 use saorsa_node::client::{send_and_await_chunk_response, DataChunk, QuantumClient, XorName};
-use saorsa_node::config::TRANSPORT_ALLOW_LOOPBACK_ENV;
 use saorsa_node::payment::{
     EvmVerifierConfig, PaymentProof, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -1059,9 +1058,6 @@ impl TestNetwork {
     /// Returns an error if any node fails to start or the network
     /// fails to stabilize within the timeout.
     pub async fn start(&mut self) -> Result<()> {
-        // Allow loopback connections — test nodes all run on 127.0.0.1.
-        std::env::set_var(TRANSPORT_ALLOW_LOOPBACK_ENV, "true");
-
         info!(
             "Starting test network with {} nodes ({} bootstrap)",
             self.config.node_count, self.config.bootstrap_count
@@ -1299,6 +1295,8 @@ impl TestNetwork {
         // Allow localhost peers in DHT routing for test environments
         // This prevents diversity filters from excluding peers on 127.0.0.1
         core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+        // Test nodes all run on 127.0.0.1.
+        core_config.allow_loopback = true;
 
         // Inject the ML-DSA identity so the P2PNode's transport peer ID
         // matches the pub_key embedded in payment quotes.

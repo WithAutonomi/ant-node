@@ -10,11 +10,6 @@ pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
 /// Subdirectory under the root dir that contains per-node data directories.
 pub const NODES_SUBDIR: &str = "nodes";
 
-/// Environment variable that tells saorsa-core's transport layer to accept
-/// loopback (127.0.0.1) connections.  Set to `"true"` for local devnets and
-/// testnets where all nodes run on the same machine.
-pub const TRANSPORT_ALLOW_LOOPBACK_ENV: &str = "SAORSA_TRANSPORT_ALLOW_LOOPBACK";
-
 /// IP version configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
