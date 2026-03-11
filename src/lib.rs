@@ -55,8 +55,8 @@ pub use ant_protocol::{
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
 pub use client::self_encrypt::{
-    decrypt_file_local, deserialize_data_map, download_and_decrypt_file, encrypt_and_upload_file,
-    encrypt_file_local, fetch_data_map_public, serialize_data_map, store_data_map_public,
+    deserialize_data_map, download_and_decrypt_file, encrypt_and_upload_file,
+    fetch_data_map_public, serialize_data_map, store_data_map_public,
 };
 pub use client::{
     compute_address, create_manifest, deserialize_manifest, peer_id_to_xor_name, reassemble_file,

@@ -149,7 +149,6 @@ async fn handle_upload(
         std::fs::write(&datamap_path, &data_map_bytes)?;
 
         println!("DATAMAP_FILE={}", datamap_path.display());
-        println!("DATAMAP_HEX={}", hex::encode(&data_map_bytes));
         println!("MODE=private");
         println!("CHUNKS={chunk_count}");
         println!("TOTAL_SIZE={file_size}");

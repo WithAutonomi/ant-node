@@ -1,8 +1,8 @@
-//! Self-encryption integration for streaming file encrypt/decrypt.
+//! Self-encryption integration for file encrypt/decrypt.
 //!
 //! Wraps the `self_encryption` crate's streaming API to provide:
-//! - **Streaming encryption** from file path (low memory footprint)
-//! - **Streaming decryption** to file path
+//! - **Encryption** from file path (chunks are collected in memory before upload)
+//! - **Streaming decryption** to file path (bounded memory via batch fetching)
 //! - **`DataMap` serialization** for public/private data modes
 //!
 //! ## Public vs Private Data
@@ -29,7 +29,8 @@ use crate::client::data_types::XorName as ChunkAddress;
 /// Encrypt a file using streaming self-encryption and upload each chunk.
 ///
 /// Uses `stream_encrypt()` which reads the file incrementally via an iterator.
-/// Chunks are collected in memory, then uploaded sequentially with payment.
+/// All encrypted chunks are collected in memory before uploading sequentially
+/// with payment, so peak memory usage is proportional to the encrypted file size.
 ///
 /// Returns the `DataMap` after all chunks are uploaded, plus the list of
 /// transaction hash strings from payment.
@@ -84,19 +85,36 @@ fn encrypt_file_to_chunks(
     let file = std::fs::File::open(file_path).map_err(Error::Io)?;
     let mut reader = BufReader::new(file);
 
+    let io_error: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let io_error_writer = std::sync::Arc::clone(&io_error);
+
     let data_iter = std::iter::from_fn(move || {
         let mut buf = vec![0u8; 65536];
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => None,
+            Ok(0) => None,
             Ok(n) => {
                 buf.truncate(n);
                 Some(Bytes::from(buf))
+            }
+            Err(e) => {
+                if let Ok(mut guard) = io_error_writer.lock() {
+                    *guard = Some(e);
+                }
+                None
             }
         }
     });
 
     let mut stream = self_encryption::stream_encrypt(file_size, data_iter)
         .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+
+    // Check if an I/O error was captured during iteration
+    if let Ok(guard) = io_error.lock() {
+        if let Some(ref e) = *guard {
+            return Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
+        }
+    }
 
     let mut chunks = Vec::new();
     for chunk_result in stream.chunks() {
@@ -159,12 +177,27 @@ pub async fn download_and_decrypt_file(
     })
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
-    let mut file = std::fs::File::create(output_path).map_err(Error::Io)?;
-    for chunk_result in stream {
-        let chunk_bytes =
-            chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
-        file.write_all(&chunk_bytes).map_err(Error::Io)?;
+    // Write to a temp file first, then rename atomically on success
+    // to prevent leaving a corrupt partial file on failure.
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(".saorsa_decrypt_{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
+        for chunk_result in stream {
+            let chunk_bytes =
+                chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
+            file.write_all(&chunk_bytes).map_err(Error::Io)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
+
+    std::fs::rename(&tmp_path, output_path).map_err(Error::Io)?;
 
     info!("Decryption complete: {}", output_path.display());
     Ok(())
@@ -282,12 +315,25 @@ fn decrypt_from_store<S: BuildHasher>(
     })
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
-    let mut file = std::fs::File::create(output_path).map_err(Error::Io)?;
-    for chunk_result in stream {
-        let chunk_bytes =
-            chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
-        file.write_all(&chunk_bytes).map_err(Error::Io)?;
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(format!(".saorsa_decrypt_{}.tmp", std::process::id()));
+
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
+        for chunk_result in stream {
+            let chunk_bytes =
+                chunk_result.map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
+            file.write_all(&chunk_bytes).map_err(Error::Io)?;
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
+
+    std::fs::rename(&tmp_path, output_path).map_err(Error::Io)?;
 
     Ok(())
 }
