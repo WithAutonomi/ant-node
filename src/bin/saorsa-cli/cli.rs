@@ -74,11 +74,18 @@ pub enum FileAction {
     Upload {
         /// Path to the file to upload.
         path: PathBuf,
+        /// Public mode: store the data map on the network (anyone with the
+        /// address can download). Default is private (data map saved locally).
+        #[arg(long)]
+        public: bool,
     },
     /// Download a file from the network.
     Download {
-        /// Hex-encoded manifest address (returned by upload).
-        address: String,
+        /// Hex-encoded address (public data map address or manifest address).
+        address: Option<String>,
+        /// Path to a local data map file (for private downloads).
+        #[arg(long)]
+        datamap: Option<PathBuf>,
         /// Output file path (defaults to stdout).
         #[arg(long, short)]
         output: Option<PathBuf>,
@@ -126,6 +133,67 @@ mod tests {
         .unwrap();
 
         assert!(cli.devnet_manifest.is_some());
+    }
+
+    #[test]
+    fn test_parse_upload_public() {
+        let cli = Cli::try_parse_from([
+            "saorsa-cli",
+            "--bootstrap",
+            "127.0.0.1:10000",
+            "file",
+            "upload",
+            "--public",
+            "/tmp/test.txt",
+        ])
+        .unwrap();
+
+        if let CliCommand::File {
+            action: FileAction::Upload { public, .. },
+        } = cli.command
+        {
+            assert!(public, "Upload should be public");
+        } else {
+            panic!("Expected File Upload");
+        }
+    }
+
+    #[test]
+    fn test_parse_download_with_datamap() {
+        let cli = Cli::try_parse_from([
+            "saorsa-cli",
+            "--bootstrap",
+            "127.0.0.1:10000",
+            "file",
+            "download",
+            "--datamap",
+            "/tmp/my.datamap",
+            "--output",
+            "/tmp/out.bin",
+        ])
+        .unwrap();
+
+        if let CliCommand::File {
+            action:
+                FileAction::Download {
+                    address,
+                    datamap,
+                    output,
+                },
+        } = cli.command
+        {
+            assert!(
+                address.is_none(),
+                "Address should be None for datamap download"
+            );
+            assert_eq!(
+                datamap.as_deref(),
+                Some(std::path::Path::new("/tmp/my.datamap"))
+            );
+            assert!(output.is_some());
+        } else {
+            panic!("Expected File Download");
+        }
     }
 
     #[test]

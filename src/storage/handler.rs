@@ -31,7 +31,8 @@ use crate::ant_protocol::{
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID,
     DATA_TYPE_CHUNK, MAX_CHUNK_SIZE,
 };
-use crate::error::Result;
+use crate::client::compute_address;
+use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
@@ -93,7 +94,7 @@ impl AntProtocol {
     /// Returns an error if message decoding or handling fails.
     pub async fn handle_message(&self, data: &[u8]) -> Result<Bytes> {
         let message = ChunkMessage::decode(data)
-            .map_err(|e| crate::error::Error::Protocol(format!("Failed to decode message: {e}")))?;
+            .map_err(|e| Error::Protocol(format!("Failed to decode message: {e}")))?;
 
         let request_id = message.request_id;
 
@@ -124,7 +125,7 @@ impl AntProtocol {
         response
             .encode()
             .map(Bytes::from)
-            .map_err(|e| crate::error::Error::Protocol(format!("Failed to encode response: {e}")))
+            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
     }
 
     /// Handle a PUT request.
@@ -142,7 +143,7 @@ impl AntProtocol {
         }
 
         // 2. Verify content address matches BLAKE3(content)
-        let computed = crate::client::compute_address(&request.content);
+        let computed = compute_address(&request.content);
         if computed != address {
             return ChunkPutResponse::Error(ProtocolError::AddressMismatch {
                 expected: address,

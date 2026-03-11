@@ -1,0 +1,8 @@
+# Set the plaintext chunk size for self_encryption to leave headroom
+# for encryption overhead (ChaCha20-Poly1305 AEAD tag: 16 bytes,
+# Brotli framing: ~50 bytes). This ensures encrypted chunks always
+# fit within saorsa-node's MAX_CHUNK_SIZE (4 MiB = 4,194,304 bytes).
+#
+# Value: 4 MiB - 4 KiB = 4,190,208 bytes (4 KiB headroom).
+[env]
+MAX_CHUNK_SIZE = "4190208"

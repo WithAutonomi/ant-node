@@ -8,14 +8,15 @@ use cli::{ChunkAction, Cli, CliCommand, FileAction};
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::P2PNode;
-use saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE;
-use saorsa_node::client::{
-    create_manifest, deserialize_manifest, reassemble_file, serialize_manifest, split_file,
-    QuantumClient, QuantumConfig, XorName,
+use saorsa_node::ant_protocol::{MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE};
+use saorsa_node::client::self_encrypt::{
+    deserialize_data_map, download_and_decrypt_file, encrypt_and_upload_file,
+    fetch_data_map_public, serialize_data_map, store_data_map_public,
 };
+use saorsa_node::client::{QuantumClient, QuantumConfig, XorName};
 use saorsa_node::devnet::DevnetManifest;
 use saorsa_node::error::Error;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
@@ -69,21 +70,33 @@ async fn main() -> color_eyre::Result<()> {
     })
     .with_node(node);
 
-    if let Some(ref key) = private_key {
-        let network = resolve_evm_network(&cli.evm_network, manifest.as_ref())?;
-        let wallet = Wallet::new_from_private_key(network, key)
-            .map_err(|e| color_eyre::eyre::eyre!("Failed to create wallet: {e}"))?;
-        info!("Wallet configured for EVM payments");
-        client = client.with_wallet(wallet);
+    if needs_wallet {
+        if let Some(ref key) = private_key {
+            let network = resolve_evm_network(&cli.evm_network, manifest.as_ref())?;
+            let wallet = Wallet::new_from_private_key(network, key)
+                .map_err(|e| color_eyre::eyre::eyre!("Failed to create wallet: {e}"))?;
+            info!("Wallet configured for EVM payments");
+            client = client.with_wallet(wallet);
+        }
     }
 
     match cli.command {
         CliCommand::File { action } => match action {
-            FileAction::Upload { path } => {
-                handle_upload(&client, &path).await?;
+            FileAction::Upload { path, public } => {
+                handle_upload(&client, &path, public).await?;
             }
-            FileAction::Download { address, output } => {
-                handle_download(&client, &address, output.as_deref()).await?;
+            FileAction::Download {
+                address,
+                datamap,
+                output,
+            } => {
+                handle_download(
+                    &client,
+                    address.as_deref(),
+                    datamap.as_deref(),
+                    output.as_deref(),
+                )
+                .await?;
             }
         },
         CliCommand::Chunk { action } => match action {
@@ -99,126 +112,99 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-async fn handle_upload(client: &QuantumClient, path: &Path) -> color_eyre::Result<()> {
-    let filename = path.file_name().and_then(|n| n.to_str()).map(String::from);
-    let file_content = std::fs::read(path)?;
-    let file_size = file_content.len();
-
+async fn handle_upload(
+    client: &QuantumClient,
+    path: &Path,
+    public: bool,
+) -> color_eyre::Result<()> {
+    let file_size = std::fs::metadata(path)?.len();
     info!("Uploading file: {} ({file_size} bytes)", path.display());
 
-    // Split file into chunks
-    let chunks = split_file(&file_content);
-    let chunk_count = chunks.len();
-    info!("File split into {chunk_count} chunk(s)");
-
-    // Upload each chunk with payment, collecting tx hashes
-    let mut chunk_addresses: Vec<[u8; 32]> = Vec::with_capacity(chunk_count);
-    let mut all_tx_hashes: Vec<String> = Vec::new();
-
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let chunk_num = i + 1;
-        info!(
-            "Uploading chunk {chunk_num}/{chunk_count} ({} bytes)",
-            chunk.len()
-        );
-        let (address, tx_hashes) = client.put_chunk_with_payment(chunk).await?;
-        info!(
-            "Chunk {chunk_num}/{chunk_count} stored at {}",
-            hex::encode(address)
-        );
-        chunk_addresses.push(address);
-        for tx in &tx_hashes {
-            all_tx_hashes.push(format!("{tx:?}"));
-        }
-    }
-
-    // Create and upload manifest (also paid)
-    let total_size =
-        u64::try_from(file_size).map_err(|e| color_eyre::eyre::eyre!("File too large: {e}"))?;
-    let manifest = create_manifest(filename, total_size, chunk_addresses);
-    let manifest_bytes = serialize_manifest(&manifest)?;
-    let (manifest_address, manifest_tx_hashes) =
-        client.put_chunk_with_payment(manifest_bytes).await?;
-    for tx in &manifest_tx_hashes {
-        all_tx_hashes.push(format!("{tx:?}"));
-    }
-
-    let manifest_hex = hex::encode(manifest_address);
+    // Encrypt and upload all chunks using streaming self-encryption
+    let (data_map, all_tx_hashes) = encrypt_and_upload_file(path, client).await?;
+    let chunk_count = data_map.chunk_identifiers.len();
     let total_tx_count = all_tx_hashes.len();
-    let tx_hashes_str = all_tx_hashes.join(",");
 
-    // Print results to stdout
-    println!("FILE_ADDRESS={manifest_hex}");
-    println!("CHUNKS={chunk_count}");
-    println!("TOTAL_SIZE={file_size}");
-    println!("PAYMENTS={total_tx_count}");
-    println!("TX_HASHES={tx_hashes_str}");
+    if public {
+        // Public mode: store the DataMap on the network too
+        let (dm_address, dm_tx_hashes) = store_data_map_public(&data_map, client).await?;
+        let address_hex = hex::encode(dm_address);
+        let combined_tx = total_tx_count + dm_tx_hashes.len();
 
-    info!(
-        "Upload complete: address={manifest_hex}, chunks={chunk_count}, payments={total_tx_count}"
-    );
+        println!("FILE_ADDRESS={address_hex}");
+        println!("MODE=public");
+        println!("CHUNKS={chunk_count}");
+        println!("TOTAL_SIZE={file_size}");
+        println!("PAYMENTS={combined_tx}");
+
+        let mut all = all_tx_hashes;
+        all.extend(dm_tx_hashes);
+        println!("TX_HASHES={}", all.join(","));
+
+        info!("Upload complete (public): address={address_hex}, chunks={chunk_count}");
+    } else {
+        // Private mode: save DataMap locally, never upload it
+        let data_map_bytes = serialize_data_map(&data_map)?;
+        let datamap_path = path.with_extension("datamap");
+        std::fs::write(&datamap_path, &data_map_bytes)?;
+
+        println!("DATAMAP_FILE={}", datamap_path.display());
+        println!("DATAMAP_HEX={}", hex::encode(&data_map_bytes));
+        println!("MODE=private");
+        println!("CHUNKS={chunk_count}");
+        println!("TOTAL_SIZE={file_size}");
+        println!("PAYMENTS={total_tx_count}");
+        println!("TX_HASHES={}", all_tx_hashes.join(","));
+
+        info!(
+            "Upload complete (private): datamap saved to {}, chunks={chunk_count}",
+            datamap_path.display()
+        );
+    }
 
     Ok(())
 }
 
 async fn handle_download(
     client: &QuantumClient,
-    address: &str,
+    address: Option<&str>,
+    datamap_path: Option<&Path>,
     output: Option<&Path>,
 ) -> color_eyre::Result<()> {
-    let manifest_address = parse_address(address)?;
-    info!("Downloading file from manifest {address}");
+    // Resolve the DataMap: either from network (public) or local file (private)
+    let data_map = if let Some(dm_path) = datamap_path {
+        info!("Loading DataMap from local file: {}", dm_path.display());
+        let dm_bytes = std::fs::read(dm_path)?;
+        deserialize_data_map(&dm_bytes)?
+    } else if let Some(addr_str) = address {
+        let addr = parse_address(addr_str)?;
+        info!("Fetching DataMap from network: {addr_str}");
+        fetch_data_map_public(&addr, client).await?
+    } else {
+        return Err(color_eyre::eyre::eyre!(
+            "Either an address or --datamap must be provided for download"
+        ));
+    };
 
-    // Fetch manifest chunk
-    let manifest_chunk = client
-        .get_chunk(&manifest_address)
-        .await?
-        .ok_or_else(|| color_eyre::eyre::eyre!("Manifest chunk not found at {address}"))?;
+    let chunk_count = data_map.chunk_identifiers.len();
+    info!("DataMap loaded: {chunk_count} chunk(s)");
 
-    let manifest = deserialize_manifest(&manifest_chunk.content)?;
-    let chunk_count = manifest.chunk_addresses.len();
-    info!(
-        "Manifest loaded: {} chunk(s), {} bytes total",
-        chunk_count, manifest.total_size
+    // Determine output path
+    let output_path = output.map_or_else(
+        || PathBuf::from("downloaded_file"),
+        std::borrow::ToOwned::to_owned,
     );
 
-    // Fetch all data chunks in order
-    let mut chunks = Vec::with_capacity(chunk_count);
-    for (i, chunk_addr) in manifest.chunk_addresses.iter().enumerate() {
-        let chunk_num = i + 1;
-        info!(
-            "Downloading chunk {chunk_num}/{chunk_count} ({})",
-            hex::encode(chunk_addr)
-        );
-        let chunk = client.get_chunk(chunk_addr).await?.ok_or_else(|| {
-            color_eyre::eyre::eyre!("Data chunk not found: {}", hex::encode(chunk_addr))
-        })?;
-        chunks.push(chunk.content);
-    }
+    download_and_decrypt_file(&data_map, &output_path, client).await?;
 
-    // Reassemble file
-    let file_content = reassemble_file(&manifest, &chunks)?;
-    info!("File reassembled: {} bytes", file_content.len());
-
-    // Write output
-    if let Some(path) = output {
-        std::fs::write(path, &file_content)?;
-        info!("File saved to {}", path.display());
-        println!(
-            "Downloaded {} bytes to {}",
-            file_content.len(),
-            path.display()
-        );
-    } else {
-        use std::io::Write;
-        std::io::stdout().write_all(&file_content)?;
-    }
+    let file_size = std::fs::metadata(&output_path)?.len();
+    println!("Downloaded {file_size} bytes to {}", output_path.display());
 
     Ok(())
 }
 
 async fn handle_chunk_put(client: &QuantumClient, file: Option<PathBuf>) -> color_eyre::Result<()> {
-    let content = read_input(file)?;
+    let content = read_input(file.as_deref())?;
     info!("Storing single chunk ({} bytes)", content.len());
 
     let (address, tx_hashes) = client.put_chunk_with_payment(Bytes::from(content)).await?;
@@ -247,7 +233,6 @@ async fn handle_chunk_get(
                 std::fs::write(&path, &chunk.content)?;
                 info!("Chunk saved to {}", path.display());
             } else {
-                use std::io::Write;
                 std::io::stdout().write_all(&chunk.content)?;
             }
         }
@@ -261,12 +246,25 @@ async fn handle_chunk_get(
     Ok(())
 }
 
-fn read_input(file: Option<PathBuf>) -> color_eyre::Result<Vec<u8>> {
+fn read_input(file: Option<&Path>) -> color_eyre::Result<Vec<u8>> {
     if let Some(path) = file {
+        let meta = std::fs::metadata(path)?;
+        if meta.len() > MAX_CHUNK_SIZE as u64 {
+            return Err(color_eyre::eyre::eyre!(
+                "Input file exceeds MAX_CHUNK_SIZE ({MAX_CHUNK_SIZE} bytes): {} bytes",
+                meta.len()
+            ));
+        }
         return Ok(std::fs::read(path)?);
     }
+    let limit = (MAX_CHUNK_SIZE + 1) as u64;
     let mut buf = Vec::new();
-    std::io::stdin().read_to_end(&mut buf)?;
+    std::io::stdin().take(limit).read_to_end(&mut buf)?;
+    if buf.len() > MAX_CHUNK_SIZE {
+        return Err(color_eyre::eyre::eyre!(
+            "Stdin input exceeds MAX_CHUNK_SIZE ({MAX_CHUNK_SIZE} bytes)"
+        ));
+    }
     Ok(buf)
 }
 

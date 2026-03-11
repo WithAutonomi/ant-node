@@ -57,6 +57,7 @@ mod chunk_protocol;
 mod data_types;
 pub mod file_ops;
 mod quantum;
+pub mod self_encrypt;
 
 pub use chunk_protocol::send_and_await_chunk_response;
 pub use data_types::{
