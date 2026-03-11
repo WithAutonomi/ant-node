@@ -1,7 +1,7 @@
 //! Self-encryption integration for file encrypt/decrypt.
 //!
 //! Wraps the `self_encryption` crate's streaming API to provide:
-//! - **Encryption** from file path (chunks are collected in memory before upload)
+//! - **Streaming encryption** with bounded-memory concurrent upload
 //! - **Streaming decryption** to file path (bounded memory via batch fetching)
 //! - **`DataMap` serialization** for public/private data modes
 //!
@@ -12,25 +12,29 @@
 //! - **Private** (default): `DataMap` is returned to the caller and never
 //!   uploaded. Only the holder of the `DataMap` can access the file.
 
+use crate::client::data_types::XorName as ChunkAddress;
 use crate::client::quantum::QuantumClient;
 use crate::error::{Error, Result};
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use self_encryption::DataMap;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use xor_name::XorName;
 
-use crate::client::data_types::XorName as ChunkAddress;
+/// Maximum number of concurrent chunk uploads.
+const UPLOAD_CONCURRENCY: usize = 4;
 
-/// Encrypt a file using streaming self-encryption and upload each chunk.
+/// Encrypt a file using streaming self-encryption and upload chunks concurrently.
 ///
-/// Uses `stream_encrypt()` which reads the file incrementally via an iterator.
-/// All encrypted chunks are collected in memory before uploading sequentially
-/// with payment, so peak memory usage is proportional to the encrypted file size.
+/// Chunks are streamed lazily from the encryption iterator and uploaded with
+/// bounded parallelism (`UPLOAD_CONCURRENCY` uploads in flight at once).
+/// Peak memory is bounded by the concurrency limit, not the file size.
 ///
 /// Returns the `DataMap` after all chunks are uploaded, plus the list of
 /// transaction hash strings from payment.
@@ -38,6 +42,7 @@ use crate::client::data_types::XorName as ChunkAddress;
 /// # Errors
 ///
 /// Returns an error if encryption fails, or any chunk upload fails.
+#[allow(clippy::too_many_lines)]
 pub async fn encrypt_and_upload_file(
     file_path: &Path,
     client: &QuantumClient,
@@ -52,27 +57,127 @@ pub async fn encrypt_and_upload_file(
         file_path.display()
     );
 
-    let (data_map, collected) = encrypt_file_to_chunks(file_path, file_size)?;
+    let file = std::fs::File::open(file_path).map_err(Error::Io)?;
+    let mut reader = BufReader::new(file);
+    let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+    let read_error_writer = Arc::clone(&read_error);
+    let data_iter = std::iter::from_fn(move || {
+        let mut buf = vec![0u8; 65536];
+        match reader.read(&mut buf) {
+            Ok(0) => None,
+            Err(e) => {
+                if let Ok(mut guard) = read_error_writer.lock() {
+                    *guard = Some(e);
+                }
+                None
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Some(Bytes::from(buf))
+            }
+        }
+    });
 
-    let chunk_count = collected.len();
-    info!("Encryption complete: {chunk_count} chunk(s) produced");
+    let mut stream = self_encryption::stream_encrypt(file_size, data_iter)
+        .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
 
     let mut all_tx_hashes: Vec<String> = Vec::new();
-    for (i, (hash, content)) in collected.into_iter().enumerate() {
-        let chunk_num = i + 1;
-        debug!("Uploading encrypted chunk {chunk_num}/{chunk_count}");
-        let (address, tx_hashes) = client.put_chunk_with_payment(content).await?;
-        if address != hash.0 {
-            return Err(Error::Crypto(format!(
-                "Hash mismatch for chunk {chunk_num}: self_encryption={} network={}",
-                hex::encode(hash.0),
-                hex::encode(address)
-            )));
+    let mut chunk_num: usize = 0;
+
+    {
+        let mut in_flight = FuturesUnordered::new();
+        let mut chunks_iter = stream.chunks();
+        let mut iter_exhausted = false;
+
+        loop {
+            // Fill up to UPLOAD_CONCURRENCY uploads
+            while !iter_exhausted && in_flight.len() < UPLOAD_CONCURRENCY {
+                match chunks_iter.next() {
+                    Some(chunk_result) => {
+                        let (hash, content) = chunk_result
+                            .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+                        chunk_num += 1;
+                        let num = chunk_num;
+                        debug!("Uploading encrypted chunk {num}");
+                        let fut = async move {
+                            let result = client.put_chunk_with_payment(content).await;
+                            (num, hash, result)
+                        };
+                        in_flight.push(fut);
+                    }
+                    None => {
+                        iter_exhausted = true;
+                    }
+                }
+            }
+
+            if in_flight.is_empty() {
+                break;
+            }
+
+            // Await the next completed upload
+            let (num, hash, result) = in_flight
+                .next()
+                .await
+                .ok_or_else(|| Error::Crypto("Upload stream unexpectedly empty".into()))?;
+            match result {
+                Ok((address, tx_hashes)) => {
+                    if address != hash.0 {
+                        // Drain remaining in-flight futures before returning
+                        let mut succeeded = all_tx_hashes.len();
+                        while let Some((_, _, res)) = in_flight.next().await {
+                            if let Ok((_, txs)) = res {
+                                all_tx_hashes.extend(txs.iter().map(|tx| format!("{tx:?}")));
+                                succeeded += 1;
+                            }
+                        }
+                        if succeeded > 0 {
+                            warn!(
+                                "{succeeded} chunk(s) already uploaded before hash mismatch on chunk {num}; \
+                                 tx_hashes so far: {all_tx_hashes:?}"
+                            );
+                        }
+                        return Err(Error::Crypto(format!(
+                            "Hash mismatch for chunk {num}: self_encryption={} network={}",
+                            hex::encode(hash.0),
+                            hex::encode(address)
+                        )));
+                    }
+                    all_tx_hashes.extend(tx_hashes.iter().map(|tx| format!("{tx:?}")));
+                }
+                Err(e) => {
+                    // Drain remaining in-flight futures so we don't lose paid chunks
+                    let mut succeeded = all_tx_hashes.len();
+                    while let Some((_, _, res)) = in_flight.next().await {
+                        if let Ok((_, txs)) = res {
+                            all_tx_hashes.extend(txs.iter().map(|tx| format!("{tx:?}")));
+                            succeeded += 1;
+                        }
+                    }
+                    if succeeded > 0 {
+                        warn!(
+                            "{succeeded} chunk(s) already uploaded successfully before failure on chunk {num}; \
+                             tx_hashes so far: {all_tx_hashes:?}"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         }
-        all_tx_hashes.extend(tx_hashes.iter().map(|tx| format!("{tx:?}")));
     }
 
-    info!("All {chunk_count} encrypted chunks uploaded");
+    // Check if the data iterator encountered an I/O error during chunk iteration
+    if let Ok(guard) = read_error.lock() {
+        if let Some(ref e) = *guard {
+            return Err(Error::Io(std::io::Error::new(e.kind(), format!("{e}"))));
+        }
+    }
+
+    let data_map = stream
+        .into_datamap()
+        .ok_or_else(|| Error::Crypto("DataMap not available after encryption".into()))?;
+
+    info!("All {chunk_num} encrypted chunks uploaded");
     Ok((data_map, all_tx_hashes))
 }
 
@@ -84,24 +189,21 @@ fn encrypt_file_to_chunks(
 ) -> Result<(DataMap, Vec<(XorName, Bytes)>)> {
     let file = std::fs::File::open(file_path).map_err(Error::Io)?;
     let mut reader = BufReader::new(file);
-
-    let io_error: std::sync::Arc<std::sync::Mutex<Option<std::io::Error>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
-    let io_error_writer = std::sync::Arc::clone(&io_error);
-
+    let read_error: Arc<Mutex<Option<std::io::Error>>> = Arc::new(Mutex::new(None));
+    let read_error_writer = Arc::clone(&read_error);
     let data_iter = std::iter::from_fn(move || {
         let mut buf = vec![0u8; 65536];
         match reader.read(&mut buf) {
             Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some(Bytes::from(buf))
-            }
             Err(e) => {
-                if let Ok(mut guard) = io_error_writer.lock() {
+                if let Ok(mut guard) = read_error_writer.lock() {
                     *guard = Some(e);
                 }
                 None
+            }
+            Ok(n) => {
+                buf.truncate(n);
+                Some(Bytes::from(buf))
             }
         }
     });
@@ -109,18 +211,18 @@ fn encrypt_file_to_chunks(
     let mut stream = self_encryption::stream_encrypt(file_size, data_iter)
         .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
 
-    // Check if an I/O error was captured during iteration
-    if let Ok(guard) = io_error.lock() {
-        if let Some(ref e) = *guard {
-            return Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
-        }
-    }
-
     let mut chunks = Vec::new();
     for chunk_result in stream.chunks() {
         let (hash, content) =
             chunk_result.map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
         chunks.push((hash, content));
+    }
+
+    // Check if the data iterator encountered an I/O error during chunk iteration
+    if let Ok(guard) = read_error.lock() {
+        if let Some(ref e) = *guard {
+            return Err(Error::Io(std::io::Error::new(e.kind(), format!("{e}"))));
+        }
     }
 
     let data_map = stream
@@ -134,9 +236,13 @@ fn encrypt_file_to_chunks(
 ///
 /// Uses `streaming_decrypt()` which yields decrypted chunks as an iterator,
 /// fetching encrypted chunks on-demand in batches from the network.
-/// Each batch is fetched via `block_in_place` + `Handle::block_on` to safely
-/// bridge async network I/O into the sync callback that the self-encryption
-/// crate requires.
+///
+/// The sync callback required by `streaming_decrypt` bridges to async via
+/// `block_in_place` + `block_on`, but fetches all chunks in each batch
+/// concurrently using `FuturesUnordered`. This means each `block_on` call
+/// resolves an entire batch in parallel rather than fetching one chunk at a
+/// time, reducing thread pool contention to one blocking call per batch
+/// instead of one per chunk.
 ///
 /// Memory usage is bounded by the batch size (default ~10 chunks), not
 /// the total file size.
@@ -155,32 +261,56 @@ pub async fn download_and_decrypt_file(
     let handle = Handle::current();
 
     let stream = self_encryption::streaming_decrypt(data_map, |batch: &[(usize, XorName)]| {
-        let mut results = Vec::with_capacity(batch.len());
-        for &(idx, ref hash) in batch {
-            let addr = hash.0;
-            let addr_hex = hex::encode(addr);
-            debug!("Fetching chunk idx={idx} ({addr_hex})");
-            let chunk = tokio::task::block_in_place(|| handle.block_on(client.get_chunk(&addr)))
-                .map_err(|e| {
-                    self_encryption::Error::Generic(format!(
-                        "Network fetch failed for {addr_hex}: {e}"
-                    ))
-                })?
-                .ok_or_else(|| {
-                    self_encryption::Error::Generic(format!(
-                        "Chunk not found on network: {addr_hex}"
-                    ))
-                })?;
-            results.push((idx, chunk.content));
+        let batch_owned: Vec<(usize, XorName)> = batch.to_vec();
+
+        // block_in_place panics on current_thread runtime, and handle.block_on
+        // deadlocks there. Reject unsupported runtime flavors explicitly.
+        if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
+            return Err(self_encryption::Error::Generic(
+                "download_and_decrypt_file requires a multi_thread tokio runtime".into(),
+            ));
         }
-        Ok(results)
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut futs = FuturesUnordered::new();
+                for (idx, hash) in batch_owned {
+                    let addr = hash.0;
+                    futs.push(async move {
+                        let result = client.get_chunk(&addr).await;
+                        (idx, hash, result)
+                    });
+                }
+
+                let mut results = Vec::with_capacity(futs.len());
+                while let Some((idx, hash, result)) = futs.next().await {
+                    let addr_hex = hex::encode(hash.0);
+                    let chunk = result
+                        .map_err(|e| {
+                            self_encryption::Error::Generic(format!(
+                                "Network fetch failed for {addr_hex}: {e}"
+                            ))
+                        })?
+                        .ok_or_else(|| {
+                            self_encryption::Error::Generic(format!(
+                                "Chunk not found on network: {addr_hex}"
+                            ))
+                        })?;
+                    results.push((idx, chunk.content));
+                }
+                Ok(results)
+            })
+        })
     })
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
     // Write to a temp file first, then rename atomically on success
     // to prevent leaving a corrupt partial file on failure.
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp_path = parent.join(format!(".saorsa_decrypt_{}.tmp", std::process::id()));
+    let unique: u64 = rand::random();
+    let tmp_path = parent.join(format!(
+        ".saorsa_decrypt_{}_{unique}.tmp",
+        std::process::id()
+    ));
 
     let result = (|| -> Result<()> {
         let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
@@ -193,7 +323,12 @@ pub async fn download_and_decrypt_file(
     })();
 
     if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+            warn!(
+                "Failed to remove temp file {}: {cleanup_err}",
+                tmp_path.display()
+            );
+        }
         return Err(e);
     }
 
@@ -316,7 +451,11 @@ fn decrypt_from_store<S: BuildHasher>(
     .map_err(|e| Error::Crypto(format!("Decryption failed: {e}")))?;
 
     let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp_path = parent.join(format!(".saorsa_decrypt_{}.tmp", std::process::id()));
+    let unique: u64 = rand::random();
+    let tmp_path = parent.join(format!(
+        ".saorsa_decrypt_{}_{unique}.tmp",
+        std::process::id()
+    ));
 
     let result = (|| -> Result<()> {
         let mut file = std::fs::File::create(&tmp_path).map_err(Error::Io)?;
@@ -329,7 +468,12 @@ fn decrypt_from_store<S: BuildHasher>(
     })();
 
     if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp_path);
+        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+            warn!(
+                "Failed to remove temp file {}: {cleanup_err}",
+                tmp_path.display()
+            );
+        }
         return Err(e);
     }
 
