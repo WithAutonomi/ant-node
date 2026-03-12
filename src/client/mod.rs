@@ -55,16 +55,11 @@
 
 mod chunk_protocol;
 mod data_types;
-pub mod file_ops;
 mod quantum;
 pub mod self_encrypt;
 
 pub use chunk_protocol::send_and_await_chunk_response;
 pub use data_types::{
     compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk, XorName,
-};
-pub use file_ops::{
-    create_manifest, deserialize_manifest, reassemble_file, serialize_manifest, split_file,
-    FileManifest,
 };
 pub use quantum::{hex_node_id_to_encoded_peer_id, QuantumClient, QuantumConfig};

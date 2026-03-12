@@ -58,12 +58,9 @@ pub use client::self_encrypt::{
     deserialize_data_map, download_and_decrypt_file, encrypt_and_upload_file,
     fetch_data_map_public, serialize_data_map, store_data_map_public,
 };
-// Legacy plaintext chunking API — retained for backward compatibility with
-// data already stored on the network without self-encryption.
 pub use client::{
-    compute_address, create_manifest, deserialize_manifest, peer_id_to_xor_name, reassemble_file,
-    serialize_manifest, split_file, xor_distance, DataChunk, FileManifest, QuantumClient,
-    QuantumConfig, XorName,
+    compute_address, peer_id_to_xor_name, xor_distance, DataChunk, QuantumClient, QuantumConfig,
+    XorName,
 };
 pub use config::{BootstrapCacheConfig, NodeConfig, StorageConfig};
 pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};

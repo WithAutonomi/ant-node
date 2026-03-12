@@ -81,7 +81,7 @@ pub enum FileAction {
     },
     /// Download a file from the network.
     Download {
-        /// Hex-encoded address (public data map address or manifest address).
+        /// Hex-encoded address (public data map address).
         address: Option<String>,
         /// Path to a local data map file (for private downloads).
         #[arg(long)]
