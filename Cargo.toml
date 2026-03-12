@@ -54,7 +54,8 @@ aes-gcm-siv = "0.11"
 hkdf = "0.12"
 
 # Self-encryption (convergent encryption + streaming)
-self_encryption = { git = "https://github.com/grumbach/self_encryption.git", rev = "95ea1a716834" }
+# Branch name "post_quatum" is intentional (matches the upstream branch).
+self_encryption = { git = "https://github.com/grumbach/self_encryption.git", branch = "post_quatum" }
 
 # Hashing (aligned with saorsa-core)
 blake3 = "1"
