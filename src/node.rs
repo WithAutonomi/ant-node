@@ -15,6 +15,7 @@ use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
 };
 use evmlib::Network as EvmNetwork;
+use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
@@ -22,6 +23,7 @@ use saorsa_core::{
     P2PNode,
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -141,6 +143,7 @@ impl NodeBuilder {
             bootstrap_manager,
             ant_protocol,
             protocol_task: None,
+            upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
         Ok(node)
@@ -433,6 +436,8 @@ pub struct RunningNode {
     ant_protocol: Option<Arc<AntProtocol>>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
+    upgrade_exit_code: Arc<AtomicI32>,
 }
 
 impl RunningNode {
@@ -495,6 +500,7 @@ impl RunningNode {
             let events_tx = self.events_tx.clone();
             let shutdown = self.shutdown.clone();
             let stop_on_upgrade = self.config.upgrade.stop_on_upgrade;
+            let upgrade_exit_code = Arc::clone(&self.upgrade_exit_code);
 
             tokio::spawn(async move {
                 let mut monitor = monitor;
@@ -505,24 +511,17 @@ impl RunningNode {
 
                 // Add randomized jitter before the first upgrade check to prevent all nodes
                 // from hitting the GitHub API simultaneously when started together.
-                // Uses ±5% of the check interval, matching the autonomi project's approach.
                 {
-                    let interval_secs = monitor.check_interval().as_secs();
-                    let variance = interval_secs / 20; // 5%
-                    let jitter_secs = if variance > 0 {
-                        use rand::Rng;
-                        rand::thread_rng().gen_range(0..=variance * 2)
-                    } else {
-                        0
-                    };
-                    let jitter_duration = std::time::Duration::from_secs(jitter_secs);
+                    let jitter_duration = jittered_interval(monitor.check_interval());
                     let first_check_time = chrono::Utc::now()
-                        + chrono::Duration::from_std(jitter_duration)
-                            .unwrap_or_else(|_| chrono::Duration::minutes(1));
+                        + chrono::Duration::from_std(jitter_duration).unwrap_or_else(|e| {
+                            warn!("chrono::Duration::from_std failed for jitter ({e}), defaulting to 1 minute");
+                            chrono::Duration::minutes(1)
+                        });
                     info!(
                         "First upgrade check scheduled for {} (jitter: {}s)",
                         first_check_time.to_rfc3339(),
-                        jitter_secs
+                        jitter_duration.as_secs()
                     );
                     tokio::time::sleep(jitter_duration).await;
                 }
@@ -551,9 +550,11 @@ impl RunningNode {
                                     // Auto-apply the upgrade
                                     info!("Starting auto-apply upgrade...");
                                     match upgrader.apply_upgrade(&upgrade_info).await {
-                                        Ok(UpgradeResult::Success { version }) => {
-                                            info!("Upgrade to {} successful! Process will restart.", version);
-                                            // If we reach here, exec() failed or not supported
+                                        Ok(UpgradeResult::Success { version, exit_code }) => {
+                                            info!("Upgrade to {} successful, initiating graceful shutdown", version);
+                                            upgrade_exit_code.store(exit_code, Ordering::SeqCst);
+                                            shutdown.cancel();
+                                            break;
                                         }
                                         Ok(UpgradeResult::RolledBack { reason }) => {
                                             warn!("Error during upgrade process: {}", reason);
@@ -582,20 +583,13 @@ impl RunningNode {
                                 }
                             }
                             // Schedule next check with jitter to prevent fleet re-alignment
-                            let base_interval = monitor.check_interval();
-                            let interval_secs = base_interval.as_secs();
-                            let variance = interval_secs / 20; // 5%
-                            let jittered_secs = if variance > 0 {
-                                use rand::Rng;
-                                let jitter = rand::thread_rng().gen_range(0..=variance * 2);
-                                interval_secs.saturating_sub(variance) + jitter
-                            } else {
-                                interval_secs
-                            };
-                            let jittered_duration = std::time::Duration::from_secs(jittered_secs);
+                            let jittered_duration =
+                                jittered_interval(monitor.check_interval());
                             let next_check = chrono::Utc::now()
-                                + chrono::Duration::from_std(jittered_duration)
-                                    .unwrap_or_else(|_| chrono::Duration::hours(1));
+                                + chrono::Duration::from_std(jittered_duration).unwrap_or_else(|e| {
+                                    warn!("chrono::Duration::from_std failed for interval ({e}), defaulting to 1 hour");
+                                    chrono::Duration::hours(1)
+                                });
                             info!("Next upgrade check scheduled for {}", next_check.to_rfc3339());
                             tokio::time::sleep(jittered_duration).await;
                         }
@@ -633,6 +627,16 @@ impl RunningNode {
             warn!("Failed to send ShuttingDown event: {e}");
         }
         info!("Node shutdown complete");
+
+        // If an upgrade triggered the shutdown, exit with the requested code.
+        // This happens *after* all cleanup (P2P shutdown, log flush, etc.) so
+        // that destructors and async resources are properly torn down.
+        let exit_code = self.upgrade_exit_code.load(Ordering::SeqCst);
+        if exit_code >= 0 {
+            info!("Exiting with code {} for upgrade restart", exit_code);
+            std::process::exit(exit_code);
+        }
+
         Ok(())
     }
 
@@ -751,6 +755,18 @@ impl RunningNode {
     pub fn shutdown(&self) {
         self.shutdown.cancel();
     }
+}
+
+/// Apply ±5% jitter to a base interval to prevent thundering-herd behaviour
+/// when multiple nodes check for upgrades on the same schedule.
+fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
+    let secs = base.as_secs();
+    let variance = secs / 20; // 5%
+    if variance == 0 {
+        return base;
+    }
+    let jitter = rand::thread_rng().gen_range(0..=variance * 2);
+    std::time::Duration::from_secs(secs.saturating_sub(variance) + jitter)
 }
 
 #[cfg(test)]

@@ -54,10 +54,13 @@ pub struct UpgradeInfo {
 /// Result of an upgrade operation.
 #[derive(Debug)]
 pub enum UpgradeResult {
-    /// Upgrade was successful.
+    /// Upgrade was successful and the process should exit to complete the restart.
     Success {
         /// The new version.
         version: Version,
+        /// Exit code to use when terminating the process.
+        /// The caller should trigger graceful shutdown, then exit with this code.
+        exit_code: i32,
     },
     /// Upgrade failed, rolled back.
     RolledBack {
@@ -348,6 +351,7 @@ impl Upgrader {
         info!("Successfully upgraded to version {}", info.version);
         Ok(UpgradeResult::Success {
             version: info.version.clone(),
+            exit_code: 0,
         })
     }
 
@@ -615,6 +619,7 @@ mod tests {
     fn test_upgrade_result_variants() {
         let success = UpgradeResult::Success {
             version: Version::new(1, 0, 0),
+            exit_code: 0,
         };
         assert!(matches!(success, UpgradeResult::Success { .. }));
 

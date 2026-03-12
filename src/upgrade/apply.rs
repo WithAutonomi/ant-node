@@ -101,19 +101,26 @@ impl AutoApplyUpgrader {
         let invoked_path = env::args().next().map(PathBuf::from);
 
         if let Some(ref invoked) = invoked_path {
-            if invoked.exists() {
-                let path_str = invoked.to_string_lossy();
-                if path_str.ends_with(" (deleted)") {
-                    let cleaned = path_str.trim_end_matches(" (deleted)");
-                    debug!("Stripped '(deleted)' suffix from invoked path: {cleaned}");
-                    return Ok(PathBuf::from(cleaned));
-                }
+            // Check for "(deleted)" suffix first — on Linux, /proc/self/exe
+            // reports this when the on-disk binary has been replaced. The
+            // `exists()` check below would return false for the suffixed path,
+            // so we must strip it before testing existence.
+            let path_str = invoked.to_string_lossy();
+            let cleaned = if path_str.ends_with(" (deleted)") {
+                let stripped = path_str.trim_end_matches(" (deleted)");
+                debug!("Stripped '(deleted)' suffix from invoked path: {stripped}");
+                PathBuf::from(stripped)
+            } else {
+                invoked.clone()
+            };
+
+            if cleaned.exists() {
                 // Canonicalize to an absolute path so that trigger_restart
                 // works even if the CWD has changed since startup.
-                if let Ok(canonical) = invoked.canonicalize() {
+                if let Ok(canonical) = cleaned.canonicalize() {
                     return Ok(canonical);
                 }
-                return Ok(invoked.clone());
+                return Ok(cleaned);
             }
         }
 
@@ -200,9 +207,10 @@ impl AutoApplyUpgrader {
                     "Binary already upgraded to {} by another service, skipping replacement",
                     info.version
                 );
-                self.trigger_restart(&current_binary)?;
+                let exit_code = self.prepare_restart(&current_binary)?;
                 return Ok(UpgradeResult::Success {
                     version: info.version.clone(),
+                    exit_code,
                 });
             }
         }
@@ -222,9 +230,16 @@ impl AutoApplyUpgrader {
             });
         }
 
-        // Step 6: Replace binary
+        // Step 6: Replace binary (offloaded to blocking thread to avoid
+        // starving the tokio runtime, especially on Windows where retries sleep)
         info!("Replacing binary...");
-        if let Err(e) = Self::replace_binary(&extracted_binary, &current_binary) {
+        let new_bin = extracted_binary.clone();
+        let target_bin = current_binary.clone();
+        let replace_result =
+            tokio::task::spawn_blocking(move || Self::replace_binary(&new_bin, &target_bin))
+                .await
+                .map_err(|e| Error::Upgrade(format!("Binary replacement task panicked: {e}")))?;
+        if let Err(e) = replace_result {
             warn!("Binary replacement failed: {e}");
             // Attempt rollback
             if let Err(restore_err) = fs::copy(&backup_path, &current_binary) {
@@ -243,11 +258,12 @@ impl AutoApplyUpgrader {
             info.version
         );
 
-        // Step 7: Trigger restart
-        self.trigger_restart(&current_binary)?;
+        // Step 7: Prepare restart (spawn new process if standalone mode)
+        let exit_code = self.prepare_restart(&current_binary)?;
 
         Ok(UpgradeResult::Success {
             version: info.version.clone(),
+            exit_code,
         })
     }
 
@@ -527,6 +543,9 @@ impl AutoApplyUpgrader {
     }
 
     /// Replace the current binary with the new one.
+    ///
+    /// This is a blocking operation (filesystem I/O, and on Windows potentially
+    /// retries with back-off). Call via `spawn_blocking` from async context.
     fn replace_binary(new_binary: &Path, target: &Path) -> Result<()> {
         #[cfg(unix)]
         {
@@ -543,7 +562,7 @@ impl AutoApplyUpgrader {
         {
             let _ = target; // target is the current exe — self_replace handles it
                             // Retry with back-off: Windows file locks may delay replacement
-            let delays = [500, 1000, 2000];
+            let delays = [500u64, 1000, 2000];
             let mut last_err = None;
             for (attempt, delay_ms) in delays.iter().enumerate() {
                 match self_replace::self_replace(new_binary) {
@@ -572,45 +591,50 @@ impl AutoApplyUpgrader {
         Ok(())
     }
 
-    /// Trigger a restart of the node process after a successful upgrade.
+    /// Prepare for a restart after a successful upgrade.
+    ///
+    /// Returns the exit code that the process should use after graceful shutdown.
+    /// The caller is responsible for triggering graceful shutdown (e.g. via
+    /// `CancellationToken`) and then calling `std::process::exit()` with the
+    /// returned code **after** all async cleanup has completed.
     ///
     /// **Service manager mode** (`stop_on_upgrade = true`):
-    /// Exit cleanly and let the service manager (systemd, launchd, Windows Service)
-    /// restart the process. On Unix exits with code 0; on Windows exits with
-    /// [`RESTART_EXIT_CODE`] (100) because `WinSW` uses `RestartPolicy::OnFailure`.
+    /// Returns exit code 0 on Unix or [`RESTART_EXIT_CODE`] on Windows so the
+    /// service manager (systemd, launchd, Windows Service) restarts the process.
     ///
     /// **Standalone mode** (`stop_on_upgrade = false`):
-    /// Spawn the new binary as a child process with the same arguments, then exit.
-    /// This ensures continuity when no service manager is present.
-    fn trigger_restart(&self, binary_path: &Path) -> Result<()> {
+    /// Spawns the new binary as a child process with the same arguments, then
+    /// returns exit code 0.
+    fn prepare_restart(&self, binary_path: &Path) -> Result<i32> {
         if self.stop_on_upgrade {
-            // Service manager mode: exit and let the service manager restart us
+            let exit_code;
+
             #[cfg(unix)]
             {
-                info!("Exiting with code 0 for service manager restart");
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
+                info!("Service manager mode: will exit with code 0 after graceful shutdown");
+                exit_code = 0;
             }
 
             #[cfg(windows)]
             {
                 let _ = binary_path;
                 info!(
-                    "Exiting with code {} to signal service manager restart",
+                    "Service manager mode: will exit with code {} after graceful shutdown",
                     RESTART_EXIT_CODE
                 );
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(RESTART_EXIT_CODE);
+                exit_code = RESTART_EXIT_CODE;
             }
 
             #[cfg(not(any(unix, windows)))]
             {
                 let _ = binary_path;
                 warn!("Auto-restart not supported on this platform. Please restart manually.");
-                Ok(())
+                exit_code = 0;
             }
+
+            Ok(exit_code)
         } else {
-            // Standalone mode: spawn new process then exit
+            // Standalone mode: spawn new process, then exit after graceful shutdown
             let args: Vec<String> = env::args().skip(1).collect();
 
             info!("Spawning new process: {} {:?}", binary_path.display(), args);
@@ -623,9 +647,8 @@ impl AutoApplyUpgrader {
                 .spawn()
                 .map_err(|e| Error::Upgrade(format!("Failed to spawn new binary: {e}")))?;
 
-            info!("New process spawned, exiting old process");
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            std::process::exit(0);
+            info!("New process spawned, will exit after graceful shutdown");
+            Ok(0)
         }
     }
 }
