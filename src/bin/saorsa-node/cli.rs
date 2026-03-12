@@ -5,7 +5,7 @@ use saorsa_node::config::{
     BootstrapCacheConfig, EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig, PaymentConfig,
     UpgradeChannel, UpgradeConfig,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 
 /// Pure quantum-proof network node for the Saorsa decentralized network.
@@ -63,9 +63,14 @@ pub struct Cli {
     )]
     pub evm_network: CliEvmNetwork,
 
-    /// Metrics port for Prometheus scraping (0 to disable).
+    /// Metrics/health server port for Prometheus scraping (0 to disable).
     #[arg(long, default_value = "9100", env = "SAORSA_METRICS_PORT")]
     pub metrics_port: u16,
+
+    /// Metrics/health server bind address (default: 127.0.0.1 loopback only).
+    /// Use 0.0.0.0 to expose on all interfaces.
+    #[arg(long, default_value = "127.0.0.1", env = "SAORSA_METRICS_HOST")]
+    pub metrics_host: IpAddr,
 
     /// Log level.
     #[arg(long, value_enum, default_value = "info", env = "RUST_LOG")]
@@ -224,8 +229,12 @@ impl Cli {
             cache_capacity: self.cache_capacity,
             rewards_address: self.rewards_address,
             evm_network: self.evm_network.into(),
-            metrics_port: self.metrics_port,
+            metrics_port: None,
         };
+
+        // Metrics config
+        config.metrics_port = self.metrics_port;
+        config.metrics_host = self.metrics_host;
 
         // Bootstrap cache config
         config.bootstrap_cache = BootstrapCacheConfig {

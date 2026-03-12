@@ -14,6 +14,10 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
+use saorsa_core::health::{
+    DhtHealthChecker, HealthManager, HealthServer, PeerHealthChecker, StorageHealthChecker,
+    TransportHealthChecker,
+};
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
@@ -125,13 +129,15 @@ impl NodeBuilder {
         debug!("Core config: {:?}", core_config);
 
         // Initialize saorsa-core's P2PNode
-        let p2p_node = P2PNode::new(core_config)
-            .await
-            .map_err(|e| Error::Startup(format!("Failed to create P2P node: {e}")))?;
+        let p2p_node_arc = Arc::new(
+            P2PNode::new(core_config)
+                .await
+                .map_err(|e| Error::Startup(format!("Failed to create P2P node: {e}")))?,
+        );
 
         // Create upgrade monitor if enabled
         let upgrade_monitor = if self.config.upgrade.enabled {
-            let node_id_seed = p2p_node.peer_id().as_bytes();
+            let node_id_seed = p2p_node_arc.peer_id().as_bytes();
             Some(Self::build_upgrade_monitor(&self.config, node_id_seed))
         } else {
             None
@@ -145,6 +151,9 @@ impl NodeBuilder {
             None
         };
 
+        // Initialize health manager and register component checkers
+        let health_manager = Self::build_health_manager(&p2p_node_arc, &self.config).await;
+
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
             Some(Arc::new(
@@ -157,13 +166,16 @@ impl NodeBuilder {
 
         let node = RunningNode {
             config: self.config,
-            p2p_node: Arc::new(p2p_node),
+            p2p_node: p2p_node_arc,
             shutdown,
             events_tx,
             events_rx: Some(events_rx),
             upgrade_monitor,
             bootstrap_manager,
             ant_protocol,
+            health_manager,
+            health_shutdown_tx: None,
+            health_handle: None,
             protocol_task: None,
         };
 
@@ -440,6 +452,55 @@ impl NodeBuilder {
             }
         }
     }
+
+    /// Build the health manager and register component health checkers.
+    async fn build_health_manager(
+        p2p_node: &Arc<P2PNode>,
+        config: &NodeConfig,
+    ) -> Arc<HealthManager> {
+        let hm = Arc::new(HealthManager::new(env!("CARGO_PKG_VERSION").to_string()));
+
+        let p2p = Arc::clone(p2p_node);
+        hm.register_checker(
+            "dht",
+            Box::new(DhtHealthChecker::new(move || {
+                let p2p = Arc::clone(&p2p);
+                async move {
+                    let stats = p2p.dht().get_stats().await;
+                    Ok(stats.routing_table_size)
+                }
+            })),
+        )
+        .await;
+
+        let p2p = Arc::clone(p2p_node);
+        hm.register_checker(
+            "transport",
+            Box::new(TransportHealthChecker::new(move || {
+                let p2p = Arc::clone(&p2p);
+                async move { Ok(p2p.is_running()) }
+            })),
+        )
+        .await;
+
+        let p2p = Arc::clone(p2p_node);
+        hm.register_checker(
+            "peers",
+            Box::new(PeerHealthChecker::new(move || {
+                let p2p = Arc::clone(&p2p);
+                async move { Ok(p2p.peer_count().await) }
+            })),
+        )
+        .await;
+
+        hm.register_checker(
+            "storage",
+            Box::new(StorageHealthChecker::new(config.root_dir.clone())),
+        )
+        .await;
+
+        hm
+    }
 }
 
 /// A running saorsa node.
@@ -454,6 +515,12 @@ pub struct RunningNode {
     bootstrap_manager: Option<BootstrapManager>,
     /// ANT protocol handler for chunk storage.
     ant_protocol: Option<Arc<AntProtocol>>,
+    /// Health manager for component health checks.
+    health_manager: Arc<HealthManager>,
+    /// Shutdown signal sender for the health/metrics HTTP server.
+    health_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Join handle for the health/metrics HTTP server task.
+    health_handle: Option<JoinHandle<()>>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
 }
@@ -502,6 +569,9 @@ impl RunningNode {
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
         self.start_protocol_routing();
+
+        // Start health/metrics HTTP server if metrics_port != 0
+        self.start_health_server();
 
         // Start upgrade monitor if enabled
         if let Some(ref monitor) = self.upgrade_monitor {
@@ -578,6 +648,14 @@ impl RunningNode {
             }
         }
 
+        // Stop health/metrics server
+        if let Some(tx) = self.health_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.health_handle.take() {
+            let _ = handle.await;
+        }
+
         // Stop protocol routing task
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
@@ -643,6 +721,27 @@ impl RunningNode {
             }
         }
         Ok(())
+    }
+
+    /// Start the health/metrics HTTP server if configured.
+    fn start_health_server(&mut self) {
+        if self.config.metrics_port == 0 {
+            return;
+        }
+
+        let metrics_addr = SocketAddr::new(self.config.metrics_host, self.config.metrics_port);
+
+        let (health_server, shutdown_tx) =
+            HealthServer::new(Arc::clone(&self.health_manager), metrics_addr);
+        self.health_shutdown_tx = Some(shutdown_tx);
+
+        self.health_handle = Some(tokio::spawn(async move {
+            if let Err(e) = health_server.run().await {
+                error!("Health server failed: {e}");
+            }
+        }));
+
+        info!("Metrics server listening on {metrics_addr}");
     }
 
     /// Start the protocol message routing background task.

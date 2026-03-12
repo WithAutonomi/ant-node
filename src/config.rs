@@ -1,7 +1,7 @@
 //! Configuration for saorsa-node.
 
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
 /// Filename for the persisted node identity keypair.
@@ -148,6 +148,18 @@ pub struct NodeConfig {
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// Metrics/health server port for Prometheus scraping.
+    /// Set to 0 to disable the metrics endpoint.
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+
+    /// Metrics/health server bind address.
+    /// Defaults to `127.0.0.1` (loopback only). Set to `0.0.0.0` to expose
+    /// metrics on all interfaces — note this makes `/debug/vars` publicly
+    /// accessible.
+    #[serde(default = "default_metrics_host")]
+    pub metrics_host: IpAddr,
 }
 
 /// Auto-upgrade configuration.
@@ -221,10 +233,11 @@ pub struct PaymentConfig {
     #[serde(default)]
     pub evm_network: EvmNetworkConfig,
 
-    /// Metrics port for Prometheus scraping.
-    /// Set to 0 to disable metrics endpoint.
-    #[serde(default = "default_metrics_port")]
-    pub metrics_port: u16,
+    /// **Deprecated:** Metrics port previously lived here. Now use
+    /// the top-level `metrics_port` field on `NodeConfig`. If this
+    /// field is set, the value is migrated automatically with a warning.
+    #[serde(default)]
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for PaymentConfig {
@@ -234,13 +247,17 @@ impl Default for PaymentConfig {
             cache_capacity: default_cache_capacity(),
             rewards_address: None,
             evm_network: EvmNetworkConfig::default(),
-            metrics_port: default_metrics_port(),
+            metrics_port: None,
         }
     }
 }
 
 const fn default_metrics_port() -> u16 {
     9100
+}
+
+fn default_metrics_host() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 const fn default_payment_enabled() -> bool {
@@ -266,6 +283,8 @@ impl Default for NodeConfig {
             storage: StorageConfig::default(),
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
+            metrics_port: default_metrics_port(),
+            metrics_host: default_metrics_host(),
         }
     }
 }
@@ -309,6 +328,30 @@ impl NodeConfig {
         !matches!(self.network_mode, NetworkMode::Production)
     }
 
+    /// Migrate deprecated config fields, logging warnings for any that are found.
+    ///
+    /// If both the deprecated `payment.metrics_port` and the new top-level
+    /// `metrics_port` are set, the top-level value takes precedence and the
+    /// deprecated value is ignored with a warning.
+    pub fn migrate_deprecated(&mut self) {
+        if let Some(port) = self.payment.metrics_port.take() {
+            if self.metrics_port == default_metrics_port() {
+                tracing::warn!(
+                    "Deprecated: `payment.metrics_port` is now a top-level field `metrics_port`. \
+                     Migrating value {port} automatically — please update your config file."
+                );
+                self.metrics_port = port;
+            } else {
+                tracing::warn!(
+                    "Deprecated `payment.metrics_port = {port}` ignored — \
+                     using top-level `metrics_port = {}`. \
+                     Please remove `payment.metrics_port` from your config file.",
+                    self.metrics_port
+                );
+            }
+        }
+    }
+
     /// Load configuration from a TOML file.
     ///
     /// # Errors
@@ -316,7 +359,10 @@ impl NodeConfig {
     /// Returns an error if the file cannot be read or parsed.
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| crate::Error::Config(e.to_string()))
+        let mut config: Self =
+            toml::from_str(&content).map_err(|e| crate::Error::Config(e.to_string()))?;
+        config.migrate_deprecated();
+        Ok(config)
     }
 
     /// Save configuration to a TOML file.
@@ -524,5 +570,61 @@ mod tests {
             config.enabled,
             "EVM verification must be enabled by default"
         );
+    }
+
+    #[test]
+    fn test_migrate_deprecated_metrics_port() {
+        let mut config = NodeConfig {
+            payment: PaymentConfig {
+                metrics_port: Some(9200),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.migrate_deprecated();
+        assert_eq!(config.metrics_port, 9200);
+        assert!(config.payment.metrics_port.is_none());
+    }
+
+    #[test]
+    fn test_migrate_deprecated_clears_old_field() {
+        let mut config = NodeConfig {
+            payment: PaymentConfig {
+                metrics_port: Some(9300),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.migrate_deprecated();
+        assert!(
+            config.payment.metrics_port.is_none(),
+            "deprecated field must be cleared after migration"
+        );
+    }
+
+    #[test]
+    fn test_migrate_deprecated_new_field_takes_precedence() {
+        let mut config = NodeConfig {
+            metrics_port: 9400,
+            payment: PaymentConfig {
+                metrics_port: Some(9200),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.migrate_deprecated();
+        assert_eq!(
+            config.metrics_port, 9400,
+            "top-level metrics_port must take precedence over deprecated payment.metrics_port"
+        );
+        assert!(config.payment.metrics_port.is_none());
+    }
+
+    #[test]
+    fn test_migrate_deprecated_noop_when_absent() {
+        let mut config = NodeConfig::default();
+        let original_port = config.metrics_port;
+        config.migrate_deprecated();
+        assert_eq!(config.metrics_port, original_port);
     }
 }
