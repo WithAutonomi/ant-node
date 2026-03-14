@@ -7,15 +7,23 @@ use crate::config::{
 };
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
+use crate::metrics::{MetricsAggregator, PrometheusFormatter, SnapshotCollector};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
 use ant_evm::RewardsAddress;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::Router;
 use evmlib::Network as EvmNetwork;
+use saorsa_core::dht::metrics::{
+    DhtMetricsCollector, PlacementMetricsCollector, TrustMetricsCollector,
+};
 use saorsa_core::health::{
-    DhtHealthChecker, HealthManager, HealthServer, PeerHealthChecker, StorageHealthChecker,
+    DhtHealthChecker, HealthManager, PeerHealthChecker, PrometheusExporter, StorageHealthChecker,
     TransportHealthChecker,
 };
 use saorsa_core::identity::NodeIdentity;
@@ -27,7 +35,8 @@ use saorsa_core::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Semaphore;
+use tokio::net::TcpListener;
+use tokio::sync::{broadcast, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -164,6 +173,10 @@ impl NodeBuilder {
             None
         };
 
+        // Build metrics aggregator and snapshot collector
+        let metrics_aggregator = Arc::new(MetricsAggregator::new());
+        let snapshot_collector = Arc::new(Self::build_snapshot_collector(&p2p_node_arc));
+
         let node = RunningNode {
             config: self.config,
             p2p_node: p2p_node_arc,
@@ -174,9 +187,12 @@ impl NodeBuilder {
             bootstrap_manager,
             ant_protocol,
             health_manager,
+            metrics_aggregator,
+            snapshot_collector,
             health_shutdown_tx: None,
             health_handle: None,
             protocol_task: None,
+            metric_event_handle: None,
         };
 
         Ok(node)
@@ -205,8 +221,13 @@ impl NodeBuilder {
         // Enable IPv6 if configured
         core_config.enable_ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
 
-        // Add bootstrap peers.
-        core_config.bootstrap_peers.clone_from(&config.bootstrap);
+        // Add bootstrap peers (convert SocketAddr → MultiAddr).
+        core_config.bootstrap_peers = config
+            .bootstrap
+            .iter()
+            .copied()
+            .map(saorsa_core::MultiAddr::from)
+            .collect();
 
         // Forward max_message_size to the transport layer.
         core_config.max_message_size = Some(config.max_message_size);
@@ -453,6 +474,31 @@ impl NodeBuilder {
         }
     }
 
+    /// Build the snapshot collector, wiring in live saorsa-core components.
+    fn build_snapshot_collector(p2p_node: &Arc<P2PNode>) -> SnapshotCollector {
+        // DhtMetricsCollector, TrustMetricsCollector, PlacementMetricsCollector
+        // are standalone instances — they serve as the canonical source for
+        // snapshot metrics and will be populated as the DHT layer reports data.
+        let dht_health = Arc::new(DhtMetricsCollector::new());
+        let trust = Arc::new(TrustMetricsCollector::new());
+        let placement = Arc::new(PlacementMetricsCollector::new());
+
+        // SecurityMetricsCollector: standalone instance that will be populated
+        // as security events are observed by the DHT layer.
+        let security = Arc::new(saorsa_core::dht::metrics::SecurityMetricsCollector::new());
+
+        let eigentrust = p2p_node.trust_engine();
+
+        SnapshotCollector::new(
+            dht_health,
+            security,
+            trust,
+            placement,
+            Arc::clone(p2p_node),
+            eigentrust,
+        )
+    }
+
     /// Build the health manager and register component health checkers.
     async fn build_health_manager(
         p2p_node: &Arc<P2PNode>,
@@ -517,12 +563,18 @@ pub struct RunningNode {
     ant_protocol: Option<Arc<AntProtocol>>,
     /// Health manager for component health checks.
     health_manager: Arc<HealthManager>,
+    /// Event-driven metrics aggregator (counters + sliding windows).
+    metrics_aggregator: Arc<MetricsAggregator>,
+    /// Pull-based snapshot collector for saorsa-core state.
+    snapshot_collector: Arc<SnapshotCollector>,
     /// Shutdown signal sender for the health/metrics HTTP server.
     health_shutdown_tx: Option<tokio::sync::oneshot::Sender<()>>,
     /// Join handle for the health/metrics HTTP server task.
     health_handle: Option<JoinHandle<()>>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// `MetricEvent` subscription loop task.
+    metric_event_handle: Option<JoinHandle<()>>,
 }
 
 impl RunningNode {
@@ -569,6 +621,9 @@ impl RunningNode {
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
         self.start_protocol_routing();
+
+        // Start metric event subscription loop
+        self.start_metric_event_loop();
 
         // Start health/metrics HTTP server if metrics_port != 0
         self.start_health_server();
@@ -661,6 +716,11 @@ impl RunningNode {
             handle.abort();
         }
 
+        // Stop metric event subscription loop
+        if let Some(handle) = self.metric_event_handle.take() {
+            handle.abort();
+        }
+
         // Shutdown P2P node
         info!("Shutting down P2P node...");
         if let Err(e) = self.p2p_node.shutdown().await {
@@ -724,20 +784,52 @@ impl RunningNode {
     }
 
     /// Start the health/metrics HTTP server if configured.
+    ///
+    /// Replaces saorsa-core's `HealthServer` with our own Axum router that
+    /// serves both health endpoints and the full Prometheus metrics output.
     fn start_health_server(&mut self) {
         if self.config.metrics_port == 0 {
             return;
         }
 
         let metrics_addr = SocketAddr::new(self.config.metrics_host, self.config.metrics_port);
-
-        let (health_server, shutdown_tx) =
-            HealthServer::new(Arc::clone(&self.health_manager), metrics_addr);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         self.health_shutdown_tx = Some(shutdown_tx);
 
+        let health_manager = Arc::clone(&self.health_manager);
+        let aggregator = Arc::clone(&self.metrics_aggregator);
+        let snapshot_collector = Arc::clone(&self.snapshot_collector);
+
+        // Shared state for the Axum router.
+        let state = MetricsServerState {
+            health_manager,
+            aggregator,
+            snapshot_collector,
+        };
+        let shared_state = Arc::new(state);
+
         self.health_handle = Some(tokio::spawn(async move {
-            if let Err(e) = health_server.run().await {
-                error!("Health server failed: {e}");
+            let app = Router::new()
+                .route("/health", get(health_handler))
+                .route("/ready", get(ready_handler))
+                .route("/metrics", get(metrics_handler))
+                .route("/debug/vars", get(debug_handler))
+                .with_state(shared_state);
+
+            let listener = match TcpListener::bind(metrics_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("Failed to bind metrics server on {metrics_addr}: {e}");
+                    return;
+                }
+            };
+
+            let server = axum::serve(listener, app).with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            });
+
+            if let Err(e) = server.await {
+                error!("Metrics server error: {e}");
             }
         }));
 
@@ -748,6 +840,7 @@ impl RunningNode {
     ///
     /// Subscribes to P2P events and routes incoming chunk protocol messages
     /// to the `AntProtocol` handler, sending responses back to the sender.
+    /// Also tracks peer connect/disconnect events in the metrics aggregator.
     fn start_protocol_routing(&mut self) {
         let protocol = match self.ant_protocol {
             Some(ref p) => Arc::clone(p),
@@ -757,48 +850,195 @@ impl RunningNode {
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
         let semaphore = Arc::new(Semaphore::new(64));
+        let aggregator = Arc::clone(&self.metrics_aggregator);
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
-                if let P2PEvent::Message {
-                    topic,
-                    source: Some(source),
-                    data,
-                } = event
-                {
-                    if topic == CHUNK_PROTOCOL_ID {
-                        debug!("Received chunk protocol message from {source}");
-                        let protocol = Arc::clone(&protocol);
-                        let p2p = Arc::clone(&p2p);
-                        let sem = semaphore.clone();
-                        tokio::spawn(async move {
-                            let Ok(_permit) = sem.acquire().await else {
-                                return;
-                            };
-                            match protocol.handle_message(&data).await {
-                                Ok(response) => {
-                                    if let Err(e) = p2p
-                                        .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec())
-                                        .await
-                                    {
-                                        warn!("Failed to send protocol response to {source}: {e}");
+                match event {
+                    P2PEvent::PeerConnected(..) => {
+                        aggregator.record_peer_connected();
+                    }
+                    P2PEvent::PeerDisconnected(..) => {
+                        aggregator.record_peer_disconnected();
+                    }
+                    P2PEvent::Message {
+                        topic,
+                        source: Some(source),
+                        data,
+                    } => {
+                        if topic == CHUNK_PROTOCOL_ID {
+                            debug!("Received chunk protocol message from {source}");
+                            let protocol = Arc::clone(&protocol);
+                            let p2p = Arc::clone(&p2p);
+                            let sem = semaphore.clone();
+                            tokio::spawn(async move {
+                                let Ok(_permit) = sem.acquire().await else {
+                                    return;
+                                };
+                                match protocol.handle_message(&data).await {
+                                    Ok(response) => {
+                                        if let Err(e) = p2p
+                                            .send_message(
+                                                &source,
+                                                CHUNK_PROTOCOL_ID,
+                                                response.to_vec(),
+                                            )
+                                            .await
+                                        {
+                                            warn!(
+                                                "Failed to send protocol response to {source}: {e}"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Protocol handler error: {e}");
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Protocol handler error: {e}");
-                                }
-                            }
-                        });
+                            });
+                        }
                     }
+                    P2PEvent::Message { .. } => {}
                 }
             }
         }));
         info!("Protocol message routing started");
     }
 
+    /// Spawn a dedicated task that drains the `MetricEvent` broadcast channel.
+    fn start_metric_event_loop(&mut self) {
+        let mut metric_rx = self.p2p_node.subscribe_metric_events();
+        let aggregator = Arc::clone(&self.metrics_aggregator);
+        let shutdown = self.shutdown.clone();
+
+        self.metric_event_handle = Some(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    result = metric_rx.recv() => {
+                        match result {
+                            Ok(event) => aggregator.handle_metric_event(event).await,
+                            Err(broadcast::error::RecvError::Lagged(n)) => {
+                                debug!("Metric event receiver lagged, dropped {n} events");
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        }));
+
+        info!("Metric event subscription loop started");
+    }
+
     /// Request the node to shut down.
     pub fn shutdown(&self) {
         self.shutdown.cancel();
+    }
+}
+
+// ---- Axum metrics server handlers ----
+
+/// Shared state for the metrics HTTP server.
+#[derive(Clone)]
+struct MetricsServerState {
+    health_manager: Arc<HealthManager>,
+    aggregator: Arc<MetricsAggregator>,
+    snapshot_collector: Arc<SnapshotCollector>,
+}
+
+/// `GET /health` — liveness check.
+async fn health_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetricsServerState>>,
+) -> impl IntoResponse {
+    match state.health_manager.get_health().await {
+        Ok(response) => {
+            let body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            (
+                axum::http::StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("{{\"error\":\"{e}\"}}"),
+        ),
+    }
+}
+
+/// `GET /ready` — readiness check.
+async fn ready_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetricsServerState>>,
+) -> impl IntoResponse {
+    match state.health_manager.get_health().await {
+        Ok(response) => {
+            let status = if response.status == "healthy" {
+                axum::http::StatusCode::OK
+            } else {
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            };
+            let body = serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string());
+            (status, [(header::CONTENT_TYPE, "application/json")], body)
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("{{\"error\":\"{e}\"}}"),
+        ),
+    }
+}
+
+/// `GET /metrics` — Prometheus text exposition format.
+///
+/// Combines saorsa-core's health metrics with our event-driven + snapshot metrics.
+async fn metrics_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetricsServerState>>,
+) -> impl IntoResponse {
+    let mut output = String::new();
+
+    // Health component metrics (from saorsa-core's PrometheusExporter)
+    let exporter = PrometheusExporter::new(Arc::clone(&state.health_manager));
+    if let Ok(health_metrics) = exporter.export().await {
+        output.push_str(&health_metrics);
+        output.push('\n');
+    }
+
+    // Pull state snapshot from saorsa-core accessors
+    let snapshot = state.snapshot_collector.collect().await;
+
+    // Domain metrics (event-driven + snapshot)
+    match PrometheusFormatter::format(&state.aggregator, &snapshot).await {
+        Ok(domain_metrics) => output.push_str(&domain_metrics),
+        Err(e) => {
+            warn!("Failed to format domain metrics: {e}");
+        }
+    }
+
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        output,
+    )
+}
+
+/// `GET /debug/vars` — debug information.
+async fn debug_handler(
+    axum::extract::State(state): axum::extract::State<Arc<MetricsServerState>>,
+) -> impl IntoResponse {
+    match state.health_manager.get_debug_info().await {
+        Ok(info) => {
+            let body = serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string());
+            (
+                axum::http::StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            format!("{{\"error\":\"{e}\"}}"),
+        ),
     }
 }
 

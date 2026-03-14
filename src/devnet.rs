@@ -635,9 +635,12 @@ impl Devnet {
         core_config.listen_addr = node.address;
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false;
-        core_config
-            .bootstrap_peers
-            .clone_from(&node.bootstrap_addrs);
+        core_config.bootstrap_peers = node
+            .bootstrap_addrs
+            .iter()
+            .copied()
+            .map(saorsa_core::MultiAddr::from)
+            .collect();
         core_config.max_message_size = Some(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE);
         core_config.diversity_config = Some(IPDiversityConfig::permissive());
 

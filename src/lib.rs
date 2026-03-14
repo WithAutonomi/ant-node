@@ -45,6 +45,7 @@ pub mod config;
 pub mod devnet;
 pub mod error;
 pub mod event;
+pub mod metrics;
 pub mod node;
 pub mod payment;
 pub mod storage;
