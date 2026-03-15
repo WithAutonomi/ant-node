@@ -17,10 +17,9 @@ use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
-    IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
-    P2PNode, ProductionConfig as CoreProductionConfig,
+    IPDiversityConfig as CoreDiversityConfig, ListenMode, MultiAddr, NodeConfig as CoreNodeConfig,
+    P2PEvent, P2PNode, ProductionConfig as CoreProductionConfig,
 };
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -172,22 +171,19 @@ impl NodeBuilder {
 
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
-        // Determine listen address based on port and IP version
-        let port = config.port;
-        let listen_addr: SocketAddr = match config.ip_version {
-            IpVersion::Ipv4 | IpVersion::Dual => format!("0.0.0.0:{port}")
-                .parse()
-                .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
-            IpVersion::Ipv6 => format!("[::]:{port}")
-                .parse()
-                .map_err(|e| Error::Config(format!("Invalid listen address: {e}")))?,
+        let ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
+        let listen_mode = match config.network_mode {
+            NetworkMode::Development => ListenMode::Local,
+            _ => ListenMode::Public,
         };
 
-        let mut core_config = CoreNodeConfig::new()
+        let mut core_config = CoreNodeConfig::builder()
+            .quic_port(config.port)
+            .ipv6(ipv6)
+            .listen_mode(listen_mode)
+            .max_message_size(config.max_message_size)
+            .build()
             .map_err(|e| Error::Config(format!("Failed to create core config: {e}")))?;
-
-        // Set listen address
-        core_config.listen_addrs = vec![MultiAddr::quic(listen_addr)];
 
         // Add bootstrap peers.
         core_config.bootstrap_peers = config
@@ -196,9 +192,6 @@ impl NodeBuilder {
             .map(|addr| MultiAddr::quic(*addr))
             .collect();
 
-        // Forward max_message_size to the transport layer.
-        core_config.max_message_size = Some(config.max_message_size);
-
         // Propagate network-mode tuning into saorsa-core where supported.
         match config.network_mode {
             NetworkMode::Production => {
@@ -206,9 +199,8 @@ impl NodeBuilder {
                 core_config.diversity_config = Some(CoreDiversityConfig::default());
             }
             NetworkMode::Testnet => {
-                // Allow loopback connections for local testnet deployments.
+                // Testnet allows loopback so nodes can be co-located.
                 core_config.allow_loopback = true;
-
                 core_config.production_config = Some(CoreProductionConfig::default());
                 let mut diversity = CoreDiversityConfig::testnet();
                 diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
@@ -229,9 +221,7 @@ impl NodeBuilder {
                 }
             }
             NetworkMode::Development => {
-                // Allow loopback connections for local development.
-                core_config.allow_loopback = true;
-
+                // ListenMode::Local already set allow_loopback via the builder.
                 core_config.production_config = None;
                 core_config.diversity_config = Some(CoreDiversityConfig::permissive());
             }
