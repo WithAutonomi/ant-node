@@ -49,6 +49,14 @@ impl PrometheusFormatter {
         Self::format_transport_metrics(&mut out, &snapshot.transport)?;
         Self::format_strategy_metrics(&mut out, &snapshot.strategy_stats)?;
 
+        // Phase 2 additions
+        Self::format_handshake_metrics(&mut out, aggregator).await?;
+        Self::format_dht_latency_metrics(&mut out, aggregator).await?;
+        Self::format_ops_per_second(&mut out, aggregator)?;
+        Self::format_extended_transport_metrics(&mut out, &snapshot.transport)?;
+        Self::format_connection_failure_breakdown(&mut out, aggregator).await?;
+        Self::format_replication_timing_metrics(&mut out, aggregator).await?;
+
         Ok(out)
     }
 
@@ -921,6 +929,349 @@ impl PrometheusFormatter {
         Ok(())
     }
 
+    // ---- Phase 2 metrics ----
+
+    async fn format_handshake_metrics(
+        out: &mut String,
+        agg: &MetricsAggregator,
+    ) -> std::fmt::Result {
+        let window = agg.handshake_latencies.read().await;
+        let mut sorted: Vec<u64> = window.iter().copied().collect();
+        sorted.sort_unstable();
+        let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+        let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+        let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
+
+        writeln!(
+            out,
+            "# HELP p2p_handshake_latency_p50_ms PQ handshake latency p50 in milliseconds"
+        )?;
+        writeln!(out, "# TYPE p2p_handshake_latency_p50_ms gauge")?;
+        writeln!(out, "p2p_handshake_latency_p50_ms {p50:.3}")?;
+
+        writeln!(
+            out,
+            "# HELP p2p_handshake_latency_p95_ms PQ handshake latency p95 in milliseconds"
+        )?;
+        writeln!(out, "# TYPE p2p_handshake_latency_p95_ms gauge")?;
+        writeln!(out, "p2p_handshake_latency_p95_ms {p95:.3}")?;
+
+        writeln!(
+            out,
+            "# HELP p2p_handshake_latency_p99_ms PQ handshake latency p99 in milliseconds"
+        )?;
+        writeln!(out, "# TYPE p2p_handshake_latency_p99_ms gauge")?;
+        writeln!(out, "p2p_handshake_latency_p99_ms {p99:.3}")?;
+
+        Ok(())
+    }
+
+    async fn format_dht_latency_metrics(
+        out: &mut String,
+        agg: &MetricsAggregator,
+    ) -> std::fmt::Result {
+        // DHT put latencies
+        {
+            let window = agg.dht_put_latencies.read().await;
+            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            sorted.sort_unstable();
+            let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+            let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_put_latency_p50_ms DHT put latency p50 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_put_latency_p50_ms gauge")?;
+            writeln!(out, "p2p_dht_put_latency_p50_ms {p50:.3}")?;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_put_latency_p95_ms DHT put latency p95 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_put_latency_p95_ms gauge")?;
+            writeln!(out, "p2p_dht_put_latency_p95_ms {p95:.3}")?;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_put_latency_p99_ms DHT put latency p99 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_put_latency_p99_ms gauge")?;
+            writeln!(out, "p2p_dht_put_latency_p99_ms {p99:.3}")?;
+        }
+
+        // DHT get latencies
+        {
+            let window = agg.dht_get_latencies.read().await;
+            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            sorted.sort_unstable();
+            let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+            let p99 = percentile_u64(&sorted, 99.0) as f64 / 1000.0;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_get_latency_p50_ms DHT get latency p50 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_get_latency_p50_ms gauge")?;
+            writeln!(out, "p2p_dht_get_latency_p50_ms {p50:.3}")?;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_get_latency_p95_ms DHT get latency p95 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_get_latency_p95_ms gauge")?;
+            writeln!(out, "p2p_dht_get_latency_p95_ms {p95:.3}")?;
+
+            writeln!(
+                out,
+                "# HELP p2p_dht_get_latency_p99_ms DHT get latency p99 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_dht_get_latency_p99_ms gauge")?;
+            writeln!(out, "p2p_dht_get_latency_p99_ms {p99:.3}")?;
+        }
+
+        Ok(())
+    }
+
+    fn format_ops_per_second(out: &mut String, agg: &MetricsAggregator) -> std::fmt::Result {
+        let ops = agg.operations_per_second();
+        writeln!(
+            out,
+            "# HELP p2p_operations_per_second DHT operations per second"
+        )?;
+        writeln!(out, "# TYPE p2p_operations_per_second gauge")?;
+        writeln!(out, "p2p_operations_per_second {ops:.6}")?;
+        Ok(())
+    }
+
+    fn format_extended_transport_metrics(out: &mut String, m: &TransportStats) -> std::fmt::Result {
+        writeln!(
+            out,
+            "# HELP p2p_transport_total_connections_established Total connections established"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_transport_total_connections_established counter"
+        )?;
+        writeln!(
+            out,
+            "p2p_transport_total_connections_established {}",
+            m.total_connections_established
+        )?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_connection_failures Total connection failures"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_connection_failures counter")?;
+        writeln!(
+            out,
+            "p2p_transport_connection_failures {}",
+            m.connection_failures
+        )?;
+
+        let total_attempts = m.total_connections_established + m.connection_failures;
+        let success_rate = if total_attempts == 0 {
+            0.0
+        } else {
+            m.total_connections_established as f64 / total_attempts as f64
+        };
+        writeln!(
+            out,
+            "# HELP p2p_transport_connection_success_rate Connection success rate"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_connection_success_rate gauge")?;
+        writeln!(
+            out,
+            "p2p_transport_connection_success_rate {success_rate:.6}"
+        )?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_bytes_sent_total Total bytes sent"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_bytes_sent_total counter")?;
+        writeln!(out, "p2p_transport_bytes_sent_total {}", m.bytes_sent_total)?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_bytes_received_total Total bytes received"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_bytes_received_total counter")?;
+        writeln!(
+            out,
+            "p2p_transport_bytes_received_total {}",
+            m.bytes_received_total
+        )?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_nat_traversal_attempts_total Total NAT traversal attempts"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_transport_nat_traversal_attempts_total counter"
+        )?;
+        writeln!(
+            out,
+            "p2p_transport_nat_traversal_attempts_total {}",
+            m.nat_traversal_attempts
+        )?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_nat_traversal_successes_total Successful NAT traversals"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_transport_nat_traversal_successes_total counter"
+        )?;
+        writeln!(
+            out,
+            "p2p_transport_nat_traversal_successes_total {}",
+            m.nat_traversal_successes
+        )?;
+
+        let nat_rate = if m.nat_traversal_attempts == 0 {
+            0.0
+        } else {
+            m.nat_traversal_successes as f64 / m.nat_traversal_attempts as f64
+        };
+        writeln!(
+            out,
+            "# HELP p2p_transport_nat_traversal_success_rate NAT traversal success rate"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_nat_traversal_success_rate gauge")?;
+        writeln!(
+            out,
+            "p2p_transport_nat_traversal_success_rate {nat_rate:.6}"
+        )?;
+
+        writeln!(
+            out,
+            "# HELP p2p_transport_connection_pool_size Current connection pool size"
+        )?;
+        writeln!(out, "# TYPE p2p_transport_connection_pool_size gauge")?;
+        writeln!(
+            out,
+            "p2p_transport_connection_pool_size {}",
+            m.connection_pool_size
+        )?;
+
+        Ok(())
+    }
+
+    async fn format_connection_failure_breakdown(
+        out: &mut String,
+        agg: &MetricsAggregator,
+    ) -> std::fmt::Result {
+        let guard = agg.connection_failures_by_reason.read().await;
+        let map: &HashMap<String, u64> = &guard;
+        if !map.is_empty() {
+            writeln!(
+                out,
+                "# HELP p2p_transport_connection_failures_by_reason Connection failures by reason"
+            )?;
+            writeln!(
+                out,
+                "# TYPE p2p_transport_connection_failures_by_reason counter"
+            )?;
+            for (reason, count) in map {
+                writeln!(
+                    out,
+                    "p2p_transport_connection_failures_by_reason{{reason=\"{reason}\"}} {count}"
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn format_replication_timing_metrics(
+        out: &mut String,
+        agg: &MetricsAggregator,
+    ) -> std::fmt::Result {
+        let cycles = agg.replication_cycles_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP p2p_replication_cycles_total Total replication repair cycles"
+        )?;
+        writeln!(out, "# TYPE p2p_replication_cycles_total counter")?;
+        writeln!(out, "p2p_replication_cycles_total {cycles}")?;
+
+        {
+            let window = agg.replication_durations.read().await;
+            let mut sorted: Vec<u64> = window.iter().copied().collect();
+            sorted.sort_unstable();
+            let p50 = percentile_u64(&sorted, 50.0) as f64 / 1000.0;
+            let p95 = percentile_u64(&sorted, 95.0) as f64 / 1000.0;
+
+            writeln!(
+                out,
+                "# HELP p2p_replication_duration_p50_ms Replication duration p50 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_replication_duration_p50_ms gauge")?;
+            writeln!(out, "p2p_replication_duration_p50_ms {p50:.3}")?;
+
+            writeln!(
+                out,
+                "# HELP p2p_replication_duration_p95_ms Replication duration p95 in milliseconds"
+            )?;
+            writeln!(out, "# TYPE p2p_replication_duration_p95_ms gauge")?;
+            writeln!(out, "p2p_replication_duration_p95_ms {p95:.3}")?;
+        }
+
+        let keys = agg.replication_keys_repaired_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP p2p_replication_keys_repaired_total Total keys repaired"
+        )?;
+        writeln!(out, "# TYPE p2p_replication_keys_repaired_total counter")?;
+        writeln!(out, "p2p_replication_keys_repaired_total {keys}")?;
+
+        let bytes = agg.replication_bytes_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP p2p_replication_bytes_transferred_total Total replication bytes transferred"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_replication_bytes_transferred_total counter"
+        )?;
+        writeln!(out, "p2p_replication_bytes_transferred_total {bytes}")?;
+
+        let grace_expired = agg.grace_periods_expired_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP p2p_replication_grace_periods_expired_total Total grace periods expired"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_replication_grace_periods_expired_total counter"
+        )?;
+        writeln!(
+            out,
+            "p2p_replication_grace_periods_expired_total {grace_expired}"
+        )?;
+
+        let grace_keys = agg.grace_period_keys_affected_total.load(Ordering::Relaxed);
+        writeln!(
+            out,
+            "# HELP p2p_replication_grace_period_keys_affected_total Keys affected by grace period expiry"
+        )?;
+        writeln!(
+            out,
+            "# TYPE p2p_replication_grace_period_keys_affected_total counter"
+        )?;
+        writeln!(
+            out,
+            "p2p_replication_grace_period_keys_affected_total {grace_keys}"
+        )?;
+
+        Ok(())
+    }
+
     fn format_strategy_metrics(out: &mut String, stats: &[StrategyStats]) -> std::fmt::Result {
         if stats.is_empty() {
             return Ok(());
@@ -1123,5 +1474,161 @@ mod tests {
         let snapshot = default_snapshot();
         let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
         assert!(output.contains("p2p_stream_bandwidth_p50_bytes_per_sec{class=\"file\"}"));
+    }
+
+    // ---- Phase 2 tests ----
+
+    #[tokio::test]
+    async fn phase2_handshake_metrics() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::HandshakeCompleted {
+            duration: Duration::from_millis(100),
+        })
+        .await;
+
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(output.contains("p2p_handshake_latency_p50_ms"));
+        assert!(output.contains("p2p_handshake_latency_p95_ms"));
+        assert!(output.contains("p2p_handshake_latency_p99_ms"));
+    }
+
+    #[tokio::test]
+    async fn phase2_dht_put_get_latencies_separate() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::DhtPutCompleted {
+            duration: Duration::from_millis(20),
+            success: true,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::DhtGetCompleted {
+            duration: Duration::from_millis(30),
+            success: true,
+        })
+        .await;
+
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(output.contains("p2p_dht_put_latency_p50_ms"));
+        assert!(output.contains("p2p_dht_get_latency_p50_ms"));
+        // Verify separate: put is 20ms, get is 30ms
+        assert!(output.contains("p2p_dht_put_latency_p50_ms 20.000"));
+        assert!(output.contains("p2p_dht_get_latency_p50_ms 30.000"));
+    }
+
+    #[tokio::test]
+    async fn phase2_ops_per_second() {
+        let agg = MetricsAggregator::new();
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(output.contains("p2p_operations_per_second"));
+    }
+
+    #[tokio::test]
+    async fn phase2_extended_transport_metrics() {
+        let agg = MetricsAggregator::new();
+        let mut snapshot = default_snapshot();
+        snapshot.transport.total_connections_established = 100;
+        snapshot.transport.connection_failures = 5;
+        snapshot.transport.bytes_sent_total = 1_000_000;
+        snapshot.transport.bytes_received_total = 2_000_000;
+        snapshot.transport.nat_traversal_attempts = 20;
+        snapshot.transport.nat_traversal_successes = 15;
+        snapshot.transport.connection_pool_size = 42;
+
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(output.contains("p2p_transport_total_connections_established 100"));
+        assert!(output.contains("p2p_transport_connection_failures 5"));
+        assert!(output.contains("p2p_transport_bytes_sent_total 1000000"));
+        assert!(output.contains("p2p_transport_bytes_received_total 2000000"));
+        assert!(output.contains("p2p_transport_nat_traversal_attempts_total 20"));
+        assert!(output.contains("p2p_transport_nat_traversal_successes_total 15"));
+        assert!(output.contains("p2p_transport_connection_pool_size 42"));
+        // Derived rates
+        assert!(output.contains("p2p_transport_connection_success_rate"));
+        assert!(output.contains("p2p_transport_nat_traversal_success_rate"));
+    }
+
+    #[tokio::test]
+    async fn phase2_connection_failure_breakdown() {
+        use saorsa_core::ConnectionFailureReason;
+
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::Timeout,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::NatTraversalFailed,
+        })
+        .await;
+
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(
+            output.contains("p2p_transport_connection_failures_by_reason{reason=\"Timeout\"} 1")
+        );
+        assert!(output.contains(
+            "p2p_transport_connection_failures_by_reason{reason=\"NatTraversalFailed\"} 1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn phase2_replication_metrics() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::ReplicationStarted { keys_to_repair: 10 })
+            .await;
+        agg.handle_metric_event(MetricEvent::ReplicationCompleted {
+            duration: Duration::from_secs(3),
+            keys_repaired: 8,
+            bytes_transferred: 4096,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::GracePeriodExpired { keys_affected: 5 })
+            .await;
+
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+        assert!(output.contains("p2p_replication_cycles_total 1"));
+        assert!(output.contains("p2p_replication_duration_p50_ms"));
+        assert!(output.contains("p2p_replication_keys_repaired_total 8"));
+        assert!(output.contains("p2p_replication_bytes_transferred_total 4096"));
+        assert!(output.contains("p2p_replication_grace_periods_expired_total 1"));
+        assert!(output.contains("p2p_replication_grace_period_keys_affected_total 5"));
+    }
+
+    #[tokio::test]
+    async fn phase2_no_orphaned_headers() {
+        use saorsa_core::ConnectionFailureReason;
+
+        let agg = MetricsAggregator::new();
+        // Generate some phase 2 events to populate all paths
+        agg.handle_metric_event(MetricEvent::HandshakeCompleted {
+            duration: Duration::from_millis(50),
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::Timeout,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::ReplicationStarted { keys_to_repair: 1 })
+            .await;
+
+        let snapshot = default_snapshot();
+        let output = PrometheusFormatter::format(&agg, &snapshot).await.unwrap();
+
+        for line in output.lines() {
+            if line.starts_with("# HELP ") {
+                let metric_name = line
+                    .strip_prefix("# HELP ")
+                    .and_then(|s| s.split_whitespace().next())
+                    .unwrap();
+                let type_line = format!("# TYPE {metric_name}");
+                assert!(
+                    output.contains(&type_line),
+                    "HELP without TYPE for {metric_name}"
+                );
+            }
+        }
     }
 }

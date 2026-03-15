@@ -8,7 +8,7 @@
 use saorsa_core::{MetricEvent, StreamClass};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Maximum number of samples retained in each sliding window.
@@ -44,6 +44,15 @@ impl OperationCounter {
     }
 }
 
+/// Push a microsecond sample into a bounded sliding window.
+async fn push_window(window: &RwLock<VecDeque<u64>>, micros: u64) {
+    let mut w = window.write().await;
+    if w.len() >= WINDOW_SIZE {
+        w.pop_front();
+    }
+    w.push_back(micros);
+}
+
 /// Aggregates event-driven metrics into counters and sliding windows.
 pub struct MetricsAggregator {
     // --- Peer connections (from P2PEvent) ---
@@ -61,6 +70,10 @@ pub struct MetricsAggregator {
     pub(crate) dht_gets_total: AtomicU64,
     pub(crate) dht_gets_success: AtomicU64,
 
+    // --- DHT operation latency windows (Phase 2) ---
+    pub(crate) dht_put_latencies: RwLock<VecDeque<u64>>, // microseconds
+    pub(crate) dht_get_latencies: RwLock<VecDeque<u64>>, // microseconds
+
     // --- Auth ---
     pub(crate) auth_failures_total: AtomicU64,
 
@@ -72,6 +85,25 @@ pub struct MetricsAggregator {
     pub(crate) storage_reads: OperationCounter,
     pub(crate) storage_writes: OperationCounter,
     pub(crate) storage_deletes: OperationCounter,
+
+    // --- Handshake latency (Phase 2) ---
+    pub(crate) handshake_latencies: RwLock<VecDeque<u64>>, // microseconds
+
+    // --- Connection failure breakdown (Phase 2) ---
+    pub(crate) connection_failures_by_reason: RwLock<HashMap<String, u64>>,
+
+    // --- Replication metrics (Phase 2) ---
+    pub(crate) replication_cycles_total: AtomicU64,
+    pub(crate) replication_durations: RwLock<VecDeque<u64>>, // microseconds
+    pub(crate) replication_bytes_total: AtomicU64,
+    pub(crate) replication_keys_repaired_total: AtomicU64,
+
+    // --- Grace period metrics (Phase 2) ---
+    pub(crate) grace_periods_expired_total: AtomicU64,
+    pub(crate) grace_period_keys_affected_total: AtomicU64,
+
+    // --- Uptime tracking for ops/sec (Phase 2) ---
+    pub(crate) start_time: Instant,
 }
 
 impl MetricsAggregator {
@@ -91,6 +123,9 @@ impl MetricsAggregator {
             dht_gets_total: AtomicU64::new(0),
             dht_gets_success: AtomicU64::new(0),
 
+            dht_put_latencies: RwLock::new(VecDeque::with_capacity(WINDOW_SIZE)),
+            dht_get_latencies: RwLock::new(VecDeque::with_capacity(WINDOW_SIZE)),
+
             auth_failures_total: AtomicU64::new(0),
 
             stream_bandwidth: RwLock::new(HashMap::new()),
@@ -99,6 +134,20 @@ impl MetricsAggregator {
             storage_reads: OperationCounter::new(),
             storage_writes: OperationCounter::new(),
             storage_deletes: OperationCounter::new(),
+
+            handshake_latencies: RwLock::new(VecDeque::with_capacity(WINDOW_SIZE)),
+
+            connection_failures_by_reason: RwLock::new(HashMap::new()),
+
+            replication_cycles_total: AtomicU64::new(0),
+            replication_durations: RwLock::new(VecDeque::with_capacity(WINDOW_SIZE)),
+            replication_bytes_total: AtomicU64::new(0),
+            replication_keys_repaired_total: AtomicU64::new(0),
+
+            grace_periods_expired_total: AtomicU64::new(0),
+            grace_period_keys_affected_total: AtomicU64::new(0),
+
+            start_time: Instant::now(),
         }
     }
 
@@ -110,13 +159,7 @@ impl MetricsAggregator {
             MetricEvent::LookupCompleted { duration, hops } => {
                 self.lookup_count.fetch_add(1, Ordering::Relaxed);
                 let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
-                {
-                    let mut w = self.lookup_latencies.write().await;
-                    if w.len() >= WINDOW_SIZE {
-                        w.pop_front();
-                    }
-                    w.push_back(micros);
-                }
+                push_window(&self.lookup_latencies, micros).await;
                 {
                     let mut w = self.lookup_hops.write().await;
                     if w.len() >= WINDOW_SIZE {
@@ -129,17 +172,21 @@ impl MetricsAggregator {
                 self.lookup_count.fetch_add(1, Ordering::Relaxed);
                 self.lookup_timeouts.fetch_add(1, Ordering::Relaxed);
             }
-            MetricEvent::DhtPutCompleted { success, .. } => {
+            MetricEvent::DhtPutCompleted { duration, success } => {
                 self.dht_puts_total.fetch_add(1, Ordering::Relaxed);
                 if success {
                     self.dht_puts_success.fetch_add(1, Ordering::Relaxed);
                 }
+                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                push_window(&self.dht_put_latencies, micros).await;
             }
-            MetricEvent::DhtGetCompleted { success, .. } => {
+            MetricEvent::DhtGetCompleted { duration, success } => {
                 self.dht_gets_total.fetch_add(1, Ordering::Relaxed);
                 if success {
                     self.dht_gets_success.fetch_add(1, Ordering::Relaxed);
                 }
+                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                push_window(&self.dht_get_latencies, micros).await;
             }
             MetricEvent::AuthFailure => {
                 self.auth_failures_total.fetch_add(1, Ordering::Relaxed);
@@ -167,6 +214,43 @@ impl MetricsAggregator {
                     window.pop_front();
                 }
                 window.push_back(micros);
+            }
+            // --- Phase 2: Transport ---
+            MetricEvent::ConnectionEstablished { .. } => {
+                // Connection counts are tracked in TransportStats (pull-based).
+                // No additional event-driven aggregation needed here.
+            }
+            MetricEvent::ConnectionFailed { reason } => {
+                let key = format!("{reason:?}");
+                let mut map = self.connection_failures_by_reason.write().await;
+                *map.entry(key).or_insert(0) += 1;
+            }
+            MetricEvent::HandshakeCompleted { duration } => {
+                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                push_window(&self.handshake_latencies, micros).await;
+            }
+            // --- Phase 2: Replication ---
+            MetricEvent::ReplicationStarted { .. } => {
+                self.replication_cycles_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            MetricEvent::ReplicationCompleted {
+                duration,
+                keys_repaired,
+                bytes_transferred,
+            } => {
+                let micros = duration.as_micros().min(u128::from(u64::MAX)) as u64;
+                push_window(&self.replication_durations, micros).await;
+                self.replication_keys_repaired_total
+                    .fetch_add(keys_repaired, Ordering::Relaxed);
+                self.replication_bytes_total
+                    .fetch_add(bytes_transferred, Ordering::Relaxed);
+            }
+            MetricEvent::GracePeriodExpired { keys_affected } => {
+                self.grace_periods_expired_total
+                    .fetch_add(1, Ordering::Relaxed);
+                self.grace_period_keys_affected_total
+                    .fetch_add(keys_affected, Ordering::Relaxed);
             }
         }
     }
@@ -249,6 +333,17 @@ impl MetricsAggregator {
             + self.dht_gets_success.load(Ordering::Relaxed);
         success as f64 / total as f64
     }
+
+    /// Total DHT operations per second since node start.
+    pub fn operations_per_second(&self) -> f64 {
+        let total = self.dht_puts_total.load(Ordering::Relaxed)
+            + self.dht_gets_total.load(Ordering::Relaxed);
+        let elapsed = self.start_time.elapsed().as_secs_f64();
+        if elapsed < 1.0 {
+            return 0.0;
+        }
+        total as f64 / elapsed
+    }
 }
 
 impl Default for MetricsAggregator {
@@ -283,6 +378,7 @@ pub(crate) fn percentile_u8(sorted: &[u8], p: f64) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use saorsa_core::{ConnectionFailureReason, ConnectionNatType};
 
     #[test]
     fn percentile_empty() {
@@ -358,6 +454,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dht_put_get_latency_windows() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::DhtPutCompleted {
+            duration: Duration::from_millis(15),
+            success: true,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::DhtGetCompleted {
+            duration: Duration::from_millis(25),
+            success: true,
+        })
+        .await;
+
+        assert_eq!(agg.dht_put_latencies.read().await.len(), 1);
+        assert_eq!(agg.dht_get_latencies.read().await.len(), 1);
+        // 15ms = 15000 microseconds
+        assert_eq!(*agg.dht_put_latencies.read().await.front().unwrap(), 15000);
+        assert_eq!(*agg.dht_get_latencies.read().await.front().unwrap(), 25000);
+    }
+
+    #[tokio::test]
     async fn peer_connect_disconnect() {
         let agg = MetricsAggregator::new();
         agg.record_peer_connected();
@@ -419,5 +536,93 @@ mod tests {
         }
         assert_eq!(agg.lookup_latencies.read().await.len(), WINDOW_SIZE);
         assert_eq!(agg.lookup_hops.read().await.len(), WINDOW_SIZE);
+    }
+
+    #[tokio::test]
+    async fn handshake_latency() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::HandshakeCompleted {
+            duration: Duration::from_millis(120),
+        })
+        .await;
+
+        assert_eq!(agg.handshake_latencies.read().await.len(), 1);
+        assert_eq!(
+            *agg.handshake_latencies.read().await.front().unwrap(),
+            120_000
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_failure_breakdown() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::Timeout,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::Timeout,
+        })
+        .await;
+        agg.handle_metric_event(MetricEvent::ConnectionFailed {
+            reason: ConnectionFailureReason::NatTraversalFailed,
+        })
+        .await;
+
+        let map = agg.connection_failures_by_reason.read().await;
+        assert_eq!(map.get("Timeout"), Some(&2));
+        assert_eq!(map.get("NatTraversalFailed"), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn replication_metrics() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::ReplicationStarted { keys_to_repair: 10 })
+            .await;
+        agg.handle_metric_event(MetricEvent::ReplicationCompleted {
+            duration: Duration::from_secs(5),
+            keys_repaired: 8,
+            bytes_transferred: 1024,
+        })
+        .await;
+
+        assert_eq!(agg.replication_cycles_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            agg.replication_keys_repaired_total.load(Ordering::Relaxed),
+            8
+        );
+        assert_eq!(agg.replication_bytes_total.load(Ordering::Relaxed), 1024);
+        assert_eq!(agg.replication_durations.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn grace_period_metrics() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::GracePeriodExpired { keys_affected: 42 })
+            .await;
+
+        assert_eq!(agg.grace_periods_expired_total.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            agg.grace_period_keys_affected_total.load(Ordering::Relaxed),
+            42
+        );
+    }
+
+    #[tokio::test]
+    async fn connection_established_no_panic() {
+        let agg = MetricsAggregator::new();
+        agg.handle_metric_event(MetricEvent::ConnectionEstablished {
+            duration: Duration::from_millis(50),
+            nat_type: ConnectionNatType::Direct,
+        })
+        .await;
+        // No assertion — just verify it doesn't panic
+    }
+
+    #[test]
+    fn operations_per_second_zero_initially() {
+        let agg = MetricsAggregator::new();
+        // Elapsed < 1s, should return 0
+        assert!((agg.operations_per_second() - 0.0).abs() < 0.001);
     }
 }

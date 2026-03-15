@@ -32,7 +32,7 @@ path = "src/bin/saorsa-cli/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/jacderida/saorsa-core", branch = "feat-metrics_event_channel" }
+saorsa-core = { git = "https://github.com/jacderida/saorsa-core", branch = "feat-metrics_phase2" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
