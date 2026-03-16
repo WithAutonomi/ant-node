@@ -1277,9 +1277,11 @@ impl TestNetwork {
         core_config.listen_addrs = vec![node.address];
         core_config.enable_ipv6 = false; // Disable IPv6 for local testing to avoid dual-stack binding issues
         core_config.connection_timeout = Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS);
-        core_config
-            .bootstrap_peers
-            .clone_from(&node.bootstrap_addrs);
+        core_config.bootstrap_peers = node
+            .bootstrap_addrs
+            .iter()
+            .map(|addr| saorsa_core::MultiAddr::from(addr))
+            .collect();
         // Override the transport-layer message size to accommodate max-size
         // chunks (4 MiB payload + serialization overhead = 5 MiB wire).
         core_config.max_message_size = Some(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE);

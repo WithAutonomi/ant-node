@@ -42,7 +42,10 @@ async fn create_testnet_client() -> P2PNode {
     println!("Connecting to testnet via: {bootstrap_addrs:?}");
 
     let mut config = CoreNodeConfig::new().expect("Failed to create config");
-    config.bootstrap_peers = bootstrap_addrs;
+    config.bootstrap_peers = bootstrap_addrs
+        .iter()
+        .map(|addr| saorsa_core::MultiAddr::from(addr))
+        .collect();
 
     // Use a random port for the client
     config.listen_addr = "127.0.0.1:0".parse().unwrap();

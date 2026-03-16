@@ -28,9 +28,9 @@ pub enum IpVersion {
 #[serde(rename_all = "lowercase")]
 pub enum UpgradeChannel {
     /// Stable releases only.
-    #[default]
     Stable,
     /// Beta releases (includes stable).
+    #[default]
     Beta,
 }
 
@@ -157,9 +157,9 @@ pub struct UpgradeConfig {
     #[serde(default)]
     pub channel: UpgradeChannel,
 
-    /// Check interval in hours.
+    /// Check interval in minutes.
     #[serde(default = "default_check_interval")]
-    pub check_interval_hours: u64,
+    pub check_interval_minutes: u64,
 
     /// GitHub repository in "owner/repo" format for release monitoring.
     #[serde(default = "default_github_repo")]
@@ -341,7 +341,7 @@ impl Default for UpgradeConfig {
     fn default() -> Self {
         Self {
             channel: UpgradeChannel::default(),
-            check_interval_hours: default_check_interval(),
+            check_interval_minutes: default_check_interval(),
             github_repo: default_github_repo(),
             staged_rollout_hours: default_staged_rollout_hours(),
             stop_on_upgrade: false,
@@ -380,7 +380,7 @@ fn default_log_level() -> String {
 }
 
 const fn default_check_interval() -> u64 {
-    1 // 1 hour
+    20 // 20 minutes
 }
 
 const fn default_staged_rollout_hours() -> u64 {

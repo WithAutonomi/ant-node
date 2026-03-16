@@ -59,7 +59,7 @@ db_size_gb = 0
 [upgrade]
 enabled = false
 channel = "stable"
-check_interval_hours = 1
+check_interval_minutes = 20
 github_repo = "dirvine/saorsa-node"
 staged_rollout_hours = 1
 
