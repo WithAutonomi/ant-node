@@ -15,8 +15,7 @@ use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
-    IPDiversityConfig, ListenMode, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
-    PeerId,
+    IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
 };
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
@@ -622,8 +621,8 @@ impl Devnet {
         *node.state.write().await = NodeState::Starting;
 
         let mut core_config = CoreNodeConfig::builder()
-            .quic_port(node.port)
-            .listen_mode(ListenMode::Local)
+            .port(node.port)
+            .local(true)
             .max_message_size(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
             .build()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;

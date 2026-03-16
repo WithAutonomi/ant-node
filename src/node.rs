@@ -17,8 +17,8 @@ use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
-    IPDiversityConfig as CoreDiversityConfig, ListenMode, MultiAddr, NodeConfig as CoreNodeConfig,
-    P2PEvent, P2PNode,
+    IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
+    P2PNode,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -172,15 +172,12 @@ impl NodeBuilder {
     /// Build the saorsa-core `NodeConfig` from our config.
     fn build_core_config(config: &NodeConfig) -> Result<CoreNodeConfig> {
         let ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
-        let listen_mode = match config.network_mode {
-            NetworkMode::Development => ListenMode::Local,
-            _ => ListenMode::Public,
-        };
+        let local = matches!(config.network_mode, NetworkMode::Development);
 
         let mut core_config = CoreNodeConfig::builder()
-            .quic_port(config.port)
+            .port(config.port)
             .ipv6(ipv6)
-            .listen_mode(listen_mode)
+            .local(local)
             .max_message_size(config.max_message_size)
             .build()
             .map_err(|e| Error::Config(format!("Failed to create core config: {e}")))?;
@@ -198,6 +195,8 @@ impl NodeBuilder {
                 core_config.diversity_config = Some(CoreDiversityConfig::default());
             }
             NetworkMode::Testnet => {
+                // Testnet allows loopback so nodes can be co-located on one machine.
+                core_config.allow_loopback = true;
                 let mut diversity = CoreDiversityConfig::testnet();
                 diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
                 diversity.max_nodes_per_64 = config.testnet.max_nodes_per_64;

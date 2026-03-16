@@ -335,13 +335,8 @@ async fn create_client_node(
     bootstrap: Vec<saorsa_core::MultiAddr>,
     allow_loopback: bool,
 ) -> Result<Arc<P2PNode>, Error> {
-    let listen_mode = if allow_loopback {
-        saorsa_core::ListenMode::Local
-    } else {
-        saorsa_core::ListenMode::Public
-    };
     let mut core_config = saorsa_core::NodeConfig::builder()
-        .listen_mode(listen_mode)
+        .local(allow_loopback)
         .max_message_size(MAX_WIRE_MESSAGE_SIZE)
         .mode(saorsa_core::NodeMode::Client)
         .build()

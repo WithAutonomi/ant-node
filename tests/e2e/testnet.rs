@@ -21,7 +21,7 @@ use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{
-    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, ListenMode, MultiAddr,
+    identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, MultiAddr,
     NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
 };
 use saorsa_node::ant_protocol::{
@@ -1265,10 +1265,10 @@ impl TestNetwork {
         *node.state.write().await = NodeState::Starting;
 
         // Build configuration for saorsa-core P2PNode.
-        // ListenMode::Local auto-enables allow_loopback for test nodes on 127.0.0.1.
+        // .local(true) auto-enables allow_loopback for test nodes on 127.0.0.1.
         let mut core_config = CoreNodeConfig::builder()
-            .quic_port(node.port)
-            .listen_mode(ListenMode::Local)
+            .port(node.port)
+            .local(true)
             .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
             .max_message_size(saorsa_node::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
             .build()
