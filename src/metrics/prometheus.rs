@@ -5,7 +5,9 @@
 //! text block.
 //!
 //! Follows the Prometheus text exposition spec:
-//! - HELP/TYPE lines are emitted only when samples exist
+//! - Counters and gauges are always emitted (even when zero) so consumers
+//!   see stable metric names; optional families like stream bandwidth and
+//!   connection failure breakdowns are only emitted when data exists
 //! - All samples for a metric family are contiguous
 //! - Duration metrics use sub-millisecond precision (f64 ms)
 
