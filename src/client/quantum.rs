@@ -32,7 +32,7 @@ use evmlib::wallet::Wallet;
 use futures::stream::{FuturesUnordered, StreamExt};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +46,22 @@ const CLOSE_GROUP_SIZE: usize = 8;
 
 /// Default number of replicas for data redundancy.
 const DEFAULT_REPLICA_COUNT: u8 = 4;
+
+/// A chunk that has been quoted but not yet paid or stored.
+///
+/// Produced by [`QuantumClient::prepare_chunk_payment`] and consumed by
+/// [`QuantumClient::batch_pay_and_store`] to pay for multiple chunks in a
+/// single EVM transaction.
+pub struct PreparedChunk {
+    /// The raw chunk content.
+    pub content: Bytes,
+    /// Content-address (BLAKE3 hash).
+    pub address: XorName,
+    /// Peer ID + quote pairs for building `ProofOfPayment`.
+    pub peer_quotes: Vec<(EncodedPeerId, PaymentQuote)>,
+    /// The payment structure (sorted quotes, median selected).
+    pub payment: SingleNodePayment,
+}
 
 /// Configuration for the quantum-resistant client.
 #[derive(Debug, Clone)]
@@ -404,6 +420,176 @@ impl QuantumClient {
             content_size,
         )
         .await
+    }
+
+    /// Collect quotes for a chunk without paying.
+    ///
+    /// Returns a [`PreparedChunk`] containing all the information needed to
+    /// pay and store the chunk later. Use with [`batch_pay_and_store`](Self::batch_pay_and_store)
+    /// to pay for multiple chunks in a single EVM transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if DHT lookup or quote collection fails.
+    pub async fn prepare_chunk_payment(&self, content: Bytes) -> Result<PreparedChunk> {
+        let content_len = content.len();
+        debug!("Preparing payment for chunk ({content_len} bytes)");
+
+        self.p2p_node
+            .as_ref()
+            .ok_or_else(|| Error::Network("P2P node not configured".into()))?;
+
+        self.wallet.as_ref().ok_or_else(|| {
+            Error::Payment(
+                "Wallet not configured - use with_wallet() to enable payments".to_string(),
+            )
+        })?;
+
+        let address = compute_address(&content);
+        let data_size = u64::try_from(content.len())
+            .map_err(|e| Error::Network(format!("Content size too large: {e}")))?;
+
+        let quotes_with_peers = self
+            .get_quotes_from_dht_for_address(&address, data_size)
+            .await?;
+
+        if quotes_with_peers.len() != REQUIRED_QUOTES {
+            return Err(Error::Payment(format!(
+                "Expected {REQUIRED_QUOTES} quotes but received {}",
+                quotes_with_peers.len()
+            )));
+        }
+
+        let mut peer_quotes: Vec<(EncodedPeerId, PaymentQuote)> =
+            Vec::with_capacity(quotes_with_peers.len());
+        let mut quotes_with_prices: Vec<(PaymentQuote, Amount)> =
+            Vec::with_capacity(quotes_with_peers.len());
+
+        for (peer_id, quote, price) in quotes_with_peers {
+            let encoded_peer_id = hex_node_id_to_encoded_peer_id(&peer_id.to_hex())?;
+            peer_quotes.push((encoded_peer_id, quote.clone()));
+            quotes_with_prices.push((quote, price));
+        }
+
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices)?;
+
+        Ok(PreparedChunk {
+            content,
+            address,
+            peer_quotes,
+            payment,
+        })
+    }
+
+    /// Pay for multiple chunks in a single EVM transaction, then store them.
+    ///
+    /// This avoids nonce collisions that occur when multiple concurrent uploads
+    /// each submit their own EVM transaction. All quote payments are batched
+    /// into one `wallet.pay_for_quotes()` call, producing a single on-chain
+    /// transaction (up to 256 payments per tx).
+    ///
+    /// # Returns
+    ///
+    /// A vec of `(XorName, Vec<TxHash>)` — one entry per chunk, in the same
+    /// order as the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if payment fails or any chunk storage fails.
+    pub async fn batch_pay_and_store(
+        &self,
+        prepared: Vec<PreparedChunk>,
+    ) -> Result<Vec<(XorName, Vec<evmlib::common::TxHash>)>> {
+        let Some(ref wallet) = self.wallet else {
+            return Err(Error::Payment(
+                "Wallet not configured - use with_wallet() to enable payments".to_string(),
+            ));
+        };
+
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Collect all quote payments across all chunks into one batch.
+        let total_amount: Amount = prepared.iter().map(|p| p.payment.total_amount()).sum();
+        let chunk_count = prepared.len();
+        info!("Batch payment for {chunk_count} chunks: {total_amount} atto total");
+
+        let all_quote_payments: Vec<(ant_evm::QuoteHash, ant_evm::RewardsAddress, Amount)> =
+            prepared
+                .iter()
+                .flat_map(|p| &p.payment.quotes)
+                .map(|q| (q.quote_hash, q.rewards_address, q.amount))
+                .collect();
+
+        // Single EVM transaction for all chunks.
+        let tx_hash_map: BTreeMap<ant_evm::QuoteHash, evmlib::common::TxHash> = wallet
+            .pay_for_quotes(all_quote_payments)
+            .await
+            .map_err(|evmlib::wallet::PayForQuotesError(err, _)| {
+                Error::Payment(format!("Batch payment failed: {err}"))
+            })?;
+
+        let unique_tx_count = {
+            let mut txs: Vec<_> = tx_hash_map.values().collect();
+            txs.sort();
+            txs.dedup();
+            txs.len()
+        };
+        info!("Batch payment successful: {unique_tx_count} on-chain transaction(s) for {chunk_count} chunks");
+
+        // Build per-chunk proofs and store concurrently.
+        let mut store_futures = FuturesUnordered::new();
+
+        for (idx, prep) in prepared.into_iter().enumerate() {
+            let chunk_tx_hashes = Self::collect_chunk_tx_hashes(&prep.payment, &tx_hash_map);
+            let proof = PaymentProof {
+                proof_of_payment: ProofOfPayment {
+                    peer_quotes: prep.peer_quotes,
+                },
+                tx_hashes: chunk_tx_hashes.clone(),
+            };
+            let proof_bytes = rmp_serde::to_vec(&proof)
+                .map_err(|e| Error::Network(format!("Failed to serialize payment proof: {e}")))?;
+
+            let fut = async move {
+                let address = self.put_chunk_with_proof(prep.content, proof_bytes).await?;
+                Ok::<_, Error>((idx, address, chunk_tx_hashes))
+            };
+            store_futures.push(fut);
+        }
+
+        // Collect results in original order.
+        let mut results: Vec<Option<(XorName, Vec<evmlib::common::TxHash>)>> =
+            vec![None; chunk_count];
+
+        while let Some(result) = store_futures.next().await {
+            let (idx, address, tx_hashes) = result?;
+            results[idx] = Some((address, tx_hashes));
+        }
+
+        results
+            .into_iter()
+            .enumerate()
+            .map(|(i, opt)| {
+                opt.ok_or_else(|| {
+                    Error::Network(format!("Missing store result for chunk index {i}"))
+                })
+            })
+            .collect()
+    }
+
+    /// Extract transaction hashes relevant to a single chunk's payment.
+    fn collect_chunk_tx_hashes(
+        payment: &SingleNodePayment,
+        tx_hash_map: &BTreeMap<ant_evm::QuoteHash, evmlib::common::TxHash>,
+    ) -> Vec<evmlib::common::TxHash> {
+        payment
+            .quotes
+            .iter()
+            .filter(|q| q.amount > Amount::ZERO)
+            .filter_map(|q| tx_hash_map.get(&q.quote_hash).copied())
+            .collect()
     }
 
     /// Store a chunk on the saorsa network.
