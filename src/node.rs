@@ -475,17 +475,31 @@ impl NodeBuilder {
     }
 
     /// Build the snapshot collector, wiring in live saorsa-core components.
+    ///
+    /// Pulls the same `Arc` collector instances that saorsa-core's internal
+    /// DHT layer writes to, so snapshot metrics reflect live data.
     fn build_snapshot_collector(p2p_node: &Arc<P2PNode>) -> SnapshotCollector {
-        // DhtMetricsCollector, TrustMetricsCollector, PlacementMetricsCollector
-        // are standalone instances — they serve as the canonical source for
-        // snapshot metrics and will be populated as the DHT layer reports data.
-        let dht_health = Arc::new(DhtMetricsCollector::new());
-        let trust = Arc::new(TrustMetricsCollector::new());
-        let placement = Arc::new(PlacementMetricsCollector::new());
-
-        // SecurityMetricsCollector: standalone instance that will be populated
-        // as security events are observed by the DHT layer.
-        let security = Arc::new(saorsa_core::dht::metrics::SecurityMetricsCollector::new());
+        let (dht_health, security, trust, placement) =
+            p2p_node.security_dashboard.as_ref().map_or_else(
+                || {
+                    // Fallback: standalone instances that report defaults.
+                    // Only hit if security_dashboard is None (e.g., minimal test configs).
+                    (
+                        Arc::new(DhtMetricsCollector::new()),
+                        Arc::new(saorsa_core::dht::metrics::SecurityMetricsCollector::new()),
+                        Arc::new(TrustMetricsCollector::new()),
+                        Arc::new(PlacementMetricsCollector::new()),
+                    )
+                },
+                |dashboard| {
+                    (
+                        dashboard.dht_collector(),
+                        dashboard.security_collector(),
+                        dashboard.trust_collector(),
+                        dashboard.placement_collector(),
+                    )
+                },
+            );
 
         let eigentrust = p2p_node.trust_engine();
 

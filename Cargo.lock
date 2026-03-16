@@ -2122,7 +2122,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -5220,7 +5220,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.15.0"
-source = "git+https://github.com/jacderida/saorsa-core?branch=feat-metrics_phase2#1f1433560cda615ad118927ade1f8371639f5eba"
+source = "git+https://github.com/jacderida/saorsa-core?branch=feat-metrics_phase2#aaad76caa4bfecadbdb782ee9747cff1220cd2a9"
 dependencies = [
  "anyhow",
  "argon2",
