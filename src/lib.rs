@@ -10,10 +10,10 @@
 //! ## Architecture
 //!
 //! `saorsa-node` delegates all core functionality to `saorsa-core`:
-//! - Networking via `NetworkCoordinator`
-//! - DHT via `TrustWeightedKademlia`
-//! - Trust via `EigenTrustEngine`
-//! - Security via `SecurityManager`
+//! - Networking via `P2PNode`
+//! - DHT via `AdaptiveDHT`
+//! - Trust via `TrustEngine`
+//! - Security via `IPDiversityConfig`
 //!
 //! ## Data Types
 //!

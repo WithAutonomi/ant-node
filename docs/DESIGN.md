@@ -8,7 +8,7 @@ Build a **pure quantum-proof network node** (`saorsa-node`) that:
 3. Auto-migrates local ant-node data on startup
 4. Implements auto-upgrade with ML-DSA signature verification
 5. Supports dual IPv4/IPv6 DHT for maximum connectivity
-6. Features geographic routing, Sybil resistance, and EigenTrust
+6. Features geographic routing, Sybil resistance, and trust-based routing
 
 ## Architecture Philosophy
 
@@ -122,7 +122,7 @@ impl SaorsaNode {
 | Network Protocol | **Dual IPv4/IPv6 DHT** | Maximum connectivity and resilience |
 | Geographic Routing | **Enabled** | No datacenter concentration |
 | Sybil Resistance | **Required** | Prevent Sybil attacks |
-| Node Reputation | **EigenTrust** | Measure and remove bad nodes |
+| Node Reputation | **TrustEngine** | Measure and block bad nodes |
 | Auto-Upgrade | Phase 1 Critical | Essential for network transition |
 
 ---
@@ -170,7 +170,7 @@ saorsa-node/
 
 **REMOVED** (provided by saorsa-core):
 - `network/` - Use NetworkCoordinator + DualStackNetworkNode
-- `trust/` - Use EigenTrustEngine
+- `trust/` - Use TrustEngine
 - `storage/` - Use ContentStore
 - `replication/` - Use ReplicationManager
 
@@ -182,20 +182,18 @@ saorsa-node/
 
 ```rust
 use saorsa_core::{
-    adaptive::coordinator::NetworkCoordinator,
-    adaptive::security::SecurityManager,
-    adaptive::trust::EigenTrustEngine,
-    bootstrap::BootstrapManager,
-    dht::trust_weighted_kademlia::TrustWeightedKademlia,
-    messaging::NetworkConfig,
-    security::{IPv6NodeID, IPDiversityEnforcer},
+    P2PNode, NodeConfig, NodeMode,
+    adaptive::trust::TrustEngine,
+    adaptive::dht::AdaptiveDhtConfig,
+    BootstrapConfig, BootstrapManager,
+    IPDiversityConfig,
+    identity::peer_id::PeerId,
 };
 
 pub struct RunningNode {
     shutdown_sender: watch::Sender<bool>,
     // USE SAORSA-CORE DIRECTLY - NO REIMPLEMENTATION!
-    coordinator: Arc<NetworkCoordinator>,  // Integrates ALL components
-    security: Arc<SecurityManager>,         // Rate limiting, blacklist, eclipse detection
+    node: Arc<P2PNode>,                     // Integrates ALL components
     bootstrap: Arc<BootstrapManager>,       // 30,000 peer cache
     // Events
     node_events_channel: NodeEventsChannel,
@@ -203,7 +201,7 @@ pub struct RunningNode {
 }
 
 pub struct NodeBuilder {
-    network_config: NetworkConfig,          // saorsa-core's config
+    node_config: NodeConfig,                // saorsa-core's config
     identity: saorsa_core::identity::NodeIdentity,
     root_dir: PathBuf,
     auto_migrate_ant_data: bool,
@@ -274,22 +272,19 @@ pub struct IPv6NodeID {
 **File:** `saorsa-core/src/adaptive/trust.rs` (825 lines)
 
 ```rust
-// Just use saorsa-core's EigenTrust++ engine!
-use saorsa_core::adaptive::trust::EigenTrustEngine;
+// Just use saorsa-core's TrustEngine (formerly EigenTrust++)!
+use saorsa_core::TrustEngine;
 
 // Multi-factor trust scoring ALREADY IMPLEMENTED:
-// - 40% response_rate (correct/total responses)
-// - 20% uptime_estimate
-// - 15% storage_contributed
-// - 15% bandwidth_contributed
-// - 10% compute_contributed
-// + Time decay (0.99 per hour)
-// + Pre-trusted node bootstrap (0.9 initial)
-// + Background computation every 5 minutes
+// - Response rate tracking
+// - Connection success/failure monitoring
+// - Time decay
+// - Pre-trusted node bootstrap
+// - Background computation
 
-let engine = EigenTrustEngine::new(pre_trusted_nodes);
-engine.update_local_trust(from, to, success).await;
-let score = engine.get_trust_async(node_id).await;
+// Trust is accessed via P2PNode:
+let score = node.peer_trust(&peer_id);
+node.report_trust_event(&peer_id, TrustEvent::SuccessfulResponse);
 ```
 
 #### 5. Geographic Routing - ALREADY IN SAORSA-CORE!
@@ -306,44 +301,31 @@ use saorsa_core::dht::geographic_routing::{GeographicRegion, LatencyAwareSelecti
 // ASN diversity enforcement
 ```
 
-#### 6. Security Manager - ALREADY IN SAORSA-CORE!
-
-**File:** `saorsa-core/src/adaptive/security.rs` (1,326 lines)
+#### 6. Security - ALREADY IN SAORSA-CORE!
 
 ```rust
-// Comprehensive security - just configure and use!
-use saorsa_core::adaptive::security::{SecurityManager, SecurityConfig};
+// IP diversity enforcement for Sybil resistance
+use saorsa_core::IPDiversityConfig;
 
-let security = SecurityManager::new(config, identity);
+// Multi-layer subnet enforcement ALREADY IMPLEMENTED:
+// - Per-subnet limits (/64, /48, /32)
+// - ASN diversity
+// - Configurable via IPDiversityConfig::permissive() / ::testnet()
 
-// ALREADY IMPLEMENTED:
-// - Rate limiting: 100 req/min per node, 500/min per IP
-// - Join rate: 20 new nodes/hour
-// - Blacklist with 24-hour TTL
-// - Eclipse attack detection via diversity scoring
-// - Message integrity verification (ML-DSA)
-// - Full audit logging with 30-day retention
+// Rate limiting and trust-based blocking handled by AdaptiveDHT
 ```
 
-#### 7. NetworkCoordinator - INTEGRATES EVERYTHING!
+#### 7. P2PNode - INTEGRATES EVERYTHING!
 
-**File:** `saorsa-core/src/adaptive/coordinator.rs`
+**File:** `saorsa-core/src/network.rs`
 
 ```rust
-// The coordinator brings ALL components together
-pub struct NetworkCoordinator {
-    identity: Arc<NodeIdentity>,
-    transport: Arc<TransportManager>,
-    dht: Arc<AdaptiveDHT>,                    // Trust-weighted Kademlia
-    router: Arc<AdaptiveRouter>,              // Geographic + trust routing
-    trust_engine: Arc<EigenTrustEngine>,      // EigenTrust++
-    gossip: Arc<AdaptiveGossipSub>,           // Pub/sub messaging
-    storage: Arc<ContentStore>,               // DHT storage
-    replication: Arc<ReplicationManager>,     // k=8 replication
-    churn_handler: Arc<ChurnHandler>,         // Node churn handling
-    security: Arc<SecurityManager>,           // All security features
-    // + ML optimization components
-}
+// P2PNode brings ALL components together
+// Access trust via:
+node.trust_engine()      // Arc<TrustEngine>
+node.adaptive_dht()      // &AdaptiveDHT
+node.peer_trust(&peer)   // Quick trust score lookup
+node.report_trust_event(&peer, event)  // Report trust signals
 ```
 
 #### 8. What saorsa-node ACTUALLY Needs to Build
@@ -368,7 +350,7 @@ pub struct AntDataMigrator {
 
 /// Node lifecycle and CLI (wrapper around saorsa-core)
 pub struct NodeLifecycle {
-    coordinator: Arc<NetworkCoordinator>,
+    node: Arc<P2PNode>,
     upgrade_monitor: UpgradeMonitor,
     migrator: Option<AntDataMigrator>,
 }
@@ -381,11 +363,10 @@ pub struct NodeLifecycle {
 **KEY INSIGHT**: saorsa-core already provides:
 - Dual IPv4/IPv6 with DualStackNetworkNode and Happy Eyeballs
 - Sybil Resistance with IPv6NodeID and IPDiversityEnforcer
-- EigenTrust++ with full trust engine
+- TrustEngine with trust scoring and blocking
 - Geographic Routing with 7 regions and latency-aware selection
-- Security Manager with rate limiting, blacklist, eclipse detection
-- NetworkCoordinator that integrates everything
-- Storage and replication via ContentStore and ReplicationManager
+- IP diversity enforcement for Sybil resistance
+- P2PNode that integrates everything
 
 **saorsa-node only needs to build**:
 1. Auto-upgrade system (Phase 1 Critical)
@@ -476,7 +457,7 @@ pub struct NodeLifecycle {
 ### 5. Network Hardening
 - **Geographic routing**: No datacenter concentration in close groups
 - **Sybil resistance**: Join rate limiting, node age, resource verification
-- **EigenTrust**: Node reputation and automatic bad node removal
+- **TrustEngine**: Node reputation and automatic bad node blocking
 - **Rationale**: Production-grade security
 
 ### 6. Migration Strategy: Client-as-Bridge + Node Auto-Migration
