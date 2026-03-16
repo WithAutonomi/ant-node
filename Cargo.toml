@@ -32,7 +32,7 @@ path = "src/bin/saorsa-cli/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.14.1"
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core.git", branch = "main" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment

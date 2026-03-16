@@ -197,7 +197,11 @@ impl NodeBuilder {
         core_config.enable_ipv6 = matches!(config.ip_version, IpVersion::Ipv6 | IpVersion::Dual);
 
         // Add bootstrap peers.
-        core_config.bootstrap_peers.clone_from(&config.bootstrap);
+        core_config.bootstrap_peers = config
+            .bootstrap
+            .iter()
+            .map(|addr| saorsa_core::MultiAddr::from(addr))
+            .collect();
 
         // Forward max_message_size to the transport layer.
         core_config.max_message_size = Some(config.max_message_size);

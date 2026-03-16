@@ -337,7 +337,10 @@ async fn create_client_node(bootstrap: Vec<std::net::SocketAddr>) -> Result<Arc<
         .map_err(|e| Error::Config(format!("Invalid listen addr: {e}")))?;
     core_config.listen_addrs = vec![core_config.listen_addr];
     core_config.enable_ipv6 = false;
-    core_config.bootstrap_peers = bootstrap;
+    core_config.bootstrap_peers = bootstrap
+        .iter()
+        .map(|addr| saorsa_core::MultiAddr::from(addr))
+        .collect();
     core_config.max_message_size = Some(MAX_WIRE_MESSAGE_SIZE);
     core_config.mode = saorsa_core::NodeMode::Client;
 
