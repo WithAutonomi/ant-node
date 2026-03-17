@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use self_encryption::DataMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::BuildHasher;
 use std::io::{BufReader, Read, Write};
@@ -177,6 +177,12 @@ pub async fn encrypt_and_upload_file(
     let (mut stream, read_error) = open_encrypt_stream(file_path, file_size)?;
     let mut all_tx_hashes: Vec<String> = Vec::new();
     let mut chunk_count: usize = 0;
+    let mut duplicates_skipped: usize = 0;
+
+    // Track chunk addresses already paid for to avoid duplicate payments
+    // across waves. Content-addressed chunks (BLAKE3) with identical content
+    // share the same address, so we only need to pay once.
+    let mut paid_addresses: HashSet<XorName> = HashSet::new();
 
     // Shared pool of in-flight store operations across all waves.
     let mut store_futs: FuturesUnordered<
@@ -191,11 +197,16 @@ pub async fn encrypt_and_upload_file(
         let mut wave_idx: usize = 0;
 
         loop {
-            // Pull the next wave of chunks from the encryption stream.
+            // Pull the next wave of chunks from the encryption stream,
+            // skipping any chunk whose address was already paid in a prior wave.
             let mut wave: Vec<Bytes> = Vec::with_capacity(PAYMENT_WAVE_SIZE);
             for chunk_result in chunks_iter.by_ref() {
-                let (_hash, content) = chunk_result
+                let (hash, content) = chunk_result
                     .map_err(|e| Error::Crypto(format!("Self-encryption failed: {e}")))?;
+                if !paid_addresses.insert(hash) {
+                    duplicates_skipped += 1;
+                    continue;
+                }
                 wave.push(content);
                 if wave.len() >= PAYMENT_WAVE_SIZE {
                     break;
@@ -241,7 +252,13 @@ pub async fn encrypt_and_upload_file(
         .into_datamap()
         .ok_or_else(|| Error::Crypto("DataMap not available after encryption".into()))?;
 
-    info!("All {chunk_count} encrypted chunks uploaded");
+    if duplicates_skipped > 0 {
+        info!(
+            "All {chunk_count} unique encrypted chunks uploaded ({duplicates_skipped} duplicates skipped)"
+        );
+    } else {
+        info!("All {chunk_count} encrypted chunks uploaded");
+    }
     Ok((data_map, all_tx_hashes))
 }
 
