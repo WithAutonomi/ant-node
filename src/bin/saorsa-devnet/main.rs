@@ -5,7 +5,8 @@ mod cli;
 use clap::Parser;
 use cli::Cli;
 use saorsa_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
-use tracing::info;
+use saorsa_node::info;
+#[cfg(debug_assertions)]
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
@@ -14,13 +15,16 @@ async fn main() -> color_eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    #[cfg(debug_assertions)]
+    {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(filter)
+            .init();
+    }
 
     info!("saorsa-devnet v{}", env!("CARGO_PKG_VERSION"));
 

@@ -26,6 +26,7 @@ use crate::ant_protocol::{
 use crate::error::{Error, Result};
 use crate::payment::single_node::REQUIRED_QUOTES;
 use crate::payment::{calculate_price, PaymentProof, SingleNodePayment};
+use crate::{debug, info, warn};
 use ant_evm::{Amount, EncodedPeerId, PaymentQuote, ProofOfPayment};
 use bytes::Bytes;
 use evmlib::wallet::Wallet;
@@ -36,7 +37,6 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info, warn};
 
 /// Default timeout for network operations in seconds.
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -173,8 +173,8 @@ impl QuantumClient {
     /// Returns an error if the network operation fails.
     pub async fn get_chunk(&self, address: &XorName) -> Result<Option<DataChunk>> {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let addr_hex = hex::encode(address);
-            debug!("Querying saorsa network for chunk: {addr_hex}");
+            let _addr_hex = hex::encode(address);
+            debug!("Querying saorsa network for chunk: {_addr_hex}");
         }
 
         let Some(ref node) = self.p2p_node else {
@@ -294,8 +294,8 @@ impl QuantumClient {
         &self,
         content: Bytes,
     ) -> Result<(XorName, Vec<evmlib::common::TxHash>)> {
-        let content_len = content.len();
-        info!("Storing chunk with payment ({content_len} bytes)");
+        let _content_len = content.len();
+        info!("Storing chunk with payment ({_content_len} bytes)");
 
         let Some(ref node) = self.p2p_node else {
             return Err(Error::Network("P2P node not configured".into()));
@@ -454,8 +454,8 @@ impl QuantumClient {
     ///
     /// Returns an error if DHT lookup or quote collection fails.
     pub async fn prepare_chunk_payment(&self, content: Bytes) -> Result<PreparedChunk> {
-        let content_len = content.len();
-        debug!("Preparing payment for chunk ({content_len} bytes)");
+        let _content_len = content.len();
+        debug!("Preparing payment for chunk ({_content_len} bytes)");
 
         self.p2p_node
             .as_ref()
@@ -524,9 +524,9 @@ impl QuantumClient {
             return Ok(Vec::new());
         }
 
-        let total_amount: Amount = prepared.iter().map(|p| p.payment.total_amount()).sum();
-        let chunk_count = prepared.len();
-        info!("Batch payment for {chunk_count} chunks: {total_amount} atto total");
+        let _total_amount: Amount = prepared.iter().map(|p| p.payment.total_amount()).sum();
+        let _chunk_count = prepared.len();
+        info!("Batch payment for {_chunk_count} chunks: {_total_amount} atto total");
 
         let all_quote_payments: Vec<(ant_evm::QuoteHash, ant_evm::RewardsAddress, Amount)> =
             prepared
@@ -541,13 +541,13 @@ impl QuantumClient {
             },
         )?;
 
-        let unique_tx_count = {
+        let _unique_tx_count = {
             let mut txs: Vec<_> = tx_hash_map.values().collect();
             txs.sort();
             txs.dedup();
             txs.len()
         };
-        info!("Batch payment successful: {unique_tx_count} on-chain transaction(s) for {chunk_count} chunks");
+        info!("Batch payment successful: {_unique_tx_count} on-chain transaction(s) for {_chunk_count} chunks");
 
         prepared
             .into_iter()
@@ -676,7 +676,7 @@ impl QuantumClient {
         request_id: u64,
         timeout_secs: u64,
         addr_hex: String,
-        content_size: usize,
+        _content_size: usize,
     ) -> Result<XorName> {
         let timeout = Duration::from_secs(timeout_secs);
         send_and_await_chunk_response(
@@ -688,7 +688,7 @@ impl QuantumClient {
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
                     info!(
-                        "Chunk stored at address: {} ({content_size} bytes)",
+                        "Chunk stored at address: {} ({_content_size} bytes)",
                         hex::encode(addr),
                     );
                     Some(Ok(addr))
@@ -835,9 +835,9 @@ impl QuantumClient {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let addr_hex = hex::encode(address);
+            let _addr_hex = hex::encode(address);
             debug!(
-                "Requesting {REQUIRED_QUOTES} quotes from DHT for chunk {addr_hex} (size: {data_size})"
+                "Requesting {REQUIRED_QUOTES} quotes from DHT for chunk {_addr_hex} (size: {data_size})"
             );
         }
 
@@ -921,8 +921,8 @@ impl QuantumClient {
 
             let message_bytes = match message.encode() {
                 Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("Failed to encode quote request for {peer_id}: {e}");
+                Err(_e) => {
+                    warn!("Failed to encode quote request for {peer_id}: {_e}");
                     continue;
                 }
             };
@@ -990,8 +990,8 @@ impl QuantumClient {
                         break;
                     }
                 }
-                Err(e) => {
-                    warn!("Failed to get quote from {peer_id}: {e}");
+                Err(_e) => {
+                    warn!("Failed to get quote from {peer_id}: {_e}");
                     // Continue trying other peers
                 }
             }
@@ -1006,9 +1006,9 @@ impl QuantumClient {
         }
 
         if tracing::enabled!(tracing::Level::INFO) {
-            let quote_count = quotes_with_peers.len();
-            let addr_hex = hex::encode(address);
-            info!("Collected {quote_count} quotes for chunk {addr_hex}");
+            let _quote_count = quotes_with_peers.len();
+            let _addr_hex = hex::encode(address);
+            info!("Collected {_quote_count} quotes for chunk {_addr_hex}");
         }
 
         Ok((closest_peer, quotes_with_peers))

@@ -15,6 +15,7 @@
 use crate::client::data_types::XorName as ChunkAddress;
 use crate::client::quantum::{PaidChunk, PreparedChunk, QuantumClient};
 use crate::error::{Error, Result};
+use crate::{info, warn};
 use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use self_encryption::DataMap;
@@ -26,7 +27,6 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
-use tracing::{info, warn};
 use xor_name::XorName;
 
 /// Size of the read buffer used when streaming file data into the encryptor.
@@ -115,9 +115,9 @@ fn write_stream_to_file(
     })();
 
     if let Err(e) = result {
-        if let Err(cleanup_err) = std::fs::remove_file(&tmp_path) {
+        if let Err(_cleanup_err) = std::fs::remove_file(&tmp_path) {
             warn!(
-                "Failed to remove temp file {}: {cleanup_err}",
+                "Failed to remove temp file {}: {_cleanup_err}",
                 tmp_path.display()
             );
         }
@@ -357,8 +357,8 @@ pub async fn download_and_decrypt_file(
     output_path: &Path,
     client: &QuantumClient,
 ) -> Result<()> {
-    let chunk_count = data_map.chunk_identifiers.len();
-    info!("Decrypting file: {chunk_count} chunk(s) to decrypt (fetching on-demand)");
+    let _chunk_count = data_map.chunk_identifiers.len();
+    info!("Decrypting file: {_chunk_count} chunk(s) to decrypt (fetching on-demand)");
 
     let handle = Handle::current();
 
@@ -448,8 +448,8 @@ pub async fn store_data_map_public(
     let content = Bytes::from(data_map_bytes);
     let (address, tx_hashes) = client.put_chunk_with_payment(content).await?;
     let tx_strs: Vec<String> = tx_hashes.iter().map(|tx| format!("{tx:?}")).collect();
-    let address_hex = hex::encode(address);
-    info!("DataMap stored publicly at {address_hex}");
+    let _address_hex = hex::encode(address);
+    info!("DataMap stored publicly at {_address_hex}");
     Ok((address, tx_strs))
 }
 

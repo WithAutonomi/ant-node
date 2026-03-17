@@ -11,11 +11,11 @@
 //! This saves gas fees while maintaining the same total payment amount.
 
 use crate::error::{Error, Result};
+use crate::info;
 use ant_evm::{Amount, PaymentQuote, QuoteHash, QuotingMetrics, RewardsAddress};
 use evmlib::contract::payment_vault;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
-use tracing::info;
 
 /// Required number of quotes for `SingleNode` payment (matches `CLOSE_GROUP_SIZE`)
 pub const REQUIRED_QUOTES: usize = 5;

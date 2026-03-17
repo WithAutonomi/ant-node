@@ -4,12 +4,12 @@
 //! generic function used by both [`super::QuantumClient`] and E2E test helpers.
 
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, CHUNK_PROTOCOL_ID};
+use crate::{debug, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PEvent, P2PNode};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
-use tracing::{debug, warn};
 
 /// Send a chunk-protocol message to `target_peer` and await a matching response.
 ///
@@ -57,8 +57,8 @@ pub async fn send_and_await_chunk_response<T, E>(
             })) if topic == CHUNK_PROTOCOL_ID && source == *target_peer => {
                 let response = match ChunkMessage::decode(&data) {
                     Ok(r) => r,
-                    Err(e) => {
-                        warn!("Failed to decode chunk message, skipping: {e}");
+                    Err(_e) => {
+                        warn!("Failed to decode chunk message, skipping: {_e}");
                         continue;
                     }
                 };
@@ -70,8 +70,8 @@ pub async fn send_and_await_chunk_response<T, E>(
                 }
             }
             Ok(Ok(_)) => {}
-            Ok(Err(RecvError::Lagged(skipped))) => {
-                debug!("Chunk protocol events lagged by {skipped} messages, continuing");
+            Ok(Err(RecvError::Lagged(_skipped))) => {
+                debug!("Chunk protocol events lagged by {_skipped} messages, continuing");
             }
             Ok(Err(RecvError::Closed)) | Err(_) => break,
         }

@@ -145,6 +145,7 @@ pub struct NodeConfig {
     #[serde(default = "default_max_message_size")]
     pub max_message_size: usize,
 
+    #[cfg(debug_assertions)]
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -265,6 +266,7 @@ impl Default for NodeConfig {
             bootstrap_cache: BootstrapCacheConfig::default(),
             storage: StorageConfig::default(),
             max_message_size: default_max_message_size(),
+            #[cfg(debug_assertions)]
             log_level: default_log_level(),
         }
     }
@@ -370,6 +372,7 @@ fn default_max_message_size() -> usize {
     crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE
 }
 
+#[cfg(debug_assertions)]
 fn default_log_level() -> String {
     "info".to_string()
 }

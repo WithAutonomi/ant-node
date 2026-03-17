@@ -7,6 +7,7 @@
 //! capabilities from saorsa-core. This module provides the interface
 //! and will be fully integrated when the node is initialized.
 
+use crate::debug;
 use crate::error::{Error, Result};
 use crate::payment::metrics::QuotingMetricsTracker;
 use ant_evm::{PaymentQuote, QuotingMetrics, RewardsAddress};
@@ -14,7 +15,6 @@ use saorsa_core::MlDsa65;
 use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use saorsa_pqc::pqc::MlDsaOperations;
 use std::time::SystemTime;
-use tracing::debug;
 
 /// Content address type (32-byte `XorName`).
 pub type XorName = [u8; 32];
@@ -157,8 +157,8 @@ impl QuoteGenerator {
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let content_hex = hex::encode(content);
-            debug!("Generated quote for {content_hex} (size: {data_size}, type: {data_type})");
+            let _content_hex = hex::encode(content);
+            debug!("Generated quote for {_content_hex} (size: {data_size}, type: {data_type})");
         }
 
         Ok(quote)
@@ -231,8 +231,8 @@ pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
     // Parse public key from quote
     let pub_key = match MlDsaPublicKey::from_bytes(&quote.pub_key) {
         Ok(pk) => pk,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 public key from quote: {e}");
+        Err(_e) => {
+            debug!("Failed to parse ML-DSA-65 public key from quote: {_e}");
             return false;
         }
     };
@@ -240,8 +240,8 @@ pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
     // Parse signature from quote
     let signature = match MlDsaSignature::from_bytes(&quote.signature) {
         Ok(sig) => sig,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 signature from quote: {e}");
+        Err(_e) => {
+            debug!("Failed to parse ML-DSA-65 signature from quote: {_e}");
             return false;
         }
     };
@@ -258,8 +258,8 @@ pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
             }
             valid
         }
-        Err(e) => {
-            debug!("ML-DSA-65 verification error: {e}");
+        Err(_e) => {
+            debug!("ML-DSA-65 verification error: {_e}");
             false
         }
     }
@@ -290,8 +290,8 @@ pub fn wire_ml_dsa_signer(
     let ml_dsa = MlDsa65::new();
     generator.set_signer(pub_key_bytes, move |msg| match ml_dsa.sign(&sk, msg) {
         Ok(sig) => sig.as_bytes().to_vec(),
-        Err(e) => {
-            tracing::error!("ML-DSA-65 signing failed: {e}");
+        Err(_e) => {
+            crate::error!("ML-DSA-65 signing failed: {_e}");
             vec![]
         }
     });

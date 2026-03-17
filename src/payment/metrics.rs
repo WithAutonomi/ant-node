@@ -5,12 +5,12 @@
 //! - Storage capacity and usage
 //! - Network liveness information
 
+use crate::{debug, info, warn};
 use ant_evm::QuotingMetrics;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-use tracing::{debug, info, warn};
 
 /// Number of operations between disk persists (debounce).
 const PERSIST_INTERVAL: usize = 10;
@@ -91,8 +91,8 @@ impl QuotingMetricsTracker {
 
     /// Record a payment received.
     pub fn record_payment(&self) {
-        let count = self.received_payment_count.fetch_add(1, Ordering::SeqCst) + 1;
-        debug!("Payment received, total count: {count}");
+        let _count = self.received_payment_count.fetch_add(1, Ordering::SeqCst) + 1;
+        debug!("Payment received, total count: {_count}");
         self.maybe_persist();
     }
 
@@ -179,8 +179,8 @@ impl QuotingMetricsTracker {
             };
 
             if let Ok(bytes) = rmp_serde::to_vec(&data) {
-                if let Err(e) = std::fs::write(path, bytes) {
-                    warn!("Failed to persist metrics: {e}");
+                if let Err(_e) = std::fs::write(path, bytes) {
+                    warn!("Failed to persist metrics: {_e}");
                 }
             }
         }

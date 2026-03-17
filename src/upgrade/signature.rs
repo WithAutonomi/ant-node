@@ -17,11 +17,11 @@
 //! This is an inherent property of FIPS 204 ML-DSA lattice-based signatures and
 //! is accepted as a reasonable trade-off for post-quantum security.
 
+use crate::debug;
 use crate::error::{Error, Result};
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVariant};
 use std::fs;
 use std::path::Path;
-use tracing::debug;
 
 /// Signing context for domain separation (prevents cross-protocol attacks).
 pub const SIGNING_CONTEXT: &[u8] = b"saorsa-node-release-v1";

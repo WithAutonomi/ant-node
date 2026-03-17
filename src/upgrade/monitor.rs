@@ -11,10 +11,10 @@ use crate::config::UpgradeChannel;
 use crate::error::{Error, Result};
 use crate::upgrade::rollout::StagedRollout;
 use crate::upgrade::UpgradeInfo;
+use crate::{debug, info, warn};
 use semver::Version;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
 
 /// GitHub release API response.
 #[derive(Debug, Deserialize)]
@@ -77,8 +77,8 @@ impl UpgradeMonitor {
             .user_agent(concat!("saorsa-node/", env!("CARGO_PKG_VERSION")))
             .timeout(Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|e| {
-                warn!("Failed to build reqwest client for upgrades: {e}");
+            .unwrap_or_else(|_e| {
+                warn!("Failed to build reqwest client for upgrades: {_e}");
                 reqwest::Client::new()
             });
 
@@ -248,11 +248,11 @@ impl UpgradeMonitor {
             self.pending_upgrade_detected = Some(Instant::now());
             self.pending_upgrade_version = Some(info.version.clone());
 
-            let delay = rollout.calculate_delay_for_version(&info.version);
+            let _delay = rollout.calculate_delay_for_version(&info.version);
             info!(
                 new_version = %info.version,
-                delay_hours = delay.as_secs() / 3600,
-                delay_minutes = (delay.as_secs() % 3600) / 60,
+                delay_hours = _delay.as_secs() / 3600,
+                delay_minutes = (_delay.as_secs() % 3600) / 60,
                 "New version detected, staged rollout delay calculated"
             );
         }
@@ -274,11 +274,11 @@ impl UpgradeMonitor {
             );
             Ok(Some(info))
         } else {
-            let remaining = delay.saturating_sub(elapsed);
+            let _remaining = delay.saturating_sub(elapsed);
             debug!(
                 "Staged rollout: {}h {}m remaining before upgrade to {}",
-                remaining.as_secs() / 3600,
-                (remaining.as_secs() % 3600) / 60,
+                _remaining.as_secs() / 3600,
+                (_remaining.as_secs() % 3600) / 60,
                 info.version
             );
             Ok(None)

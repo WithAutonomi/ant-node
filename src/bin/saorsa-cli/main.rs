@@ -16,10 +16,11 @@ use saorsa_node::client::self_encrypt::{
 use saorsa_node::client::{QuantumClient, QuantumConfig, XorName};
 use saorsa_node::devnet::DevnetManifest;
 use saorsa_node::error::Error;
+use saorsa_node::info;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::info;
+#[cfg(debug_assertions)]
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 /// Length of an `XorName` address in bytes.
@@ -31,13 +32,16 @@ async fn main() -> color_eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    #[cfg(debug_assertions)]
+    {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
-    tracing_subscriber::registry()
-        .with(fmt::layer().with_writer(std::io::stderr))
-        .with(filter)
-        .init();
+        tracing_subscriber::registry()
+            .with(fmt::layer().with_writer(std::io::stderr))
+            .with(filter)
+            .init();
+    }
 
     info!("saorsa-cli v{}", env!("CARGO_PKG_VERSION"));
 
@@ -185,8 +189,8 @@ async fn handle_download(
         ));
     };
 
-    let chunk_count = data_map.chunk_identifiers.len();
-    info!("DataMap loaded: {chunk_count} chunk(s)");
+    let _chunk_count = data_map.chunk_identifiers.len();
+    info!("DataMap loaded: {_chunk_count} chunk(s)");
 
     // Determine output path
     let output_path = output.map_or_else(

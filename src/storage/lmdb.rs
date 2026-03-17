@@ -9,11 +9,11 @@
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
+use crate::{debug, trace, warn};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
-use tracing::{debug, trace, warn};
 
 /// Default LMDB map size: 32 GiB.
 ///
@@ -369,8 +369,8 @@ impl LmdbStorage {
         let mut stats = self.stats.read().clone();
         match self.current_chunks() {
             Ok(count) => stats.current_chunks = count,
-            Err(e) => {
-                warn!("Failed to read current_chunks for stats: {e}");
+            Err(_e) => {
+                warn!("Failed to read current_chunks for stats: {_e}");
                 stats.current_chunks = 0;
             }
         }

@@ -35,9 +35,9 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::storage::lmdb::LmdbStorage;
+use crate::{debug, info, warn};
 use bytes::Bytes;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
 ///
@@ -131,8 +131,8 @@ impl AntProtocol {
     /// Handle a PUT request.
     async fn handle_put(&self, request: ChunkPutRequest) -> ChunkPutResponse {
         let address = request.address;
-        let addr_hex = hex::encode(address);
-        debug!("Handling PUT request for {addr_hex}");
+        let _addr_hex = hex::encode(address);
+        debug!("Handling PUT request for {_addr_hex}");
 
         // 1. Validate chunk size
         if request.content.len() > MAX_CHUNK_SIZE {
@@ -154,7 +154,7 @@ impl AntProtocol {
         // 3. Check if already exists (idempotent success)
         match self.storage.exists(&address) {
             Ok(true) => {
-                debug!("Chunk {addr_hex} already exists");
+                debug!("Chunk {_addr_hex} already exists");
                 return ChunkPutResponse::AlreadyExists { address };
             }
             Err(e) => {
@@ -188,16 +188,16 @@ impl AntProtocol {
         // 5. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
-                let content_len = request.content.len();
-                info!("Stored chunk {addr_hex} ({content_len} bytes)");
+                let _content_len = request.content.len();
+                info!("Stored chunk {_addr_hex} ({_content_len} bytes)");
                 // Record the store and payment in metrics
                 self.quote_generator.record_store(DATA_TYPE_CHUNK);
                 self.quote_generator.record_payment();
                 ChunkPutResponse::Success { address }
             }
-            Err(e) => {
-                warn!("Failed to store chunk {addr_hex}: {e}");
-                ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()))
+            Err(_e) => {
+                warn!("Failed to store chunk {_addr_hex}: {_e}");
+                ChunkPutResponse::Error(ProtocolError::StorageFailed(_e.to_string()))
             }
         }
     }
@@ -205,31 +205,31 @@ impl AntProtocol {
     /// Handle a GET request.
     async fn handle_get(&self, request: ChunkGetRequest) -> ChunkGetResponse {
         let address = request.address;
-        let addr_hex = hex::encode(address);
-        debug!("Handling GET request for {addr_hex}");
+        let _addr_hex = hex::encode(address);
+        debug!("Handling GET request for {_addr_hex}");
 
         match self.storage.get(&address).await {
             Ok(Some(content)) => {
-                let content_len = content.len();
-                debug!("Retrieved chunk {addr_hex} ({content_len} bytes)");
+                let _content_len = content.len();
+                debug!("Retrieved chunk {_addr_hex} ({_content_len} bytes)");
                 ChunkGetResponse::Success { address, content }
             }
             Ok(None) => {
-                debug!("Chunk {addr_hex} not found");
+                debug!("Chunk {_addr_hex} not found");
                 ChunkGetResponse::NotFound { address }
             }
-            Err(e) => {
-                warn!("Failed to retrieve chunk {addr_hex}: {e}");
-                ChunkGetResponse::Error(ProtocolError::StorageFailed(e.to_string()))
+            Err(_e) => {
+                warn!("Failed to retrieve chunk {_addr_hex}: {_e}");
+                ChunkGetResponse::Error(ProtocolError::StorageFailed(_e.to_string()))
             }
         }
     }
 
     /// Handle a quote request.
     fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
-        let addr_hex = hex::encode(request.address);
-        let data_size = request.data_size;
-        debug!("Handling quote request for {addr_hex} (size: {data_size})");
+        let _addr_hex = hex::encode(request.address);
+        let _data_size = request.data_size;
+        debug!("Handling quote request for {_addr_hex} (size: {_data_size})");
 
         // Validate data size - data_size is u64, cast carefully and reject overflow
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {

@@ -8,13 +8,13 @@ use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::deserialize_proof;
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
 use crate::payment::single_node::REQUIRED_QUOTES;
+use crate::{debug, info};
 use ant_evm::{ProofOfPayment, RewardsAddress};
 use evmlib::contract::payment_vault::error::Error as PaymentVaultError;
 use evmlib::contract::payment_vault::verify_data_payment;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use std::time::SystemTime;
-use tracing::{debug, info};
 
 /// Minimum allowed size for a payment proof in bytes.
 ///
@@ -123,9 +123,9 @@ impl PaymentVerifier {
     pub fn new(config: PaymentVerifierConfig) -> Self {
         let cache = VerifiedCache::with_capacity(config.cache_capacity);
 
-        let cache_capacity = config.cache_capacity;
-        let evm_enabled = config.evm.enabled;
-        info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm_enabled={evm_enabled})");
+        let _cache_capacity = config.cache_capacity;
+        let _evm_enabled = config.evm.enabled;
+        info!("Payment verifier initialized (cache_capacity={_cache_capacity}, evm_enabled={_evm_enabled})");
 
         Self { cache, config }
     }
@@ -284,9 +284,9 @@ impl PaymentVerifier {
     /// not bypass verification here.
     async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
-            let xorname_hex = hex::encode(xorname);
-            let quote_count = payment.peer_quotes.len();
-            debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
+            let _xorname_hex = hex::encode(xorname);
+            let _quote_count = payment.peer_quotes.len();
+            debug!("Verifying EVM payment for {_xorname_hex} with {_quote_count} quotes");
         }
 
         debug_assert!(self.config.evm.enabled);

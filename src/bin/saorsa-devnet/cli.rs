@@ -44,6 +44,7 @@ pub struct Cli {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
+    #[cfg(debug_assertions)]
     /// Log level for devnet process.
     #[arg(long, default_value = "info")]
     pub log_level: String,

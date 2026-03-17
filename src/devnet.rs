@@ -10,6 +10,7 @@ use crate::payment::{
     QuotingMetricsTracker,
 };
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use crate::{debug, info, warn};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use rand::Rng;
@@ -26,7 +27,6 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
 
 // =============================================================================
 // Devnet Constants
@@ -432,14 +432,14 @@ impl Devnet {
                 handle.abort();
             }
 
-            let node_index = node.index;
+            let _node_index = node.index;
             let node_state = Arc::clone(&node.state);
             let p2p_node = node.p2p_node.take();
 
             shutdown_futures.push(async move {
                 if let Some(p2p) = p2p_node {
-                    if let Err(e) = p2p.shutdown().await {
-                        warn!("Error shutting down node {node_index}: {e}");
+                    if let Err(_e) = p2p.shutdown().await {
+                        warn!("Error shutting down node {_node_index}: {_e}");
                     }
                 }
                 *node_state.write().await = NodeState::Stopped;
@@ -448,8 +448,8 @@ impl Devnet {
         futures::future::join_all(shutdown_futures).await;
 
         if self.config.cleanup_data_dir {
-            if let Err(e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
-                warn!("Failed to cleanup devnet data directory: {e}");
+            if let Err(_e) = tokio::fs::remove_dir_all(&self.config.data_dir).await {
+                warn!("Failed to cleanup devnet data directory: {_e}");
             }
         }
 
@@ -491,8 +491,8 @@ impl Devnet {
     }
 
     async fn start_regular_nodes(&mut self) -> Result<()> {
-        let regular_count = self.config.node_count - self.config.bootstrap_count;
-        info!("Starting {} regular nodes", regular_count);
+        let _regular_count = self.config.node_count - self.config.bootstrap_count;
+        info!("Starting {} regular nodes", _regular_count);
 
         let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
@@ -655,7 +655,7 @@ impl Devnet {
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
-            let node_index = node.index;
+            let _node_index = node.index;
             node.protocol_task = Some(tokio::spawn(async move {
                 while let Ok(event) = events.recv().await {
                     if let P2PEvent::Message {
@@ -666,14 +666,14 @@ impl Devnet {
                     {
                         if topic == CHUNK_PROTOCOL_ID {
                             debug!(
-                                "Node {node_index} received chunk protocol message from {source}"
+                                "Node {_node_index} received chunk protocol message from {source}"
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             tokio::spawn(async move {
                                 match protocol.handle_message(&data).await {
                                     Ok(response) => {
-                                        if let Err(e) = p2p
+                                        if let Err(_e) = p2p
                                             .send_message(
                                                 &source,
                                                 CHUNK_PROTOCOL_ID,
@@ -682,12 +682,12 @@ impl Devnet {
                                             .await
                                         {
                                             warn!(
-                                                "Node {node_index} failed to send response to {source}: {e}"
+                                                "Node {_node_index} failed to send response to {source}: {_e}"
                                             );
                                         }
                                     }
-                                    Err(e) => {
-                                        warn!("Node {node_index} protocol handler error: {e}");
+                                    Err(_e) => {
+                                        warn!("Node {_node_index} protocol handler error: {_e}");
                                     }
                                 }
                             });
@@ -786,9 +786,9 @@ impl Devnet {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(check_interval) => {
-                        for (i, node) in nodes.iter().enumerate() {
+                        for (_i, node) in nodes.iter().enumerate() {
                             if !node.is_running() {
-                                warn!("Node {} appears unhealthy", i);
+                                warn!("Node {} appears unhealthy", _i);
                             }
                         }
                     }

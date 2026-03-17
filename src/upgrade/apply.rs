@@ -9,6 +9,7 @@
 
 use crate::error::{Error, Result};
 use crate::upgrade::{signature, UpgradeInfo, UpgradeResult};
+use crate::{debug, error, info, warn};
 use flate2::read::GzDecoder;
 use semver::Version;
 use std::env;
@@ -16,7 +17,6 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
-use tracing::{debug, error, info, warn};
 
 /// Maximum allowed upgrade archive size (200 MiB).
 const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;

@@ -25,6 +25,7 @@ pub struct Cli {
     #[arg(long)]
     pub allow_loopback: bool,
 
+    #[cfg(debug_assertions)]
     /// Log level.
     #[arg(long, default_value = "info")]
     pub log_level: String,

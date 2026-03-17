@@ -67,20 +67,24 @@ pub struct Cli {
     #[arg(long, default_value = "9100", env = "SAORSA_METRICS_PORT")]
     pub metrics_port: u16,
 
+    #[cfg(debug_assertions)]
     /// Log level.
     #[arg(long, value_enum, default_value = "info", env = "RUST_LOG")]
     pub log_level: CliLogLevel,
 
+    #[cfg(debug_assertions)]
     /// Log output format.
     #[arg(long, value_enum, default_value = "text", env = "SAORSA_LOG_FORMAT")]
     pub log_format: CliLogFormat,
 
+    #[cfg(debug_assertions)]
     /// Directory for log file output.
     /// When set, logs are written to files in this directory instead of stdout.
     /// Files rotate daily and are named saorsa-node.YYYY-MM-DD.log.
     #[arg(long, env = "SAORSA_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
 
+    #[cfg(debug_assertions)]
     /// Maximum number of rotated log files to retain (only used with --log-dir).
     /// Oldest files are deleted when this limit is reached. Rotation is daily.
     #[arg(long, default_value = "7", env = "SAORSA_LOG_MAX_FILES")]
@@ -208,7 +212,10 @@ impl Cli {
         config.port = self.port;
         config.ip_version = self.ip_version.into();
         config.bootstrap = self.bootstrap;
-        config.log_level = self.log_level.into();
+        #[cfg(debug_assertions)]
+        {
+            config.log_level = self.log_level.into();
+        }
         config.network_mode = self.network_mode.into();
 
         // Upgrade config

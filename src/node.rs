@@ -12,6 +12,7 @@ use crate::payment::wallet::parse_rewards_address;
 use crate::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator};
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{AutoApplyUpgrader, UpgradeMonitor, UpgradeResult};
+use crate::{debug, error, info, warn};
 use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
 use saorsa_core::identity::NodeIdentity;
@@ -25,7 +26,6 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
 
 /// Node storage capacity limit (5 GB).
 ///
@@ -93,9 +93,9 @@ impl NodeBuilder {
 
         // Warn if payment disabled in any mode
         if !self.config.payment.enabled {
-            let mode = self.config.network_mode;
+            let _mode = self.config.network_mode;
             warn!("⚠️  ⚠️  ⚠️");
-            warn!("⚠️  PAYMENT VERIFICATION DISABLED (mode: {mode:?})");
+            warn!("⚠️  PAYMENT VERIFICATION DISABLED (mode: {_mode:?})");
             warn!("⚠️  This should ONLY be used for testing!");
             warn!("⚠️  All storage requests will be accepted for FREE");
             warn!("⚠️  ⚠️  ⚠️");
@@ -103,9 +103,9 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
-        let peer_id = identity.peer_id().to_hex();
+        let _peer_id = identity.peer_id().to_hex();
 
-        info!(peer_id = %peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
+        info!(peer_id = %_peer_id, root_dir = %self.config.root_dir.display(), "Node identity resolved");
 
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
@@ -404,8 +404,8 @@ impl NodeBuilder {
             .unwrap_or_else(|| config.root_dir.join("bootstrap_cache"));
 
         // Create cache directory
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            warn!("Failed to create bootstrap cache directory: {e}");
+        if let Err(_e) = std::fs::create_dir_all(&cache_dir) {
+            warn!("Failed to create bootstrap cache directory: {_e}");
             return None;
         }
 
@@ -423,8 +423,8 @@ impl NodeBuilder {
                 );
                 Some(manager)
             }
-            Err(e) => {
-                warn!("Failed to initialize bootstrap cache: {e}");
+            Err(_e) => {
+                warn!("Failed to initialize bootstrap cache: {_e}");
                 None
             }
         }
@@ -481,12 +481,12 @@ impl RunningNode {
             .await
             .map_err(|e| Error::Startup(format!("Failed to start P2P node: {e}")))?;
 
-        let addrs = self.p2p_node.listen_addrs().await;
-        info!(listen_addrs = ?addrs, "P2P node started");
+        let _addrs = self.p2p_node.listen_addrs().await;
+        info!(listen_addrs = ?_addrs, "P2P node started");
 
         // Emit started event
-        if let Err(e) = self.events_tx.send(NodeEvent::Started) {
-            warn!("Failed to send Started event: {e}");
+        if let Err(_e) = self.events_tx.send(NodeEvent::Started) {
+            warn!("Failed to send Started event: {_e}");
         }
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
@@ -515,27 +515,27 @@ impl RunningNode {
                                 );
 
                                 // Send notification event
-                                if let Err(e) = events_tx.send(NodeEvent::UpgradeAvailable {
+                                if let Err(_e) = events_tx.send(NodeEvent::UpgradeAvailable {
                                     version: upgrade_info.version.to_string(),
                                 }) {
-                                    warn!("Failed to send UpgradeAvailable event: {e}");
+                                    warn!("Failed to send UpgradeAvailable event: {_e}");
                                 }
 
                                 // Auto-apply the upgrade
                                 info!("Starting auto-apply upgrade...");
                                 match upgrader.apply_upgrade(&upgrade_info).await {
-                                    Ok(UpgradeResult::Success { version }) => {
-                                        info!(version = %version, "Upgrade successful, process will restart");
+                                    Ok(UpgradeResult::Success { version: _version }) => {
+                                        info!(version = %_version, "Upgrade successful, process will restart");
                                         // If we reach here, exec() failed or not supported
                                     }
-                                    Ok(UpgradeResult::RolledBack { reason }) => {
-                                        warn!("Upgrade rolled back: {reason}");
+                                    Ok(UpgradeResult::RolledBack { reason: _reason }) => {
+                                        warn!("Upgrade rolled back: {_reason}");
                                     }
                                     Ok(UpgradeResult::NoUpgrade) => {
                                         debug!("No upgrade needed");
                                     }
-                                    Err(e) => {
-                                        error!("Critical upgrade error: {e}");
+                                    Err(_e) => {
+                                        error!("Critical upgrade error: {_e}");
                                     }
                                 }
                             }
@@ -554,10 +554,10 @@ impl RunningNode {
 
         // Log bootstrap cache stats before shutdown
         if let Some(ref manager) = self.bootstrap_manager {
-            let stats = manager.stats().await;
+            let _stats = manager.stats().await;
             info!(
                 "Bootstrap cache shutdown: {} peers, avg quality {:.2}",
-                stats.total_peers, stats.average_quality
+                _stats.total_peers, _stats.average_quality
             );
         }
 
@@ -568,12 +568,12 @@ impl RunningNode {
 
         // Shutdown P2P node
         info!("Shutting down P2P node...");
-        if let Err(e) = self.p2p_node.shutdown().await {
-            warn!("Error during P2P node shutdown: {e}");
+        if let Err(_e) = self.p2p_node.shutdown().await {
+            warn!("Error during P2P node shutdown: {_e}");
         }
 
-        if let Err(e) = self.events_tx.send(NodeEvent::ShuttingDown) {
-            warn!("Failed to send ShuttingDown event: {e}");
+        if let Err(_e) = self.events_tx.send(NodeEvent::ShuttingDown) {
+            warn!("Failed to send ShuttingDown event: {_e}");
         }
         info!("Node shutdown complete");
         Ok(())
@@ -661,15 +661,15 @@ impl RunningNode {
                             };
                             match protocol.handle_message(&data).await {
                                 Ok(response) => {
-                                    if let Err(e) = p2p
+                                    if let Err(_e) = p2p
                                         .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec())
                                         .await
                                     {
-                                        warn!("Failed to send protocol response to {source}: {e}");
+                                        warn!("Failed to send protocol response to {source}: {_e}");
                                     }
                                 }
-                                Err(e) => {
-                                    warn!("Protocol handler error: {e}");
+                                Err(_e) => {
+                                    warn!("Protocol handler error: {_e}");
                                 }
                             }
                         });

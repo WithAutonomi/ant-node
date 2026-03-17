@@ -38,13 +38,13 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
-
 pub mod ant_protocol;
 pub mod client;
 pub mod config;
 pub mod devnet;
 pub mod error;
 pub mod event;
+pub(crate) mod logging;
 pub mod node;
 pub mod payment;
 pub mod storage;
