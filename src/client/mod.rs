@@ -62,4 +62,6 @@ pub use chunk_protocol::send_and_await_chunk_response;
 pub use data_types::{
     compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk, XorName,
 };
-pub use quantum::{hex_node_id_to_encoded_peer_id, QuantumClient, QuantumConfig};
+pub use quantum::{
+    hex_node_id_to_encoded_peer_id, PaidChunk, PreparedChunk, QuantumClient, QuantumConfig,
+};

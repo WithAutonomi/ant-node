@@ -392,7 +392,7 @@ impl QuantumClient {
     /// The `target_peer` should be the peer pinned during quote collection so that
     /// the storage target is guaranteed to be one of the paid peers. Use the
     /// `target_peer` field from [`PaidChunk`] or the first element returned by
-    /// [`get_quotes_from_dht`].
+    /// [`get_quotes_from_dht`](Self::get_quotes_from_dht).
     ///
     /// # Arguments
     ///

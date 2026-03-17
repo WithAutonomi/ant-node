@@ -37,7 +37,7 @@ saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
 ant-evm = "0.1.19"
-evmlib = "0.4.7"
+evmlib = "0.4.9"
 xor_name = "5"
 libp2p = "0.56"  # For PeerId in payment proofs
 multihash = "0.19"  # For identity multihash in PeerId construction

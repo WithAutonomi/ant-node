@@ -139,7 +139,7 @@ fn write_stream_to_file(
 /// The upload proceeds as follows:
 /// 1. **Stream** encrypted chunks lazily from the file — at most one wave
 ///    of chunks lives in memory at a time.
-/// 2. **Wave loop** — for each wave of [`PAYMENT_WAVE_SIZE`] chunks:
+/// 2. **Wave loop** — for each wave of `PAYMENT_WAVE_SIZE` chunks:
 ///    - **Quote** the wave concurrently, while draining completed stores
 ///      from the previous wave via `select!`.
 ///    - **Pay** the wave in a single EVM transaction.
