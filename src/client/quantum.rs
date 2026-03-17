@@ -535,12 +535,11 @@ impl QuantumClient {
                 .map(|q| (q.quote_hash, q.rewards_address, q.amount))
                 .collect();
 
-        let tx_hash_map: BTreeMap<ant_evm::QuoteHash, evmlib::common::TxHash> = wallet
-            .pay_for_quotes(all_quote_payments)
-            .await
-            .map_err(|evmlib::wallet::PayForQuotesError(err, _)| {
+        let (tx_hash_map, _gas_info) = wallet.pay_for_quotes(all_quote_payments).await.map_err(
+            |evmlib::wallet::PayForQuotesError(err, _)| {
                 Error::Payment(format!("Batch payment failed: {err}"))
-            })?;
+            },
+        )?;
 
         let unique_tx_count = {
             let mut txs: Vec<_> = tx_hash_map.values().collect();

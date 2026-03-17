@@ -168,7 +168,7 @@ impl SingleNodePayment {
             REQUIRED_QUOTES - 1
         );
 
-        let tx_hashes = wallet.pay_for_quotes(quote_payments).await.map_err(
+        let (tx_hashes, _gas_info) = wallet.pay_for_quotes(quote_payments).await.map_err(
             |evmlib::wallet::PayForQuotesError(err, _)| {
                 Error::Payment(format!("Failed to pay for quotes: {err}"))
             },
