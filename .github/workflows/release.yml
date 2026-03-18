@@ -24,7 +24,7 @@ permissions:
 jobs:
   validate:
     name: Validate Release
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       version_number: ${{ steps.version.outputs.version_number }}
@@ -77,7 +77,7 @@ jobs:
   test:
     name: Test Suite
     needs: validate
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -106,7 +106,7 @@ jobs:
   security-audit:
     name: Security Audit
     needs: validate
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -324,7 +324,7 @@ jobs:
   sign:
     name: Sign Releases
     needs: [build, installers-linux, installers-windows]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -383,7 +383,7 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     needs: [validate, test, security-audit]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     if: github.event.inputs.dry_run != 'true'
     steps:
       - uses: actions/checkout@v4
@@ -404,7 +404,7 @@ jobs:
   release:
     name: Create GitHub Release
     needs: [validate, sign]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     if: github.event.inputs.dry_run != 'true'
     steps:
       - uses: actions/checkout@v4
