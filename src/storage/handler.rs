@@ -296,7 +296,7 @@ impl AntProtocol {
     /// Exposed for **test harnesses only** — production code should not call
     /// this directly. Use `cache_insert()` on the returned verifier to
     /// pre-populate the payment cache in test setups.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn payment_verifier(&self) -> &PaymentVerifier {
         &self.payment_verifier

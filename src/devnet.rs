@@ -164,13 +164,9 @@ pub struct DevnetConfig {
     /// Whether to remove the data directory on shutdown.
     pub cleanup_data_dir: bool,
 
-    /// Enable EVM payment enforcement on all nodes.
-    /// When true, nodes will require valid on-chain payment proofs.
-    pub enable_evm: bool,
-
     /// Optional EVM network for payment verification.
-    /// When `enable_evm` is true and this is `Some`, nodes will use
-    /// this network (e.g. Anvil testnet) for on-chain verification.
+    /// When `Some`, nodes will use this network (e.g. Anvil testnet) for
+    /// on-chain verification. Defaults to Arbitrum One when `None`.
     pub evm_network: Option<EvmNetwork>,
 }
 
@@ -192,7 +188,6 @@ impl Default for DevnetConfig {
             node_startup_timeout: Duration::from_secs(DEFAULT_NODE_STARTUP_TIMEOUT_SECS),
             enable_node_logging: false,
             cleanup_data_dir: true,
-            enable_evm: false,
             evm_network: None,
         }
     }

@@ -642,7 +642,6 @@ impl RunningNode {
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
-                        let response_topic = response_topic.to_string();
                         tokio::spawn(async move {
                             let Ok(_permit) = sem.acquire().await else {
                                 return;
@@ -654,7 +653,7 @@ impl RunningNode {
                             match result {
                                 Ok(response) => {
                                     if let Err(e) = p2p
-                                        .send_message(&source, &response_topic, response.to_vec())
+                                        .send_message(&source, response_topic, response.to_vec())
                                         .await
                                     {
                                         warn!("Failed to send {data_type} protocol response to {source}: {e}");

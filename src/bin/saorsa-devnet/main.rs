@@ -73,7 +73,6 @@ async fn main() -> color_eyre::Result<()> {
             }
         };
 
-        config.enable_evm = true;
         config.evm_network = Some(network);
 
         info!("Anvil blockchain running at {rpc_url}");

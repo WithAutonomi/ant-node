@@ -48,8 +48,9 @@ pub struct Cli {
     #[arg(long, default_value = "info")]
     pub log_level: String,
 
-    /// Enable EVM payment enforcement with a local Anvil blockchain.
-    /// Starts Anvil, deploys contracts, and enables payment verification on all nodes.
+    /// Start a local Anvil blockchain for EVM payment verification.
+    /// Starts Anvil, deploys contracts, and configures all nodes to verify
+    /// payments against the local chain.
     #[arg(long)]
     pub enable_evm: bool,
 }

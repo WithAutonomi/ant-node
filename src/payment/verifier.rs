@@ -246,6 +246,7 @@ impl PaymentVerifier {
     /// This marks the address as already paid, so subsequent `verify_payment`
     /// calls will return `CachedAsVerified` without on-chain verification.
     /// Useful for test setups where real EVM payment is not needed.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn cache_insert(&self, xorname: XorName) {
         self.cache.insert(xorname);
     }

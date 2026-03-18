@@ -102,15 +102,19 @@ proptest = "1"
 alloy = { version = "1", features = ["node-bindings"] }
 serial_test = "3"
 
-# E2E test infrastructure
+# E2E test infrastructure (run with --features test-utils)
 [[test]]
 name = "e2e"
 path = "tests/e2e/mod.rs"
+required-features = ["test-utils"]
 
 [features]
 default = []
 # Enable additional diagnostics for development
 dev = []
+# Expose test helpers (cache_insert, payment_verifier accessor) for
+# integration tests and downstream test harnesses.
+test-utils = []
 
 [profile.release]
 lto = true
