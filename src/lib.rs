@@ -69,6 +69,9 @@ pub use storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 /// Re-exports from `saorsa-core` so downstream crates (e.g. `saorsa-client`)
 /// can depend on `saorsa-node` alone without a direct `saorsa-core` dependency.
 pub mod core {
-    pub use saorsa_core::identity::PeerId;
-    pub use saorsa_core::{NodeConfig as CoreNodeConfig, NodeMode, P2PNode};
+    pub use saorsa_core::identity::{NodeIdentity, PeerId};
+    pub use saorsa_core::{
+        IPDiversityConfig, MlDsa65, MultiAddr, NodeConfig as CoreNodeConfig, NodeMode, P2PEvent,
+        P2PNode,
+    };
 }

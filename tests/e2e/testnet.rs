@@ -1114,7 +1114,9 @@ impl TestNetwork {
             .build()
             .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
 
-        core_config.bootstrap_peers = node.bootstrap_addrs.clone();
+        core_config
+            .bootstrap_peers
+            .clone_from(&node.bootstrap_addrs);
         core_config.diversity_config = Some(CoreDiversityConfig::permissive());
 
         // Inject the ML-DSA identity so the P2PNode's transport peer ID
