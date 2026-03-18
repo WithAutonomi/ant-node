@@ -39,9 +39,8 @@ pub fn disable_app_nap() -> Result<AppNapActivity, String> {
         // timer firing, App Nap prevention, and idle sleep prevention.
         let options: u64 = 0x00FF_FFFF;
 
-        let reason = NSString::from_str(
-            "saorsa-node: P2P network daemon performing background operations",
-        );
+        let reason =
+            NSString::from_str("saorsa-node: P2P network daemon performing background operations");
 
         let activity: AppNapActivity = msg_send_id![
             &process_info,

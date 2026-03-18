@@ -481,7 +481,8 @@ impl RunningNode {
         // Extract the actual bound port (config port may be 0 = auto-select)
         let actual_port = listen_addrs
             .first()
-            .map_or(self.config.port, std::net::SocketAddr::port);
+            .and_then(|addr| addr.port())
+            .unwrap_or(self.config.port);
         info!(
             port = actual_port,
             "Node is running on port: {}", actual_port
