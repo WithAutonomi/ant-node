@@ -303,7 +303,7 @@ impl LmdbStorage {
         .map_err(|e| Error::Storage(format!("LMDB put_raw task failed: {e}")))??;
 
         if !was_new {
-            trace!("Record {} already exists", hex::encode(address));
+            // Race: fast-path missed it, txn-level check caught it.
             self.stats.write().duplicates += 1;
             return Ok(false);
         }
@@ -823,5 +823,96 @@ mod tests {
             let retrieved = storage.get(&address).await.expect("get");
             assert_eq!(retrieved, Some(content.to_vec()));
         }
+    }
+
+    #[tokio::test]
+    async fn test_put_raw_and_get_raw() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // put_raw uses a caller-supplied address (not BLAKE3(content))
+        let address = [0xAA; 32];
+        let data = b"raw record data";
+
+        let was_new = storage.put_raw(&address, data).await.expect("put_raw");
+        assert!(was_new, "first put_raw should return true");
+
+        // get_raw retrieves without content-address verification
+        let retrieved = storage.get_raw(&address).await.expect("get_raw");
+        assert_eq!(retrieved, Some(data.to_vec()));
+
+        // Duplicate put_raw returns false
+        let was_new2 = storage.put_raw(&address, data).await.expect("put_raw dup");
+        assert!(!was_new2, "duplicate put_raw should return false");
+
+        // Stats: 1 stored, 1 duplicate
+        let stats = storage.stats();
+        assert_eq!(stats.chunks_stored, 1);
+        assert_eq!(stats.duplicates, 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_raw_not_found() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let result = storage.get_raw(&[0xBB; 32]).await.expect("get_raw");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_put_overwrite_new_record() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let address = [0xCC; 32];
+        let data = b"new overwrite data";
+
+        storage
+            .put_overwrite(&address, data)
+            .await
+            .expect("put_overwrite");
+
+        let retrieved = storage.get_raw(&address).await.expect("get_raw");
+        assert_eq!(retrieved, Some(data.to_vec()));
+
+        let stats = storage.stats();
+        assert_eq!(stats.chunks_stored, 1);
+        assert_eq!(stats.bytes_stored, data.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn test_put_overwrite_updates_stats_correctly() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let address = [0xDD; 32];
+        let v1 = b"short";
+        let v2 = b"much longer replacement value";
+
+        // First write
+        storage
+            .put_overwrite(&address, v1)
+            .await
+            .expect("put_overwrite v1");
+        let stats1 = storage.stats();
+        assert_eq!(stats1.chunks_stored, 1);
+        assert_eq!(stats1.bytes_stored, v1.len() as u64);
+
+        // Overwrite with larger value — chunks_stored stays 1, bytes adjusts
+        storage
+            .put_overwrite(&address, v2)
+            .await
+            .expect("put_overwrite v2");
+        let stats2 = storage.stats();
+        assert_eq!(
+            stats2.chunks_stored, 1,
+            "overwrite should not increment chunk count"
+        );
+        assert_eq!(
+            stats2.bytes_stored,
+            v2.len() as u64,
+            "bytes should reflect new value size"
+        );
+
+        // Verify the new value is stored
+        let retrieved = storage.get_raw(&address).await.expect("get_raw");
+        assert_eq!(retrieved, Some(v2.to_vec()));
     }
 }

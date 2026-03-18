@@ -349,6 +349,11 @@ impl TestHarness {
     /// Inserts `address` into the target node's payment verifier cache so
     /// P2P store requests are accepted without an on-chain proof. This
     /// simulates the address having been previously paid for.
+    /// # Panics
+    ///
+    /// Panics if no running node matches `peer_id` — this indicates a test
+    /// configuration error (e.g. wrong peer ID or the target node was shut down).
+    #[allow(clippy::panic)]
     pub fn prepopulate_payment_cache_for_peer(
         &self,
         peer_id: &saorsa_core::identity::PeerId,
@@ -364,6 +369,7 @@ impl TestHarness {
                 }
             }
         }
+        panic!("prepopulate_payment_cache_for_peer: no running node with peer_id {peer_id}");
     }
 
     /// Get a random non-bootstrap node.

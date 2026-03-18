@@ -292,6 +292,11 @@ impl AntProtocol {
     }
 
     /// Get a reference to the payment verifier.
+    ///
+    /// Exposed for **test harnesses only** — production code should not call
+    /// this directly. Use `cache_insert()` on the returned verifier to
+    /// pre-populate the payment cache in test setups.
+    #[doc(hidden)]
     #[must_use]
     pub fn payment_verifier(&self) -> &PaymentVerifier {
         &self.payment_verifier
@@ -336,6 +341,9 @@ mod tests {
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
     use crate::storage::LmdbStorageConfig;
     use ant_evm::RewardsAddress;
+    use saorsa_core::identity::NodeIdentity;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use tempfile::TempDir;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
@@ -361,9 +369,22 @@ mod tests {
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
-        let quote_generator = Arc::new(QuoteGenerator::new(rewards_address, metrics_tracker));
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        let protocol = AntProtocol::new(storage, payment_verifier, quote_generator);
+        // Wire ML-DSA-65 signing so quote requests succeed
+        let identity = NodeIdentity::generate().expect("generate identity");
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize secret key");
+        quote_generator.set_signer(pub_key_bytes, move |msg| {
+            use saorsa_pqc::pqc::MlDsaOperations;
+            let ml_dsa = MlDsa65::new();
+            ml_dsa
+                .sign(&sk, msg)
+                .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
+        });
+
+        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
         (protocol, temp_dir)
     }
 
@@ -724,6 +745,86 @@ mod tests {
             assert!(msg.contains("Unexpected"));
         } else {
             panic!("expected Internal error, got: {response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_quote_already_stored_flag() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let content = b"already stored quote test";
+        let address = LmdbStorage::compute_address(content);
+
+        // Store the chunk first
+        protocol.payment_verifier().cache_insert(address);
+        let put_request = ChunkPutRequest::new(address, content.to_vec());
+        let put_msg = ChunkMessage {
+            request_id: 300,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+        let _ = protocol
+            .handle_message(&put_bytes)
+            .await
+            .expect("handle put");
+
+        // Now request a quote for the same address — already_stored should be true
+        let quote_request = ChunkQuoteRequest {
+            address,
+            data_size: content.len() as u64,
+            data_type: DATA_TYPE_CHUNK,
+        };
+        let quote_msg = ChunkMessage {
+            request_id: 301,
+            body: ChunkMessageBody::QuoteRequest(quote_request),
+        };
+        let quote_bytes = quote_msg.encode().expect("encode quote");
+        let response_bytes = protocol
+            .handle_message(&quote_bytes)
+            .await
+            .expect("handle quote");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode");
+
+        match response.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert!(
+                    already_stored,
+                    "already_stored should be true for existing chunk"
+                );
+            }
+            other => panic!("expected Success with already_stored, got: {other:?}"),
+        }
+
+        // Request a quote for a chunk that does NOT exist — already_stored should be false
+        let new_address = [0xFFu8; 32];
+        let quote_request2 = ChunkQuoteRequest {
+            address: new_address,
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        };
+        let quote_msg2 = ChunkMessage {
+            request_id: 302,
+            body: ChunkMessageBody::QuoteRequest(quote_request2),
+        };
+        let quote_bytes2 = quote_msg2.encode().expect("encode quote2");
+        let response_bytes2 = protocol
+            .handle_message(&quote_bytes2)
+            .await
+            .expect("handle quote2");
+        let response2 = ChunkMessage::decode(&response_bytes2).expect("decode2");
+
+        match response2.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Success {
+                already_stored, ..
+            }) => {
+                assert!(
+                    !already_stored,
+                    "already_stored should be false for new chunk"
+                );
+            }
+            other => panic!("expected Success with already_stored=false, got: {other:?}"),
         }
     }
 }
