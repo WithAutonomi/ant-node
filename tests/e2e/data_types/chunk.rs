@@ -249,6 +249,10 @@ mod tests {
         let mut rng = rand::thread_rng();
         let target_peer_id = peers.choose(&mut rng).expect("peers is non-empty");
 
+        // Pre-populate payment cache on the target node so the store is accepted
+        let expected_address = ChunkTestFixture::compute_address(&fixture.large);
+        harness.prepopulate_payment_cache_for_peer(target_peer_id, &expected_address);
+
         // Use the max-size (4 MiB) chunk to exercise QUIC stream limits
         let address = requester
             .store_chunk_on_peer(target_peer_id, &fixture.large)
@@ -256,7 +260,6 @@ mod tests {
             .expect("Failed to store max-size chunk on remote node");
 
         // Verify the returned address matches the expected content hash
-        let expected_address = ChunkTestFixture::compute_address(&fixture.large);
         assert_eq!(
             address, expected_address,
             "Returned address should match computed content address"

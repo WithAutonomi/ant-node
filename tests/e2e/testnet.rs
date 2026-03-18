@@ -628,7 +628,8 @@ impl TestNode {
     ) -> Result<XorName> {
         let p2p = self.p2p_node.as_ref().ok_or(TestnetError::NodeNotRunning)?;
 
-        // Create PUT request WITHOUT payment proof (EVM disabled in tests)
+        // Create PUT request without payment proof — caller must pre-populate
+        // the target node's payment cache via harness.prepopulate_payment_cache_for_peer().
         let address = Self::compute_chunk_address(data);
 
         let request_id: u64 = rand::thread_rng().gen();
