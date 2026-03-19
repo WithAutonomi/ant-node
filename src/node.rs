@@ -653,7 +653,12 @@ impl RunningNode {
                             match result {
                                 Ok(response) => {
                                     if let Err(e) = p2p
-                                        .send_message(&source, response_topic, response.to_vec())
+                                        .send_message(
+                                            &source,
+                                            response_topic,
+                                            response.to_vec(),
+                                            &[],
+                                        )
                                         .await
                                     {
                                         warn!("Failed to send {data_type} protocol response to {source}: {e}");

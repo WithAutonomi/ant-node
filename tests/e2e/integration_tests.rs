@@ -218,7 +218,7 @@ async fn test_node_to_node_messaging() {
     let sender_p2p = sender.p2p_node.as_ref().expect("Node 3 should be running");
 
     sender_p2p
-        .send_message(&target_peer_id, TEST_TOPIC, PAYLOAD.to_vec())
+        .send_message(&target_peer_id, TEST_TOPIC, PAYLOAD.to_vec(), &[])
         .await
         .expect("Failed to send message to connected peer");
 

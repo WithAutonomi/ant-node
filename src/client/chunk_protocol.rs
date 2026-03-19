@@ -5,7 +5,7 @@
 
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, CHUNK_PROTOCOL_ID};
 use saorsa_core::identity::PeerId;
-use saorsa_core::{P2PEvent, P2PNode};
+use saorsa_core::{MultiAddr, P2PEvent, P2PNode};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
@@ -34,6 +34,7 @@ pub async fn send_and_await_chunk_response<T, E>(
     message_bytes: Vec<u8>,
     request_id: u64,
     timeout: Duration,
+    peer_addrs: &[MultiAddr],
     response_handler: impl Fn(ChunkMessageBody) -> Option<Result<T, E>>,
     send_error: impl FnOnce(String) -> E,
     timeout_error: impl FnOnce() -> E,
@@ -41,7 +42,7 @@ pub async fn send_and_await_chunk_response<T, E>(
     // Subscribe before sending so we don't miss the response
     let mut events = node.subscribe_events();
 
-    node.send_message(target_peer, CHUNK_PROTOCOL_ID, message_bytes)
+    node.send_message(target_peer, CHUNK_PROTOCOL_ID, message_bytes, peer_addrs)
         .await
         .map_err(|e| send_error(e.to_string()))?;
 
