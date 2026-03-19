@@ -292,12 +292,19 @@ impl PaymentVerifier {
 
         // Verify on-chain payment.
         //
-        // The SingleNode payment model pays only the median-priced quote (3x)
+        // The SingleNode payment model pays only the median-priced quote (at 3x)
         // and sends Amount::ZERO for the other 4. evmlib's pay_for_quotes()
         // filters out zero-amount payments, so only 1 quote has an on-chain
-        // record. The contract's verifyPayment() returns isValid=false for
-        // unpaid quotes, which is expected — we only require that at least
-        // one result is valid (the paid quote).
+        // record. The contract's verifyPayment() returns amountPaid=0 and
+        // isValid=false for unpaid quotes, which is expected.
+        //
+        // We use the amountPaid field to distinguish paid from unpaid results:
+        // - At least one quote must have been paid (amountPaid > 0)
+        // - ALL paid quotes must be valid (isValid=true)
+        // - Unpaid quotes (amountPaid=0) are allowed to be invalid
+        //
+        // This matches autonomi's strict verification model (all paid must be
+        // valid) while accommodating payment models that don't pay every quote.
         let payment_digest = payment.digest();
         if payment_digest.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
@@ -310,8 +317,7 @@ impl PaymentVerifier {
             )
             .collect();
 
-        let provider =
-            evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
+        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
         let handler = evmlib::contract::payment_vault::handler::PaymentVaultHandler::new(
             *self.config.evm.network.data_payments_address(),
             provider,
@@ -327,18 +333,31 @@ impl PaymentVerifier {
                 ))
             })?;
 
-        let any_valid = results.iter().any(|r| r.isValid);
-        if !any_valid {
+        let paid_results: Vec<_> = results
+            .iter()
+            .filter(|r| r.amountPaid > evmlib::common::U256::ZERO)
+            .collect();
+
+        if paid_results.is_empty() {
             return Err(Error::Payment(format!(
-                "Payment verification failed on-chain for {} (no valid payments found)",
+                "Payment verification failed on-chain for {} (no paid quotes found)",
                 hex::encode(xorname)
             )));
         }
 
+        for result in &paid_results {
+            if !result.isValid {
+                return Err(Error::Payment(format!(
+                    "Payment verification failed on-chain for {} (paid quote is invalid)",
+                    hex::encode(xorname)
+                )));
+            }
+        }
+
         if tracing::enabled!(tracing::Level::INFO) {
-            let valid_count = results.iter().filter(|r| r.isValid).count();
+            let valid_count = paid_results.len();
             info!(
-                "EVM payment verified for {} ({valid_count}/{} quotes paid)",
+                "EVM payment verified for {} ({valid_count} paid and valid, {} total results)",
                 hex::encode(xorname),
                 results.len()
             );
