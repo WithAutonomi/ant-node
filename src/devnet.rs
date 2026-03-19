@@ -247,6 +247,7 @@ pub struct DevnetEvmInfo {
     /// Data payments contract address.
     pub data_payments_address: String,
     /// Merkle payments contract address (for batch payments).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merkle_payments_address: Option<String>,
 }
 

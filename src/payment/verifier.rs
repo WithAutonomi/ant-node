@@ -239,9 +239,9 @@ impl PaymentVerifier {
                             self.verify_evm_payment(xorname, &payment).await?;
                         }
                         None => {
+                            let tag = proof.first().copied().unwrap_or(0);
                             return Err(Error::Payment(format!(
-                                "Unknown payment proof type tag: {:?}",
-                                proof.first()
+                                "Unknown payment proof type tag: 0x{tag:02x}"
                             )));
                         }
                     }

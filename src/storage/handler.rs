@@ -300,10 +300,10 @@ impl AntProtocol {
         );
 
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
-            return MerkleCandidateQuoteResponse::Error(ProtocolError::ChunkTooLarge {
-                size: MAX_CHUNK_SIZE + 1,
-                max_size: MAX_CHUNK_SIZE,
-            });
+            return MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
+                "data_size {} overflows usize",
+                request.data_size
+            )));
         };
         if data_size_usize > MAX_CHUNK_SIZE {
             return MerkleCandidateQuoteResponse::Error(ProtocolError::ChunkTooLarge {
