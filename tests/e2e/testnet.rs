@@ -651,6 +651,7 @@ impl TestNode {
             message_bytes,
             request_id,
             timeout,
+            &[],
             |body| match body {
                 ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: addr }) => {
                     debug!(
@@ -747,6 +748,7 @@ impl TestNode {
             message_bytes,
             request_id,
             timeout,
+            &[],
             |body| match body {
                 ChunkMessageBody::GetResponse(ChunkGetResponse::Success {
                     address: addr,
@@ -1164,6 +1166,7 @@ impl TestNetwork {
                                                 &source,
                                                 CHUNK_PROTOCOL_ID,
                                                 response.to_vec(),
+                                                &[],
                                             )
                                             .await
                                         {

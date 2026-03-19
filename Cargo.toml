@@ -1,6 +1,6 @@
 [package]
 name = "saorsa-node"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Saorsa decentralized network"
@@ -28,7 +28,7 @@ path = "src/bin/saorsa-devnet/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.17"
+saorsa-core = "0.18.1"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment

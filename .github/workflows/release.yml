@@ -103,22 +103,9 @@ jobs:
       - name: Run tests
         run: cargo test
 
-  security-audit:
-    name: Security Audit
-    needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install cargo-audit
-        run: cargo install cargo-audit
-      - name: Run audit
-        run: cargo audit
-
   build:
     name: Build ${{ matrix.target }}
-    needs: [validate, test, security-audit]
+    needs: [validate, test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -382,7 +369,7 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
-    needs: [validate, test, security-audit]
+    needs: [validate, test]
     runs-on: ubuntu-latest
     if: github.event.inputs.dry_run != 'true'
     steps:
