@@ -644,5 +644,4 @@ mod tests {
             assert_eq!(retrieved, Some(content.to_vec()));
         }
     }
-
 }
