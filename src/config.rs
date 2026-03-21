@@ -49,47 +49,43 @@ pub enum NetworkMode {
     Development,
 }
 
-/// Testnet-specific configuration for relaxed anti-Sybil protection.
+/// Testnet-specific configuration for relaxed IP diversity limits.
+///
+/// saorsa-core uses a simple 2-tier model: per-exact-IP and per-subnet
+/// (/24 IPv4, /64 IPv6) limits.  Testnet defaults are permissive so
+/// nodes co-located on a single provider (e.g. Digital Ocean) can join.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestnetConfig {
-    /// Maximum nodes allowed per ASN.
-    /// Default: 5000 (compared to 20 in production).
-    #[serde(default = "default_testnet_max_per_asn")]
-    pub max_nodes_per_asn: usize,
+    /// Maximum nodes sharing an exact IP address.
+    /// Default: `usize::MAX` (effectively unlimited for testnet).
+    #[serde(default = "default_testnet_max_per_ip")]
+    pub max_per_ip: Option<usize>,
 
-    /// Maximum nodes allowed per /64 subnet.
-    /// Default: 100 (compared to 1 in production).
-    #[serde(default = "default_testnet_max_per_64")]
-    pub max_nodes_per_64: usize,
-
-    /// Whether to enforce node age requirements.
-    /// Default: false (compared to true in production).
-    #[serde(default)]
-    pub enforce_age_requirements: bool,
-
-    /// Enable geographic diversity checks.
-    /// Default: false (compared to true in production).
-    #[serde(default)]
-    pub enable_geo_checks: bool,
+    /// Maximum nodes in the same /24 (IPv4) or /64 (IPv6) subnet.
+    /// Default: `usize::MAX` (effectively unlimited for testnet).
+    #[serde(default = "default_testnet_max_per_subnet")]
+    pub max_per_subnet: Option<usize>,
 }
 
 impl Default for TestnetConfig {
     fn default() -> Self {
         Self {
-            max_nodes_per_asn: default_testnet_max_per_asn(),
-            max_nodes_per_64: default_testnet_max_per_64(),
-            enforce_age_requirements: false,
-            enable_geo_checks: false,
+            max_per_ip: default_testnet_max_per_ip(),
+            max_per_subnet: default_testnet_max_per_subnet(),
         }
     }
 }
 
-const fn default_testnet_max_per_asn() -> usize {
-    5000
+// These return `Option` because `serde(default = "...")` requires the function's
+// return type to match the field type (`Option<usize>`).
+#[allow(clippy::unnecessary_wraps)]
+const fn default_testnet_max_per_ip() -> Option<usize> {
+    Some(usize::MAX)
 }
 
-const fn default_testnet_max_per_64() -> usize {
-    100
+#[allow(clippy::unnecessary_wraps)]
+const fn default_testnet_max_per_subnet() -> Option<usize> {
+    Some(usize::MAX)
 }
 
 /// Node configuration.
@@ -135,6 +131,13 @@ pub struct NodeConfig {
     /// Storage configuration for chunk persistence.
     #[serde(default)]
     pub storage: StorageConfig,
+
+    /// Directory for persisting the close group cache.
+    ///
+    /// When `None` (default), the node's `root_dir` is used — the cache
+    /// file lands alongside `node_identity.key`.
+    #[serde(default)]
+    pub close_group_cache_dir: Option<PathBuf>,
 
     /// Maximum application-layer message size in bytes.
     ///
@@ -254,6 +257,7 @@ impl Default for NodeConfig {
             payment: PaymentConfig::default(),
             bootstrap_cache: BootstrapCacheConfig::default(),
             storage: StorageConfig::default(),
+            close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
         }
@@ -284,10 +288,8 @@ impl NodeConfig {
         Self {
             network_mode: NetworkMode::Development,
             testnet: TestnetConfig {
-                max_nodes_per_asn: usize::MAX,
-                max_nodes_per_64: usize::MAX,
-                enforce_age_requirements: false,
-                enable_geo_checks: false,
+                max_per_ip: Some(usize::MAX),
+                max_per_subnet: Some(usize::MAX),
             },
             ..Self::default()
         }

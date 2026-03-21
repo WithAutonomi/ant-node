@@ -177,28 +177,24 @@ impl NodeBuilder {
             NetworkMode::Testnet => {
                 // Testnet allows loopback so nodes can be co-located on one machine.
                 core_config.allow_loopback = true;
-                let mut diversity = CoreDiversityConfig::testnet();
-                diversity.max_nodes_per_asn = config.testnet.max_nodes_per_asn;
-                diversity.max_nodes_per_ipv6_64 = config.testnet.max_nodes_per_64;
-                diversity.enable_geolocation_check = config.testnet.enable_geo_checks;
-                diversity.min_geographic_diversity = if config.testnet.enable_geo_checks {
-                    3
-                } else {
-                    1
-                };
-                core_config.diversity_config = Some(diversity);
-
-                if config.testnet.enforce_age_requirements {
-                    warn!(
-                        "testnet.enforce_age_requirements is set but saorsa-core does not yet \
-                         expose a knob; age checks may remain relaxed"
-                    );
-                }
+                core_config.diversity_config = Some(CoreDiversityConfig {
+                    max_per_ip: config.testnet.max_per_ip,
+                    max_per_subnet: config.testnet.max_per_subnet,
+                });
             }
             NetworkMode::Development => {
                 core_config.diversity_config = Some(CoreDiversityConfig::permissive());
             }
         }
+
+        // Persist close group peers + trust scores across restarts.
+        // Default to root_dir (alongside node_identity.key) when not explicitly set.
+        core_config.close_group_cache_dir = Some(
+            config
+                .close_group_cache_dir
+                .clone()
+                .unwrap_or_else(|| config.root_dir.clone()),
+        );
 
         Ok(core_config)
     }
@@ -867,14 +863,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_core_config_sets_development_mode_relaxed() {
+    fn test_build_core_config_sets_development_mode_permissive() {
         let config = NodeConfig {
             network_mode: NetworkMode::Development,
             ..Default::default()
         };
         let core = NodeBuilder::build_core_config(&config).expect("core config");
         let diversity = core.diversity_config.expect("diversity");
-        assert!(diversity.is_relaxed());
+        assert_eq!(diversity.max_per_ip, Some(usize::MAX));
+        assert_eq!(diversity.max_per_subnet, Some(usize::MAX));
     }
 
     #[test]
