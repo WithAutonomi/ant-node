@@ -487,14 +487,21 @@ impl TestNode {
 
         // Handle the protocol message
         let timeout = Duration::from_secs(DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS);
-        let response_bytes = tokio::time::timeout(timeout, protocol.handle_message(&message_bytes))
-            .await
-            .map_err(|_| {
-                TestnetError::Storage(format!(
-                    "Timeout storing chunk after {DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS}s"
-                ))
-            })?
-            .map_err(|e| TestnetError::Storage(format!("Protocol error: {e}")))?;
+        let response_bytes =
+            tokio::time::timeout(timeout, protocol.try_handle_request(&message_bytes))
+                .await
+                .map_err(|_| {
+                    TestnetError::Storage(format!(
+                        "Timeout storing chunk after {DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS}s"
+                    ))
+                })?
+                .map_err(|e| TestnetError::Storage(format!("Protocol error: {e}")))?
+                .ok_or_else(|| {
+                    TestnetError::Storage(format!(
+                        "Protocol returned no response for PUT request (request_id={request_id}, node_index={})",
+                        self.index
+                    ))
+                })?;
 
         // Parse response
         let response = ChunkMessage::decode(&response_bytes)
@@ -553,14 +560,20 @@ impl TestNode {
 
         // Handle the protocol message
         let timeout = Duration::from_secs(DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS);
-        let response_bytes = tokio::time::timeout(timeout, protocol.handle_message(&message_bytes))
-            .await
-            .map_err(|_| {
-                TestnetError::Retrieval(format!(
-                    "Timeout retrieving chunk after {DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS}s"
-                ))
-            })?
-            .map_err(|e| TestnetError::Retrieval(format!("Protocol error: {e}")))?;
+        let response_bytes =
+            tokio::time::timeout(timeout, protocol.try_handle_request(&message_bytes))
+                .await
+                .map_err(|_| {
+                    TestnetError::Retrieval(format!(
+                        "Timeout retrieving chunk after {DEFAULT_CHUNK_OPERATION_TIMEOUT_SECS}s"
+                    ))
+                })?
+                .map_err(|e| TestnetError::Retrieval(format!("Protocol error: {e}")))?
+                .ok_or_else(|| {
+                    TestnetError::Retrieval(format!(
+                        "Protocol returned no response for GET request (request_id={request_id}, address={address:?})"
+                    ))
+                })?;
 
         // Parse response
         let response = ChunkMessage::decode(&response_bytes)
@@ -1159,8 +1172,8 @@ impl TestNetwork {
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
                             tokio::spawn(async move {
-                                match protocol.handle_message(&data).await {
-                                    Ok(response) => {
+                                match protocol.try_handle_request(&data).await {
+                                    Ok(Some(response)) => {
                                         if let Err(e) = p2p
                                             .send_message(
                                                 &source,
@@ -1174,6 +1187,9 @@ impl TestNetwork {
                                                 "Node {node_index} failed to send chunk response to {source}: {e}"
                                             );
                                         }
+                                    }
+                                    Ok(None) => {
+                                        // Response message — no reply needed
                                     }
                                     Err(e) => {
                                         warn!(

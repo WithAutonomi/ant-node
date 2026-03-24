@@ -61,9 +61,10 @@ async fn send_put_to_node(
         .encode()
         .map_err(|e| format!("Encode failed: {e}"))?;
     let response_bytes = protocol
-        .handle_message(&message_bytes)
+        .try_handle_request(&message_bytes)
         .await
-        .map_err(|e| format!("Handle failed: {e}"))?;
+        .map_err(|e| format!("Handle failed: {e}"))?
+        .ok_or("expected response")?;
     ChunkMessage::decode(&response_bytes).map_err(|e| format!("Decode failed: {e}"))
 }
 

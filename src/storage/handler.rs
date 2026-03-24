@@ -11,7 +11,7 @@
 //! ├─────────────────────────────────────────────────────────┤
 //! │  protocol_id() = "autonomi/ant/chunk/v1"                  │
 //! │                                                         │
-//! │  handle_message(data) ──▶ decode ChunkMessage  │
+//! │  try_handle_request(data) ──▶ decode ChunkMessage  │
 //! │                                   │                     │
 //! │         ┌─────────────────────────┼─────────────────┐  │
 //! │         ▼                         ▼                 ▼  │
@@ -22,7 +22,8 @@
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
-//! │                 return Ok(response_bytes)               │
+//! │           return Ok(Some(response_bytes))              │
+//! │           return Ok(None) for response messages       │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
@@ -130,57 +131,6 @@ impl AntProtocol {
         response
             .encode()
             .map(|b| Some(Bytes::from(b)))
-            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
-    }
-
-    /// Handle an incoming protocol message.
-    ///
-    /// **Deprecated**: Use [`try_handle_request`](Self::try_handle_request)
-    /// instead. This method always returns response bytes — even for
-    /// response messages that should be ignored — which can create an
-    /// infinite ping-pong loop if the caller blindly sends the result back.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if message decoding or handling fails.
-    pub async fn handle_message(&self, data: &[u8]) -> Result<Bytes> {
-        let message = ChunkMessage::decode(data)
-            .map_err(|e| Error::Protocol(format!("Failed to decode message: {e}")))?;
-
-        let request_id = message.request_id;
-
-        let response_body = match message.body {
-            ChunkMessageBody::PutRequest(req) => {
-                ChunkMessageBody::PutResponse(self.handle_put(req).await)
-            }
-            ChunkMessageBody::GetRequest(req) => {
-                ChunkMessageBody::GetResponse(self.handle_get(req).await)
-            }
-            ChunkMessageBody::QuoteRequest(ref req) => {
-                ChunkMessageBody::QuoteResponse(self.handle_quote(req))
-            }
-            ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
-                ChunkMessageBody::MerkleCandidateQuoteResponse(
-                    self.handle_merkle_candidate_quote(req),
-                )
-            }
-            ChunkMessageBody::PutResponse(_)
-            | ChunkMessageBody::GetResponse(_)
-            | ChunkMessageBody::QuoteResponse(_)
-            | ChunkMessageBody::MerkleCandidateQuoteResponse(_) => {
-                let error = ProtocolError::Internal("Unexpected response message".to_string());
-                ChunkMessageBody::PutResponse(ChunkPutResponse::Error(error))
-            }
-        };
-
-        let response = ChunkMessage {
-            request_id,
-            body: response_body,
-        };
-
-        response
-            .encode()
-            .map(Bytes::from)
             .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
     }
 
@@ -507,9 +457,10 @@ mod tests {
 
         // Handle PUT
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put");
+            .expect("handle put")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 1);
@@ -531,9 +482,10 @@ mod tests {
 
         // Handle GET
         let response_bytes = protocol
-            .handle_message(&get_bytes)
+            .try_handle_request(&get_bytes)
             .await
-            .expect("handle get");
+            .expect("handle get")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 2);
@@ -562,9 +514,10 @@ mod tests {
         let get_bytes = get_msg.encode().expect("encode get");
 
         let response_bytes = protocol
-            .handle_message(&get_bytes)
+            .try_handle_request(&get_bytes)
             .await
-            .expect("handle get");
+            .expect("handle get")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 10);
@@ -595,9 +548,10 @@ mod tests {
         let put_bytes = put_msg.encode().expect("encode put");
 
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put");
+            .expect("handle put")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 20);
@@ -627,9 +581,10 @@ mod tests {
         let put_bytes = put_msg.encode().expect("encode put");
 
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put");
+            .expect("handle put")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 30);
@@ -661,15 +616,16 @@ mod tests {
         let put_bytes = put_msg.encode().expect("encode put");
 
         let _ = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
             .expect("handle put");
 
         // Store again - should return AlreadyExists
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put 2");
+            .expect("handle put 2")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 40);
@@ -734,9 +690,10 @@ mod tests {
         };
         let put_bytes = put_msg.encode().expect("encode put");
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put");
+            .expect("handle put")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode");
 
         if let ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. }) = response.body {
@@ -764,15 +721,16 @@ mod tests {
         };
         let put_bytes = put_msg.encode().expect("encode put");
         let _ = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
             .expect("handle put 1");
 
         // Second PUT — should return AlreadyExists (checked in storage before payment)
         let response_bytes = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
-            .expect("handle put 2");
+            .expect("handle put 2")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode");
 
         if let ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists { .. }) = response.body
@@ -804,7 +762,7 @@ mod tests {
         };
         let put_bytes = put_msg.encode().expect("encode put");
         let _ = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
             .expect("handle put");
 
@@ -848,9 +806,10 @@ mod tests {
         let msg_bytes = msg.encode().expect("encode request");
 
         let response_bytes = protocol
-            .handle_message(&msg_bytes)
+            .try_handle_request(&msg_bytes)
             .await
-            .expect("handle merkle candidate quote");
+            .expect("handle merkle candidate quote")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
 
         assert_eq!(response.request_id, 600);
@@ -879,27 +838,22 @@ mod tests {
     async fn test_handle_unexpected_response_message() {
         let (protocol, _temp) = create_test_protocol().await;
 
-        // Send a PutResponse as if it were a request
+        // Send a PutResponse as if it were a request — should return None
         let msg = ChunkMessage {
             request_id: 200,
             body: ChunkMessageBody::PutResponse(ChunkPutResponse::Success { address: [0u8; 32] }),
         };
         let msg_bytes = msg.encode().expect("encode");
 
-        let response_bytes = protocol
-            .handle_message(&msg_bytes)
+        let result = protocol
+            .try_handle_request(&msg_bytes)
             .await
             .expect("handle msg");
-        let response = ChunkMessage::decode(&response_bytes).expect("decode");
 
-        if let ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::Internal(
-            msg,
-        ))) = response.body
-        {
-            assert!(msg.contains("Unexpected"));
-        } else {
-            panic!("expected Internal error, got: {response:?}");
-        }
+        assert!(
+            result.is_none(),
+            "expected None for response message, got: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -918,7 +872,7 @@ mod tests {
         };
         let put_bytes = put_msg.encode().expect("encode put");
         let _ = protocol
-            .handle_message(&put_bytes)
+            .try_handle_request(&put_bytes)
             .await
             .expect("handle put");
 
@@ -934,9 +888,10 @@ mod tests {
         };
         let quote_bytes = quote_msg.encode().expect("encode quote");
         let response_bytes = protocol
-            .handle_message(&quote_bytes)
+            .try_handle_request(&quote_bytes)
             .await
-            .expect("handle quote");
+            .expect("handle quote")
+            .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode");
 
         match response.body {
@@ -964,9 +919,10 @@ mod tests {
         };
         let quote_bytes2 = quote_msg2.encode().expect("encode quote2");
         let response_bytes2 = protocol
-            .handle_message(&quote_bytes2)
+            .try_handle_request(&quote_bytes2)
             .await
-            .expect("handle quote2");
+            .expect("handle quote2")
+            .expect("expected response");
         let response2 = ChunkMessage::decode(&response_bytes2).expect("decode2");
 
         match response2.body {

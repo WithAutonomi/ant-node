@@ -490,7 +490,10 @@ mod tests {
         let message_bytes = message.encode()?;
 
         // Send PUT request to protocol handler
-        let response_bytes = protocol.handle_message(&message_bytes).await?;
+        let response_bytes = protocol
+            .try_handle_request(&message_bytes)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected response"))?;
         let response = ChunkMessage::decode(&response_bytes)?;
 
         // Verify the response indicates payment is required or an error occurred
@@ -528,7 +531,10 @@ mod tests {
         };
         let get_message_bytes = get_message.encode()?;
 
-        let get_response_bytes = protocol.handle_message(&get_message_bytes).await?;
+        let get_response_bytes = protocol
+            .try_handle_request(&get_message_bytes)
+            .await?
+            .ok_or_else(|| color_eyre::eyre::eyre!("expected response"))?;
         let get_response = ChunkMessage::decode(&get_response_bytes)?;
 
         match get_response.body {
