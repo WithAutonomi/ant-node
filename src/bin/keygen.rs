@@ -69,6 +69,12 @@ enum Commands {
         #[arg(short, long)]
         signature: PathBuf,
     },
+    /// Validate a hex-encoded secret key (for CI secret verification)
+    VerifyKey {
+        /// Hex-encoded secret key string (reads from stdin if not provided)
+        #[arg(short = 'x', long)]
+        hex: Option<String>,
+    },
 }
 
 fn main() {
@@ -82,6 +88,7 @@ fn main() {
             input,
             signature,
         } => verify_signature(&key, &input, &signature),
+        Commands::VerifyKey { hex } => verify_hex_key(hex),
     }
 }
 
@@ -213,6 +220,69 @@ fn sign_file(key_path: &PathBuf, input_path: &PathBuf, output_path: &PathBuf) {
 
     println!("Signature written to: {}", output_path.display());
     println!("  Signature size: {} bytes", sig_bytes.len());
+}
+
+fn verify_hex_key(hex_input: Option<String>) {
+    println!("Validating hex-encoded ML-DSA-65 secret key...\n");
+
+    let hex_str = hex_input.unwrap_or_else(|| {
+        eprintln!("Reading hex from stdin...");
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .expect("Failed to read from stdin");
+        buf
+    });
+
+    // Strip whitespace/newlines that might have been introduced during copy-paste
+    let hex_clean: String = hex_str.chars().filter(char::is_ascii_hexdigit).collect();
+
+    println!("Hex length: {} characters", hex_clean.len());
+    println!("Expected:   {} characters ({} bytes * 2)", 4032 * 2, 4032);
+
+    if hex_clean.len() != 4032 * 2 {
+        eprintln!(
+            "\nERROR: Hex string decodes to {} bytes, expected 4032",
+            hex_clean.len() / 2
+        );
+        process::exit(1);
+    }
+
+    // Decode hex to bytes
+    let bytes: Vec<u8> = (0..hex_clean.len())
+        .step_by(2)
+        .map(|i| {
+            u8::from_str_radix(&hex_clean[i..i + 2], 16).unwrap_or_else(|e| {
+                eprintln!("ERROR: Invalid hex at position {i}: {e}");
+                process::exit(1);
+            })
+        })
+        .collect();
+
+    println!("Decoded:    {} bytes", bytes.len());
+
+    // Try to parse as ML-DSA-65 secret key
+    match MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &bytes) {
+        Ok(secret_key) => {
+            println!("\nSecret key parsed successfully.");
+
+            // Test-sign something to confirm it's functional
+            let dsa = ml_dsa_65();
+            let test_data = b"ant-node-key-validation-test";
+            match dsa.sign_with_context(&secret_key, test_data, SIGNING_CONTEXT) {
+                Ok(_) => println!("Test signature created successfully."),
+                Err(e) => {
+                    eprintln!("\nERROR: Key parsed but signing failed: {e}");
+                    process::exit(1);
+                }
+            }
+
+            println!("\nKey is VALID and ready for use as ANT_NODE_SIGNING_KEY.");
+        }
+        Err(e) => {
+            eprintln!("\nERROR: Failed to parse secret key: {e}");
+            process::exit(1);
+        }
+    }
 }
 
 fn verify_signature(key_path: &PathBuf, input_path: &PathBuf, sig_path: &PathBuf) {
