@@ -45,6 +45,17 @@
 
 pub mod chunk;
 
+/// Number of nodes in a Kademlia close group.
+///
+/// Clients fetch quotes from the `CLOSE_GROUP_SIZE` closest nodes to a target
+/// address and select the median-priced quote for payment.
+pub const CLOSE_GROUP_SIZE: usize = 5;
+
+/// Minimum number of close group members that must agree for a decision to be valid.
+///
+/// This is a simple majority: `(CLOSE_GROUP_SIZE / 2) + 1`.
+pub const CLOSE_GROUP_MAJORITY: usize = (CLOSE_GROUP_SIZE / 2) + 1;
+
 // Re-export chunk types for convenience
 pub use chunk::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,

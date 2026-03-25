@@ -10,15 +10,13 @@
 //! Total cost is the same as Standard mode (3x), but with one actual payment.
 //! This saves gas fees while maintaining the same total payment amount.
 
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use ant_evm::{Amount, PaymentQuote, QuoteHash, QuotingMetrics, RewardsAddress};
 use evmlib::contract::payment_vault;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use tracing::info;
-
-/// Required number of quotes for `SingleNode` payment (matches `CLOSE_GROUP_SIZE`)
-pub const REQUIRED_QUOTES: usize = 5;
 
 /// Create zero-valued `QuotingMetrics` for payment verification.
 ///
@@ -37,20 +35,20 @@ fn zero_quoting_metrics() -> QuotingMetrics {
     }
 }
 
-/// Index of the median-priced node after sorting
-const MEDIAN_INDEX: usize = 2;
+/// Index of the median-priced node after sorting, derived from `CLOSE_GROUP_SIZE`.
+const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;
 
 /// Single node payment structure for a chunk.
 ///
-/// Contains exactly 5 quotes where only the median-priced one receives payment (3x),
-/// and the other 4 have `Amount::ZERO`.
+/// Contains exactly `CLOSE_GROUP_SIZE` quotes where only the median-priced one
+/// receives payment (3x), and the remaining quotes have `Amount::ZERO`.
 ///
-/// The fixed-size array ensures compile-time enforcement of the 5-quote requirement,
-/// making the median index (2) always valid.
+/// The fixed-size array ensures compile-time enforcement of the quote count,
+/// making the median index always valid.
 #[derive(Debug, Clone)]
 pub struct SingleNodePayment {
-    /// All 5 quotes (sorted by price) - fixed size ensures median index is always valid
-    pub quotes: [QuotePaymentInfo; REQUIRED_QUOTES],
+    /// All quotes (sorted by price) - fixed size ensures median index is always valid
+    pub quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE],
 }
 
 /// Information about a single quote payment
@@ -82,9 +80,9 @@ impl SingleNodePayment {
     /// Returns error if not exactly 5 quotes are provided.
     pub fn from_quotes(mut quotes_with_prices: Vec<(PaymentQuote, Amount)>) -> Result<Self> {
         let len = quotes_with_prices.len();
-        if len != REQUIRED_QUOTES {
+        if len != CLOSE_GROUP_SIZE {
             return Err(Error::Payment(format!(
-                "SingleNode payment requires exactly {REQUIRED_QUOTES} quotes, got {len}"
+                "SingleNode payment requires exactly {CLOSE_GROUP_SIZE} quotes, got {len}"
             )));
         }
 
@@ -96,7 +94,7 @@ impl SingleNodePayment {
             .get(MEDIAN_INDEX)
             .ok_or_else(|| {
                 Error::Payment(format!(
-                    "Missing median quote at index {MEDIAN_INDEX}: expected {REQUIRED_QUOTES} quotes but get() failed"
+                    "Missing median quote at index {MEDIAN_INDEX}: expected {CLOSE_GROUP_SIZE} quotes but get() failed"
                 ))
             })?
             .1;
@@ -123,8 +121,8 @@ impl SingleNodePayment {
             })
             .collect();
 
-        // Convert Vec to array - we already validated length is REQUIRED_QUOTES
-        let quotes: [QuotePaymentInfo; REQUIRED_QUOTES] = quotes_vec
+        // Convert Vec to array - we already validated length is CLOSE_GROUP_SIZE
+        let quotes: [QuotePaymentInfo; CLOSE_GROUP_SIZE] = quotes_vec
             .try_into()
             .map_err(|_| Error::Payment("Failed to convert quotes to fixed array".to_string()))?;
 
@@ -140,7 +138,7 @@ impl SingleNodePayment {
     /// Get the median quote that receives payment.
     ///
     /// Returns `None` only if the internal array is somehow shorter than `MEDIAN_INDEX`,
-    /// which should never happen since the array is fixed-size `[_; REQUIRED_QUOTES]`.
+    /// which should never happen since the array is fixed-size `[_; CLOSE_GROUP_SIZE]`.
     #[must_use]
     pub fn paid_quote(&self) -> Option<&QuotePaymentInfo> {
         self.quotes.get(MEDIAN_INDEX)
@@ -163,9 +161,9 @@ impl SingleNodePayment {
 
         info!(
             "Paying for {} quotes: 1 real ({} atto) + {} with 0 atto",
-            REQUIRED_QUOTES,
+            CLOSE_GROUP_SIZE,
             self.total_amount(),
-            REQUIRED_QUOTES - 1
+            CLOSE_GROUP_SIZE - 1
         );
 
         let (tx_hashes, _gas_info) = wallet.pay_for_quotes(quote_payments).await.map_err(
@@ -338,9 +336,9 @@ mod tests {
 
         let transaction_config = TransactionConfig::default();
 
-        // Create 5 random quote payments (autonomi pattern)
+        // Create CLOSE_GROUP_SIZE random quote payments (autonomi pattern)
         let mut quote_payments = vec![];
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let quote_hash = dummy_hash();
             let reward_address = dummy_address();
             let amount = Amount::from(1u64);
@@ -412,8 +410,8 @@ mod tests {
 
         let mut quote_payments = vec![(real_quote_hash, real_reward_address, real_amount)];
 
-        // Add 4 dummy payments with 0 amount
-        for _ in 0..4 {
+        // Add dummy payments with 0 amount for remaining close group members
+        for _ in 0..CLOSE_GROUP_SIZE - 1 {
             let dummy_quote_hash = dummy_hash();
             let dummy_reward_address = dummy_address();
             let dummy_amount = Amount::from(0u64); // 0 amount
@@ -559,8 +557,9 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_paid_quote_returns_median() {
-        let quotes: Vec<_> = (0..5u8)
-            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+        let quotes: Vec<_> = (1u8..)
+            .take(CLOSE_GROUP_SIZE)
+            .map(|i| (make_test_quote(i), Amount::from(u64::from(i) * 10)))
             .collect();
 
         let payment = SingleNodePayment::from_quotes(quotes).unwrap();
@@ -576,17 +575,18 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn test_all_quotes_have_distinct_addresses() {
-        let quotes: Vec<_> = (0..5u8)
-            .map(|i| (make_test_quote(i + 1), Amount::from(u64::from(i + 1) * 10)))
+        let quotes: Vec<_> = (1u8..)
+            .take(CLOSE_GROUP_SIZE)
+            .map(|i| (make_test_quote(i), Amount::from(u64::from(i) * 10)))
             .collect();
 
         let payment = SingleNodePayment::from_quotes(quotes).unwrap();
 
-        // Verify all 5 quotes are present (sorting doesn't lose data)
+        // Verify all quotes are present (sorting doesn't lose data)
         let mut addresses: Vec<_> = payment.quotes.iter().map(|q| q.rewards_address).collect();
         addresses.sort();
         addresses.dedup();
-        assert_eq!(addresses.len(), 5);
+        assert_eq!(addresses.len(), CLOSE_GROUP_SIZE);
     }
 
     #[test]
@@ -629,7 +629,7 @@ mod tests {
         let chunk_size = 1024usize;
 
         let mut quotes_with_prices = Vec::new();
-        for i in 0..REQUIRED_QUOTES {
+        for i in 0..CLOSE_GROUP_SIZE {
             let quoting_metrics = QuotingMetrics {
                 data_size: chunk_size,
                 data_type: 0,
@@ -687,7 +687,7 @@ mod tests {
             .ok_or_else(|| Error::Payment("Failed to calculate median price".to_string()))?;
         println!("✓ Sorted and selected median price: {median_price} atto");
 
-        assert_eq!(payment.quotes.len(), REQUIRED_QUOTES);
+        assert_eq!(payment.quotes.len(), CLOSE_GROUP_SIZE);
         let median_amount = payment
             .quotes
             .get(MEDIAN_INDEX)

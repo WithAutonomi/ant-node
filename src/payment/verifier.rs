@@ -3,13 +3,13 @@
 //! This is the core payment verification logic for ant-node.
 //! All new data requires EVM payment on Arbitrum (no free tier).
 
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
-use crate::payment::single_node::REQUIRED_QUOTES;
 use ant_evm::merkle_payments::OnChainPaymentInfo;
 use ant_evm::{ProofOfPayment, RewardsAddress};
 use evmlib::contract::merkle_payment_vault;
@@ -410,9 +410,9 @@ impl PaymentVerifier {
         }
 
         let quote_count = payment.peer_quotes.len();
-        if quote_count != REQUIRED_QUOTES {
+        if quote_count != CLOSE_GROUP_SIZE {
             return Err(Error::Payment(format!(
-                "Payment must have exactly {REQUIRED_QUOTES} quotes, got {quote_count}"
+                "Payment must have exactly {CLOSE_GROUP_SIZE} quotes, got {quote_count}"
             )));
         }
 
@@ -1039,9 +1039,9 @@ mod tests {
             signature: vec![0u8; 64],
         };
 
-        // Build 5 quotes with distinct peer IDs (required by REQUIRED_QUOTES enforcement)
+        // Build CLOSE_GROUP_SIZE quotes with distinct peer IDs
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = Keypair::generate_ed25519();
             let peer_id = PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1121,7 +1121,7 @@ mod tests {
         let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1152,7 +1152,7 @@ mod tests {
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1183,7 +1183,7 @@ mod tests {
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1214,7 +1214,7 @@ mod tests {
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1248,7 +1248,7 @@ mod tests {
         let quote = make_fake_quote(xorname, old_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1304,7 +1304,7 @@ mod tests {
         // Use real ML-DSA keys so the pub_key→peer_id binding check passes
         let ml_dsa = MlDsa65::new();
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
             let pub_key_bytes = public_key.as_bytes().to_vec();
             let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
@@ -1348,7 +1348,7 @@ mod tests {
 
         // Use random ed25519 peer IDs — they won't match BLAKE3(pub_key)
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
@@ -1409,7 +1409,7 @@ mod tests {
         // Build a valid tagged single-node proof
         let quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
         let mut peer_quotes = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..CLOSE_GROUP_SIZE {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
             peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
