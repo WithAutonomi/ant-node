@@ -52,7 +52,8 @@ pub mod upgrade;
 
 pub use ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
+    ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, CHUNK_PROTOCOL_ID,
+    CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE, MAX_CHUNK_SIZE,
 };
 pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,

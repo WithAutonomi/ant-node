@@ -3,13 +3,13 @@
 //! This is the core payment verification logic for ant-node.
 //! All new data requires EVM payment on Arbitrum (no free tier).
 
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
-use crate::payment::single_node::REQUIRED_QUOTES;
 use ant_evm::merkle_payments::OnChainPaymentInfo;
 use ant_evm::{ProofOfPayment, RewardsAddress};
 use evmlib::contract::merkle_payment_vault;
@@ -410,9 +410,9 @@ impl PaymentVerifier {
         }
 
         let quote_count = payment.peer_quotes.len();
-        if quote_count != REQUIRED_QUOTES {
+        if quote_count != CLOSE_GROUP_SIZE {
             return Err(Error::Payment(format!(
-                "Payment must have exactly {REQUIRED_QUOTES} quotes, got {quote_count}"
+                "Payment must have exactly {CLOSE_GROUP_SIZE} quotes, got {quote_count}"
             )));
         }
 
@@ -1039,7 +1039,7 @@ mod tests {
             signature: vec![0u8; 64],
         };
 
-        // Build 5 quotes with distinct peer IDs (required by REQUIRED_QUOTES enforcement)
+        // Build 5 quotes with distinct peer IDs (required by CLOSE_GROUP_SIZE enforcement)
         let mut peer_quotes = Vec::new();
         for _ in 0..5 {
             let keypair = Keypair::generate_ed25519();
