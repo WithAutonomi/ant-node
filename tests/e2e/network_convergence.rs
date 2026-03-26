@@ -12,7 +12,14 @@
 //! - Sample size for statistical confidence is independent of N
 //! - We compare observers against *each other*, not against an omniscient oracle
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args
+)]
 
 use std::collections::HashSet;
 use std::time::Duration;

@@ -17,7 +17,15 @@
 //! - **Ground-truth mismatch** — DHT results don't match XOR-computed truth
 //! - **Quoting→verification gap** — time or perspective difference changes results
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    clippy::items_after_statements
+)]
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -349,7 +357,6 @@ async fn test_close_group_vs_ground_truth_25_nodes() {
     );
 
     let mut total_overlap_ratios: Vec<f64> = Vec::new();
-    let mut per_target_results: Vec<(usize, f64, f64)> = Vec::new(); // (target_idx, avg_overlap, response_rate)
 
     for (t_idx, target) in targets.iter().enumerate() {
         let truth: HashSet<String> = ground_truth_closest(target, &identities, CLOSE_GROUP_SIZE)
@@ -383,15 +390,7 @@ async fn test_close_group_vs_ground_truth_25_nodes() {
             overlaps.iter().sum::<f64>() / overlaps.len() as f64
         };
 
-        #[allow(clippy::cast_precision_loss)]
-        let response_rate = if queried == 0 {
-            0.0
-        } else {
-            responded as f64 / queried as f64
-        };
-
         total_overlap_ratios.push(avg_overlap);
-        per_target_results.push((t_idx, avg_overlap, response_rate));
 
         eprintln!(
             "  Target {:>2} ({}…): ground_truth_overlap={:.2}, responses={responded}/{queried}",
