@@ -184,26 +184,36 @@ pub async fn is_node_in_close_group(node: &P2PNode, target: &XorName) -> bool {
     };
     let my_distance = xor_distance(target, &my_xor);
 
+    // Request K+1 peers because the DHT may include this node in results.
+    // We filter out self below to ensure comparison against K external peers.
+    let lookup_k = CLOSE_GROUP_SIZE + 1;
+
     match tokio::time::timeout(
         CONFIRMATION_LOOKUP_TIMEOUT,
-        node.dht().find_closest_nodes(target, CLOSE_GROUP_SIZE),
+        node.dht().find_closest_nodes(target, lookup_k),
     )
     .await
     {
         Ok(Ok(peers)) => {
-            // If we couldn't retrieve a full close group, we can't confirm
+            // Filter out our own peer ID from the results
+            let external_peers: Vec<_> = peers
+                .iter()
+                .filter(|p| p.peer_id.to_hex() != my_peer_id)
+                .collect();
+
+            // If we couldn't retrieve enough external peers, we can't confirm
             // responsibility — treat as "not in close group" so the PUT is
             // rejected or retried rather than silently accepted.
-            if peers.len() < CLOSE_GROUP_SIZE {
+            if external_peers.len() < CLOSE_GROUP_SIZE {
                 warn!(
-                    "is_node_in_close_group: only found {} peers (need {CLOSE_GROUP_SIZE})",
-                    peers.len()
+                    "is_node_in_close_group: only found {} external peers (need {CLOSE_GROUP_SIZE})",
+                    external_peers.len()
                 );
                 return false;
             }
 
-            // Check if we're closer than the furthest member
-            let furthest_distance = peers
+            // Check if we're closer than the furthest external member
+            let furthest_distance = external_peers
                 .iter()
                 .filter_map(|p| peer_id_to_xor_name(&p.peer_id.to_hex()))
                 .map(|xor| xor_distance(target, &xor))

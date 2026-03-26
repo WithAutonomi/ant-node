@@ -147,11 +147,11 @@ impl AntProtocol {
                 ChunkMessageBody::GetResponse(self.handle_get(req).await)
             }
             ChunkMessageBody::QuoteRequest(ref req) => {
-                ChunkMessageBody::QuoteResponse(self.handle_quote(req))
+                ChunkMessageBody::QuoteResponse(self.handle_quote(req).await)
             }
             ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
                 ChunkMessageBody::MerkleCandidateQuoteResponse(
-                    self.handle_merkle_candidate_quote(req),
+                    self.handle_merkle_candidate_quote(req).await,
                 )
             }
             // Response messages are handled by client subscribers
@@ -285,10 +285,20 @@ impl AntProtocol {
     }
 
     /// Handle a quote request.
-    fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
+    async fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
         let addr_hex = hex::encode(request.address);
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
+
+        // Verify this node is in the close group for the address before
+        // issuing a quote. This prevents clients from paying nodes that
+        // will later refuse the PUT with NotInCloseGroup.
+        if let Some(p2p) = self.p2p_node.get() {
+            if !is_node_in_close_group(p2p, &request.address).await {
+                debug!("Refusing quote for {addr_hex}: not in close group");
+                return ChunkQuoteResponse::Error(ProtocolError::NotInCloseGroup);
+            }
+        }
 
         // Check if the chunk is already stored so we can tell the client
         // to skip payment (already_stored = true).
@@ -339,7 +349,7 @@ impl AntProtocol {
     }
 
     /// Handle a merkle candidate quote request.
-    fn handle_merkle_candidate_quote(
+    async fn handle_merkle_candidate_quote(
         &self,
         request: &MerkleCandidateQuoteRequest,
     ) -> MerkleCandidateQuoteResponse {
@@ -349,6 +359,15 @@ impl AntProtocol {
             "Handling merkle candidate quote request for {addr_hex} (size: {data_size}, ts: {})",
             request.merkle_payment_timestamp
         );
+
+        // Verify this node is in the close group for the address before
+        // issuing a merkle candidate quote.
+        if let Some(p2p) = self.p2p_node.get() {
+            if !is_node_in_close_group(p2p, &request.address).await {
+                debug!("Refusing merkle candidate quote for {addr_hex}: not in close group");
+                return MerkleCandidateQuoteResponse::Error(ProtocolError::NotInCloseGroup);
+            }
+        }
 
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
             return MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
