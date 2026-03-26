@@ -94,6 +94,9 @@ impl AntProtocol {
     /// responsible for the address.
     #[must_use]
     pub fn with_p2p_node(self, p2p_node: Arc<P2PNode>) -> Self {
+        // Set on payment verifier for merkle candidate close group verification
+        self.payment_verifier.set_p2p_node(Arc::clone(&p2p_node));
+        // Set on handler for PUT close group check
         if self.p2p_node.set(p2p_node).is_err() {
             warn!("with_p2p_node called on AntProtocol that already has a P2P node set");
         }
@@ -106,6 +109,9 @@ impl AntProtocol {
     /// (e.g. in test harnesses where `AntProtocol` is built before `P2PNode`).
     /// Can only be called once — subsequent calls log a warning.
     pub fn set_p2p_node(&self, p2p_node: Arc<P2PNode>) {
+        // Set on payment verifier for merkle candidate close group verification
+        self.payment_verifier.set_p2p_node(Arc::clone(&p2p_node));
+        // Set on handler for PUT close group check
         if self.p2p_node.set(p2p_node).is_err() {
             warn!("set_p2p_node called but P2P node was already set");
         }

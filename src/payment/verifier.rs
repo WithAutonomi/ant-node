@@ -18,9 +18,11 @@ use evmlib::Network as EvmNetwork;
 use lru::LruCache;
 use parking_lot::Mutex;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
+use saorsa_core::P2PNode;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Minimum allowed size for a payment proof in bytes.
 ///
@@ -118,6 +120,11 @@ pub struct PaymentVerifier {
     pool_cache: Mutex<LruCache<PoolHash, OnChainPaymentInfo>>,
     /// Configuration.
     config: PaymentVerifierConfig,
+    /// Optional P2P node for candidate close group verification.
+    /// When set, merkle payment verification also checks that the
+    /// candidate nodes in the winner pool are actually the closest
+    /// nodes to the data address.
+    p2p_node: OnceLock<Arc<P2PNode>>,
 }
 
 impl PaymentVerifier {
@@ -140,6 +147,7 @@ impl PaymentVerifier {
             cache,
             pool_cache,
             config,
+            p2p_node: OnceLock::new(),
         }
     }
 
@@ -262,6 +270,18 @@ impl PaymentVerifier {
             PaymentStatus::PaymentVerified => Err(Error::Payment(
                 "Unexpected PaymentVerified status from check_payment_required".to_string(),
             )),
+        }
+    }
+
+    /// Set the P2P node for candidate close group verification.
+    ///
+    /// When set, merkle payment verification additionally checks that the
+    /// candidate nodes in the winner pool are actually the closest nodes
+    /// to the data address being stored. This prevents malicious clients
+    /// from building winner pools with arbitrary (non-closest) nodes.
+    pub fn set_p2p_node(&self, p2p_node: Arc<P2PNode>) {
+        if self.p2p_node.set(p2p_node).is_err() {
+            warn!("PaymentVerifier: P2P node was already set");
         }
     }
 
@@ -667,6 +687,18 @@ impl PaymentVerifier {
             }
         }
 
+        // Verify candidate nodes are actually close to the data address.
+        // This prevents malicious clients from building winner pools with
+        // arbitrary nodes that are not in the close group for the address.
+        if let Some(p2p) = self.p2p_node.get() {
+            self.verify_candidates_are_closest(
+                xorname,
+                &merkle_proof.winner_pool.candidate_nodes,
+                p2p,
+            )
+            .await?;
+        }
+
         if tracing::enabled!(tracing::Level::INFO) {
             info!(
                 "Merkle payment verified for {} (pool: {})",
@@ -674,6 +706,99 @@ impl PaymentVerifier {
                 hex::encode(pool_hash)
             );
         }
+
+        Ok(())
+    }
+
+    /// Verify that the candidate nodes in a merkle winner pool are actually
+    /// the closest nodes to the data address.
+    ///
+    /// Performs a DHT lookup for the address and checks that a majority of
+    /// the candidates appear in the close group. This is critical to prevent
+    /// malicious clients from paying arbitrary nodes instead of the actual
+    /// closest nodes.
+    async fn verify_candidates_are_closest(
+        &self,
+        xorname: &XorName,
+        candidates: &[ant_evm::merkle_payments::MerklePaymentCandidateNode],
+        p2p: &P2PNode,
+    ) -> Result<()> {
+        // Look up the actual closest nodes to this address
+        let lookup_k = CLOSE_GROUP_SIZE * 3; // Request more than K to get broader view
+        let closest = match tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            p2p.dht().find_closest_nodes(xorname, lookup_k),
+        )
+        .await
+        {
+            Ok(Ok(peers)) if !peers.is_empty() => peers,
+            Ok(Ok(_)) => {
+                // Empty results — can't verify, log and allow
+                warn!(
+                    "Cannot verify merkle candidates for {}: DHT returned empty results",
+                    hex::encode(xorname)
+                );
+                return Ok(());
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    "Cannot verify merkle candidates for {}: DHT error: {e}",
+                    hex::encode(xorname)
+                );
+                return Ok(());
+            }
+            Err(_) => {
+                warn!(
+                    "Cannot verify merkle candidates for {}: DHT lookup timed out",
+                    hex::encode(xorname)
+                );
+                return Ok(());
+            }
+        };
+
+        // Build set of known close-group peer ID hex strings
+        let close_group_ids: std::collections::HashSet<String> =
+            closest.iter().map(|p| p.peer_id.to_hex()).collect();
+
+        // For each candidate, derive peer ID from pub_key and check if
+        // it's in the close group
+        let mut candidates_in_close_group = 0usize;
+        for candidate in candidates {
+            // Derive peer ID from ML-DSA pub key: BLAKE3(pub_key) = peer_id
+            if let Ok(peer_id) = peer_id_from_public_key_bytes(&candidate.pub_key) {
+                let peer_hex = peer_id.to_hex();
+                if close_group_ids.contains(&peer_hex) {
+                    candidates_in_close_group += 1;
+                }
+            }
+        }
+
+        // Require at least a majority of candidates to be in the close group.
+        // We use CLOSE_GROUP_SIZE as the bar since the winner pool may have
+        // more candidates than the close group (e.g., 16 candidates for K=5).
+        let min_required = if candidates.len() >= CLOSE_GROUP_SIZE {
+            // At least CLOSE_GROUP_MAJORITY of the close group nodes
+            // should appear among the candidates
+            (CLOSE_GROUP_SIZE / 2) + 1
+        } else {
+            // Small pool — require majority of what's there
+            (candidates.len() / 2) + 1
+        };
+
+        if candidates_in_close_group < min_required {
+            return Err(Error::Payment(format!(
+                "Merkle candidate pool for {} has only {candidates_in_close_group} nodes \
+                 in the close group (need {min_required}). Candidates may not be the \
+                 actual closest nodes to this address.",
+                hex::encode(xorname)
+            )));
+        }
+
+        debug!(
+            "Merkle candidate close group check passed for {}: {candidates_in_close_group}/{} candidates in close group",
+            hex::encode(xorname),
+            candidates.len()
+        );
 
         Ok(())
     }
