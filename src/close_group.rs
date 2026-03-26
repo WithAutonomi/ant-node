@@ -112,7 +112,9 @@ pub async fn confirm_close_group(
 
     for i in 0..actual_lookups {
         let node_idx = (i * step) % nodes.len();
-        let p2p = &nodes[node_idx];
+        let Some(p2p) = nodes.get(node_idx) else {
+            continue;
+        };
 
         match tokio::time::timeout(
             CONFIRMATION_LOOKUP_TIMEOUT,

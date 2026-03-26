@@ -206,17 +206,8 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Close group verification — check if this node is responsible
-        //    for the address. This prevents storing data we're not close to,
-        //    which is critical for merkle payment verification consistency.
-        if let Some(p2p) = self.p2p_node.get() {
-            if !is_node_in_close_group(p2p, &address).await {
-                debug!("Rejecting PUT for {addr_hex}: this node is not in the close group");
-                return ChunkPutResponse::Error(ProtocolError::NotInCloseGroup);
-            }
-        }
-
-        // 5. Verify payment
+        // 4. Verify payment (fast cache check first to reject spam before
+        //    expensive DHT lookups in the close group check)
         let payment_result = self
             .payment_verifier
             .verify_payment(&address, request.payment_proof.as_deref())
@@ -233,6 +224,17 @@ impl AntProtocol {
             }
             Err(e) => {
                 return ChunkPutResponse::Error(ProtocolError::PaymentFailed(e.to_string()));
+            }
+        }
+
+        // 5. Close group verification — check if this node is responsible
+        //    for the address. This prevents storing data we're not close to,
+        //    which is critical for merkle payment verification consistency.
+        //    Done after payment check to avoid DHT lookup DoS from unpaid requests.
+        if let Some(p2p) = self.p2p_node.get() {
+            if !is_node_in_close_group(p2p, &address).await {
+                debug!("Rejecting PUT for {addr_hex}: this node is not in the close group");
+                return ChunkPutResponse::Error(ProtocolError::NotInCloseGroup);
             }
         }
 
