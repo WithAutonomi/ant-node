@@ -123,11 +123,14 @@ impl NodeBuilder {
             None
         };
 
+        let p2p_node = Arc::new(p2p_node);
+
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
-            Some(Arc::new(
-                Self::build_ant_protocol(&self.config, &identity).await?,
-            ))
+            let protocol = Self::build_ant_protocol(&self.config, &identity)
+                .await?
+                .with_p2p_node(Arc::clone(&p2p_node));
+            Some(Arc::new(protocol))
         } else {
             info!("Chunk storage disabled");
             None
@@ -135,7 +138,7 @@ impl NodeBuilder {
 
         let node = RunningNode {
             config: self.config,
-            p2p_node: Arc::new(p2p_node),
+            p2p_node,
             shutdown,
             events_tx,
             events_rx: Some(events_rx),
@@ -143,6 +146,7 @@ impl NodeBuilder {
             bootstrap_manager,
             ant_protocol,
             protocol_task: None,
+            dht_refresh_task: None,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -424,6 +428,15 @@ impl NodeBuilder {
     }
 }
 
+/// Interval between DHT routing table refresh rounds (seconds).
+const DHT_REFRESH_INTERVAL_SECS: u64 = 30;
+
+/// Number of random addresses to probe per DHT refresh round.
+const DHT_REFRESH_ADDRESSES: usize = 5;
+
+/// K parameter for DHT refresh lookups.
+const DHT_REFRESH_K: usize = 20;
+
 /// A running Ant node.
 pub struct RunningNode {
     config: NodeConfig,
@@ -438,6 +451,8 @@ pub struct RunningNode {
     ant_protocol: Option<Arc<AntProtocol>>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// DHT routing table refresh background task.
+    dht_refresh_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -497,6 +512,12 @@ impl RunningNode {
 
         // Start protocol message routing (P2P → AntProtocol → P2P response)
         self.start_protocol_routing();
+
+        // Start DHT routing table refresh background task.
+        // This periodically performs random lookups to keep the routing table
+        // populated, addressing the issue where nodes discover only ~13% of
+        // the network via DHT despite being connected to ~90%.
+        self.start_dht_refresh();
 
         // Start upgrade monitor if enabled
         if let Some(monitor) = self.upgrade_monitor.take() {
@@ -617,6 +638,11 @@ impl RunningNode {
 
         // Stop protocol routing task
         if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
+
+        // Stop DHT refresh task
+        if let Some(handle) = self.dht_refresh_task.take() {
             handle.abort();
         }
 
@@ -758,6 +784,36 @@ impl RunningNode {
             }
         }));
         info!("Protocol message routing started");
+    }
+
+    /// Start the DHT routing table refresh background task.
+    ///
+    /// Periodically performs random lookups to populate the DHT routing table.
+    /// Without this, nodes may only discover ~13% of the network via DHT despite
+    /// being connected to ~90% via the transport layer. This is critical for
+    /// merkle payment verification which requires consistent close group lookups.
+    fn start_dht_refresh(&mut self) {
+        let p2p = Arc::clone(&self.p2p_node);
+        let shutdown = self.shutdown.clone();
+
+        self.dht_refresh_task = Some(tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(DHT_REFRESH_INTERVAL_SECS);
+
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(interval) => {
+                        for _ in 0..DHT_REFRESH_ADDRESSES {
+                            let mut addr = [0u8; 32];
+                            rand::Rng::fill(&mut rand::thread_rng(), &mut addr);
+                            let _ = p2p.dht().find_closest_nodes(&addr, DHT_REFRESH_K).await;
+                        }
+                        debug!("DHT routing table refresh completed ({DHT_REFRESH_ADDRESSES} lookups, k={DHT_REFRESH_K})");
+                    }
+                }
+            }
+        }));
+        info!("DHT routing table refresh task started (every {DHT_REFRESH_INTERVAL_SECS}s)");
     }
 
     /// Request the node to shut down.

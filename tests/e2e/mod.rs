@@ -60,6 +60,12 @@ mod merkle_payment;
 #[cfg(test)]
 mod security_attacks;
 
+#[cfg(test)]
+mod close_group_stability;
+
+#[cfg(test)]
+mod network_convergence;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};

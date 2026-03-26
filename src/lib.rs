@@ -41,6 +41,7 @@
 
 pub mod ant_protocol;
 pub mod client;
+pub mod close_group;
 pub mod config;
 pub mod devnet;
 pub mod error;

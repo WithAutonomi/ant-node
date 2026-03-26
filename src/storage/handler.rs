@@ -34,11 +34,13 @@ use crate::ant_protocol::{
     MAX_CHUNK_SIZE,
 };
 use crate::client::compute_address;
+use crate::close_group::is_node_in_close_group;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
-use std::sync::Arc;
+use saorsa_core::P2PNode;
+use std::sync::{Arc, OnceLock};
 use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
@@ -53,6 +55,13 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
+    /// Optional P2P node for close group verification during PUT.
+    /// When set, the handler verifies that this node is actually in the
+    /// close group for the address being stored, preventing storage of
+    /// data this node is not responsible for.
+    /// Uses `OnceLock` so the P2P node can be set after construction
+    /// (the P2P node may not exist yet when the protocol handler is created).
+    p2p_node: OnceLock<Arc<P2PNode>>,
 }
 
 impl AntProtocol {
@@ -73,7 +82,30 @@ impl AntProtocol {
             storage,
             payment_verifier,
             quote_generator,
+            p2p_node: OnceLock::new(),
         }
+    }
+
+    /// Set the P2P node for close group verification during PUT operations.
+    ///
+    /// When set, the handler will verify that this node is in the close group
+    /// for the chunk address before accepting storage. This is critical for
+    /// merkle payment verification where the verifier must confirm it is
+    /// responsible for the address.
+    #[must_use]
+    pub fn with_p2p_node(self, p2p_node: Arc<P2PNode>) -> Self {
+        // OnceLock is empty after construction, so set() always succeeds here.
+        let _ = self.p2p_node.set(p2p_node);
+        self
+    }
+
+    /// Set the P2P node after construction.
+    ///
+    /// This is used when the P2P node is created after the protocol handler
+    /// (e.g. in test harnesses where `AntProtocol` is built before `P2PNode`).
+    /// Can only be called once — subsequent calls are silently ignored.
+    pub fn set_p2p_node(&self, p2p_node: Arc<P2PNode>) {
+        let _ = self.p2p_node.set(p2p_node);
     }
 
     /// Get the protocol identifier.
@@ -171,7 +203,19 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Verify payment
+        // 4. Close group verification — check if this node is responsible
+        //    for the address. This prevents storing data we're not close to,
+        //    which is critical for merkle payment verification consistency.
+        if let Some(p2p) = self.p2p_node.get() {
+            if !is_node_in_close_group(p2p, &address).await {
+                debug!("Rejecting PUT for {addr_hex}: this node is not in the close group");
+                return ChunkPutResponse::Error(ProtocolError::Internal(
+                    "This node is not in the close group for this address".to_string(),
+                ));
+            }
+        }
+
+        // 5. Verify payment
         let payment_result = self
             .payment_verifier
             .verify_payment(&address, request.payment_proof.as_deref())
@@ -191,7 +235,7 @@ impl AntProtocol {
             }
         }
 
-        // 5. Store chunk
+        // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
                 let content_len = request.content.len();

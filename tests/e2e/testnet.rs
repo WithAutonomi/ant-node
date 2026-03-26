@@ -388,6 +388,9 @@ pub struct TestNode {
     /// Populated once the node starts and the protocol router is spawned.
     /// Dropped (and aborted) during teardown so tests don't leave tasks behind.
     pub protocol_task: Option<JoinHandle<()>>,
+
+    /// DHT routing table refresh background task handle.
+    pub dht_refresh_task: Option<JoinHandle<()>>,
 }
 
 impl TestNode {
@@ -412,6 +415,11 @@ impl TestNode {
 
         // Stop protocol handler first
         if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
+
+        // Stop DHT refresh task
+        if let Some(handle) = self.dht_refresh_task.take() {
             handle.abort();
         }
 
@@ -1033,6 +1041,7 @@ impl TestNetwork {
             bootstrap_addrs,
             node_identity: Some(identity),
             protocol_task: None,
+            dht_refresh_task: None,
         })
     }
 
@@ -1148,8 +1157,14 @@ impl TestNetwork {
             TestnetError::Startup(format!("Failed to start node {}: {e}", node.index))
         })?;
 
-        node.p2p_node = Some(Arc::new(p2p_node));
+        let p2p_arc = Arc::new(p2p_node);
+        node.p2p_node = Some(Arc::clone(&p2p_arc));
         *node.state.write().await = NodeState::Running;
+
+        // Wire the P2P node into the protocol handler for close group verification
+        if let Some(ref protocol) = node.ant_protocol {
+            protocol.set_p2p_node(Arc::clone(&p2p_arc));
+        }
 
         // Start protocol handler that routes incoming P2P messages to AntProtocol
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
@@ -1200,6 +1215,25 @@ impl TestNetwork {
                             });
                         }
                     }
+                }
+            }));
+        }
+
+        // Start DHT routing table refresh background task.
+        // Periodically performs random lookups to keep routing tables populated.
+        if let Some(ref p2p) = node.p2p_node {
+            let p2p_clone = Arc::clone(p2p);
+            let node_index = node.index;
+            node.dht_refresh_task = Some(tokio::spawn(async move {
+                let interval = std::time::Duration::from_secs(10);
+                loop {
+                    tokio::time::sleep(interval).await;
+                    for _ in 0..5 {
+                        let mut addr = [0u8; 32];
+                        rand::Rng::fill(&mut rand::thread_rng(), &mut addr);
+                        let _ = p2p_clone.dht().find_closest_nodes(&addr, 20).await;
+                    }
+                    debug!("Node {node_index} DHT routing table refresh completed");
                 }
             }));
         }
@@ -1403,6 +1437,9 @@ impl TestNetwork {
 
             debug!("Stopping node {}", node.index);
             if let Some(handle) = node.protocol_task.take() {
+                handle.abort();
+            }
+            if let Some(handle) = node.dht_refresh_task.take() {
                 handle.abort();
             }
             *node.state.write().await = NodeState::Stopping;
