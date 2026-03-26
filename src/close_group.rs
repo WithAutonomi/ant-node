@@ -90,6 +90,16 @@ pub async fn confirm_close_group(
     threshold: usize,
 ) -> ConfirmedCloseGroup {
     let actual_lookups = num_lookups.min(nodes.len());
+
+    if actual_lookups == 0 || nodes.is_empty() {
+        return ConfirmedCloseGroup {
+            members: Vec::new(),
+            num_lookups: 0,
+            num_responses: 0,
+            threshold,
+        };
+    }
+
     let mut appearance_count: HashMap<String, usize> = HashMap::new();
     let mut num_responses = 0usize;
 
@@ -148,8 +158,8 @@ pub async fn confirm_close_group(
         }
     });
 
-    // Trim to close group size
-    confirmed.truncate(CLOSE_GROUP_SIZE);
+    // Trim to the requested size, capped at close group size
+    confirmed.truncate(k.min(CLOSE_GROUP_SIZE));
 
     ConfirmedCloseGroup {
         members: confirmed,
@@ -178,10 +188,15 @@ pub async fn is_node_in_close_group(node: &P2PNode, target: &XorName) -> bool {
     .await
     {
         Ok(Ok(peers)) => {
-            // Check if we are closer than or equal to the furthest peer in the group
+            // If we couldn't retrieve a full close group, we can't confirm
+            // responsibility — treat as "not in close group" so the PUT is
+            // rejected or retried rather than silently accepted.
             if peers.len() < CLOSE_GROUP_SIZE {
-                // Not enough peers found — we are likely in the close group
-                return true;
+                warn!(
+                    "is_node_in_close_group: only found {} peers (need {CLOSE_GROUP_SIZE})",
+                    peers.len()
+                );
+                return false;
             }
 
             // Check if we're closer than the furthest member
@@ -191,12 +206,15 @@ pub async fn is_node_in_close_group(node: &P2PNode, target: &XorName) -> bool {
                 .map(|xor| xor_distance(target, &xor))
                 .max();
 
-            furthest_distance.map_or(true, |furthest| my_distance <= furthest)
+            furthest_distance.is_some_and(|furthest| my_distance <= furthest)
         }
-        _ => {
-            // Lookup failed — can't determine, assume we're in to avoid
-            // rejecting valid payments
-            true
+        Ok(Err(e)) => {
+            warn!("is_node_in_close_group: DHT lookup failed: {e}");
+            false
+        }
+        Err(_) => {
+            warn!("is_node_in_close_group: DHT lookup timed out");
+            false
         }
     }
 }

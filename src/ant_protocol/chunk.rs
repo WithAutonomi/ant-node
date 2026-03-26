@@ -322,6 +322,9 @@ pub enum ProtocolError {
     PaymentFailed(String),
     /// Quote generation failed.
     QuoteFailed(String),
+    /// This node is not in the close group for the requested address.
+    /// The client should retry with a different close-group member.
+    NotInCloseGroup,
     /// Internal error.
     Internal(String),
 }
@@ -348,6 +351,9 @@ impl std::fmt::Display for ProtocolError {
             Self::StorageFailed(msg) => write!(f, "storage failed: {msg}"),
             Self::PaymentFailed(msg) => write!(f, "payment failed: {msg}"),
             Self::QuoteFailed(msg) => write!(f, "quote failed: {msg}"),
+            Self::NotInCloseGroup => {
+                write!(f, "this node is not in the close group for this address")
+            }
             Self::Internal(msg) => write!(f, "internal error: {msg}"),
         }
     }

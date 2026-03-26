@@ -94,8 +94,9 @@ impl AntProtocol {
     /// responsible for the address.
     #[must_use]
     pub fn with_p2p_node(self, p2p_node: Arc<P2PNode>) -> Self {
-        // OnceLock is empty after construction, so set() always succeeds here.
-        let _ = self.p2p_node.set(p2p_node);
+        if self.p2p_node.set(p2p_node).is_err() {
+            warn!("with_p2p_node called on AntProtocol that already has a P2P node set");
+        }
         self
     }
 
@@ -103,9 +104,11 @@ impl AntProtocol {
     ///
     /// This is used when the P2P node is created after the protocol handler
     /// (e.g. in test harnesses where `AntProtocol` is built before `P2PNode`).
-    /// Can only be called once — subsequent calls are silently ignored.
+    /// Can only be called once — subsequent calls log a warning.
     pub fn set_p2p_node(&self, p2p_node: Arc<P2PNode>) {
-        let _ = self.p2p_node.set(p2p_node);
+        if self.p2p_node.set(p2p_node).is_err() {
+            warn!("set_p2p_node called but P2P node was already set");
+        }
     }
 
     /// Get the protocol identifier.
@@ -209,9 +212,7 @@ impl AntProtocol {
         if let Some(p2p) = self.p2p_node.get() {
             if !is_node_in_close_group(p2p, &address).await {
                 debug!("Rejecting PUT for {addr_hex}: this node is not in the close group");
-                return ChunkPutResponse::Error(ProtocolError::Internal(
-                    "This node is not in the close group for this address".to_string(),
-                ));
+                return ChunkPutResponse::Error(ProtocolError::NotInCloseGroup);
             }
         }
 
