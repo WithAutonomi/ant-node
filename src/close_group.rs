@@ -1,8 +1,9 @@
 //! Close group confirmation protocol.
 //!
-//! Provides utilities for verifying close group membership with consensus.
-//! Multiple nodes independently look up the same address and the intersection
-//! of their results forms the "confirmed" close group.
+//! Provides utilities for verifying close group membership with quorum-based
+//! consensus. Multiple nodes independently look up the same address and peers
+//! that appear in at least a configurable threshold of those lookups form the
+//! "confirmed" close group.
 //!
 //! This addresses the DHT routing table incompleteness problem where different
 //! nodes may return different closest-node sets for the same address.

@@ -299,7 +299,7 @@ async fn test_routing_table_completeness_25_nodes() {
     }
 
     // Assertions
-    // In a 25-node network, every node should discover at least 50% of peers
+    // In a 25-node network, every node should discover at least 25% of peers
     // via DHT after thorough warmup. If not, the routing table is broken.
     assert!(
         min_discovered >= total_nodes / 4,
@@ -307,7 +307,7 @@ async fn test_routing_table_completeness_25_nodes() {
          routing tables are severely incomplete"
     );
 
-    // Every node should have at least 3 direct connections
+    // Every node should have at least 2 direct connections
     assert!(
         min_peers >= 2,
         "Node with fewest connections has only {min_peers} — \
