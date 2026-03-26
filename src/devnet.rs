@@ -639,8 +639,14 @@ impl Devnet {
             .await
             .map_err(|e| DevnetError::Startup(format!("Failed to start node {index}: {e}")))?;
 
-        node.p2p_node = Some(Arc::new(p2p_node));
+        let p2p_arc = Arc::new(p2p_node);
+        node.p2p_node = Some(Arc::clone(&p2p_arc));
         *node.state.write().await = NodeState::Running;
+
+        // Wire P2P node into protocol handler for close group verification
+        if let Some(ref protocol) = node.ant_protocol {
+            protocol.set_p2p_node(Arc::clone(&p2p_arc));
+        }
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
             let mut events = p2p.subscribe_events();
