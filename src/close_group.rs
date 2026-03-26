@@ -172,11 +172,27 @@ pub async fn confirm_close_group(
     }
 }
 
-/// Check if a node is likely in the close group for a given address.
+/// Number of independent DHT lookups for close group confirmation.
 ///
-/// Performs a single DHT lookup from the given node and checks if the node
-/// itself would be among the K closest. This is the "am I responsible for
-/// this address?" check that nodes should perform during verification.
+/// Each lookup follows a different iterative path through the network,
+/// so multiple lookups from the same node can discover different peer sets.
+/// This compensates for incomplete routing tables (nodes only see ~13-17%
+/// of the network via a single lookup).
+const CLOSE_GROUP_LOOKUPS: usize = 3;
+
+/// Minimum number of lookups that must agree the node is in the close group.
+const CLOSE_GROUP_CONFIRMATION_THRESHOLD: usize = 2;
+
+/// Check if a node is in the close group for a given address.
+///
+/// Performs multiple independent DHT lookups from this node and checks
+/// whether a threshold of them agree that this node would be among the
+/// K closest. Multiple lookups follow different iterative paths through
+/// the network, compensating for incomplete routing tables.
+///
+/// This is the production close group verification used in PUT and quote
+/// handlers. It uses the same threshold-based consensus approach as
+/// `confirm_close_group()` but operates from a single node.
 pub async fn is_node_in_close_group(node: &P2PNode, target: &XorName) -> bool {
     let my_peer_id = node.peer_id().to_hex();
     let Some(my_xor) = peer_id_to_xor_name(&my_peer_id) else {
@@ -185,51 +201,76 @@ pub async fn is_node_in_close_group(node: &P2PNode, target: &XorName) -> bool {
     let my_distance = xor_distance(target, &my_xor);
 
     // Request K+1 peers because the DHT may include this node in results.
-    // We filter out self below to ensure comparison against K external peers.
     let lookup_k = CLOSE_GROUP_SIZE + 1;
 
-    match tokio::time::timeout(
-        CONFIRMATION_LOOKUP_TIMEOUT,
-        node.dht().find_closest_nodes(target, lookup_k),
-    )
-    .await
-    {
-        Ok(Ok(peers)) => {
-            // Filter out our own peer ID from the results
-            let external_peers: Vec<_> = peers
-                .iter()
-                .filter(|p| p.peer_id.to_hex() != my_peer_id)
-                .collect();
+    let mut votes_in = 0usize;
+    let mut votes_out = 0usize;
+    let mut successful_lookups = 0usize;
 
-            // If we couldn't retrieve enough external peers, we can't confirm
-            // responsibility — treat as "not in close group" so the PUT is
-            // rejected or retried rather than silently accepted.
-            if external_peers.len() < CLOSE_GROUP_SIZE {
-                warn!(
-                    "is_node_in_close_group: only found {} external peers (need {CLOSE_GROUP_SIZE})",
-                    external_peers.len()
-                );
-                return false;
+    for round in 0..CLOSE_GROUP_LOOKUPS {
+        let result = tokio::time::timeout(
+            CONFIRMATION_LOOKUP_TIMEOUT,
+            node.dht().find_closest_nodes(target, lookup_k),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(peers)) => {
+                // Filter out our own peer ID from the results
+                let external_peers: Vec<_> = peers
+                    .iter()
+                    .filter(|p| p.peer_id.to_hex() != my_peer_id)
+                    .collect();
+
+                if external_peers.len() < CLOSE_GROUP_SIZE {
+                    debug!(
+                        "is_node_in_close_group round {round}: only {} external peers",
+                        external_peers.len()
+                    );
+                    votes_out += 1;
+                    continue;
+                }
+
+                successful_lookups += 1;
+
+                // Check if we're closer than the furthest external member
+                let furthest_distance = external_peers
+                    .iter()
+                    .filter_map(|p| peer_id_to_xor_name(&p.peer_id.to_hex()))
+                    .map(|xor| xor_distance(target, &xor))
+                    .max();
+
+                if furthest_distance.is_some_and(|furthest| my_distance <= furthest) {
+                    votes_in += 1;
+                } else {
+                    votes_out += 1;
+                }
             }
-
-            // Check if we're closer than the furthest external member
-            let furthest_distance = external_peers
-                .iter()
-                .filter_map(|p| peer_id_to_xor_name(&p.peer_id.to_hex()))
-                .map(|xor| xor_distance(target, &xor))
-                .max();
-
-            furthest_distance.is_some_and(|furthest| my_distance <= furthest)
-        }
-        Ok(Err(e)) => {
-            warn!("is_node_in_close_group: DHT lookup failed: {e}");
-            false
-        }
-        Err(_) => {
-            warn!("is_node_in_close_group: DHT lookup timed out");
-            false
+            Ok(Err(e)) => {
+                debug!("is_node_in_close_group round {round}: DHT error: {e}");
+                votes_out += 1;
+            }
+            Err(_) => {
+                debug!("is_node_in_close_group round {round}: timeout");
+                votes_out += 1;
+            }
         }
     }
+
+    if successful_lookups == 0 {
+        warn!("is_node_in_close_group: all {CLOSE_GROUP_LOOKUPS} lookups failed");
+        return false;
+    }
+
+    let is_in = votes_in >= CLOSE_GROUP_CONFIRMATION_THRESHOLD;
+    if !is_in {
+        debug!(
+            "is_node_in_close_group: not confirmed (votes: {votes_in} in, {votes_out} out, \
+             threshold: {CLOSE_GROUP_CONFIRMATION_THRESHOLD})"
+        );
+    }
+
+    is_in
 }
 
 #[cfg(test)]
