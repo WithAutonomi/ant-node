@@ -101,22 +101,11 @@ pub struct BucketStats {
 }
 ```
 
-### Fix 4: `find_closest_nodes_local` (Nice-to-have)
+### Rejected: `find_closest_nodes_local`
 
-Add a method that returns the closest nodes from the local routing table only, without performing a network walk. This would allow fast close group checks without the 15-second timeout risk of a full iterative lookup.
+A local-only lookup (returning closest nodes from the routing table without a network walk) was considered but **rejected**. With routing tables at 13-17% discovery, the local view is fundamentally incomplete -- the "closest" nodes in the local table may not be the actual closest nodes in the network. Using this for close group decisions would produce the exact inaccuracy this work is trying to eliminate.
 
-```rust
-impl Dht {
-    /// Return the K closest nodes from the local routing table only.
-    /// No network queries are performed.
-    pub fn find_closest_nodes_local(&self, target: &[u8; 32], k: usize) -> Vec<PeerInfo>;
-}
-```
-
-This is useful for:
-- Fast "am I in the close group?" checks during PUT/quote handling
-- Reducing latency on the storage critical path
-- Avoiding DoS amplification (no network round-trips triggered by incoming requests)
+A local-only lookup would only be safe **after Fix 1** (routing table seeded from transport connections), at which point routing tables would reflect ~90% of the network and local results would be reliable. Until then, iterative network lookups are the only way to get accurate closest-node results.
 
 ## Workarounds Currently in ant-node
 
@@ -136,8 +125,7 @@ These workarounds are effective but inherently limited. They cannot compensate f
 
 1. **Fix 1 (routing table seeding)** -- Critical. This single change would likely resolve 90%+ of close group instability. Standard Kademlia behavior.
 2. **Fix 2 (bucket refresh)** -- Important. Prevents staleness over time. Standard Kademlia behavior.
-3. **Fix 4 (local lookup)** -- Important for performance. Eliminates network round-trips in the PUT critical path.
-4. **Fix 3 (routing table API)** -- Nice-to-have for monitoring and debugging.
+3. **Fix 3 (routing table API)** -- Nice-to-have for monitoring and debugging.
 
 ## Validation
 
