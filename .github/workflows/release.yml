@@ -183,134 +183,9 @@ jobs:
           path: ant-node-cli-${{ matrix.friendly_name }}.${{ matrix.archive }}
           retention-days: 1
 
-  installers-linux:
-    name: Build Linux Installers
-    needs: build
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-deb
-        run: cargo install cargo-deb
-
-      - name: Install cargo-generate-rpm
-        run: cargo install cargo-generate-rpm
-
-      - name: Build release binaries
-        run: cargo build --release
-
-      - name: Build .deb package
-        run: cargo deb --no-build --output ant-node.deb
-
-      - name: Build .rpm package
-        run: cargo generate-rpm --output ant-node.rpm
-
-      - name: Upload .deb
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-deb
-          path: ant-node.deb
-          retention-days: 1
-
-      - name: Upload .rpm
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-rpm
-          path: ant-node.rpm
-          retention-days: 1
-
-  installers-windows:
-    name: Build Windows Installer
-    needs: [validate, build]
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release binaries
-        run: cargo build --release --target x86_64-pc-windows-msvc
-
-      - name: Install WiX Toolset
-        run: |
-          choco install wixtoolset -y
-          echo "C:\Program Files (x86)\WiX Toolset v3.14\bin" >> $env:GITHUB_PATH
-
-      - name: Extract version from tag
-        id: version
-        shell: pwsh
-        run: |
-          $tag = "${{ needs.validate.outputs.version }}"
-          # Remove 'v' prefix and strip any pre-release suffix (e.g., -rc.1, -beta.2)
-          $version = $tag -replace '^v', '' -replace '-.*$', ''
-          # Ensure 4-part version for MSI (add .0 if needed)
-          $parts = $version.Split('.')
-          while ($parts.Length -lt 4) {
-            $version = "$version.0"
-            $parts = $version.Split('.')
-          }
-          echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "MSI Version: $version"
-
-      - name: Build MSI installer
-        shell: pwsh
-        run: |
-          # Create placeholder images if they don't exist
-          if (-not (Test-Path "wix\banner.bmp")) {
-            # Create a simple 493x58 banner
-            Add-Type -AssemblyName System.Drawing
-            $bmp = New-Object System.Drawing.Bitmap(493, 58)
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.Clear([System.Drawing.Color]::FromArgb(0, 120, 212))
-            $bmp.Save("wix\banner.bmp")
-          }
-          if (-not (Test-Path "wix\dialog.bmp")) {
-            # Create a simple 493x312 dialog
-            Add-Type -AssemblyName System.Drawing
-            $bmp = New-Object System.Drawing.Bitmap(493, 312)
-            $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.Clear([System.Drawing.Color]::FromArgb(0, 120, 212))
-            $bmp.Save("wix\dialog.bmp")
-          }
-          if (-not (Test-Path "wix\ant.ico")) {
-            # Use a default icon
-            Copy-Item "C:\Windows\System32\shell32.dll" -Destination "wix\temp.dll"
-            Add-Type -AssemblyName System.Drawing
-            $icon = [System.Drawing.Icon]::ExtractAssociatedIcon("C:\Windows\System32\cmd.exe")
-            $stream = [System.IO.File]::Create("wix\ant.ico")
-            $icon.Save($stream)
-            $stream.Close()
-          }
-
-          # Create license.rtf if it doesn't exist
-          if (-not (Test-Path "wix\license.rtf")) {
-            $licenseText = Get-Content "LICENSE-MIT" -Raw
-            $rtfContent = "{\rtf1\ansi\deff0{\fonttbl{\f0 Consolas;}}\f0\fs20 " + ($licenseText -replace '\n', '\par ') + "}"
-            Set-Content -Path "wix\license.rtf" -Value $rtfContent
-          }
-
-          $version = "${{ steps.version.outputs.version }}"
-          candle.exe wix\main.wxs -o wix\main.wixobj -ext WixUIExtension -dProductVersion="$version"
-          light.exe wix\main.wixobj -o ant-node.msi -ext WixUIExtension
-
-      - name: Upload MSI
-        uses: actions/upload-artifact@v4
-        with:
-          name: installer-msi
-          path: ant-node.msi
-          retention-days: 1
-
   sign:
     name: Sign Releases
-    needs: [build, installers-linux, installers-windows]
+    needs: [build]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -339,7 +214,7 @@ jobs:
 
       - name: Sign all release files
         run: |
-          for file in artifacts/ant-node-cli-*.tar.gz artifacts/ant-node-cli-*.zip artifacts/*.deb artifacts/*.rpm artifacts/*.msi; do
+          for file in artifacts/ant-node-cli-*.tar.gz artifacts/ant-node-cli-*.zip; do
             if [ -f "$file" ]; then
               echo "Signing $file..."
               ./target/release/ant-keygen sign \
@@ -356,7 +231,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          sha256sum ant-node-cli-* *.deb *.rpm *.msi 2>/dev/null > SHA256SUMS.txt || true
+          sha256sum ant-node-cli-* 2>/dev/null > SHA256SUMS.txt || true
           cat SHA256SUMS.txt
 
       - name: Upload signed artifacts
@@ -435,29 +310,6 @@ jobs:
             .\ant-node.exe --testnet
             ```
 
-            ### Service Installers (Automatic Startup)
-
-            Install as a system service with automatic startup:
-
-            | Platform | Download |
-            |----------|----------|
-            | Debian/Ubuntu | `ant-node.deb` |
-            | RHEL/Fedora | `ant-node.rpm` |
-            | Windows | `ant-node.msi` |
-
-            **Service Installation:**
-            ```bash
-            # Debian/Ubuntu
-            sudo dpkg -i ant-node.deb
-            sudo systemctl enable --now ant-node
-
-            # RHEL/Fedora
-            sudo rpm -i ant-node.rpm
-            sudo systemctl enable --now ant-node
-
-            # Windows: Run ant-node.msi installer
-            ```
-
             ### Verification
 
             All downloads are signed with ML-DSA-65 (FIPS 204) post-quantum signatures.
@@ -477,12 +329,6 @@ jobs:
             release/ant-node-cli-*.tar.gz
             release/ant-node-cli-*.zip
             release/ant-node-cli-*.sig
-            release/*.deb
-            release/*.rpm
-            release/*.msi
-            release/*.deb.sig
-            release/*.rpm.sig
-            release/*.msi.sig
             release/SHA256SUMS.txt
           draft: false
           prerelease: ${{ needs.validate.outputs.is_prerelease }}
