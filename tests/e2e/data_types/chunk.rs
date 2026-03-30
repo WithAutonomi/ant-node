@@ -443,6 +443,7 @@ mod tests {
             evm: EvmVerifierConfig { network },
             cache_capacity: 100,
             local_rewards_address: rewards_address,
+            local_peer_id: [0x01; 32],
         });
         let metrics_tracker = QuotingMetricsTracker::new(100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
@@ -451,6 +452,7 @@ mod tests {
             Arc::new(storage),
             Arc::new(payment_verifier),
             Arc::new(quote_generator),
+            None,
         );
 
         Ok((protocol, temp_dir, testnet))
