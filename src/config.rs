@@ -369,7 +369,7 @@ const fn default_check_interval() -> u64 {
 }
 
 const fn default_staged_rollout_hours() -> u64 {
-    1 // 1 hour window for staged rollout (testing)
+    24 // 24 hour window for staged rollout
 }
 
 // ============================================================================
