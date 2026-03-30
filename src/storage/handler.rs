@@ -40,6 +40,7 @@ use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
 use saorsa_core::P2PNode;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use tracing::{debug, info, warn};
 
 /// ANT protocol handler.
@@ -54,9 +55,10 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
-    /// P2P node for local close-group lookups during quote generation.
-    /// `None` only in unit tests where a full P2P node is unavailable.
-    p2p_node: Option<Arc<P2PNode>>,
+    /// P2P node for local close-group lookups during quote and payment
+    /// validation. Initialised via the constructor or [`set_p2p_node`] when
+    /// the P2P layer starts after the protocol handler (devnet / test nodes).
+    p2p_node: OnceLock<Arc<P2PNode>>,
 }
 
 impl AntProtocol {
@@ -67,7 +69,8 @@ impl AntProtocol {
     /// * `storage` - LMDB storage for chunk persistence
     /// * `payment_verifier` - Payment verifier for validating payments
     /// * `quote_generator` - Quote generator for creating storage quotes
-    /// * `p2p_node` - P2P node for local close-group lookups (`None` in unit tests)
+    /// * `p2p_node` - P2P node for local close-group lookups (`None` in unit tests
+    ///   or when the P2P layer is not yet started — see [`set_p2p_node`])
     #[must_use]
     pub fn new(
         storage: Arc<LmdbStorage>,
@@ -75,11 +78,51 @@ impl AntProtocol {
         quote_generator: Arc<QuoteGenerator>,
         p2p_node: Option<Arc<P2PNode>>,
     ) -> Self {
+        let lock = OnceLock::new();
+        if let Some(node) = p2p_node {
+            // Fresh OnceLock — set cannot fail.
+            let _ = lock.set(node);
+        }
         Self {
             storage,
             payment_verifier,
             quote_generator,
-            p2p_node,
+            p2p_node: lock,
+        }
+    }
+
+    /// Inject the P2P node after construction.
+    ///
+    /// Used by devnet and test harnesses where the `P2PNode` is created after
+    /// the `AntProtocol` handler.
+    ///
+    /// # Errors
+    ///
+    /// Returns the rejected `Arc<P2PNode>` if a node was already set.
+    pub fn set_p2p_node(&self, node: Arc<P2PNode>) -> std::result::Result<(), Arc<P2PNode>> {
+        self.p2p_node.set(node)
+    }
+
+    /// Query the local routing table for the closest peers to `address`.
+    ///
+    /// Returns up to `CLOSE_GROUP_SIZE` peer IDs **excluding this node**.
+    /// The local node is intentionally omitted because `find_closest_nodes_local`
+    /// filters out self — the caller adds `local_peer_id` separately when
+    /// building the full close-group set for validation.
+    ///
+    /// We request `CLOSE_GROUP_SIZE` (not `CLOSE_GROUP_SIZE - 1`) because this
+    /// node may not be in the actual close group for the target address — asking
+    /// for fewer peers could exclude a legitimate member.
+    async fn local_close_group(&self, address: &[u8; 32]) -> Vec<[u8; 32]> {
+        match self.p2p_node.get() {
+            Some(p2p) => p2p
+                .dht()
+                .find_closest_nodes_local(address, CLOSE_GROUP_SIZE)
+                .await
+                .iter()
+                .map(|node| *node.peer_id.as_bytes())
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -179,16 +222,7 @@ impl AntProtocol {
         }
 
         // 4. Look up local close group for this content address.
-        let local_close_group: Vec<[u8; 32]> = match self.p2p_node {
-            Some(ref p2p) => p2p
-                .dht()
-                .find_closest_nodes_local(&address, CLOSE_GROUP_SIZE)
-                .await
-                .iter()
-                .map(|node| *node.peer_id.as_bytes())
-                .collect(),
-            None => Vec::new(),
-        };
+        let local_close_group = self.local_close_group(&address).await;
 
         // 5. Verify payment (including close group membership check)
         let payment_result = self
@@ -214,7 +248,7 @@ impl AntProtocol {
             }
         }
 
-        // 5. Store chunk
+        // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
                 let content_len = request.content.len();
@@ -288,18 +322,7 @@ impl AntProtocol {
             });
         }
 
-        // Query local routing table for this node's view of the close group.
-        // This is an in-memory lookup — no network round-trips.
-        let close_group: Vec<[u8; 32]> = match self.p2p_node {
-            Some(ref p2p) => p2p
-                .dht()
-                .find_closest_nodes_local(&request.address, CLOSE_GROUP_SIZE)
-                .await
-                .iter()
-                .map(|node| *node.peer_id.as_bytes())
-                .collect(),
-            None => Vec::new(),
-        };
+        let close_group = self.local_close_group(&request.address).await;
 
         match self
             .quote_generator
