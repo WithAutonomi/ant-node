@@ -3,7 +3,7 @@
 //! This is the core payment verification logic for ant-node.
 //! All new data requires EVM payment on Arbitrum (no free tier).
 
-use crate::ant_protocol::{CLOSE_GROUP_MAJORITY, CLOSE_GROUP_SIZE};
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
@@ -686,11 +686,11 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// Verify that the peers in the payment proof are known close group members.
+    /// Verify that **every** peer in the payment proof is a known close group member.
     ///
-    /// Extracts peer IDs from the proof via `BLAKE3(pub_key)` and checks that at
-    /// least `CLOSE_GROUP_MAJORITY` appear in this node's close group view
-    /// (`local_close_group` + self).
+    /// Builds the known set from the current DHT close group plus this node
+    /// itself, then checks that each proof peer (derived via `BLAKE3(pub_key)`)
+    /// appears in that set. Rejects the proof if ANY peer is unrecognized.
     ///
     /// Skipped when `local_close_group` is empty (unit tests without DHT).
     fn validate_close_group_membership(
@@ -702,41 +702,29 @@ impl PaymentVerifier {
             return Ok(());
         }
 
-        // Build the full close group set: DHT peers + this node itself.
+        // Build the known peer set: current DHT close group + this node.
         let mut known_peers: HashSet<[u8; 32]> = local_close_group.iter().copied().collect();
         known_peers.insert(self.config.local_peer_id);
 
-        // Extract peer IDs from the proof by hashing each quote's pub_key.
-        let mut recognized = 0usize;
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            match peer_id_from_public_key_bytes(&quote.pub_key) {
-                Ok(peer_id) => {
-                    if known_peers.contains(peer_id.as_bytes()) {
-                        recognized += 1;
-                    } else {
-                        debug!("Proof peer {} not in local close group", peer_id.to_hex());
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Failed to derive peer ID from quote pub_key for {encoded_peer_id:?}: {e}"
-                    );
-                }
+        // Every proof peer must be in the known set.
+        for (_encoded_peer_id, quote) in &payment.peer_quotes {
+            let peer_id = peer_id_from_public_key_bytes(&quote.pub_key).map_err(|e| {
+                Error::Payment(format!("Invalid ML-DSA pub_key in proof quote: {e}"))
+            })?;
+
+            if !known_peers.contains(peer_id.as_bytes()) {
+                return Err(Error::Payment(format!(
+                    "Proof peer {} is not in the current close group",
+                    peer_id.to_hex()
+                )));
             }
         }
 
-        if recognized >= CLOSE_GROUP_MAJORITY {
-            debug!(
-                "Close group membership validated: {recognized}/{} proof peers recognized",
-                payment.peer_quotes.len()
-            );
-            Ok(())
-        } else {
-            Err(Error::Payment(format!(
-                "Too few proof peers are known close group members: {recognized}/{} recognized (need {CLOSE_GROUP_MAJORITY})",
-                payment.peer_quotes.len()
-            )))
-        }
+        debug!(
+            "Close group membership validated: all {} proof peers recognized",
+            payment.peer_quotes.len()
+        );
+        Ok(())
     }
 }
 
