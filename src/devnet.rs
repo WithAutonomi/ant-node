@@ -588,6 +588,7 @@ impl Devnet {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
             local_rewards_address: rewards_address,
+            local_peer_id: *identity.peer_id().as_bytes(),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
         let metrics_tracker =
@@ -602,6 +603,7 @@ impl Devnet {
             Arc::new(storage),
             Arc::new(payment_verifier),
             Arc::new(quote_generator),
+            None,
         ))
     }
 

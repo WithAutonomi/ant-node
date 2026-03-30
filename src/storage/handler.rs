@@ -30,14 +30,15 @@
 use crate::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, DATA_TYPE_CHUNK,
-    MAX_CHUNK_SIZE,
+    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, CLOSE_GROUP_SIZE,
+    DATA_TYPE_CHUNK, MAX_CHUNK_SIZE,
 };
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, QuoteGenerator};
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
+use saorsa_core::P2PNode;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -53,6 +54,9 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
+    /// P2P node for local close-group lookups during quote generation.
+    /// `None` only in unit tests where a full P2P node is unavailable.
+    p2p_node: Option<Arc<P2PNode>>,
 }
 
 impl AntProtocol {
@@ -63,16 +67,19 @@ impl AntProtocol {
     /// * `storage` - LMDB storage for chunk persistence
     /// * `payment_verifier` - Payment verifier for validating payments
     /// * `quote_generator` - Quote generator for creating storage quotes
+    /// * `p2p_node` - P2P node for local close-group lookups (`None` in unit tests)
     #[must_use]
     pub fn new(
         storage: Arc<LmdbStorage>,
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
+        p2p_node: Option<Arc<P2PNode>>,
     ) -> Self {
         Self {
             storage,
             payment_verifier,
             quote_generator,
+            p2p_node,
         }
     }
 
@@ -106,7 +113,7 @@ impl AntProtocol {
                 ChunkMessageBody::GetResponse(self.handle_get(req).await)
             }
             ChunkMessageBody::QuoteRequest(ref req) => {
-                ChunkMessageBody::QuoteResponse(self.handle_quote(req))
+                ChunkMessageBody::QuoteResponse(self.handle_quote(req).await)
             }
             ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
                 ChunkMessageBody::MerkleCandidateQuoteResponse(
@@ -171,10 +178,26 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Verify payment
+        // 4. Look up local close group for this content address.
+        let local_close_group: Vec<[u8; 32]> = match self.p2p_node {
+            Some(ref p2p) => p2p
+                .dht()
+                .find_closest_nodes_local(&address, CLOSE_GROUP_SIZE)
+                .await
+                .iter()
+                .map(|node| *node.peer_id.as_bytes())
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // 5. Verify payment (including close group membership check)
         let payment_result = self
             .payment_verifier
-            .verify_payment(&address, request.payment_proof.as_deref())
+            .verify_payment(
+                &address,
+                request.payment_proof.as_deref(),
+                &local_close_group,
+            )
             .await;
 
         match payment_result {
@@ -232,7 +255,7 @@ impl AntProtocol {
     }
 
     /// Handle a quote request.
-    fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
+    async fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
         let addr_hex = hex::encode(request.address);
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
@@ -265,6 +288,19 @@ impl AntProtocol {
             });
         }
 
+        // Query local routing table for this node's view of the close group.
+        // This is an in-memory lookup — no network round-trips.
+        let close_group: Vec<[u8; 32]> = match self.p2p_node {
+            Some(ref p2p) => p2p
+                .dht()
+                .find_closest_nodes_local(&request.address, CLOSE_GROUP_SIZE)
+                .await
+                .iter()
+                .map(|node| *node.peer_id.as_bytes())
+                .collect(),
+            None => Vec::new(),
+        };
+
         match self
             .quote_generator
             .create_quote(request.address, data_size_usize, request.data_type)
@@ -275,6 +311,7 @@ impl AntProtocol {
                     Ok(quote_bytes) => ChunkQuoteResponse::Success {
                         quote: quote_bytes,
                         already_stored,
+                        close_group,
                     },
                     Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
                         "Failed to serialize quote: {e}"
@@ -416,6 +453,7 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100_000,
             local_rewards_address: rewards_address,
+            local_peer_id: [1u8; 32],
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
@@ -434,7 +472,7 @@ mod tests {
                 .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
         });
 
-        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
+        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator), None);
         (protocol, temp_dir)
     }
 

@@ -38,7 +38,7 @@
 //! let storage = Arc::new(LmdbStorage::new(config).await?);
 //!
 //! // Create protocol handler
-//! let protocol = AntProtocol::new(storage, Arc::new(payment_verifier), Arc::new(quote_generator));
+//! let protocol = AntProtocol::new(storage, Arc::new(payment_verifier), Arc::new(quote_generator), None);
 //!
 //! // Register with saorsa-core
 //! listener.register_protocol(protocol).await?;

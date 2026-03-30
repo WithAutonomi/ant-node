@@ -123,10 +123,14 @@ impl NodeBuilder {
             None
         };
 
+        // Wrap P2P node in Arc early so it can be shared with the protocol handler.
+        let p2p_node = Arc::new(p2p_node);
+
         // Initialize ANT protocol handler for chunk storage
         let ant_protocol = if self.config.storage.enabled {
             Some(Arc::new(
-                Self::build_ant_protocol(&self.config, &identity).await?,
+                Self::build_ant_protocol(&self.config, &identity, Some(Arc::clone(&p2p_node)))
+                    .await?,
             ))
         } else {
             info!("Chunk storage disabled");
@@ -135,7 +139,7 @@ impl NodeBuilder {
 
         let node = RunningNode {
             config: self.config,
-            p2p_node: Arc::new(p2p_node),
+            p2p_node,
             shutdown,
             events_tx,
             events_rx: Some(events_rx),
@@ -330,6 +334,7 @@ impl NodeBuilder {
     async fn build_ant_protocol(
         config: &NodeConfig,
         identity: &NodeIdentity,
+        p2p_node: Option<Arc<P2PNode>>,
     ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
@@ -363,6 +368,7 @@ impl NodeBuilder {
             },
             cache_capacity: config.payment.cache_capacity,
             local_rewards_address: rewards_address,
+            local_peer_id: *identity.peer_id().as_bytes(),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
         // Safe: 5GB fits in usize on all supported 64-bit platforms.
@@ -379,6 +385,7 @@ impl NodeBuilder {
             Arc::new(storage),
             Arc::new(payment_verifier),
             Arc::new(quote_generator),
+            p2p_node,
         );
 
         info!(

@@ -236,6 +236,10 @@ pub enum ChunkQuoteResponse {
         quote: Vec<u8>,
         /// `true` when the chunk already exists on this node (skip payment).
         already_stored: bool,
+        /// Peer IDs (raw 32-byte BLAKE3 hashes) this node considers closest to
+        /// the content address, excluding itself. Clients use these views to
+        /// verify close-group quorum before paying.
+        close_group: Vec<[u8; 32]>,
     },
     /// Quote generation failed.
     Error(ProtocolError),
