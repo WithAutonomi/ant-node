@@ -637,6 +637,8 @@ impl Devnet {
         *node.state.write().await = NodeState::Running;
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
+            // Inject P2P node into protocol handler for close-group lookups.
+            let _ = protocol.set_p2p_node(Arc::clone(p2p));
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
