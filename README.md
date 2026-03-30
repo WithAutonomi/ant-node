@@ -739,11 +739,25 @@ For production deployments, run ant-node under a service manager so it restarts 
 
 ### systemd (Linux)
 
-A service file is included at `systemd/ant-node.service` and installed automatically by RPM/DEB packages.
+Create a service file at `/etc/systemd/system/ant-node.service`:
+
+```ini
+[Unit]
+Description=Ant Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ant-node --stop-on-upgrade
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-# Install and enable
-sudo cp systemd/ant-node.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ant-node
 ```
@@ -751,7 +765,6 @@ sudo systemctl enable --now ant-node
 Key settings:
 - `--stop-on-upgrade` tells the node to exit cleanly after applying an upgrade
 - `Restart=always` ensures systemd restarts the node after the upgrade exit
-- Security hardening (NoNewPrivileges, ProtectSystem, etc.) is pre-configured
 
 ### launchd (macOS)
 
@@ -869,23 +882,24 @@ cargo build --release
 ./target/release/ant-node
 ```
 
-### Join Testnet
+### Join the Network
+
+On first startup, the node needs bootstrap peers to join the network.
+Production bootstrap peers are shipped in `bootstrap_peers.toml` alongside
+the binary and are loaded automatically:
 
 ```bash
-# Connect to testnet bootstrap nodes
-./target/release/ant-node --testnet
-
-# Or specify bootstrap peers manually
-./target/release/ant-node \
-    --bootstrap "165.22.4.178:12000" \
-    --bootstrap "164.92.111.156:12000"
+# Starts and auto-discovers bootstrap_peers.toml next to the binary
+./target/release/ant-node
 ```
 
-**Testnet Bootstrap Nodes:**
-| Node | Location | Address |
-|------|----------|---------|
-| ant-bootstrap-1 | NYC (DigitalOcean) | `165.22.4.178:12000` |
-| ant-bootstrap-2 | SFO (DigitalOcean) | `164.92.111.156:12000` |
+You can also specify bootstrap peers explicitly:
+
+```bash
+./target/release/ant-node \
+    --bootstrap "10.0.0.1:10000" \
+    --bootstrap "10.0.0.2:10000"
+```
 
 ### Full Configuration
 
@@ -920,8 +934,8 @@ Options:
         [default: dual]
 
     --bootstrap <ADDR>
-        Bootstrap peer multiaddresses (can be specified multiple times)
-        Example: /ip4/1.2.3.4/udp/12000/quic-v1
+        Bootstrap peer socket addresses (can be specified multiple times)
+        Example: 1.2.3.4:10000
 
     --migrate-ant-data <PATH>
         Path to legacy ant-node data directory to migrate
@@ -948,9 +962,41 @@ Options:
 
 Configuration sources (highest to lowest priority):
 
-1. **Command-line arguments**
+1. **Command-line arguments** (e.g., `--bootstrap`)
 2. **Environment variables** (`ANT_*`)
-3. **Configuration file** (`~/.ant-node/config.toml`)
+3. **Configuration file** (`--config path/to/config.toml`)
+4. **Bootstrap peers file** (auto-discovered `bootstrap_peers.toml`)
+
+### Bootstrap Peers File
+
+The `bootstrap_peers.toml` file provides initial peers for joining the network.
+It is shipped alongside the binary in release archives and auto-discovered on startup
+when no `--bootstrap` CLI argument is provided.
+
+**Format:**
+```toml
+peers = [
+    "10.0.0.1:10000",
+    "10.0.0.2:10000",
+]
+```
+
+**Search order** (first match wins):
+
+| Priority | Source | Path |
+|----------|--------|------|
+| 1 | `$ANT_BOOTSTRAP_PEERS_PATH` env var | Explicit path to file |
+| 2 | Executable directory | `<exe_dir>/bootstrap_peers.toml` |
+| 3 | Platform config dir | Linux: `~/.config/ant/bootstrap_peers.toml` |
+|   |                      | macOS: `~/Library/Application Support/ant/bootstrap_peers.toml` |
+|   |                      | Windows: `%APPDATA%\ant\bootstrap_peers.toml` |
+| 4 | System config (Unix) | `/etc/ant/bootstrap_peers.toml` |
+
+**Bootstrap peer precedence** (highest wins):
+1. `--bootstrap` CLI argument or `ANT_BOOTSTRAP` env var
+2. `bootstrap = [...]` in a `--config` file
+3. Auto-discovered `bootstrap_peers.toml`
+4. Empty (node cannot join an existing network)
 
 ### Environment Variables
 
@@ -968,15 +1014,12 @@ export ANT_UPGRADE_CHANNEL=stable
 `~/.ant-node/config.toml`:
 
 ```toml
-[node]
 root_dir = "~/.ant-node"
 port = 0  # Auto-select
-
-[network]
 ip_version = "dual"
 bootstrap = [
-    "/ip4/165.22.4.178/udp/12000/quic-v1",
-    "/ip4/164.92.111.156/udp/12000/quic-v1"
+    "10.0.0.1:10000",
+    "10.0.0.2:10000",
 ]
 
 [upgrade]

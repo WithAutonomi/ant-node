@@ -3,6 +3,7 @@
 mod cli;
 mod platform;
 
+use ant_node::config::BootstrapSource;
 use ant_node::NodeBuilder;
 use clap::Parser;
 use cli::{Cli, CliLogFormat};
@@ -104,7 +105,34 @@ async fn main() -> color_eyre::Result<()> {
     };
 
     // Build configuration
-    let config = cli.into_config()?;
+    let (config, bootstrap_source) = cli.into_config()?;
+
+    match &bootstrap_source {
+        BootstrapSource::Cli => {
+            info!(
+                count = config.bootstrap.len(),
+                "Bootstrap peers provided via CLI"
+            );
+        }
+        BootstrapSource::ConfigFile => {
+            info!(
+                count = config.bootstrap.len(),
+                "Bootstrap peers loaded from config file"
+            );
+        }
+        BootstrapSource::AutoDiscovered(path) => {
+            info!(
+                count = config.bootstrap.len(),
+                path = %path.display(),
+                "Bootstrap peers loaded from discovered config"
+            );
+        }
+        BootstrapSource::None => {
+            warn!(
+                "No bootstrap peers configured — node will not be able to join an existing network"
+            );
+        }
+    }
 
     // Build and run the node
     let mut node = NodeBuilder::new(config).build().await?;

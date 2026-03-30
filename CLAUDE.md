@@ -32,9 +32,6 @@ cargo run --release -- --listen 0.0.0.0:10000 --bootstrap
 # Run additional instance (use any port in range 10000-10999)
 cargo run --release -- --listen 0.0.0.0:10001
 
-# Run as regular node connecting to bootstrap
-cargo run --release -- --listen 0.0.0.0:10000 --connect saorsa-2.saorsalabs.com:10000
-
 # Run with debug logging
 RUST_LOG=debug cargo run --release -- --listen 0.0.0.0:10000
 ```
@@ -97,31 +94,15 @@ When testing or developing ant-node:
 # CORRECT - ant-node operations (within 10000-10999)
 cargo run --release -- --listen 0.0.0.0:10000
 cargo run --release -- --listen 0.0.0.0:10001  # Second instance OK
-ssh root@saorsa-2.saorsalabs.com "systemctl restart ant-node-bootstrap"
-
-# WRONG - Would disrupt other networks
-ssh root@saorsa-2.saorsalabs.com "pkill -f ':9'"    # NEVER - matches ant-quic ports
-ssh root@saorsa-2.saorsalabs.com "pkill -f ':11'"   # NEVER - matches communitas ports
-ssh root@saorsa-2.saorsalabs.com "systemctl restart ant-quic-bootstrap"  # NOT OUR SERVICE
 ```
 
-### Bootstrap Endpoints (ant-node)
-```
-saorsa-2.saorsalabs.com:10000  (NYC - 142.93.199.50)
-saorsa-3.saorsalabs.com:10000  (SFO - 147.182.234.192)
-```
+### Bootstrap Peers Configuration
+
+Production bootstrap peer addresses are defined in `config/bootstrap_peers.toml`.
+This file is shipped alongside the binary in release archives and is auto-discovered
+on startup when no `--bootstrap` CLI argument is provided.
 
 ### Before Any VPS Operations
 1. Verify you're targeting ports 10000-10999 only
 2. Double-check service names contain "ant-node"
 3. Never run broad `pkill` commands that could affect other services
-
-### Deploy New Binary
-```bash
-# Build release binary
-cargo build --release
-
-# Deploy to bootstrap node
-scp target/release/ant-node root@saorsa-2.saorsalabs.com:/opt/ant-node/
-ssh root@saorsa-2.saorsalabs.com "systemctl restart ant-node-bootstrap"
-```

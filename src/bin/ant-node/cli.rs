@@ -1,8 +1,8 @@
 //! Command-line interface definition.
 
 use ant_node::config::{
-    BootstrapCacheConfig, EvmNetworkConfig, IpVersion, NetworkMode, NodeConfig, PaymentConfig,
-    UpgradeChannel,
+    BootstrapCacheConfig, BootstrapPeersConfig, BootstrapSource, EvmNetworkConfig, IpVersion,
+    NetworkMode, NodeConfig, PaymentConfig, UpgradeChannel,
 };
 use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
@@ -185,18 +185,29 @@ pub enum CliNetworkMode {
 }
 
 impl Cli {
-    /// Convert CLI arguments into a `NodeConfig`.
+    /// Convert CLI arguments into a `NodeConfig` and the source of bootstrap peers.
+    ///
+    /// # Bootstrap peer precedence (highest to lowest)
+    ///
+    /// 1. `--bootstrap` CLI argument (or `ANT_BOOTSTRAP` env var)
+    /// 2. `bootstrap` field in a `--config` file
+    /// 3. Auto-discovered `bootstrap_peers.toml` from well-known paths
+    /// 4. Empty list
     ///
     /// # Errors
     ///
     /// Returns an error if a config file is specified but cannot be loaded.
-    pub fn into_config(self) -> color_eyre::Result<NodeConfig> {
+    pub fn into_config(self) -> color_eyre::Result<(NodeConfig, BootstrapSource)> {
         // Start with default config or load from file
+        let has_config_file = self.config.is_some();
         let mut config = if let Some(ref path) = self.config {
             NodeConfig::from_file(path)?
         } else {
             NodeConfig::default()
         };
+
+        // Track whether CLI provided bootstrap peers.
+        let cli_bootstrap_provided = !self.bootstrap.is_empty();
 
         // Override with CLI arguments
         if let Some(root_dir) = self.root_dir {
@@ -205,9 +216,13 @@ impl Cli {
 
         config.port = self.port;
         config.ip_version = self.ip_version.into();
-        config.bootstrap = self.bootstrap;
         config.log_level = self.log_level.into();
         config.network_mode = self.network_mode.into();
+
+        // Apply CLI bootstrap peers if provided; otherwise keep config file value.
+        if cli_bootstrap_provided {
+            config.bootstrap = self.bootstrap;
+        }
 
         // Upgrade config
         config.upgrade.channel = self.upgrade_channel.into();
@@ -229,7 +244,25 @@ impl Cli {
             ..config.bootstrap_cache
         };
 
-        Ok(config)
+        // Determine bootstrap source and apply auto-discovery if needed.
+        let bootstrap_source = if cli_bootstrap_provided {
+            BootstrapSource::Cli
+        } else if !config.bootstrap.is_empty() && has_config_file {
+            BootstrapSource::ConfigFile
+        } else if config.bootstrap.is_empty() {
+            // No peers from CLI or config file — try auto-discovery.
+            if let Some((peers_config, path)) = BootstrapPeersConfig::discover() {
+                config.bootstrap = peers_config.peers;
+                BootstrapSource::AutoDiscovered(path)
+            } else {
+                BootstrapSource::None
+            }
+        } else {
+            // Config had peers from default (e.g., testnet preset) but no --config file.
+            BootstrapSource::None
+        };
+
+        Ok((config, bootstrap_source))
     }
 }
 

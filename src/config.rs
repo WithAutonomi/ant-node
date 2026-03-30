@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Filename for the persisted node identity keypair.
 pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
@@ -482,6 +482,114 @@ const fn default_storage_verify_on_read() -> bool {
     true
 }
 
+// ============================================================================
+// Bootstrap Peers Configuration (shipped config file)
+// ============================================================================
+
+/// The filename for the bootstrap peers configuration file.
+pub const BOOTSTRAP_PEERS_FILENAME: &str = "bootstrap_peers.toml";
+
+/// Environment variable that overrides the bootstrap peers file search path.
+pub const BOOTSTRAP_PEERS_ENV: &str = "ANT_BOOTSTRAP_PEERS_PATH";
+
+/// Bootstrap peers loaded from a shipped configuration file.
+///
+/// This file provides initial peers for first-time network joins.
+/// It is separate from the bootstrap *cache* (which stores quality-ranked
+/// peers discovered at runtime).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapPeersConfig {
+    /// The bootstrap peer socket addresses.
+    #[serde(default)]
+    pub peers: Vec<SocketAddr>,
+}
+
+/// The source from which bootstrap peers were resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootstrapSource {
+    /// Provided via `--bootstrap` CLI argument or `ANT_BOOTSTRAP` env var.
+    Cli,
+    /// Loaded from an explicit `--config` file.
+    ConfigFile,
+    /// Auto-discovered from a `bootstrap_peers.toml` file.
+    AutoDiscovered(PathBuf),
+    /// No bootstrap peers were found from any source.
+    None,
+}
+
+impl BootstrapPeersConfig {
+    /// Load bootstrap peers from a TOML file at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or contains invalid TOML.
+    pub fn from_file(path: &Path) -> crate::Result<Self> {
+        let content = std::fs::read_to_string(path)?;
+        toml::from_str(&content).map_err(|e| crate::Error::Config(e.to_string()))
+    }
+
+    /// Search well-known locations for a `bootstrap_peers.toml` file and load it.
+    ///
+    /// Search order (first match wins):
+    /// 1. `$ANT_BOOTSTRAP_PEERS_PATH` environment variable (path to file)
+    /// 2. Same directory as the running executable
+    /// 3. Platform config directory (`~/.config/ant/` on Linux,
+    ///    `~/Library/Application Support/ant/` on macOS,
+    ///    `%APPDATA%\ant\` on Windows)
+    /// 4. System config: `/etc/ant/` (Unix only)
+    ///
+    /// Returns `None` if no file is found in any location.
+    #[must_use]
+    pub fn discover() -> Option<(Self, PathBuf)> {
+        let candidates = Self::search_paths();
+        for path in candidates {
+            if path.is_file() {
+                match Self::from_file(&path) {
+                    Ok(config) if !config.peers.is_empty() => return Some((config, path)),
+                    Ok(_) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "Warning: failed to load bootstrap peers from {}: {err}",
+                            path.display(),
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Build the ordered list of candidate paths to search.
+    fn search_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        // 1. Environment variable override.
+        if let Ok(env_path) = std::env::var(BOOTSTRAP_PEERS_ENV) {
+            paths.push(PathBuf::from(env_path));
+        }
+
+        // 2. Next to the running executable.
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                paths.push(exe_dir.join(BOOTSTRAP_PEERS_FILENAME));
+            }
+        }
+
+        // 3. Platform config directory.
+        if let Some(proj_dirs) = directories::ProjectDirs::from("", "", "ant") {
+            paths.push(proj_dirs.config_dir().join(BOOTSTRAP_PEERS_FILENAME));
+        }
+
+        // 4. System config (Unix only).
+        #[cfg(unix)]
+        {
+            paths.push(PathBuf::from("/etc/ant").join(BOOTSTRAP_PEERS_FILENAME));
+        }
+
+        paths
+    }
+}
+
 /// Default testnet bootstrap nodes.
 ///
 /// These are well-known bootstrap nodes for the Autonomi testnet.
@@ -497,8 +605,10 @@ fn default_testnet_bootstrap() -> Vec<SocketAddr> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_default_config_has_cache_capacity() {
@@ -511,5 +621,102 @@ mod tests {
         use crate::payment::EvmVerifierConfig;
         let _config = EvmVerifierConfig::default();
         // EVM verification is always on — no enabled field
+    }
+
+    #[test]
+    fn test_bootstrap_peers_parse_valid_toml() {
+        let toml_str = r#"
+            peers = [
+                "127.0.0.1:10000",
+                "192.168.1.1:10001",
+            ]
+        "#;
+        let config: BootstrapPeersConfig =
+            toml::from_str(toml_str).expect("valid TOML should parse");
+        assert_eq!(config.peers.len(), 2);
+        assert_eq!(config.peers[0].port(), 10000);
+        assert_eq!(config.peers[1].port(), 10001);
+    }
+
+    #[test]
+    fn test_bootstrap_peers_parse_empty_peers() {
+        let toml_str = r"peers = []";
+        let config: BootstrapPeersConfig =
+            toml::from_str(toml_str).expect("empty peers should parse");
+        assert!(config.peers.is_empty());
+    }
+
+    #[test]
+    fn test_bootstrap_peers_parse_missing_peers_field() {
+        let toml_str = "";
+        let config: BootstrapPeersConfig =
+            toml::from_str(toml_str).expect("missing field should use default");
+        assert!(config.peers.is_empty());
+    }
+
+    #[test]
+    fn test_bootstrap_peers_from_file() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("bootstrap_peers.toml");
+        std::fs::write(&path, r#"peers = ["10.0.0.1:10000", "10.0.0.2:10000"]"#)
+            .expect("write file");
+
+        let config = BootstrapPeersConfig::from_file(&path).expect("load from file");
+        assert_eq!(config.peers.len(), 2);
+    }
+
+    #[test]
+    fn test_bootstrap_peers_from_file_invalid_toml() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("bootstrap_peers.toml");
+        std::fs::write(&path, "not valid toml [[[").expect("write file");
+
+        assert!(BootstrapPeersConfig::from_file(&path).is_err());
+    }
+
+    /// Env-var-based discovery tests must run serially because they mutate
+    /// a shared process-wide environment variable.
+    #[test]
+    #[serial]
+    fn test_bootstrap_peers_discover_env_var() {
+        // Sub-test 1: valid file with peers is discovered.
+        {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("bootstrap_peers.toml");
+            std::fs::write(&path, r#"peers = ["10.0.0.1:10000"]"#).expect("write file");
+
+            std::env::set_var(BOOTSTRAP_PEERS_ENV, &path);
+            let result = BootstrapPeersConfig::discover();
+            std::env::remove_var(BOOTSTRAP_PEERS_ENV);
+
+            let (config, discovered_path) = result.expect("should discover from env var");
+            assert_eq!(config.peers.len(), 1);
+            assert_eq!(discovered_path, path);
+        }
+
+        // Sub-test 2: file with empty peers list is skipped.
+        {
+            let dir = tempfile::tempdir().expect("create temp dir");
+            let path = dir.path().join("bootstrap_peers.toml");
+            std::fs::write(&path, r"peers = []").expect("write file");
+
+            std::env::set_var(BOOTSTRAP_PEERS_ENV, &path);
+            let result = BootstrapPeersConfig::discover();
+            std::env::remove_var(BOOTSTRAP_PEERS_ENV);
+
+            assert!(result.is_none(), "empty peers file should be skipped");
+        }
+    }
+
+    #[test]
+    fn test_bootstrap_peers_search_paths_contains_exe_dir() {
+        let paths = BootstrapPeersConfig::search_paths();
+        // At minimum, the exe-dir candidate should be present.
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.file_name().is_some_and(|f| f == BOOTSTRAP_PEERS_FILENAME)),
+            "search paths should include a candidate with the bootstrap peers filename"
+        );
     }
 }
