@@ -732,6 +732,9 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ant_evm::EncodedPeerId;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::MlDsaOperations;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -1979,6 +1982,166 @@ mod tests {
         assert!(
             err_msg.contains("Underpayment"),
             "Error should mention underpayment: {err_msg}"
+        );
+    }
+
+    // =========================================================================
+    // Close-group membership validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_close_group_all_peers_recognised_accepted() {
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        let mut close_group_ids: Vec<[u8; 32]> = Vec::new();
+
+        // Generate CLOSE_GROUP_SIZE peers with real ML-DSA keys.
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let ant_peer_id =
+                peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+            close_group_ids.push(*ant_peer_id.as_bytes());
+
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(
+                [0xAA; 32],
+                SystemTime::now(),
+                RewardsAddress::new([1u8; 20]),
+            );
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        // Verifier whose local_peer_id is NOT one of the proof peers (but that's
+        // fine — it only needs to be in the known set, and we insert it).
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [0xBBu8; 32],
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let result = verifier.validate_close_group_membership(&payment, &close_group_ids);
+        assert!(
+            result.is_ok(),
+            "All proof peers are in close group — should accept: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_unknown_peer_rejected() {
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        let mut close_group_ids: Vec<[u8; 32]> = Vec::new();
+
+        // Generate CLOSE_GROUP_SIZE peers; include all but the last in the
+        // close group so one peer is "unknown".
+        for i in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let ant_peer_id =
+                peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+
+            // Only add the first N-1 peers to the close group.
+            if i < CLOSE_GROUP_SIZE - 1 {
+                close_group_ids.push(*ant_peer_id.as_bytes());
+            }
+
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(
+                [0xAA; 32],
+                SystemTime::now(),
+                RewardsAddress::new([1u8; 20]),
+            );
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [0xBBu8; 32],
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let result = verifier.validate_close_group_membership(&payment, &close_group_ids);
+        assert!(result.is_err(), "One unknown peer — should reject");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("not in the current close group"),
+            "Error should mention close group: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_empty_skips_validation() {
+        // With an empty close group (unit test / no DHT), validation is skipped.
+        let verifier = create_test_verifier();
+
+        let quote = make_fake_quote(
+            [0xAA; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+        );
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+        let peer_quotes = vec![(EncodedPeerId::from(peer_id), quote)];
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        let result = verifier.validate_close_group_membership(&payment, &[]);
+        assert!(
+            result.is_ok(),
+            "Empty close group should skip validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_local_peer_is_implicitly_known() {
+        let ml_dsa = MlDsa65::new();
+
+        // Generate a single peer whose BLAKE3 ID we'll set as local_peer_id.
+        let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let ant_peer_id =
+            peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+
+        let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+        let mut quote = make_fake_quote(
+            [0xAA; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+        );
+        quote.pub_key = pub_key_bytes;
+
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(encoded, quote)],
+        };
+
+        // The local_peer_id matches the proof peer, and the close group
+        // contains at least one entry (so validation isn't skipped) but
+        // does NOT contain the proof peer — only local_peer_id does.
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: *ant_peer_id.as_bytes(),
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        // Close group has a dummy entry so validation isn't skipped.
+        let dummy_peer = [0xFFu8; 32];
+        let result = verifier.validate_close_group_membership(&payment, &[dummy_peer]);
+        assert!(
+            result.is_ok(),
+            "Proof peer matches local_peer_id — should accept: {result:?}"
         );
     }
 }

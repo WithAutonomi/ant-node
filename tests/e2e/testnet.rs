@@ -1169,7 +1169,12 @@ impl TestNetwork {
         // Start protocol handler that routes incoming P2P messages to AntProtocol
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
             // Inject P2P node into protocol handler for close-group lookups.
-            let _ = protocol.set_p2p_node(Arc::clone(p2p));
+            protocol.set_p2p_node(Arc::clone(p2p)).map_err(|_| {
+                TestnetError::Startup(format!(
+                    "P2P node already set on protocol handler for node {}",
+                    node.index,
+                ))
+            })?;
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);
