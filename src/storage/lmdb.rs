@@ -712,9 +712,9 @@ mod tests {
         storage.put(&addr2, content2).await.expect("put 2");
 
         let mut keys = storage.all_keys().expect("all_keys");
-        keys.sort();
+        keys.sort_unstable();
         let mut expected = vec![addr1, addr2];
-        expected.sort();
+        expected.sort_unstable();
         assert_eq!(keys, expected);
     }
 

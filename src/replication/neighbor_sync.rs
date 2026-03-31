@@ -349,7 +349,9 @@ mod tests {
         // Mark peer 1 as synced a long time ago (simulate expired cooldown).
         state.last_sync_times.insert(
             peer_id_from_byte(1),
-            Instant::now() - Duration::from_secs(7200),
+            Instant::now()
+                .checked_sub(Duration::from_secs(7200))
+                .unwrap(),
         );
 
         let cooldown = Duration::from_secs(3600);
@@ -492,7 +494,9 @@ mod tests {
         let peer = peer_id_from_byte(1);
 
         // Record a sync at an old time.
-        let old_time = Instant::now() - Duration::from_secs(3600);
+        let old_time = Instant::now()
+            .checked_sub(Duration::from_secs(3600))
+            .unwrap();
         state.last_sync_times.insert(peer, old_time);
 
         record_successful_sync(&mut state, &peer);

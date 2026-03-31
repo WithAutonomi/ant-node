@@ -486,7 +486,7 @@ mod tests {
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
 
-        let bootstrap_keys: HashSet<XorName> = [key].into_iter().collect();
+        let bootstrap_keys: HashSet<XorName> = std::iter::once(key).collect();
         assert!(!queues.is_bootstrap_work_empty(&bootstrap_keys));
     }
 
@@ -499,7 +499,9 @@ mod tests {
 
         // Create entry with a backdated timestamp.
         let mut entry = test_entry(1);
-        entry.created_at = Instant::now() - Duration::from_secs(120);
+        entry.created_at = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .unwrap();
         queues.pending_verify.insert(key, entry);
 
         assert_eq!(queues.pending_count(), 1);

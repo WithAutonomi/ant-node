@@ -191,7 +191,7 @@ mod tests {
         // When a key appears in both replica_hints and paid_hints, the
         // paid_hints entry should be suppressed by cross-set precedence.
         let key = xor_name_from_byte(0xAA);
-        let replica_set: HashSet<XorName> = [key].into_iter().collect();
+        let replica_set: HashSet<XorName> = std::iter::once(key).collect();
 
         // Simulating the paid-hint loop: key is in replica_set, so it should
         // be skipped.
@@ -273,9 +273,9 @@ mod tests {
         // Simulate rejection: a key whose XOR distance from self is large
         // should not appear in a close-group of size 3 when there are closer
         // peers.
-        let self_id = peer_id_from_byte(0x00);
+        let _self_id = peer_id_from_byte(0x00);
         let key = xor_name_from_byte(0xFF);
-        let config = ReplicationConfig::default();
+        let _config = ReplicationConfig::default();
 
         // Distance from self (0x00...) to key (0xFF...):
         let self_xor: XorName = [0u8; 32];

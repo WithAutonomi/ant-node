@@ -458,13 +458,13 @@ mod tests {
 
         // Deduplicate keys per peer.
         for keys_list in peer_to_keys.values_mut() {
-            keys_list.sort();
+            keys_list.sort_unstable();
             keys_list.dedup();
         }
 
         VerificationTargets {
-            quorum_targets: [(key.to_owned(), quorum_peers)].into_iter().collect(),
-            paid_targets: [(key.to_owned(), paid_peers)].into_iter().collect(),
+            quorum_targets: std::iter::once((key.to_owned(), quorum_peers)).collect(),
+            paid_targets: std::iter::once((key.to_owned(), paid_peers)).collect(),
             all_peers,
             peer_to_keys,
             peer_to_paid_keys,
@@ -751,14 +751,13 @@ mod tests {
 
         let targets = single_key_targets(&key, vec![peer], vec![peer]);
 
-        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
             key,
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
             },
-        )]
-        .into_iter()
+        ))
         .collect();
 
         let response = VerificationResponse {
@@ -791,14 +790,13 @@ mod tests {
 
         let targets = single_key_targets(&key, vec![peer], vec![peer]);
 
-        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
             key,
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
             },
-        )]
-        .into_iter()
+        ))
         .collect();
 
         // Empty response: peer did not include our key.
@@ -827,14 +825,13 @@ mod tests {
 
         let targets = single_key_targets(&key, vec![peer], vec![]);
 
-        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [(
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
             key,
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
             },
-        )]
-        .into_iter()
+        ))
         .collect();
 
         // Response includes an unsolicited key.
@@ -881,13 +878,11 @@ mod tests {
 
         // Peer is a quorum target for key_a and a paid target for key_b.
         let targets = VerificationTargets {
-            quorum_targets: [(key_a, vec![peer])].into_iter().collect(),
-            paid_targets: [(key_b, vec![peer])].into_iter().collect(),
-            all_peers: [peer].into_iter().collect(),
-            peer_to_keys: [(peer, vec![key_a, key_b])].into_iter().collect(),
-            peer_to_paid_keys: [(peer, [key_b].into_iter().collect())]
-                .into_iter()
-                .collect(),
+            quorum_targets: std::iter::once((key_a, vec![peer])).collect(),
+            paid_targets: std::iter::once((key_b, vec![peer])).collect(),
+            all_peers: std::iter::once(peer).collect(),
+            peer_to_keys: std::iter::once((peer, vec![key_a, key_b])).collect(),
+            peer_to_paid_keys: std::iter::once((peer, std::iter::once(key_b).collect())).collect(),
         };
 
         let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
@@ -917,7 +912,7 @@ mod tests {
             Some(&PresenceEvidence::Unresolved)
         );
         // key_a is not in peer_to_paid_keys, so no paid_list entry.
-        assert!(ev_a.paid_list.get(&peer).is_none());
+        assert!(!ev_a.paid_list.contains_key(&peer));
 
         let ev_b = evidence.get(&key_b).expect("evidence for key_b");
         assert_eq!(

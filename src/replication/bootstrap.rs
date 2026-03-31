@@ -164,7 +164,7 @@ mod tests {
         let state = Arc::new(RwLock::new(BootstrapState {
             drained: false,
             pending_peer_requests: 0,
-            pending_keys: [xor_name_from_byte(0x01)].into_iter().collect(),
+            pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
         }));
         let queues = ReplicationQueues::new(10);
 
@@ -178,7 +178,7 @@ mod tests {
         let state = Arc::new(RwLock::new(BootstrapState {
             drained: false,
             pending_peer_requests: 0,
-            pending_keys: [xor_name_from_byte(0x01)].into_iter().collect(),
+            pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
         }));
         let mut queues = ReplicationQueues::new(10);
 

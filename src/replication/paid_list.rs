@@ -475,19 +475,19 @@ mod tests {
     async fn test_all_keys() {
         let (pl, _temp) = create_test_paid_list().await;
 
-        let key1: XorName = [0x01; 32];
-        let key2: XorName = [0x02; 32];
-        let key3: XorName = [0x03; 32];
+        let key_a: XorName = [0x01; 32];
+        let key_b: XorName = [0x02; 32];
+        let key_c: XorName = [0x03; 32];
 
-        pl.insert(&key1).await.expect("insert 1");
-        pl.insert(&key2).await.expect("insert 2");
-        pl.insert(&key3).await.expect("insert 3");
+        pl.insert(&key_a).await.expect("insert 1");
+        pl.insert(&key_b).await.expect("insert 2");
+        pl.insert(&key_c).await.expect("insert 3");
 
         let mut keys = pl.all_keys().expect("all_keys");
-        keys.sort();
+        keys.sort_unstable();
 
-        let mut expected = vec![key1, key2, key3];
-        expected.sort();
+        let mut expected = vec![key_a, key_b, key_c];
+        expected.sort_unstable();
 
         assert_eq!(keys, expected);
     }
