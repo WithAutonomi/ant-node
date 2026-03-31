@@ -4,9 +4,9 @@
 //! on-chain transaction hashes returned by the wallet after payment.
 
 use crate::ant_protocol::{PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE};
-use ant_evm::merkle_payments::MerklePaymentProof;
-use ant_evm::ProofOfPayment;
 use evmlib::common::TxHash;
+use evmlib::merkle_payments::MerklePaymentProof;
+use evmlib::ProofOfPayment;
 use serde::{Deserialize, Serialize};
 
 /// A payment proof that includes both the quote-based proof and on-chain tx hashes.
@@ -116,15 +116,14 @@ pub fn deserialize_merkle_proof(bytes: &[u8]) -> std::result::Result<MerklePayme
 mod tests {
     use super::*;
     use alloy::primitives::FixedBytes;
-    use ant_evm::merkle_payments::{
+    use evmlib::merkle_payments::{
         MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
         CANDIDATES_PER_POOL,
     };
-    use ant_evm::RewardsAddress;
-    use ant_evm::{EncodedPeerId, PaymentQuote};
     use evmlib::quoting_metrics::QuotingMetrics;
-    use libp2p::identity::Keypair;
-    use libp2p::PeerId;
+    use evmlib::EncodedPeerId;
+    use evmlib::PaymentQuote;
+    use evmlib::RewardsAddress;
     use saorsa_core::MlDsa65;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
     use saorsa_pqc::pqc::MlDsaOperations;
@@ -153,10 +152,9 @@ mod tests {
     }
 
     fn make_proof_of_payment() -> ProofOfPayment {
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = PeerId::from_public_key(&keypair.public());
+        let random_peer = EncodedPeerId::new(rand::random());
         ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::from(peer_id), make_test_quote())],
+            peer_quotes: vec![(random_peer, make_test_quote())],
         }
     }
 

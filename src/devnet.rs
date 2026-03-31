@@ -10,8 +10,8 @@ use crate::payment::{
     QuotingMetricsTracker,
 };
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
-use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
+use evmlib::RewardsAddress;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{

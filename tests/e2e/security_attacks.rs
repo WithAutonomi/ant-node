@@ -10,13 +10,13 @@
 
 use super::harness::TestHarness;
 use super::testnet::TestNetworkConfig;
-use ant_evm::ProofOfPayment;
 use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ProtocolError,
 };
 use ant_node::compute_address;
 use ant_node::payment::PaymentProof;
 use evmlib::testnet::Testnet;
+use evmlib::ProofOfPayment;
 use rand::Rng;
 use serial_test::serial;
 use std::time::Duration;
@@ -71,7 +71,7 @@ async fn send_put_to_node(
 /// Create a lightweight test harness with payment enforcement and Anvil wiring.
 /// Returns (harness, testnet) -- keep testnet alive to avoid Anvil teardown.
 async fn setup_enforcement_env() -> Result<(TestHarness, Testnet), Box<dyn std::error::Error>> {
-    let testnet = Testnet::new().await;
+    let testnet = Testnet::new().await?;
     let network = testnet.to_network();
     let config = TestNetworkConfig::minimal()
         .with_payment_enforcement()

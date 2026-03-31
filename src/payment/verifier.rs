@@ -10,11 +10,12 @@ use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
-use ant_evm::merkle_payments::OnChainPaymentInfo;
-use ant_evm::{ProofOfPayment, RewardsAddress};
 use evmlib::contract::merkle_payment_vault;
 use evmlib::merkle_batch_payment::PoolHash;
+use evmlib::merkle_payments::OnChainPaymentInfo;
 use evmlib::Network as EvmNetwork;
+use evmlib::ProofOfPayment;
+use evmlib::RewardsAddress;
 use lru::LruCache;
 use parking_lot::Mutex;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
@@ -253,9 +254,9 @@ impl PaymentVerifier {
                     Ok(PaymentStatus::PaymentVerified)
                 } else {
                     // No payment provided in production mode
+                    let xorname_hex = hex::encode(xorname);
                     Err(Error::Payment(format!(
-                        "Payment required for new data {}",
-                        hex::encode(xorname)
+                        "Payment required for new data {xorname_hex}"
                     )))
                 }
             }
@@ -365,10 +366,8 @@ impl PaymentVerifier {
             .verify_payment(payment_verifications)
             .await
             .map_err(|e| {
-                Error::Payment(format!(
-                    "EVM verification error for {}: {e}",
-                    hex::encode(xorname)
-                ))
+                let xorname_hex = hex::encode(xorname);
+                Error::Payment(format!("EVM verification error for {xorname_hex}: {e}"))
             })?;
 
         let paid_results: Vec<_> = results
@@ -377,27 +376,27 @@ impl PaymentVerifier {
             .collect();
 
         if paid_results.is_empty() {
+            let xorname_hex = hex::encode(xorname);
             return Err(Error::Payment(format!(
-                "Payment verification failed on-chain for {} (no paid quotes found)",
-                hex::encode(xorname)
+                "Payment verification failed on-chain for {xorname_hex} (no paid quotes found)"
             )));
         }
 
         for result in &paid_results {
             if !result.isValid {
+                let xorname_hex = hex::encode(xorname);
                 return Err(Error::Payment(format!(
-                    "Payment verification failed on-chain for {} (paid quote is invalid)",
-                    hex::encode(xorname)
+                    "Payment verification failed on-chain for {xorname_hex} (paid quote is invalid)"
                 )));
             }
         }
 
         if tracing::enabled!(tracing::Level::INFO) {
             let valid_count = paid_results.len();
+            let total_results = results.len();
+            let xorname_hex = hex::encode(xorname);
             info!(
-                "EVM payment verified for {} ({valid_count} paid and valid, {} total results)",
-                hex::encode(xorname),
-                results.len()
+                "EVM payment verified for {xorname_hex} ({valid_count} paid and valid, {total_results} total results)"
             );
         }
         Ok(())
@@ -416,7 +415,7 @@ impl PaymentVerifier {
             )));
         }
 
-        let mut seen: Vec<&ant_evm::EncodedPeerId> = Vec::with_capacity(quote_count);
+        let mut seen: Vec<&evmlib::EncodedPeerId> = Vec::with_capacity(quote_count);
         for (encoded_peer_id, _) in &payment.peer_quotes {
             if seen.contains(&encoded_peer_id) {
                 return Err(Error::Payment(format!(
@@ -433,10 +432,10 @@ impl PaymentVerifier {
     fn validate_quote_content(payment: &ProofOfPayment, xorname: &XorName) -> Result<()> {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             if !verify_quote_content(quote, xorname) {
+                let expected_hex = hex::encode(xorname);
+                let actual_hex = hex::encode(quote.content.0);
                 return Err(Error::Payment(format!(
-                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {}, got {}",
-                    hex::encode(xorname),
-                    hex::encode(quote.content.0)
+                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {expected_hex}, got {actual_hex}"
                 )));
             }
         }
@@ -482,25 +481,12 @@ impl PaymentVerifier {
             let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
                 .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
 
-            let libp2p_peer_id = encoded_peer_id
-                .to_peer_id()
-                .map_err(|e| Error::Payment(format!("Invalid encoded peer ID: {e}")))?;
-            let peer_id_bytes = libp2p_peer_id.to_bytes();
-            let raw_peer_bytes = if peer_id_bytes.len() > 2 {
-                &peer_id_bytes[2..]
-            } else {
-                return Err(Error::Payment(format!(
-                    "Invalid encoded peer ID: too short ({} bytes)",
-                    peer_id_bytes.len()
-                )));
-            };
-
-            if expected_peer_id.as_bytes() != raw_peer_bytes {
+            if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
+                let expected_hex = expected_peer_id.to_hex();
+                let actual_hex = hex::encode(encoded_peer_id.as_bytes());
                 return Err(Error::Payment(format!(
                     "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
-                     BLAKE3(pub_key) = {}, peer_id = {}",
-                    expected_peer_id.to_hex(),
-                    hex::encode(raw_peer_bytes)
+                     BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
                 )));
             }
         }
@@ -527,10 +513,10 @@ impl PaymentVerifier {
 
         // Verify the address in the proof matches the xorname being stored
         if merkle_proof.address.0 != *xorname {
+            let proof_hex = hex::encode(merkle_proof.address.0);
+            let store_hex = hex::encode(xorname);
             return Err(Error::Payment(format!(
-                "Merkle proof address mismatch: proof is for {}, but storing {}",
-                hex::encode(merkle_proof.address.0),
-                hex::encode(xorname)
+                "Merkle proof address mismatch: proof is for {proof_hex}, but storing {store_hex}"
             )));
         }
 
@@ -551,9 +537,9 @@ impl PaymentVerifier {
                 merkle_payment_vault::get_merkle_payment_info(&self.config.evm.network, pool_hash)
                     .await
                     .map_err(|e| {
+                        let pool_hex = hex::encode(pool_hash);
                         Error::Payment(format!(
-                            "Failed to query merkle payment info for pool {}: {e}",
-                            hex::encode(pool_hash)
+                            "Failed to query merkle payment info for pool {pool_hex}: {e}"
                         ))
                     })?;
 
@@ -615,7 +601,7 @@ impl PaymentVerifier {
 
         // Verify the cryptographic merkle proofs (address belongs to tree,
         // midpoint belongs to tree, roots match, timestamps valid).
-        ant_evm::merkle_payments::verify_merkle_proof(
+        evmlib::merkle_payments::verify_merkle_proof(
             &merkle_proof.address,
             &merkle_proof.data_proof,
             &merkle_proof.winner_pool.midpoint_proof,
@@ -624,18 +610,18 @@ impl PaymentVerifier {
             payment_info.merkle_payment_timestamp,
         )
         .map_err(|e| {
+            let xorname_hex = hex::encode(xorname);
             Error::Payment(format!(
-                "Merkle proof verification failed for {}: {e}",
-                hex::encode(xorname)
+                "Merkle proof verification failed for {xorname_hex}: {e}"
             ))
         })?;
 
         // Verify paid node count matches depth
-        if payment_info.paid_node_addresses.len() != payment_info.depth as usize {
+        let expected_depth = payment_info.depth as usize;
+        let actual_paid = payment_info.paid_node_addresses.len();
+        if actual_paid != expected_depth {
             return Err(Error::Payment(format!(
-                "Wrong number of paid nodes: expected {}, got {}",
-                payment_info.depth,
-                payment_info.paid_node_addresses.len()
+                "Wrong number of paid nodes: expected {expected_depth}, got {actual_paid}"
             )));
         }
 
@@ -951,7 +937,7 @@ mod tests {
         use crate::payment::proof::PaymentProof;
         use crate::payment::quote::{QuoteGenerator, XorName};
         use alloy::primitives::FixedBytes;
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::types::MlDsaSecretKey;
         use saorsa_pqc::pqc::MlDsaOperations;
@@ -977,9 +963,7 @@ mod tests {
             let content: XorName = [i; 32];
             let quote = generator.create_quote(content, 4096, 0).expect("quote");
 
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote));
         }
 
         let proof = PaymentProof {
@@ -1008,9 +992,8 @@ mod tests {
     #[tokio::test]
     async fn test_content_address_mismatch_rejected() {
         use crate::payment::proof::{serialize_single_node_proof, PaymentProof};
-        use ant_evm::{EncodedPeerId, PaymentQuote, QuotingMetrics, RewardsAddress};
-        use libp2p::identity::Keypair;
-        use libp2p::PeerId;
+        use evmlib::quoting_metrics::QuotingMetrics;
+        use evmlib::{EncodedPeerId, PaymentQuote, RewardsAddress};
         use std::time::SystemTime;
 
         let verifier = create_test_verifier();
@@ -1042,9 +1025,7 @@ mod tests {
         // Build CLOSE_GROUP_SIZE quotes with distinct peer IDs
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = Keypair::generate_ed25519();
-            let peer_id = PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof = PaymentProof {
@@ -1071,8 +1052,9 @@ mod tests {
         xorname: [u8; 32],
         timestamp: SystemTime,
         rewards_address: RewardsAddress,
-    ) -> ant_evm::PaymentQuote {
-        use ant_evm::{PaymentQuote, QuotingMetrics};
+    ) -> evmlib::PaymentQuote {
+        use evmlib::quoting_metrics::QuotingMetrics;
+        use evmlib::PaymentQuote;
 
         PaymentQuote {
             content: xor_name::XorName(xorname),
@@ -1095,9 +1077,7 @@ mod tests {
     }
 
     /// Helper: wrap quotes into a tagged serialized `PaymentProof`.
-    fn serialize_proof(
-        peer_quotes: Vec<(ant_evm::EncodedPeerId, ant_evm::PaymentQuote)>,
-    ) -> Vec<u8> {
+    fn serialize_proof(peer_quotes: Vec<(evmlib::EncodedPeerId, evmlib::PaymentQuote)>) -> Vec<u8> {
         use crate::payment::proof::{serialize_single_node_proof, PaymentProof};
 
         let proof = PaymentProof {
@@ -1109,7 +1089,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_expired_quote_rejected() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
         let verifier = create_test_verifier();
@@ -1122,9 +1102,7 @@ mod tests {
 
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1140,7 +1118,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_future_timestamp_rejected() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
         let verifier = create_test_verifier();
@@ -1153,9 +1131,7 @@ mod tests {
 
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1171,7 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quote_within_clock_skew_tolerance_accepted() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
         let verifier = create_test_verifier();
@@ -1184,9 +1160,7 @@ mod tests {
 
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1202,7 +1176,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quote_just_beyond_clock_skew_tolerance_rejected() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
         let verifier = create_test_verifier();
@@ -1215,9 +1189,7 @@ mod tests {
 
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1236,7 +1208,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_quote_23h_old_still_accepted() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use std::time::Duration;
 
         let verifier = create_test_verifier();
@@ -1249,9 +1221,7 @@ mod tests {
 
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1266,23 +1236,14 @@ mod tests {
     }
 
     /// Helper: build an `EncodedPeerId` that matches the BLAKE3 hash of an ML-DSA public key.
-    fn encoded_peer_id_for_pub_key(pub_key: &[u8]) -> ant_evm::EncodedPeerId {
+    fn encoded_peer_id_for_pub_key(pub_key: &[u8]) -> evmlib::EncodedPeerId {
         let ant_peer_id = peer_id_from_public_key_bytes(pub_key).expect("valid ML-DSA pub key");
-        // Wrap raw 32-byte peer ID in identity multihash format: [0x00, length, ...bytes]
-        let raw = ant_peer_id.as_bytes();
-        let mut multihash_bytes = Vec::with_capacity(2 + raw.len());
-        multihash_bytes.push(0x00); // identity multihash code
-                                    // PeerId is always 32 bytes, safely fits in u8
-        multihash_bytes.push(u8::try_from(raw.len()).unwrap_or(32));
-        multihash_bytes.extend_from_slice(raw);
-        let libp2p_peer_id =
-            libp2p::PeerId::from_bytes(&multihash_bytes).expect("valid multihash peer ID");
-        ant_evm::EncodedPeerId::from(libp2p_peer_id)
+        evmlib::EncodedPeerId::new(*ant_peer_id.as_bytes())
     }
 
     #[tokio::test]
     async fn test_local_not_in_paid_set_rejected() {
-        use ant_evm::RewardsAddress;
+        use evmlib::RewardsAddress;
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::MlDsaOperations;
 
@@ -1328,7 +1289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wrong_peer_binding_rejected() {
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::MlDsaOperations;
 
@@ -1349,9 +1310,7 @@ mod tests {
         // Use random ed25519 peer IDs — they won't match BLAKE3(pub_key)
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
@@ -1400,7 +1359,7 @@ mod tests {
     #[tokio::test]
     async fn test_single_node_tagged_proof_deserialization() {
         use crate::payment::proof::serialize_single_node_proof;
-        use ant_evm::{EncodedPeerId, RewardsAddress};
+        use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
         let xorname = [0xA2u8; 32];
@@ -1410,9 +1369,7 @@ mod tests {
         let quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
-            let keypair = libp2p::identity::Keypair::generate_ed25519();
-            let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-            peer_quotes.push((EncodedPeerId::from(peer_id), quote.clone()));
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
         }
 
         let proof = crate::payment::proof::PaymentProof {
@@ -1453,7 +1410,7 @@ mod tests {
         let verifier = create_test_verifier();
 
         let pool_hash: PoolHash = [0xBBu8; 32];
-        let payment_info = ant_evm::merkle_payments::OnChainPaymentInfo {
+        let payment_info = evmlib::merkle_payments::OnChainPaymentInfo {
             depth: 4,
             merkle_payment_timestamp: 1_700_000_000,
             paid_node_addresses: vec![],
@@ -1498,9 +1455,9 @@ mod tests {
     /// Helper: build 16 validly-signed ML-DSA-65 candidate nodes.
     fn make_candidate_nodes(
         timestamp: u64,
-    ) -> [ant_evm::merkle_payments::MerklePaymentCandidateNode;
-           ant_evm::merkle_payments::CANDIDATES_PER_POOL] {
-        use ant_evm::merkle_payments::{MerklePaymentCandidateNode, CANDIDATES_PER_POOL};
+    ) -> [evmlib::merkle_payments::MerklePaymentCandidateNode;
+           evmlib::merkle_payments::CANDIDATES_PER_POOL] {
+        use evmlib::merkle_payments::{MerklePaymentCandidateNode, CANDIDATES_PER_POOL};
         use saorsa_core::MlDsa65;
         use saorsa_pqc::pqc::types::MlDsaSecretKey;
         use saorsa_pqc::pqc::MlDsaOperations;
@@ -1508,7 +1465,7 @@ mod tests {
         std::array::from_fn::<_, CANDIDATES_PER_POOL, _>(|i| {
             let ml_dsa = MlDsa65::new();
             let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let metrics = ant_evm::QuotingMetrics {
+            let metrics = evmlib::quoting_metrics::QuotingMetrics {
                 data_size: 1024,
                 data_type: 0,
                 close_records_stored: i * 10,
@@ -1539,14 +1496,12 @@ mod tests {
     /// Helper: build a valid `MerklePaymentProof` with real ML-DSA-65
     /// signatures. Returns the raw proof, pool hash, xorname, and timestamp.
     fn make_valid_merkle_proof() -> (
-        ant_evm::merkle_payments::MerklePaymentProof,
+        evmlib::merkle_payments::MerklePaymentProof,
         evmlib::merkle_batch_payment::PoolHash,
         [u8; 32],
         u64,
     ) {
-        use ant_evm::merkle_payments::{
-            MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-        };
+        use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree};
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1701,7 +1656,7 @@ mod tests {
                     hash[j] = *b;
                 }
             }
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 4,
                 merkle_payment_timestamp: 1_700_000_000,
                 paid_node_addresses: vec![],
@@ -1716,7 +1671,7 @@ mod tests {
 
         // Insert one more — should evict the oldest
         let overflow_hash: PoolHash = [0xFFu8; 32];
-        let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+        let info = evmlib::merkle_payments::OnChainPaymentInfo {
             depth: 8,
             merkle_payment_timestamp: 1_800_000_000,
             paid_node_addresses: vec![],
@@ -1750,7 +1705,7 @@ mod tests {
             let v = verifier.clone();
             handles.push(std::thread::spawn(move || {
                 let hash: PoolHash = [i; 32];
-                let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+                let info = evmlib::merkle_payments::OnChainPaymentInfo {
                     depth: i,
                     merkle_payment_timestamp: u64::from(i) * 1000,
                     paid_node_addresses: vec![],
@@ -1792,7 +1747,7 @@ mod tests {
 
         // Pre-populate pool cache so we skip the on-chain query
         {
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 4,
                 merkle_payment_timestamp: timestamp,
                 paid_node_addresses: vec![],
@@ -1825,7 +1780,7 @@ mod tests {
         // Pre-populate pool cache with a DIFFERENT timestamp than the candidates
         {
             let mismatched_ts = timestamp + 9999;
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 4,
                 merkle_payment_timestamp: mismatched_ts,
                 paid_node_addresses: vec![],
@@ -1855,7 +1810,7 @@ mod tests {
         // so verify_merkle_proof passes the depth check, then the paid node
         // index out-of-bounds check fires.
         {
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
@@ -1889,7 +1844,7 @@ mod tests {
         // Tree has depth 2, so provide 2 paid node entries.
         // Both use valid indices but the second has a wrong reward address.
         {
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
@@ -1920,7 +1875,7 @@ mod tests {
         // Pre-populate pool cache with depth=3 but only 1 paid node address
         // (depth must equal paid_node_addresses.len())
         {
-            let info = ant_evm::merkle_payments::OnChainPaymentInfo {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 3,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![(RewardsAddress::new([0u8; 20]), 0)],

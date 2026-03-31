@@ -390,7 +390,7 @@ mod tests {
     use crate::payment::metrics::QuotingMetricsTracker;
     use crate::payment::{EvmVerifierConfig, PaymentVerifierConfig};
     use crate::storage::LmdbStorageConfig;
-    use ant_evm::RewardsAddress;
+    use evmlib::RewardsAddress;
     use saorsa_core::identity::NodeIdentity;
     use saorsa_core::MlDsa65;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
@@ -782,7 +782,7 @@ mod tests {
     #[tokio::test]
     async fn test_merkle_candidate_quote_request() {
         use crate::payment::quote::verify_merkle_candidate_signature;
-        use ant_evm::merkle_payments::MerklePaymentCandidateNode;
+        use evmlib::merkle_payments::MerklePaymentCandidateNode;
 
         // create_test_protocol already wires ML-DSA-65 signing
         let (protocol, _temp) = create_test_protocol().await;

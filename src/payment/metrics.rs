@@ -5,7 +5,7 @@
 //! - Storage capacity and usage
 //! - Network liveness information
 
-use ant_evm::QuotingMetrics;
+use evmlib::quoting_metrics::QuotingMetrics;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

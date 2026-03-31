@@ -20,7 +20,8 @@
 //! charge the same regardless of remaining capacity. The logarithmic curve ensures
 //! the network self-balances as nodes fill up.
 
-use ant_evm::{Amount, QuotingMetrics};
+use evmlib::common::Amount;
+use evmlib::quoting_metrics::QuotingMetrics;
 
 /// Minimum price floor (matches contract's `minPrice = 3`).
 const MIN_PRICE: u64 = 3;

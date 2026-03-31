@@ -45,37 +45,23 @@ pub use data_types::{
 
 // Re-export hex_node_id_to_encoded_peer_id for payment operations
 use crate::error::{Error, Result};
-use ant_evm::EncodedPeerId;
-
-/// Identity multihash code (stores raw bytes without hashing).
-const MULTIHASH_IDENTITY_CODE: u64 = 0x00;
+use evmlib::EncodedPeerId;
 
 /// Convert a hex-encoded 32-byte node ID to an [`EncodedPeerId`].
 ///
 /// Peer IDs are 64-character hex strings representing 32 raw bytes.
-/// libp2p `PeerId` expects a multihash-encoded identity. This function bridges the two
-/// formats by wrapping the raw bytes in an identity multihash (code 0x00) and then
-/// converting to `EncodedPeerId` via `From<PeerId>`.
+/// This function decodes the hex string and wraps the raw bytes directly
+/// into an `EncodedPeerId`.
 ///
 /// # Errors
 ///
-/// Returns an error if the hex string is invalid or the peer ID cannot be constructed.
+/// Returns an error if the hex string is invalid or not exactly 32 bytes.
 pub fn hex_node_id_to_encoded_peer_id(hex_id: &str) -> Result<EncodedPeerId> {
     let raw_bytes = hex::decode(hex_id)
         .map_err(|e| Error::Payment(format!("Invalid hex peer ID '{hex_id}': {e}")))?;
-
-    let multihash =
-        multihash::Multihash::<64>::wrap(MULTIHASH_IDENTITY_CODE, &raw_bytes).map_err(|e| {
-            Error::Payment(format!(
-                "Failed to create multihash for peer '{hex_id}': {e}"
-            ))
-        })?;
-
-    let peer_id = libp2p::PeerId::from_multihash(multihash).map_err(|_| {
-        Error::Payment(format!(
-            "Failed to create PeerId from multihash for peer '{hex_id}'"
-        ))
+    let bytes: [u8; 32] = raw_bytes.try_into().map_err(|v: Vec<u8>| {
+        let len = v.len();
+        Error::Payment(format!("Peer ID must be 32 bytes, got {len}"))
     })?;
-
-    Ok(EncodedPeerId::from(peer_id))
+    Ok(EncodedPeerId::new(bytes))
 }

@@ -63,13 +63,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{TestHarness, TestNetwork};
-    use ant_evm::RewardsAddress;
     use ant_node::payment::{
         EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
         QuotingMetricsTracker,
     };
     use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
     use evmlib::testnet::Testnet;
+    use evmlib::RewardsAddress;
     use rand::seq::SliceRandom;
     use serial_test::serial;
 
@@ -421,7 +421,9 @@ mod tests {
     async fn create_evm_enabled_protocol(
         test_name: &str,
     ) -> color_eyre::Result<(AntProtocol, std::path::PathBuf, Testnet)> {
-        let testnet = Testnet::new().await;
+        let testnet = Testnet::new()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to start testnet: {e}"))?;
         let network = testnet.to_network();
 
         let temp_dir = std::env::temp_dir().join(format!("{test_name}_{}", rand::random::<u64>()));
@@ -476,7 +478,7 @@ mod tests {
         let address = ChunkTestFixture::compute_address(data);
 
         // Create empty payment proof
-        let empty_payment = rmp_serde::to_vec(&ant_evm::ProofOfPayment {
+        let empty_payment = rmp_serde::to_vec(&evmlib::ProofOfPayment {
             peer_quotes: vec![],
         })?;
 

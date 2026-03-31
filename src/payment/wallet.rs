@@ -5,8 +5,8 @@
 
 use crate::config::EvmNetworkConfig;
 use crate::error::{Error, Result};
-use ant_evm::RewardsAddress;
 use evmlib::Network as EvmNetwork;
+use evmlib::RewardsAddress;
 
 /// EVM wallet configuration for a node.
 #[derive(Debug, Clone)]

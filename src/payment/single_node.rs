@@ -12,10 +12,13 @@
 
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
-use ant_evm::{Amount, PaymentQuote, QuoteHash, QuotingMetrics, RewardsAddress};
+use evmlib::common::{Amount, QuoteHash};
 use evmlib::contract::payment_vault;
+use evmlib::quoting_metrics::QuotingMetrics;
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
+use evmlib::PaymentQuote;
+use evmlib::RewardsAddress;
 use tracing::info;
 
 /// Create zero-valued `QuotingMetrics` for payment verification.
@@ -330,9 +333,13 @@ mod tests {
     async fn test_standard_five_quote_payment() {
         // Use autonomi's setup pattern with increased timeout for CI
         let (node, rpc_url) = start_node_with_timeout();
-        let network_token = deploy_network_token_contract(&rpc_url, &node).await;
+        let network_token = deploy_network_token_contract(&rpc_url, &node)
+            .await
+            .expect("deploy network token");
         let mut payment_vault =
-            deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
+            deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address())
+                .await
+                .expect("deploy data payments");
 
         let transaction_config = TransactionConfig::default();
 
@@ -397,9 +404,13 @@ mod tests {
     #[allow(clippy::expect_used)]
     async fn test_single_node_payment_strategy() {
         let (node, rpc_url) = start_node_with_timeout();
-        let network_token = deploy_network_token_contract(&rpc_url, &node).await;
+        let network_token = deploy_network_token_contract(&rpc_url, &node)
+            .await
+            .expect("deploy network token");
         let mut payment_vault =
-            deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address()).await;
+            deploy_data_payments_contract(&rpc_url, &node, *network_token.contract.address())
+                .await
+                .expect("deploy data payments");
 
         let transaction_config = TransactionConfig::default();
 
@@ -608,11 +619,15 @@ mod tests {
     #[serial]
     async fn test_single_node_with_real_prices() -> Result<()> {
         // Setup testnet
-        let testnet = Testnet::new().await;
+        let testnet = Testnet::new()
+            .await
+            .map_err(|e| Error::Payment(format!("Failed to start testnet: {e}")))?;
         let network = testnet.to_network();
-        let wallet =
-            Wallet::new_from_private_key(network.clone(), &testnet.default_wallet_private_key())
-                .map_err(|e| Error::Payment(format!("Failed to create wallet: {e}")))?;
+        let wallet_key = testnet
+            .default_wallet_private_key()
+            .map_err(|e| Error::Payment(format!("Failed to get wallet key: {e}")))?;
+        let wallet = Wallet::new_from_private_key(network.clone(), &wallet_key)
+            .map_err(|e| Error::Payment(format!("Failed to create wallet: {e}")))?;
 
         println!("✓ Started Anvil testnet");
 

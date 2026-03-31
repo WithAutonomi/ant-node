@@ -56,9 +56,13 @@ async fn main() -> color_eyre::Result<()> {
     // Start Anvil and deploy contracts if EVM is enabled
     let evm_info = if cli.enable_evm {
         info!("Starting local Anvil blockchain for EVM payment enforcement...");
-        let testnet = evmlib::testnet::Testnet::new().await;
+        let testnet = evmlib::testnet::Testnet::new()
+            .await
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to start Anvil testnet: {e}"))?;
         let network = testnet.to_network();
-        let wallet_key = testnet.default_wallet_private_key();
+        let wallet_key = testnet
+            .default_wallet_private_key()
+            .map_err(|e| color_eyre::eyre::eyre!("Failed to get wallet key: {e}"))?;
 
         let (rpc_url, token_addr, payments_addr, merkle_addr) = match &network {
             evmlib::Network::Custom(custom) => (

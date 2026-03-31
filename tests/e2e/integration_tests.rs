@@ -120,7 +120,7 @@ async fn test_network_with_evm() {
     let anvil = harness.anvil().expect("Anvil should be present");
     // Verify the Anvil testnet is usable by checking we can get a network config
     let _network = anvil.to_network();
-    assert!(!anvil.default_wallet_key().is_empty());
+    assert!(!anvil.default_wallet_key().expect("wallet key").is_empty());
 
     harness.teardown().await.expect("Failed to teardown");
 }

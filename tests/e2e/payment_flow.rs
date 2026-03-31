@@ -48,7 +48,7 @@ impl PaymentTestEnv {
     /// Create a funded wallet from the Anvil testnet.
     fn create_funded_wallet(&self) -> Result<Wallet, Box<dyn std::error::Error>> {
         let network = self.testnet.to_network();
-        let private_key = self.testnet.default_wallet_private_key();
+        let private_key = self.testnet.default_wallet_private_key()?;
 
         let wallet = Wallet::new_from_private_key(network, &private_key)?;
         info!("Created funded wallet: {}", wallet.address());
@@ -74,7 +74,7 @@ async fn init_testnet_and_evm() -> Result<PaymentTestEnv, Box<dyn std::error::Er
     info!("Initializing payment test environment");
 
     // Start Anvil EVM testnet FIRST so we can wire it to nodes
-    let testnet = Testnet::new().await;
+    let testnet = Testnet::new().await?;
     let network = testnet.to_network();
     info!("Anvil testnet started");
 

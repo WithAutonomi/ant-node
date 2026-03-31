@@ -28,11 +28,8 @@ saorsa-core = "0.20.0"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
-ant-evm = "0.1.19"
-evmlib = "0.4.9"
+evmlib = { path = "/Users/anselme/Documents/maidsafe/saorsa/evmlib" }
 xor_name = "5"
-libp2p = "0.56"  # For PeerId in payment proofs
-multihash = "0.19"  # For identity multihash in PeerId construction
 
 # Caching - LRU cache for verified XorNames
 lru = "0.16.3"

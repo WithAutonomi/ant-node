@@ -9,8 +9,10 @@
 
 use crate::error::{Error, Result};
 use crate::payment::metrics::QuotingMetricsTracker;
-use ant_evm::merkle_payments::MerklePaymentCandidateNode;
-use ant_evm::{PaymentQuote, QuotingMetrics, RewardsAddress};
+use evmlib::merkle_payments::MerklePaymentCandidateNode;
+use evmlib::quoting_metrics::QuotingMetrics;
+use evmlib::PaymentQuote;
+use evmlib::RewardsAddress;
 use saorsa_core::MlDsa65;
 use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use saorsa_pqc::pqc::MlDsaOperations;
@@ -612,7 +614,7 @@ mod tests {
         let quote = PaymentQuote {
             content: xor_name::XorName([0u8; 32]),
             timestamp: SystemTime::now(),
-            quoting_metrics: ant_evm::QuotingMetrics {
+            quoting_metrics: QuotingMetrics {
                 data_size: 0,
                 data_type: 0,
                 close_records_stored: 0,
@@ -761,7 +763,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_secs();
-        let metrics = ant_evm::QuotingMetrics {
+        let metrics = QuotingMetrics {
             data_size: 4096,
             data_type: 0,
             close_records_stored: 10,

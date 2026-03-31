@@ -13,7 +13,6 @@
 //! - Payment verification (when enabled)
 //! - LMDB storage persistence
 
-use ant_evm::RewardsAddress;
 use ant_node::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, CHUNK_PROTOCOL_ID,
@@ -26,6 +25,7 @@ use ant_node::payment::{
 use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use bytes::Bytes;
 use evmlib::Network as EvmNetwork;
+use evmlib::RewardsAddress;
 use futures::future::join_all;
 use rand::Rng;
 use saorsa_core::identity::PeerId;

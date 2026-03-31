@@ -57,7 +57,9 @@ impl TestAnvil {
     pub async fn new() -> Result<Self> {
         info!("Starting Anvil EVM testnet");
 
-        let testnet = Testnet::new().await;
+        let testnet = Testnet::new()
+            .await
+            .map_err(|e| AnvilError::Startup(format!("Failed to start Anvil testnet: {e}")))?;
 
         info!("Anvil testnet started");
 
@@ -79,9 +81,14 @@ impl TestAnvil {
     }
 
     /// Get the default wallet private key (pre-funded Anvil account).
-    #[must_use]
-    pub fn default_wallet_key(&self) -> String {
-        self.testnet.default_wallet_private_key()
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wallet key cannot be retrieved.
+    pub fn default_wallet_key(&self) -> Result<String> {
+        self.testnet
+            .default_wallet_private_key()
+            .map_err(|e| AnvilError::Startup(format!("Failed to get wallet key: {e}")))
     }
 
     /// Create a wallet funded with test tokens.
@@ -93,7 +100,10 @@ impl TestAnvil {
     /// Returns an error if wallet creation fails.
     pub fn create_funded_wallet(&self) -> Result<Wallet> {
         let network = self.testnet.to_network();
-        let private_key = self.testnet.default_wallet_private_key();
+        let private_key = self
+            .testnet
+            .default_wallet_private_key()
+            .map_err(|e| AnvilError::Startup(format!("Failed to get wallet key: {e}")))?;
 
         let wallet = Wallet::new_from_private_key(network, &private_key)
             .map_err(|e| AnvilError::Startup(format!("Failed to create funded wallet: {e}")))?;
@@ -188,7 +198,7 @@ mod tests {
     async fn test_anvil_creation() {
         let anvil = TestAnvil::new().await.unwrap();
         let _network = anvil.to_network();
-        assert!(!anvil.default_wallet_key().is_empty());
+        assert!(!anvil.default_wallet_key().unwrap().is_empty());
     }
 
     #[test]

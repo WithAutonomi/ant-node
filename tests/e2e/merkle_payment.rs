@@ -14,11 +14,6 @@
 
 use super::harness::TestHarness;
 use super::testnet::TestNetworkConfig;
-use ant_evm::merkle_payments::{
-    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    CANDIDATES_PER_POOL,
-};
-use ant_evm::RewardsAddress;
 use ant_node::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ProtocolError,
     PROOF_TAG_MERKLE,
@@ -27,8 +22,13 @@ use ant_node::compute_address;
 use ant_node::payment::{
     serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use evmlib::merkle_payments::{
+    MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
+    CANDIDATES_PER_POOL,
+};
 use evmlib::quoting_metrics::QuotingMetrics;
 use evmlib::testnet::Testnet;
+use evmlib::RewardsAddress;
 use rand::Rng;
 use saorsa_core::MlDsa65;
 use saorsa_pqc::pqc::types::MlDsaSecretKey;
@@ -87,7 +87,7 @@ async fn send_put_to_node(
 
 /// Create a lightweight test harness with payment enforcement and Anvil wiring.
 async fn setup_enforcement_env() -> Result<(TestHarness, Testnet), Box<dyn std::error::Error>> {
-    let testnet = Testnet::new().await;
+    let testnet = Testnet::new().await?;
     let network = testnet.to_network();
     let config = TestNetworkConfig::minimal()
         .with_payment_enforcement()
