@@ -16,7 +16,7 @@ use evmlib::common::Amount;
 /// Divisor for the pricing formula.
 const PRICING_DIVISOR: u64 = 6000;
 
-/// PRICING_DIVISOR², precomputed to avoid repeated multiplication.
+/// `PRICING_DIVISOR²`, precomputed to avoid repeated multiplication.
 const DIVISOR_SQUARED: u64 = PRICING_DIVISOR * PRICING_DIVISOR;
 
 /// 1 token = 10^18 wei.
