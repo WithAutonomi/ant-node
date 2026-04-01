@@ -71,11 +71,19 @@ pub const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(SELF_LOOKUP_I
 /// Periodic self-lookup cadence range (max).
 pub const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(SELF_LOOKUP_INTERVAL_MAX_SECS);
 
-/// Bootstrap concurrent fetches cap.
-pub const MAX_PARALLEL_FETCH_BOOTSTRAP: usize = 20;
+/// Concurrent fetches cap, derived from hardware thread count.
+///
+/// Uses `std::thread::available_parallelism()` so the node scales to the
+/// machine it runs on.  Falls back to 4 if the OS query fails.
+const AVAILABLE_PARALLELISM_FALLBACK: usize = 4;
 
-/// Normal-operation concurrent fetches cap (post-bootstrap).
-pub const MAX_PARALLEL_FETCH_NORMAL: usize = 50;
+/// Returns the number of hardware threads available, used as the fetch
+/// concurrency limit.
+#[allow(clippy::incompatible_msrv)] // NonZero::get is stable since 1.79; MSRV lint conflicts with redundant_closure
+pub fn max_parallel_fetch() -> usize {
+    std::thread::available_parallelism()
+        .map_or(AVAILABLE_PARALLELISM_FALLBACK, std::num::NonZero::get)
+}
 
 /// Minimum audit-scheduler cadence.
 const AUDIT_TICK_INTERVAL_MIN_SECS: u64 = 30 * 60;
@@ -159,8 +167,6 @@ pub struct ReplicationConfig {
     pub self_lookup_interval_min: Duration,
     /// Self-lookup cadence range (max).
     pub self_lookup_interval_max: Duration,
-    /// Bootstrap concurrent fetches cap.
-    pub max_parallel_fetch_bootstrap: usize,
     /// Audit scheduler cadence range (min).
     pub audit_tick_interval_min: Duration,
     /// Audit scheduler cadence range (max).
@@ -193,7 +199,6 @@ impl Default for ReplicationConfig {
             neighbor_sync_cooldown: NEIGHBOR_SYNC_COOLDOWN,
             self_lookup_interval_min: SELF_LOOKUP_INTERVAL_MIN,
             self_lookup_interval_max: SELF_LOOKUP_INTERVAL_MAX,
-            max_parallel_fetch_bootstrap: MAX_PARALLEL_FETCH_BOOTSTRAP,
             audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
             audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
             audit_response_timeout: AUDIT_RESPONSE_TIMEOUT,

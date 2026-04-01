@@ -32,6 +32,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use rand::Rng;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -42,9 +44,7 @@ use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
-use crate::replication::config::{
-    ReplicationConfig, MAX_PARALLEL_FETCH_NORMAL, REPLICATION_PROTOCOL_ID,
-};
+use crate::replication::config::{max_parallel_fetch, ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     FreshReplicationResponse, ReplicationMessage, ReplicationMessageBody, VerificationResponse,
@@ -148,9 +148,7 @@ impl ReplicationEngine {
             storage,
             paid_list,
             payment_verifier,
-            queues: Arc::new(RwLock::new(ReplicationQueues::new(
-                config.max_parallel_fetch_bootstrap,
-            ))),
+            queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
@@ -435,40 +433,77 @@ impl ReplicationEngine {
         let queues = Arc::clone(&self.queues);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
-        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let concurrency = max_parallel_fetch();
+
+        info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
 
         let handle = tokio::spawn(async move {
-            loop {
-                // Gap 7: Adaptive fetch concurrency.
-                // Poll immediately when there is backlog, sleep when idle.
-                let has_backlog = {
-                    let q = queues.read().await;
-                    q.fetch_queue_count() > 0
-                };
+            let mut in_flight = FuturesUnordered::<JoinHandle<FetchOutcome>>::new();
 
-                if has_backlog {
-                    // Process immediately when work is available.
-                    if shutdown.is_cancelled() {
-                        break;
+            loop {
+                // Fill up to `concurrency` slots from the queue.
+                {
+                    let mut q = queues.write().await;
+                    while in_flight.len() < concurrency {
+                        let Some(candidate) = q.dequeue_fetch() else {
+                            break;
+                        };
+                        let source = match candidate
+                            .sources
+                            .iter()
+                            .find(|p| !candidate.tried.contains(p))
+                        {
+                            Some(p) => *p,
+                            None => continue,
+                        };
+                        q.start_fetch(candidate.key, source, candidate.sources.clone());
+
+                        let p2p = Arc::clone(&p2p);
+                        let storage = Arc::clone(&storage);
+                        let config = Arc::clone(&config);
+                        in_flight.push(tokio::spawn(execute_single_fetch(
+                            p2p,
+                            storage,
+                            config,
+                            candidate.key,
+                            source,
+                        )));
                     }
-                    run_fetch_cycle(&p2p, &storage, &queues, &config).await;
-                } else {
+                } // release queues write lock
+
+                if in_flight.is_empty() {
+                    // No work — wait for new items or shutdown.
                     tokio::select! {
                         () = shutdown.cancelled() => break,
                         () = tokio::time::sleep(
                             std::time::Duration::from_millis(FETCH_WORKER_POLL_MS)
-                        ) => {
-                            run_fetch_cycle(&p2p, &storage, &queues, &config).await;
-                        }
+                        ) => continue,
                     }
                 }
 
-                // Gap 8: Post-bootstrap concurrency adjustment.
-                if bootstrap_state.read().await.is_drained() {
-                    let mut q = queues.write().await;
-                    q.set_max_concurrent_fetch(MAX_PARALLEL_FETCH_NORMAL);
+                // Wait for the next fetch to complete and process the result.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    Some(join_result) = in_flight.next() => {
+                        if let Ok(outcome) = join_result {
+                            let mut q = queues.write().await;
+                            match outcome.result {
+                                FetchResult::Stored | FetchResult::IntegrityFailed => {
+                                    q.complete_fetch(&outcome.key);
+                                }
+                                FetchResult::SourceFailed => {
+                                    if q.retry_fetch(&outcome.key).is_none() {
+                                        q.complete_fetch(&outcome.key);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
+
+            // Drain remaining in-flight fetches on shutdown.
+            drop(in_flight);
             debug!("Fetch worker shut down");
         });
         self.task_handles.push(handle);
@@ -1489,138 +1524,136 @@ async fn run_verification_cycle(
 }
 
 // ---------------------------------------------------------------------------
-// Fetch cycle
+// Fetch types and single-fetch executor
 // ---------------------------------------------------------------------------
 
-/// Run one fetch cycle: dequeue and execute fetches.
-#[allow(clippy::too_many_lines)]
-async fn run_fetch_cycle(
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    queues: &Arc<RwLock<ReplicationQueues>>,
-    config: &ReplicationConfig,
-) {
-    loop {
-        let candidate = {
-            let mut q = queues.write().await;
-            q.dequeue_fetch()
-        };
+/// Result classification for a single fetch attempt.
+enum FetchResult {
+    /// Data fetched, integrity-checked, and stored successfully.
+    Stored,
+    /// Content-address integrity check failed — do not retry.
+    IntegrityFailed,
+    /// Source failed (network error or non-success response) — retryable.
+    SourceFailed,
+}
 
-        let Some(candidate) = candidate else { break };
+/// Outcome produced by [`execute_single_fetch`] and consumed by the fetch
+/// worker loop to update queue state.
+struct FetchOutcome {
+    key: XorName,
+    result: FetchResult,
+}
 
-        // Pick first untried source.
-        let source = match candidate
-            .sources
-            .iter()
-            .find(|p| !candidate.tried.contains(p))
-        {
-            Some(p) => *p,
-            None => continue,
-        };
+/// Execute a single fetch request against `source` for `key`.
+///
+/// Handles encoding, network I/O, integrity checking, storage, and trust
+/// event reporting.  Returns a [`FetchOutcome`] so the caller can update
+/// queue state without holding any locks during the network round-trip.
+async fn execute_single_fetch(
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<LmdbStorage>,
+    config: Arc<ReplicationConfig>,
+    key: XorName,
+    source: PeerId,
+) -> FetchOutcome {
+    let request = protocol::FetchRequest { key };
+    let msg = ReplicationMessage {
+        request_id: rand::thread_rng().gen::<u64>(),
+        body: ReplicationMessageBody::FetchRequest(request),
+    };
 
-        // Mark as in-flight.
-        {
-            let mut q = queues.write().await;
-            q.start_fetch(candidate.key, source, candidate.sources.clone());
+    let encoded = match msg.encode() {
+        Ok(data) => data,
+        Err(e) => {
+            warn!("Failed to encode fetch request: {e}");
+            return FetchOutcome {
+                key,
+                result: FetchResult::SourceFailed,
+            };
         }
+    };
 
-        // Build and send fetch request.
-        let request = protocol::FetchRequest { key: candidate.key };
-        let msg = ReplicationMessage {
-            request_id: rand::thread_rng().gen::<u64>(),
-            body: ReplicationMessageBody::FetchRequest(request),
-        };
+    let result = p2p_node
+        .send_request(
+            &source,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            config.fetch_request_timeout,
+        )
+        .await;
 
-        let encoded = match msg.encode() {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("Failed to encode fetch request: {e}");
-                let mut q = queues.write().await;
-                q.complete_fetch(&candidate.key);
-                continue;
-            }
-        };
-
-        let result = p2p_node
-            .send_request(
-                &source,
-                REPLICATION_PROTOCOL_ID,
-                encoded,
-                config.fetch_request_timeout,
-            )
-            .await;
-
-        match result {
-            Ok(response) => {
-                if let Ok(resp_msg) = ReplicationMessage::decode(&response.data) {
-                    if let ReplicationMessageBody::FetchResponse(
-                        protocol::FetchResponse::Success { key, data },
-                    ) = resp_msg.body
-                    {
-                        // Gap 2: Content-address integrity check.
-                        let computed = crate::client::compute_address(&data);
-                        if computed != key {
-                            warn!(
-                                "Fetched record integrity check failed: expected {}, got {}",
-                                hex::encode(key),
-                                hex::encode(computed)
-                            );
-                            p2p_node
-                                .report_trust_event(
-                                    &source,
-                                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                                )
-                                .await;
-                            let mut q = queues.write().await;
-                            q.complete_fetch(&candidate.key);
-                            continue;
-                        }
-
-                        if let Err(e) = storage.put(&key, &data).await {
-                            warn!("Failed to store fetched record {}: {e}", hex::encode(key));
-                        }
-
-                        // Gap 5: Successful fetch — emit trust success for
-                        // source to mark prior fetch-failure evidence as
-                        // stale (Section 14, rule 4).
+    match result {
+        Ok(response) => {
+            if let Ok(resp_msg) = ReplicationMessage::decode(&response.data) {
+                if let ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Success {
+                    key: resp_key,
+                    data,
+                }) = resp_msg.body
+                {
+                    // Content-address integrity check.
+                    let computed = crate::client::compute_address(&data);
+                    if computed != resp_key {
+                        warn!(
+                            "Fetched record integrity check failed: expected {}, got {}",
+                            hex::encode(resp_key),
+                            hex::encode(computed)
+                        );
                         p2p_node
                             .report_trust_event(
                                 &source,
-                                TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                             )
                             .await;
-
-                        let mut q = queues.write().await;
-                        q.complete_fetch(&candidate.key);
-                        continue;
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::IntegrityFailed,
+                        };
                     }
-                }
-                // Non-success response: emit trust failure and try next source.
-                // Gap 5: ReplicationFailure trust event.
-                p2p_node
-                    .report_trust_event(
-                        &source,
-                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                    )
-                    .await;
-                let mut q = queues.write().await;
-                if q.retry_fetch(&candidate.key).is_none() {
-                    q.complete_fetch(&candidate.key);
+
+                    if let Err(e) = storage.put(&resp_key, &data).await {
+                        warn!(
+                            "Failed to store fetched record {}: {e}",
+                            hex::encode(resp_key)
+                        );
+                    }
+
+                    // Successful fetch — emit trust success (Section 14, rule 4).
+                    p2p_node
+                        .report_trust_event(
+                            &source,
+                            TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
+                        )
+                        .await;
+
+                    return FetchOutcome {
+                        key,
+                        result: FetchResult::Stored,
+                    };
                 }
             }
-            Err(e) => {
-                debug!("Fetch request to {source} failed: {e}");
-                // Gap 5: ReplicationFailure trust event on network error.
-                p2p_node
-                    .report_trust_event(
-                        &source,
-                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                    )
-                    .await;
-                let mut q = queues.write().await;
-                if q.retry_fetch(&candidate.key).is_none() {
-                    q.complete_fetch(&candidate.key);
-                }
+            // Non-success response: emit trust failure.
+            p2p_node
+                .report_trust_event(
+                    &source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+            FetchOutcome {
+                key,
+                result: FetchResult::SourceFailed,
+            }
+        }
+        Err(e) => {
+            debug!("Fetch request to {source} failed: {e}");
+            p2p_node
+                .report_trust_event(
+                    &source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+            FetchOutcome {
+                key,
+                result: FetchResult::SourceFailed,
             }
         }
     }

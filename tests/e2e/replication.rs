@@ -736,8 +736,7 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
 #[tokio::test]
 #[serial]
 async fn scenario_9_fetch_retry_uses_alternate_source() {
-    let max_concurrent = 10;
-    let mut queues = ReplicationQueues::new(max_concurrent);
+    let mut queues = ReplicationQueues::new();
     let key = [0x09; 32];
     let distance = [0x01; 32];
     let source_a = PeerId::from_bytes([0xA0; 32]);
@@ -768,8 +767,7 @@ async fn scenario_9_fetch_retry_uses_alternate_source() {
 #[tokio::test]
 #[serial]
 async fn scenario_10_fetch_retry_exhaustion() {
-    let max_concurrent = 10;
-    let mut queues = ReplicationQueues::new(max_concurrent);
+    let mut queues = ReplicationQueues::new();
     let key = [0x10; 32];
     let distance = [0x01; 32];
     let source = PeerId::from_bytes([0xC0; 32]);

@@ -209,7 +209,7 @@ mod tests {
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
         }));
-        let queues = ReplicationQueues::new(10);
+        let queues = ReplicationQueues::new();
 
         assert!(
             check_bootstrap_drained(&state, &queues).await,
@@ -224,7 +224,7 @@ mod tests {
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
         }));
-        let queues = ReplicationQueues::new(10);
+        let queues = ReplicationQueues::new();
 
         assert!(
             !check_bootstrap_drained(&state, &queues).await,
@@ -239,7 +239,7 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
         }));
-        let queues = ReplicationQueues::new(10);
+        let queues = ReplicationQueues::new();
 
         // Key 0x01 is not in any queue, so bootstrap should drain.
         assert!(check_bootstrap_drained(&state, &queues).await);
@@ -253,7 +253,7 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
         }));
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
 
         // Put the bootstrap key into the pending-verify queue.
         let entry = VerificationEntry {

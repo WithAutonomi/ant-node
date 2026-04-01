@@ -51,26 +51,24 @@ pub struct ReplicationQueues {
     fetch_queue_keys: HashSet<XorName>,
     /// Active downloads keyed by `XorName`.
     in_flight_fetch: HashMap<XorName, InFlightEntry>,
-    /// Maximum concurrent fetches (adjustable between bootstrap and normal).
-    max_concurrent_fetch: usize,
+}
+
+impl Default for ReplicationQueues {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReplicationQueues {
-    /// Create new empty queues with the given fetch concurrency limit.
+    /// Create new empty queues.
     #[must_use]
-    pub fn new(max_concurrent_fetch: usize) -> Self {
+    pub fn new() -> Self {
         Self {
             pending_verify: HashMap::new(),
             fetch_queue: BinaryHeap::new(),
             fetch_queue_keys: HashSet::new(),
             in_flight_fetch: HashMap::new(),
-            max_concurrent_fetch,
         }
-    }
-
-    /// Update the fetch concurrency limit (e.g. after bootstrap drains).
-    pub fn set_max_concurrent_fetch(&mut self, max: usize) {
-        self.max_concurrent_fetch = max;
     }
 
     // -----------------------------------------------------------------------
@@ -136,14 +134,12 @@ impl ReplicationQueues {
         });
     }
 
-    /// Dequeue the nearest fetch candidate if there is capacity.
+    /// Dequeue the nearest fetch candidate.
     ///
-    /// Returns `None` when the concurrency limit is reached or the queue is
-    /// empty. Silently skips candidates that are somehow already in-flight.
+    /// Returns `None` when the queue is empty.  Silently skips candidates
+    /// that are somehow already in-flight.  Concurrency is enforced by the
+    /// fetch worker, not by this method.
     pub fn dequeue_fetch(&mut self) -> Option<FetchCandidate> {
-        if self.in_flight_fetch.len() >= self.max_concurrent_fetch {
-            return None;
-        }
         while let Some(candidate) = self.fetch_queue.pop() {
             self.fetch_queue_keys.remove(&candidate.key);
             if !self.in_flight_fetch.contains_key(&candidate.key) {
@@ -287,7 +283,7 @@ mod tests {
 
     #[test]
     fn add_pending_verify_new_key_succeeds() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         assert!(queues.add_pending_verify(key, test_entry(1)));
         assert_eq!(queues.pending_count(), 1);
@@ -295,7 +291,7 @@ mod tests {
 
     #[test]
     fn add_pending_verify_duplicate_rejected() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         assert!(queues.add_pending_verify(key, test_entry(1)));
         assert!(!queues.add_pending_verify(key, test_entry(2)));
@@ -304,7 +300,7 @@ mod tests {
 
     #[test]
     fn add_pending_verify_rejected_if_in_fetch_queue() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x02);
         let distance = xor_name_from_byte(0x10);
         queues.enqueue_fetch(key, distance, vec![peer_id_from_byte(1)]);
@@ -317,7 +313,7 @@ mod tests {
 
     #[test]
     fn add_pending_verify_rejected_if_in_flight() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x03);
         let source = peer_id_from_byte(1);
         queues.start_fetch(key, source, vec![source]);
@@ -332,7 +328,7 @@ mod tests {
 
     #[test]
     fn dequeue_returns_nearest_first() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
 
         let near_key = xor_name_from_byte(0x01);
         let far_key = xor_name_from_byte(0x02);
@@ -350,27 +346,8 @@ mod tests {
     }
 
     #[test]
-    fn dequeue_respects_concurrency_limit() {
-        let concurrency_limit = 1;
-        let mut queues = ReplicationQueues::new(concurrency_limit);
-
-        let key_a = xor_name_from_byte(0x01);
-        let key_b = xor_name_from_byte(0x02);
-        queues.enqueue_fetch(key_a, [0x10; 32], vec![peer_id_from_byte(1)]);
-        queues.enqueue_fetch(key_b, [0x20; 32], vec![peer_id_from_byte(2)]);
-
-        // Start one fetch to fill the limit.
-        queues.start_fetch(xor_name_from_byte(0xFF), peer_id_from_byte(3), vec![]);
-
-        assert!(
-            queues.dequeue_fetch().is_none(),
-            "should not dequeue when at concurrency limit"
-        );
-    }
-
-    #[test]
     fn enqueue_dedup_prevents_duplicates() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
 
         queues.enqueue_fetch(key, [0x10; 32], vec![peer_id_from_byte(1)]);
@@ -387,7 +364,7 @@ mod tests {
 
     #[test]
     fn start_and_complete_fetch() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         let source = peer_id_from_byte(1);
 
@@ -401,7 +378,7 @@ mod tests {
 
     #[test]
     fn complete_nonexistent_returns_none() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x99);
         assert!(queues.complete_fetch(&key).is_none());
     }
@@ -410,7 +387,7 @@ mod tests {
 
     #[test]
     fn retry_fetch_returns_next_untried_source() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         let source_a = peer_id_from_byte(1);
         let source_b = peer_id_from_byte(2);
@@ -433,7 +410,7 @@ mod tests {
 
     #[test]
     fn retry_fetch_nonexistent_returns_none() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         assert!(queues.retry_fetch(&xor_name_from_byte(0xFF)).is_none());
     }
 
@@ -441,7 +418,7 @@ mod tests {
 
     #[test]
     fn contains_key_in_pending() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
         assert!(queues.contains_key(&key));
@@ -449,7 +426,7 @@ mod tests {
 
     #[test]
     fn contains_key_in_fetch_queue() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x02);
         queues.enqueue_fetch(key, [0x10; 32], vec![peer_id_from_byte(1)]);
         assert!(queues.contains_key(&key));
@@ -457,7 +434,7 @@ mod tests {
 
     #[test]
     fn contains_key_in_flight() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x03);
         queues.start_fetch(key, peer_id_from_byte(1), vec![]);
         assert!(queues.contains_key(&key));
@@ -465,7 +442,7 @@ mod tests {
 
     #[test]
     fn contains_key_absent() {
-        let queues = ReplicationQueues::new(10);
+        let queues = ReplicationQueues::new();
         assert!(!queues.contains_key(&xor_name_from_byte(0xFF)));
     }
 
@@ -473,7 +450,7 @@ mod tests {
 
     #[test]
     fn bootstrap_work_empty_when_no_keys_present() {
-        let queues = ReplicationQueues::new(10);
+        let queues = ReplicationQueues::new();
         let bootstrap_keys: HashSet<XorName> = [xor_name_from_byte(0x01), xor_name_from_byte(0x02)]
             .into_iter()
             .collect();
@@ -482,7 +459,7 @@ mod tests {
 
     #[test]
     fn bootstrap_work_not_empty_when_key_in_pending() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
 
@@ -494,7 +471,7 @@ mod tests {
 
     #[test]
     fn evict_stale_removes_old_entries() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
 
         // Create entry with a backdated timestamp. Use a small subtraction
@@ -516,7 +493,7 @@ mod tests {
 
     #[test]
     fn evict_stale_keeps_fresh_entries() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
 
@@ -532,7 +509,7 @@ mod tests {
 
     #[test]
     fn remove_pending_returns_entry() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
 
@@ -543,28 +520,8 @@ mod tests {
 
     #[test]
     fn remove_pending_nonexistent_returns_none() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         assert!(queues.remove_pending(&xor_name_from_byte(0xFF)).is_none());
-    }
-
-    // -- set_max_concurrent_fetch -----------------------------------------
-
-    #[test]
-    fn set_max_concurrent_fetch_allows_more_dequeues() {
-        let mut queues = ReplicationQueues::new(0); // no fetches allowed
-        let key = xor_name_from_byte(0x01);
-        queues.enqueue_fetch(key, [0x10; 32], vec![peer_id_from_byte(1)]);
-
-        assert!(
-            queues.dequeue_fetch().is_none(),
-            "should not dequeue at limit 0"
-        );
-
-        queues.set_max_concurrent_fetch(1);
-        assert!(
-            queues.dequeue_fetch().is_some(),
-            "should dequeue after increasing limit"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -576,7 +533,7 @@ mod tests {
     /// re-added to `PendingVerify`.
     #[test]
     fn scenario_8_duplicate_key_not_double_queued() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0xE0);
         let distance = xor_name_from_byte(0x10);
 
@@ -641,7 +598,7 @@ mod tests {
     /// because cross-set precedence in admission gives replica priority.
     #[test]
     fn scenario_8_replica_and_paid_hint_collapses_to_replica() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0xE1);
 
         // Simulate admission result: key was in both replica_hints and
@@ -697,7 +654,7 @@ mod tests {
     ///   `PendingVerify` → (quorum pass) → `QueuedForFetch` → `Fetching` → `Stored`
     #[test]
     fn scenario_3_neighbor_sync_quorum_pass_full_pipeline() {
-        let mut queues = ReplicationQueues::new(10);
+        let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x03);
         let distance = xor_name_from_byte(0x01);
         let source_a = peer_id_from_byte(1);
