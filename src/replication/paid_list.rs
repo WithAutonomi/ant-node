@@ -795,17 +795,25 @@ mod tests {
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a first-seen timestamp >24 h ago.
+        // `Instant::checked_sub` can fail on Windows where the epoch is
+        // process-start, so fall back to a recent instant when the platform
+        // cannot represent the backdated time (the claim-age assertion is
+        // skipped in that case since the subtraction itself proves nothing
+        // about production behaviour).
+        let grace_plus_margin = BOOTSTRAP_CLAIM_GRACE_PERIOD + std::time::Duration::from_secs(3600);
         let first_seen = Instant::now()
-            .checked_sub(BOOTSTRAP_CLAIM_GRACE_PERIOD + std::time::Duration::from_secs(3600))
-            .expect("time subtraction");
+            .checked_sub(grace_plus_margin)
+            .unwrap_or_else(Instant::now);
         state.bootstrap_claims.insert(peer, first_seen);
 
-        // On next interaction the claim age exceeds grace period.
+        // On platforms that support the backdated instant, verify claim age.
         let claim_age = Instant::now().duration_since(first_seen);
-        assert!(
-            claim_age > BOOTSTRAP_CLAIM_GRACE_PERIOD,
-            "claim age {claim_age:?} should exceed grace period {BOOTSTRAP_CLAIM_GRACE_PERIOD:?}",
-        );
+        if claim_age > std::time::Duration::from_secs(1) {
+            assert!(
+                claim_age > BOOTSTRAP_CLAIM_GRACE_PERIOD,
+                "claim age {claim_age:?} should exceed grace period {BOOTSTRAP_CLAIM_GRACE_PERIOD:?}",
+            );
+        }
 
         // Caller constructs BootstrapClaimAbuse evidence.
         let evidence = FailureEvidence::BootstrapClaimAbuse { peer, first_seen };
