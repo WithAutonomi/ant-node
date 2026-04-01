@@ -168,7 +168,11 @@ impl ReplicationEngine {
     }
 
     /// Start all background tasks.
-    pub fn start(&mut self) {
+    ///
+    /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
+    /// the `BootstrapComplete` event emitted during DHT bootstrap is not
+    /// missed by the bootstrap-sync gate.
+    pub fn start(&mut self, dht_events: tokio::sync::broadcast::Receiver<DhtNetworkEvent>) {
         info!("Starting replication engine");
 
         self.start_message_handler();
@@ -177,7 +181,7 @@ impl ReplicationEngine {
         self.start_audit_loop();
         self.start_fetch_worker();
         self.start_verification_worker();
-        self.start_bootstrap_sync();
+        self.start_bootstrap_sync(dht_events);
 
         info!(
             "Replication engine started with {} background tasks",
@@ -495,10 +499,19 @@ impl ReplicationEngine {
 
     /// Gap 3: Run a one-shot bootstrap sync on startup.
     ///
-    /// Finds close neighbors, syncs with each in round-robin batches,
-    /// admits returned hints into the verification pipeline, and tracks
-    /// discovered keys for bootstrap drain detection.
-    fn start_bootstrap_sync(&mut self) {
+    /// Waits for saorsa-core to emit `DhtNetworkEvent::BootstrapComplete`
+    /// (indicating the routing table is populated) before snapshotting
+    /// close neighbors. Falls back after a timeout so bootstrap nodes
+    /// (which have no peers and therefore never receive the event) still
+    /// proceed.
+    ///
+    /// After the gate, finds close neighbors, syncs with each in
+    /// round-robin batches, admits returned hints into the verification
+    /// pipeline, and tracks discovered keys for bootstrap drain detection.
+    fn start_bootstrap_sync(
+        &mut self,
+        dht_events: tokio::sync::broadcast::Receiver<DhtNetworkEvent>,
+    ) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
         let paid_list = Arc::clone(&self.paid_list);
@@ -509,6 +522,20 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
 
         let handle = tokio::spawn(async move {
+            // Wait for DHT bootstrap to complete before snapshotting
+            // neighbors. The routing table is empty until saorsa-core
+            // finishes its FIND_NODE rounds and bucket refreshes.
+            let gate = bootstrap::wait_for_bootstrap_complete(
+                dht_events,
+                config.bootstrap_complete_timeout_secs,
+                &shutdown,
+            )
+            .await;
+
+            if gate == bootstrap::BootstrapGateResult::Shutdown {
+                return;
+            }
+
             let self_id = *p2p.peer_id();
             let neighbors =
                 bootstrap::snapshot_close_neighbors(&p2p, &self_id, config.neighbor_sync_scope)

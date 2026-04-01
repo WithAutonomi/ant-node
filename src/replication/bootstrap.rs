@@ -5,16 +5,89 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
 use saorsa_core::identity::PeerId;
-use saorsa_core::{DHTNode, P2PNode};
+use saorsa_core::{DHTNode, DhtNetworkEvent, P2PNode};
 
 use crate::ant_protocol::XorName;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::BootstrapState;
+
+// ---------------------------------------------------------------------------
+// DHT bootstrap gate
+// ---------------------------------------------------------------------------
+
+/// Outcome of waiting for the `DhtNetworkEvent::BootstrapComplete` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapGateResult {
+    /// The event was received — routing table is populated.
+    Received,
+    /// Timed out or channel error — proceed anyway (bootstrap node scenario).
+    TimedOut,
+    /// Shutdown was requested while waiting.
+    Shutdown,
+}
+
+/// Wait for saorsa-core's `DhtNetworkEvent::BootstrapComplete` before
+/// returning.
+///
+/// The caller must supply a pre-subscribed `dht_events` receiver. This is
+/// critical: the subscription must be created **before**
+/// `P2PNode::start()` so the `BootstrapComplete` event is not missed.
+///
+/// Returns [`BootstrapGateResult::Received`] on success,
+/// [`BootstrapGateResult::TimedOut`] if the timeout elapses (e.g. a
+/// bootstrap node with no peers), or [`BootstrapGateResult::Shutdown`] if
+/// cancellation is signalled.
+pub async fn wait_for_bootstrap_complete(
+    mut dht_events: tokio::sync::broadcast::Receiver<DhtNetworkEvent>,
+    timeout_secs: u64,
+    shutdown: &CancellationToken,
+) -> BootstrapGateResult {
+    let timeout = Duration::from_secs(timeout_secs);
+
+    let result = tokio::select! {
+        () = shutdown.cancelled() => {
+            debug!("Bootstrap sync: shutdown during BootstrapComplete wait");
+            BootstrapGateResult::Shutdown
+        }
+        () = tokio::time::sleep(timeout) => {
+            warn!(
+                "Bootstrap sync: timed out after {timeout_secs}s waiting for \
+                 BootstrapComplete — proceeding (likely a bootstrap node with no peers)",
+            );
+            BootstrapGateResult::TimedOut
+        }
+        gate = async {
+            loop {
+                match dht_events.recv().await {
+                    Ok(DhtNetworkEvent::BootstrapComplete { num_peers }) => {
+                        info!(
+                            "Bootstrap sync: DHT bootstrap complete \
+                             with {num_peers} peers in routing table"
+                        );
+                        break BootstrapGateResult::Received;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            "Bootstrap sync: DHT event channel error: {e}, \
+                             proceeding without gate"
+                        );
+                        break BootstrapGateResult::TimedOut;
+                    }
+                }
+            }
+        } => gate,
+    };
+    drop(dht_events);
+    result
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap sync

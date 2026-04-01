@@ -498,6 +498,14 @@ impl RunningNode {
     pub async fn run(&mut self) -> Result<()> {
         info!("Node runtime loop starting");
 
+        // Subscribe to DHT events BEFORE starting the P2P node so the
+        // bootstrap-sync task does not miss the BootstrapComplete event
+        // emitted during P2PNode::start().
+        let dht_events_for_bootstrap = self
+            .replication_engine
+            .as_ref()
+            .map(|_| self.p2p_node.dht_manager().subscribe_events());
+
         // Start the P2P node
         self.p2p_node
             .start()
@@ -527,7 +535,11 @@ impl RunningNode {
 
         // Start replication engine background tasks
         if let Some(ref mut engine) = self.replication_engine {
-            engine.start();
+            // Safety: dht_events_for_bootstrap is Some when replication_engine
+            // is Some (both arms use the same condition).
+            if let Some(dht_events) = dht_events_for_bootstrap {
+                engine.start(dht_events);
+            }
             info!("Replication engine started");
         }
 

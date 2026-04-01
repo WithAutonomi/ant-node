@@ -129,6 +129,10 @@ pub const FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(FETCH_REQUEST_TI
 /// Maximum consumer trust event weight (clamped by `TrustEngine`).
 pub const MAX_CONSUMER_TRUST_WEIGHT: f64 = 5.0;
 
+/// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
+/// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
+const BOOTSTRAP_COMPLETE_TIMEOUT_SECS: u64 = 60;
+
 // ---------------------------------------------------------------------------
 // Runtime-configurable wrapper
 // ---------------------------------------------------------------------------
@@ -176,6 +180,9 @@ pub struct ReplicationConfig {
     pub verification_request_timeout: Duration,
     /// Fetch request timeout.
     pub fetch_request_timeout: Duration,
+    /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before
+    /// proceeding with bootstrap sync (covers bootstrap nodes with no peers).
+    pub bootstrap_complete_timeout_secs: u64,
 }
 
 impl Default for ReplicationConfig {
@@ -200,6 +207,7 @@ impl Default for ReplicationConfig {
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
             fetch_request_timeout: FETCH_REQUEST_TIMEOUT,
+            bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
         }
     }
 }
