@@ -1308,4 +1308,84 @@ mod tests {
             other => panic!("expected QuorumVerified, got {other:?}"),
         }
     }
+
+    /// Scenario 20: Unknown replica key found in local `PaidForList` bypasses
+    /// presence quorum.
+    ///
+    /// When a key's paid-list evidence shows confirmation from enough peers,
+    /// `PaidListVerified` is returned even without a single presence-positive
+    /// response.  This models the local-hit fast-path: the caller already
+    /// checked the local paid list and the network confirms majority — no
+    /// presence quorum needed.
+    #[test]
+    fn scenario_20_paid_list_local_hit_bypasses_presence_quorum() {
+        let key = xor_name_from_byte(0xE0);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, quorum_needed = 4.
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 5 paid peers, confirm_needed = floor(5/2)+1 = 3.
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // ALL quorum peers Absent (presence quorum impossible) but 3/5 paid
+        // peers confirm → PaidListVerified.
+        let evidence = build_evidence(
+            quorum_peers
+                .iter()
+                .map(|p| (*p, PresenceEvidence::Absent))
+                .collect(),
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::Confirmed),
+                (paid_peers[3], PaidListEvidence::NotFound),
+                (paid_peers[4], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "paid-list majority should bypass failed presence quorum, got {outcome:?}"
+        );
+    }
+
+    /// Scenario 22: Paid-list confirmation below threshold AND presence quorum
+    /// fails → `QuorumFailed`.
+    ///
+    /// Neither path can succeed: presence peers are all Absent (can't reach
+    /// `quorum_needed`) and paid confirmations are below `confirm_needed`.
+    #[test]
+    fn scenario_22_paid_list_rejection_below_threshold() {
+        let key = xor_name_from_byte(0xE2);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, quorum_needed = 4.
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 5 paid peers, confirm_needed = 3.
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // All quorum peers Absent; only 2/5 paid confirmations (below 3).
+        let evidence = build_evidence(
+            quorum_peers
+                .iter()
+                .map(|p| (*p, PresenceEvidence::Absent))
+                .collect(),
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::NotFound),
+                (paid_peers[3], PaidListEvidence::NotFound),
+                (paid_peers[4], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "below-threshold paid confirmations with all-Absent quorum should yield QuorumFailed, got {outcome:?}"
+        );
+    }
 }

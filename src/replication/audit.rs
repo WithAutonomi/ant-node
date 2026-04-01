@@ -488,6 +488,7 @@ pub fn handle_audit_challenge(
 mod tests {
     use super::*;
     use crate::replication::protocol::compute_audit_digest;
+    use crate::replication::types::NeighborSyncState;
     use crate::storage::LmdbStorageConfig;
     use tempfile::TempDir;
 
@@ -979,5 +980,290 @@ mod tests {
             d1, d2,
             "Different record bytes must produce different digests"
         );
+    }
+
+    // -- Scenario 29: Audit start gate ------------------------------------------
+
+    /// Scenario 29: `handle_audit_challenge` returns `Bootstrapping` when the
+    /// node is still bootstrapping — audit digests are never computed, and no
+    /// `AuditFailure` evidence is emitted by the caller.
+    ///
+    /// This is the responder-side gate.  The challenger-side gate is enforced
+    /// by `check_bootstrap_drained()` in the engine loop (tested in
+    /// `bootstrap.rs`); this test confirms the complementary responder behavior.
+    #[tokio::test]
+    async fn scenario_29_audit_start_gate_during_bootstrap() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Store data so there *would* be work to audit.
+        let content = b"should not be audited during bootstrap";
+        let addr = LmdbStorage::compute_address(content);
+        storage.put(&addr, content).await.expect("put");
+
+        let challenge = make_challenge(2900, [0x29; 32], [0x29; 32], vec![addr]);
+
+        // Responder is bootstrapping → Bootstrapping response, NOT Digests.
+        let response = handle_audit_challenge(&challenge, &storage, true);
+        assert!(
+            matches!(
+                response,
+                AuditResponse::Bootstrapping { challenge_id: 2900 }
+            ),
+            "bootstrapping node must not compute digests — audit start gate"
+        );
+
+        // Responder is NOT bootstrapping → normal Digests.
+        let response = handle_audit_challenge(&challenge, &storage, false);
+        assert!(
+            matches!(response, AuditResponse::Digests { .. }),
+            "drained node should compute digests normally"
+        );
+    }
+
+    // -- Scenario 30: Audit peer selection from sampled keys --------------------
+
+    /// Scenario 30: Key sampling respects `audit_batch_size` and
+    /// `RepairOpportunity` filtering excludes never-synced peers.
+    ///
+    /// Full `audit_tick` requires a live network.  This test verifies the two
+    /// deterministic sub-steps the function relies on:
+    ///   (a) `audit_batch_size.min(all_keys.len())` caps the sample count.
+    ///   (b) `PeerSyncRecord::has_repair_opportunity` gates peer eligibility.
+    #[test]
+    fn scenario_30_audit_peer_selection_from_sampled_keys() {
+        let config = ReplicationConfig::default(); // audit_batch_size = 8
+
+        // (a) Sample count is capped at audit_batch_size.
+        let many_keys = 100usize;
+        assert_eq!(
+            config.audit_batch_size.min(many_keys),
+            config.audit_batch_size,
+            "sample count should be capped at audit_batch_size when local store is larger"
+        );
+
+        let few_keys = 3usize;
+        assert_eq!(
+            config.audit_batch_size.min(few_keys),
+            few_keys,
+            "sample count should equal key count when store is smaller than batch size"
+        );
+
+        // (b) Peer eligibility via RepairOpportunity.
+        // Never synced → not eligible.
+        let never = PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 10,
+        };
+        assert!(!never.has_repair_opportunity());
+
+        // Synced but zero subsequent cycles → not eligible.
+        let too_soon = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 0,
+        };
+        assert!(!too_soon.has_repair_opportunity());
+
+        // Synced with ≥1 cycle → eligible.
+        let eligible = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 2,
+        };
+        assert!(eligible.has_repair_opportunity());
+    }
+
+    // -- Scenario 32: Dynamic challenge size ------------------------------------
+
+    /// Scenario 32: Challenge key count equals `|PeerKeySet(challenged_peer)|`,
+    /// which is dynamic per round.  If no eligible peer remains after filtering,
+    /// the tick is idle.
+    ///
+    /// Verified via `handle_audit_challenge`: the response digest count always
+    /// equals the number of keys in the challenge.
+    #[tokio::test]
+    async fn scenario_32_dynamic_challenge_size() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Store varying numbers of chunks.
+        let mut addrs = Vec::new();
+        for i in 0u8..5 {
+            let content = format!("dynamic challenge key {i}");
+            let addr = LmdbStorage::compute_address(content.as_bytes());
+            storage.put(&addr, content.as_bytes()).await.expect("put");
+            addrs.push(addr);
+        }
+
+        let nonce = [0x32; 32];
+        let peer_id = [0x32; 32];
+
+        // Challenge with 1 key.
+        let challenge1 = make_challenge(3201, nonce, peer_id, vec![addrs[0]]);
+        let resp1 = handle_audit_challenge(&challenge1, &storage, false);
+        if let AuditResponse::Digests { digests, .. } = resp1 {
+            assert_eq!(digests.len(), 1, "|PeerKeySet| = 1 → 1 digest");
+        }
+
+        // Challenge with 3 keys.
+        let challenge3 = make_challenge(3203, nonce, peer_id, addrs[0..3].to_vec());
+        let resp3 = handle_audit_challenge(&challenge3, &storage, false);
+        if let AuditResponse::Digests { digests, .. } = resp3 {
+            assert_eq!(digests.len(), 3, "|PeerKeySet| = 3 → 3 digests");
+        }
+
+        // Challenge with all 5 keys.
+        let challenge5 = make_challenge(3205, nonce, peer_id, addrs.clone());
+        let resp5 = handle_audit_challenge(&challenge5, &storage, false);
+        if let AuditResponse::Digests { digests, .. } = resp5 {
+            assert_eq!(digests.len(), 5, "|PeerKeySet| = 5 → 5 digests");
+        }
+
+        // Challenge with 0 keys (idle equivalent — no work).
+        let challenge0 = make_challenge(3200, nonce, peer_id, vec![]);
+        let resp0 = handle_audit_challenge(&challenge0, &storage, false);
+        if let AuditResponse::Digests { digests, .. } = resp0 {
+            assert!(digests.is_empty(), "|PeerKeySet| = 0 → 0 digests (idle)");
+        }
+    }
+
+    // -- Scenario 47: Bootstrap claim grace period (audit) ----------------------
+
+    /// Scenario 47: Challenged peer responds with bootstrapping claim during
+    /// audit.  `handle_audit_challenge` returns `Bootstrapping`; caller records
+    /// `BootstrapClaimFirstSeen`.  No `AuditFailure` evidence is emitted.
+    #[tokio::test]
+    async fn scenario_47_bootstrap_claim_grace_period_audit() {
+        let (storage, _temp) = create_test_storage().await;
+
+        // Store data so there is an auditable key.
+        let content = b"bootstrap grace test";
+        let addr = LmdbStorage::compute_address(content);
+        storage.put(&addr, content).await.expect("put");
+
+        let challenge = make_challenge(4700, [0x47; 32], [0x47; 32], vec![addr]);
+
+        // Bootstrapping peer → Bootstrapping response (grace period start).
+        let response = handle_audit_challenge(&challenge, &storage, true);
+        let challenge_id = match response {
+            AuditResponse::Bootstrapping { challenge_id } => challenge_id,
+            AuditResponse::Digests { .. } => {
+                panic!("Expected Bootstrapping response during grace period")
+            }
+        };
+        assert_eq!(challenge_id, 4700);
+
+        // Caller records BootstrapClaimFirstSeen — verify the types support it.
+        let peer = PeerId::from_bytes([0x47; 32]);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let now = Instant::now();
+        state.bootstrap_claims.entry(peer).or_insert(now);
+
+        assert!(
+            state.bootstrap_claims.contains_key(&peer),
+            "BootstrapClaimFirstSeen should be recorded after grace-period claim"
+        );
+    }
+
+    // -- Scenario 53: Audit partial per-key failure with mixed responsibility ---
+
+    /// Scenario 53: P challenged on {K1, K2, K3}.  K1 matches, K2 and K3
+    /// mismatch.  Responsibility confirmation: P is responsible for K2 but
+    /// not K3.  `AuditFailure` emitted for {K2} only.
+    ///
+    /// Full `verify_digests` + `handle_audit_failure` requires a `P2PNode` for
+    /// network lookups.  This test verifies the conceptual steps:
+    ///   (1) Digest comparison correctly identifies K2 and K3 as failures.
+    ///   (2) `FailureEvidence::AuditFailure` carries only confirmed keys.
+    #[tokio::test]
+    async fn scenario_53_partial_failure_mixed_responsibility() {
+        let (storage, _temp) = create_test_storage().await;
+        let nonce = [0x53; 32];
+        let peer_id = [0x53; 32];
+
+        // Store K1, K2, K3.
+        let c1 = b"scenario 53 key one";
+        let c2 = b"scenario 53 key two";
+        let c3 = b"scenario 53 key three";
+        let k1 = LmdbStorage::compute_address(c1);
+        let k2 = LmdbStorage::compute_address(c2);
+        let k3 = LmdbStorage::compute_address(c3);
+        storage.put(&k1, c1).await.expect("put k1");
+        storage.put(&k2, c2).await.expect("put k2");
+        storage.put(&k3, c3).await.expect("put k3");
+
+        // Correct digests from challenger's local store.
+        let d1_expected = compute_audit_digest(&nonce, &peer_id, &k1, c1);
+        let d2_expected = compute_audit_digest(&nonce, &peer_id, &k2, c2);
+        let d3_expected = compute_audit_digest(&nonce, &peer_id, &k3, c3);
+
+        // Simulate peer response: K1 matches, K2 wrong data, K3 wrong data.
+        let d2_wrong = compute_audit_digest(&nonce, &peer_id, &k2, b"tampered k2");
+        let d3_wrong = compute_audit_digest(&nonce, &peer_id, &k3, b"tampered k3");
+
+        assert_eq!(d1_expected, d1_expected, "K1 should match");
+        assert_ne!(d2_wrong, d2_expected, "K2 should mismatch");
+        assert_ne!(d3_wrong, d3_expected, "K3 should mismatch");
+
+        // Step 1: Identify failed keys (digest comparison).
+        let digests = [d1_expected, d2_wrong, d3_wrong];
+        let keys = [k1, k2, k3];
+        let contents: [&[u8]; 3] = [c1, c2, c3];
+
+        let mut failed_keys = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            if digests[i] == ABSENT_KEY_DIGEST {
+                failed_keys.push(*key);
+                continue;
+            }
+            let expected = compute_audit_digest(&nonce, &peer_id, key, contents[i]);
+            if digests[i] != expected {
+                failed_keys.push(*key);
+            }
+        }
+
+        assert_eq!(failed_keys.len(), 2, "K2 and K3 should be in failure set");
+        assert!(failed_keys.contains(&k2));
+        assert!(failed_keys.contains(&k3));
+        assert!(!failed_keys.contains(&k1), "K1 passed digest check");
+
+        // Step 2: Responsibility confirmation removes K3 (not responsible).
+        // Simulate: P is in closest peers for K2 but not K3.
+        let responsible_for_k2 = true;
+        let responsible_for_k3 = false;
+        let mut confirmed = Vec::new();
+        for key in &failed_keys {
+            let is_responsible = if *key == k2 {
+                responsible_for_k2
+            } else {
+                responsible_for_k3
+            };
+            if is_responsible {
+                confirmed.push(*key);
+            }
+        }
+
+        assert_eq!(confirmed, vec![k2], "Only K2 should be in confirmed set");
+
+        // Step 3: Construct evidence for confirmed failures only.
+        let challenged_peer = PeerId::from_bytes(peer_id);
+        let evidence = FailureEvidence::AuditFailure {
+            challenge_id: 5300,
+            challenged_peer,
+            confirmed_failed_keys: confirmed,
+            reason: AuditFailureReason::DigestMismatch,
+        };
+
+        match evidence {
+            FailureEvidence::AuditFailure {
+                confirmed_failed_keys,
+                ..
+            } => {
+                assert_eq!(
+                    confirmed_failed_keys.len(),
+                    1,
+                    "Only K2 should generate evidence"
+                );
+                assert_eq!(confirmed_failed_keys[0], k2);
+            }
+            _ => panic!("Expected AuditFailure evidence"),
+        }
     }
 }

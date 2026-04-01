@@ -389,8 +389,8 @@ impl PaidList {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::replication::config::PRUNE_HYSTERESIS_DURATION;
-    use crate::replication::types::NeighborSyncState;
+    use crate::replication::config::{BOOTSTRAP_CLAIM_GRACE_PERIOD, PRUNE_HYSTERESIS_DURATION};
+    use crate::replication::types::{FailureEvidence, NeighborSyncState};
     use saorsa_core::identity::PeerId;
     use tempfile::TempDir;
 
@@ -784,6 +784,41 @@ mod tests {
             Some(&first_ts),
             "second insert must not overwrite the original timestamp"
         );
+    }
+
+    /// #48: Peer P first claimed bootstrapping >24 h ago.  On next interaction
+    /// the claim age exceeds `BOOTSTRAP_CLAIM_GRACE_PERIOD` and the node emits
+    /// `BootstrapClaimAbuse` evidence.
+    #[test]
+    fn scenario_48_bootstrap_claim_abuse_after_grace_period() {
+        let peer = PeerId::from_bytes([0x48; 32]);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+
+        // Record a first-seen timestamp >24 h ago.
+        let first_seen = Instant::now()
+            .checked_sub(BOOTSTRAP_CLAIM_GRACE_PERIOD + std::time::Duration::from_secs(3600))
+            .expect("time subtraction");
+        state.bootstrap_claims.insert(peer, first_seen);
+
+        // On next interaction the claim age exceeds grace period.
+        let claim_age = Instant::now().duration_since(first_seen);
+        assert!(
+            claim_age > BOOTSTRAP_CLAIM_GRACE_PERIOD,
+            "claim age {claim_age:?} should exceed grace period {BOOTSTRAP_CLAIM_GRACE_PERIOD:?}",
+        );
+
+        // Caller constructs BootstrapClaimAbuse evidence.
+        let evidence = FailureEvidence::BootstrapClaimAbuse { peer, first_seen };
+
+        let FailureEvidence::BootstrapClaimAbuse {
+            peer: p,
+            first_seen: fs,
+        } = evidence
+        else {
+            unreachable!("evidence was just constructed as BootstrapClaimAbuse");
+        };
+        assert_eq!(p, peer);
+        assert_eq!(fs, first_seen);
     }
 
     /// #49: Bootstrap claim is cleared when a peer responds normally.

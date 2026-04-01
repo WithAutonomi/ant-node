@@ -564,4 +564,46 @@ mod tests {
             "0 peers yields floor(0/2)+1 = 1 (degenerate case)"
         );
     }
+
+    /// Scenario 31: Consecutive audit ticks occur on randomized intervals
+    /// bounded by the configured `[audit_tick_interval_min, audit_tick_interval_max]`
+    /// window.
+    #[test]
+    fn scenario_31_audit_cadence_within_jitter_bounds() {
+        let config = ReplicationConfig {
+            audit_tick_interval_min: Duration::from_secs(1800),
+            audit_tick_interval_max: Duration::from_secs(3600),
+            ..ReplicationConfig::default()
+        };
+
+        // Sample many intervals and verify each is within bounds.
+        let iterations = 100;
+        let mut saw_different = false;
+        let mut prev = Duration::ZERO;
+
+        for _ in 0..iterations {
+            let interval = config.random_audit_tick_interval();
+            assert!(
+                interval >= config.audit_tick_interval_min,
+                "interval {interval:?} below min {:?}",
+                config.audit_tick_interval_min,
+            );
+            assert!(
+                interval <= config.audit_tick_interval_max,
+                "interval {interval:?} above max {:?}",
+                config.audit_tick_interval_max,
+            );
+            if interval != prev && prev != Duration::ZERO {
+                saw_different = true;
+            }
+            prev = interval;
+        }
+
+        // With 100 samples from a 30-minute range, at least two should differ
+        // (probabilistically near-certain).
+        assert!(
+            saw_different,
+            "audit intervals should exhibit randomized jitter across samples"
+        );
+    }
 }
