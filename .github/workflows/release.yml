@@ -101,7 +101,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --features test-utils
 
   build:
     name: Build ${{ matrix.target }}

@@ -48,7 +48,7 @@ jobs:
         with:
           version: nightly
       - name: Run tests
-        run: cargo test
+        run: cargo test --features test-utils
 
   doc:
     name: Documentation
