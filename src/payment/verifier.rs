@@ -10,6 +10,7 @@ use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
+use crate::payment::single_node::SingleNodePayment;
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
@@ -332,30 +333,40 @@ impl PaymentVerifier {
         // Verify on-chain payment via the contract's verifyPayment function.
         //
         // The SingleNode payment model pays only the median-priced quote (at 3x)
-        // and sends Amount::ZERO for the other 4. The contract's verifyPayment
-        // checks that each payment's amount and address match what was recorded
-        // on-chain. We submit all quotes and require at least one to be valid
-        // with a non-zero amount.
-        let payment_digest = payment.digest();
-        if payment_digest.is_empty() {
-            return Err(Error::Payment("Payment has no quotes".to_string()));
-        }
+        // and sends Amount::ZERO for the other 4. We must reconstruct the same
+        // payment amounts the client used so the contract's exact-match check
+        // (`completedPayments[hash].amount == expected`) passes.
+        //
+        // ProofOfPayment::digest() returns raw quote prices, NOT the actual paid
+        // amounts. We use SingleNodePayment::from_quotes() — the same function
+        // the client uses — to derive the correct on-chain amounts.
+        let quotes_with_prices: Vec<_> = payment
+            .peer_quotes
+            .iter()
+            .map(|(_, quote)| (quote.clone(), quote.price))
+            .collect();
+        let single_payment = SingleNodePayment::from_quotes(quotes_with_prices).map_err(|e| {
+            Error::Payment(format!(
+                "Failed to reconstruct payment for verification: {e}"
+            ))
+        })?;
 
         let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
         let vault_address = *self.config.evm.network.payment_vault_address();
         let contract =
             evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
 
-        // Build DataPayment entries for the contract's verifyPayment call
-        let data_payments: Vec<_> = payment_digest
+        // Build DataPayment entries with the actual paid amounts (3x median, 0 others)
+        let data_payments: Vec<_> = single_payment
+            .quotes
             .iter()
-            .map(|(quote_hash, amount, rewards_address)| {
-                evmlib::contract::payment_vault::interface::IPaymentVault::DataPayment {
-                    rewardsAddress: *rewards_address,
-                    amount: *amount,
-                    quoteHash: *quote_hash,
-                }
-            })
+            .map(
+                |q| evmlib::contract::payment_vault::interface::IPaymentVault::DataPayment {
+                    rewardsAddress: q.rewards_address,
+                    amount: q.amount,
+                    quoteHash: q.quote_hash,
+                },
+            )
             .collect();
 
         let results = contract
@@ -369,7 +380,7 @@ impl PaymentVerifier {
                 ))
             })?;
 
-        let total_quotes = payment_digest.len();
+        let total_quotes = single_payment.quotes.len();
         let mut valid_paid_count: usize = 0;
 
         for result in &results {
