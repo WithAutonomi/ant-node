@@ -10,9 +10,8 @@ use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
-use evmlib::contract::merkle_payment_vault;
-use evmlib::merkle_batch_payment::PoolHash;
-use evmlib::merkle_payments::OnChainPaymentInfo;
+use evmlib::contract::payment_vault;
+use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
 use evmlib::Network as EvmNetwork;
 use evmlib::ProofOfPayment;
 use evmlib::RewardsAddress;
@@ -329,74 +328,67 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        // Verify on-chain payment.
+        // Verify on-chain payment via the contract's verifyPayment function.
         //
         // The SingleNode payment model pays only the median-priced quote (at 3x)
-        // and sends Amount::ZERO for the other 4. evmlib's pay_for_quotes()
-        // filters out zero-amount payments, so only 1 quote has an on-chain
-        // record. The contract's verifyPayment() returns amountPaid=0 and
-        // isValid=false for unpaid quotes, which is expected.
-        //
-        // We use the amountPaid field to distinguish paid from unpaid results:
-        // - At least one quote must have been paid (amountPaid > 0)
-        // - ALL paid quotes must be valid (isValid=true)
-        // - Unpaid quotes (amountPaid=0) are allowed to be invalid
-        //
-        // This matches autonomi's strict verification model (all paid must be
-        // valid) while accommodating payment models that don't pay every quote.
+        // and sends Amount::ZERO for the other 4. The contract's verifyPayment
+        // checks that each payment's amount and address match what was recorded
+        // on-chain. We submit all quotes and require at least one to be valid
+        // with a non-zero amount.
         let payment_digest = payment.digest();
         if payment_digest.is_empty() {
             return Err(Error::Payment("Payment has no quotes".to_string()));
         }
 
-        let payment_verifications: Vec<_> = payment_digest
-            .into_iter()
-            .map(
-                evmlib::contract::payment_vault::interface::IPaymentVault::PaymentVerification::from,
-            )
+        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
+        let vault_address = *self.config.evm.network.payment_vault_address();
+        let contract =
+            evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
+
+        // Build DataPayment entries for the contract's verifyPayment call
+        let data_payments: Vec<_> = payment_digest
+            .iter()
+            .map(|(quote_hash, amount, rewards_address)| {
+                evmlib::contract::payment_vault::interface::IPaymentVault::DataPayment {
+                    rewardsAddress: *rewards_address,
+                    amount: *amount,
+                    quoteHash: *quote_hash,
+                }
+            })
             .collect();
 
-        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
-        let handler = evmlib::contract::payment_vault::handler::PaymentVaultHandler::new(
-            *self.config.evm.network.data_payments_address(),
-            provider,
-        );
-
-        let results = handler
-            .verify_payment(payment_verifications)
+        let results = contract
+            .verifyPayment(data_payments)
+            .call()
             .await
             .map_err(|e| {
                 let xorname_hex = hex::encode(xorname);
-                Error::Payment(format!("EVM verification error for {xorname_hex}: {e}"))
+                Error::Payment(format!(
+                    "EVM verifyPayment call failed for {xorname_hex}: {e}"
+                ))
             })?;
 
-        let paid_results: Vec<_> = results
-            .iter()
-            .filter(|r| r.amountPaid > evmlib::common::U256::ZERO)
-            .collect();
+        let total_quotes = payment_digest.len();
+        let mut valid_paid_count: usize = 0;
 
-        if paid_results.is_empty() {
-            let xorname_hex = hex::encode(xorname);
-            return Err(Error::Payment(format!(
-                "Payment verification failed on-chain for {xorname_hex} (no paid quotes found)"
-            )));
-        }
-
-        for result in &paid_results {
-            if !result.isValid {
-                let xorname_hex = hex::encode(xorname);
-                return Err(Error::Payment(format!(
-                    "Payment verification failed on-chain for {xorname_hex} (paid quote is invalid)"
-                )));
+        for result in &results {
+            if result.isValid && result.amountPaid > evmlib::common::Amount::ZERO {
+                valid_paid_count += 1;
             }
         }
 
+        if valid_paid_count == 0 {
+            let xorname_hex = hex::encode(xorname);
+            return Err(Error::Payment(format!(
+                "Payment verification failed on-chain for {xorname_hex}: \
+                 no valid paid quotes found ({total_quotes} checked)"
+            )));
+        }
+
         if tracing::enabled!(tracing::Level::INFO) {
-            let valid_count = paid_results.len();
-            let total_results = results.len();
             let xorname_hex = hex::encode(xorname);
             info!(
-                "EVM payment verified for {xorname_hex} ({valid_count} paid and valid, {total_results} total results)"
+                "EVM payment verified for {xorname_hex} ({valid_paid_count} valid, {total_quotes} total quotes)"
             );
         }
         Ok(())
@@ -532,9 +524,9 @@ impl PaymentVerifier {
             debug!("Pool cache hit for hash {}", hex::encode(pool_hash));
             info
         } else {
-            // Query on-chain for payment info
+            // Query on-chain for completed merkle payment
             let info =
-                merkle_payment_vault::get_merkle_payment_info(&self.config.evm.network, pool_hash)
+                payment_vault::get_completed_merkle_payment(&self.config.evm.network, pool_hash)
                     .await
                     .map_err(|e| {
                         let pool_hex = hex::encode(pool_hash);
@@ -546,7 +538,7 @@ impl PaymentVerifier {
             let paid_node_addresses: Vec<_> = info
                 .paidNodeAddresses
                 .iter()
-                .map(|pna| (pna.rewardsAddress, usize::from(pna.poolIndex)))
+                .map(|pna| (pna.rewardsAddress, usize::from(pna.poolIndex), pna.amount))
                 .collect();
 
             let on_chain_info = OnChainPaymentInfo {
@@ -625,7 +617,12 @@ impl PaymentVerifier {
             )));
         }
 
-        // Verify paid node indices are valid within the candidate pool.
+        // Verify paid node indices, addresses, and amounts against the candidate pool.
+        //
+        // Each paid node must:
+        // 1. Have a valid index within the candidate pool
+        // 2. Match the expected reward address at that index
+        // 3. Have been paid at least the candidate's quoted price
         //
         // Note: unlike single-node payments, merkle proofs are NOT bound to a
         // specific storing node. The contract pays `depth` random nodes from the
@@ -634,7 +631,7 @@ impl PaymentVerifier {
         // any node that can verify the merkle proof is allowed to store the chunk.
         // Replay protection comes from the per-address proof binding (each proof
         // is for a specific XorName in the paid tree).
-        for (addr, idx) in &payment_info.paid_node_addresses {
+        for (addr, idx, paid_amount) in &payment_info.paid_node_addresses {
             let node = merkle_proof
                 .winner_pool
                 .candidate_nodes
@@ -649,6 +646,13 @@ impl PaymentVerifier {
                 return Err(Error::Payment(format!(
                     "Paid node address mismatch at index {idx}: expected {addr}, got {}",
                     node.reward_address
+                )));
+            }
+            if *paid_amount < node.price {
+                return Err(Error::Payment(format!(
+                    "Underpayment for node at index {idx}: paid {paid_amount}, \
+                     candidate quoted {}",
+                    node.price
                 )));
             }
         }
@@ -684,6 +688,7 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use evmlib::common::Amount;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -992,7 +997,6 @@ mod tests {
     #[tokio::test]
     async fn test_content_address_mismatch_rejected() {
         use crate::payment::proof::{serialize_single_node_proof, PaymentProof};
-        use evmlib::quoting_metrics::QuotingMetrics;
         use evmlib::{EncodedPeerId, PaymentQuote, RewardsAddress};
         use std::time::SystemTime;
 
@@ -1006,17 +1010,7 @@ mod tests {
         let quote = PaymentQuote {
             content: xor_name::XorName(wrong_xorname),
             timestamp: SystemTime::now(),
-            quoting_metrics: QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 1000,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([1u8; 20]),
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
@@ -1053,23 +1047,12 @@ mod tests {
         timestamp: SystemTime,
         rewards_address: RewardsAddress,
     ) -> evmlib::PaymentQuote {
-        use evmlib::quoting_metrics::QuotingMetrics;
         use evmlib::PaymentQuote;
 
         PaymentQuote {
             content: xor_name::XorName(xorname),
             timestamp,
-            quoting_metrics: QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 1000,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: Amount::from(1u64),
             rewards_address,
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
@@ -1465,27 +1448,16 @@ mod tests {
         std::array::from_fn::<_, CANDIDATES_PER_POOL, _>(|i| {
             let ml_dsa = MlDsa65::new();
             let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let metrics = evmlib::quoting_metrics::QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: i * 10,
-                records_per_type: vec![],
-                max_records: 500,
-                received_payment_count: 0,
-                live_time: 100,
-                network_density: None,
-                network_size: None,
-            };
+            let price = evmlib::common::Amount::from(1024u64);
             #[allow(clippy::cast_possible_truncation)]
             let reward_address = RewardsAddress::new([i as u8; 20]);
-            let msg =
-                MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+            let msg = MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp);
             let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
             let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
             MerklePaymentCandidateNode {
                 pub_key: pub_key.as_bytes().to_vec(),
-                quoting_metrics: metrics,
+                price,
                 reward_address,
                 merkle_payment_timestamp: timestamp,
                 signature,
@@ -1814,10 +1786,10 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // First paid node: valid (matches candidate 0)
-                    (RewardsAddress::new([0u8; 20]), 0),
+                    // First paid node: valid (matches candidate 0, price >= 1024)
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1024u64)),
                     // Second paid node: index 999 is way beyond CANDIDATES_PER_POOL (16)
-                    (RewardsAddress::new([1u8; 20]), 999),
+                    (RewardsAddress::new([1u8; 20]), 999, Amount::from(1024u64)),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -1849,9 +1821,9 @@ mod tests {
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
                     // Index 0 with matching address [0x00; 20]
-                    (RewardsAddress::new([0u8; 20]), 0),
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1024u64)),
                     // Index 1 with WRONG address — candidate 1's address is [0x01; 20]
-                    (RewardsAddress::new([0xFF; 20]), 1),
+                    (RewardsAddress::new([0xFF; 20]), 1, Amount::from(1024u64)),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -1878,7 +1850,11 @@ mod tests {
             let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 3,
                 merkle_payment_timestamp: ts,
-                paid_node_addresses: vec![(RewardsAddress::new([0u8; 20]), 0)],
+                paid_node_addresses: vec![(
+                    RewardsAddress::new([0u8; 20]),
+                    0,
+                    Amount::from(1024u64),
+                )],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
         }
@@ -1894,6 +1870,38 @@ mod tests {
             err_msg.contains("Wrong number of paid nodes")
                 || err_msg.contains("verification failed"),
             "Error should mention depth/count mismatch: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_merkle_underpayment_rejected() {
+        let verifier = create_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        // Tree depth=2, so 2 paid nodes required. Candidates have price=1024.
+        // Pay only 1 wei per node — far below the candidate's quoted price.
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1u64)),
+                    (RewardsAddress::new([1u8; 20]), 1, Amount::from(1u64)),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+
+        assert!(
+            result.is_err(),
+            "Should reject merkle payment where paid amount < candidate's quoted price"
+        );
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("Underpayment"),
+            "Error should mention underpayment: {err_msg}"
         );
     }
 }
