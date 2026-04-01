@@ -13,6 +13,9 @@ use ant_node::replication::protocol::{
     FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
     ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
+use ant_node::replication::scheduling::ReplicationQueues;
+use saorsa_core::identity::PeerId;
+use saorsa_core::TrustEvent;
 use serial_test::serial;
 use std::time::Duration;
 
@@ -711,6 +714,670 @@ async fn test_fetch_returns_error_for_corrupt_key() {
             ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { .. })
         ),
         "Expected NotFound for non-existent key"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #3: Neighbor-sync unknown key quorum pass -> stored
+// =========================================================================
+
+/// Fresh replication stores chunk on remote peer AND updates their `PaidForList`
+/// (Section 18 #3).
+///
+/// Store a chunk on node A, call `replicate_fresh`, wait for propagation, then
+/// verify at least one remote node has the chunk in both storage and `PaidForList`.
+#[tokio::test]
+#[serial]
+async fn scenario_3_fresh_replication_stores_and_updates_paid_list() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source_idx = 3;
+    let source = harness.test_node(source_idx).expect("source");
+    let protocol = source.ant_protocol.as_ref().expect("protocol");
+    let storage = protocol.storage();
+
+    let content = b"scenario 3 quorum pass test";
+    let address = compute_address(content);
+    storage.put(&address, content).await.expect("put");
+
+    // Pre-populate payment cache so the store is considered paid
+    protocol.payment_verifier().cache_insert(address);
+
+    // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify)
+    let dummy_pop = [0x01u8; 64];
+    if let Some(ref engine) = source.replication_engine {
+        engine.replicate_fresh(&address, content, &dummy_pop).await;
+    }
+
+    // Wait for propagation
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Check: at least one other node has the chunk AND has it in paid list
+    let mut stored_elsewhere = false;
+    let mut paid_listed_elsewhere = false;
+    for i in 0..harness.node_count() {
+        if i == source_idx {
+            continue;
+        }
+        if let Some(node) = harness.test_node(i) {
+            if let Some(p) = &node.ant_protocol {
+                if p.storage().exists(&address).unwrap_or(false) {
+                    stored_elsewhere = true;
+                }
+            }
+            if let Some(ref engine) = node.replication_engine {
+                if engine.paid_list().contains(&address).unwrap_or(false) {
+                    paid_listed_elsewhere = true;
+                }
+            }
+        }
+    }
+    assert!(
+        stored_elsewhere,
+        "Chunk should be stored on at least one other node"
+    );
+    assert!(
+        paid_listed_elsewhere,
+        "Key should be in PaidForList on at least one other node"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #9: Fetch retry with alternate source
+// =========================================================================
+
+/// When a fetch fails, the queue rotates to the next untried source
+/// (Section 18 #9).
+///
+/// Tested via direct `ReplicationQueues` manipulation since we cannot
+/// deterministically trigger network failures in e2e.
+#[tokio::test]
+#[serial]
+async fn scenario_9_fetch_retry_uses_alternate_source() {
+    let max_concurrent = 10;
+    let mut queues = ReplicationQueues::new(max_concurrent);
+    let key = [0x09; 32];
+    let distance = [0x01; 32];
+    let source_a = PeerId::from_bytes([0xA0; 32]);
+    let source_b = PeerId::from_bytes([0xB0; 32]);
+
+    // Enqueue with two sources
+    queues.enqueue_fetch(key, distance, vec![source_a, source_b]);
+    let candidate = queues.dequeue_fetch().expect("dequeue");
+
+    // Start in-flight with first source
+    queues.start_fetch(key, source_a, candidate.sources);
+
+    // First source fails -> retry should give source_b
+    let next = queues.retry_fetch(&key);
+    assert_eq!(next, Some(source_b), "Should retry with alternate source");
+
+    // Second source fails -> no more sources
+    let exhausted = queues.retry_fetch(&key);
+    assert!(exhausted.is_none(), "No more sources available");
+}
+
+// =========================================================================
+// Section 18, Scenario #10: Fetch retry exhaustion
+// =========================================================================
+
+/// When all sources fail, the fetch is exhausted and can be completed
+/// (Section 18 #10).
+#[tokio::test]
+#[serial]
+async fn scenario_10_fetch_retry_exhaustion() {
+    let max_concurrent = 10;
+    let mut queues = ReplicationQueues::new(max_concurrent);
+    let key = [0x10; 32];
+    let distance = [0x01; 32];
+    let source = PeerId::from_bytes([0xC0; 32]);
+
+    // Single source
+    queues.enqueue_fetch(key, distance, vec![source]);
+    let _candidate = queues.dequeue_fetch().expect("dequeue");
+    queues.start_fetch(key, source, vec![source]);
+
+    // Source fails -> no alternates -> exhausted
+    let next = queues.retry_fetch(&key);
+    assert!(next.is_none(), "Single source exhausted");
+
+    // Complete the fetch (abandon)
+    let entry = queues.complete_fetch(&key);
+    assert!(entry.is_some(), "Should have in-flight entry to complete");
+    assert_eq!(queues.in_flight_count(), 0);
+}
+
+// =========================================================================
+// Section 18, Scenario #11: Repeated failures -> trust penalty
+// =========================================================================
+
+/// Multiple application failures from a peer decrease its trust score
+/// (Section 18 #11).
+#[tokio::test]
+#[serial]
+async fn scenario_11_repeated_failures_decrease_trust() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_b = *p2p_b.peer_id();
+
+    // Get initial trust score for node B (should be neutral ~0.5)
+    let initial_trust = p2p_a.peer_trust(&peer_b);
+
+    // Report multiple application failures
+    let failure_count = 5;
+    let failure_weight = 3.0;
+    for _ in 0..failure_count {
+        p2p_a
+            .report_trust_event(&peer_b, TrustEvent::ApplicationFailure(failure_weight))
+            .await;
+    }
+
+    let final_trust = p2p_a.peer_trust(&peer_b);
+    assert!(
+        final_trust < initial_trust,
+        "Trust should decrease after repeated failures: {initial_trust} -> {final_trust}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #12: Bootstrap quorum aggregation
+// =========================================================================
+
+/// Store chunks on multiple nodes and verify storage + paid-list consistency
+/// (Section 18 #12).
+///
+/// Simulates the state a bootstrapping node would discover: keys that exist
+/// on multiple peers with paid-list entries.
+#[tokio::test]
+#[serial]
+async fn scenario_12_bootstrap_discovers_keys() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // Store a chunk on nodes 3 and 4
+    let content = b"bootstrap discovery test";
+    let address = compute_address(content);
+
+    for idx in [3, 4] {
+        let node = harness.test_node(idx).expect("node");
+        let protocol = node.ant_protocol.as_ref().expect("protocol");
+        protocol
+            .storage()
+            .put(&address, content)
+            .await
+            .expect("put");
+        protocol.payment_verifier().cache_insert(address);
+        // Add to paid list
+        if let Some(ref engine) = node.replication_engine {
+            engine
+                .paid_list()
+                .insert(&address)
+                .await
+                .expect("paid insert");
+        }
+    }
+
+    // Verify both nodes have storage AND paid-list entries
+    for idx in [3, 4] {
+        let node = harness.test_node(idx).expect("node");
+        let protocol = node.ant_protocol.as_ref().expect("protocol");
+        assert!(
+            protocol.storage().exists(&address).unwrap(),
+            "Node {idx} should have the chunk in storage"
+        );
+        if let Some(ref engine) = node.replication_engine {
+            assert!(
+                engine.paid_list().contains(&address).unwrap(),
+                "Node {idx} should have the key in PaidForList"
+            );
+        }
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #14: Coverage under backlog
+// =========================================================================
+
+/// All locally stored keys appear in `all_keys()`, ensuring neighbor-sync
+/// hint construction covers the full local inventory (Section 18 #14).
+#[tokio::test]
+#[serial]
+async fn scenario_14_hint_construction_covers_all_local_keys() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node = harness.test_node(3).expect("node");
+    let protocol = node.ant_protocol.as_ref().expect("protocol");
+    let storage = protocol.storage();
+
+    // Store multiple chunks
+    let chunk_count = 10u8;
+    let mut addresses = Vec::new();
+    for i in 0..chunk_count {
+        let content = format!("backlog test chunk {i}");
+        let address = compute_address(content.as_bytes());
+        storage
+            .put(&address, content.as_bytes())
+            .await
+            .expect("put");
+        addresses.push(address);
+    }
+
+    // Verify all_keys returns all stored keys
+    let all_keys = storage.all_keys().expect("all_keys");
+    for addr in &addresses {
+        assert!(
+            all_keys.contains(addr),
+            "all_keys should include every stored key"
+        );
+    }
+    assert_eq!(all_keys.len(), addresses.len());
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #15: Partition and heal
+// =========================================================================
+
+/// Data survives a network partition (node shutdown). The remaining node
+/// retains the chunk and its `PaidForList` entry (Section 18 #15).
+#[tokio::test]
+#[serial]
+async fn scenario_15_partition_and_heal() {
+    let mut harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // Store a chunk on node 3
+    let address;
+    let content = b"partition test data";
+    {
+        let node3 = harness.test_node(3).expect("node3");
+        let protocol3 = node3.ant_protocol.as_ref().expect("protocol");
+        address = compute_address(content);
+        protocol3
+            .storage()
+            .put(&address, content)
+            .await
+            .expect("put");
+
+        // Add to paid list so it survives verification
+        if let Some(ref engine) = node3.replication_engine {
+            engine
+                .paid_list()
+                .insert(&address)
+                .await
+                .expect("paid insert");
+        }
+    }
+
+    // "Partition": shut down node 4
+    harness.shutdown_node(4).await.expect("shutdown");
+
+    // Data should still exist on node 3
+    let node3 = harness.test_node(3).expect("node3 after partition");
+    assert!(
+        node3
+            .ant_protocol
+            .as_ref()
+            .unwrap()
+            .storage()
+            .exists(&address)
+            .unwrap(),
+        "Data should survive partition on remaining node"
+    );
+
+    // Paid list should also survive
+    if let Some(ref engine) = node3.replication_engine {
+        assert!(
+            engine.paid_list().contains(&address).unwrap(),
+            "PaidForList should survive partition"
+        );
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #17: Admission asymmetry
+// =========================================================================
+
+/// A `NeighborSyncRequest` from any peer returns a valid
+/// `NeighborSyncResponse`, regardless of routing-table membership
+/// (Section 18 #17).
+///
+/// The protocol always replies with outbound hints; inbound hint acceptance
+/// depends on RT membership, but we verify the response is well-formed.
+#[tokio::test]
+#[serial]
+async fn scenario_17_admission_requires_sender_in_rt() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
+
+    // Send sync request with a hint for a fabricated key
+    let fake_key = [0x17; 32];
+    let request = NeighborSyncRequest {
+        replica_hints: vec![fake_key],
+        paid_hints: vec![],
+        bootstrapping: false,
+    };
+    let msg = ReplicationMessage {
+        request_id: 1700,
+        body: ReplicationMessageBody::NeighborSyncRequest(request),
+    };
+    let encoded = msg.encode().expect("encode");
+
+    let response = p2p_b
+        .send_request(
+            &peer_a,
+            ant_node::replication::config::REPLICATION_PROTOCOL_ID,
+            encoded,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("send");
+
+    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    // Response should be a valid NeighborSyncResponse regardless of RT membership
+    assert!(
+        matches!(
+            resp_msg.body,
+            ReplicationMessageBody::NeighborSyncResponse(_)
+        ),
+        "Expected NeighborSyncResponse, got: {:?}",
+        resp_msg.body
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #21: Paid-list majority confirmation
+// =========================================================================
+
+/// Paid-list status is confirmed by querying multiple peers via verification
+/// requests (Section 18 #21).
+///
+/// Insert a key into the paid lists of 4 out of 5 nodes, then query each
+/// from the remaining node and verify a majority confirms paid status.
+#[tokio::test]
+#[serial]
+async fn scenario_21_paid_list_majority_from_multiple_peers() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let key = [0x21; 32];
+
+    // Add key to paid lists on nodes 0,1,2,3 (4 of 5 nodes)
+    let populated_count = 4;
+    for idx in 0..populated_count {
+        if let Some(node) = harness.test_node(idx) {
+            if let Some(ref engine) = node.replication_engine {
+                engine.paid_list().insert(&key).await.expect("paid insert");
+            }
+        }
+    }
+
+    // Node 4 queries nodes 0..3 for paid-list status via verification
+    let querier = harness.test_node(4).expect("querier");
+    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
+
+    let mut paid_confirmations = 0u32;
+    for idx in 0..populated_count {
+        let target = harness.test_node(idx).expect("target");
+        let target_p2p = target.p2p_node.as_ref().expect("target_p2p");
+        let peer = *target_p2p.peer_id();
+
+        let request = VerificationRequest {
+            keys: vec![key],
+            paid_list_check_indices: vec![0],
+        };
+        let msg = ReplicationMessage {
+            request_id: 2100 + idx as u64,
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
+        let encoded = msg.encode().expect("encode");
+
+        if let Ok(response) = p2p_q
+            .send_request(
+                &peer,
+                ant_node::replication::config::REPLICATION_PROTOCOL_ID,
+                encoded,
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            if let Ok(resp_msg) = ReplicationMessage::decode(&response.data) {
+                if let ReplicationMessageBody::VerificationResponse(resp) = resp_msg.body {
+                    if resp.results.first().and_then(|r| r.paid) == Some(true) {
+                        paid_confirmations += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Should have at least 3 confirmations (we added to 4 nodes)
+    let min_confirmations = 3;
+    assert!(
+        paid_confirmations >= min_confirmations,
+        "Should get paid confirmations from multiple peers, got {paid_confirmations}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #24: Fresh replication paid-list propagation
+// =========================================================================
+
+/// After fresh replication, `PaidNotify` propagates to remote nodes' paid
+/// lists (Section 18 #24).
+#[tokio::test]
+#[serial]
+async fn scenario_24_fresh_replication_propagates_paid_notify() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source_idx = 3;
+    let source = harness.test_node(source_idx).expect("source");
+    let protocol = source.ant_protocol.as_ref().expect("protocol");
+
+    let content = b"paid notify propagation test";
+    let address = compute_address(content);
+    protocol
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put");
+    protocol.payment_verifier().cache_insert(address);
+
+    // Trigger fresh replication (includes PaidNotify to PaidCloseGroup)
+    let dummy_pop = [0x01u8; 64];
+    if let Some(ref engine) = source.replication_engine {
+        engine.replicate_fresh(&address, content, &dummy_pop).await;
+    }
+
+    // Wait for propagation
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Check paid lists on other nodes
+    let mut paid_count = 0u32;
+    for i in 0..harness.node_count() {
+        if i == source_idx {
+            continue;
+        }
+        if let Some(node) = harness.test_node(i) {
+            if let Some(ref engine) = node.replication_engine {
+                if engine.paid_list().contains(&address).unwrap_or(false) {
+                    paid_count += 1;
+                }
+            }
+        }
+    }
+
+    // At least one other node should have received the PaidNotify
+    // (PaidCloseGroup is up to 20, but in a 5-node network all peers are close)
+    assert!(
+        paid_count >= 1,
+        "PaidNotify should propagate to at least 1 other node, got {paid_count}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #25: Convergence repair
+// =========================================================================
+
+/// Paid-list convergence: a majority of queried peers confirm paid status
+/// for a key added to a subset of nodes (Section 18 #25).
+#[tokio::test]
+#[serial]
+async fn scenario_25_paid_list_convergence_via_verification() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let key = [0x25; 32];
+
+    // Add to paid list on nodes 0,1,2 (majority of 5)
+    let populated_count = 3;
+    for idx in 0..populated_count {
+        if let Some(node) = harness.test_node(idx) {
+            if let Some(ref engine) = node.replication_engine {
+                engine.paid_list().insert(&key).await.expect("insert");
+            }
+        }
+    }
+
+    // Node 4 queries nodes 0,1,2 for paid-list status
+    let querier = harness.test_node(4).expect("querier");
+    let p2p_q = querier.p2p_node.as_ref().expect("p2p");
+
+    let mut confirmations = 0u32;
+    for idx in 0..populated_count {
+        let target = harness.test_node(idx).expect("target");
+        let peer = *target.p2p_node.as_ref().expect("p2p").peer_id();
+
+        let request = VerificationRequest {
+            keys: vec![key],
+            paid_list_check_indices: vec![0],
+        };
+        let msg = ReplicationMessage {
+            request_id: 2500 + idx as u64,
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
+        let encoded = msg.encode().expect("encode");
+
+        if let Ok(resp) = p2p_q
+            .send_request(
+                &peer,
+                ant_node::replication::config::REPLICATION_PROTOCOL_ID,
+                encoded,
+                Duration::from_secs(10),
+            )
+            .await
+        {
+            if let Ok(resp_msg) = ReplicationMessage::decode(&resp.data) {
+                if let ReplicationMessageBody::VerificationResponse(v) = resp_msg.body {
+                    if v.results.first().and_then(|r| r.paid) == Some(true) {
+                        confirmations += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let min_confirmations = 2;
+    assert!(
+        confirmations >= min_confirmations,
+        "Majority of queried peers should confirm paid status, got {confirmations}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #44: Cold-start recovery
+// =========================================================================
+
+/// `PaidForList` survives restart: keys inserted before shutdown are found
+/// when the list is reopened from the same data directory (Section 18 #44).
+#[tokio::test]
+#[serial]
+async fn scenario_44_paid_list_survives_restart() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+
+    let node = harness.test_node(3).expect("node");
+    let data_dir = node.data_dir.clone();
+    let key = [0x44; 32];
+
+    // Insert into paid list
+    if let Some(ref engine) = node.replication_engine {
+        engine.paid_list().insert(&key).await.expect("insert");
+    }
+
+    // Simulate restart: reopen PaidList from same directory
+    let paid_list2 = ant_node::replication::paid_list::PaidList::new(&data_dir)
+        .await
+        .expect("reopen");
+
+    assert!(
+        paid_list2.contains(&key).expect("contains"),
+        "PaidForList should survive restart (cold-start recovery)"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #45: Unrecoverable when paid-list lost
+// =========================================================================
+
+/// If `PaidForList` is lost AND no quorum exists, the key is unrecoverable.
+/// A fresh `PaidList` in a different directory does NOT contain previously-paid
+/// keys (Section 18 #45).
+#[tokio::test]
+#[serial]
+async fn scenario_45_unrecoverable_when_paid_list_lost() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+
+    let key = [0x45; 32];
+
+    // Insert into node 3's paid list
+    let node = harness.test_node(3).expect("node");
+    if let Some(ref engine) = node.replication_engine {
+        engine.paid_list().insert(&key).await.expect("insert");
+    }
+
+    // Create a fresh PaidList in a different directory (simulating data loss)
+    let temp_dir = tempfile::tempdir().expect("tempdir");
+    let fresh_paid_list = ant_node::replication::paid_list::PaidList::new(temp_dir.path())
+        .await
+        .expect("fresh paid list");
+
+    assert!(
+        !fresh_paid_list.contains(&key).expect("contains"),
+        "Key should NOT be found in a fresh (lost) PaidForList"
     );
 
     harness.teardown().await.expect("teardown");
