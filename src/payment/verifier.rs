@@ -10,6 +10,7 @@ use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
+use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
 use evmlib::Network as EvmNetwork;
@@ -372,7 +373,7 @@ impl PaymentVerifier {
         let mut valid_paid_count: usize = 0;
 
         for result in &results {
-            if result.isValid && result.amountPaid > evmlib::common::Amount::ZERO {
+            if result.isValid && result.amountPaid > Amount::ZERO {
                 valid_paid_count += 1;
             }
         }
@@ -617,12 +618,32 @@ impl PaymentVerifier {
             )));
         }
 
+        // Compute expected per-node payment using the contract formula:
+        // totalAmount = median16(candidate_prices) * (1 << depth)
+        // amountPerNode = totalAmount / depth
+        let expected_per_node = if payment_info.depth > 0 {
+            let mut candidate_prices: Vec<Amount> = merkle_proof
+                .winner_pool
+                .candidate_nodes
+                .iter()
+                .map(|c| c.price)
+                .collect();
+            candidate_prices.sort_unstable(); // ascending
+                                              // Upper median (index 8 of 16) — matches Solidity's median16 (k = 8)
+            let median_price = candidate_prices[candidate_prices.len() / 2];
+            let total_amount = median_price * Amount::from(1u64 << payment_info.depth);
+            total_amount / Amount::from(u64::from(payment_info.depth))
+        } else {
+            Amount::ZERO
+        };
+
         // Verify paid node indices, addresses, and amounts against the candidate pool.
         //
         // Each paid node must:
         // 1. Have a valid index within the candidate pool
         // 2. Match the expected reward address at that index
-        // 3. Have been paid at least the candidate's quoted price
+        // 3. Have been paid at least the expected per-node amount from the
+        //    contract formula: median16(prices) * 2^depth / depth
         //
         // Note: unlike single-node payments, merkle proofs are NOT bound to a
         // specific storing node. The contract pays `depth` random nodes from the
@@ -648,11 +669,12 @@ impl PaymentVerifier {
                     node.reward_address
                 )));
             }
-            if *paid_amount < node.price {
+            if *paid_amount < expected_per_node {
                 return Err(Error::Payment(format!(
                     "Underpayment for node at index {idx}: paid {paid_amount}, \
-                     candidate quoted {}",
-                    node.price
+                     expected at least {expected_per_node} \
+                     (median16 formula, depth={})",
+                    payment_info.depth
                 )));
             }
         }
@@ -688,7 +710,6 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use evmlib::common::Amount;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -1786,10 +1807,11 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // First paid node: valid (matches candidate 0, price >= 1024)
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1024u64)),
+                    // First paid node: valid (matches candidate 0, amount matches formula)
+                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
                     // Second paid node: index 999 is way beyond CANDIDATES_PER_POOL (16)
-                    (RewardsAddress::new([1u8; 20]), 999, Amount::from(1024u64)),
+                    (RewardsAddress::new([1u8; 20]), 999, Amount::from(2048u64)),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -1821,9 +1843,10 @@ mod tests {
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
                     // Index 0 with matching address [0x00; 20]
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1024u64)),
+                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
                     // Index 1 with WRONG address — candidate 1's address is [0x01; 20]
-                    (RewardsAddress::new([0xFF; 20]), 1, Amount::from(1024u64)),
+                    (RewardsAddress::new([0xFF; 20]), 1, Amount::from(2048u64)),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -1878,8 +1901,9 @@ mod tests {
         let verifier = create_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
-        // Tree depth=2, so 2 paid nodes required. Candidates have price=1024.
-        // Pay only 1 wei per node — far below the candidate's quoted price.
+        // Tree depth=2, so 2 paid nodes required. Candidates all quote price=1024.
+        // Expected per-node: median(1024) * 2^2 / 2 = 2048.
+        // Pay only 1 wei per node — far below the expected amount.
         {
             let info = evmlib::merkle_payments::OnChainPaymentInfo {
                 depth: 2,
@@ -1896,7 +1920,7 @@ mod tests {
 
         assert!(
             result.is_err(),
-            "Should reject merkle payment where paid amount < candidate's quoted price"
+            "Should reject merkle payment where paid amount < expected per-node amount"
         );
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
