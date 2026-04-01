@@ -508,4 +508,290 @@ mod tests {
         let ts = state.last_sync_times.get(&peer).expect("timestamp exists");
         assert!(*ts > old_time, "sync time should be updated");
     }
+
+    // -- Section 18: Neighbor sync scenarios --------------------------------
+
+    #[test]
+    fn scenario_35_round_robin_with_cooldown_skip() {
+        // With >PEER_COUNT eligible peers, consecutive rounds scan forward
+        // from cursor, skip cooldown peers, sync next batch.
+        // Create 8 peers, mark peers 2,4 on cooldown.
+        // First batch of 4: peers 1,3,5,6 (2,4 skipped and removed).
+        // Second batch of 4: peers 7,8 (only 2 remain).
+        // Cycle should complete after second batch.
+        let peers: Vec<PeerId> = (1..=8).map(peer_id_from_byte).collect();
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let batch_size = 4;
+        let cooldown = Duration::from_secs(3600);
+
+        // Mark peers 2 and 4 as recently synced (on cooldown).
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(2), Instant::now());
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(4), Instant::now());
+
+        // First batch: scan from cursor 0. Peers 2 and 4 are removed,
+        // leaving [1,3,5,6,7,8]. We pick the first 4: [1,3,5,6].
+        let batch1 = select_sync_batch(&mut state, batch_size, cooldown);
+        assert_eq!(batch1.len(), 4);
+        assert_eq!(batch1[0], peer_id_from_byte(1));
+        assert_eq!(batch1[1], peer_id_from_byte(3));
+        assert_eq!(batch1[2], peer_id_from_byte(5));
+        assert_eq!(batch1[3], peer_id_from_byte(6));
+
+        // Cooldown peers should have been removed from the order.
+        assert!(!state.order.contains(&peer_id_from_byte(2)));
+        assert!(!state.order.contains(&peer_id_from_byte(4)));
+
+        // Second batch: only peers 7,8 remain after cursor.
+        let batch2 = select_sync_batch(&mut state, batch_size, cooldown);
+        assert_eq!(batch2.len(), 2);
+        assert_eq!(batch2[0], peer_id_from_byte(7));
+        assert_eq!(batch2[1], peer_id_from_byte(8));
+
+        // Cycle should be complete after second batch.
+        assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn scenario_36_cycle_complete_when_cursor_past_order() {
+        // is_cycle_complete() returns true when cursor >= order.len().
+        let peers: Vec<PeerId> = (1..=3).map(peer_id_from_byte).collect();
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Not complete at the start.
+        assert!(!state.is_cycle_complete());
+
+        // Advance cursor to exactly order.len().
+        state.cursor = 3;
+        assert!(state.is_cycle_complete());
+
+        // Also complete when cursor exceeds order.len().
+        state.cursor = 10;
+        assert!(state.is_cycle_complete());
+
+        // Edge case: order is emptied (peers removed) with cursor at 0.
+        state.order.clear();
+        state.cursor = 0;
+        assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn scenario_38_mid_cycle_peer_join_excluded() {
+        // Peer D joins CloseNeighbors mid-cycle.
+        // D should NOT appear in the current NeighborSyncOrder snapshot.
+        // After cycle completes and a new snapshot is taken, D can be included.
+        let peers = vec![
+            peer_id_from_byte(0xA),
+            peer_id_from_byte(0xB),
+            peer_id_from_byte(0xC),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Advance cursor to simulate mid-cycle.
+        let _ = select_sync_batch(&mut state, 1, Duration::from_secs(0));
+        assert_eq!(state.cursor, 1);
+
+        // Peer D "joins" the network. It should NOT be in the current snapshot.
+        let peer_d = peer_id_from_byte(0xD);
+        assert!(
+            !state.order.contains(&peer_d),
+            "mid-cycle joiner must not appear in the current snapshot"
+        );
+
+        // Complete the current cycle.
+        let _ = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        assert!(state.is_cycle_complete());
+
+        // New cycle: now D can be included in the fresh snapshot.
+        let new_peers = vec![
+            peer_id_from_byte(0xA),
+            peer_id_from_byte(0xB),
+            peer_id_from_byte(0xC),
+            peer_d,
+        ];
+        let new_state = NeighborSyncState::new_cycle(new_peers);
+        assert!(
+            new_state.order.contains(&peer_d),
+            "after new snapshot, joiner D should be present"
+        );
+    }
+
+    #[test]
+    fn scenario_39_unreachable_peer_removed_slot_filled() {
+        // Peer P is in snapshot. Sync fails. P removed from order.
+        // Node resumes scanning and picks next peer Q to fill the slot.
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+            peer_id_from_byte(4),
+            peer_id_from_byte(5),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // First batch selects peers 1,2.
+        let batch = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        assert_eq!(batch, vec![peer_id_from_byte(1), peer_id_from_byte(2)]);
+
+        // Peer 2 becomes unreachable. Remove it and fill the slot.
+        let replacement = handle_sync_failure(&mut state, &peer_id_from_byte(2));
+        assert!(!state.order.contains(&peer_id_from_byte(2)));
+
+        // Slot should be filled by the next available peer (peer 3).
+        assert_eq!(
+            replacement,
+            Some(peer_id_from_byte(3)),
+            "vacated slot should be filled by next peer in order"
+        );
+
+        // Continue: next batch should resume from after the replacement.
+        let batch2 = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        assert_eq!(batch2, vec![peer_id_from_byte(4), peer_id_from_byte(5)]);
+        assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn scenario_40_cooldown_peer_removed_from_snapshot() {
+        // Peer synced within cooldown period. When batch selection reaches it,
+        // peer is REMOVED from order (not just skipped). Scanning continues to
+        // next peer.
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let cooldown = Duration::from_secs(3600);
+
+        // Mark peer 2 as recently synced.
+        state
+            .last_sync_times
+            .insert(peer_id_from_byte(2), Instant::now());
+
+        let batch = select_sync_batch(&mut state, 3, cooldown);
+
+        // Peer 2 should have been REMOVED from order, not just skipped.
+        assert!(!state.order.contains(&peer_id_from_byte(2)));
+        assert_eq!(state.order.len(), 2, "order should shrink by 1");
+
+        // Batch contains the non-cooldown peers.
+        assert_eq!(batch, vec![peer_id_from_byte(1), peer_id_from_byte(3)]);
+
+        // Cycle is complete since all remaining peers were selected.
+        assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn scenario_41_cycle_always_terminates() {
+        // Under arbitrary cooldowns and removals, cycle always terminates.
+        // Create 10 peers. Mark ALL on cooldown. select_sync_batch
+        // should remove all and return empty. Cycle complete.
+        let peer_count: u8 = 10;
+        let peers: Vec<PeerId> = (1..=peer_count).map(peer_id_from_byte).collect();
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let cooldown = Duration::from_secs(3600);
+
+        // Mark all peers as recently synced.
+        for i in 1..=peer_count {
+            state
+                .last_sync_times
+                .insert(peer_id_from_byte(i), Instant::now());
+        }
+
+        let batch = select_sync_batch(&mut state, 4, cooldown);
+
+        assert!(
+            batch.is_empty(),
+            "all peers on cooldown — batch must be empty"
+        );
+        assert!(state.order.is_empty(), "all peers should have been removed");
+        assert!(
+            state.is_cycle_complete(),
+            "cycle must terminate when all peers are removed"
+        );
+    }
+
+    #[test]
+    fn consecutive_rounds_advance_through_full_cycle() {
+        // 6 peers, batch_size=2, no cooldowns.
+        // Round 1: peers 0,1. Round 2: peers 2,3. Round 3: peers 4,5.
+        // After round 3: cycle complete.
+        let peers: Vec<PeerId> = (1..=6).map(peer_id_from_byte).collect();
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let batch_size = 2;
+        let no_cooldown = Duration::from_secs(0);
+
+        let round1 = select_sync_batch(&mut state, batch_size, no_cooldown);
+        assert_eq!(round1, vec![peer_id_from_byte(1), peer_id_from_byte(2)]);
+        assert_eq!(state.cursor, 2);
+        assert!(!state.is_cycle_complete());
+
+        let round2 = select_sync_batch(&mut state, batch_size, no_cooldown);
+        assert_eq!(round2, vec![peer_id_from_byte(3), peer_id_from_byte(4)]);
+        assert_eq!(state.cursor, 4);
+        assert!(!state.is_cycle_complete());
+
+        let round3 = select_sync_batch(&mut state, batch_size, no_cooldown);
+        assert_eq!(round3, vec![peer_id_from_byte(5), peer_id_from_byte(6)]);
+        assert_eq!(state.cursor, 6);
+        assert!(state.is_cycle_complete());
+
+        // Extra call after cycle complete returns empty.
+        let round4 = select_sync_batch(&mut state, batch_size, no_cooldown);
+        assert!(round4.is_empty());
+    }
+
+    #[test]
+    fn cycle_completion_resets_cursor_but_keeps_sync_times() {
+        // Verify that after cycle completes, starting a new cycle
+        // preserves the last_sync_times from the old state.
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+
+        // Sync both peers and record their times.
+        let _ = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        record_successful_sync(&mut state, &peer_id_from_byte(1));
+        record_successful_sync(&mut state, &peer_id_from_byte(2));
+        assert!(state.is_cycle_complete());
+
+        // Capture sync times before "resetting" for a new cycle.
+        let old_sync_times = state.last_sync_times.clone();
+        assert_eq!(old_sync_times.len(), 2);
+
+        // Simulate starting a new cycle: create fresh state but carry over
+        // last_sync_times (as the real driver would).
+        let new_peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+        ];
+        let mut new_state = NeighborSyncState::new_cycle(new_peers);
+        new_state.last_sync_times = old_sync_times;
+
+        // Cursor is reset.
+        assert_eq!(new_state.cursor, 0);
+        assert!(!new_state.is_cycle_complete());
+
+        // Sync times are preserved.
+        assert_eq!(new_state.last_sync_times.len(), 2);
+        assert!(new_state
+            .last_sync_times
+            .contains_key(&peer_id_from_byte(1)));
+        assert!(new_state
+            .last_sync_times
+            .contains_key(&peer_id_from_byte(2)));
+
+        // The preserved cooldowns cause peers 1,2 to be removed, leaving
+        // only peer 3 selected.
+        let cooldown = Duration::from_secs(3600);
+        let batch = select_sync_batch(&mut new_state, 3, cooldown);
+        assert_eq!(
+            batch,
+            std::iter::once(peer_id_from_byte(3)).collect::<Vec<_>>(),
+            "only the new peer should be selected; old peers are on cooldown"
+        );
+    }
 }

@@ -604,4 +604,129 @@ mod tests {
         );
         assert_eq!(from_new.pending_keys, from_default.pending_keys);
     }
+
+    // -- Scenario tests -------------------------------------------------------
+
+    /// #13: Bootstrap not drained while `pending_keys` overlap with the
+    /// pipeline. Keys must be removed from `pending_keys` for drain to occur.
+    #[test]
+    fn scenario_13_bootstrap_drain_with_pending_keys() {
+        let key_a: XorName = [0xA0; 32];
+        let key_b: XorName = [0xB0; 32];
+        let key_c: XorName = [0xC0; 32];
+
+        let mut state = BootstrapState::new();
+        state.pending_peer_requests = 0; // requests already done
+        state.pending_keys = std::iter::once(key_a)
+            .chain(std::iter::once(key_b))
+            .chain(std::iter::once(key_c))
+            .collect();
+
+        assert!(
+            !state.is_drained(),
+            "should NOT be drained while pending_keys still has entries"
+        );
+
+        // Simulate pipeline processing — remove one key at a time.
+        state.pending_keys.remove(&key_a);
+        assert!(!state.is_drained(), "still not drained with 2 pending keys");
+
+        state.pending_keys.remove(&key_b);
+        assert!(!state.is_drained(), "still not drained with 1 pending key");
+
+        state.pending_keys.remove(&key_c);
+        assert!(
+            state.is_drained(),
+            "should be drained once all pending_keys are removed"
+        );
+    }
+
+    /// Verify that the FSM terminal states are distinguishable and document
+    /// which variants are logically terminal (no outgoing transitions).
+    #[test]
+    fn verification_state_terminal_variants() {
+        let terminal_states = [
+            VerificationState::QuorumAbandoned,
+            VerificationState::FetchAbandoned,
+            VerificationState::Stored,
+            VerificationState::Idle,
+        ];
+
+        // All terminal states must be distinct from each other.
+        for (i, a) in terminal_states.iter().enumerate() {
+            for (j, b) in terminal_states.iter().enumerate() {
+                if i != j {
+                    assert_ne!(
+                        a, b,
+                        "terminal states at indices {i} and {j} must be distinct"
+                    );
+                }
+            }
+        }
+
+        // Terminal states must be distinct from all non-terminal states.
+        let non_terminal_states = [
+            VerificationState::OfferReceived,
+            VerificationState::PendingVerify,
+            VerificationState::QuorumVerified,
+            VerificationState::PaidListVerified,
+            VerificationState::QueuedForFetch,
+            VerificationState::Fetching,
+            VerificationState::FetchRetryable,
+            VerificationState::QuorumFailed,
+            VerificationState::QuorumInconclusive,
+        ];
+
+        for terminal in &terminal_states {
+            for non_terminal in &non_terminal_states {
+                assert_ne!(
+                    terminal, non_terminal,
+                    "terminal state {terminal:?} must not equal non-terminal state {non_terminal:?}"
+                );
+            }
+        }
+    }
+
+    /// `has_repair_opportunity` requires BOTH a previous sync AND at least
+    /// one subsequent cycle.
+    #[test]
+    fn repair_opportunity_requires_both_sync_and_cycle() {
+        // last_sync = Some, cycles_since_sync = 0 → false (synced but no cycle yet)
+        let synced_no_cycle = PeerSyncRecord {
+            last_sync: Some(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(2))
+                    .unwrap_or_else(Instant::now),
+            ),
+            cycles_since_sync: 0,
+        };
+        assert!(
+            !synced_no_cycle.has_repair_opportunity(),
+            "synced with zero subsequent cycles should NOT have repair opportunity"
+        );
+
+        // last_sync = None, cycles_since_sync = 5 → false (never synced)
+        let never_synced = PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 5,
+        };
+        assert!(
+            !never_synced.has_repair_opportunity(),
+            "never-synced peer should NOT have repair opportunity regardless of cycles"
+        );
+
+        // last_sync = Some, cycles_since_sync = 1 → true
+        let ready = PeerSyncRecord {
+            last_sync: Some(
+                Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(5))
+                    .unwrap_or_else(Instant::now),
+            ),
+            cycles_since_sync: 1,
+        };
+        assert!(
+            ready.has_repair_opportunity(),
+            "synced peer with >= 1 cycle SHOULD have repair opportunity"
+        );
+    }
 }

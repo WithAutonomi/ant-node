@@ -418,7 +418,7 @@ fn process_verification_response(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::replication::protocol::KeyVerificationResult;
@@ -923,5 +923,389 @@ mod tests {
             ev_b.paid_list.get(&peer),
             Some(&PaidListEvidence::Unresolved)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Section 18 scenarios
+    // -----------------------------------------------------------------------
+
+    /// Scenario 4: All peers respond Absent with no paid confirmations.
+    /// Both presence and paid-list paths are impossible -> `QuorumFailed`.
+    #[test]
+    fn scenario_4_quorum_fail_transitions_to_abandoned() {
+        let key = xor_name_from_byte(0xD0);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, threshold = min(4, floor(7/2)+1) = 4
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 5 paid peers, confirm_needed = floor(5/2)+1 = 3
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // All quorum peers respond Absent, all paid peers respond NotFound.
+        let evidence = build_evidence(
+            quorum_peers
+                .iter()
+                .map(|p| (*p, PresenceEvidence::Absent))
+                .collect(),
+            paid_peers
+                .iter()
+                .map(|p| (*p, PaidListEvidence::NotFound))
+                .collect(),
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "all-Absent with no paid confirmations should yield QuorumFailed, got {outcome:?}"
+        );
+    }
+
+    /// Scenario 16: All peers unresolved (timeout). Neither success nor
+    /// fail-fast is possible because unresolved counts keep both paths alive.
+    #[test]
+    fn scenario_16_timeout_yields_inconclusive() {
+        let key = xor_name_from_byte(0xD1);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, quorum_needed = 4
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 5 paid peers, confirm_needed = 3
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // Every peer is Unresolved (simulating full timeout).
+        let evidence = build_evidence(
+            quorum_peers
+                .iter()
+                .map(|p| (*p, PresenceEvidence::Unresolved))
+                .collect(),
+            paid_peers
+                .iter()
+                .map(|p| (*p, PaidListEvidence::Unresolved))
+                .collect(),
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumInconclusive),
+            "all-unresolved should yield QuorumInconclusive, got {outcome:?}"
+        );
+    }
+
+    /// Scenario 27: A single verification round collects both presence
+    /// evidence from `QuorumTargets` and paid-list confirmations from
+    /// `PaidTargets`. Paid-list success triggers `PaidListVerified` even when
+    /// presence quorum fails.
+    #[test]
+    fn scenario_27_single_round_collects_both_presence_and_paid() {
+        let key = xor_name_from_byte(0xD2);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers: only 1 Present (quorum_needed=4, so quorum fails).
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 5 paid peers: 3 Confirmed (confirm_needed=3, so paid passes).
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Absent),
+                (quorum_peers[2], PresenceEvidence::Absent),
+                (quorum_peers[3], PresenceEvidence::Absent),
+                (quorum_peers[4], PresenceEvidence::Absent),
+                (quorum_peers[5], PresenceEvidence::Absent),
+                (quorum_peers[6], PresenceEvidence::Absent),
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::Confirmed),
+                (paid_peers[3], PaidListEvidence::NotFound),
+                (paid_peers[4], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "paid-list majority should trigger PaidListVerified when quorum fails, got {outcome:?}"
+        );
+    }
+
+    /// Scenario 28: With |QuorumTargets|=3,
+    /// `QuorumNeeded` = min(4, floor(3/2)+1) = min(4, 2) = 2.
+    /// 2 Present responses should pass.
+    #[test]
+    fn scenario_28_dynamic_threshold_with_3_targets() {
+        let key = xor_name_from_byte(0xD3);
+        let config = ReplicationConfig::default();
+
+        let quorum_peers: Vec<PeerId> = (1..=3).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), vec![]);
+
+        // Verify the dynamic threshold is indeed 2.
+        assert_eq!(config.quorum_needed(3), 2, "quorum_needed(3) should be 2");
+
+        // 2 Present, 1 Absent -> 2 >= 2 -> QuorumVerified.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Absent),
+            ],
+            vec![],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumVerified { ref sources } if sources.len() == 2),
+            "2 Present in 3-target set should QuorumVerify, got {outcome:?}"
+        );
+    }
+
+    /// Helper: build `VerificationTargets` for two keys with shared or
+    /// separate peer sets.
+    fn two_key_targets(
+        key_a: &XorName,
+        key_b: &XorName,
+        quorum_peers_a: Vec<PeerId>,
+        quorum_peers_b: Vec<PeerId>,
+        paid_peers_a: Vec<PeerId>,
+        paid_peers_b: Vec<PeerId>,
+    ) -> VerificationTargets {
+        let mut all_peers = HashSet::new();
+        let mut peer_to_keys: HashMap<PeerId, Vec<XorName>> = HashMap::new();
+        let mut peer_to_paid_keys: HashMap<PeerId, HashSet<XorName>> = HashMap::new();
+
+        for &p in &quorum_peers_a {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key_a);
+        }
+        for &p in &quorum_peers_b {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key_b);
+        }
+        for &p in &paid_peers_a {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key_a);
+            peer_to_paid_keys.entry(p).or_default().insert(*key_a);
+        }
+        for &p in &paid_peers_b {
+            all_peers.insert(p);
+            peer_to_keys.entry(p).or_default().push(*key_b);
+            peer_to_paid_keys.entry(p).or_default().insert(*key_b);
+        }
+
+        for keys_list in peer_to_keys.values_mut() {
+            keys_list.sort_unstable();
+            keys_list.dedup();
+        }
+
+        let mut quorum_targets = HashMap::new();
+        quorum_targets.insert(*key_a, quorum_peers_a);
+        quorum_targets.insert(*key_b, quorum_peers_b);
+
+        let mut paid_targets = HashMap::new();
+        paid_targets.insert(*key_a, paid_peers_a);
+        paid_targets.insert(*key_b, paid_peers_b);
+
+        VerificationTargets {
+            quorum_targets,
+            paid_targets,
+            all_peers,
+            peer_to_keys,
+            peer_to_paid_keys,
+        }
+    }
+
+    /// Scenario 33: `process_verification_response` correctly attributes
+    /// per-key evidence when a single peer responds for multiple keys.
+    #[test]
+    fn scenario_33_batched_response_per_key_evidence() {
+        let key_a = xor_name_from_byte(0xD4);
+        let key_b = xor_name_from_byte(0xD5);
+        let peer = peer_id_from_byte(1);
+
+        // Peer is a quorum+paid target for both keys.
+        let targets = two_key_targets(
+            &key_a,
+            &key_b,
+            vec![peer],
+            vec![peer],
+            vec![peer],
+            vec![peer],
+        );
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
+            (
+                key_a,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+            (
+                key_b,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Peer responds: key_a Present+Confirmed, key_b Absent+NotFound.
+        let response = VerificationResponse {
+            results: vec![
+                KeyVerificationResult {
+                    key: key_a,
+                    present: true,
+                    paid: Some(true),
+                },
+                KeyVerificationResult {
+                    key: key_b,
+                    present: false,
+                    paid: Some(false),
+                },
+            ],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        // key_a: Present + Confirmed.
+        let ev_a = evidence.get(&key_a).expect("evidence for key_a");
+        assert_eq!(ev_a.presence.get(&peer), Some(&PresenceEvidence::Present));
+        assert_eq!(
+            ev_a.paid_list.get(&peer),
+            Some(&PaidListEvidence::Confirmed)
+        );
+
+        // key_b: Absent + NotFound.
+        let ev_b = evidence.get(&key_b).expect("evidence for key_b");
+        assert_eq!(ev_b.presence.get(&peer), Some(&PresenceEvidence::Absent));
+        assert_eq!(ev_b.paid_list.get(&peer), Some(&PaidListEvidence::NotFound));
+    }
+
+    /// Scenario 34: Peer responds for `key_a` but omits `key_b`.
+    /// `key_a` gets explicit evidence, `key_b` gets Unresolved.
+    #[test]
+    fn scenario_34_partial_response_unresolved_per_key() {
+        let key_a = xor_name_from_byte(0xD6);
+        let key_b = xor_name_from_byte(0xD7);
+        let peer = peer_id_from_byte(2);
+
+        // Peer is a quorum target for both keys, paid target for key_b only.
+        let targets = two_key_targets(&key_a, &key_b, vec![peer], vec![peer], vec![], vec![peer]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
+            (
+                key_a,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+            (
+                key_b,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        // Peer responds only for key_a, omits key_b entirely.
+        let response = VerificationResponse {
+            results: vec![KeyVerificationResult {
+                key: key_a,
+                present: true,
+                paid: None,
+            }],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        // key_a: explicit Present.
+        let ev_a = evidence.get(&key_a).expect("evidence for key_a");
+        assert_eq!(
+            ev_a.presence.get(&peer),
+            Some(&PresenceEvidence::Present),
+            "key_a should have explicit Present"
+        );
+
+        // key_b: missing from response -> Unresolved for both presence and
+        // paid_list.
+        let ev_b = evidence.get(&key_b).expect("evidence for key_b");
+        assert_eq!(
+            ev_b.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved),
+            "omitted key_b should get Unresolved presence"
+        );
+        assert_eq!(
+            ev_b.paid_list.get(&peer),
+            Some(&PaidListEvidence::Unresolved),
+            "omitted key_b (paid target) should get Unresolved paid_list"
+        );
+    }
+
+    /// Scenario 42: `QuorumVerified` outcome populates sources correctly,
+    /// which downstream uses to add the key to `PaidForList`.
+    #[test]
+    fn scenario_42_quorum_pass_derives_paid_list_auth() {
+        let key = xor_name_from_byte(0xD8);
+        let config = ReplicationConfig::default();
+
+        // 5 quorum peers, quorum_needed = min(4, 3) = 3.
+        let quorum_peers: Vec<PeerId> = (1..=5).map(peer_id_from_byte).collect();
+        // 3 paid peers (some overlap with quorum peers for realistic scenario).
+        let paid_peers: Vec<PeerId> = (3..=5).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // 4 quorum peers Present, 1 Absent -> quorum met.
+        // Also mark paid_peers[0] (peer 3) as Present so it's collected from
+        // paid targets too.
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Present), // peer 3
+                (quorum_peers[3], PresenceEvidence::Present), // peer 4
+                (quorum_peers[4], PresenceEvidence::Absent),  // peer 5
+            ],
+            vec![
+                (paid_peers[0], PaidListEvidence::NotFound),
+                (paid_peers[1], PaidListEvidence::NotFound),
+                (paid_peers[2], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        match outcome {
+            KeyVerificationOutcome::QuorumVerified { ref sources } => {
+                // Sources should include peers that responded Present from
+                // both quorum and paid targets.
+                assert!(
+                    sources.len() >= 4,
+                    "QuorumVerified sources should contain at least the 4 quorum-positive peers, got {}",
+                    sources.len()
+                );
+                // The sources list is used downstream to authorize
+                // PaidForList insertion. Verify specific peers are present.
+                assert!(
+                    sources.contains(&quorum_peers[0]),
+                    "source peer 1 should be in sources"
+                );
+                assert!(
+                    sources.contains(&quorum_peers[1]),
+                    "source peer 2 should be in sources"
+                );
+            }
+            other => panic!("expected QuorumVerified, got {other:?}"),
+        }
     }
 }

@@ -316,6 +316,7 @@ fn random_duration_in_range(min: Duration, max: Duration) -> Duration {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -466,5 +467,101 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert_eq!(config.random_neighbor_sync_interval(), fixed);
+    }
+
+    // -----------------------------------------------------------------------
+    // Section 18 scenarios
+    // -----------------------------------------------------------------------
+
+    /// Scenario 18: Invalid runtime config is rejected by `validate()`.
+    #[test]
+    fn scenario_18_invalid_config_rejected() {
+        // quorum_threshold > close_group_size -> validation fails.
+        let config = ReplicationConfig {
+            quorum_threshold: 10,
+            close_group_size: 7,
+            ..ReplicationConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("quorum_threshold"),
+            "error should mention quorum_threshold: {err}"
+        );
+
+        // close_group_size = 0 -> validation fails.
+        let config = ReplicationConfig {
+            close_group_size: 0,
+            ..ReplicationConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("close_group_size"),
+            "error should mention close_group_size: {err}"
+        );
+
+        // neighbor_sync interval min > max -> validation fails.
+        let config = ReplicationConfig {
+            neighbor_sync_interval_min: Duration::from_secs(200),
+            neighbor_sync_interval_max: Duration::from_secs(100),
+            ..ReplicationConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("neighbor_sync_interval"),
+            "error should mention neighbor_sync_interval: {err}"
+        );
+
+        // self_lookup interval min > max -> validation fails.
+        let config = ReplicationConfig {
+            self_lookup_interval_min: Duration::from_secs(999),
+            self_lookup_interval_max: Duration::from_secs(1),
+            ..ReplicationConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("self_lookup_interval"),
+            "error should mention self_lookup_interval: {err}"
+        );
+
+        // audit_tick interval min > max -> validation fails.
+        let config = ReplicationConfig {
+            audit_tick_interval_min: Duration::from_secs(500),
+            audit_tick_interval_max: Duration::from_secs(10),
+            ..ReplicationConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.contains("audit_tick_interval"),
+            "error should mention audit_tick_interval: {err}"
+        );
+    }
+
+    /// Scenario 26: Dynamic paid-list threshold for undersized set.
+    /// With PaidGroupSize=8, `ConfirmNeeded` = floor(8/2)+1 = 5.
+    #[test]
+    fn scenario_26_dynamic_paid_threshold_undersized() {
+        assert_eq!(ReplicationConfig::confirm_needed(8), 5, "floor(8/2)+1 = 5");
+
+        // Additional boundary checks for small paid groups.
+        assert_eq!(
+            ReplicationConfig::confirm_needed(1),
+            1,
+            "single peer requires 1 confirmation"
+        );
+        assert_eq!(
+            ReplicationConfig::confirm_needed(2),
+            2,
+            "2 peers require 2 confirmations"
+        );
+        assert_eq!(
+            ReplicationConfig::confirm_needed(3),
+            2,
+            "3 peers require 2 confirmations"
+        );
+        assert_eq!(
+            ReplicationConfig::confirm_needed(0),
+            1,
+            "0 peers yields floor(0/2)+1 = 1 (degenerate case)"
+        );
     }
 }

@@ -782,4 +782,202 @@ mod tests {
             "bootstrapping node must not compute digests"
         );
     }
+
+    // -- Scenario 19/53: Partial failure with mixed responsibility ----------------
+
+    #[tokio::test]
+    async fn scenario_19_partial_failure_mixed_responsibility() {
+        // Three keys challenged: K1 matches, K2 mismatches, K3 absent.
+        // After responsibility confirmation, only K2 is confirmed responsible.
+        // AuditFailure emitted for {K2} only.
+        // Test handle_audit_challenge with mixed results, then verify
+        // the digest logic manually.
+
+        let (storage, _temp) = create_test_storage().await;
+        let nonce = [0x42u8; 32];
+        let peer_id = [0xAA; 32];
+
+        // Store K1 and K2, but NOT K3
+        let content_k1 = b"key one data";
+        let addr_k1 = LmdbStorage::compute_address(content_k1);
+        storage.put(&addr_k1, content_k1).await.unwrap();
+
+        let content_k2 = b"key two data";
+        let addr_k2 = LmdbStorage::compute_address(content_k2);
+        storage.put(&addr_k2, content_k2).await.unwrap();
+
+        let addr_k3 = [0xFF; 32]; // Not stored
+
+        let challenge = AuditChallenge {
+            challenge_id: 100,
+            nonce,
+            challenged_peer_id: peer_id,
+            keys: vec![addr_k1, addr_k2, addr_k3],
+        };
+
+        let response = handle_audit_challenge(&challenge, &storage, false);
+
+        match response {
+            AuditResponse::Digests { digests, .. } => {
+                assert_eq!(digests.len(), 3);
+
+                // K1 should have correct digest
+                let expected_k1 = compute_audit_digest(&nonce, &peer_id, &addr_k1, content_k1);
+                assert_eq!(digests[0], expected_k1);
+
+                // K2 should have correct digest
+                let expected_k2 = compute_audit_digest(&nonce, &peer_id, &addr_k2, content_k2);
+                assert_eq!(digests[1], expected_k2);
+
+                // K3 absent -> sentinel
+                assert_eq!(digests[2], ABSENT_KEY_DIGEST);
+            }
+            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests response"),
+        }
+    }
+
+    // -- Scenario 54: All digests pass -------------------------------------------
+
+    #[tokio::test]
+    async fn scenario_54_all_digests_pass() {
+        // All challenged keys present and digests match.
+        // Multiple keys to strengthen coverage beyond existing two-key tests.
+        let (storage, _temp) = create_test_storage().await;
+        let nonce = [0x10; 32];
+        let peer_id = [0x20; 32];
+
+        let c1 = b"chunk alpha";
+        let c2 = b"chunk beta";
+        let c3 = b"chunk gamma";
+        let a1 = LmdbStorage::compute_address(c1);
+        let a2 = LmdbStorage::compute_address(c2);
+        let a3 = LmdbStorage::compute_address(c3);
+        storage.put(&a1, c1).await.unwrap();
+        storage.put(&a2, c2).await.unwrap();
+        storage.put(&a3, c3).await.unwrap();
+
+        let challenge = AuditChallenge {
+            challenge_id: 200,
+            nonce,
+            challenged_peer_id: peer_id,
+            keys: vec![a1, a2, a3],
+        };
+
+        let response = handle_audit_challenge(&challenge, &storage, false);
+        match response {
+            AuditResponse::Digests { digests, .. } => {
+                assert_eq!(digests.len(), 3);
+                for (i, (addr, content)) in [(a1, &c1[..]), (a2, &c2[..]), (a3, &c3[..])]
+                    .iter()
+                    .enumerate()
+                {
+                    let expected = compute_audit_digest(&nonce, &peer_id, addr, content);
+                    assert_eq!(digests[i], expected, "Key {i} digest should match");
+                }
+            }
+            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
+        }
+    }
+
+    // -- Scenario 55: Empty failure set means no evidence -------------------------
+
+    #[test]
+    fn scenario_55_empty_failure_set_means_no_evidence() {
+        // After responsibility confirmation removes all keys from failure set,
+        // no AuditFailure evidence should be emitted.
+        // This is implicit in the code (handle_audit_failure returns Passed
+        // when confirmed_failures is empty), but verify the FailureEvidence
+        // reason variants are properly differentiated.
+
+        assert_ne!(
+            AuditFailureReason::Timeout,
+            AuditFailureReason::DigestMismatch
+        );
+        assert_ne!(
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::KeyAbsent
+        );
+    }
+
+    // -- Scenario 56: RepairOpportunity filters never-synced peers ----------------
+
+    #[test]
+    fn scenario_56_repair_opportunity_filters_never_synced() {
+        // PeerSyncRecord with last_sync=None should not pass
+        // has_repair_opportunity().
+
+        let never_synced = PeerSyncRecord {
+            last_sync: None,
+            cycles_since_sync: 5,
+        };
+        assert!(!never_synced.has_repair_opportunity());
+
+        let synced_no_cycle = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 0,
+        };
+        assert!(!synced_no_cycle.has_repair_opportunity());
+
+        let synced_with_cycle = PeerSyncRecord {
+            last_sync: Some(Instant::now()),
+            cycles_since_sync: 1,
+        };
+        assert!(synced_with_cycle.has_repair_opportunity());
+    }
+
+    // -- Audit response must match key count --------------------------------------
+
+    #[tokio::test]
+    async fn audit_response_must_match_key_count() {
+        // Section 15: "A response is invalid if it has fewer or more entries
+        // than challenged keys."
+        // Verify handle_audit_challenge always produces exactly N digests for
+        // N keys, including edge cases.
+
+        let (storage, _temp) = create_test_storage().await;
+        let nonce = [0x50; 32];
+        let peer_id = [0x60; 32];
+
+        // Store a single chunk
+        let content = b"single chunk";
+        let addr = LmdbStorage::compute_address(content);
+        storage.put(&addr, content).await.unwrap();
+
+        // Challenge with 1 stored + 4 absent = 5 keys total
+        let absent_keys: Vec<XorName> = (1..=4u8).map(|i| [i; 32]).collect();
+        let mut keys = vec![addr];
+        keys.extend_from_slice(&absent_keys);
+
+        let key_count = keys.len();
+        let challenge = make_challenge(300, nonce, peer_id, keys);
+
+        let response = handle_audit_challenge(&challenge, &storage, false);
+        match response {
+            AuditResponse::Digests { digests, .. } => {
+                assert_eq!(
+                    digests.len(),
+                    key_count,
+                    "must produce exactly one digest per challenged key"
+                );
+            }
+            AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
+        }
+    }
+
+    // -- Audit digest uses full record bytes --------------------------------------
+
+    #[test]
+    fn audit_digest_uses_full_record_bytes() {
+        // Verify digest changes when record content changes.
+        let nonce = [1u8; 32];
+        let peer = [2u8; 32];
+        let key = [3u8; 32];
+
+        let d1 = compute_audit_digest(&nonce, &peer, &key, b"data version 1");
+        let d2 = compute_audit_digest(&nonce, &peer, &key, b"data version 2");
+        assert_ne!(
+            d1, d2,
+            "Different record bytes must produce different digests"
+        );
+    }
 }

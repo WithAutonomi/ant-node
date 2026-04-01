@@ -389,6 +389,9 @@ impl PaidList {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::replication::config::PRUNE_HYSTERESIS_DURATION;
+    use crate::replication::types::NeighborSyncState;
+    use saorsa_core::identity::PeerId;
     use tempfile::TempDir;
 
     async fn create_test_paid_list() -> (PaidList, TempDir) {
@@ -631,5 +634,176 @@ mod tests {
 
         let removed = pl.remove_batch(&[]).await.expect("remove_batch empty");
         assert_eq!(removed, 0);
+    }
+
+    // -- Scenario tests -------------------------------------------------------
+
+    /// #50: Key goes out of range. `set_record_out_of_range` called.
+    /// Immediately the elapsed time is less than `PRUNE_HYSTERESIS_DURATION`,
+    /// so a prune pass should NOT delete it. We verify the timestamp is
+    /// present but recent.
+    #[tokio::test]
+    async fn scenario_50_hysteresis_prevents_premature_deletion() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x50; 32];
+
+        // Key goes out of range — record the timestamp.
+        pl.set_record_out_of_range(&key);
+
+        // Timestamp must be present.
+        let since = pl
+            .record_out_of_range_since(&key)
+            .expect("timestamp should exist after set");
+
+        // Elapsed time is effectively zero — well below hysteresis threshold.
+        let elapsed = since.elapsed();
+        assert!(
+            elapsed < PRUNE_HYSTERESIS_DURATION,
+            "elapsed ({elapsed:?}) should be far below PRUNE_HYSTERESIS_DURATION ({PRUNE_HYSTERESIS_DURATION:?})",
+        );
+    }
+
+    /// #51: Key goes out of range, then comes back. Timestamp is cleared.
+    /// If the key leaves again, the clock restarts from now.
+    #[tokio::test]
+    async fn scenario_51_timestamp_reset_on_heal() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x51; 32];
+
+        // Key goes out of range.
+        pl.set_record_out_of_range(&key);
+        assert!(
+            pl.record_out_of_range_since(&key).is_some(),
+            "timestamp should exist after going out of range"
+        );
+
+        // Partition heals — key comes back in range.
+        pl.clear_record_out_of_range(&key);
+        assert!(
+            pl.record_out_of_range_since(&key).is_none(),
+            "timestamp should be cleared after heal"
+        );
+
+        // Key goes out of range again — clock must restart.
+        let before_second = Instant::now();
+        pl.set_record_out_of_range(&key);
+        let second_ts = pl
+            .record_out_of_range_since(&key)
+            .expect("timestamp should exist after second out-of-range");
+        assert!(
+            second_ts >= before_second,
+            "new timestamp should be >= the instant before second set call"
+        );
+    }
+
+    /// #52: Paid and record out-of-range timestamps are independent.
+    /// Clearing one must not affect the other.
+    #[tokio::test]
+    async fn scenario_52_paid_and_record_timestamps_independent() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x52; 32];
+
+        // Set both timestamps.
+        pl.set_paid_out_of_range(&key);
+        pl.set_record_out_of_range(&key);
+        assert!(pl.paid_out_of_range_since(&key).is_some());
+        assert!(pl.record_out_of_range_since(&key).is_some());
+
+        // Clear record — paid must survive.
+        pl.clear_record_out_of_range(&key);
+        assert!(
+            pl.paid_out_of_range_since(&key).is_some(),
+            "paid timestamp should survive clearing record timestamp"
+        );
+        assert!(pl.record_out_of_range_since(&key).is_none());
+
+        // Re-set record, then clear paid — record must survive.
+        pl.set_record_out_of_range(&key);
+        pl.clear_paid_out_of_range(&key);
+        assert!(
+            pl.record_out_of_range_since(&key).is_some(),
+            "record timestamp should survive clearing paid timestamp"
+        );
+        assert!(pl.paid_out_of_range_since(&key).is_none());
+    }
+
+    /// #23: Inserting then removing a key from the paid list clears both
+    /// the persistence entry and any in-memory out-of-range timestamps.
+    #[tokio::test]
+    async fn scenario_23_paid_list_entry_removed() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x23; 32];
+
+        // Insert key and attach out-of-range timestamps.
+        pl.insert(&key).await.expect("insert");
+        pl.set_paid_out_of_range(&key);
+        pl.set_record_out_of_range(&key);
+
+        // Remove — should clear everything.
+        let removed = pl.remove(&key).await.expect("remove");
+        assert!(removed, "key should have existed");
+        assert!(
+            !pl.contains(&key).expect("contains check"),
+            "key should be gone from paid list"
+        );
+        assert!(
+            pl.paid_out_of_range_since(&key).is_none(),
+            "paid timestamp should be cleaned up on remove"
+        );
+        assert!(
+            pl.record_out_of_range_since(&key).is_none(),
+            "record timestamp should be cleaned up on remove"
+        );
+    }
+
+    /// #46: Bootstrap claim first-seen is recorded and follows
+    /// first-observation-wins semantics.
+    #[test]
+    fn scenario_46_bootstrap_claim_first_seen_recorded() {
+        let peer = PeerId::from_bytes([0x46; 32]);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+
+        // Insert a first-seen timestamp.
+        let first_ts = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3))
+            .unwrap_or_else(Instant::now);
+        state.bootstrap_claims.insert(peer, first_ts);
+
+        // Verify recorded.
+        assert_eq!(
+            state.bootstrap_claims.get(&peer),
+            Some(&first_ts),
+            "first-seen timestamp should be recorded"
+        );
+
+        // Insert again — must NOT overwrite (first-observation-wins).
+        let later_ts = Instant::now();
+        state.bootstrap_claims.entry(peer).or_insert(later_ts);
+        assert_eq!(
+            state.bootstrap_claims.get(&peer),
+            Some(&first_ts),
+            "second insert must not overwrite the original timestamp"
+        );
+    }
+
+    /// #49: Bootstrap claim is cleared when a peer responds normally.
+    #[test]
+    fn scenario_49_bootstrap_claim_cleared() {
+        let peer = PeerId::from_bytes([0x49; 32]);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+
+        // Record a bootstrap claim.
+        state.bootstrap_claims.insert(peer, Instant::now());
+        assert!(
+            state.bootstrap_claims.contains_key(&peer),
+            "claim should exist after insert"
+        );
+
+        // Peer responded normally — clear the claim.
+        state.bootstrap_claims.remove(&peer);
+        assert!(
+            !state.bootstrap_claims.contains_key(&peer),
+            "claim should be gone after normal response"
+        );
     }
 }

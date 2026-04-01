@@ -10,7 +10,8 @@ use ant_node::client::compute_address;
 use ant_node::replication::config::REPLICATION_PROTOCOL_ID;
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
-    ReplicationMessage, ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
+    FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
+    ReplicationMessageBody, VerificationRequest, ABSENT_KEY_DIGEST,
 };
 use serial_test::serial;
 use std::time::Duration;
@@ -459,6 +460,258 @@ async fn test_verification_with_paid_list_check() {
     } else {
         panic!("Expected VerificationResponse");
     }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Fresh write with empty `PoP` rejected (Section 18 #2).
+///
+/// Send a `FreshReplicationOffer` with an empty `proof_of_payment` and
+/// verify the receiver rejects it without storing the chunk.
+#[tokio::test]
+#[serial]
+async fn test_fresh_offer_with_empty_pop_rejected() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
+
+    let content = b"invalid pop test";
+    let address = ant_node::client::compute_address(content);
+
+    // Send fresh offer with EMPTY PoP
+    let offer = FreshReplicationOffer {
+        key: address,
+        data: content.to_vec(),
+        proof_of_payment: vec![], // Empty!
+    };
+    let msg = ReplicationMessage {
+        request_id: 1000,
+        body: ReplicationMessageBody::FreshReplicationOffer(offer),
+    };
+    let encoded = msg.encode().expect("encode");
+
+    let response = p2p_b
+        .send_request(
+            &peer_a,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("send_request");
+
+    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    match resp_msg.body {
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            reason,
+            ..
+        }) => {
+            assert!(
+                reason.contains("proof of payment") || reason.contains("Missing"),
+                "Should mention missing PoP, got: {reason}"
+            );
+        }
+        other => panic!("Expected Rejected, got: {other:?}"),
+    }
+
+    // Verify chunk was NOT stored
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
+    assert!(
+        !protocol_a.storage().exists(&address).unwrap_or(false),
+        "Chunk should not be stored with empty PoP"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Neighbor sync request returns a sync response (Section 18 #5/#37).
+///
+/// Send a `NeighborSyncRequest` from one node to another and verify we
+/// receive a well-formed `NeighborSyncResponse`.
+#[tokio::test]
+#[serial]
+async fn test_neighbor_sync_request_returns_hints() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
+
+    // Store something on A so it has hints to share
+    let content = b"sync test data";
+    let address = ant_node::client::compute_address(content);
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
+    protocol_a
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put");
+
+    // Send sync request
+    let request = NeighborSyncRequest {
+        replica_hints: vec![],
+        paid_hints: vec![],
+        bootstrapping: false,
+    };
+    let msg = ReplicationMessage {
+        request_id: 2000,
+        body: ReplicationMessageBody::NeighborSyncRequest(request),
+    };
+    let encoded = msg.encode().expect("encode");
+
+    let response = p2p_b
+        .send_request(
+            &peer_a,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("send_request");
+
+    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    match resp_msg.body {
+        ReplicationMessageBody::NeighborSyncResponse(resp) => {
+            // Node A should return a sync response (may or may not contain hints
+            // depending on whether B is in A's close group for any keys)
+            assert!(!resp.bootstrapping, "Node A shouldn't claim bootstrapping");
+            // The response is valid -- that's the main assertion
+        }
+        other => panic!("Expected NeighborSyncResponse, got: {other:?}"),
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Audit challenge with multiple keys, some present and some absent
+/// (Section 18 #11).
+///
+/// Challenge a node with three keys (two stored, one missing) and verify
+/// per-key digest correctness.
+#[tokio::test]
+#[serial]
+async fn test_audit_challenge_multi_key() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol_a");
+
+    // Store two chunks on A
+    let c1 = b"audit multi key 1";
+    let c2 = b"audit multi key 2";
+    let a1 = ant_node::client::compute_address(c1);
+    let a2 = ant_node::client::compute_address(c2);
+    protocol_a.storage().put(&a1, c1).await.expect("put 1");
+    protocol_a.storage().put(&a2, c2).await.expect("put 2");
+
+    let absent_key = [0xCC; 32];
+    let peer_a = *p2p_a.peer_id();
+    let nonce = [0x55; 32];
+
+    let challenge = AuditChallenge {
+        challenge_id: 3000,
+        nonce,
+        challenged_peer_id: *peer_a.as_bytes(),
+        keys: vec![a1, absent_key, a2],
+    };
+    let msg = ReplicationMessage {
+        request_id: 3000,
+        body: ReplicationMessageBody::AuditChallenge(challenge),
+    };
+    let encoded = msg.encode().expect("encode");
+
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let response = p2p_b
+        .send_request(
+            &peer_a,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("send_request");
+
+    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    if let ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+        challenge_id,
+        digests,
+    }) = resp_msg.body
+    {
+        assert_eq!(challenge_id, 3000);
+        assert_eq!(digests.len(), 3);
+
+        // Key 1 -- correct digest
+        let expected_1 = compute_audit_digest(&nonce, peer_a.as_bytes(), &a1, c1);
+        assert_eq!(digests[0], expected_1, "First key digest should match");
+
+        // Key 2 -- absent sentinel
+        assert_eq!(
+            digests[1], ABSENT_KEY_DIGEST,
+            "Absent key should be sentinel"
+        );
+
+        // Key 3 -- correct digest
+        let expected_2 = compute_audit_digest(&nonce, peer_a.as_bytes(), &a2, c2);
+        assert_eq!(digests[2], expected_2, "Third key digest should match");
+    } else {
+        panic!("Expected AuditResponse::Digests");
+    }
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Fetch returns `NotFound` for a zeroed-out key (variant of the basic
+/// not-found test).
+///
+/// Request a key that is all zeros -- not a valid content address -- and
+/// verify the response is `FetchResponse::NotFound`.
+#[tokio::test]
+#[serial]
+async fn test_fetch_returns_error_for_corrupt_key() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_a = node_a.p2p_node.as_ref().expect("p2p_a");
+    let peer_a = *p2p_a.peer_id();
+
+    let fake_key = [0x00; 32];
+    let request = FetchRequest { key: fake_key };
+    let msg = ReplicationMessage {
+        request_id: 4000,
+        body: ReplicationMessageBody::FetchRequest(request),
+    };
+    let encoded = msg.encode().expect("encode");
+
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let response = p2p_b
+        .send_request(
+            &peer_a,
+            REPLICATION_PROTOCOL_ID,
+            encoded,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("send_request");
+
+    let resp_msg = ReplicationMessage::decode(&response.data).expect("decode");
+    assert!(
+        matches!(
+            resp_msg.body,
+            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { .. })
+        ),
+        "Expected NotFound for non-existent key"
+    );
 
     harness.teardown().await.expect("teardown");
 }
