@@ -1309,6 +1309,87 @@ mod tests {
         }
     }
 
+    /// Scenario 44: Paid-list cold-start recovery via replica majority.
+    ///
+    /// Multiple nodes restart simultaneously and lose their `PaidForList`
+    /// (persistence corrupted). Key `K` still has `>= QuorumNeeded(K)`
+    /// replicas in the close group. During neighbor-sync verification,
+    /// presence quorum passes and all verifying nodes re-derive `K` into
+    /// their `PaidForList` via close-group replica majority (Section 7.2
+    /// rule 4).
+    ///
+    /// This test verifies that when paid-list evidence is entirely
+    /// `NotFound` (simulating data loss) but presence evidence meets
+    /// quorum, the outcome is `QuorumVerified` with sources that enable
+    /// `PaidForList` re-derivation.
+    #[test]
+    fn scenario_44_cold_start_recovery_via_replica_majority() {
+        let key = xor_name_from_byte(0xD9);
+        let config = ReplicationConfig::default();
+
+        // 7 quorum peers, quorum_needed = min(4, floor(7/2)+1) = 4.
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        // 10 paid peers (wider group), confirm_needed = floor(10/2)+1 = 6.
+        let paid_peers: Vec<PeerId> = (10..=19).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        // Cold-start scenario: ALL paid-list entries are lost across every
+        // peer in PaidCloseGroup. Every paid peer reports NotFound.
+        let paid_evidence: Vec<(PeerId, PaidListEvidence)> = paid_peers
+            .iter()
+            .map(|p| (*p, PaidListEvidence::NotFound))
+            .collect();
+
+        // But the replicas still exist: 5 out of 7 quorum peers report
+        // Present (>= QuorumNeeded(K) = 4).
+        let presence_evidence = vec![
+            (quorum_peers[0], PresenceEvidence::Present),
+            (quorum_peers[1], PresenceEvidence::Present),
+            (quorum_peers[2], PresenceEvidence::Present),
+            (quorum_peers[3], PresenceEvidence::Present),
+            (quorum_peers[4], PresenceEvidence::Present),
+            (quorum_peers[5], PresenceEvidence::Absent),
+            (quorum_peers[6], PresenceEvidence::Absent),
+        ];
+
+        let evidence = build_evidence(presence_evidence, paid_evidence);
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+
+        match outcome {
+            KeyVerificationOutcome::QuorumVerified { ref sources } => {
+                // Quorum passed despite total paid-list loss. The caller
+                // re-derives PaidForList from close-group replica majority.
+                assert!(
+                    sources.len() >= 4,
+                    "QuorumVerified should have >= 4 sources (the presence-positive peers), got {}",
+                    sources.len()
+                );
+
+                // Verify the specific Present peers are in sources.
+                for i in 0..5 {
+                    assert!(
+                        sources.contains(&quorum_peers[i]),
+                        "quorum_peer[{i}] responded Present and should be a fetch source"
+                    );
+                }
+
+                // Absent peers are NOT sources.
+                assert!(
+                    !sources.contains(&quorum_peers[5]),
+                    "absent peer should not be a fetch source"
+                );
+                assert!(
+                    !sources.contains(&quorum_peers[6]),
+                    "absent peer should not be a fetch source"
+                );
+            }
+            other => panic!(
+                "Cold-start recovery should succeed via replica majority \
+                 (QuorumVerified), got {other:?}"
+            ),
+        }
+    }
+
     /// Scenario 20: Unknown replica key found in local `PaidForList` bypasses
     /// presence quorum.
     ///

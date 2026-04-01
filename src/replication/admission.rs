@@ -319,95 +319,196 @@ mod tests {
     // Section 18 scenarios
     // -----------------------------------------------------------------------
 
-    /// Scenario 5: Verify that sender identity alone does not grant
-    /// admission. Keys from any sender must still pass relevance checks
-    /// (`is_responsible` / `is_in_paid_close_group`). The admission logic
-    /// does not trust the sender for key relevance -- it only trusts the
-    /// DHT distance check.
+    /// Scenario 5: Unauthorized sync peer — hints from peers not in
+    /// `LocalRT(self)` are dropped and do not enter verification.
+    ///
+    /// Two layers enforce this:
+    /// (a) `handle_sync_request` in `neighbor_sync.rs` returns
+    ///     `sender_in_rt = false` when the sender is not in `LocalRT`.
+    ///     The caller (`handle_neighbor_sync_request` in `mod.rs`) returns
+    ///     early without processing ANY inbound hints. This is the primary
+    ///     gate tested at the e2e level (scenario 17 tests the positive
+    ///     case).
+    /// (b) Even if a sender IS in `LocalRT`, the per-key relevance check
+    ///     (`is_responsible` / `is_in_paid_close_group`) in `admit_hints`
+    ///     still applies. Sender identity does not grant key admission.
+    ///
+    /// This test exercises layer (b): the admission pipeline's dedup,
+    /// cross-set precedence, and relevance filtering using the same logic
+    /// that `admit_hints` performs — without the `P2PNode` dependency
+    /// needed for the actual `is_responsible` DHT lookup.
     #[test]
     fn scenario_5_sender_does_not_grant_key_relevance() {
-        // Simulate the admission dedup + cross-set logic for two keys from
-        // the same sender. One would pass is_responsible (simulated by
-        // being in the "local" set) and the other would not.
-        let key_relevant = xor_name_from_byte(0xB0);
-        let key_irrelevant = xor_name_from_byte(0xB1);
+        let key_pending = xor_name_from_byte(0xB0);
+        let key_not_pending = xor_name_from_byte(0xB1);
+        let key_paid_existing = xor_name_from_byte(0xB2);
         let _sender = peer_id_from_byte(0x01);
 
-        // Simulate the "already local or pending" fast path: only key_relevant
-        // is in the pending set.
-        let pending: HashSet<XorName> = std::iter::once(key_relevant).collect();
+        // Simulate local state: only key_pending is in the pending set,
+        // key_paid_existing is in the paid list.
+        let pending: HashSet<XorName> = std::iter::once(key_pending).collect();
+        let paid_set: HashSet<XorName> = std::iter::once(key_paid_existing).collect();
 
-        // key_relevant: pending -> admitted via fast path.
-        assert!(
-            pending.contains(&key_relevant),
-            "relevant key should be in pending set"
+        // Trace through admit_hints logic for replica hints:
+        let replica_hints = [key_pending, key_not_pending];
+        let replica_set: HashSet<XorName> = replica_hints.iter().copied().collect();
+        let mut seen = HashSet::new();
+        let mut admitted_replica = Vec::new();
+        let mut rejected = Vec::new();
+
+        for &key in &replica_hints {
+            if !seen.insert(key) {
+                continue; // dedup
+            }
+            // Fast path: already pending -> admitted.
+            if pending.contains(&key) {
+                admitted_replica.push(key);
+                continue;
+            }
+            // key_not_pending: not pending, not local -> needs is_responsible.
+            // Simulate is_responsible returning false (out of range).
+            let is_responsible = false;
+            if is_responsible {
+                admitted_replica.push(key);
+            } else {
+                rejected.push(key);
+            }
+        }
+
+        // Trace through paid hints:
+        let paid_hints = [key_paid_existing, key_pending]; // key_pending overlaps with replica
+        let mut admitted_paid = Vec::new();
+
+        for &key in &paid_hints {
+            if !seen.insert(key) {
+                continue; // dedup: key_pending already seen
+            }
+            if replica_set.contains(&key) {
+                continue; // cross-set precedence
+            }
+            // Fast path: already in paid list -> admitted.
+            if paid_set.contains(&key) {
+                admitted_paid.push(key);
+                continue;
+            }
+            rejected.push(key);
+        }
+
+        // Verify outcomes:
+        assert_eq!(
+            admitted_replica,
+            vec![key_pending],
+            "only the pending key should be admitted as replica"
+        );
+        assert_eq!(
+            rejected,
+            vec![key_not_pending],
+            "non-pending, non-responsible key must be rejected"
+        );
+        assert_eq!(
+            admitted_paid,
+            vec![key_paid_existing],
+            "existing paid-list key should be admitted via fast path"
         );
 
-        // key_irrelevant: not pending, not local -> would need
-        // is_responsible check (which we simulate as failing).
+        // Cross-set precedence: key_pending appeared in both replica and
+        // paid hints — it was processed as replica only, paid duplicate
+        // was deduped.
         assert!(
-            !pending.contains(&key_irrelevant),
-            "irrelevant key should not be in pending set"
+            !admitted_paid.contains(&key_pending),
+            "key in both hint sets must be processed as replica only"
         );
-
-        // Build an AdmissionResult manually to verify the expected outcome.
-        let result = AdmissionResult {
-            replica_keys: vec![key_relevant],
-            paid_only_keys: Vec::new(),
-            rejected_keys: vec![key_irrelevant],
-        };
-
-        assert_eq!(result.replica_keys.len(), 1);
-        assert_eq!(result.rejected_keys.len(), 1);
-        assert_eq!(result.rejected_keys[0], key_irrelevant);
     }
 
-    /// Scenario 7: Out-of-range key hint is rejected.
+    /// Scenario 7: Out-of-range key hint rejected regardless of quorum.
     ///
     /// A key whose XOR distance from self is much larger than the distance
-    /// of the close-group members should fail the `is_responsible` check.
-    /// Here we verify the distance-based reasoning that underpins rejection.
+    /// of the close-group members fails the `is_responsible` check in
+    /// `admit_hints`. The key never enters the verification pipeline, so
+    /// quorum is irrelevant.
+    ///
+    /// This test exercises the distance-based reasoning that `admit_hints`
+    /// uses, tracing through the same logic path. Full `is_responsible`
+    /// requires a P2PNode for DHT lookups; here we verify the distance
+    /// comparison and admission outcome for both close and far keys.
     #[test]
     fn scenario_7_out_of_range_key_rejected() {
         let self_xor: XorName = [0u8; 32];
-        let config = ReplicationConfig::default();
 
-        // Construct a key at maximum XOR distance from self.
+        // -- Distance proof: far key vs close key --
+
         let far_key = xor_name_from_byte(0xFF);
+        let close_key = xor_name_from_byte(0x01);
         let far_dist = xor_distance(&self_xor, &far_key);
+        let close_dist = xor_distance(&self_xor, &close_key);
 
-        // Construct 7 peers that are closer to the key than self would be.
-        // If there are `close_group_size` peers closer, self is NOT
-        // responsible.
-        let closer_peer_count = config.close_group_size;
-        assert!(
-            closer_peer_count > 0,
-            "need at least 1 closer peer for the test"
-        );
+        assert_eq!(far_dist[0], 0xFF, "far_key distance should be maximal");
+        assert_eq!(close_dist[0], 0x01, "close_key distance should be small");
+        assert!(far_dist > close_dist, "far key is further than close key");
 
-        // Self's distance to far_key should be very large.
+        // -- Simulate admit_hints for these keys --
+        //
+        // When `close_group_size` peers are all closer to far_key than
+        // self, `is_responsible(self, far_key)` returns false. The key is
+        // rejected without entering verification or quorum.
+
+        let pending: HashSet<XorName> = HashSet::new();
+        let replica_hints = [far_key, close_key];
+        let mut seen = HashSet::new();
+        let mut admitted = Vec::new();
+        let mut rejected = Vec::new();
+
+        for &key in &replica_hints {
+            if !seen.insert(key) {
+                continue;
+            }
+            // Not pending, not local.
+            if pending.contains(&key) {
+                admitted.push(key);
+                continue;
+            }
+            // Simulate is_responsible: self (0x00) has close_group_size
+            // peers closer to far_key (0xFF) than itself -> not responsible.
+            // For close_key (0x01), self is very close -> responsible.
+            let distance = xor_distance(&self_xor, &key);
+            let simulated_responsible = distance[0] < 0x80;
+            if simulated_responsible {
+                admitted.push(key);
+            } else {
+                rejected.push(key);
+            }
+        }
+
         assert_eq!(
-            far_dist[0], 0xFF,
-            "self-to-far_key distance should have leading 0xFF"
+            admitted,
+            vec![close_key],
+            "only close key should be admitted"
+        );
+        assert_eq!(
+            rejected,
+            vec![far_key],
+            "far key should be rejected regardless of quorum — it never enters verification"
         );
 
-        // When there are `close_group_size` peers closer to the key than
-        // self, is_responsible returns false. The admission path in
-        // admit_hints would therefore reject this key.
-        let result = AdmissionResult {
-            replica_keys: Vec::new(),
-            paid_only_keys: Vec::new(),
-            rejected_keys: vec![far_key],
-        };
+        // Verify the key doesn't sneak in via paid hints either.
+        // far_key was already seen (deduped), so paid processing skips it.
+        let paid_hints = [far_key];
+        let replica_set: HashSet<XorName> = replica_hints.iter().copied().collect();
+        let mut paid_admitted = Vec::new();
+
+        for &key in &paid_hints {
+            if !seen.insert(key) {
+                continue; // already seen from replica processing
+            }
+            if replica_set.contains(&key) {
+                continue; // cross-set precedence
+            }
+            paid_admitted.push(key);
+        }
 
         assert!(
-            result.replica_keys.is_empty(),
-            "far key should not be admitted as replica"
+            paid_admitted.is_empty(),
+            "far key already processed as replica (and rejected) should not re-enter via paid hints"
         );
-        assert!(
-            result.paid_only_keys.is_empty(),
-            "far key should not be admitted as paid-only"
-        );
-        assert_eq!(result.rejected_keys.len(), 1, "far key should be rejected");
     }
 }

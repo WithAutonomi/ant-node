@@ -1330,14 +1330,14 @@ async fn scenario_25_paid_list_convergence_via_verification() {
 }
 
 // =========================================================================
-// Section 18, Scenario #44: Cold-start recovery
+// Section 18, Scenario #43: Paid-list persistence across restart
 // =========================================================================
 
 /// `PaidForList` survives restart: keys inserted before shutdown are found
-/// when the list is reopened from the same data directory (Section 18 #44).
+/// when the list is reopened from the same data directory (Section 18 #43).
 #[tokio::test]
 #[serial]
-async fn scenario_44_paid_list_survives_restart() {
+async fn scenario_43_paid_list_persists_across_restart() {
     let mut harness = TestHarness::setup_minimal().await.expect("setup");
 
     let data_dir = {
