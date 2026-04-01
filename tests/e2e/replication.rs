@@ -61,8 +61,15 @@ async fn test_fresh_replication_propagates_to_close_group() {
     let address = compute_address(content);
     source_storage.put(&address, content).await.expect("put");
 
-    // Pre-populate payment cache so the store is considered paid
-    source_protocol.payment_verifier().cache_insert(address);
+    // Pre-populate payment cache on ALL nodes so receivers accept the offer
+    // (bypasses EVM verification, which is unavailable without Anvil).
+    for i in 0..harness.node_count() {
+        if let Some(node) = harness.test_node(i) {
+            if let Some(protocol) = &node.ant_protocol {
+                protocol.payment_verifier().cache_insert(address);
+            }
+        }
+    }
 
     // Trigger fresh replication with a dummy PoP
     let dummy_pop = [0x01u8; 64];
@@ -666,8 +673,15 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
     let address = compute_address(content);
     storage.put(&address, content).await.expect("put");
 
-    // Pre-populate payment cache so the store is considered paid
-    protocol.payment_verifier().cache_insert(address);
+    // Pre-populate payment cache on ALL nodes so receivers accept the offer
+    // (bypasses EVM verification, which is unavailable without Anvil).
+    for i in 0..harness.node_count() {
+        if let Some(node) = harness.test_node(i) {
+            if let Some(p) = &node.ant_protocol {
+                p.payment_verifier().cache_insert(address);
+            }
+        }
+    }
 
     // Trigger fresh replication (sends FreshReplicationOffer + PaidNotify)
     let dummy_pop = [0x01u8; 64];
@@ -1211,7 +1225,16 @@ async fn scenario_24_fresh_replication_propagates_paid_notify() {
         .put(&address, content)
         .await
         .expect("put");
-    protocol.payment_verifier().cache_insert(address);
+
+    // Pre-populate payment cache on ALL nodes so receivers accept the offer
+    // and PaidNotify (bypasses EVM verification, unavailable without Anvil).
+    for i in 0..harness.node_count() {
+        if let Some(node) = harness.test_node(i) {
+            if let Some(p) = &node.ant_protocol {
+                p.payment_verifier().cache_insert(address);
+            }
+        }
+    }
 
     // Trigger fresh replication (includes PaidNotify to PaidCloseGroup)
     let dummy_pop = [0x01u8; 64];

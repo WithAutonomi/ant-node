@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use rand::Rng;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -108,6 +108,8 @@ pub struct ReplicationEngine {
     bootstrap_state: Arc<RwLock<BootstrapState>>,
     /// Whether this node is currently bootstrapping.
     is_bootstrapping: Arc<RwLock<bool>>,
+    /// Trigger for early neighbor sync (signalled on topology changes).
+    sync_trigger: Arc<Notify>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -153,6 +155,7 @@ impl ReplicationEngine {
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
             is_bootstrapping: Arc::new(RwLock::new(true)),
+            sync_trigger: Arc::new(Notify::new()),
             shutdown,
             task_handles: Vec::new(),
         })
@@ -224,7 +227,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
         let sync_history = Arc::clone(&self.sync_history);
-        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -277,6 +280,12 @@ impl ReplicationEngine {
                                 }
                             }
                             // Gap 4: Topology churn handling (Section 13).
+                            //
+                            // Signal the neighbor sync loop to run early rather
+                            // than running the sync round inline. Running it
+                            // here would block the message handler on
+                            // `send_request()` calls, deadlocking when
+                            // multiple nodes trigger sync simultaneously.
                             P2PEvent::PeerConnected(peer_id, _addr) => {
                                 let kind = classify_topology_event(
                                     &peer_id, &p2p, &config,
@@ -286,17 +295,7 @@ impl ReplicationEngine {
                                         "Close-group churn detected (connected {peer_id}), \
                                          triggering early neighbor sync"
                                     );
-                                    run_neighbor_sync_round(
-                                        &p2p,
-                                        &storage,
-                                        &paid_list,
-                                        &queues,
-                                        &config,
-                                        &sync_state,
-                                        &sync_history,
-                                        &is_bootstrapping,
-                                        &bootstrap_state,
-                                    ).await;
+                                    sync_trigger.notify_one();
                                 }
                             }
                             P2PEvent::PeerDisconnected(peer_id) => {
@@ -308,17 +307,7 @@ impl ReplicationEngine {
                                         "Close-group churn detected (disconnected {peer_id}), \
                                          triggering early neighbor sync"
                                     );
-                                    run_neighbor_sync_round(
-                                        &p2p,
-                                        &storage,
-                                        &paid_list,
-                                        &queues,
-                                        &config,
-                                        &sync_state,
-                                        &sync_history,
-                                        &is_bootstrapping,
-                                        &bootstrap_state,
-                                    ).await;
+                                    sync_trigger.notify_one();
                                 }
                             }
                             P2PEvent::Message { .. } => {}
@@ -342,26 +331,30 @@ impl ReplicationEngine {
         let sync_history = Arc::clone(&self.sync_history);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
             loop {
                 let interval = config.random_neighbor_sync_interval();
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(interval) => {
-                        run_neighbor_sync_round(
-                            &p2p,
-                            &storage,
-                            &paid_list,
-                            &queues,
-                            &config,
-                            &sync_state,
-                            &sync_history,
-                            &is_bootstrapping,
-                            &bootstrap_state,
-                        ).await;
+                    () = tokio::time::sleep(interval) => {}
+                    () = sync_trigger.notified() => {
+                        debug!("Neighbor sync triggered by topology change");
                     }
                 }
+                run_neighbor_sync_round(
+                    &p2p,
+                    &storage,
+                    &paid_list,
+                    &queues,
+                    &config,
+                    &sync_state,
+                    &sync_history,
+                    &is_bootstrapping,
+                    &bootstrap_state,
+                )
+                .await;
             }
             debug!("Neighbor sync loop shut down");
         });
@@ -541,6 +534,7 @@ impl ReplicationEngine {
             if neighbors.is_empty() {
                 info!("Bootstrap sync: no close neighbors found, marking drained");
                 bootstrap::mark_bootstrap_drained(&bootstrap_state).await;
+                *is_bootstrapping.write().await = false;
                 return;
             }
 
@@ -602,7 +596,9 @@ impl ReplicationEngine {
             // Check drain condition.
             {
                 let q = queues.read().await;
-                bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await;
+                if bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await {
+                    *is_bootstrapping.write().await = false;
+                }
             }
 
             info!("Bootstrap sync completed");
