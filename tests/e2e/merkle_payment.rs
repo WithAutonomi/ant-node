@@ -22,11 +22,11 @@ use ant_node::compute_address;
 use ant_node::payment::{
     serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use evmlib::common::Amount;
 use evmlib::merkle_payments::{
     MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
     CANDIDATES_PER_POOL,
 };
-use evmlib::quoting_metrics::QuotingMetrics;
 use evmlib::testnet::Testnet;
 use evmlib::RewardsAddress;
 use rand::Rng;
@@ -178,26 +178,16 @@ fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDA
     std::array::from_fn(|i| {
         let ml_dsa = MlDsa65::new();
         let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-        let metrics = QuotingMetrics {
-            data_size: 1024,
-            data_type: 0,
-            close_records_stored: i * 10,
-            records_per_type: vec![],
-            max_records: 500,
-            received_payment_count: 0,
-            live_time: 100,
-            network_density: None,
-            network_size: None,
-        };
+        let price = Amount::from(1024u64);
         #[allow(clippy::cast_possible_truncation)]
         let reward_address = RewardsAddress::new([i as u8; 20]);
-        let msg = MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+        let msg = MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp);
         let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
         let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
         MerklePaymentCandidateNode {
             pub_key: pub_key.as_bytes().to_vec(),
-            quoting_metrics: metrics,
+            price,
             reward_address,
             merkle_payment_timestamp: timestamp,
             signature,

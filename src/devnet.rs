@@ -244,11 +244,8 @@ pub struct DevnetEvmInfo {
     pub wallet_private_key: String,
     /// Payment token contract address.
     pub payment_token_address: String,
-    /// Data payments contract address.
-    pub data_payments_address: String,
-    /// Merkle payments contract address (for batch payments).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merkle_payments_address: Option<String>,
+    /// Unified payment vault contract address (handles both single-node and merkle payments).
+    pub payment_vault_address: String,
 }
 
 /// Network state for devnet startup lifecycle.

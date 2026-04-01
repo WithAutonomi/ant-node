@@ -9,8 +9,8 @@
 
 use crate::error::{Error, Result};
 use crate::payment::metrics::QuotingMetricsTracker;
+use crate::payment::pricing::calculate_price;
 use evmlib::merkle_payments::MerklePaymentCandidateNode;
-use evmlib::quoting_metrics::QuotingMetrics;
 use evmlib::PaymentQuote;
 use evmlib::RewardsAddress;
 use saorsa_core::MlDsa65;
@@ -128,19 +128,15 @@ impl QuoteGenerator {
 
         let timestamp = SystemTime::now();
 
-        // Get current quoting metrics
-        let quoting_metrics = self.metrics_tracker.get_metrics(data_size, data_type);
+        // Calculate price from current record count
+        let price = calculate_price(self.metrics_tracker.records_stored());
 
         // Convert XorName to xor_name::XorName
         let xor_name = xor_name::XorName(content);
 
         // Create bytes for signing (following autonomi's pattern)
-        let bytes = PaymentQuote::bytes_for_signing(
-            xor_name,
-            timestamp,
-            &quoting_metrics,
-            &self.rewards_address,
-        );
+        let bytes =
+            PaymentQuote::bytes_for_signing(xor_name, timestamp, &price, &self.rewards_address);
 
         // Sign the bytes
         let signature = sign_fn(&bytes);
@@ -153,7 +149,7 @@ impl QuoteGenerator {
         let quote = PaymentQuote {
             content: xor_name,
             timestamp,
-            quoting_metrics,
+            price,
             pub_key: self.pub_key.clone(),
             rewards_address: self.rewards_address,
             signature,
@@ -173,10 +169,10 @@ impl QuoteGenerator {
         &self.rewards_address
     }
 
-    /// Get current quoting metrics.
+    /// Get the current number of records stored.
     #[must_use]
-    pub fn current_metrics(&self) -> QuotingMetrics {
-        self.metrics_tracker.get_metrics(0, 0)
+    pub fn records_stored(&self) -> usize {
+        self.metrics_tracker.records_stored()
     }
 
     /// Record a payment received (delegates to metrics tracker).
@@ -214,11 +210,11 @@ impl QuoteGenerator {
             .as_ref()
             .ok_or_else(|| Error::Payment("Quote signing not configured".to_string()))?;
 
-        let quoting_metrics = self.metrics_tracker.get_metrics(data_size, data_type);
+        let price = calculate_price(self.metrics_tracker.records_stored());
 
         // Compute the same bytes_to_sign used by the upstream library
         let msg = MerklePaymentCandidateNode::bytes_to_sign(
-            &quoting_metrics,
+            &price,
             &self.rewards_address,
             merkle_payment_timestamp,
         );
@@ -233,7 +229,7 @@ impl QuoteGenerator {
 
         let candidate = MerklePaymentCandidateNode {
             pub_key: self.pub_key.clone(),
-            quoting_metrics,
+            price,
             reward_address: self.rewards_address,
             merkle_payment_timestamp,
             signature,
@@ -355,7 +351,7 @@ pub fn verify_merkle_candidate_signature(candidate: &MerklePaymentCandidateNode)
     };
 
     let msg = MerklePaymentCandidateNode::bytes_to_sign(
-        &candidate.quoting_metrics,
+        &candidate.price,
         &candidate.reward_address,
         candidate.merkle_payment_timestamp,
     );
@@ -414,6 +410,7 @@ pub fn wire_ml_dsa_signer(
 mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
+    use evmlib::common::Amount;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
 
     fn create_test_generator() -> QuoteGenerator {
@@ -532,29 +529,12 @@ mod tests {
     }
 
     #[test]
-    fn test_current_metrics() {
+    fn test_records_stored() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
         let metrics_tracker = QuotingMetricsTracker::new(500, 50);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        let metrics = generator.current_metrics();
-        assert_eq!(metrics.max_records, 500);
-        assert_eq!(metrics.close_records_stored, 50);
-        assert_eq!(metrics.data_size, 0);
-        assert_eq!(metrics.data_type, 0);
-    }
-
-    #[test]
-    fn test_record_payment_delegation() {
-        let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
-        let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
-
-        generator.record_payment();
-        generator.record_payment();
-
-        let metrics = generator.current_metrics();
-        assert_eq!(metrics.received_payment_count, 2);
+        assert_eq!(generator.records_stored(), 50);
     }
 
     #[test]
@@ -567,8 +547,7 @@ mod tests {
         generator.record_store(1);
         generator.record_store(0);
 
-        let metrics = generator.current_metrics();
-        assert_eq!(metrics.close_records_stored, 3);
+        assert_eq!(generator.records_stored(), 3);
     }
 
     #[test]
@@ -576,17 +555,15 @@ mod tests {
         let generator = create_test_generator();
         let content = [10u8; 32];
 
-        // Data type 0 (chunk)
+        // All data types produce the same price (price depends on records_stored, not data_type)
         let q0 = generator.create_quote(content, 1024, 0).expect("type 0");
-        assert_eq!(q0.quoting_metrics.data_type, 0);
-
-        // Data type 1
         let q1 = generator.create_quote(content, 512, 1).expect("type 1");
-        assert_eq!(q1.quoting_metrics.data_type, 1);
-
-        // Data type 2
         let q2 = generator.create_quote(content, 256, 2).expect("type 2");
-        assert_eq!(q2.quoting_metrics.data_type, 2);
+
+        // All quotes should have a valid price (minimum floor of 1)
+        assert!(q0.price >= Amount::from(1u64));
+        assert!(q1.price >= Amount::from(1u64));
+        assert!(q2.price >= Amount::from(1u64));
     }
 
     #[test]
@@ -594,8 +571,9 @@ mod tests {
         let generator = create_test_generator();
         let content = [11u8; 32];
 
+        // Price depends on records_stored, not data size
         let quote = generator.create_quote(content, 0, 0).expect("zero size");
-        assert_eq!(quote.quoting_metrics.data_size, 0);
+        assert!(quote.price >= Amount::from(1u64));
     }
 
     #[test]
@@ -603,10 +581,11 @@ mod tests {
         let generator = create_test_generator();
         let content = [12u8; 32];
 
+        // Price depends on records_stored, not data size
         let quote = generator
             .create_quote(content, 10_000_000, 0)
             .expect("large size");
-        assert_eq!(quote.quoting_metrics.data_size, 10_000_000);
+        assert!(quote.price >= Amount::from(1u64));
     }
 
     #[test]
@@ -614,17 +593,7 @@ mod tests {
         let quote = PaymentQuote {
             content: xor_name::XorName([0u8; 32]),
             timestamp: SystemTime::now(),
-            quoting_metrics: QuotingMetrics {
-                data_size: 0,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 0,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([0u8; 20]),
             pub_key: vec![],
             signature: vec![],
@@ -722,11 +691,8 @@ mod tests {
         // Verify the timestamp was set correctly
         assert_eq!(candidate.merkle_payment_timestamp, timestamp);
 
-        // Verify metrics match what the tracker would produce
-        assert_eq!(candidate.quoting_metrics.data_size, 2048);
-        assert_eq!(candidate.quoting_metrics.data_type, 0);
-        assert_eq!(candidate.quoting_metrics.max_records, 800);
-        assert_eq!(candidate.quoting_metrics.close_records_stored, 50);
+        // Verify price was calculated from records_stored using the pricing formula
+        assert_eq!(candidate.price, calculate_price(50));
 
         // Verify the public key is the ML-DSA-65 public key (not ed25519)
         assert_eq!(
@@ -763,25 +729,15 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_secs();
-        let metrics = QuotingMetrics {
-            data_size: 4096,
-            data_type: 0,
-            close_records_stored: 10,
-            records_per_type: vec![],
-            max_records: 500,
-            received_payment_count: 3,
-            live_time: 600,
-            network_density: None,
-            network_size: None,
-        };
+        let price = Amount::from(42u64);
 
-        let msg = MerklePaymentCandidateNode::bytes_to_sign(&metrics, &rewards_address, timestamp);
+        let msg = MerklePaymentCandidateNode::bytes_to_sign(&price, &rewards_address, timestamp);
         let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
         let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
         MerklePaymentCandidateNode {
             pub_key: public_key.as_bytes().to_vec(),
-            quoting_metrics: metrics,
+            price,
             reward_address: rewards_address,
             merkle_payment_timestamp: timestamp,
             signature,
@@ -821,12 +777,12 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_merkle_candidate_tampered_metrics() {
+    fn test_verify_merkle_candidate_tampered_price() {
         let mut candidate = make_valid_merkle_candidate();
-        candidate.quoting_metrics.data_size = 999_999;
+        candidate.price = Amount::from(999_999u64);
         assert!(
             !verify_merkle_candidate_signature(&candidate),
-            "Tampered quoting_metrics must invalidate the signature"
+            "Tampered price must invalidate the signature"
         );
     }
 

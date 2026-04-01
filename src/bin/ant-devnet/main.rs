@@ -64,14 +64,11 @@ async fn main() -> color_eyre::Result<()> {
             .default_wallet_private_key()
             .map_err(|e| color_eyre::eyre::eyre!("Failed to get wallet key: {e}"))?;
 
-        let (rpc_url, token_addr, payments_addr, merkle_addr) = match &network {
+        let (rpc_url, token_addr, vault_addr) = match &network {
             evmlib::Network::Custom(custom) => (
                 custom.rpc_url_http.to_string(),
                 format!("{:?}", custom.payment_token_address),
-                format!("{:?}", custom.data_payments_address),
-                custom
-                    .merkle_payments_address
-                    .map(|addr| format!("{addr:?}")),
+                format!("{:?}", custom.payment_vault_address),
             ),
             _ => {
                 return Err(color_eyre::eyre::eyre!(
@@ -93,8 +90,7 @@ async fn main() -> color_eyre::Result<()> {
             rpc_url,
             wallet_private_key: wallet_key,
             payment_token_address: token_addr,
-            data_payments_address: payments_addr,
-            merkle_payments_address: merkle_addr,
+            payment_vault_address: vault_addr,
         })
     } else {
         None

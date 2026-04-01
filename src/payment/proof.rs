@@ -116,11 +116,11 @@ pub fn deserialize_merkle_proof(bytes: &[u8]) -> std::result::Result<MerklePayme
 mod tests {
     use super::*;
     use alloy::primitives::FixedBytes;
+    use evmlib::common::Amount;
     use evmlib::merkle_payments::{
         MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
         CANDIDATES_PER_POOL,
     };
-    use evmlib::quoting_metrics::QuotingMetrics;
     use evmlib::EncodedPeerId;
     use evmlib::PaymentQuote;
     use evmlib::RewardsAddress;
@@ -134,17 +134,7 @@ mod tests {
         PaymentQuote {
             content: XorName::random(&mut rand::thread_rng()),
             timestamp: SystemTime::now(),
-            quoting_metrics: QuotingMetrics {
-                data_size: 1024,
-                data_type: 0,
-                close_records_stored: 0,
-                records_per_type: vec![],
-                max_records: 1000,
-                received_payment_count: 0,
-                live_time: 0,
-                network_density: None,
-                network_size: None,
-            },
+            price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([1u8; 20]),
             pub_key: vec![],
             signature: vec![],
@@ -312,27 +302,17 @@ mod tests {
             std::array::from_fn(|i| {
                 let ml_dsa = MlDsa65::new();
                 let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-                let metrics = QuotingMetrics {
-                    data_size: 1024,
-                    data_type: 0,
-                    close_records_stored: i * 10,
-                    records_per_type: vec![],
-                    max_records: 500,
-                    received_payment_count: 0,
-                    live_time: 100,
-                    network_density: None,
-                    network_size: None,
-                };
+                let price = Amount::from(1024u64);
                 #[allow(clippy::cast_possible_truncation)]
                 let reward_address = RewardsAddress::new([i as u8; 20]);
                 let msg =
-                    MerklePaymentCandidateNode::bytes_to_sign(&metrics, &reward_address, timestamp);
+                    MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp);
                 let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
                 let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
                 MerklePaymentCandidateNode {
                     pub_key: pub_key.as_bytes().to_vec(),
-                    quoting_metrics: metrics,
+                    price,
                     reward_address,
                     merkle_payment_timestamp: timestamp,
                     signature,
