@@ -2285,6 +2285,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.5.0"
+source = "git+https://github.com/WithAutonomi/evmlib/?branch=refactor/unify-payment-vault-v2#f4cdd45ea76a98ced0a416794c92b9b4bc2da224"
 dependencies = [
  "alloy",
  "ant-merkle",
