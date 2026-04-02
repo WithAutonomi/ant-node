@@ -2285,8 +2285,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.5.0"
-source = "git+https://github.com/WithAutonomi/evmlib/?branch=refactor/unify-payment-vault-v2#779b996b9b02e381e67efb9d0770bec7ba0adcd2"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af67fe5494790b75d91fed4c5dd3215098e5adf071f73f40a238d199116c75ac"
 dependencies = [
  "alloy",
  "ant-merkle",
