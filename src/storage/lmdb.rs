@@ -27,8 +27,6 @@ pub struct LmdbStorageConfig {
     pub root_dir: PathBuf,
     /// Whether to verify content on read (compares hash to address).
     pub verify_on_read: bool,
-    /// Maximum number of chunks to store (0 = unlimited).
-    pub max_chunks: usize,
     /// Maximum LMDB map size in bytes (0 = use default of 32 GiB).
     pub max_map_size: usize,
 }
@@ -38,7 +36,6 @@ impl Default for LmdbStorageConfig {
         Self {
             root_dir: PathBuf::from(".ant/chunks"),
             verify_on_read: true,
-            max_chunks: 0,
             max_map_size: 0,
         }
     }
@@ -185,11 +182,10 @@ impl LmdbStorage {
         let value = content.to_vec();
         let env = self.env.clone();
         let db = self.db;
-        let max_chunks = self.config.max_chunks;
 
-        // Existence check, capacity enforcement, and write all happen atomically
-        // inside a single write transaction. LMDB serializes write transactions,
-        // so there are no TOCTOU races or counter-drift issues.
+        // Existence check and write happen atomically inside a single write
+        // transaction. LMDB serializes write transactions, so there are no
+        // TOCTOU races.
         let was_new = spawn_blocking(move || -> Result<bool> {
             let mut wtxn = env
                 .write_txn()
@@ -202,19 +198,6 @@ impl LmdbStorage {
                 .is_some()
             {
                 return Ok(false);
-            }
-
-            // Enforce capacity limit (0 = unlimited)
-            if max_chunks > 0 {
-                let current = db
-                    .stat(&wtxn)
-                    .map_err(|e| Error::Storage(format!("Failed to read db stats: {e}")))?
-                    .entries;
-                if current >= max_chunks {
-                    return Err(Error::Storage(format!(
-                        "Storage capacity reached: {current} chunks stored, max is {max_chunks}"
-                    )));
-                }
             }
 
             db.put(&mut wtxn, &key, &value)
@@ -421,7 +404,6 @@ mod tests {
         let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
-            max_chunks: 0,
             max_map_size: 0,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
@@ -510,34 +492,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_max_chunks_enforced() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config = LmdbStorageConfig {
-            root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: true,
-            max_chunks: 2,
-            max_map_size: 0,
-        };
-        let storage = LmdbStorage::new(config).await.expect("create storage");
-
-        let content1 = b"chunk one";
-        let content2 = b"chunk two";
-        let content3 = b"chunk three";
-        let addr1 = LmdbStorage::compute_address(content1);
-        let addr2 = LmdbStorage::compute_address(content2);
-        let addr3 = LmdbStorage::compute_address(content3);
-
-        // First two should succeed
-        assert!(storage.put(&addr1, content1).await.is_ok());
-        assert!(storage.put(&addr2, content2).await.is_ok());
-
-        // Third should be rejected
-        let result = storage.put(&addr3, content3).await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("capacity reached"));
-    }
-
-    #[tokio::test]
     async fn test_address_mismatch() {
         let (storage, _temp) = create_test_storage().await;
 
@@ -587,32 +541,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_capacity_recovers_after_delete() {
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let config = LmdbStorageConfig {
-            root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: true,
-            max_chunks: 1,
-            max_map_size: 0,
-        };
-        let storage = LmdbStorage::new(config).await.expect("create storage");
-
-        let first = b"first chunk";
-        let second = b"second chunk";
-        let addr1 = LmdbStorage::compute_address(first);
-        let addr2 = LmdbStorage::compute_address(second);
-
-        storage.put(&addr1, first).await.expect("put first");
-        storage.delete(&addr1).await.expect("delete first");
-
-        // Should succeed because delete freed capacity.
-        storage.put(&addr2, second).await.expect("put second");
-
-        let stats = storage.stats();
-        assert_eq!(stats.current_chunks, 1);
-    }
-
-    #[tokio::test]
     async fn test_persistence_across_reopen() {
         let temp_dir = TempDir::new().expect("create temp dir");
         let content = b"persistent data";
@@ -623,7 +551,7 @@ mod tests {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
-                max_chunks: 0,
+
                 max_map_size: 0,
             };
             let storage = LmdbStorage::new(config).await.expect("create storage");
@@ -635,7 +563,7 @@ mod tests {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
-                max_chunks: 0,
+
                 max_map_size: 0,
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");

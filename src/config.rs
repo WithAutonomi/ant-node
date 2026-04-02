@@ -430,7 +430,6 @@ const fn default_bootstrap_stale_days() -> u64 {
 ///
 /// Controls how chunks are stored, including:
 /// - Whether storage is enabled
-/// - Maximum chunks to store (for capacity management)
 /// - Content verification on read
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -438,11 +437,6 @@ pub struct StorageConfig {
     /// Default: true
     #[serde(default = "default_storage_enabled")]
     pub enabled: bool,
-
-    /// Maximum number of chunks to store (0 = unlimited).
-    /// Default: 0 (unlimited)
-    #[serde(default)]
-    pub max_chunks: usize,
 
     /// Verify content hash matches address on read.
     /// Default: true
@@ -460,7 +454,6 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             enabled: default_storage_enabled(),
-            max_chunks: 0,
             verify_on_read: default_storage_verify_on_read(),
             db_size_gb: 0,
         }

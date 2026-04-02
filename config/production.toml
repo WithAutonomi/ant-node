@@ -43,9 +43,6 @@ metrics_port = 9100
 [storage]
 enabled = true
 
-# Maximum number of chunks to store (0 = unlimited)
-max_chunks = 0
-
 # Verify content hash on read
 verify_on_read = true
 
