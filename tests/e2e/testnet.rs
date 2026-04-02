@@ -1389,6 +1389,42 @@ impl TestNetwork {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         info!("✅ DHT routing tables warmed up");
+
+        // Wait for all replication engines to exit the bootstrap phase so
+        // that audit and neighbor-sync handlers return operational responses
+        // instead of `Bootstrapping` / `bootstrapping: true`.
+        self.wait_for_replication_bootstrap().await?;
+
+        Ok(())
+    }
+
+    /// Wait for every node's replication engine to complete its bootstrap
+    /// phase.
+    ///
+    /// This ensures `is_bootstrapping` is `false` on all nodes before tests
+    /// that depend on audit or neighbor-sync responses start running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any node's bootstrap does not complete within
+    /// the timeout.
+    async fn wait_for_replication_bootstrap(&self) -> Result<()> {
+        const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(120);
+
+        for node in &self.nodes {
+            if let Some(ref engine) = node.replication_engine {
+                if !engine.wait_for_bootstrap_complete(BOOTSTRAP_TIMEOUT).await {
+                    return Err(TestnetError::Stabilization(format!(
+                        "Node {} replication bootstrap did not complete within {}s",
+                        node.index,
+                        BOOTSTRAP_TIMEOUT.as_secs(),
+                    )));
+                }
+                debug!("Node {} replication bootstrap complete", node.index,);
+            }
+        }
+
+        info!("✅ All replication engines bootstrapped");
         Ok(())
     }
 

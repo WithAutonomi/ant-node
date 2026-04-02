@@ -30,7 +30,7 @@ pub mod types;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use std::pin::Pin;
 
@@ -120,6 +120,8 @@ pub struct ReplicationEngine {
     is_bootstrapping: Arc<RwLock<bool>>,
     /// Trigger for early neighbor sync (signalled on topology changes).
     sync_trigger: Arc<Notify>,
+    /// Notified when `is_bootstrapping` transitions from `true` to `false`.
+    bootstrap_complete_notify: Arc<Notify>,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -170,6 +172,7 @@ impl ReplicationEngine {
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
+            bootstrap_complete_notify: Arc::new(Notify::new()),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
             task_handles: Vec::new(),
@@ -207,6 +210,36 @@ impl ReplicationEngine {
             "Replication engine started with {} background tasks",
             self.task_handles.len()
         );
+    }
+
+    /// Returns `true` if the node is still in the replication bootstrap phase.
+    ///
+    /// During bootstrap, audit challenges return `Bootstrapping` instead of
+    /// digests, and neighbor sync responses carry `bootstrapping: true`.
+    pub async fn is_bootstrapping(&self) -> bool {
+        *self.is_bootstrapping.read().await
+    }
+
+    /// Wait until the replication bootstrap phase completes.
+    ///
+    /// Returns immediately if bootstrap has already completed. Useful for
+    /// readiness probes, health checks, and test harnesses that need the
+    /// node to be fully operational before proceeding.
+    ///
+    /// Returns `true` if bootstrap completed within the timeout, `false`
+    /// if the timeout elapsed first.
+    pub async fn wait_for_bootstrap_complete(&self, timeout: Duration) -> bool {
+        // Register the notification future *before* checking the flag so that
+        // a transition between the read and the await is not missed.
+        let notified = self.bootstrap_complete_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+
+        if !*self.is_bootstrapping.read().await {
+            return true;
+        }
+
+        tokio::time::timeout(timeout, notified).await.is_ok()
     }
 
     /// Cancel all background tasks and wait for them to terminate.
@@ -506,6 +539,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -641,7 +675,10 @@ impl ReplicationEngine {
                                 )
                                 .await
                                 {
-                                    *is_bootstrapping.write().await = false;
+                                    complete_bootstrap(
+                                        &is_bootstrapping,
+                                        &bootstrap_complete_notify,
+                                    ).await;
                                 }
                             }
                         }
@@ -666,6 +703,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -677,6 +715,7 @@ impl ReplicationEngine {
                         run_verification_cycle(
                             &p2p, &paid_list, &queues, &config,
                             &bootstrap_state, &is_bootstrapping,
+                            &bootstrap_complete_notify,
                         ).await;
                     }
                 }
@@ -709,6 +748,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -733,7 +773,7 @@ impl ReplicationEngine {
             if neighbors.is_empty() {
                 info!("Bootstrap sync: no close neighbors found, marking drained");
                 bootstrap::mark_bootstrap_drained(&bootstrap_state).await;
-                *is_bootstrapping.write().await = false;
+                complete_bootstrap(&is_bootstrapping, &bootstrap_complete_notify).await;
                 return;
             }
 
@@ -798,7 +838,7 @@ impl ReplicationEngine {
             {
                 let q = queues.read().await;
                 if bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await {
-                    *is_bootstrapping.write().await = false;
+                    complete_bootstrap(&is_bootstrapping, &bootstrap_complete_notify).await;
                 }
             }
 
@@ -1747,6 +1787,7 @@ async fn run_verification_cycle(
     config: &ReplicationConfig,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
 ) {
     // Evict stale entries that have been pending too long (e.g. unreachable
     // verification targets during a network partition).
@@ -1868,8 +1909,14 @@ async fn run_verification_cycle(
 
     // Step 6: Remove terminal keys from bootstrap pending set and re-check
     // the drain condition.
-    update_bootstrap_after_verification(&terminal_keys, bootstrap_state, queues, is_bootstrapping)
-        .await;
+    update_bootstrap_after_verification(
+        &terminal_keys,
+        bootstrap_state,
+        queues,
+        is_bootstrapping,
+        bootstrap_complete_notify,
+    )
+    .await;
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -1879,6 +1926,7 @@ async fn update_bootstrap_after_verification(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     queues: &Arc<RwLock<ReplicationQueues>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
 ) {
     if terminal_keys.is_empty() || bootstrap_state.read().await.is_drained() {
         return;
@@ -1891,8 +1939,18 @@ async fn update_bootstrap_after_verification(
     }
     let q = queues.read().await;
     if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
-        *is_bootstrapping.write().await = false;
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
     }
+}
+
+/// Set `is_bootstrapping` to `false` and wake all waiters.
+async fn complete_bootstrap(
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+) {
+    *is_bootstrapping.write().await = false;
+    bootstrap_complete_notify.notify_waiters();
+    info!("Replication bootstrap complete");
 }
 
 // ---------------------------------------------------------------------------
