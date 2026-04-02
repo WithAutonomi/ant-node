@@ -1704,6 +1704,12 @@ async fn handle_audit_result(
             keys_checked,
         } => {
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
+            // Peer responded normally — clear any stale bootstrap claim so
+            // a future legitimate bootstrap claim starts with a fresh timer.
+            {
+                let mut state = sync_state.write().await;
+                state.bootstrap_claims.remove(challenged_peer);
+            }
             p2p_node
                 .report_trust_event(
                     challenged_peer,
@@ -1722,6 +1728,12 @@ async fn handle_audit_result(
                     "Audit failure for {challenged_peer}: {} confirmed failed keys",
                     confirmed_failed_keys.len()
                 );
+                // Peer responded with digests (not a bootstrap claim) — clear
+                // any stale bootstrap claim timestamp.
+                {
+                    let mut state = sync_state.write().await;
+                    state.bootstrap_claims.remove(challenged_peer);
+                }
                 p2p_node
                     .report_trust_event(
                         challenged_peer,
