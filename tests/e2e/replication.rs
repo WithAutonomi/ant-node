@@ -19,6 +19,11 @@ use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
 use std::time::Duration;
 
+/// Maximum time to wait for replication propagation in tests.
+const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// Interval between propagation poll checks.
+const PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
 /// Send a replication request via saorsa-core's request-response mechanism
 /// and decode the response.
 ///
@@ -77,23 +82,26 @@ async fn test_fresh_replication_propagates_to_close_group() {
         engine.replicate_fresh(&address, content, &dummy_pop).await;
     }
 
-    // Wait for replication to propagate
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Check if any other node received the chunk
+    // Poll until replication propagates (or timeout).
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
     let mut found_on_other = false;
-    for i in 0..harness.node_count() {
-        if i == source_idx {
-            continue;
-        }
-        if let Some(node) = harness.test_node(i) {
-            if let Some(protocol) = &node.ant_protocol {
-                if protocol.storage().exists(&address).unwrap_or(false) {
-                    found_on_other = true;
-                    break;
+    while tokio::time::Instant::now() < deadline {
+        for i in 0..harness.node_count() {
+            if i == source_idx {
+                continue;
+            }
+            if let Some(node) = harness.test_node(i) {
+                if let Some(protocol) = &node.ant_protocol {
+                    if protocol.storage().exists(&address).unwrap_or(false) {
+                        found_on_other = true;
+                    }
                 }
             }
         }
+        if found_on_other {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
     }
     assert!(
         found_on_other,
@@ -689,28 +697,32 @@ async fn scenario_1_and_24_fresh_replication_stores_and_propagates_paid_list() {
         engine.replicate_fresh(&address, content, &dummy_pop).await;
     }
 
-    // Wait for propagation
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Check: at least one other node has the chunk AND has it in paid list
+    // Poll until replication propagates (or timeout).
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
     let mut stored_elsewhere = false;
     let mut paid_listed_elsewhere = false;
-    for i in 0..harness.node_count() {
-        if i == source_idx {
-            continue;
-        }
-        if let Some(node) = harness.test_node(i) {
-            if let Some(p) = &node.ant_protocol {
-                if p.storage().exists(&address).unwrap_or(false) {
-                    stored_elsewhere = true;
+    loop {
+        for i in 0..harness.node_count() {
+            if i == source_idx {
+                continue;
+            }
+            if let Some(node) = harness.test_node(i) {
+                if let Some(p) = &node.ant_protocol {
+                    if p.storage().exists(&address).unwrap_or(false) {
+                        stored_elsewhere = true;
+                    }
+                }
+                if let Some(ref engine) = node.replication_engine {
+                    if engine.paid_list().contains(&address).unwrap_or(false) {
+                        paid_listed_elsewhere = true;
+                    }
                 }
             }
-            if let Some(ref engine) = node.replication_engine {
-                if engine.paid_list().contains(&address).unwrap_or(false) {
-                    paid_listed_elsewhere = true;
-                }
-            }
         }
+        if (stored_elsewhere && paid_listed_elsewhere) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
     }
     assert!(
         stored_elsewhere,
@@ -1240,22 +1252,27 @@ async fn scenario_24_fresh_replication_propagates_paid_notify() {
         engine.replicate_fresh(&address, content, &dummy_pop).await;
     }
 
-    // Wait for propagation
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Check paid lists on other nodes
-    let mut paid_count = 0u32;
-    for i in 0..harness.node_count() {
-        if i == source_idx {
-            continue;
-        }
-        if let Some(node) = harness.test_node(i) {
-            if let Some(ref engine) = node.replication_engine {
-                if engine.paid_list().contains(&address).unwrap_or(false) {
-                    paid_count += 1;
+    // Poll until PaidNotify propagates (or timeout).
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+    let mut paid_count;
+    loop {
+        paid_count = 0u32;
+        for i in 0..harness.node_count() {
+            if i == source_idx {
+                continue;
+            }
+            if let Some(node) = harness.test_node(i) {
+                if let Some(ref engine) = node.replication_engine {
+                    if engine.paid_list().contains(&address).unwrap_or(false) {
+                        paid_count += 1;
+                    }
                 }
             }
         }
+        if paid_count >= 1 || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
     }
 
     // At least one other node should have received the PaidNotify

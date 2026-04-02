@@ -112,8 +112,6 @@ pub struct FetchCandidate {
     pub distance: XorName,
     /// Verified source peers that responded `Present`.
     pub sources: Vec<PeerId>,
-    /// Sources already tried (failed).
-    pub tried: HashSet<PeerId>,
 }
 
 impl Eq for FetchCandidate {}
@@ -322,8 +320,8 @@ impl BootstrapState {
 
     /// Check if bootstrap is drained.
     ///
-    /// Only returns `true` after [`check_bootstrap_drained`] or
-    /// [`mark_bootstrap_drained`] has explicitly set the flag. A fresh
+    /// Only returns `true` after [`super::bootstrap::check_bootstrap_drained`] or
+    /// [`super::bootstrap::mark_bootstrap_drained`] has explicitly set the flag. A fresh
     /// `BootstrapState` is NOT drained — the audit loop must wait until
     /// bootstrap work has actually completed (Invariant 19).
     #[must_use]
@@ -353,7 +351,7 @@ impl Default for BootstrapState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BinaryHeap, HashSet};
+    use std::collections::BinaryHeap;
 
     use super::*;
 
@@ -375,7 +373,6 @@ mod tests {
                 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(1)],
-            tried: HashSet::new(),
         };
 
         let far = FetchCandidate {
@@ -385,7 +382,6 @@ mod tests {
                 0, 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(2)],
-            tried: HashSet::new(),
         };
 
         // In a max-heap the "greatest" element pops first.
@@ -421,14 +417,12 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
-            tried: HashSet::new(),
         };
 
         let b = FetchCandidate {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
-            tried: HashSet::new(),
         };
 
         assert_eq!(
@@ -445,14 +439,12 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
-            tried: HashSet::new(),
         };
 
         let b = FetchCandidate {
             key: [2u8; 32],
             distance: [5u8; 32],
             sources: vec![],
-            tried: HashSet::new(),
         };
 
         assert_ne!(

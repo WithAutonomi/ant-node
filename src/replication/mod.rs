@@ -237,7 +237,6 @@ impl ReplicationEngine {
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
-        let sync_state = Arc::clone(&self.sync_state);
         let sync_history = Arc::clone(&self.sync_history);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
@@ -277,7 +276,6 @@ impl ReplicationEngine {
                                     &queues,
                                     &config,
                                     &is_bootstrapping,
-                                    &sync_state,
                                     &sync_history,
                                     rr_message_id.as_deref(),
                                 ).await {
@@ -324,7 +322,6 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let sync_history = Arc::clone(&self.sync_history);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
-        let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
@@ -346,7 +343,6 @@ impl ReplicationEngine {
                     &sync_state,
                     &sync_history,
                     &is_bootstrapping,
-                    &bootstrap_state,
                 )
                 .await;
             }
@@ -405,9 +401,11 @@ impl ReplicationEngine {
             // Run one audit tick immediately after bootstrap drain.
             {
                 let bootstrapping = *is_bootstrapping.read().await;
+                // Lock ordering: sync_state before sync_history (consistent
+                // with run_neighbor_sync_round and handle_sync_response).
                 let result = {
-                    let history = sync_history.read().await;
                     let claims = sync_state.read().await;
+                    let history = sync_history.read().await;
                     audit::audit_tick(
                         &p2p,
                         &storage,
@@ -428,9 +426,10 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
                         let bootstrapping = *is_bootstrapping.read().await;
+                        // Lock ordering: sync_state before sync_history.
                         let result = {
-                            let history = sync_history.read().await;
                             let claims = sync_state.read().await;
+                            let history = sync_history.read().await;
                             audit::audit_tick(
                                 &p2p, &storage, &config, &history,
                                 &claims.bootstrap_claims,
@@ -470,11 +469,7 @@ impl ReplicationEngine {
                         let Some(candidate) = q.dequeue_fetch() else {
                             break;
                         };
-                        let source = match candidate
-                            .sources
-                            .iter()
-                            .find(|p| !candidate.tried.contains(p))
-                        {
+                        let source = match candidate.sources.first() {
                             Some(p) => *p,
                             None => continue,
                         };
@@ -629,7 +624,7 @@ impl ReplicationEngine {
 
             let self_id = *p2p.peer_id();
             let neighbors =
-                bootstrap::snapshot_close_neighbors(&p2p, &self_id, config.neighbor_sync_scope)
+                neighbor_sync::snapshot_close_neighbors(&p2p, &self_id, config.neighbor_sync_scope)
                     .await;
 
             if neighbors.is_empty() {
@@ -642,8 +637,6 @@ impl ReplicationEngine {
             let neighbor_count = neighbors.len();
             info!("Bootstrap sync: syncing with {neighbor_count} close neighbors");
 
-            let bootstrapping = *is_bootstrapping.read().await;
-
             // Process neighbors in batches of NEIGHBOR_SYNC_PEER_COUNT.
             for batch in neighbors.chunks(config.neighbor_sync_peer_count) {
                 if shutdown.is_cancelled() {
@@ -654,6 +647,9 @@ impl ReplicationEngine {
                     if shutdown.is_cancelled() {
                         break;
                     }
+
+                    // Re-read on each iteration so peers see current state.
+                    let bootstrapping = *is_bootstrapping.read().await;
 
                     bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
 
@@ -672,7 +668,7 @@ impl ReplicationEngine {
                     if let Some(resp) = response {
                         if !resp.bootstrapping {
                             // Admit hints into verification pipeline.
-                            let admitted_keys = admit_bootstrap_hints(
+                            let admitted_keys = admit_and_queue_hints(
                                 &self_id,
                                 peer,
                                 &resp.replica_hints,
@@ -729,7 +725,6 @@ async fn handle_replication_message(
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
     is_bootstrapping: &Arc<RwLock<bool>>,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -773,7 +768,6 @@ async fn handle_replication_message(
                 queues,
                 config,
                 bootstrapping,
-                sync_state,
                 sync_history,
                 msg.request_id,
                 rr_message_id,
@@ -1034,12 +1028,23 @@ async fn handle_neighbor_sync_request(
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
-    _sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
+
+    // Bound incoming hint count using the same dynamic limit as audit challenges.
+    #[allow(clippy::cast_possible_truncation)]
+    let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
+    let max_hints = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
+    let total_hints = request.replica_hints.len() + request.paid_hints.len();
+    if total_hints > max_hints {
+        warn!(
+            "Neighbor sync request from {source} rejected: {total_hints} hints exceeds limit of {max_hints}",
+        );
+        return Ok(());
+    }
 
     // Build response (outbound hints).
     let (response, sender_in_rt) = neighbor_sync::handle_sync_request(
@@ -1079,57 +1084,19 @@ async fn handle_neighbor_sync_request(
         record.cycles_since_sync = 0;
     }
 
-    // Admit inbound hints.
-    let pending_keys: HashSet<XorName> = {
-        let q = queues.read().await;
-        q.pending_keys().into_iter().collect()
-    };
-
-    let admitted = admission::admit_hints(
+    // Admit inbound hints and queue for verification.
+    admit_and_queue_hints(
         &self_id,
+        source,
         &request.replica_hints,
         &request.paid_hints,
         p2p_node,
         config,
         storage,
         paid_list,
-        &pending_keys,
+        queues,
     )
     .await;
-
-    // Queue admitted keys for verification.
-    let mut q = queues.write().await;
-    let now = Instant::now();
-
-    for key in admitted.replica_keys {
-        if !storage.exists(&key).unwrap_or(false) {
-            q.add_pending_verify(
-                key,
-                VerificationEntry {
-                    state: VerificationState::PendingVerify,
-                    pipeline: HintPipeline::Replica,
-                    verified_sources: Vec::new(),
-                    tried_sources: HashSet::new(),
-                    created_at: now,
-                    hint_sender: *source,
-                },
-            );
-        }
-    }
-
-    for key in admitted.paid_only_keys {
-        q.add_pending_verify(
-            key,
-            VerificationEntry {
-                state: VerificationState::PendingVerify,
-                pipeline: HintPipeline::PaidOnly,
-                verified_sources: Vec::new(),
-                tried_sources: HashSet::new(),
-                created_at: now,
-                hint_sender: *source,
-            },
-        );
-    }
 
     Ok(())
 }
@@ -1143,6 +1110,18 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    // Bound incoming key count using the same dynamic limit as audit challenges.
+    #[allow(clippy::cast_possible_truncation)]
+    let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
+    let max_keys = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
+    if request.keys.len() > max_keys {
+        warn!(
+            "Verification request from {source} rejected: {} keys exceeds limit of {max_keys}",
+            request.keys.len(),
+        );
+        return Ok(());
+    }
+
     let paid_check_set: HashSet<u32> = request.paid_list_check_indices.iter().copied().collect();
 
     let mut results = Vec::with_capacity(request.keys.len());
@@ -1290,7 +1269,6 @@ async fn run_neighbor_sync_round(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
-    _bootstrap_state: &Arc<RwLock<BootstrapState>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -1466,7 +1444,7 @@ async fn handle_sync_response(
             let mut state = sync_state.write().await;
             state.bootstrap_claims.remove(peer);
         }
-        admit_response_hints(
+        admit_and_queue_hints(
             self_id,
             peer,
             &resp.replica_hints,
@@ -1481,9 +1459,12 @@ async fn handle_sync_response(
     }
 }
 
-/// Admit hints from a neighbor sync response into the verification pipeline.
+/// Admit hints and queue them for verification, returning newly-discovered keys.
+///
+/// Shared by neighbor-sync request handling, response handling, and bootstrap
+/// sync so that admission + queueing logic lives in one place.
 #[allow(clippy::too_many_arguments)]
-async fn admit_response_hints(
+async fn admit_and_queue_hints(
     self_id: &PeerId,
     source_peer: &PeerId,
     replica_hints: &[XorName],
@@ -1493,7 +1474,7 @@ async fn admit_response_hints(
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
-) {
+) -> HashSet<XorName> {
     let pending_keys: HashSet<XorName> = {
         let q = queues.read().await;
         q.pending_keys().into_iter().collect()
@@ -1511,12 +1492,13 @@ async fn admit_response_hints(
     )
     .await;
 
+    let mut discovered = HashSet::new();
     let mut q = queues.write().await;
     let now = Instant::now();
 
     for key in admitted.replica_keys {
         if !storage.exists(&key).unwrap_or(false) {
-            q.add_pending_verify(
+            let added = q.add_pending_verify(
                 key,
                 VerificationEntry {
                     state: VerificationState::PendingVerify,
@@ -1527,11 +1509,14 @@ async fn admit_response_hints(
                     hint_sender: *source_peer,
                 },
             );
+            if added {
+                discovered.insert(key);
+            }
         }
     }
 
     for key in admitted.paid_only_keys {
-        q.add_pending_verify(
+        let added = q.add_pending_verify(
             key,
             VerificationEntry {
                 state: VerificationState::PendingVerify,
@@ -1542,7 +1527,12 @@ async fn admit_response_hints(
                 hint_sender: *source_peer,
             },
         );
+        if added {
+            discovered.insert(key);
+        }
     }
+
+    discovered
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,19 +1659,32 @@ async fn run_verification_cycle(
         }
     }
 
-    // Step 6: Option B — remove terminal keys from bootstrap pending set.
-    //         Option A — re-check drain condition after removals.
-    if !terminal_keys.is_empty() && !bootstrap_state.read().await.is_drained() {
-        {
-            let mut bs = bootstrap_state.write().await;
-            for key in &terminal_keys {
-                bs.remove_key(key);
-            }
+    // Step 6: Remove terminal keys from bootstrap pending set and re-check
+    // the drain condition.
+    update_bootstrap_after_verification(&terminal_keys, bootstrap_state, queues, is_bootstrapping)
+        .await;
+}
+
+/// Post-verification bootstrap bookkeeping: remove terminal keys from the
+/// bootstrap pending set and transition out of bootstrapping when drained.
+async fn update_bootstrap_after_verification(
+    terminal_keys: &[XorName],
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+) {
+    if terminal_keys.is_empty() || bootstrap_state.read().await.is_drained() {
+        return;
+    }
+    {
+        let mut bs = bootstrap_state.write().await;
+        for key in terminal_keys {
+            bs.remove_key(key);
         }
-        let q = queues.read().await;
-        if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
-            *is_bootstrapping.write().await = false;
-        }
+    }
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        *is_bootstrapping.write().await = false;
     }
 }
 
@@ -1961,80 +1964,4 @@ async fn handle_audit_result(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bootstrap hint admission helper (Gap 3)
-// ---------------------------------------------------------------------------
-
-/// Admit hints from a bootstrap sync response into the verification pipeline
-/// and return the set of admitted keys for drain tracking.
-#[allow(clippy::too_many_arguments)]
-async fn admit_bootstrap_hints(
-    self_id: &PeerId,
-    source_peer: &PeerId,
-    replica_hints: &[XorName],
-    paid_hints: &[XorName],
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    queues: &Arc<RwLock<ReplicationQueues>>,
-) -> HashSet<XorName> {
-    let pending_keys: HashSet<XorName> = {
-        let q = queues.read().await;
-        q.pending_keys().into_iter().collect()
-    };
-
-    let admitted = admission::admit_hints(
-        self_id,
-        replica_hints,
-        paid_hints,
-        p2p_node,
-        config,
-        storage,
-        paid_list,
-        &pending_keys,
-    )
-    .await;
-
-    let mut discovered = HashSet::new();
-    let mut q = queues.write().await;
-    let now = Instant::now();
-
-    for key in admitted.replica_keys {
-        if !storage.exists(&key).unwrap_or(false) {
-            let added = q.add_pending_verify(
-                key,
-                VerificationEntry {
-                    state: VerificationState::PendingVerify,
-                    pipeline: HintPipeline::Replica,
-                    verified_sources: Vec::new(),
-                    tried_sources: HashSet::new(),
-                    created_at: now,
-                    hint_sender: *source_peer,
-                },
-            );
-            if added {
-                discovered.insert(key);
-            }
-        }
-    }
-
-    for key in admitted.paid_only_keys {
-        let added = q.add_pending_verify(
-            key,
-            VerificationEntry {
-                state: VerificationState::PendingVerify,
-                pipeline: HintPipeline::PaidOnly,
-                verified_sources: Vec::new(),
-                tried_sources: HashSet::new(),
-                created_at: now,
-                hint_sender: *source_peer,
-            },
-        );
-        if added {
-            discovered.insert(key);
-        }
-    }
-
-    discovered
-}
+// `admit_bootstrap_hints` was consolidated into `admit_and_queue_hints`.

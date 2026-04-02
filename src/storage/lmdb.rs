@@ -15,8 +15,7 @@ use std::path::{Path, PathBuf};
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace, warn};
 
-/// Length of an `XorName` key in bytes.
-const XORNAME_LEN: usize = 32;
+use crate::ant_protocol::XORNAME_LEN;
 
 /// Default LMDB map size: 32 GiB.
 ///

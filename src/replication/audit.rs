@@ -213,7 +213,13 @@ pub async fn audit_tick(
     };
 
     match resp_msg.body {
-        ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { .. }) => {
+        ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
+            challenge_id: resp_id,
+        }) => {
+            if resp_id != challenge_id {
+                warn!("Audit: challenge ID mismatch on Bootstrapping from {challenged_peer}");
+                return AuditTickResult::Idle;
+            }
             // Step 7b: Bootstrapping claim.
             AuditTickResult::BootstrapClaim {
                 peer: challenged_peer,
@@ -239,7 +245,14 @@ pub async fn audit_tick(
             )
             .await
         }
-        ReplicationMessageBody::AuditResponse(AuditResponse::Rejected { reason, .. }) => {
+        ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
+            challenge_id: resp_id,
+            reason,
+        }) => {
+            if resp_id != challenge_id {
+                warn!("Audit: challenge ID mismatch on Rejected from {challenged_peer}");
+                return AuditTickResult::Idle;
+            }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
                 &challenged_peer,
@@ -381,13 +394,13 @@ async fn handle_audit_failure(
         }
     }
 
-    // Step 9c: Empty confirmed set -> discard entirely.
+    // Step 9c: Empty confirmed set -> peer is no longer responsible for any
+    // of the failed keys (topology churn). This is NOT a pass — the peer did
+    // not prove it stores the data. Return Idle to avoid granting unearned
+    // positive trust.
     if confirmed_failures.is_empty() {
         info!("Audit: all failures for {challenged_peer} cleared by responsibility confirmation");
-        return AuditTickResult::Passed {
-            challenged_peer: *challenged_peer,
-            keys_checked: failed_keys.len(),
-        };
+        return AuditTickResult::Idle;
     }
 
     // Step 9d: Non-empty confirmed set -> emit evidence.

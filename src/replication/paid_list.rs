@@ -31,8 +31,7 @@ use std::time::Instant;
 use tokio::task::spawn_blocking;
 use tracing::{debug, trace};
 
-/// Size of an `XorName` in bytes.
-const XORNAME_LEN: usize = 32;
+use crate::ant_protocol::XORNAME_LEN;
 
 /// Default LMDB map size for the paid list: 256 MiB.
 ///

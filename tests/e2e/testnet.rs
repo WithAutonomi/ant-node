@@ -1616,6 +1616,14 @@ impl Drop for TestNetwork {
         // Note: async cleanup should be done via shutdown() before dropping
         let _ = self.shutdown_tx.send(());
 
+        // Cancel replication engine background tasks so they don't outlive
+        // the test's tokio runtime.
+        for node in &mut self.nodes {
+            if let Some(token) = node.replication_shutdown.take() {
+                token.cancel();
+            }
+        }
+
         // Abort health monitor if still running
         if let Some(handle) = self.health_monitor.take() {
             handle.abort();

@@ -40,10 +40,11 @@ pub async fn replicate_fresh(
     }
 
     // Rule 2-3: Send fresh offers to CLOSE_GROUP_SIZE nearest peers
-    // (excluding self).
+    // (excluding self). Use self-inclusive query to get the true close group,
+    // then filter self out.
     let closest = p2p_node
         .dht_manager()
-        .find_closest_nodes_local(key, config.close_group_size)
+        .find_closest_nodes_local_with_self(key, config.close_group_size)
         .await;
     let target_peers: Vec<PeerId> = closest
         .iter()
@@ -62,20 +63,25 @@ pub async fn replicate_fresh(
         body: ReplicationMessageBody::FreshReplicationOffer(offer),
     };
 
-    if let Ok(encoded) = offer_msg.encode() {
-        for peer in &target_peers {
-            let p2p = Arc::clone(p2p_node);
-            let data = encoded.clone();
-            let peer_id = *peer;
-            tokio::spawn(async move {
-                if let Err(e) = p2p
-                    .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
-                    .await
-                {
-                    debug!("Failed to send fresh offer to {peer_id}: {e}");
-                }
-            });
-        }
+    let Ok(encoded) = offer_msg.encode() else {
+        warn!(
+            "Failed to encode FreshReplicationOffer for {}",
+            hex::encode(key),
+        );
+        return;
+    };
+    for peer in &target_peers {
+        let p2p = Arc::clone(p2p_node);
+        let data = encoded.clone();
+        let peer_id = *peer;
+        tokio::spawn(async move {
+            if let Err(e) = p2p
+                .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
+                .await
+            {
+                debug!("Failed to send fresh offer to {peer_id}: {e}");
+            }
+        });
     }
 
     // Rule 7-8: Send PaidNotify to every member of PaidCloseGroup(K).

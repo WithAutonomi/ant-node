@@ -138,7 +138,6 @@ impl ReplicationQueues {
             key,
             distance,
             sources,
-            tried: HashSet::new(),
         });
     }
 

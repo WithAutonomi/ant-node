@@ -30,6 +30,9 @@ pub const DATA_TYPE_CHUNK: u32 = 0;
 /// Content-addressed identifier (32 bytes).
 pub type XorName = [u8; 32];
 
+/// Byte length of an [`XorName`].
+pub const XORNAME_LEN: usize = std::mem::size_of::<XorName>();
+
 /// Enum of all chunk protocol message types.
 ///
 /// Uses a single-byte discriminant for efficient wire encoding.

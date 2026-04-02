@@ -11,8 +11,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use saorsa_core::identity::PeerId;
-use saorsa_core::{DHTNode, DhtNetworkEvent, P2PNode};
+use saorsa_core::DhtNetworkEvent;
 
 use crate::ant_protocol::XorName;
 use crate::replication::scheduling::ReplicationQueues;
@@ -93,21 +92,7 @@ pub async fn wait_for_bootstrap_complete(
 // Bootstrap sync
 // ---------------------------------------------------------------------------
 
-/// Snapshot the `NEIGHBOR_SYNC_SCOPE` closest peers to `self_id`.
-///
-/// Returns them as `PeerId` values for use in bootstrap hint requests.
-pub async fn snapshot_close_neighbors(
-    p2p_node: &Arc<P2PNode>,
-    self_id: &PeerId,
-    scope: usize,
-) -> Vec<PeerId> {
-    let self_xor: XorName = *self_id.as_bytes();
-    let nodes: Vec<DHTNode> = p2p_node
-        .dht_manager()
-        .find_closest_nodes_local(&self_xor, scope)
-        .await;
-    nodes.into_iter().map(|n| n.peer_id).collect()
-}
+// `snapshot_close_neighbors` is defined in `neighbor_sync` and re-used here.
 
 /// Mark bootstrap as complete, updating the shared state.
 pub async fn mark_bootstrap_drained(bootstrap_state: &Arc<RwLock<BootstrapState>>) {
