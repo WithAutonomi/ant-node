@@ -44,6 +44,8 @@ pub struct QuotePaymentInfo {
     pub rewards_address: RewardsAddress,
     /// The amount to pay (3x for median, 0 for others)
     pub amount: Amount,
+    /// The original quoted price (before 3x multiplier)
+    pub price: Amount,
 }
 
 impl SingleNodePayment {
@@ -91,7 +93,7 @@ impl SingleNodePayment {
         let quotes_vec: Vec<QuotePaymentInfo> = quotes_with_prices
             .into_iter()
             .enumerate()
-            .map(|(idx, (quote, _))| QuotePaymentInfo {
+            .map(|(idx, (quote, price))| QuotePaymentInfo {
                 quote_hash: quote.hash(),
                 rewards_address: quote.rewards_address,
                 amount: if idx == MEDIAN_INDEX {
@@ -99,6 +101,7 @@ impl SingleNodePayment {
                 } else {
                     Amount::ZERO
                 },
+                price,
             })
             .collect();
 
@@ -176,48 +179,63 @@ impl SingleNodePayment {
         Ok(result_hashes)
     }
 
-    /// Verify that the median quote was paid at least 3× its price on-chain.
+    /// Verify that a median-priced quote was paid at least 3× its price on-chain.
     ///
-    /// Every node in the close group runs this same check: look up the median
-    /// quote's on-chain payment amount and confirm it meets the 3× threshold.
-    /// This ensures all 5 nodes can independently detect underpayment, not
-    /// just the median node.
+    /// When multiple quotes share the median price (a tie), the client and
+    /// verifier may sort them in different order. This method checks all
+    /// quotes tied at the median price and accepts the payment if any one
+    /// of them was paid the correct amount.
     ///
     /// # Returns
     ///
-    /// The on-chain payment amount for the median quote.
+    /// The on-chain payment amount for the verified quote.
     ///
     /// # Errors
     ///
-    /// Returns an error if the on-chain lookup fails or the median quote
-    /// was paid less than 3× its price.
+    /// Returns an error if the on-chain lookup fails or none of the
+    /// median-priced quotes were paid at least 3× the median price.
     pub async fn verify(&self, network: &EvmNetwork) -> Result<Amount> {
         let median = &self.quotes[MEDIAN_INDEX];
+        let median_price = median.price;
         let expected_amount = median.amount;
 
-        info!("Verifying median quote payment: expected at least {expected_amount} atto");
+        // Collect all quotes tied at the median price
+        let tied_quotes: Vec<&QuotePaymentInfo> = self
+            .quotes
+            .iter()
+            .filter(|q| q.price == median_price)
+            .collect();
+
+        info!(
+            "Verifying median quote payment: expected at least {expected_amount} atto, {} quote(s) tied at median price",
+            tied_quotes.len()
+        );
 
         let provider = evmlib::utils::http_provider(network.rpc_url().clone());
         let vault_address = *network.payment_vault_address();
         let contract =
             evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
 
-        let result = contract
-            .completedPayments(median.quote_hash)
-            .call()
-            .await
-            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+        // Check each tied quote — accept if any one was paid correctly
+        for candidate in &tied_quotes {
+            let result = contract
+                .completedPayments(candidate.quote_hash)
+                .call()
+                .await
+                .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
-        let on_chain_amount = Amount::from(result.amount);
+            let on_chain_amount = Amount::from(result.amount);
 
-        if on_chain_amount < expected_amount {
-            return Err(Error::Payment(format!(
-                "Median quote underpaid: on-chain {on_chain_amount}, expected at least {expected_amount}"
-            )));
+            if on_chain_amount >= expected_amount {
+                info!("Payment verified: {on_chain_amount} atto paid for median-priced quote");
+                return Ok(on_chain_amount);
+            }
         }
 
-        info!("Payment verified: {on_chain_amount} atto paid for median quote");
-        Ok(on_chain_amount)
+        Err(Error::Payment(format!(
+            "No median-priced quote was paid enough: expected at least {expected_amount}, checked {} tied quote(s)",
+            tied_quotes.len()
+        )))
     }
 }
 
@@ -529,6 +547,40 @@ mod tests {
         addresses.sort();
         addresses.dedup();
         assert_eq!(addresses.len(), CLOSE_GROUP_SIZE);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn test_tied_median_prices_all_share_median_price() {
+        // Prices: 10, 30, 30, 30, 50 — three quotes tied at median price 30
+        let prices = [10u64, 30, 30, 30, 50];
+        let mut quotes_with_prices = Vec::new();
+
+        for (i, price) in prices.iter().enumerate() {
+            let quote = PaymentQuote {
+                content: XorName::random(&mut rand::thread_rng()),
+                timestamp: SystemTime::now(),
+                price: Amount::from(*price),
+                rewards_address: RewardsAddress::new([i as u8 + 1; 20]),
+                pub_key: vec![],
+                signature: vec![],
+            };
+            quotes_with_prices.push((quote, Amount::from(*price)));
+        }
+
+        let payment = SingleNodePayment::from_quotes(quotes_with_prices).unwrap();
+
+        // All three tied quotes should have price == 30
+        let tied_count = payment
+            .quotes
+            .iter()
+            .filter(|q| q.price == Amount::from(30u64))
+            .count();
+        assert_eq!(tied_count, 3, "Should have 3 quotes tied at median price");
+
+        // Only the median index gets the 3x amount
+        assert_eq!(payment.quotes[MEDIAN_INDEX].amount, Amount::from(90u64));
+        assert_eq!(payment.total_amount(), Amount::from(90u64));
     }
 
     #[test]
