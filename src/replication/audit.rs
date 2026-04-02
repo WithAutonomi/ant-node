@@ -136,7 +136,7 @@ pub async fn audit_tick(
     let mut peer_keys = Vec::new();
     for key in &sampled_keys {
         let closest = dht
-            .find_closest_nodes_local(key, config.close_group_size)
+            .find_closest_nodes_local_with_self(key, config.close_group_size)
             .await;
         if closest.iter().any(|n| n.peer_id == challenged_peer) {
             peer_keys.push(*key);
@@ -361,7 +361,7 @@ async fn handle_audit_failure(
     // Step 9a-b: Fresh local RT lookup for each failed key.
     for key in failed_keys {
         let closest = dht
-            .find_closest_nodes_local(key, config.close_group_size)
+            .find_closest_nodes_local_with_self(key, config.close_group_size)
             .await;
         if closest.iter().any(|n| n.peer_id == *challenged_peer) {
             confirmed_failures.push(*key);
