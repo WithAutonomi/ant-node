@@ -572,8 +572,8 @@ mod tests {
         let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: false,
-            max_chunks: 0,
             max_map_size: 0,
+            disk_reserve: 0,
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
