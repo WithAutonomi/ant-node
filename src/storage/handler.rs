@@ -442,8 +442,7 @@ mod tests {
 
         let storage_config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: true,
-            ..LmdbStorageConfig::default()
+            ..LmdbStorageConfig::test_default()
         };
         let storage = Arc::new(
             LmdbStorage::new(storage_config)

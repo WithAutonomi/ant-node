@@ -69,6 +69,19 @@ impl Default for LmdbStorageConfig {
     }
 }
 
+impl LmdbStorageConfig {
+    /// A test-friendly default with `disk_reserve` set to 0 so unit tests
+    /// don't depend on the host having >= 1 GiB free disk space.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_default() -> Self {
+        Self {
+            disk_reserve: 0,
+            ..Self::default()
+        }
+    }
+}
+
 /// Statistics about storage operations.
 #[derive(Debug, Clone, Default)]
 pub struct StorageStats {
@@ -707,8 +720,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("create temp dir");
         let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
-            verify_on_read: true,
-            ..LmdbStorageConfig::default()
+            ..LmdbStorageConfig::test_default()
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
@@ -854,8 +866,7 @@ mod tests {
         {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
-                verify_on_read: true,
-                ..LmdbStorageConfig::default()
+                ..LmdbStorageConfig::test_default()
             };
             let storage = LmdbStorage::new(config).await.expect("create storage");
             storage.put(&address, content).await.expect("put");
@@ -865,8 +876,7 @@ mod tests {
         {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
-                verify_on_read: true,
-                ..LmdbStorageConfig::default()
+                ..LmdbStorageConfig::test_default()
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");
             assert_eq!(storage.current_chunks().expect("current_chunks"), 1);
