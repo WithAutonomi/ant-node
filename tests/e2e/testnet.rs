@@ -1055,8 +1055,7 @@ impl TestNetwork {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
-            verify_on_read: true,
-            ..LmdbStorageConfig::default()
+            ..LmdbStorageConfig::test_default()
         };
         let storage = LmdbStorage::new(storage_config)
             .await
