@@ -239,9 +239,6 @@ impl LmdbStorage {
             )));
         }
 
-        // ── Disk-space guard (cached — at most one syscall per interval) ─
-        self.check_disk_space_cached()?;
-
         // Fast-path duplicate check (read-only, no write lock needed).
         // This is an optimistic hint — the authoritative check happens inside
         // the write transaction below to prevent TOCTOU races.
@@ -250,6 +247,11 @@ impl LmdbStorage {
             self.stats.write().duplicates += 1;
             return Ok(false);
         }
+
+        // ── Disk-space guard (cached — at most one syscall per interval) ─
+        // Placed after the duplicate check so that re-storing an existing
+        // chunk remains a harmless no-op even when disk space is low.
+        self.check_disk_space_cached()?;
 
         // ── Write (with resize-on-demand) ───────────────────────────────
         match self.try_put(address, content).await? {
