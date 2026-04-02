@@ -561,6 +561,7 @@ mod tests {
                 content: XorName::random(&mut rand::thread_rng()),
                 timestamp: SystemTime::now(),
                 price: Amount::from(*price),
+                #[allow(clippy::cast_possible_truncation)] // i is always < 5
                 rewards_address: RewardsAddress::new([i as u8 + 1; 20]),
                 pub_key: vec![],
                 signature: vec![],
