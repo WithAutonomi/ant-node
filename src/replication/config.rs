@@ -131,6 +131,11 @@ const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.
 pub const FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(FETCH_REQUEST_TIMEOUT_SECS);
 
+/// Maximum age for pending-verification entries before stale eviction.
+const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
+/// Maximum age for pending-verification entries before stale eviction.
+pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
+
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 2.0;
 
@@ -268,6 +273,9 @@ impl ReplicationConfig {
     /// `min(self.quorum_threshold, floor(quorum_targets_count / 2) + 1)`
     #[must_use]
     pub fn quorum_needed(&self, quorum_targets_count: usize) -> usize {
+        if quorum_targets_count == 0 {
+            return 0;
+        }
         let majority = quorum_targets_count / 2 + 1;
         self.quorum_threshold.min(majority)
     }
@@ -494,8 +502,8 @@ mod tests {
         // With 3 targets: majority = 3/2+1 = 2, threshold = 4 → min = 2
         assert_eq!(config.quorum_needed(3), 2);
 
-        // With 0 targets: majority = 0/2+1 = 1, threshold = 4 → min = 1
-        assert_eq!(config.quorum_needed(0), 1);
+        // With 0 targets: quorum is impossible — returns 0
+        assert_eq!(config.quorum_needed(0), 0);
 
         // With 100 targets: majority = 51, threshold = 4 → min = 4
         assert_eq!(config.quorum_needed(100), 4);

@@ -201,10 +201,11 @@ pub async fn audit_tick(
         Ok(m) => m,
         Err(e) => {
             warn!("Audit: failed to decode response from {challenged_peer}: {e}");
-            return handle_audit_timeout(
+            return handle_audit_failure(
                 &challenged_peer,
                 challenge_id,
                 &peer_keys,
+                AuditFailureReason::MalformedResponse,
                 p2p_node,
                 config,
             )
@@ -218,7 +219,15 @@ pub async fn audit_tick(
         }) => {
             if resp_id != challenge_id {
                 warn!("Audit: challenge ID mismatch on Bootstrapping from {challenged_peer}");
-                return AuditTickResult::Idle;
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::MalformedResponse,
+                    p2p_node,
+                    config,
+                )
+                .await;
             }
             // Step 7b: Bootstrapping claim.
             AuditTickResult::BootstrapClaim {
@@ -231,7 +240,15 @@ pub async fn audit_tick(
         }) => {
             if resp_id != challenge_id {
                 warn!("Audit: challenge ID mismatch from {challenged_peer}");
-                return AuditTickResult::Idle;
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::MalformedResponse,
+                    p2p_node,
+                    config,
+                )
+                .await;
             }
             verify_digests(
                 &challenged_peer,
@@ -251,7 +268,15 @@ pub async fn audit_tick(
         }) => {
             if resp_id != challenge_id {
                 warn!("Audit: challenge ID mismatch on Rejected from {challenged_peer}");
-                return AuditTickResult::Idle;
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::MalformedResponse,
+                    p2p_node,
+                    config,
+                )
+                .await;
             }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
@@ -266,7 +291,15 @@ pub async fn audit_tick(
         }
         _ => {
             warn!("Audit: unexpected response type from {challenged_peer}");
-            AuditTickResult::Idle
+            handle_audit_failure(
+                &challenged_peer,
+                challenge_id,
+                &peer_keys,
+                AuditFailureReason::MalformedResponse,
+                p2p_node,
+                config,
+            )
+            .await
         }
     }
 }

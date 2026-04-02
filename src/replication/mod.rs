@@ -32,8 +32,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use std::pin::Pin;
+
 use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use futures::{Future, StreamExt};
 use rand::Rng;
 use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -66,6 +68,9 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
+
+/// Boxed future type for in-flight fetch tasks.
+type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
 
 /// Fetch worker polling interval in milliseconds.
 const FETCH_WORKER_POLL_MS: u64 = 100;
@@ -446,6 +451,7 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
+    #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
     fn start_fetch_worker(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
@@ -459,7 +465,9 @@ impl ReplicationEngine {
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
 
         let handle = tokio::spawn(async move {
-            let mut in_flight = FuturesUnordered::<JoinHandle<FetchOutcome>>::new();
+            // Each in-flight future yields (key, Option<FetchOutcome>) so we
+            // always recover the key — even if the inner task panics.
+            let mut in_flight = FuturesUnordered::<FetchFuture>::new();
 
             loop {
                 // Fill up to `concurrency` slots from the queue.
@@ -469,22 +477,44 @@ impl ReplicationEngine {
                         let Some(candidate) = q.dequeue_fetch() else {
                             break;
                         };
-                        let source = match candidate.sources.first() {
-                            Some(p) => *p,
-                            None => continue,
+                        let Some(&source) = candidate.sources.first() else {
+                            warn!(
+                                "Fetch candidate {} has no sources — dropping",
+                                hex::encode(candidate.key)
+                            );
+                            continue;
                         };
                         q.start_fetch(candidate.key, source, candidate.sources.clone());
 
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
-                        in_flight.push(tokio::spawn(execute_single_fetch(
-                            p2p,
-                            storage,
-                            config,
-                            candidate.key,
-                            source,
-                        )));
+                        let token = shutdown.clone();
+                        let fetch_key = candidate.key;
+                        in_flight.push(Box::pin(async move {
+                            let handle = tokio::spawn(async move {
+                                // Cancel-aware: abort when the engine shuts down.
+                                tokio::select! {
+                                    () = token.cancelled() => FetchOutcome {
+                                        key: fetch_key,
+                                        result: FetchResult::SourceFailed,
+                                    },
+                                    outcome = execute_single_fetch(
+                                        p2p, storage, config, fetch_key, source,
+                                    ) => outcome,
+                                }
+                            });
+                            match handle.await {
+                                Ok(outcome) => (outcome.key, Some(outcome)),
+                                Err(e) => {
+                                    error!(
+                                        "Fetch task for {} panicked: {e}",
+                                        hex::encode(fetch_key)
+                                    );
+                                    (fetch_key, None)
+                                }
+                            }
+                        }));
                     }
                 } // release queues write lock
 
@@ -501,39 +531,64 @@ impl ReplicationEngine {
                 // Wait for the next fetch to complete and process the result.
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    Some(join_result) = in_flight.next() => {
-                        if let Ok(outcome) = join_result {
-                            let mut q = queues.write().await;
-                            let terminal = match outcome.result {
+                    Some((key, maybe_outcome)) = in_flight.next() => {
+                        let mut q = queues.write().await;
+                        let terminal = if let Some(outcome) = maybe_outcome {
+                            match outcome.result {
                                 FetchResult::Stored => {
-                                    q.complete_fetch(&outcome.key);
+                                    q.complete_fetch(&key);
                                     true
                                 }
                                 FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
-                                    if let Some(next_peer) = q.retry_fetch(&outcome.key) {
+                                    if let Some(next_peer) = q.retry_fetch(&key) {
                                         // Spawn a new fetch task for the next source.
                                         let p2p = Arc::clone(&p2p);
                                         let storage = Arc::clone(&storage);
                                         let config = Arc::clone(&config);
-                                        in_flight.push(tokio::spawn(execute_single_fetch(
-                                            p2p,
-                                            storage,
-                                            config,
-                                            outcome.key,
-                                            next_peer,
-                                        )));
+                                        let token = shutdown.clone();
+                                        let fetch_key = key;
+                                        in_flight.push(Box::pin(async move {
+                                            let handle = tokio::spawn(async move {
+                                                tokio::select! {
+                                                    () = token.cancelled() => FetchOutcome {
+                                                        key: fetch_key,
+                                                        result: FetchResult::SourceFailed,
+                                                    },
+                                                    outcome = execute_single_fetch(
+                                                        p2p, storage, config, fetch_key, next_peer,
+                                                    ) => outcome,
+                                                }
+                                            });
+                                            match handle.await {
+                                                Ok(outcome) => (outcome.key, Some(outcome)),
+                                                Err(e) => {
+                                                    error!(
+                                                        "Fetch task for {} panicked: {e}",
+                                                        hex::encode(fetch_key)
+                                                    );
+                                                    (fetch_key, None)
+                                                }
+                                            }
+                                        }));
                                         false
                                     } else {
-                                        q.complete_fetch(&outcome.key);
+                                        q.complete_fetch(&key);
                                         true
                                     }
                                 }
-                            };
+                            }
+                        } else {
+                            // Task panicked — reclaim the in-flight slot.
+                            q.complete_fetch(&key);
+                            true
+                        };
 
-                            // Option B: shrink bootstrap pending set on terminal exit.
-                            // Option A: re-check drain condition after removal.
-                            if terminal && !bootstrap_state.read().await.is_drained() {
-                                bootstrap_state.write().await.remove_key(&outcome.key);
+                        // Shrink bootstrap pending set on terminal exit.
+                        if terminal {
+                            drop(q); // release queues lock before acquiring bootstrap_state
+                            if !bootstrap_state.read().await.is_drained() {
+                                bootstrap_state.write().await.remove_key(&key);
+                                let q = queues.read().await;
                                 if bootstrap::check_bootstrap_drained(
                                     &bootstrap_state,
                                     &q,
@@ -548,8 +603,10 @@ impl ReplicationEngine {
                 }
             }
 
-            // Drain remaining in-flight fetches on shutdown.
-            drop(in_flight);
+            // Cancel and drain remaining in-flight fetches on shutdown.
+            // The CancellationToken is already cancelled by this point, so
+            // spawned tasks will see cancellation via their select! branches.
+            while in_flight.next().await.is_some() {}
             debug!("Fetch worker shut down");
         });
         self.task_handles.push(handle);
@@ -1043,6 +1100,20 @@ async fn handle_neighbor_sync_request(
         warn!(
             "Neighbor sync request from {source} rejected: {total_hints} hints exceeds limit of {max_hints}",
         );
+        // Send an empty response so the peer is not left waiting until timeout.
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::NeighborSyncResponse(NeighborSyncResponse {
+                replica_hints: Vec::new(),
+                paid_hints: Vec::new(),
+                bootstrapping: is_bootstrapping,
+                rejected_keys: Vec::new(),
+            }),
+            rr_message_id,
+        )
+        .await;
         return Ok(());
     }
 
@@ -1122,7 +1193,24 @@ async fn handle_verification_request(
         return Ok(());
     }
 
-    let paid_check_set: HashSet<u32> = request.paid_list_check_indices.iter().copied().collect();
+    #[allow(clippy::cast_possible_truncation)]
+    let keys_len = request.keys.len() as u32;
+    let paid_check_set: HashSet<u32> = request
+        .paid_list_check_indices
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            if idx >= keys_len {
+                warn!(
+                    "Verification request from {source}: paid_list_check_index {idx} out of bounds (keys.len() = {})",
+                    request.keys.len(),
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
 
     let mut results = Vec::with_capacity(request.keys.len());
     for (i, key) in request.keys.iter().enumerate() {
@@ -1274,28 +1362,29 @@ async fn run_neighbor_sync_round(
     let bootstrapping = *is_bootstrapping.read().await;
 
     // Check if cycle is complete; start new one if needed.
-    {
+    // We check under a read lock, then release it before the expensive
+    // prune pass and DHT snapshot so other tasks are not starved.
+    let cycle_complete = sync_state.read().await.is_cycle_complete();
+    if cycle_complete {
+        // Post-cycle pruning (Section 11) — runs without holding sync_state.
+        pruning::run_prune_pass(&self_id, storage, paid_list, p2p_node, config).await;
+
+        // Increment `cycles_since_sync` for all peers.
+        {
+            let mut history = sync_history.write().await;
+            for record in history.values_mut() {
+                record.cycles_since_sync = record.cycles_since_sync.saturating_add(1);
+            }
+        }
+
+        // Take fresh close-neighbor snapshot (DHT query, no lock held).
+        let neighbors =
+            neighbor_sync::snapshot_close_neighbors(p2p_node, &self_id, config.neighbor_sync_scope)
+                .await;
+
+        // Now re-acquire write lock and re-check before swapping cycle.
         let mut state = sync_state.write().await;
         if state.is_cycle_complete() {
-            // Post-cycle pruning (Section 11).
-            pruning::run_prune_pass(&self_id, storage, paid_list, p2p_node, config).await;
-
-            // Increment `cycles_since_sync` for all peers.
-            {
-                let mut history = sync_history.write().await;
-                for record in history.values_mut() {
-                    record.cycles_since_sync = record.cycles_since_sync.saturating_add(1);
-                }
-            }
-
-            // Take fresh close-neighbor snapshot.
-            let neighbors = neighbor_sync::snapshot_close_neighbors(
-                p2p_node,
-                &self_id,
-                config.neighbor_sync_scope,
-            )
-            .await;
-
             // Preserve last_sync_times and bootstrap_claims across cycles.
             // Claims have a 24h lifecycle vs 10-20 min cycles — dropping them
             // would reset the abuse detection timer every cycle.
@@ -1421,16 +1510,25 @@ async fn handle_sync_response(
     // Process inbound hints from response (skip if peer is bootstrapping).
     if resp.bootstrapping {
         // Gap 6: BootstrapClaimAbuse grace period enforcement.
-        let now = Instant::now();
-        let mut state = sync_state.write().await;
-        let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
-        let claim_age = now.duration_since(*first_seen);
-        if claim_age > config.bootstrap_claim_grace_period {
-            warn!(
-                "Peer {peer} has been claiming bootstrap for {:?}, \
-                 exceeding grace period of {:?} — reporting abuse",
-                claim_age, config.bootstrap_claim_grace_period,
-            );
+        // Separate state mutation from network I/O to avoid holding the
+        // write lock across report_trust_event.
+        let should_report = {
+            let now = Instant::now();
+            let mut state = sync_state.write().await;
+            let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
+            let claim_age = now.duration_since(*first_seen);
+            if claim_age > config.bootstrap_claim_grace_period {
+                warn!(
+                    "Peer {peer} has been claiming bootstrap for {:?}, \
+                     exceeding grace period of {:?} — reporting abuse",
+                    claim_age, config.bootstrap_claim_grace_period,
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if should_report {
             p2p_node
                 .report_trust_event(
                     peer,
@@ -1548,6 +1646,13 @@ async fn run_verification_cycle(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
 ) {
+    // Evict stale entries that have been pending too long (e.g. unreachable
+    // verification targets during a network partition).
+    {
+        let mut q = queues.write().await;
+        q.evict_stale(config::PENDING_VERIFY_MAX_AGE);
+    }
+
     let pending_keys = {
         let q = queues.read().await;
         q.pending_keys()
@@ -1940,24 +2045,32 @@ async fn handle_audit_result(
         }
         AuditTickResult::BootstrapClaim { peer } => {
             // Gap 6: BootstrapClaimAbuse grace period in audit path.
-            let now = Instant::now();
-            let mut state = sync_state.write().await;
-            let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
-            let claim_age = now.duration_since(*first_seen);
-            if claim_age > config.bootstrap_claim_grace_period {
-                warn!(
-                    "Audit: peer {peer} claiming bootstrap past grace period \
-                     ({:?} > {:?}), reporting abuse",
-                    claim_age, config.bootstrap_claim_grace_period,
-                );
+            // Separate state mutation from network I/O to avoid holding the
+            // write lock across report_trust_event.
+            let should_report = {
+                let now = Instant::now();
+                let mut state = sync_state.write().await;
+                let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
+                let claim_age = now.duration_since(*first_seen);
+                if claim_age > config.bootstrap_claim_grace_period {
+                    warn!(
+                        "Audit: peer {peer} claiming bootstrap past grace period \
+                         ({:?} > {:?}), reporting abuse",
+                        claim_age, config.bootstrap_claim_grace_period,
+                    );
+                    true
+                } else {
+                    debug!("Audit: peer {peer} claims bootstrapping (within grace period)");
+                    false
+                }
+            };
+            if should_report {
                 p2p_node
                     .report_trust_event(
                         peer,
                         TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
                     )
                     .await;
-            } else {
-                debug!("Audit: peer {peer} claims bootstrapping (within grace period)");
             }
         }
         AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}

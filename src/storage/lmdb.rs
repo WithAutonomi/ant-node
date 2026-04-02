@@ -438,6 +438,11 @@ impl LmdbStorage {
                     let mut key = [0u8; XORNAME_LEN];
                     key.copy_from_slice(key_bytes);
                     keys.push(key);
+                } else {
+                    tracing::warn!(
+                        "LmdbStorage: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
+                        key_bytes.len()
+                    );
                 }
             }
             Ok(keys)

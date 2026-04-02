@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use crate::ant_protocol::XORNAME_LEN;
 
@@ -265,6 +265,11 @@ impl PaidList {
                 let mut key = [0u8; XORNAME_LEN];
                 key.copy_from_slice(key_bytes);
                 keys.push(key);
+            } else {
+                warn!(
+                    "PaidList: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
+                    key_bytes.len()
+                );
             }
         }
         Ok(keys)

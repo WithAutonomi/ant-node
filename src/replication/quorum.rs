@@ -202,22 +202,27 @@ pub fn evaluate_key_evidence(
     let confirm_needed = ReplicationConfig::confirm_needed(paid_group_size);
 
     // Step 10: Presence quorum reached.
-    if presence_positive >= quorum_needed {
+    // quorum_needed == 0 means zero targets exist — quorum is impossible,
+    // not trivially met.
+    if quorum_needed > 0 && presence_positive >= quorum_needed {
         return KeyVerificationOutcome::QuorumVerified {
             sources: present_peers,
         };
     }
 
     // Step 9: Paid-list majority reached.
-    if paid_confirmed >= confirm_needed {
+    // confirm_needed from 0 paid peers is 1, so this naturally fails with
+    // 0 confirmed — no special guard needed. But be explicit for clarity.
+    if paid_group_size > 0 && paid_confirmed >= confirm_needed {
         return KeyVerificationOutcome::PaidListVerified {
             sources: present_peers,
         };
     }
 
     // Step 14: Fail fast when both paths are impossible.
-    let paid_possible = paid_confirmed + paid_unresolved >= confirm_needed;
-    let quorum_possible = presence_positive + presence_unresolved >= quorum_needed;
+    let paid_possible = paid_group_size > 0 && paid_confirmed + paid_unresolved >= confirm_needed;
+    let quorum_possible =
+        quorum_needed > 0 && presence_positive + presence_unresolved >= quorum_needed;
 
     if !paid_possible && !quorum_possible {
         return KeyVerificationOutcome::QuorumFailed;
@@ -370,9 +375,27 @@ fn process_verification_response(
         return;
     };
 
+    // Use a HashSet for O(1) key membership checks instead of linear scan,
+    // preventing CPU amplification from large responses.
+    let peer_keys_set: HashSet<&XorName> = peer_keys.iter().collect();
+
+    // Cap results at 2x requested keys to limit processing of stuffed
+    // responses while still tolerating some unsolicited entries.
+    let max_results = peer_keys.len().saturating_mul(2);
+    let results = if response.results.len() > max_results {
+        warn!(
+            "Peer {peer} sent {} verification results but only {} keys were requested — truncating",
+            response.results.len(),
+            peer_keys.len(),
+        );
+        &response.results[..max_results]
+    } else {
+        &response.results
+    };
+
     // Match response results to requested keys.
-    for result in &response.results {
-        if !peer_keys.contains(&result.key) {
+    for result in results {
+        if !peer_keys_set.contains(&result.key) {
             continue; // Ignore unsolicited key results.
         }
 
