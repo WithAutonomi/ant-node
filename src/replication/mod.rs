@@ -641,7 +641,6 @@ impl ReplicationEngine {
 
             let neighbor_count = neighbors.len();
             info!("Bootstrap sync: syncing with {neighbor_count} close neighbors");
-            bootstrap::increment_pending_requests(&bootstrap_state, neighbor_count).await;
 
             let bootstrapping = *is_bootstrapping.read().await;
 
@@ -655,6 +654,8 @@ impl ReplicationEngine {
                     if shutdown.is_cancelled() {
                         break;
                     }
+
+                    bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
 
                     let response = neighbor_sync::sync_with_peer(
                         peer,
