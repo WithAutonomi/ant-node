@@ -431,6 +431,7 @@ const fn default_bootstrap_stale_days() -> u64 {
 /// Controls how chunks are stored, including:
 /// - Whether storage is enabled
 /// - Content verification on read
+/// - Database size limits (auto-scales with available disk by default)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Enable chunk storage.
@@ -443,11 +444,20 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
 
-    /// Maximum LMDB database size in GiB (0 = use default of 32 GiB).
-    /// On Unix the mmap is a lazy reservation and costs nothing until pages
-    /// are faulted in.
+    /// Explicit LMDB database size cap in GiB.
+    ///
+    /// When set to 0 (default), the map size is computed automatically from
+    /// available disk space at startup and grows on demand when the operator
+    /// adds storage.  Set a non-zero value to impose a hard cap.
     #[serde(default)]
     pub db_size_gb: usize,
+
+    /// Minimum free disk space (in GiB) to preserve on the storage partition.
+    ///
+    /// Writes are refused when available space drops below this threshold,
+    /// preventing the node from filling the disk completely.  Default: 1 GiB.
+    #[serde(default = "default_disk_reserve_gb")]
+    pub disk_reserve_gb: u64,
 }
 
 impl Default for StorageConfig {
@@ -456,8 +466,13 @@ impl Default for StorageConfig {
             enabled: default_storage_enabled(),
             verify_on_read: default_storage_verify_on_read(),
             db_size_gb: 0,
+            disk_reserve_gb: default_disk_reserve_gb(),
         }
     }
+}
+
+const fn default_disk_reserve_gb() -> u64 {
+    1
 }
 
 const fn default_storage_enabled() -> bool {

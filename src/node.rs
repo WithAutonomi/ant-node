@@ -322,7 +322,11 @@ impl NodeBuilder {
         let storage_config = LmdbStorageConfig {
             root_dir: config.root_dir.clone(),
             verify_on_read: config.storage.verify_on_read,
-            max_map_size: config.storage.db_size_gb.saturating_mul(1_073_741_824),
+            max_map_size: config.storage.db_size_gb.saturating_mul(1024 * 1024 * 1024),
+            disk_reserve: config
+                .storage
+                .disk_reserve_gb
+                .saturating_mul(1024 * 1024 * 1024),
         };
         let storage = LmdbStorage::new(storage_config)
             .await

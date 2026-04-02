@@ -10,15 +10,33 @@
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, Env, EnvOpenOptions, MdbError};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 use tokio::task::spawn_blocking;
-use tracing::{debug, trace, warn};
+use tracing::{debug, info, trace, warn};
 
-/// Default LMDB map size: 32 GiB.
+/// Bytes in one GiB.
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// Convert a byte count to GiB for human-readable log messages.
+#[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is irrelevant
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / GIB as f64
+}
+
+/// Absolute minimum LMDB map size.
 ///
-/// Node operators can override this via `storage.db_size_gb` in `config.toml`.
-const DEFAULT_MAX_MAP_SIZE: usize = 32 * 1_073_741_824; // 32 GiB
+/// Even on a nearly-full disk the database must be able to open.
+/// Set to 256 MiB — enough for millions of LMDB pages.
+const MIN_MAP_SIZE: usize = 256 * 1024 * 1024;
+
+/// How often to re-query available disk space (in seconds).
+///
+/// Between checks the cached result is trusted.  Disk space changes slowly
+/// relative to chunk-write throughput, so a multi-second window is safe.
+const DISK_CHECK_INTERVAL_SECS: u64 = 5;
 
 /// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
@@ -27,8 +45,15 @@ pub struct LmdbStorageConfig {
     pub root_dir: PathBuf,
     /// Whether to verify content on read (compares hash to address).
     pub verify_on_read: bool,
-    /// Maximum LMDB map size in bytes (0 = use default of 32 GiB).
+    /// Explicit LMDB map size cap in bytes.
+    ///
+    /// When 0 (default), the map size is computed automatically from available
+    /// disk space and grows on demand when more storage becomes available.
     pub max_map_size: usize,
+    /// Minimum free disk space (in bytes) to preserve on the storage partition.
+    ///
+    /// Writes are refused when available space drops below this threshold.
+    pub disk_reserve: u64,
 }
 
 impl Default for LmdbStorageConfig {
@@ -37,6 +62,7 @@ impl Default for LmdbStorageConfig {
             root_dir: PathBuf::from(".ant/chunks"),
             verify_on_read: true,
             max_map_size: 0,
+            disk_reserve: GIB,
         }
     }
 }
@@ -71,14 +97,33 @@ pub struct LmdbStorage {
     db: Database<Bytes, Bytes>,
     /// Storage configuration.
     config: LmdbStorageConfig,
+    /// Path to the LMDB environment directory (for disk-space queries).
+    env_dir: PathBuf,
     /// Operation statistics.
     stats: parking_lot::RwLock<StorageStats>,
+    /// Serialises access to the LMDB environment during a map resize.
+    ///
+    /// Normal read/write operations acquire a **shared** lock.  The rare
+    /// resize path acquires an **exclusive** lock, ensuring no transactions
+    /// are active when `env.resize()` is called (an LMDB safety requirement).
+    env_lock: Arc<parking_lot::RwLock<()>>,
+    /// Timestamp of the last successful disk-space check.
+    ///
+    /// `None` means "never checked — check on next write".  Updated only
+    /// after a passing check, so a low-space result is always rechecked.
+    last_disk_ok: parking_lot::Mutex<Option<Instant>>,
 }
 
 impl LmdbStorage {
     /// Create a new LMDB storage instance.
     ///
     /// Opens (or creates) an LMDB environment at `{root_dir}/chunks.mdb/`.
+    ///
+    /// When `config.max_map_size` is 0 (the default) the map size is derived
+    /// from the available disk space on the partition that hosts the database,
+    /// minus `config.disk_reserve`.  This allows a node to use all available
+    /// storage without a fixed cap.  If the operator adds more storage later
+    /// the map is resized on demand (see [`Self::put`]).
     ///
     /// # Errors
     ///
@@ -92,9 +137,17 @@ impl LmdbStorage {
             .map_err(|e| Error::Storage(format!("Failed to create LMDB directory: {e}")))?;
 
         let map_size = if config.max_map_size > 0 {
+            // Operator provided an explicit cap.
             config.max_map_size
         } else {
-            DEFAULT_MAX_MAP_SIZE
+            // Auto-scale: current DB footprint + available space − reserve.
+            let computed = compute_map_size(&env_dir, config.disk_reserve)?;
+            info!(
+                "Auto-computed LMDB map size: {:.2} GiB (available disk minus {:.2} GiB reserve)",
+                bytes_to_gib(computed as u64),
+                bytes_to_gib(config.disk_reserve),
+            );
+            computed
         };
 
         let env_dir_clone = env_dir.clone();
@@ -132,12 +185,15 @@ impl LmdbStorage {
             env,
             db,
             config,
+            env_dir,
             stats: parking_lot::RwLock::new(StorageStats::default()),
+            env_lock: Arc::new(parking_lot::RwLock::new(())),
+            last_disk_ok: parking_lot::Mutex::new(None),
         };
 
         debug!(
             "Initialized LMDB storage at {:?} ({} existing chunks)",
-            env_dir,
+            storage.env_dir,
             storage.current_chunks()?
         );
 
@@ -146,10 +202,10 @@ impl LmdbStorage {
 
     /// Store a chunk.
     ///
-    /// # Arguments
-    ///
-    /// * `address` - Content address (should be BLAKE3 of content)
-    /// * `content` - Chunk data
+    /// Before writing, verifies that available disk space exceeds the
+    /// configured reserve.  If the LMDB map is full but more disk space
+    /// exists (e.g. the operator added storage), the map is resized
+    /// automatically and the write is retried.
     ///
     /// # Returns
     ///
@@ -157,7 +213,8 @@ impl LmdbStorage {
     ///
     /// # Errors
     ///
-    /// Returns an error if the write fails or content doesn't match address.
+    /// Returns an error if the write fails, content doesn't match address,
+    /// or the disk is too full to accept new chunks.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
         // Verify content address
         let computed = Self::compute_address(content);
@@ -169,6 +226,9 @@ impl LmdbStorage {
             )));
         }
 
+        // ── Disk-space guard (cached — at most one syscall per interval) ─
+        self.check_disk_space_cached()?;
+
         // Fast-path duplicate check (read-only, no write lock needed).
         // This is an optimistic hint — the authoritative check happens inside
         // the write transaction below to prevent TOCTOU races.
@@ -178,41 +238,32 @@ impl LmdbStorage {
             return Ok(false);
         }
 
-        let key = *address;
-        let value = content.to_vec();
-        let env = self.env.clone();
-        let db = self.db;
-
-        // Existence check and write happen atomically inside a single write
-        // transaction. LMDB serializes write transactions, so there are no
-        // TOCTOU races.
-        let was_new = spawn_blocking(move || -> Result<bool> {
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-
-            // Authoritative existence check inside the serialized write txn
-            if db
-                .get(&wtxn, &key)
-                .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
-                .is_some()
-            {
+        // ── Write (with resize-on-demand) ───────────────────────────────
+        match self.try_put(address, content).await? {
+            PutOutcome::New => {}
+            PutOutcome::Duplicate => {
+                trace!("Chunk {} already exists", hex::encode(address));
+                self.stats.write().duplicates += 1;
                 return Ok(false);
             }
-
-            db.put(&mut wtxn, &key, &value)
-                .map_err(|e| Error::Storage(format!("Failed to put chunk: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit put: {e}")))?;
-            Ok(true)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))??;
-
-        if !was_new {
-            trace!("Chunk {} already exists", hex::encode(address));
-            self.stats.write().duplicates += 1;
-            return Ok(false);
+            PutOutcome::MapFull => {
+                // The map ceiling was reached but there may be more disk space
+                // available (e.g. operator expanded the partition).
+                self.try_resize().await?;
+                // Retry once after resize.
+                match self.try_put(address, content).await? {
+                    PutOutcome::New => {}
+                    PutOutcome::Duplicate => {
+                        self.stats.write().duplicates += 1;
+                        return Ok(false);
+                    }
+                    PutOutcome::MapFull => {
+                        return Err(Error::Storage(
+                            "LMDB map full after resize — disk may be at capacity".into(),
+                        ));
+                    }
+                }
+            }
         }
 
         {
@@ -230,11 +281,52 @@ impl LmdbStorage {
         Ok(true)
     }
 
+    /// Attempt a single put inside a write transaction.
+    ///
+    /// Returns [`PutOutcome::MapFull`] instead of an error when the LMDB map
+    /// ceiling is reached, so the caller can resize and retry.
+    async fn try_put(&self, address: &XorName, content: &[u8]) -> Result<PutOutcome> {
+        let key = *address;
+        let value = content.to_vec();
+        let env = self.env.clone();
+        let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
+
+        spawn_blocking(move || -> Result<PutOutcome> {
+            let _guard = lock.read();
+
+            let mut wtxn = env
+                .write_txn()
+                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+
+            // Authoritative existence check inside the serialized write txn
+            if db
+                .get(&wtxn, &key)
+                .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
+                .is_some()
+            {
+                return Ok(PutOutcome::Duplicate);
+            }
+
+            match db.put(&mut wtxn, &key, &value) {
+                Ok(()) => {}
+                Err(heed::Error::Mdb(MdbError::MapFull)) => return Ok(PutOutcome::MapFull),
+                Err(e) => {
+                    return Err(Error::Storage(format!("Failed to put chunk: {e}")));
+                }
+            }
+
+            match wtxn.commit() {
+                Ok(()) => Ok(PutOutcome::New),
+                Err(heed::Error::Mdb(MdbError::MapFull)) => Ok(PutOutcome::MapFull),
+                Err(e) => Err(Error::Storage(format!("Failed to commit put: {e}"))),
+            }
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))?
+    }
+
     /// Retrieve a chunk.
-    ///
-    /// # Arguments
-    ///
-    /// * `address` - Content address to retrieve
     ///
     /// # Returns
     ///
@@ -247,8 +339,10 @@ impl LmdbStorage {
         let key = *address;
         let env = self.env.clone();
         let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
 
         let content = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+            let _guard = lock.read();
             let rtxn = env
                 .read_txn()
                 .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
@@ -303,6 +397,7 @@ impl LmdbStorage {
     ///
     /// Returns an error if the LMDB read transaction fails.
     pub fn exists(&self, address: &XorName) -> Result<bool> {
+        let _guard = self.env_lock.read();
         let rtxn = self
             .env
             .read_txn()
@@ -324,8 +419,10 @@ impl LmdbStorage {
         let key = *address;
         let env = self.env.clone();
         let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
 
         let deleted = spawn_blocking(move || -> Result<bool> {
+            let _guard = lock.read();
             let mut wtxn = env
                 .write_txn()
                 .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
@@ -368,6 +465,7 @@ impl LmdbStorage {
     ///
     /// Returns an error if the LMDB read transaction fails.
     pub fn current_chunks(&self) -> Result<u64> {
+        let _guard = self.env_lock.read();
         let rtxn = self
             .env
             .read_txn()
@@ -391,6 +489,140 @@ impl LmdbStorage {
     pub fn root_dir(&self) -> &Path {
         &self.config.root_dir
     }
+
+    /// Check available disk space, skipping the syscall if a recent check passed.
+    ///
+    /// Only caches *passing* results — a low-space condition is always
+    /// rechecked so we detect freed space promptly.
+    fn check_disk_space_cached(&self) -> Result<()> {
+        {
+            let last = self.last_disk_ok.lock();
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS {
+                    return Ok(());
+                }
+            }
+        }
+        // Cache miss or stale — perform the actual statvfs check.
+        check_disk_space(&self.env_dir, self.config.disk_reserve)?;
+        // Passed — update the cache timestamp.
+        *self.last_disk_ok.lock() = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Grow the LMDB map to match currently available disk space.
+    ///
+    /// The new size is the **larger** of:
+    ///   1. the current map size (so existing data is never truncated), and
+    ///   2. `current_db_file_size + available_space − reserve`
+    ///      (so all reachable disk space can be used).
+    ///
+    /// Acquires an **exclusive** lock on `env_lock` so that no read or write
+    /// transactions are active when the underlying `mdb_env_set_mapsize` is
+    /// called (an LMDB safety requirement).
+    #[allow(unsafe_code)]
+    async fn try_resize(&self) -> Result<()> {
+        let from_disk = compute_map_size(&self.env_dir, self.config.disk_reserve)?;
+        let env = self.env.clone();
+        let lock = Arc::clone(&self.env_lock);
+
+        spawn_blocking(move || -> Result<()> {
+            // Exclusive lock guarantees no concurrent transactions.
+            let _guard = lock.write();
+
+            // Never shrink below the current map — existing data must remain
+            // addressable regardless of what the disk-space calculation says.
+            let current_map = env.info().map_size;
+            let new_size = from_disk.max(current_map);
+
+            if new_size <= current_map {
+                debug!("LMDB map resize skipped — no additional disk space available");
+                return Ok(());
+            }
+
+            // SAFETY: We hold an exclusive lock, so no transactions are active.
+            unsafe {
+                env.resize(new_size)
+                    .map_err(|e| Error::Storage(format!("Failed to resize LMDB map: {e}")))?;
+            }
+
+            info!(
+                "Resized LMDB map to {:.2} GiB (was {:.2} GiB)",
+                bytes_to_gib(new_size as u64),
+                bytes_to_gib(current_map as u64),
+            );
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("LMDB resize task failed: {e}")))?
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Outcome of a single `try_put` attempt.
+enum PutOutcome {
+    /// Chunk was newly stored.
+    New,
+    /// Chunk already existed (idempotent).
+    Duplicate,
+    /// The LMDB map ceiling was reached — caller should resize and retry.
+    MapFull,
+}
+
+/// Compute the LMDB map size from the disk hosting `db_dir`.
+///
+/// The result covers **all existing data** plus all remaining usable disk
+/// space:
+///
+/// ```text
+/// map_size = current_db_file_size + max(0, available_space − reserve)
+/// ```
+///
+/// `available_space` (from `statvfs`) reports only the *free* bytes on the
+/// partition — the DB file's own footprint is **not** included, so adding
+/// it back ensures the map is always large enough for the data already
+/// stored.
+///
+/// The result is page-aligned and never falls below [`MIN_MAP_SIZE`].
+fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
+    let available = fs2::available_space(db_dir)
+        .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
+
+    // The MDB data file may not exist yet on first run.
+    let mdb_file = db_dir.join("data.mdb");
+    let current_db_bytes = std::fs::metadata(&mdb_file).map(|m| m.len()).unwrap_or(0);
+
+    // available_space excludes the DB file, so we add it back to get the
+    // total space the DB could occupy while still leaving `reserve` free.
+    let growth_room = available.saturating_sub(reserve);
+    let target = current_db_bytes.saturating_add(growth_room);
+
+    // Align up to system page size (required by heed's resize).
+    let page = page_size::get() as u64;
+    let aligned = target.div_ceil(page) * page;
+
+    let result = usize::try_from(aligned).unwrap_or(usize::MAX);
+    Ok(result.max(MIN_MAP_SIZE))
+}
+
+/// Reject the write early if available disk space is below `reserve`.
+fn check_disk_space(db_dir: &Path, reserve: u64) -> Result<()> {
+    let available = fs2::available_space(db_dir)
+        .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
+
+    if available < reserve {
+        return Err(Error::Storage(format!(
+            "Insufficient disk space: {:.2} GiB available, {:.2} GiB reserve required. \
+             Free disk space or increase the partition to continue storing chunks.",
+            bytes_to_gib(available),
+            bytes_to_gib(reserve),
+        )));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -404,7 +636,7 @@ mod tests {
         let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             verify_on_read: true,
-            max_map_size: 0,
+            ..LmdbStorageConfig::default()
         };
         let storage = LmdbStorage::new(config).await.expect("create storage");
         (storage, temp_dir)
@@ -551,8 +783,7 @@ mod tests {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
-
-                max_map_size: 0,
+                ..LmdbStorageConfig::default()
             };
             let storage = LmdbStorage::new(config).await.expect("create storage");
             storage.put(&address, content).await.expect("put");
@@ -563,8 +794,7 @@ mod tests {
             let config = LmdbStorageConfig {
                 root_dir: temp_dir.path().to_path_buf(),
                 verify_on_read: true,
-
-                max_map_size: 0,
+                ..LmdbStorageConfig::default()
             };
             let storage = LmdbStorage::new(config).await.expect("reopen storage");
             assert_eq!(storage.current_chunks().expect("current_chunks"), 1);

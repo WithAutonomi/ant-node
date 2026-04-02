@@ -1056,7 +1056,7 @@ impl TestNetwork {
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
             verify_on_read: true,
-            max_map_size: 0,
+            ..LmdbStorageConfig::default()
         };
         let storage = LmdbStorage::new(storage_config)
             .await

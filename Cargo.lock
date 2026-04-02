@@ -856,6 +856,7 @@ dependencies = [
  "lru",
  "objc2",
  "objc2-foundation",
+ "page_size",
  "parking_lot",
  "postcard",
  "proptest",

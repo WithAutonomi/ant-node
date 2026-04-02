@@ -432,7 +432,7 @@ mod tests {
         let storage = LmdbStorage::new(LmdbStorageConfig {
             root_dir: temp_dir.clone(),
             verify_on_read: true,
-            max_map_size: 0,
+            ..LmdbStorageConfig::default()
         })
         .await?;
 
