@@ -552,14 +552,11 @@ mod tests {
         );
 
         // Step 2: Attempt to enqueue fetch while still in PendingVerify.
-        // enqueue_fetch checks fetch_queue_keys and in_flight, but NOT
-        // pending_verify. However, the key SHOULD still be blocked by
-        // the caller checking contains_key. Verify enqueue_fetch itself
-        // at least doesn't create a second entry in fetch_queue_keys.
+        // enqueue_fetch checks all three stages (pending_verify,
+        // fetch_queue_keys, in_flight), so this is a no-op while the key
+        // is still in PendingVerify.
         queues.enqueue_fetch(key, distance, vec![peer_id_from_byte(2)]);
-        // fetch_queue_keys won't contain the key because enqueue_fetch
-        // only checks fetch_queue_keys + in_flight. So let's verify the
-        // higher-level invariant: contains_key covers all three stages.
+        // Verify the key is still tracked via the cross-stage check.
         assert!(queues.contains_key(&key), "key should still be in pipeline");
 
         // Step 3: Remove from PendingVerify, add to FetchQueue.

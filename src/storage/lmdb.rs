@@ -444,7 +444,7 @@ impl LmdbStorage {
             Ok(keys)
         })
         .await
-        .map_err(|e| Error::Storage(format!("all_keys task panicked: {e}")))?;
+        .map_err(|e| Error::Storage(format!("all_keys task failed: {e}")))?;
 
         keys
     }
@@ -472,7 +472,7 @@ impl LmdbStorage {
             Ok(val.map(Vec::from))
         })
         .await
-        .map_err(|e| Error::Storage(format!("get_raw task panicked: {e}")))?;
+        .map_err(|e| Error::Storage(format!("get_raw task failed: {e}")))?;
 
         value
     }
