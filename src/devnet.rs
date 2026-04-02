@@ -79,9 +79,6 @@ const DEVNET_PAYMENT_CACHE_CAPACITY: usize = 1000;
 /// Devnet rewards address (20 bytes, all 0x01).
 const DEVNET_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
-/// Max records for quoting metrics (devnet value).
-const DEVNET_MAX_RECORDS: usize = 100_000;
-
 /// Initial records for quoting metrics (devnet value).
 const DEVNET_INITIAL_RECORDS: usize = 1000;
 
@@ -586,8 +583,7 @@ impl Devnet {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        let metrics_tracker =
-            QuotingMetricsTracker::new(DEVNET_MAX_RECORDS, DEVNET_INITIAL_RECORDS);
+        let metrics_tracker = QuotingMetricsTracker::new(DEVNET_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from the devnet node's identity

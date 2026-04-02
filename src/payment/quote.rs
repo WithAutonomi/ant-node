@@ -415,7 +415,7 @@ mod tests {
 
     fn create_test_generator() -> QuoteGenerator {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
 
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn test_generator_without_signer() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         assert!(!generator.can_sign());
@@ -478,7 +478,7 @@ mod tests {
         let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keypair generation");
 
         let rewards_address = RewardsAddress::new([2u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         let pub_key_bytes = public_key.as_bytes().to_vec();
@@ -522,7 +522,7 @@ mod tests {
     #[test]
     fn test_rewards_address_getter() {
         let addr = RewardsAddress::new([42u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let generator = QuoteGenerator::new(addr, metrics_tracker);
 
         assert_eq!(*generator.rewards_address(), addr);
@@ -531,7 +531,7 @@ mod tests {
     #[test]
     fn test_records_stored() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(500, 50);
+        let metrics_tracker = QuotingMetricsTracker::new(50);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         assert_eq!(generator.records_stored(), 50);
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn test_record_store_delegation() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         generator.record_store(0);
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn test_can_sign_after_set_signer() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         assert!(!generator.can_sign());
@@ -620,7 +620,7 @@ mod tests {
     fn test_wire_ml_dsa_signer_returns_ok_with_valid_identity() {
         let identity = saorsa_core::identity::NodeIdentity::generate().expect("keypair generation");
         let rewards_address = RewardsAddress::new([3u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         let result = wire_ml_dsa_signer(&mut generator, &identity);
@@ -634,7 +634,7 @@ mod tests {
     #[test]
     fn test_probe_signer_fails_without_signer() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         let result = generator.probe_signer();
@@ -644,7 +644,7 @@ mod tests {
     #[test]
     fn test_probe_signer_fails_with_empty_signature() {
         let rewards_address = RewardsAddress::new([1u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         generator.set_signer(vec![0u8; 32], |_| vec![]);
@@ -659,7 +659,7 @@ mod tests {
         let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keypair generation");
 
         let rewards_address = RewardsAddress::new([0x42u8; 20]);
-        let metrics_tracker = QuotingMetricsTracker::new(800, 50);
+        let metrics_tracker = QuotingMetricsTracker::new(50);
         let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing (same as production nodes)

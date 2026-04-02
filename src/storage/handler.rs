@@ -417,7 +417,7 @@ mod tests {
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quote requests succeed

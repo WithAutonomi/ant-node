@@ -442,7 +442,7 @@ mod tests {
             cache_capacity: 100,
             local_rewards_address: rewards_address,
         });
-        let metrics_tracker = QuotingMetricsTracker::new(1000, 100);
+        let metrics_tracker = QuotingMetricsTracker::new(100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         let protocol = AntProtocol::new(

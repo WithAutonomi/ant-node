@@ -105,10 +105,6 @@ const TEST_PAYMENT_CACHE_CAPACITY: usize = 1000;
 /// Test rewards address (20 bytes, all 0x01).
 const TEST_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
-/// Max records for quoting metrics (derived from node storage limit / max chunk size).
-/// 5 GB / 4 MB = 1280 records.
-const TEST_MAX_RECORDS: usize = 1280;
-
 /// Initial records for quoting metrics (test value).
 const TEST_INITIAL_RECORDS: usize = 1000;
 
@@ -1080,7 +1076,7 @@ impl TestNetwork {
         let payment_verifier = PaymentVerifier::new(payment_config);
 
         // Create quote generator with ML-DSA-65 signing from the test node's identity
-        let metrics_tracker = QuotingMetricsTracker::new(TEST_MAX_RECORDS, TEST_INITIAL_RECORDS);
+        let metrics_tracker = QuotingMetricsTracker::new(TEST_INITIAL_RECORDS);
         let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing so quotes are properly signed and verifiable

@@ -986,7 +986,7 @@ mod tests {
             let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
 
             let rewards_address = RewardsAddress::new([i; 20]);
-            let metrics_tracker = QuotingMetricsTracker::new(1000, 0);
+            let metrics_tracker = QuotingMetricsTracker::new(0);
             let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
             let pub_key_bytes = public_key.as_bytes().to_vec();
