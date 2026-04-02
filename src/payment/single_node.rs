@@ -176,87 +176,48 @@ impl SingleNodePayment {
         Ok(result_hashes)
     }
 
-    /// Verify all payments on-chain.
+    /// Verify that the median quote was paid at least 3× its price on-chain.
     ///
-    /// This checks that all 5 payments were recorded on the blockchain.
-    /// The contract requires exactly 5 payment verifications.
-    ///
-    /// # Arguments
-    ///
-    /// * `network` - The EVM network to verify on
-    /// * `owned_quote_hash` - Optional quote hash that this node owns (expects to receive payment)
+    /// Every node in the close group runs this same check: look up the median
+    /// quote's on-chain payment amount and confirm it meets the 3× threshold.
+    /// This ensures all 5 nodes can independently detect underpayment, not
+    /// just the median node.
     ///
     /// # Returns
     ///
-    /// The total verified payment amount received by owned quotes.
+    /// The on-chain payment amount for the median quote.
     ///
     /// # Errors
     ///
-    /// Returns an error if verification fails or payment is invalid.
-    pub async fn verify(
-        &self,
-        network: &EvmNetwork,
-        owned_quote_hash: Option<QuoteHash>,
-    ) -> Result<Amount> {
-        info!(
-            "Verifying {} payments via completedPayments mapping",
-            self.quotes.len()
-        );
+    /// Returns an error if the on-chain lookup fails or the median quote
+    /// was paid less than 3× its price.
+    pub async fn verify(&self, network: &EvmNetwork) -> Result<Amount> {
+        let median = &self.quotes[MEDIAN_INDEX];
+        let expected_amount = median.amount;
+
+        info!("Verifying median quote payment: expected at least {expected_amount} atto");
 
         let provider = evmlib::utils::http_provider(network.rpc_url().clone());
         let vault_address = *network.payment_vault_address();
         let contract =
             evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
 
-        let mut total_verified = Amount::ZERO;
-        let mut owned_on_chain = Amount::ZERO;
+        let result = contract
+            .completedPayments(median.quote_hash)
+            .call()
+            .await
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
-        for quote_info in &self.quotes {
-            let result = contract
-                .completedPayments(quote_info.quote_hash)
-                .call()
-                .await
-                .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+        let on_chain_amount = Amount::from(result.amount);
 
-            let on_chain_amount = Amount::from(result.amount);
-            if on_chain_amount > Amount::ZERO {
-                total_verified = total_verified.checked_add(on_chain_amount).ok_or_else(|| {
-                    Error::Payment("Overflow summing verified amounts".to_string())
-                })?;
-
-                if owned_quote_hash == Some(quote_info.quote_hash) {
-                    owned_on_chain = on_chain_amount;
-                }
-            }
+        if on_chain_amount < expected_amount {
+            return Err(Error::Payment(format!(
+                "Median quote underpaid: on-chain {on_chain_amount}, expected at least {expected_amount}"
+            )));
         }
 
-        if total_verified == Amount::ZERO {
-            return Err(Error::Payment(
-                "No payments found on-chain for any quote".to_string(),
-            ));
-        }
-
-        // If we own a quote, verify the amount matches
-        if let Some(owned_hash) = owned_quote_hash {
-            let expected = self
-                .quotes
-                .iter()
-                .find(|q| q.quote_hash == owned_hash)
-                .ok_or_else(|| Error::Payment("Owned quote hash not found in payment".to_string()))?
-                .amount;
-
-            if owned_on_chain != expected {
-                return Err(Error::Payment(format!(
-                    "Payment amount mismatch: expected {expected}, on-chain {owned_on_chain}"
-                )));
-            }
-
-            info!("Payment verified: {owned_on_chain} atto received");
-        } else {
-            info!("Payment verified as valid on-chain");
-        }
-
-        Ok(total_verified)
+        info!("Payment verified: {on_chain_amount} atto paid for median quote");
+        Ok(on_chain_amount)
     }
 }
 
@@ -669,22 +630,12 @@ mod tests {
         let tx_hashes = payment.pay(&wallet).await?;
         println!("✓ Payment successful: {} transactions", tx_hashes.len());
 
-        // Verify payment (as owner of median quote)
-        let median_quote = payment
-            .quotes
-            .get(MEDIAN_INDEX)
-            .ok_or_else(|| {
-                Error::Payment(format!(
-                    "Index out of bounds: tried to access median index {} but quotes array has {} elements",
-                    MEDIAN_INDEX,
-                    payment.quotes.len()
-                ))
-            })?;
-        let median_quote_hash = median_quote.quote_hash;
-        let verified_amount = payment.verify(&network, Some(median_quote_hash)).await?;
+        // Verify median quote payment — all nodes run this same check
+        let verified_amount = payment.verify(&network).await?;
+        let expected_median_amount = payment.quotes[MEDIAN_INDEX].amount;
 
         assert_eq!(
-            verified_amount, median_quote.amount,
+            verified_amount, expected_median_amount,
             "Verified amount should match median payment"
         );
 
