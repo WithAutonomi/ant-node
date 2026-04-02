@@ -78,7 +78,7 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// Standard trust event weight for per-operation success/failure signals.
 ///
 /// Used for individual replication fetch outcomes, integrity check failures,
-/// and bootstrap claim abuse. Distinct from `MAX_CONSUMER_TRUST_WEIGHT` which
+/// and bootstrap claim abuse. Distinct from `AUDIT_FAILURE_TRUST_WEIGHT` which
 /// is reserved for confirmed audit failures.
 const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 
@@ -1733,7 +1733,7 @@ async fn handle_audit_result(
                 p2p_node
                     .report_trust_event(
                         challenged_peer,
-                        TrustEvent::ApplicationFailure(config::MAX_CONSUMER_TRUST_WEIGHT),
+                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
                     )
                     .await;
             }

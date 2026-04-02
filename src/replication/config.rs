@@ -143,8 +143,8 @@ const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.
 pub const FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(FETCH_REQUEST_TIMEOUT_SECS);
 
-/// Maximum consumer trust event weight (clamped by `TrustEngine`).
-pub const MAX_CONSUMER_TRUST_WEIGHT: f64 = 5.0;
+/// Trust event weight for confirmed audit failures.
+pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 2.0;
 
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
