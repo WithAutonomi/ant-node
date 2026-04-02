@@ -289,15 +289,17 @@ impl PaymentVerifier {
         self.cache.insert(xorname);
     }
 
-    /// Verify an EVM payment proof.
+    /// Verify a single-node EVM payment proof.
     ///
-    /// This verification ALWAYS validates payment proofs on-chain.
-    /// It verifies that:
-    /// 1. All quotes target the correct content address (xorname binding)
-    /// 2. All quote ML-DSA-65 signatures are valid (offloaded to a blocking
-    ///    thread via `spawn_blocking` since post-quantum signature verification
-    ///    is CPU-intensive)
-    /// 3. The payment was made on-chain via the EVM payment vault contract
+    /// Verification steps:
+    /// 1. Exactly `CLOSE_GROUP_SIZE` quotes are present
+    /// 2. All quotes target the correct content address (xorname binding)
+    /// 3. Quote timestamps are fresh (not expired or future-dated)
+    /// 4. Peer ID bindings match the ML-DSA-65 public keys
+    /// 5. This node is among the quoted recipients
+    /// 6. All ML-DSA-65 signatures are valid (offloaded to `spawn_blocking`)
+    /// 7. The median-priced quote was paid at least 3x its price on-chain
+    ///    (looked up via `completedPayments(quoteHash)` on the payment vault)
     ///
     /// For unit tests that don't need on-chain verification, pre-populate
     /// the cache so `verify_payment` returns `CachedAsVerified` before
@@ -330,16 +332,8 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        // Verify on-chain payment via the contract's verifyPayment function.
-        //
-        // The SingleNode payment model pays only the median-priced quote (at 3x)
-        // and sends Amount::ZERO for the other 4. We must reconstruct the same
-        // payment amounts the client used so the contract's exact-match check
-        // (`completedPayments[hash].amount == expected`) passes.
-        //
-        // ProofOfPayment::digest() returns raw quote prices, NOT the actual paid
-        // amounts. We use SingleNodePayment::from_quotes() — the same function
-        // the client uses — to derive the correct on-chain amounts.
+        // Reconstruct the SingleNodePayment to identify the median quote.
+        // from_quotes() sorts by price and marks the median for 3x payment.
         let quotes_with_prices: Vec<_> = payment
             .peer_quotes
             .iter()
@@ -351,57 +345,21 @@ impl PaymentVerifier {
             ))
         })?;
 
-        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
-        let vault_address = *self.config.evm.network.payment_vault_address();
-        let contract =
-            evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
-
-        // Build DataPayment entries with the actual paid amounts (3x median, 0 others)
-        let data_payments: Vec<_> = single_payment
-            .quotes
-            .iter()
-            .map(
-                |q| evmlib::contract::payment_vault::interface::IPaymentVault::DataPayment {
-                    rewardsAddress: q.rewards_address,
-                    amount: q.amount,
-                    quoteHash: q.quote_hash,
-                },
-            )
-            .collect();
-
-        let results = contract
-            .verifyPayment(data_payments)
-            .call()
+        // Verify the median quote was paid at least 3x its price on-chain
+        // via completedPayments(quoteHash) on the payment vault contract.
+        let verified_amount = single_payment
+            .verify(&self.config.evm.network)
             .await
             .map_err(|e| {
                 let xorname_hex = hex::encode(xorname);
                 Error::Payment(format!(
-                    "EVM verifyPayment call failed for {xorname_hex}: {e}"
+                    "Median quote payment verification failed for {xorname_hex}: {e}"
                 ))
             })?;
 
-        let total_quotes = single_payment.quotes.len();
-        let mut valid_paid_count: usize = 0;
-
-        for result in &results {
-            if result.isValid && result.amountPaid > Amount::ZERO {
-                valid_paid_count += 1;
-            }
-        }
-
-        if valid_paid_count == 0 {
-            let xorname_hex = hex::encode(xorname);
-            return Err(Error::Payment(format!(
-                "Payment verification failed on-chain for {xorname_hex}: \
-                 no valid paid quotes found ({total_quotes} checked)"
-            )));
-        }
-
         if tracing::enabled!(tracing::Level::INFO) {
             let xorname_hex = hex::encode(xorname);
-            info!(
-                "EVM payment verified for {xorname_hex} ({valid_paid_count} valid, {total_quotes} total quotes)"
-            );
+            info!("EVM payment verified for {xorname_hex} (median paid {verified_amount} atto)");
         }
         Ok(())
     }
