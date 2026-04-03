@@ -78,6 +78,16 @@ jobs:
       - name: Build release (no logging)
         run: cargo build --release --no-default-features
 
+  test-no-logging:
+    name: Test (no logging)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run unit tests without logging
+        run: cargo test --lib --no-default-features
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
