@@ -28,7 +28,7 @@ saorsa-core = "0.22.0"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = "0.8"
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", rev = "a3be57fcb3bd4982bc93ad0b58116255d509db28" }
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames

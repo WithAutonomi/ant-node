@@ -136,6 +136,7 @@ mod tests {
             timestamp: SystemTime::now(),
             price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([1u8; 20]),
+            close_group: vec![],
             pub_key: vec![],
             signature: vec![],
         }

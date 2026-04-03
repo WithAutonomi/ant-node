@@ -365,17 +365,18 @@ impl AntProtocol {
 
         let close_group = self.local_close_group(&request.address).await;
 
-        match self
-            .quote_generator
-            .create_quote(request.address, data_size_usize, request.data_type)
-        {
+        match self.quote_generator.create_quote(
+            request.address,
+            data_size_usize,
+            request.data_type,
+            close_group,
+        ) {
             Ok(quote) => {
                 // Serialize the quote
                 match rmp_serde::to_vec(&quote) {
                     Ok(quote_bytes) => ChunkQuoteResponse::Success {
                         quote: quote_bytes,
                         already_stored,
-                        close_group,
                     },
                     Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
                         "Failed to serialize quote: {e}"

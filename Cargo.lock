@@ -2286,8 +2286,7 @@ dependencies = [
 [[package]]
 name = "evmlib"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1338c23c9ce1b4e54ff5cc65e53ce859095f121bfc742e474e1e1f2e03748000"
+source = "git+https://github.com/WithAutonomi/evmlib?rev=a3be57fcb3bd4982bc93ad0b58116255d509db28#a3be57fcb3bd4982bc93ad0b58116255d509db28"
 dependencies = [
  "alloy",
  "ant-merkle",

@@ -688,10 +688,16 @@ impl PaymentVerifier {
 
     /// Verify that **every** peer in the payment proof is a known close group member.
     ///
-    /// Builds the known set from the current DHT close group plus this node
-    /// itself, then checks that each proof peer (derived via `BLAKE3(pub_key)`)
-    /// appears in that set. Rejects the proof if ANY peer is unrecognized.
+    /// Builds the allowed set from:
+    /// 1. The current DHT close group (from the routing table)
+    /// 2. This node itself
+    /// 3. Peers listed in this node's own quote's `close_group` field
     ///
+    /// Source (3) handles routing table churn: the close group may have changed
+    /// between quote issuance and the PUT arriving, but the node's own signed
+    /// quote captured its view at quote time, so those peers are still valid.
+    ///
+    /// Rejects the proof if ANY peer is unrecognized across all three sources.
     /// Skipped when `local_close_group` is empty (unit tests without DHT).
     fn validate_close_group_membership(
         &self,
@@ -702,11 +708,23 @@ impl PaymentVerifier {
             return Ok(());
         }
 
-        // Build the known peer set: current DHT close group + this node.
+        // Build the allowed peer set: current DHT close group + this node.
         let mut known_peers: HashSet<[u8; 32]> = local_close_group.iter().copied().collect();
         known_peers.insert(self.config.local_peer_id);
 
-        // Every proof peer must be in the known set.
+        // Also allow peers that were in this node's close group view at quote
+        // time. Find our own quote by matching the local rewards address, then
+        // add its signed close_group entries to the allowed set.
+        for (_, quote) in &payment.peer_quotes {
+            if quote.rewards_address == self.config.local_rewards_address {
+                for peer_id in &quote.close_group {
+                    known_peers.insert(*peer_id);
+                }
+                break;
+            }
+        }
+
+        // Every proof peer must be in the allowed set.
         for (_encoded_peer_id, quote) in &payment.peer_quotes {
             let peer_id = peer_id_from_public_key_bytes(&quote.pub_key).map_err(|e| {
                 Error::Payment(format!("Invalid ML-DSA pub_key in proof quote: {e}"))
@@ -732,7 +750,7 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ant_evm::EncodedPeerId;
+    use evmlib::EncodedPeerId;
     use saorsa_core::MlDsa65;
     use saorsa_pqc::pqc::MlDsaOperations;
 
@@ -1017,7 +1035,9 @@ mod tests {
             });
 
             let content: XorName = [i; 32];
-            let quote = generator.create_quote(content, 4096, 0).expect("quote");
+            let quote = generator
+                .create_quote(content, 4096, 0, vec![])
+                .expect("quote");
 
             peer_quotes.push((EncodedPeerId::new(rand::random()), quote));
         }
@@ -1063,6 +1083,7 @@ mod tests {
             timestamp: SystemTime::now(),
             price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([1u8; 20]),
+            close_group: vec![],
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
         };
@@ -1105,6 +1126,7 @@ mod tests {
             timestamp,
             price: Amount::from(1u64),
             rewards_address,
+            close_group: vec![],
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
         }
@@ -2092,9 +2114,7 @@ mod tests {
             SystemTime::now(),
             RewardsAddress::new([1u8; 20]),
         );
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
-        let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
-        let peer_quotes = vec![(EncodedPeerId::from(peer_id), quote)];
+        let peer_quotes = vec![(EncodedPeerId::new(rand::random()), quote)];
 
         let payment = ProofOfPayment { peer_quotes };
 

@@ -258,6 +258,7 @@ mod tests {
             timestamp: SystemTime::now(),
             price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([rewards_addr_seed; 20]),
+            close_group: vec![],
             pub_key: vec![],
             signature: vec![],
         }
@@ -456,6 +457,7 @@ mod tests {
                 timestamp: SystemTime::now(),
                 price: Amount::from(*price),
                 rewards_address: RewardsAddress::new([1u8; 20]),
+                close_group: vec![],
                 pub_key: vec![],
                 signature: vec![],
             };
@@ -566,6 +568,7 @@ mod tests {
                 price: Amount::from(*price),
                 #[allow(clippy::cast_possible_truncation)] // i is always < 7
                 rewards_address: RewardsAddress::new([i as u8 + 1; 20]),
+                close_group: vec![],
                 pub_key: vec![],
                 signature: vec![],
             };
@@ -639,6 +642,7 @@ mod tests {
                 timestamp: SystemTime::now(),
                 price,
                 rewards_address: wallet.address(),
+                close_group: vec![],
                 pub_key: vec![],
                 signature: vec![],
             };

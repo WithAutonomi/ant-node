@@ -120,6 +120,7 @@ impl QuoteGenerator {
         content: XorName,
         data_size: usize,
         data_type: u32,
+        close_group: Vec<[u8; 32]>,
     ) -> Result<PaymentQuote> {
         let sign_fn = self
             .sign_fn
@@ -134,9 +135,15 @@ impl QuoteGenerator {
         // Convert XorName to xor_name::XorName
         let xor_name = xor_name::XorName(content);
 
-        // Create bytes for signing (following autonomi's pattern)
-        let bytes =
-            PaymentQuote::bytes_for_signing(xor_name, timestamp, &price, &self.rewards_address);
+        // Create bytes for signing — includes close_group so it's
+        // cryptographically bound to this quote.
+        let bytes = PaymentQuote::bytes_for_signing(
+            xor_name,
+            timestamp,
+            &price,
+            &self.rewards_address,
+            &close_group,
+        );
 
         // Sign the bytes
         let signature = sign_fn(&bytes);
@@ -152,6 +159,7 @@ impl QuoteGenerator {
             price,
             pub_key: self.pub_key.clone(),
             rewards_address: self.rewards_address,
+            close_group,
             signature,
         };
 
@@ -437,7 +445,7 @@ mod tests {
         let generator = create_test_generator();
         let content = [42u8; 32];
 
-        let quote = generator.create_quote(content, 1024, 0);
+        let quote = generator.create_quote(content, 1024, 0, vec![]);
         assert!(quote.is_ok());
 
         let quote = quote.expect("valid quote");
@@ -450,7 +458,7 @@ mod tests {
         let content = [42u8; 32];
 
         let quote = generator
-            .create_quote(content, 1024, 0)
+            .create_quote(content, 1024, 0, vec![])
             .expect("valid quote");
         assert!(verify_quote_content(&quote, &content));
 
@@ -468,7 +476,7 @@ mod tests {
         assert!(!generator.can_sign());
 
         let content = [42u8; 32];
-        let result = generator.create_quote(content, 1024, 0);
+        let result = generator.create_quote(content, 1024, 0, vec![]);
         assert!(result.is_err());
     }
 
@@ -491,7 +499,7 @@ mod tests {
 
         let content = [7u8; 32];
         let quote = generator
-            .create_quote(content, 2048, 0)
+            .create_quote(content, 2048, 0, vec![])
             .expect("create quote");
 
         // Valid signature should verify
@@ -511,7 +519,7 @@ mod tests {
         let content = [42u8; 32];
 
         let quote = generator
-            .create_quote(content, 1024, 0)
+            .create_quote(content, 1024, 0, vec![])
             .expect("create quote");
 
         // The dummy signer produces a 64-byte fake signature, not a valid
@@ -556,9 +564,15 @@ mod tests {
         let content = [10u8; 32];
 
         // All data types produce the same price (price depends on records_stored, not data_type)
-        let q0 = generator.create_quote(content, 1024, 0).expect("type 0");
-        let q1 = generator.create_quote(content, 512, 1).expect("type 1");
-        let q2 = generator.create_quote(content, 256, 2).expect("type 2");
+        let q0 = generator
+            .create_quote(content, 1024, 0, vec![])
+            .expect("type 0");
+        let q1 = generator
+            .create_quote(content, 512, 1, vec![])
+            .expect("type 1");
+        let q2 = generator
+            .create_quote(content, 256, 2, vec![])
+            .expect("type 2");
 
         // All quotes should have a valid price (minimum floor of 1)
         assert!(q0.price >= Amount::from(1u64));
@@ -572,7 +586,9 @@ mod tests {
         let content = [11u8; 32];
 
         // Price depends on records_stored, not data size
-        let quote = generator.create_quote(content, 0, 0).expect("zero size");
+        let quote = generator
+            .create_quote(content, 0, 0, vec![])
+            .expect("zero size");
         assert!(quote.price >= Amount::from(1u64));
     }
 
@@ -583,7 +599,7 @@ mod tests {
 
         // Price depends on records_stored, not data size
         let quote = generator
-            .create_quote(content, 10_000_000, 0)
+            .create_quote(content, 10_000_000, 0, vec![])
             .expect("large size");
         assert!(quote.price >= Amount::from(1u64));
     }
@@ -595,6 +611,7 @@ mod tests {
             timestamp: SystemTime::now(),
             price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([0u8; 20]),
+            close_group: vec![],
             pub_key: vec![],
             signature: vec![],
         };

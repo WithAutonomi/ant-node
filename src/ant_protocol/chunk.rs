@@ -234,17 +234,14 @@ pub enum ChunkQuoteResponse {
     /// When `already_stored` is `true` the node already holds this chunk and no
     /// payment is required — the client should skip the pay-then-PUT cycle for
     /// this address. The quote is still included for informational purposes.
+    ///
+    /// The close group view is embedded inside the serialized `PaymentQuote`
+    /// and covered by the quote's ML-DSA-65 signature, so it cannot be forged.
     Success {
-        /// Serialized `PaymentQuote`.
+        /// Serialized `PaymentQuote` (includes the node's close group view).
         quote: Vec<u8>,
         /// `true` when the chunk already exists on this node (skip payment).
         already_stored: bool,
-        /// Up to `CLOSE_GROUP_SIZE` peer IDs (raw 32-byte BLAKE3 hashes) this
-        /// node considers closest to the content address, **excluding itself**
-        /// (the local node is filtered out by the DHT query). Clients combine
-        /// these views from multiple nodes to verify close-group quorum before
-        /// paying.
-        close_group: Vec<[u8; 32]>,
     },
     /// Quote generation failed.
     Error(ProtocolError),
