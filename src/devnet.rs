@@ -5,6 +5,7 @@
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{default_root_dir, NODES_SUBDIR, NODE_IDENTITY_FILENAME};
+use crate::logging::{debug, info, warn};
 use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
@@ -26,7 +27,6 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
 
 // =============================================================================
 // Devnet Constants

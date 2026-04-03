@@ -10,13 +10,13 @@
 //! ML-DSA-65 signature verification performed during the initial download.
 
 use crate::error::{Error, Result};
+use crate::logging::{debug, warn};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use tracing::{debug, warn};
 
 /// On-disk cache for downloaded upgrade binaries.
 #[derive(Clone)]

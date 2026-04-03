@@ -8,6 +8,7 @@
 //! 5. Restart the node process
 
 use crate::error::{Error, Result};
+use crate::logging::{debug, error, info, warn};
 use crate::upgrade::binary_cache::BinaryCache;
 use crate::upgrade::{signature, UpgradeInfo, UpgradeResult};
 use flate2::read::GzDecoder;
@@ -17,7 +18,6 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use tar::Archive;
-use tracing::{debug, error, info, warn};
 
 /// Maximum allowed upgrade archive size (200 MiB).
 const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;

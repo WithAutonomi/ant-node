@@ -1,12 +1,12 @@
 //! ant-devnet CLI entry point.
 
+#![cfg_attr(not(feature = "logging"), allow(unused_variables))]
+
 mod cli;
 
 use ant_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 use clap::Parser;
 use cli::Cli;
-use tracing::info;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -14,15 +14,20 @@ async fn main() -> color_eyre::Result<()> {
 
     let cli = Cli::parse();
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
+    #[cfg(feature = "logging")]
+    {
+        use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(filter)
-        .init();
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cli.log_level));
 
-    info!("ant-devnet v{}", env!("CARGO_PKG_VERSION"));
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(filter)
+            .init();
+    }
+
+    ant_node::logging::info!("ant-devnet v{}", env!("CARGO_PKG_VERSION"));
 
     let mut config =
         cli.preset
@@ -55,7 +60,7 @@ async fn main() -> color_eyre::Result<()> {
 
     // Start Anvil and deploy contracts if EVM is enabled
     let evm_info = if cli.enable_evm {
-        info!("Starting local Anvil blockchain for EVM payment enforcement...");
+        ant_node::logging::info!("Starting local Anvil blockchain for EVM payment enforcement...");
         let testnet = evmlib::testnet::Testnet::new()
             .await
             .map_err(|e| color_eyre::eyre::eyre!("Failed to start Anvil testnet: {e}"))?;
@@ -79,8 +84,8 @@ async fn main() -> color_eyre::Result<()> {
 
         config.evm_network = Some(network);
 
-        info!("Anvil blockchain running at {rpc_url}");
-        info!("Funded wallet private key: {wallet_key}");
+        ant_node::logging::info!("Anvil blockchain running at {rpc_url}");
+        ant_node::logging::info!("Funded wallet private key: {wallet_key}");
 
         // Keep testnet alive by leaking it (it will be cleaned up on process exit)
         // This is necessary because AnvilInstance stops Anvil when dropped
@@ -111,12 +116,12 @@ async fn main() -> color_eyre::Result<()> {
     let json = serde_json::to_string_pretty(&manifest)?;
     if let Some(path) = cli.manifest {
         tokio::fs::write(&path, &json).await?;
-        info!("Wrote manifest to {}", path.display());
+        ant_node::logging::info!("Wrote manifest to {}", path.display());
     } else {
         println!("{json}");
     }
 
-    info!("Devnet running. Press Ctrl+C to stop.");
+    ant_node::logging::info!("Devnet running. Press Ctrl+C to stop.");
     tokio::signal::ctrl_c().await?;
 
     devnet.shutdown().await?;

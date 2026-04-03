@@ -34,13 +34,13 @@ use std::time::{Duration, Instant};
 
 use std::pin::Pin;
 
+use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};

@@ -62,21 +62,25 @@ pub struct Cli {
     pub metrics_port: u16,
 
     /// Log level.
+    #[cfg(feature = "logging")]
     #[arg(long, value_enum, default_value = "info", env = "RUST_LOG")]
     pub log_level: CliLogLevel,
 
     /// Log output format.
+    #[cfg(feature = "logging")]
     #[arg(long, value_enum, default_value = "text", env = "ANT_LOG_FORMAT")]
     pub log_format: CliLogFormat,
 
     /// Directory for log file output.
     /// When set, logs are written to files in this directory instead of stdout.
     /// Files rotate daily and are named ant-node.YYYY-MM-DD.log.
+    #[cfg(feature = "logging")]
     #[arg(long, env = "ANT_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
 
     /// Maximum number of rotated log files to retain (only used with --log-dir).
     /// Oldest files are deleted when this limit is reached. Rotation is daily.
+    #[cfg(feature = "logging")]
     #[arg(long, default_value = "7", env = "ANT_LOG_MAX_FILES")]
     pub log_max_files: usize,
 
@@ -136,6 +140,7 @@ pub enum CliEvmNetwork {
 }
 
 /// Log level CLI enum.
+#[cfg(feature = "logging")]
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum CliLogLevel {
     /// Error messages only.
@@ -152,6 +157,7 @@ pub enum CliLogLevel {
 }
 
 /// Log format CLI enum.
+#[cfg(feature = "logging")]
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum CliLogFormat {
     /// Plain text output (default).
@@ -207,7 +213,10 @@ impl Cli {
 
         config.port = self.port;
         config.ipv4_only = self.ipv4_only;
-        config.log_level = self.log_level.into();
+        #[cfg(feature = "logging")]
+        {
+            config.log_level = self.log_level.into();
+        }
         config.network_mode = self.network_mode.into();
 
         // Apply CLI bootstrap peers if provided; otherwise keep config file value.
@@ -275,6 +284,7 @@ impl From<CliEvmNetwork> for EvmNetworkConfig {
     }
 }
 
+#[cfg(feature = "logging")]
 impl From<CliLogLevel> for String {
     fn from(level: CliLogLevel) -> Self {
         match level {

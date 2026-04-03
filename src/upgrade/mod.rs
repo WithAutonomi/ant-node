@@ -27,10 +27,10 @@ pub use signature::{
 };
 
 use crate::error::{Error, Result};
+use crate::logging::{debug, info, warn};
 use semver::Version;
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info, warn};
 
 /// Maximum allowed upgrade binary size (200 MiB).
 ///

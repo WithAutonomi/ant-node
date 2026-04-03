@@ -30,9 +30,9 @@ echo "Log file: ${LOG_FILE}" | tee -a "$LOG_FILE"
 echo "Start time: $(date)" | tee -a "$LOG_FILE"
 echo "" | tee -a "$LOG_FILE"
 
-# Build the test binary if needed
-echo "Building test binary..." | tee -a "$LOG_FILE"
-cargo build --release 2>&1 | tee -a "$LOG_FILE"
+# Build the binary (no logging)
+echo "Building binary..." | tee -a "$LOG_FILE"
+cargo build --release --no-default-features 2>&1 | tee -a "$LOG_FILE"
 
 # Export test configuration
 export ANT_TEST_BOOTSTRAP="$BOOTSTRAP"

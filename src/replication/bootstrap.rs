@@ -7,9 +7,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::logging::{debug, info, warn};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
 
 use saorsa_core::DhtNetworkEvent;
 

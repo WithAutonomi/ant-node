@@ -1,52 +1,42 @@
 //! ant-node CLI entry point.
 
+#![cfg_attr(not(feature = "logging"), allow(unused_variables))]
+
 mod cli;
 mod platform;
 
 use ant_node::config::BootstrapSource;
 use ant_node::NodeBuilder;
 use clap::Parser;
-use cli::{Cli, CliLogFormat};
-use tracing::{info, warn};
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::{fmt, EnvFilter, Layer};
+use cli::Cli;
 
-/// Force at least 4 worker threads regardless of CPU count.
+/// Initialize the tracing subscriber when the `logging` feature is active.
 ///
-/// On small VMs (1-2 vCPU), the default `num_cpus` gives only 1-2 worker
-/// threads.  The NAT traversal `poll()` function does synchronous work
-/// (`parking_lot` locks, `DashMap` iteration) that blocks its worker thread.
-/// With only 1 worker, this freezes the entire runtime — timers stop,
-/// keepalives can't fire, and connections die silently.
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> color_eyre::Result<()> {
-    // Initialize error handling
-    color_eyre::install()?;
+/// Returns a guard that must be held for the lifetime of the process to ensure
+/// buffered logs are flushed on shutdown.
+#[cfg(feature = "logging")]
+fn init_logging(
+    cli: &Cli,
+) -> color_eyre::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    use cli::CliLogFormat;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-    // Parse CLI arguments
-    let cli = Cli::parse();
-
-    // Extract logging options before consuming the CLI struct
     let log_format = cli.log_format;
     let log_dir = cli.log_dir.clone();
     let log_max_files = cli.log_max_files;
-
-    // Initialize tracing
     let log_level: String = cli.log_level.into();
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&log_level));
 
-    // _guard must live for the duration of main() to ensure log flushing.
-    // The guard's Drop impl flushes buffered logs — it is intentionally held, not read.
-    #[allow(clippy::collection_is_never_read)]
-    let _guard: Option<tracing_appender::non_blocking::WorkerGuard>;
+    let guard: Option<tracing_appender::non_blocking::WorkerGuard>;
 
     let layer: Box<dyn Layer<_> + Send + Sync> = match (log_format, log_dir) {
         (CliLogFormat::Text, None) => {
-            _guard = None;
+            guard = None;
             Box::new(fmt::layer())
         }
         (CliLogFormat::Json, None) => {
-            _guard = None;
+            guard = None;
             Box::new(fmt::layer().json().flatten_event(true))
         }
         (CliLogFormat::Text, Some(dir)) => {
@@ -56,8 +46,8 @@ async fn main() -> color_eyre::Result<()> {
                 .filename_prefix("ant-node")
                 .filename_suffix("log")
                 .build(dir)?;
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            _guard = Some(guard);
+            let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+            guard = Some(g);
             Box::new(fmt::layer().with_writer(non_blocking).with_ansi(false))
         }
         (CliLogFormat::Json, Some(dir)) => {
@@ -67,8 +57,8 @@ async fn main() -> color_eyre::Result<()> {
                 .filename_prefix("ant-node")
                 .filename_suffix("log")
                 .build(dir)?;
-            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            _guard = Some(guard);
+            let (non_blocking, g) = tracing_appender::non_blocking(file_appender);
+            guard = Some(g);
             Box::new(
                 fmt::layer()
                     .json()
@@ -84,7 +74,27 @@ async fn main() -> color_eyre::Result<()> {
         .with(filter)
         .init();
 
-    info!(
+    Ok(guard)
+}
+
+/// Force at least 4 worker threads regardless of CPU count.
+///
+/// On small VMs (1-2 vCPU), the default `num_cpus` gives only 1-2 worker
+/// threads.  The NAT traversal `poll()` function does synchronous work
+/// (`parking_lot` locks, `DashMap` iteration) that blocks its worker thread.
+/// With only 1 worker, this freezes the entire runtime — timers stop,
+/// keepalives can't fire, and connections die silently.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
+    let cli = Cli::parse();
+
+    // _guard must live for the duration of main() to ensure log flushing.
+    #[cfg(feature = "logging")]
+    let _logging_guard = init_logging(&cli)?;
+
+    ant_node::logging::info!(
         version = env!("CARGO_PKG_VERSION"),
         commit = env!("ANT_GIT_COMMIT"),
         "ant-node starting"
@@ -95,11 +105,11 @@ async fn main() -> color_eyre::Result<()> {
     #[allow(clippy::collection_is_never_read)]
     let _activity = match platform::disable_app_nap() {
         Ok(activity) => {
-            info!("App Nap prevention enabled");
+            ant_node::logging::info!("App Nap prevention enabled");
             Some(activity)
         }
         Err(e) => {
-            warn!("Failed to disable App Nap: {e}");
+            ant_node::logging::warn!("Failed to disable App Nap: {e}");
             None
         }
     };
@@ -109,37 +119,34 @@ async fn main() -> color_eyre::Result<()> {
 
     match &bootstrap_source {
         BootstrapSource::Cli => {
-            info!(
+            ant_node::logging::info!(
                 count = config.bootstrap.len(),
                 "Bootstrap peers provided via CLI"
             );
         }
         BootstrapSource::ConfigFile => {
-            info!(
+            ant_node::logging::info!(
                 count = config.bootstrap.len(),
                 "Bootstrap peers loaded from config file"
             );
         }
         BootstrapSource::AutoDiscovered(path) => {
-            info!(
+            ant_node::logging::info!(
                 count = config.bootstrap.len(),
                 path = %path.display(),
                 "Bootstrap peers loaded from discovered config"
             );
         }
         BootstrapSource::None => {
-            warn!(
+            ant_node::logging::warn!(
                 "No bootstrap peers configured — node will not be able to join an existing network"
             );
         }
     }
 
-    // Build and run the node
     let mut node = NodeBuilder::new(config).build().await?;
-
-    // Run until shutdown
     node.run().await?;
 
-    info!("Goodbye!");
+    ant_node::logging::info!("Goodbye!");
     Ok(())
 }

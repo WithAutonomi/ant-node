@@ -9,13 +9,13 @@
 
 use crate::config::UpgradeChannel;
 use crate::error::{Error, Result};
+use crate::logging::{debug, info, warn};
 use crate::upgrade::release_cache::ReleaseCache;
 use crate::upgrade::rollout::StagedRollout;
 use crate::upgrade::UpgradeInfo;
 use semver::Version;
 use serde::Deserialize;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
 
 /// GitHub release API response.
 #[derive(Debug, Deserialize)]

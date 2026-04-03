@@ -38,6 +38,9 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 #![warn(clippy::pedantic)]
+// When the `logging` feature is off, variables used only in log macros become
+// unused. These are expected and harmless — the compiler optimises them away.
+#![cfg_attr(not(feature = "logging"), allow(unused_variables, unused_assignments))]
 
 pub mod ant_protocol;
 pub mod client;
@@ -45,6 +48,7 @@ pub mod config;
 pub mod devnet;
 pub mod error;
 pub mod event;
+pub mod logging;
 pub mod node;
 pub mod payment;
 pub mod replication;

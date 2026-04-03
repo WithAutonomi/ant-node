@@ -12,12 +12,12 @@
 
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
+use crate::logging::info;
 use evmlib::common::{Amount, QuoteHash};
 use evmlib::wallet::Wallet;
 use evmlib::Network as EvmNetwork;
 use evmlib::PaymentQuote;
 use evmlib::RewardsAddress;
-use tracing::info;
 
 /// Index of the median-priced node after sorting, derived from `CLOSE_GROUP_SIZE`.
 const MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;

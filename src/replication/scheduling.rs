@@ -7,7 +7,7 @@
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use tracing::debug;
+use crate::logging::debug;
 
 use crate::ant_protocol::XorName;
 use crate::replication::types::{FetchCandidate, VerificationEntry};

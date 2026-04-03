@@ -6,6 +6,7 @@
 //! first node to hit a stale cache actually contacts GitHub.
 
 use crate::error::{Error, Result};
+use crate::logging::debug;
 use crate::upgrade::monitor::{Asset, GitHubRelease};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -13,7 +14,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::debug;
 
 /// On-disk cache for GitHub release metadata.
 #[derive(Clone)]

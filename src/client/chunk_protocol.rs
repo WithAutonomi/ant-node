@@ -4,12 +4,12 @@
 //! generic function used by both [`super::QuantumClient`] and E2E test helpers.
 
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, CHUNK_PROTOCOL_ID};
+use crate::logging::{debug, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::{MultiAddr, P2PEvent, P2PNode};
 use std::time::Duration;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::Instant;
-use tracing::{debug, warn};
 
 /// Send a chunk-protocol message to `target_peer` and await a matching response.
 ///

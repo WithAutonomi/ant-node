@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use crate::logging::{debug, info, warn};
 
 use saorsa_core::identity::PeerId;
 use saorsa_core::{DHTNode, P2PNode};

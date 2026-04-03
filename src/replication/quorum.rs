@@ -6,9 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::logging::{debug, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-use tracing::{debug, warn};
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};

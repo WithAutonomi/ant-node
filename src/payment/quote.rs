@@ -8,6 +8,7 @@
 //! and will be fully integrated when the node is initialized.
 
 use crate::error::{Error, Result};
+use crate::logging::debug;
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::pricing::calculate_price;
 use evmlib::merkle_payments::MerklePaymentCandidateNode;
@@ -17,7 +18,6 @@ use saorsa_core::MlDsa65;
 use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
 use saorsa_pqc::pqc::MlDsaOperations;
 use std::time::SystemTime;
-use tracing::debug;
 
 /// Content address type (32-byte `XorName`).
 pub type XorName = [u8; 32];
@@ -155,7 +155,7 @@ impl QuoteGenerator {
             signature,
         };
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             let content_hex = hex::encode(content);
             debug!("Generated quote for {content_hex} (size: {data_size}, type: {data_type})");
         }
@@ -235,7 +235,7 @@ impl QuoteGenerator {
             signature,
         };
 
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             debug!(
                 "Generated ML-DSA-65 merkle candidate quote (size: {data_size}, type: {data_type}, ts: {merkle_payment_timestamp})"
             );
@@ -259,7 +259,7 @@ impl QuoteGenerator {
 pub fn verify_quote_content(quote: &PaymentQuote, expected_content: &XorName) -> bool {
     // Check content matches
     if quote.content.0 != *expected_content {
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             debug!(
                 "Quote content mismatch: expected {}, got {}",
                 hex::encode(expected_content),
@@ -397,7 +397,7 @@ pub fn wire_ml_dsa_signer(
     generator.set_signer(pub_key_bytes, move |msg| match ml_dsa.sign(&sk, msg) {
         Ok(sig) => sig.as_bytes().to_vec(),
         Err(e) => {
-            tracing::error!("ML-DSA-65 signing failed: {e}");
+            crate::logging::error!("ML-DSA-65 signing failed: {e}");
             vec![]
         }
     });

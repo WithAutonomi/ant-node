@@ -22,6 +22,7 @@
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
+use crate::logging::{debug, trace, warn};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions};
 use parking_lot::RwLock;
@@ -29,7 +30,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
-use tracing::{debug, trace, warn};
 
 use crate::ant_protocol::XORNAME_LEN;
 

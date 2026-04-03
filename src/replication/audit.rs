@@ -6,9 +6,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::logging::{debug, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
-use tracing::{debug, info, warn};
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};

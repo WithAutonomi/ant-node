@@ -18,10 +18,10 @@
 //! is accepted as a reasonable trade-off for post-quantum security.
 
 use crate::error::{Error, Result};
+use crate::logging::debug;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSignature, MlDsaVariant};
 use std::fs;
 use std::path::Path;
-use tracing::debug;
 
 /// Signing context for domain separation (prevents cross-protocol attacks).
 pub const SIGNING_CONTEXT: &[u8] = b"ant-node-release-v1";

@@ -23,8 +23,8 @@
 //! - Nodes are evenly distributed across the rollout window
 //! - The same node always upgrades at the same point in the window
 
+use crate::logging::debug;
 use std::time::Duration;
-use tracing::debug;
 
 /// Staged rollout configuration and delay calculation.
 #[derive(Debug, Clone)]

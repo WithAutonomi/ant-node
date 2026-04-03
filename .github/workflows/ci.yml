@@ -75,8 +75,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build release
-        run: cargo build --release
+      - name: Build release (no logging)
+        run: cargo build --release --no-default-features
+
+  test-no-logging:
+    name: Test (no logging)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: nightly
+      - name: Run unit tests without logging
+        run: cargo test --lib --no-default-features
 
   security:
     name: Security Audit

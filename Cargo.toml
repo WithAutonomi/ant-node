@@ -62,10 +62,10 @@ directories = "5"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 semver = "1"
 
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
+# Logging (optional — behind `logging` feature flag)
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"], optional = true }
+tracing-appender = { version = "0.2", optional = true }
 
 # Error handling
 thiserror = "2"
@@ -119,7 +119,12 @@ path = "tests/e2e/mod.rs"
 required-features = ["test-utils"]
 
 [features]
-default = []
+default = ["logging"]
+# Enable tracing/logging infrastructure.
+# Included in `default` so dev builds (`cargo build`, `cargo test`) get logging
+# automatically. Release builds strip it:
+#   cargo build --release --no-default-features
+logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Enable additional diagnostics for development
 dev = []
 # Expose test helpers (cache_insert, payment_verifier accessor) for

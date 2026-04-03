@@ -144,6 +144,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Determine build profile
+        id: profile
+        shell: bash
+        run: |
+          if [[ "${{ needs.validate.outputs.is_prerelease }}" == "true" ]]; then
+            echo "build_flags=" >> $GITHUB_OUTPUT
+            echo "profile_dir=debug" >> $GITHUB_OUTPUT
+            echo "Building DEBUG (RC pre-release: logging enabled)"
+          else
+            echo "build_flags=--release --no-default-features" >> $GITHUB_OUTPUT
+            echo "profile_dir=release" >> $GITHUB_OUTPUT
+            echo "Building RELEASE (logging stripped)"
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -159,17 +173,17 @@ jobs:
 
       - name: Build (cross)
         if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
+        run: cross build ${{ steps.profile.outputs.build_flags }} --target ${{ matrix.target }}
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build ${{ steps.profile.outputs.build_flags }} --target ${{ matrix.target }}
 
       - name: Create archive (Unix)
         if: matrix.archive == 'tar.gz'
         run: |
-          cp config/bootstrap_peers.toml target/${{ matrix.target }}/release/
-          cd target/${{ matrix.target }}/release
+          cp config/bootstrap_peers.toml target/${{ matrix.target }}/${{ steps.profile.outputs.profile_dir }}/
+          cd target/${{ matrix.target }}/${{ steps.profile.outputs.profile_dir }}
           tar -czvf ../../../ant-node-cli-${{ matrix.friendly_name }}.tar.gz ${{ matrix.binary }} bootstrap_peers.toml
           cd ../../..
 
@@ -177,8 +191,8 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Copy-Item "config/bootstrap_peers.toml" "target/${{ matrix.target }}/release/bootstrap_peers.toml"
-          Push-Location "target/${{ matrix.target }}/release"
+          Copy-Item "config/bootstrap_peers.toml" "target/${{ matrix.target }}/${{ steps.profile.outputs.profile_dir }}/bootstrap_peers.toml"
+          Push-Location "target/${{ matrix.target }}/${{ steps.profile.outputs.profile_dir }}"
           Compress-Archive -Path "${{ matrix.binary }}", "bootstrap_peers.toml" -DestinationPath "../../../ant-node-cli-${{ matrix.friendly_name }}.zip"
           Pop-Location
 

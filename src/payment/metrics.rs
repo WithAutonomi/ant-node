@@ -5,12 +5,12 @@
 //! - Storage capacity and usage
 //! - Network liveness information
 
+use crate::logging::{debug, info, warn};
 use evmlib::quoting_metrics::QuotingMetrics;
 use parking_lot::RwLock;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-use tracing::{debug, info, warn};
 
 /// Number of operations between disk persists (debounce).
 const PERSIST_INTERVAL: usize = 10;

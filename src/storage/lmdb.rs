@@ -9,13 +9,13 @@
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
+use crate::logging::{debug, info, trace, warn};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, MdbError};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
-use tracing::{debug, info, trace, warn};
 
 use crate::ant_protocol::XORNAME_LEN;
 
@@ -541,7 +541,7 @@ impl LmdbStorage {
                     key.copy_from_slice(key_bytes);
                     keys.push(key);
                 } else {
-                    tracing::warn!(
+                    crate::logging::warn!(
                         "LmdbStorage: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
                         key_bytes.len()
                     );
