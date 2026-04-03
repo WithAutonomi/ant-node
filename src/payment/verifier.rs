@@ -20,6 +20,7 @@ use evmlib::RewardsAddress;
 use lru::LruCache;
 use parking_lot::Mutex;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
+use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::time::SystemTime;
 use tracing::{debug, info};
@@ -77,6 +78,10 @@ pub struct PaymentVerifierConfig {
     /// Local node's rewards address.
     /// The verifier rejects payments that don't include this node as a recipient.
     pub local_rewards_address: RewardsAddress,
+    /// Local node's peer ID (32-byte BLAKE3 hash of ML-DSA-65 public key).
+    /// Used to build the full close group view (self + DHT peers) during
+    /// payment proof validation.
+    pub local_peer_id: [u8; 32],
 }
 
 /// Status returned by payment verification.
@@ -201,6 +206,7 @@ impl PaymentVerifier {
         &self,
         xorname: &XorName,
         payment_proof: Option<&[u8]>,
+        local_close_group: &[[u8; 32]],
     ) -> Result<PaymentStatus> {
         // First check if payment is required
         let status = self.check_payment_required(xorname);
@@ -239,7 +245,8 @@ impl PaymentVerifier {
                                 debug!("Proof includes {} transaction hash(es)", tx_hashes.len());
                             }
 
-                            self.verify_evm_payment(xorname, &payment).await?;
+                            self.verify_evm_payment(xorname, &payment, local_close_group)
+                                .await?;
                         }
                         None => {
                             let tag = proof.first().copied().unwrap_or(0);
@@ -304,7 +311,12 @@ impl PaymentVerifier {
     /// For unit tests that don't need on-chain verification, pre-populate
     /// the cache so `verify_payment` returns `CachedAsVerified` before
     /// reaching this method.
-    async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
+    async fn verify_evm_payment(
+        &self,
+        xorname: &XorName,
+        payment: &ProofOfPayment,
+        local_close_group: &[[u8; 32]],
+    ) -> Result<()> {
         if tracing::enabled!(tracing::Level::DEBUG) {
             let xorname_hex = hex::encode(xorname);
             let quote_count = payment.peer_quotes.len();
@@ -316,6 +328,7 @@ impl PaymentVerifier {
         Self::validate_quote_timestamps(payment)?;
         Self::validate_peer_bindings(payment)?;
         self.validate_local_recipient(payment)?;
+        self.validate_close_group_membership(payment, local_close_group)?;
 
         // Verify quote signatures (CPU-bound, run off async runtime)
         let peer_quotes = payment.peer_quotes.clone();
@@ -672,12 +685,56 @@ impl PaymentVerifier {
         }
         Ok(())
     }
+
+    /// Verify that **every** peer in the payment proof is a known close group member.
+    ///
+    /// Builds the known set from the current DHT close group plus this node
+    /// itself, then checks that each proof peer (derived via `BLAKE3(pub_key)`)
+    /// appears in that set. Rejects the proof if ANY peer is unrecognized.
+    ///
+    /// Skipped when `local_close_group` is empty (unit tests without DHT).
+    fn validate_close_group_membership(
+        &self,
+        payment: &ProofOfPayment,
+        local_close_group: &[[u8; 32]],
+    ) -> Result<()> {
+        if local_close_group.is_empty() {
+            return Ok(());
+        }
+
+        // Build the known peer set: current DHT close group + this node.
+        let mut known_peers: HashSet<[u8; 32]> = local_close_group.iter().copied().collect();
+        known_peers.insert(self.config.local_peer_id);
+
+        // Every proof peer must be in the known set.
+        for (_encoded_peer_id, quote) in &payment.peer_quotes {
+            let peer_id = peer_id_from_public_key_bytes(&quote.pub_key).map_err(|e| {
+                Error::Payment(format!("Invalid ML-DSA pub_key in proof quote: {e}"))
+            })?;
+
+            if !known_peers.contains(peer_id.as_bytes()) {
+                return Err(Error::Payment(format!(
+                    "Proof peer {} is not in the current close group",
+                    peer_id.to_hex()
+                )));
+            }
+        }
+
+        debug!(
+            "Close group membership validated: all {} proof peers recognized",
+            payment.peer_quotes.len()
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use ant_evm::EncodedPeerId;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::MlDsaOperations;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -686,6 +743,7 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [1u8; 32],
         };
         PaymentVerifier::new(config)
     }
@@ -719,7 +777,7 @@ mod tests {
         let xorname = [1u8; 32];
 
         // No proof provided => should return an error (EVM is always on)
-        let result = verifier.verify_payment(&xorname, None).await;
+        let result = verifier.verify_payment(&xorname, None, &[]).await;
         assert!(
             result.is_err(),
             "Expected Err without proof, got: {result:?}"
@@ -735,7 +793,7 @@ mod tests {
         verifier.cache.insert(xorname);
 
         // Should succeed without payment (cached)
-        let result = verifier.verify_payment(&xorname, None).await;
+        let result = verifier.verify_payment(&xorname, None, &[]).await;
         assert!(result.is_ok());
         assert_eq!(result.expect("cached"), PaymentStatus::CachedAsVerified);
     }
@@ -782,7 +840,9 @@ mod tests {
 
         // Proof smaller than MIN_PAYMENT_PROOF_SIZE_BYTES
         let small_proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
-        let result = verifier.verify_payment(&xorname, Some(&small_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&small_proof), &[])
+            .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -798,7 +858,9 @@ mod tests {
 
         // Proof larger than MAX_PAYMENT_PROOF_SIZE_BYTES
         let large_proof = vec![0u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
-        let result = verifier.verify_payment(&xorname, Some(&large_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&large_proof), &[])
+            .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -815,7 +877,7 @@ mod tests {
         // Exactly MIN_PAYMENT_PROOF_SIZE_BYTES with unknown tag — rejected
         let boundary_proof = vec![0xFFu8; MIN_PAYMENT_PROOF_SIZE_BYTES];
         let result = verifier
-            .verify_payment(&xorname, Some(&boundary_proof))
+            .verify_payment(&xorname, Some(&boundary_proof), &[])
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -833,7 +895,7 @@ mod tests {
         // Exactly MAX_PAYMENT_PROOF_SIZE_BYTES with unknown tag — rejected
         let boundary_proof = vec![0xFFu8; MAX_PAYMENT_PROOF_SIZE_BYTES];
         let result = verifier
-            .verify_payment(&xorname, Some(&boundary_proof))
+            .verify_payment(&xorname, Some(&boundary_proof), &[])
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -851,7 +913,7 @@ mod tests {
         // Valid tag (0x01) but garbage payload — should fail deserialization
         let mut garbage = vec![crate::ant_protocol::PROOF_TAG_SINGLE_NODE];
         garbage.extend_from_slice(&[0xAB; 63]);
-        let result = verifier.verify_payment(&xorname, Some(&garbage)).await;
+        let result = verifier.verify_payment(&xorname, Some(&garbage), &[]).await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -906,7 +968,7 @@ mod tests {
             let v = verifier.clone();
             handles.push(tokio::spawn(async move {
                 let xorname = [i; 32];
-                v.verify_payment(&xorname, None).await
+                v.verify_payment(&xorname, None, &[]).await
             }));
         }
 
@@ -1019,7 +1081,7 @@ mod tests {
         let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
 
         let result = verifier
-            .verify_payment(&target_xorname, Some(&proof_bytes))
+            .verify_payment(&target_xorname, Some(&proof_bytes), &[])
             .await;
 
         assert!(result.is_err(), "Should reject mismatched content address");
@@ -1078,7 +1140,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject expired quote");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1107,7 +1171,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject future-timestamped quote");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1136,7 +1202,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -1165,7 +1233,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         assert!(
             result.is_err(),
@@ -1197,7 +1267,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -1227,6 +1299,7 @@ mod tests {
             },
             cache_capacity: 100,
             local_rewards_address: local_addr,
+            local_peer_id: [0xAAu8; 32],
         };
         let verifier = PaymentVerifier::new(config);
 
@@ -1249,7 +1322,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject payment not addressed to us");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1286,7 +1361,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject wrong peer binding");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1314,7 +1391,7 @@ mod tests {
         merkle_garbage.extend_from_slice(&[0xAB; 63]);
 
         let result = verifier
-            .verify_payment(&xorname, Some(&merkle_garbage))
+            .verify_payment(&xorname, Some(&merkle_garbage), &[])
             .await;
 
         assert!(
@@ -1362,7 +1439,9 @@ mod tests {
         // verify_payment should process it through the single-node path.
         // It will fail at quote validation (fake pub_key), but we verify
         // it passes the deserialization stage by checking the error type.
-        let result = verifier.verify_payment(&xorname, Some(&tagged_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_bytes), &[])
+            .await;
 
         assert!(result.is_err(), "Should fail at quote validation stage");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1524,7 +1603,7 @@ mod tests {
         let wrong_xorname = [0xFFu8; 32];
 
         let result = verifier
-            .verify_payment(&wrong_xorname, Some(&tagged_proof))
+            .verify_payment(&wrong_xorname, Some(&tagged_proof), &[])
             .await;
 
         assert!(
@@ -1552,7 +1631,9 @@ mod tests {
             bad_proof.push(0x00);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&bad_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&bad_proof), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject malformed merkle body");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1604,6 +1685,7 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [1u8; 32],
         };
         let verifier = PaymentVerifier::new(config);
 
@@ -1719,7 +1801,7 @@ mod tests {
         let tagged =
             crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged)).await;
+        let result = verifier.verify_payment(&xorname, Some(&tagged), &[]).await;
 
         assert!(
             result.is_err(),
@@ -1749,7 +1831,7 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged)).await;
+        let result = verifier.verify_payment(&xorname, Some(&tagged), &[]).await;
 
         assert!(
             result.is_err(),
@@ -1785,7 +1867,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_proof), &[])
+            .await;
 
         assert!(
             result.is_err(),
@@ -1820,7 +1904,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_proof), &[])
+            .await;
 
         assert!(result.is_err(), "Should reject paid node address mismatch");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1850,7 +1936,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_proof), &[])
+            .await;
 
         assert!(
             result.is_err(),
@@ -1884,7 +1972,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_proof), &[])
+            .await;
 
         assert!(
             result.is_err(),
@@ -1894,6 +1984,166 @@ mod tests {
         assert!(
             err_msg.contains("Underpayment"),
             "Error should mention underpayment: {err_msg}"
+        );
+    }
+
+    // =========================================================================
+    // Close-group membership validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_close_group_all_peers_recognised_accepted() {
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        let mut close_group_ids: Vec<[u8; 32]> = Vec::new();
+
+        // Generate CLOSE_GROUP_SIZE peers with real ML-DSA keys.
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let ant_peer_id =
+                peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+            close_group_ids.push(*ant_peer_id.as_bytes());
+
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(
+                [0xAA; 32],
+                SystemTime::now(),
+                RewardsAddress::new([1u8; 20]),
+            );
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        // Verifier whose local_peer_id is NOT one of the proof peers (but that's
+        // fine — it only needs to be in the known set, and we insert it).
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [0xBBu8; 32],
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let result = verifier.validate_close_group_membership(&payment, &close_group_ids);
+        assert!(
+            result.is_ok(),
+            "All proof peers are in close group — should accept: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_unknown_peer_rejected() {
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        let mut close_group_ids: Vec<[u8; 32]> = Vec::new();
+
+        // Generate CLOSE_GROUP_SIZE peers; include all but the last in the
+        // close group so one peer is "unknown".
+        for i in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let ant_peer_id =
+                peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+
+            // Only add the first N-1 peers to the close group.
+            if i < CLOSE_GROUP_SIZE - 1 {
+                close_group_ids.push(*ant_peer_id.as_bytes());
+            }
+
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(
+                [0xAA; 32],
+                SystemTime::now(),
+                RewardsAddress::new([1u8; 20]),
+            );
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: [0xBBu8; 32],
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let result = verifier.validate_close_group_membership(&payment, &close_group_ids);
+        assert!(result.is_err(), "One unknown peer — should reject");
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("not in the current close group"),
+            "Error should mention close group: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_empty_skips_validation() {
+        // With an empty close group (unit test / no DHT), validation is skipped.
+        let verifier = create_test_verifier();
+
+        let quote = make_fake_quote(
+            [0xAA; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+        );
+        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let peer_id = libp2p::PeerId::from_public_key(&keypair.public());
+        let peer_quotes = vec![(EncodedPeerId::from(peer_id), quote)];
+
+        let payment = ProofOfPayment { peer_quotes };
+
+        let result = verifier.validate_close_group_membership(&payment, &[]);
+        assert!(
+            result.is_ok(),
+            "Empty close group should skip validation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_close_group_local_peer_is_implicitly_known() {
+        let ml_dsa = MlDsa65::new();
+
+        // Generate a single peer whose BLAKE3 ID we'll set as local_peer_id.
+        let (public_key, _) = ml_dsa.generate_keypair().expect("keygen");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let ant_peer_id =
+            peer_id_from_public_key_bytes(&pub_key_bytes).expect("peer id from pub key");
+
+        let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+        let mut quote = make_fake_quote(
+            [0xAA; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+        );
+        quote.pub_key = pub_key_bytes;
+
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(encoded, quote)],
+        };
+
+        // The local_peer_id matches the proof peer, and the close group
+        // contains at least one entry (so validation isn't skipped) but
+        // does NOT contain the proof peer — only local_peer_id does.
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            local_peer_id: *ant_peer_id.as_bytes(),
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        // Close group has a dummy entry so validation isn't skipped.
+        let dummy_peer = [0xFFu8; 32];
+        let result = verifier.validate_close_group_membership(&payment, &[dummy_peer]);
+        assert!(
+            result.is_ok(),
+            "Proof peer matches local_peer_id — should accept: {result:?}"
         );
     }
 }
