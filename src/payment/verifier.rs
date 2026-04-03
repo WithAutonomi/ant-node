@@ -11,6 +11,7 @@ use crate::payment::proof::{
 };
 use crate::payment::quote::{verify_quote_content, verify_quote_signature};
 use crate::payment::single_node::SingleNodePayment;
+use crate::payment::verify_merkle_candidate_signature;
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
@@ -21,6 +22,7 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info};
 
@@ -66,9 +68,11 @@ impl Default for EvmVerifierConfig {
 
 /// Configuration for the payment verifier.
 ///
+/// Callback to check if the local node is in the close group for a given address.
+pub type CloseGroupChecker = Arc<dyn Fn(&[u8; 32]) -> Vec<RewardsAddress> + Send + Sync>;
+
 /// All new data requires EVM payment on Arbitrum. The cache stores
 /// previously verified payments to avoid redundant on-chain lookups.
-#[derive(Debug, Clone)]
 pub struct PaymentVerifierConfig {
     /// EVM verifier configuration.
     pub evm: EvmVerifierConfig,
@@ -77,6 +81,22 @@ pub struct PaymentVerifierConfig {
     /// Local node's rewards address.
     /// The verifier rejects payments that don't include this node as a recipient.
     pub local_rewards_address: RewardsAddress,
+    /// Optional close group checker for merkle payments.
+    pub close_group_checker: Option<CloseGroupChecker>,
+}
+
+impl std::fmt::Debug for PaymentVerifierConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaymentVerifierConfig")
+            .field("evm", &self.evm)
+            .field("cache_capacity", &self.cache_capacity)
+            .field("local_rewards_address", &self.local_rewards_address)
+            .field(
+                "close_group_checker",
+                &self.close_group_checker.as_ref().map(|_| "<fn>"),
+            )
+            .finish()
+    }
 }
 
 /// Status returned by payment verification.
@@ -484,6 +504,17 @@ impl PaymentVerifier {
 
         let pool_hash = merkle_proof.winner_pool_hash();
 
+        // Run cheap local checks BEFORE expensive on-chain queries.
+        // This prevents DoS via garbage proofs that trigger RPC lookups.
+        for candidate in &merkle_proof.winner_pool.candidate_nodes {
+            if !verify_merkle_candidate_signature(candidate) {
+                return Err(Error::Payment(format!(
+                    "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
+                    candidate.reward_address
+                )));
+            }
+        }
+
         // Check pool cache first
         let cached_info = {
             let mut pool_cache = self.pool_cache.lock();
@@ -534,20 +565,8 @@ impl PaymentVerifier {
             on_chain_info
         };
 
-        // pool_hash was derived from merkle_proof.winner_pool and used to query
-        // the contract. The contract only returns data if a payment exists for that
-        // hash. The ML-DSA signature check below ensures the pool contents are
-        // authentic (nodes actually signed their candidate quotes).
-
-        // Verify ML-DSA-65 signatures and timestamp/data_type consistency
-        // on all candidate nodes in the winner pool.
+        // Verify timestamp consistency (signatures already checked above before RPC).
         for candidate in &merkle_proof.winner_pool.candidate_nodes {
-            if !crate::payment::verify_merkle_candidate_signature(candidate) {
-                return Err(Error::Payment(format!(
-                    "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
-                    candidate.reward_address
-                )));
-            }
             if candidate.merkle_payment_timestamp != payment_info.merkle_payment_timestamp {
                 return Err(Error::Payment(format!(
                     "Candidate timestamp mismatch: expected {}, got {} (reward: {})",
@@ -648,6 +667,17 @@ impl PaymentVerifier {
             }
         }
 
+        // Verify this node is in the close group for the data address.
+        if let Some(ref checker) = self.config.close_group_checker {
+            let close_group_addrs = checker(xorname);
+            if !close_group_addrs.contains(&self.config.local_rewards_address) {
+                return Err(Error::Payment(format!(
+                    "This node is not in the close group for address {}",
+                    hex::encode(xorname)
+                )));
+            }
+        }
+
         if tracing::enabled!(tracing::Level::INFO) {
             info!(
                 "Merkle payment verified for {} (pool: {})",
@@ -687,6 +717,7 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            close_group_checker: None,
         };
         PaymentVerifier::new(config)
     }
@@ -1228,6 +1259,7 @@ mod tests {
             },
             cache_capacity: 100,
             local_rewards_address: local_addr,
+            close_group_checker: None,
         };
         let verifier = PaymentVerifier::new(config);
 
@@ -1605,6 +1637,7 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            close_group_checker: None,
         };
         let verifier = PaymentVerifier::new(config);
 

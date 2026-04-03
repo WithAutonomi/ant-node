@@ -385,6 +385,7 @@ impl NodeBuilder {
             },
             cache_capacity: config.payment.cache_capacity,
             local_rewards_address: rewards_address,
+            close_group_checker: None,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
         let metrics_tracker = QuotingMetricsTracker::new(0);

@@ -1090,6 +1090,7 @@ impl TestNetwork {
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
             local_rewards_address: rewards_address,
+            close_group_checker: None,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 
