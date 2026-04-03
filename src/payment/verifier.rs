@@ -1972,7 +1972,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged_proof), &[])
+            .await;
 
         assert!(
             result.is_err(),

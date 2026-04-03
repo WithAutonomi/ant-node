@@ -1059,7 +1059,7 @@ async fn handle_fresh_offer(
 
     // Gap 1: Validate PoP via PaymentVerifier.
     match payment_verifier
-        .verify_payment(&offer.key, Some(&offer.proof_of_payment))
+        .verify_payment(&offer.key, Some(&offer.proof_of_payment), &[])
         .await
     {
         Ok(status) if status.can_store() => {
@@ -1174,7 +1174,7 @@ async fn handle_paid_notify(
 
     // Gap 1: Validate PoP via PaymentVerifier.
     match payment_verifier
-        .verify_payment(&notify.key, Some(&notify.proof_of_payment))
+        .verify_payment(&notify.key, Some(&notify.proof_of_payment), &[])
         .await
     {
         Ok(status) if status.can_store() => {
