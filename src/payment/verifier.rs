@@ -484,6 +484,17 @@ impl PaymentVerifier {
 
         let pool_hash = merkle_proof.winner_pool_hash();
 
+        // Run cheap local checks BEFORE expensive on-chain queries.
+        // This prevents DoS via garbage proofs that trigger RPC lookups.
+        for candidate in &merkle_proof.winner_pool.candidate_nodes {
+            if !crate::payment::verify_merkle_candidate_signature(candidate) {
+                return Err(Error::Payment(format!(
+                    "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
+                    candidate.reward_address
+                )));
+            }
+        }
+
         // Check pool cache first
         let cached_info = {
             let mut pool_cache = self.pool_cache.lock();
@@ -534,20 +545,8 @@ impl PaymentVerifier {
             on_chain_info
         };
 
-        // pool_hash was derived from merkle_proof.winner_pool and used to query
-        // the contract. The contract only returns data if a payment exists for that
-        // hash. The ML-DSA signature check below ensures the pool contents are
-        // authentic (nodes actually signed their candidate quotes).
-
-        // Verify ML-DSA-65 signatures and timestamp/data_type consistency
-        // on all candidate nodes in the winner pool.
+        // Verify timestamp consistency (signatures already checked above before RPC).
         for candidate in &merkle_proof.winner_pool.candidate_nodes {
-            if !crate::payment::verify_merkle_candidate_signature(candidate) {
-                return Err(Error::Payment(format!(
-                    "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
-                    candidate.reward_address
-                )));
-            }
             if candidate.merkle_payment_timestamp != payment_info.merkle_payment_timestamp {
                 return Err(Error::Payment(format!(
                     "Candidate timestamp mismatch: expected {}, got {} (reward: {})",
