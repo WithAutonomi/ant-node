@@ -57,8 +57,6 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
-<<<<<<< HEAD
-    /// Channel for notifying the replication engine about newly-stored chunks.
     /// Channel for notifying the replication engine about newly-stored chunks.
     fresh_write_tx: Option<mpsc::UnboundedSender<FreshWriteEvent>>,
     /// P2P node for local close-group lookups during quote and payment
