@@ -3,8 +3,16 @@
 //! When the `logging` feature is enabled, this module re-exports the
 //! [`tracing`] macros (`info!`, `warn!`, `debug!`, `error!`, `trace!`).
 //!
-//! When disabled, all macros expand to nothing — zero binary size overhead,
-//! zero runtime cost.
+//! When disabled, all macros expand to `()` — zero binary size overhead,
+//! zero runtime cost. Argument expressions are **not evaluated**, so
+//! `info!("{}", expensive_call())` costs nothing in release builds.
+//!
+//! ## Unused variables with `--no-default-features`
+//!
+//! Variables that exist only for logging (e.g. `let addr_hex = hex::encode(...)`)
+//! become unused when macros are compiled out. The crate-level attribute
+//! `#![cfg_attr(not(feature = "logging"), allow(unused_variables, unused_assignments))]`
+//! in `lib.rs` (and the binary entry points) suppresses these expected warnings.
 
 // ---- Feature enabled: re-export tracing ----
 #[cfg(feature = "logging")]
