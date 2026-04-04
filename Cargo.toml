@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.10.0-rc.1"
+version = "0.10.0-rc.2"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
