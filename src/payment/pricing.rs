@@ -1,48 +1,60 @@
-//! Simple quadratic pricing algorithm for ant-node.
+//! Quadratic pricing with a baseline floor for ant-node (Phase 1 recalibration).
 //!
-//! Uses the formula `(close_records_stored / 6000)^2` to calculate storage price.
-//! Integer division means nodes with fewer than 6000 records get a ratio of 0,
-//! but a minimum floor of 1 prevents free storage.
+//! Formula: `price_per_chunk_ANT(n) = BASELINE + K × (n / D)²`
+//!
+//! This recalibration introduces a non-zero `BASELINE` so that empty nodes
+//! charge a meaningful spam-barrier price, and re-anchors `K` so per-GB USD
+//! pricing matches real-world targets at the current ~$0.10/ANT token price.
+//! The legacy formula produced ~$25/GB at the lower stable boundary and ~$0/GB
+//! when nodes were empty — both unreasonable.
+//!
+//! ## Parameters
+//!
+//! | Constant  | Value         | Role                                            |
+//! |-----------|---------------|-------------------------------------------------|
+//! | BASELINE  | 0.00390625 ANT| Price at empty (bootstrap-phase spam barrier)   |
+//! | K         | 0.03515625 ANT| Quadratic coefficient                           |
+//! | D         | 6000          | Lower stable boundary (records stored)          |
 //!
 //! ## Design Rationale
 //!
-//! The quadratic curve creates natural load balancing:
-//! - **Lightly loaded nodes** (< 6000 records) charge the minimum floor price
-//! - **Moderately loaded nodes** charge proportionally more as records grow
-//! - **Heavily loaded nodes** charge quadratically more, pushing clients elsewhere
+//! - **Empty / lightly loaded nodes** charge the `BASELINE` floor, preventing
+//!   free storage and acting as a bootstrap-phase spam barrier.
+//! - **Moderately loaded nodes** add a small quadratic contribution on top.
+//! - **Heavily loaded nodes** charge quadratically more, pushing clients
+//!   toward less-loaded nodes elsewhere in the network.
 
 use evmlib::common::Amount;
 
-/// Divisor for the pricing formula.
-const PRICING_DIVISOR: u64 = 6000;
+/// Lower stable boundary of the quadratic curve, in records stored.
+const PRICING_DIVISOR: u128 = 6000;
 
 /// `PRICING_DIVISOR²`, precomputed to avoid repeated multiplication.
-const DIVISOR_SQUARED: u64 = PRICING_DIVISOR * PRICING_DIVISOR;
+const DIVISOR_SQUARED: u128 = PRICING_DIVISOR * PRICING_DIVISOR;
 
-/// 1 token = 10^18 wei.
-const WEI_PER_TOKEN: u128 = 1_000_000_000_000_000_000;
+/// Baseline price at empty / bootstrap-phase spam barrier.
+///
+/// `0.00390625 ANT × 10¹⁸ wei/ANT = 3_906_250_000_000_000 wei`.
+const PRICE_BASELINE_WEI: u128 = 3_906_250_000_000_000;
 
-/// Minimum price in wei (1 wei) to prevent free storage.
-const MIN_PRICE_WEI: u128 = 1;
+/// Quadratic coefficient `K`.
+///
+/// `0.03515625 ANT × 10¹⁸ wei/ANT = 35_156_250_000_000_000 wei`.
+const PRICE_COEFFICIENT_WEI: u128 = 35_156_250_000_000_000;
 
 /// Calculate storage price in wei from the number of close records stored.
 ///
-/// Formula: `price_wei = n² × 10¹⁸ / 6000²`
+/// Formula: `price_wei = BASELINE + n² × K / D²`
 ///
-/// This is equivalent to `(n / 6000)²` in tokens, converted to wei, but
-/// preserves sub-token precision by scaling before dividing. U256 arithmetic
-/// prevents overflow for large record counts.
+/// where `BASELINE = 0.00390625 ANT`, `K = 0.03515625 ANT`, and `D = 6000`.
+/// U256 arithmetic prevents overflow for large record counts.
 #[must_use]
 pub fn calculate_price(close_records_stored: usize) -> Amount {
     let n = Amount::from(close_records_stored);
     let n_squared = n.saturating_mul(n);
-    let price_wei =
-        n_squared.saturating_mul(Amount::from(WEI_PER_TOKEN)) / Amount::from(DIVISOR_SQUARED);
-    if price_wei.is_zero() {
-        Amount::from(MIN_PRICE_WEI)
-    } else {
-        price_wei
-    }
+    let quadratic_wei = n_squared.saturating_mul(Amount::from(PRICE_COEFFICIENT_WEI))
+        / Amount::from(DIVISOR_SQUARED);
+    Amount::from(PRICE_BASELINE_WEI).saturating_add(quadratic_wei)
 }
 
 #[cfg(test)]
@@ -50,53 +62,67 @@ pub fn calculate_price(close_records_stored: usize) -> Amount {
 mod tests {
     use super::*;
 
-    const WEI: u128 = WEI_PER_TOKEN;
+    /// 1 token = 10¹⁸ wei (used for test sanity-checks).
+    const WEI_PER_TOKEN: u128 = 1_000_000_000_000_000_000;
 
-    /// Helper: expected price for n records = n² * 10^18 / 6000²
+    /// Helper: expected price matching the formula `BASELINE + n² × K / D²`.
     fn expected_price(n: u64) -> Amount {
-        let n = Amount::from(n);
-        n * n * Amount::from(WEI) / Amount::from(DIVISOR_SQUARED)
+        let n_amt = Amount::from(n);
+        let quad =
+            n_amt * n_amt * Amount::from(PRICE_COEFFICIENT_WEI) / Amount::from(DIVISOR_SQUARED);
+        Amount::from(PRICE_BASELINE_WEI) + quad
     }
 
     #[test]
-    fn test_zero_records_gets_min_price() {
+    fn test_zero_records_gets_baseline() {
+        // At n = 0 the quadratic term vanishes, leaving the baseline floor.
         let price = calculate_price(0);
-        assert_eq!(price, Amount::from(MIN_PRICE_WEI));
+        assert_eq!(price, Amount::from(PRICE_BASELINE_WEI));
     }
 
     #[test]
-    fn test_one_record_nonzero() {
-        // 1² * 1e18 / 36e6 = 1e18 / 36e6 ≈ 27_777_777_777
+    fn test_baseline_is_nonzero_spam_barrier() {
+        // The baseline ensures even empty nodes charge a meaningful price,
+        // making the legacy MIN_PRICE_WEI = 1 sentinel redundant.
+        assert!(calculate_price(0) > Amount::ZERO);
+        assert!(calculate_price(1) > calculate_price(0));
+    }
+
+    #[test]
+    fn test_one_record_above_baseline() {
         let price = calculate_price(1);
         assert_eq!(price, expected_price(1));
-        assert!(price > Amount::ZERO);
+        assert!(price > Amount::from(PRICE_BASELINE_WEI));
     }
 
     #[test]
-    fn test_at_divisor_gets_one_token() {
-        // 6000² * 1e18 / 6000² = 1e18
+    fn test_at_divisor_is_baseline_plus_k() {
+        // At n = D the quadratic contribution equals K × 1² = K.
+        // price = BASELINE + K = 0.00390625 + 0.03515625 = 0.0390625 ANT
         let price = calculate_price(6000);
-        assert_eq!(price, Amount::from(WEI));
+        let expected = Amount::from(PRICE_BASELINE_WEI + PRICE_COEFFICIENT_WEI);
+        assert_eq!(price, expected);
     }
 
     #[test]
-    fn test_double_divisor_gets_four_tokens() {
-        // 12000² * 1e18 / 6000² = 4e18
+    fn test_double_divisor_is_baseline_plus_four_k() {
+        // At n = 2D the quadratic contribution is 4K.
         let price = calculate_price(12000);
-        assert_eq!(price, Amount::from(4 * WEI));
+        let expected = Amount::from(PRICE_BASELINE_WEI + 4 * PRICE_COEFFICIENT_WEI);
+        assert_eq!(price, expected);
     }
 
     #[test]
-    fn test_triple_divisor_gets_nine_tokens() {
-        // 18000² * 1e18 / 6000² = 9e18
+    fn test_triple_divisor_is_baseline_plus_nine_k() {
+        // At n = 3D the quadratic contribution is 9K.
         let price = calculate_price(18000);
-        assert_eq!(price, Amount::from(9 * WEI));
+        let expected = Amount::from(PRICE_BASELINE_WEI + 9 * PRICE_COEFFICIENT_WEI);
+        assert_eq!(price, expected);
     }
 
     #[test]
     fn test_smooth_pricing_no_staircase() {
-        // With the old integer-division approach, 6000 and 11999 gave the same price.
-        // Now 11999 should give a higher price than 6000.
+        // 11999 should give a strictly higher price than 6000 (no integer-division plateau).
         let price_6k = calculate_price(6000);
         let price_11k = calculate_price(11999);
         assert!(
@@ -141,19 +167,23 @@ mod tests {
     }
 
     #[test]
-    fn test_quadratic_growth() {
-        // price at 4x records should be 16x price at 1x
-        let price_1x = calculate_price(6000);
-        let price_4x = calculate_price(24000);
-        assert_eq!(price_1x, Amount::from(WEI));
-        assert_eq!(price_4x, Amount::from(16 * WEI));
+    fn test_quadratic_growth_excluding_baseline() {
+        // Subtracting the baseline, quadratic contribution should scale with n².
+        // At 2× records the quadratic portion is 4×; at 4× records it is 16×.
+        let base = Amount::from(PRICE_BASELINE_WEI);
+        let quad_6k = calculate_price(6000) - base;
+        let quad_12k = calculate_price(12000) - base;
+        let quad_24k = calculate_price(24000) - base;
+        assert_eq!(quad_12k, quad_6k * Amount::from(4u64));
+        assert_eq!(quad_24k, quad_6k * Amount::from(16u64));
     }
 
     #[test]
-    fn test_small_record_counts_are_cheap() {
-        // 100 records: 100² * 1e18 / 36e6 ≈ 277_777_777_777_777 wei ≈ 0.000278 tokens
+    fn test_small_record_counts_near_baseline() {
+        // At small n, price is dominated by the baseline — quadratic term is tiny.
         let price = calculate_price(100);
         assert_eq!(price, expected_price(100));
-        assert!(price < Amount::from(WEI)); // well below 1 token
+        assert!(price < Amount::from(WEI_PER_TOKEN)); // well below 1 ANT
+        assert!(price > Amount::from(PRICE_BASELINE_WEI)); // strictly above baseline
     }
 }
