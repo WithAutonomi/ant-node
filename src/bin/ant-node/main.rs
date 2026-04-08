@@ -9,18 +9,26 @@ use ant_node::config::BootstrapSource;
 use ant_node::NodeBuilder;
 use clap::Parser;
 use cli::Cli;
+#[cfg(feature = "logging")]
+use cli::CliLogFormat;
+#[cfg(feature = "logging")]
+use tracing_subscriber::prelude::*;
+#[cfg(feature = "logging")]
+use tracing_subscriber::{fmt, EnvFilter, Layer};
 
-/// Initialize the tracing subscriber when the `logging` feature is active.
+/// Initialize the tracing subscriber when the `logging` feature is active
+/// **and** the user passed `--enable-logging`.
 ///
-/// Returns a guard that must be held for the lifetime of the process to ensure
-/// buffered logs are flushed on shutdown.
+/// Returns `Ok(None)` when logging was not requested. Otherwise returns a
+/// guard (possibly `None` for stdout sinks) that must be held for the
+/// lifetime of the process to ensure buffered logs are flushed on shutdown.
 #[cfg(feature = "logging")]
 fn init_logging(
     cli: &Cli,
 ) -> color_eyre::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use cli::CliLogFormat;
-    use tracing_subscriber::prelude::*;
-    use tracing_subscriber::{fmt, EnvFilter, Layer};
+    if !cli.enable_logging {
+        return Ok(None);
+    }
 
     let log_format = cli.log_format;
     let log_dir = cli.log_dir.clone();

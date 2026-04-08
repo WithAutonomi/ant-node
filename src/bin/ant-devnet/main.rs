@@ -15,7 +15,7 @@ async fn main() -> color_eyre::Result<()> {
     let cli = Cli::parse();
 
     #[cfg(feature = "logging")]
-    {
+    if cli.enable_logging {
         use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
         let filter =
