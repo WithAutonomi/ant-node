@@ -1618,8 +1618,8 @@ impl P2PNode {
 /// misconfigured clocks or high-latency network conditions. Can be tightened (e.g., to 60s)
 /// once the network stabilizes and node clock synchronization improves.
 const MAX_MESSAGE_AGE_SECS: u64 = 300;
-/// Maximum allowed future timestamp (30 seconds to account for clock drift)
-const MAX_FUTURE_SECS: u64 = 30;
+/// Maximum allowed future timestamp -- symmetric with the past window.
+const MAX_FUTURE_SECS: u64 = 300;
 
 /// Convenience constructor for `P2PError::Network(NetworkError::ProtocolError(...))`.
 fn protocol_error(msg: impl std::fmt::Display) -> P2PError {
