@@ -165,6 +165,16 @@ pub struct DevnetConfig {
     /// When `Some`, nodes will use this network (e.g. Anvil testnet) for
     /// on-chain verification. Defaults to Arbitrum One when `None`.
     pub evm_network: Option<EvmNetwork>,
+
+    /// Number of regular (non-bootstrap) nodes that should be forced into
+    /// private mode, skipping reachability classification and acquiring a
+    /// MASQUE relay instead.
+    ///
+    /// These are the **last** `private_node_count` regular nodes spawned,
+    /// ensuring enough public nodes exist to serve as relayers.
+    ///
+    /// Must be ≤ `node_count - bootstrap_count`. Default: 0.
+    pub private_node_count: usize,
 }
 
 impl Default for DevnetConfig {
@@ -186,6 +196,7 @@ impl Default for DevnetConfig {
             enable_node_logging: false,
             cleanup_data_dir: true,
             evm_network: None,
+            private_node_count: 0,
         }
     }
 }
@@ -292,6 +303,7 @@ pub struct DevnetNode {
     p2p_node: Option<Arc<P2PNode>>,
     ant_protocol: Option<Arc<AntProtocol>>,
     is_bootstrap: bool,
+    assume_private: bool,
     state: Arc<RwLock<NodeState>>,
     bootstrap_addrs: Vec<MultiAddr>,
     protocol_task: Option<JoinHandle<()>>,
@@ -336,6 +348,14 @@ impl Devnet {
             return Err(DevnetError::Config(
                 "At least one bootstrap node is required".to_string(),
             ));
+        }
+
+        let regular_count = config.node_count - config.bootstrap_count;
+        if config.private_node_count > regular_count {
+            return Err(DevnetError::Config(format!(
+                "private_node_count ({}) exceeds regular node count ({})",
+                config.private_node_count, regular_count
+            )));
         }
 
         let node_count = config.node_count;
@@ -470,7 +490,7 @@ impl Devnet {
         info!("Starting {} bootstrap nodes", self.config.bootstrap_count);
 
         for i in 0..self.config.bootstrap_count {
-            let node = self.create_node(i, true, vec![]).await?;
+            let node = self.create_node(i, true, false, vec![]).await?;
             self.start_node(node).await?;
             tokio::time::sleep(self.config.spawn_delay).await;
         }
@@ -484,7 +504,13 @@ impl Devnet {
 
     async fn start_regular_nodes(&mut self) -> Result<()> {
         let regular_count = self.config.node_count - self.config.bootstrap_count;
-        info!("Starting {} regular nodes", regular_count);
+        let private_start_index = self.config.node_count - self.config.private_node_count;
+        info!(
+            "Starting {} regular nodes ({} public, {} private)",
+            regular_count,
+            regular_count - self.config.private_node_count,
+            self.config.private_node_count,
+        );
 
         let bootstrap_addrs: Vec<MultiAddr> = self
             .nodes
@@ -501,7 +527,10 @@ impl Devnet {
             .collect();
 
         for i in self.config.bootstrap_count..self.config.node_count {
-            let node = self.create_node(i, false, bootstrap_addrs.clone()).await?;
+            let is_private = i >= private_start_index;
+            let node = self
+                .create_node(i, false, is_private, bootstrap_addrs.clone())
+                .await?;
             self.start_node(node).await?;
             tokio::time::sleep(self.config.spawn_delay).await;
         }
@@ -514,6 +543,7 @@ impl Devnet {
         &self,
         index: usize,
         is_bootstrap: bool,
+        assume_private: bool,
         bootstrap_addrs: Vec<MultiAddr>,
     ) -> Result<DevnetNode> {
         let index_u16 = u16::try_from(index)
@@ -549,6 +579,7 @@ impl Devnet {
             p2p_node: None,
             ant_protocol: Some(Arc::new(ant_protocol)),
             is_bootstrap,
+            assume_private,
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
             protocol_task: None,
@@ -598,12 +629,22 @@ impl Devnet {
     }
 
     async fn start_node(&mut self, mut node: DevnetNode) -> Result<()> {
-        debug!("Starting node {} on port {}", node.index, node.port);
+        debug!(
+            "Starting node {} on port {}{}",
+            node.index,
+            node.port,
+            if node.assume_private {
+                " (private)"
+            } else {
+                ""
+            }
+        );
         *node.state.write().await = NodeState::Starting;
 
         let mut core_config = CoreNodeConfig::builder()
             .port(node.port)
             .local(true)
+            .assume_private(node.assume_private)
             .max_message_size(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
             .build()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
