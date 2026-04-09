@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+.cargo/config.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Coverage
+lcov.info
+coverage/
+
+# Benchmark results
+criterion/
+
+# Local config
+.env
+.env.local
+patches/
+
+# Tool state
+.serena/
+.claude/tasks/
+.claude/plans/
+.cache/

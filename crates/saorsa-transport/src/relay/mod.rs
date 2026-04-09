@@ -1,0 +1,303 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This Saorsa Network Software is licensed under the General Public License (GPL), version 3.
+// Please see the file LICENSE-GPL, or visit <http://www.gnu.org/licenses/> for the full text.
+//
+// Full details available at https://saorsalabs.com/licenses
+
+//! Relay Infrastructure for NAT Traversal
+//!
+//! This module provides relay infrastructure components used by the MASQUE
+//! CONNECT-UDP Bind implementation for guaranteed NAT traversal fallback.
+//!
+//! # Overview
+//!
+//! The relay system implements `draft-ietf-masque-connect-udp-listen-10` to
+//! enable UDP proxying over QUIC connections. This provides 100% connectivity
+//! guarantee even when direct hole punching fails.
+//!
+//! # Components
+//!
+//! - `authenticator` - ML-DSA-65 post-quantum authentication
+//! - `error` - Relay error types
+//! - `rate_limiter` - Token bucket rate limiting
+//! - `statistics` - Relay statistics collection
+//!
+//! # Usage
+//!
+//! The primary relay implementation is in [`crate::masque`]. This module
+//! provides shared infrastructure components.
+//!
+//! ```rust,ignore
+//! use saorsa_transport::masque::{MasqueRelayServer, MasqueRelayClient, RelayManager};
+//! use saorsa_transport::relay::{RelayAuthenticator, RateLimiter};
+//!
+//! // Create a relay server with authentication
+//! let authenticator = RelayAuthenticator::new(keypair);
+//! let server = MasqueRelayServer::new(config, relay_address);
+//!
+//! // Create a relay client
+//! let client = MasqueRelayClient::new(relay_address, client_config);
+//! ```
+//!
+//! See [`crate::masque`] for the full MASQUE implementation.
+
+pub mod authenticator;
+pub mod error;
+pub mod rate_limiter;
+pub mod statistics;
+
+// Core exports
+pub use authenticator::{AuthToken, RelayAuthenticator};
+pub use error::{RelayError, RelayResult};
+pub use rate_limiter::{RateLimiter, TokenBucket};
+pub use statistics::RelayStatisticsCollector;
+
+// Re-export MASQUE types for convenience
+pub use crate::masque::{
+    MasqueRelayClient, MasqueRelayConfig, MasqueRelayServer, MasqueRelayStats, MigrationConfig,
+    MigrationCoordinator, MigrationState, RelayManager, RelayManagerConfig, RelaySession,
+    RelaySessionConfig, RelaySessionState,
+};
+
+use std::time::Duration;
+
+/// Default relay session timeout (5 minutes)
+pub const DEFAULT_SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default bandwidth limit per session (1 MB/s)
+pub const DEFAULT_BANDWIDTH_LIMIT: u32 = 1_048_576;
+
+/// Maximum number of concurrent relay sessions per client
+pub const MAX_CONCURRENT_SESSIONS: usize = 10;
+
+/// Maximum size of relay data payload (64 KB)
+pub const MAX_RELAY_DATA_SIZE: usize = 65536;
+
+/// Rate limiting: tokens per second (100 requests/second)
+pub const RATE_LIMIT_TOKENS_PER_SECOND: u32 = 100;
+
+/// Rate limiting: maximum burst size (500 tokens)
+pub const RATE_LIMIT_BURST_SIZE: u32 = 500;
+
+/// Anti-replay window size for authentication tokens
+pub const ANTI_REPLAY_WINDOW_SIZE: u64 = 1000;
+
+/// Session cleanup interval (check every 30 seconds)
+pub const SESSION_CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Comprehensive relay statistics combining all relay operations
+#[derive(Debug, Clone, Default)]
+pub struct RelayStatistics {
+    /// Session-related statistics
+    pub session_stats: SessionStatistics,
+
+    /// Connection-related statistics
+    pub connection_stats: ConnectionStatistics,
+
+    /// Authentication and security statistics
+    pub auth_stats: AuthenticationStatistics,
+
+    /// Rate limiting statistics
+    pub rate_limit_stats: RateLimitingStatistics,
+
+    /// Error and failure statistics
+    pub error_stats: ErrorStatistics,
+}
+
+/// Session management statistics
+#[derive(Debug, Clone, Default)]
+pub struct SessionStatistics {
+    /// Total sessions created since startup
+    pub total_sessions_created: u64,
+
+    /// Currently active sessions
+    pub active_sessions: u32,
+
+    /// Sessions currently in pending state
+    pub pending_sessions: u32,
+
+    /// Sessions terminated normally
+    pub sessions_terminated_normally: u64,
+
+    /// Sessions terminated due to timeout
+    pub sessions_timed_out: u64,
+
+    /// Sessions terminated due to errors
+    pub sessions_terminated_with_errors: u64,
+
+    /// Average session duration (in seconds)
+    pub avg_session_duration: f64,
+
+    /// Total data forwarded across all sessions (bytes)
+    pub total_bytes_forwarded: u64,
+}
+
+/// Connection-level statistics
+#[derive(Debug, Clone, Default)]
+pub struct ConnectionStatistics {
+    /// Total relay connections established
+    pub total_connections: u64,
+
+    /// Currently active connections
+    pub active_connections: u32,
+
+    /// Total bytes sent through all connections
+    pub total_bytes_sent: u64,
+
+    /// Total bytes received through all connections
+    pub total_bytes_received: u64,
+
+    /// Average connection bandwidth usage (bytes/sec)
+    pub avg_bandwidth_usage: f64,
+
+    /// Peak concurrent connections
+    pub peak_concurrent_connections: u32,
+
+    /// Connection timeouts
+    pub connection_timeouts: u64,
+
+    /// Keep-alive packets sent
+    pub keep_alive_sent: u64,
+}
+
+/// Authentication and security statistics
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticationStatistics {
+    /// Total authentication attempts
+    pub total_auth_attempts: u64,
+
+    /// Successful authentications
+    pub successful_auths: u64,
+
+    /// Failed authentications
+    pub failed_auths: u64,
+
+    /// Authentication rate (auths per second)
+    pub auth_rate: f64,
+
+    /// Replay attacks detected and blocked
+    pub replay_attacks_blocked: u64,
+
+    /// Invalid signatures detected
+    pub invalid_signatures: u64,
+
+    /// Unknown peer keys encountered
+    pub unknown_peer_keys: u64,
+}
+
+/// Rate limiting statistics
+#[derive(Debug, Clone, Default)]
+pub struct RateLimitingStatistics {
+    /// Total requests received
+    pub total_requests: u64,
+
+    /// Requests allowed through rate limiter
+    pub requests_allowed: u64,
+
+    /// Requests blocked by rate limiter
+    pub requests_blocked: u64,
+
+    /// Current token bucket levels
+    pub current_tokens: u32,
+
+    /// Rate limiting efficiency (% of requests allowed)
+    pub efficiency_percentage: f64,
+
+    /// Peak request rate (requests per second)
+    pub peak_request_rate: f64,
+}
+
+/// Error and failure statistics
+#[derive(Debug, Clone, Default)]
+pub struct ErrorStatistics {
+    /// Protocol errors encountered
+    pub protocol_errors: u64,
+
+    /// Resource exhaustion events
+    pub resource_exhausted: u64,
+
+    /// Session-related errors
+    pub session_errors: u64,
+
+    /// Authentication failures
+    pub auth_failures: u64,
+
+    /// Network-related errors
+    pub network_errors: u64,
+
+    /// Internal errors
+    pub internal_errors: u64,
+
+    /// Error rate (errors per second)
+    pub error_rate: f64,
+
+    /// Most common error types
+    pub error_breakdown: std::collections::HashMap<String, u64>,
+}
+
+impl RelayStatistics {
+    /// Create new empty relay statistics
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Calculate overall success rate
+    pub fn success_rate(&self) -> f64 {
+        let total_ops = self.session_stats.total_sessions_created
+            + self.connection_stats.total_connections
+            + self.auth_stats.total_auth_attempts;
+
+        if total_ops == 0 {
+            return 1.0;
+        }
+
+        let total_failures = self.session_stats.sessions_terminated_with_errors
+            + self.connection_stats.connection_timeouts
+            + self.auth_stats.failed_auths
+            + self.error_stats.protocol_errors
+            + self.error_stats.resource_exhausted;
+
+        1.0 - (total_failures as f64 / total_ops as f64)
+    }
+
+    /// Calculate total throughput (bytes per second)
+    pub fn total_throughput(&self) -> f64 {
+        if self.session_stats.avg_session_duration == 0.0 {
+            return 0.0;
+        }
+        self.session_stats.total_bytes_forwarded as f64 / self.session_stats.avg_session_duration
+    }
+
+    /// Check if relay is operating within healthy parameters
+    pub fn is_healthy(&self) -> bool {
+        let total_ops = self.session_stats.total_sessions_created
+            + self.connection_stats.total_connections
+            + self.auth_stats.total_auth_attempts
+            + self.rate_limit_stats.total_requests;
+
+        if total_ops == 0 {
+            return true;
+        }
+
+        let total_errors = self.error_stats.protocol_errors
+            + self.error_stats.resource_exhausted
+            + self.error_stats.session_errors
+            + self.error_stats.auth_failures
+            + self.error_stats.network_errors
+            + self.error_stats.internal_errors;
+
+        let error_rate_ok = if total_errors == 0 {
+            true
+        } else if self.error_stats.error_rate < 1.0 {
+            true
+        } else {
+            total_errors <= 5 && total_ops >= 100
+        };
+
+        self.success_rate() > 0.95
+            && error_rate_ok
+            && (self.rate_limit_stats.total_requests == 0
+                || self.rate_limit_stats.efficiency_percentage > 80.0)
+    }
+}

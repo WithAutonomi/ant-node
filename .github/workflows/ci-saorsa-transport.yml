@@ -1,0 +1,62 @@
+name: CI — saorsa-transport
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/saorsa-transport/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/saorsa-transport/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (saorsa-transport)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Clippy (strict)
+        run: cargo clippy -p saorsa-transport --all-targets -- -D warnings
+
+  test:
+    name: Test (saorsa-transport)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Unit tests
+        run: cargo test -p saorsa-transport --lib
+
+  doc:
+    name: Doc (saorsa-transport)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: Build docs
+        run: cargo doc -p saorsa-transport --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"

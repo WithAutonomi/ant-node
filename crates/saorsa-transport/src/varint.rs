@@ -1,0 +1,223 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This Saorsa Network Software is licensed under the General Public License (GPL), version 3.
+// Please see the file LICENSE-GPL, or visit <http://www.gnu.org/licenses/> for the full text.
+//
+// Full details available at https://saorsalabs.com/licenses
+
+use std::{convert::TryInto, fmt};
+
+use bytes::{Buf, BufMut};
+use thiserror::Error;
+
+use crate::coding::{self, Codec, UnexpectedEnd};
+
+#[cfg(feature = "arbitrary")]
+use arbitrary::Arbitrary;
+
+/// An integer less than 2^62
+///
+/// Values of this type are suitable for encoding as QUIC variable-length integer.
+// It would be neat if we could express to Rust that the top two bits are available for use as enum
+// discriminants
+#[derive(Default, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct VarInt(pub(crate) u64);
+
+impl VarInt {
+    /// The largest representable value
+    pub const MAX: Self = Self((1 << 62) - 1);
+    /// The largest encoded value length
+    pub const MAX_SIZE: usize = 8;
+
+    /// Create a VarInt from a value that is guaranteed to be in range
+    ///
+    /// This should only be used when the value is known at compile time or
+    /// has been validated to be less than 2^62.
+    #[inline]
+    pub(crate) fn from_u64_bounded(x: u64) -> Self {
+        debug_assert!(x < 2u64.pow(62), "VarInt value {} exceeds maximum", x);
+        // Safety: caller guarantees the bound.
+        unsafe { Self::from_u64_unchecked(x) }
+    }
+
+    /// Construct a `VarInt` infallibly
+    pub const fn from_u32(x: u32) -> Self {
+        Self(x as u64)
+    }
+
+    /// Succeeds iff `x` < 2^62
+    pub fn from_u64(x: u64) -> Result<Self, VarIntBoundsExceeded> {
+        if x < 2u64.pow(62) {
+            Ok(Self(x))
+        } else {
+            Err(VarIntBoundsExceeded)
+        }
+    }
+
+    /// Create a VarInt without ensuring it's in range
+    ///
+    /// # Safety
+    ///
+    /// `x` must be less than 2^62.
+    pub const unsafe fn from_u64_unchecked(x: u64) -> Self {
+        Self(x)
+    }
+
+    /// Extract the integer value
+    pub const fn into_inner(self) -> u64 {
+        self.0
+    }
+
+    /// Compute the number of bytes needed to encode this value
+    pub(crate) const fn size(self) -> usize {
+        let x = self.0;
+        if x < 2u64.pow(6) {
+            1
+        } else if x < 2u64.pow(14) {
+            2
+        } else if x < 2u64.pow(30) {
+            4
+        } else if x < 2u64.pow(62) {
+            8
+        } else {
+            Self::MAX_SIZE
+        }
+    }
+
+    pub(crate) fn encode_checked<B: BufMut>(x: u64, w: &mut B) -> Result<(), VarIntBoundsExceeded> {
+        if x < 2u64.pow(6) {
+            w.put_u8(x as u8);
+            Ok(())
+        } else if x < 2u64.pow(14) {
+            w.put_u16((0b01 << 14) | x as u16);
+            Ok(())
+        } else if x < 2u64.pow(30) {
+            w.put_u32((0b10 << 30) | x as u32);
+            Ok(())
+        } else if x < 2u64.pow(62) {
+            w.put_u64((0b11 << 62) | x);
+            Ok(())
+        } else {
+            Err(VarIntBoundsExceeded)
+        }
+    }
+}
+
+impl From<VarInt> for u64 {
+    fn from(x: VarInt) -> Self {
+        x.0
+    }
+}
+
+impl From<u8> for VarInt {
+    fn from(x: u8) -> Self {
+        Self(x.into())
+    }
+}
+
+impl From<u16> for VarInt {
+    fn from(x: u16) -> Self {
+        Self(x.into())
+    }
+}
+
+impl From<u32> for VarInt {
+    fn from(x: u32) -> Self {
+        Self(x.into())
+    }
+}
+
+impl std::convert::TryFrom<u64> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: u64) -> Result<Self, VarIntBoundsExceeded> {
+        Self::from_u64(x)
+    }
+}
+
+impl std::convert::TryFrom<u128> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: u128) -> Result<Self, VarIntBoundsExceeded> {
+        Self::from_u64(x.try_into().map_err(|_| VarIntBoundsExceeded)?)
+    }
+}
+
+impl std::convert::TryFrom<usize> for VarInt {
+    type Error = VarIntBoundsExceeded;
+    /// Succeeds iff `x` < 2^62
+    fn try_from(x: usize) -> Result<Self, VarIntBoundsExceeded> {
+        Self::try_from(x as u64)
+    }
+}
+
+impl fmt::Debug for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Display for VarInt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[cfg(feature = "arbitrary")]
+impl<'arbitrary> Arbitrary<'arbitrary> for VarInt {
+    fn arbitrary(u: &mut arbitrary::Unstructured<'arbitrary>) -> arbitrary::Result<Self> {
+        Ok(Self(u.int_in_range(0..=Self::MAX.0)?))
+    }
+}
+
+/// Error returned when constructing a `VarInt` from a value >= 2^62
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Error)]
+#[error("value too large for varint encoding")]
+pub struct VarIntBoundsExceeded;
+
+impl Codec for VarInt {
+    fn decode<B: Buf>(r: &mut B) -> coding::Result<Self> {
+        if !r.has_remaining() {
+            return Err(UnexpectedEnd);
+        }
+        let mut buf = [0; 8];
+        buf[0] = r.get_u8();
+        let tag = buf[0] >> 6;
+        buf[0] &= 0b0011_1111;
+        let x = match tag {
+            0b00 => u64::from(buf[0]),
+            0b01 => {
+                if r.remaining() < 1 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..2]);
+                // Safe: buf[..2] is exactly 2 bytes
+                u64::from(u16::from_be_bytes([buf[0], buf[1]]))
+            }
+            0b10 => {
+                if r.remaining() < 3 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..4]);
+                // Safe: buf[..4] is exactly 4 bytes
+                u64::from(u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]))
+            }
+            0b11 => {
+                if r.remaining() < 7 {
+                    return Err(UnexpectedEnd);
+                }
+                r.copy_to_slice(&mut buf[1..8]);
+                u64::from_be_bytes(buf)
+            }
+            _ => unreachable!(),
+        };
+        Ok(Self(x))
+    }
+
+    fn encode<B: BufMut>(&self, w: &mut B) {
+        if let Err(_) = Self::encode_checked(self.0, w) {
+            tracing::error!("VarInt overflow: {} exceeds maximum", self.0);
+            debug_assert!(false, "VarInt overflow: {}", self.0);
+        }
+    }
+}

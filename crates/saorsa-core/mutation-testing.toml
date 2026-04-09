@@ -1,0 +1,64 @@
+# Mutation Testing Configuration
+# This file controls which parts of the codebase are subject to mutation testing
+
+[mutants]
+# Files to include in mutation testing
+include_files = [
+    "src/adaptive/**/*.rs",
+    "src/identity/**/*.rs",
+    "src/dht/**/*.rs",
+    "src/security.rs",
+    "src/validation.rs",
+    "src/network.rs",
+]
+
+# Files to exclude from mutation testing
+exclude_files = [
+    "src/main.rs",
+    "src/lib.rs",
+    "src/config.rs",
+    "tests/**/*.rs",
+    "benches/**/*.rs",
+    "examples/**/*.rs",
+]
+
+# Functions to exclude from mutation testing (too complex or external dependencies)
+exclude_functions = [
+    "tokio::main",
+    "async fn main",
+    "println!",
+    "eprintln!",
+    "dbg!",
+    "unimplemented!",
+    "todo!",
+]
+
+# Mutation operators to use
+operators = [
+    "arith",      # Arithmetic operator replacement
+    "binary",     # Binary operator replacement
+    "bool",       # Boolean literal replacement
+    "comparison", # Comparison operator replacement
+    "if",         # If statement condition negation
+    "negate",     # Negate expressions
+    "return",     # Return value replacement
+    "swap",       # Swap expressions
+]
+
+# Timeout for each test run (seconds)
+test_timeout = 300
+
+# Maximum number of mutations to test (0 = unlimited)
+max_mutants = 1000
+
+# Minimum test coverage threshold
+min_coverage = 80.0
+
+# Generate HTML report
+html_report = true
+
+# Output directory for reports
+report_dir = "target/mutation-reports"
+
+# Parallel execution
+threads = 4

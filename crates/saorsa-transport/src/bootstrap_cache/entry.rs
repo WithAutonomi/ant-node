@@ -1,0 +1,539 @@
+// Copyright 2024 Saorsa Labs Ltd.
+//
+// This Saorsa Network Software is licensed under the General Public License (GPL), version 3.
+// Please see the file LICENSE-GPL, or visit <http://www.gnu.org/licenses/> for the full text.
+//
+// Full details available at https://saorsalabs.com/licenses
+
+//! Cached peer entry types.
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::time::{Duration, SystemTime};
+
+/// A cached peer entry with quality metrics
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedPeer {
+    /// Primary address used to identify and reach this peer
+    pub primary_address: SocketAddr,
+
+    /// Additional known socket addresses for this peer
+    pub addresses: Vec<SocketAddr>,
+
+    /// Peer capabilities and features
+    pub capabilities: PeerCapabilities,
+
+    /// When we first discovered this peer
+    pub first_seen: SystemTime,
+
+    /// When we last successfully communicated with this peer
+    pub last_seen: SystemTime,
+
+    /// When we last attempted to connect (success or failure)
+    pub last_attempt: Option<SystemTime>,
+
+    /// Connection statistics
+    pub stats: ConnectionStats,
+
+    /// Computed quality score (0.0 to 1.0)
+    #[serde(default = "default_quality_score")]
+    pub quality_score: f64,
+
+    /// Source that added this peer
+    pub source: PeerSource,
+
+    /// Known relay paths for reaching this peer when direct connection fails
+    #[serde(default)]
+    pub relay_paths: Vec<RelayPathHint>,
+
+    /// Persistent QUIC address validation token
+    #[serde(default)]
+    pub token: Option<Vec<u8>>,
+}
+
+fn default_quality_score() -> f64 {
+    0.5
+}
+
+/// Peer capabilities and features
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PeerCapabilities {
+    /// Peer supports relay traffic (observed, not self-asserted)
+    pub supports_relay: bool,
+
+    /// Peer supports NAT traversal coordination (observed, not self-asserted)
+    pub supports_coordination: bool,
+
+    /// Protocol identifiers advertised by this peer (as hex strings for serialization)
+    #[serde(default)]
+    pub protocols: HashSet<String>,
+
+    /// Observed NAT type hint
+    pub nat_type: Option<NatType>,
+
+    /// External addresses reported by peer
+    #[serde(default)]
+    pub external_addresses: Vec<SocketAddr>,
+}
+
+impl PeerCapabilities {
+    /// Check if this peer has any IPv4 addresses
+    pub fn has_ipv4(&self) -> bool {
+        self.external_addresses.iter().any(|addr| addr.is_ipv4())
+    }
+
+    /// Check if this peer has any IPv6 addresses
+    pub fn has_ipv6(&self) -> bool {
+        self.external_addresses.iter().any(|addr| addr.is_ipv6())
+    }
+
+    /// Check if this peer supports dual-stack (both IPv4 and IPv6)
+    ///
+    /// A dual-stack peer can bridge traffic between IPv4 and IPv6 networks
+    /// when acting as a relay.
+    pub fn supports_dual_stack(&self) -> bool {
+        self.has_ipv4() && self.has_ipv6()
+    }
+
+    /// Get addresses filtered by IP version
+    pub fn addresses_by_version(&self, ipv4: bool) -> Vec<SocketAddr> {
+        self.external_addresses
+            .iter()
+            .filter(|addr| addr.is_ipv4() == ipv4)
+            .copied()
+            .collect()
+    }
+
+    /// Check if this peer can bridge between source and target IP versions
+    pub fn can_bridge(&self, source: &SocketAddr, target: &SocketAddr) -> bool {
+        let source_v4 = source.is_ipv4();
+        let target_v4 = target.is_ipv4();
+
+        // Same version - any peer can handle
+        if source_v4 == target_v4 {
+            return true;
+        }
+
+        // Different versions - need dual-stack
+        self.supports_dual_stack()
+    }
+}
+
+/// NAT type classification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NatType {
+    /// No NAT (public IP)
+    None,
+    /// Full cone NAT (easiest to traverse)
+    FullCone,
+    /// Address-restricted cone NAT
+    AddressRestrictedCone,
+    /// Port-restricted cone NAT
+    PortRestrictedCone,
+    /// Symmetric NAT (hardest to traverse)
+    Symmetric,
+    /// Unknown NAT type
+    Unknown,
+}
+
+/// Connection statistics for quality scoring
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConnectionStats {
+    /// Total successful connections
+    pub success_count: u32,
+
+    /// Total failed connection attempts
+    pub failure_count: u32,
+
+    /// Exponential moving average RTT in milliseconds
+    pub avg_rtt_ms: u32,
+
+    /// Minimum observed RTT
+    pub min_rtt_ms: u32,
+
+    /// Maximum observed RTT
+    pub max_rtt_ms: u32,
+
+    /// Total bytes relayed through this peer (if relay)
+    pub bytes_relayed: u64,
+
+    /// Number of NAT traversals coordinated (if coordinator)
+    pub coordinations_completed: u32,
+}
+
+/// How we discovered this peer
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PeerSource {
+    /// User-provided bootstrap seed
+    Seed,
+    /// Discovered via active connection
+    Connection,
+    /// Discovered via relay traffic
+    Relay,
+    /// Discovered via NAT coordination
+    Coordination,
+    /// Merged from another cache instance
+    Merge,
+    /// Unknown source (legacy entries)
+    #[default]
+    Unknown,
+}
+
+/// Result of a connection attempt
+#[derive(Debug, Clone)]
+pub struct ConnectionOutcome {
+    /// Whether the connection succeeded
+    pub success: bool,
+    /// RTT in milliseconds if available
+    pub rtt_ms: Option<u32>,
+    /// Capabilities discovered during connection
+    pub capabilities_discovered: Option<PeerCapabilities>,
+}
+
+/// A relay path hint for reaching a peer through an intermediary
+///
+/// When direct connections fail, relay paths provide alternative routes.
+/// This tracks known relays that can reach a given peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayPathHint {
+    /// Primary socket address of the relay peer
+    pub relay_address: SocketAddr,
+
+    /// Additional known socket addresses for the relay
+    pub relay_locators: Vec<SocketAddr>,
+
+    /// Observed round-trip latency through this relay in milliseconds
+    pub observed_latency_ms: Option<u32>,
+
+    /// When this relay path was last successfully used
+    pub last_used: SystemTime,
+}
+
+impl CachedPeer {
+    /// Create a new peer entry keyed by its primary address.
+    pub fn new(
+        primary_address: SocketAddr,
+        addresses: Vec<SocketAddr>,
+        source: PeerSource,
+    ) -> Self {
+        let now = SystemTime::now();
+        Self {
+            primary_address,
+            addresses,
+            capabilities: PeerCapabilities::default(),
+            first_seen: now,
+            last_seen: now,
+            last_attempt: None,
+            stats: ConnectionStats::default(),
+            quality_score: 0.5, // Neutral starting score
+            source,
+            relay_paths: Vec::new(),
+            token: None,
+        }
+    }
+
+    /// Record a successful connection
+    pub fn record_success(&mut self, rtt_ms: u32, caps: Option<PeerCapabilities>) {
+        self.last_seen = SystemTime::now();
+        self.last_attempt = Some(SystemTime::now());
+        self.stats.success_count = self.stats.success_count.saturating_add(1);
+
+        // Update RTT with exponential moving average (alpha = 0.125)
+        if self.stats.avg_rtt_ms == 0 {
+            self.stats.avg_rtt_ms = rtt_ms;
+            self.stats.min_rtt_ms = rtt_ms;
+            self.stats.max_rtt_ms = rtt_ms;
+        } else {
+            self.stats.avg_rtt_ms = (self.stats.avg_rtt_ms * 7 + rtt_ms) / 8;
+            self.stats.min_rtt_ms = self.stats.min_rtt_ms.min(rtt_ms);
+            self.stats.max_rtt_ms = self.stats.max_rtt_ms.max(rtt_ms);
+        }
+
+        if let Some(caps) = caps {
+            self.capabilities = caps;
+        }
+    }
+
+    /// Record a failed connection attempt
+    pub fn record_failure(&mut self) {
+        self.last_attempt = Some(SystemTime::now());
+        self.stats.failure_count = self.stats.failure_count.saturating_add(1);
+    }
+
+    /// Calculate quality score based on metrics
+    pub fn calculate_quality(&mut self, weights: &super::config::QualityWeights) {
+        let total_attempts = self.stats.success_count + self.stats.failure_count;
+
+        // Success rate component (0.0 to 1.0)
+        let success_rate = if total_attempts > 0 {
+            self.stats.success_count as f64 / total_attempts as f64
+        } else {
+            0.5 // Neutral for untested peers
+        };
+
+        // RTT component (lower is better, normalized to 0.0-1.0)
+        // 50ms = 1.0, 500ms = 0.5, 1000ms+ = 0.0
+        let rtt_score = if self.stats.avg_rtt_ms > 0 {
+            1.0 - (self.stats.avg_rtt_ms as f64 / 1000.0).min(1.0)
+        } else {
+            0.5 // Neutral for unknown RTT
+        };
+
+        // Freshness component (exponential decay with 24-hour half-life)
+        let age_secs = self
+            .last_seen
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .ok()
+            .and_then(|last_seen_epoch| {
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .ok()
+                    .map(|now_epoch| {
+                        now_epoch
+                            .as_secs()
+                            .saturating_sub(last_seen_epoch.as_secs())
+                    })
+            })
+            .unwrap_or(0) as f64;
+
+        // Half-life of 24 hours = decay constant ln(2)/86400
+        let freshness = (-age_secs * 0.693 / 86400.0).exp();
+
+        // Capability bonuses
+        let mut cap_bonus: f64 = 0.0;
+        if self.capabilities.supports_relay {
+            cap_bonus += 0.25;
+        }
+        if self.capabilities.supports_coordination {
+            cap_bonus += 0.25;
+        }
+        if self.capabilities.supports_dual_stack() {
+            cap_bonus += 0.2; // Dual-stack relays are valuable for bridging
+        }
+        if matches!(
+            self.capabilities.nat_type,
+            Some(NatType::None) | Some(NatType::FullCone)
+        ) {
+            cap_bonus += 0.3; // Easy to connect
+        }
+        let cap_score = cap_bonus.min(1.0);
+
+        // Weighted combination
+        self.quality_score = (success_rate * weights.success_rate
+            + rtt_score * weights.rtt
+            + freshness * weights.freshness
+            + cap_score * weights.capabilities)
+            .clamp(0.0, 1.0);
+    }
+
+    /// Check if this peer is stale
+    pub fn is_stale(&self, threshold: Duration) -> bool {
+        self.last_seen
+            .elapsed()
+            .map(|age| age > threshold)
+            .unwrap_or(true)
+    }
+
+    /// Get success rate
+    pub fn success_rate(&self) -> f64 {
+        let total = self.stats.success_count + self.stats.failure_count;
+        if total == 0 {
+            0.5
+        } else {
+            self.stats.success_count as f64 / total as f64
+        }
+    }
+
+    /// Merge addresses from another peer entry
+    pub fn merge_addresses(&mut self, other: &CachedPeer) {
+        for addr in &other.addresses {
+            if !self.addresses.contains(addr) {
+                self.addresses.push(*addr);
+            }
+        }
+        // Keep reasonable limit
+        if self.addresses.len() > 10 {
+            self.addresses.truncate(10);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
+    #[test]
+    fn test_cached_peer_new() {
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+
+        assert_eq!(peer.primary_address, addr);
+        assert_eq!(peer.addresses.len(), 1);
+        assert_eq!(peer.source, PeerSource::Seed);
+        assert!((peer.quality_score - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_record_success() {
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
+
+        peer.record_success(100, None);
+        assert_eq!(peer.stats.success_count, 1);
+        assert_eq!(peer.stats.avg_rtt_ms, 100);
+        assert_eq!(peer.stats.min_rtt_ms, 100);
+        assert_eq!(peer.stats.max_rtt_ms, 100);
+
+        peer.record_success(200, None);
+        assert_eq!(peer.stats.success_count, 2);
+        // EMA: (100*7 + 200) / 8 = 112
+        assert_eq!(peer.stats.avg_rtt_ms, 112);
+        assert_eq!(peer.stats.min_rtt_ms, 100);
+        assert_eq!(peer.stats.max_rtt_ms, 200);
+    }
+
+    #[test]
+    fn test_record_failure() {
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
+
+        peer.record_failure();
+        assert_eq!(peer.stats.failure_count, 1);
+        assert!(peer.last_attempt.is_some());
+    }
+
+    #[test]
+    fn test_success_rate() {
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
+
+        // No attempts = 0.5
+        assert!((peer.success_rate() - 0.5).abs() < f64::EPSILON);
+
+        peer.record_success(100, None);
+        assert!((peer.success_rate() - 1.0).abs() < f64::EPSILON);
+
+        peer.record_failure();
+        assert!((peer.success_rate() - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_quality_calculation() {
+        let weights = super::super::config::QualityWeights::default();
+        let mut peer = CachedPeer::new(test_addr(), vec![test_addr()], PeerSource::Seed);
+
+        // Initial quality should be moderate (untested peer)
+        peer.calculate_quality(&weights);
+        assert!(peer.quality_score > 0.3 && peer.quality_score < 0.7);
+
+        // Good performance should increase quality
+        for _ in 0..5 {
+            peer.record_success(50, None); // Low RTT
+        }
+        peer.calculate_quality(&weights);
+        assert!(peer.quality_score > 0.6);
+    }
+
+    #[test]
+    fn test_peer_serialization() {
+        let addr = test_addr();
+        let peer = CachedPeer::new(addr, vec![addr], PeerSource::Seed);
+
+        let json = serde_json::to_string(&peer).unwrap();
+        let deserialized: CachedPeer = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.primary_address, peer.primary_address);
+        assert_eq!(deserialized.addresses, peer.addresses);
+        assert_eq!(deserialized.source, peer.source);
+    }
+
+    #[test]
+    fn test_peer_capabilities_dual_stack() {
+        let mut caps = PeerCapabilities::default();
+
+        // Default - no addresses
+        assert!(!caps.supports_dual_stack());
+        assert!(!caps.has_ipv4());
+        assert!(!caps.has_ipv6());
+
+        // Add IPv4 only
+        caps.external_addresses
+            .push("127.0.0.1:9000".parse().unwrap());
+        assert!(!caps.supports_dual_stack());
+        assert!(caps.has_ipv4());
+        assert!(!caps.has_ipv6());
+
+        // Add IPv6 - now dual-stack
+        caps.external_addresses.push("[::1]:9001".parse().unwrap());
+        assert!(caps.supports_dual_stack());
+        assert!(caps.has_ipv4());
+        assert!(caps.has_ipv6());
+    }
+
+    #[test]
+    fn test_peer_capabilities_ipv6_only() {
+        let mut caps = PeerCapabilities::default();
+        caps.external_addresses.push("[::1]:9000".parse().unwrap());
+        caps.external_addresses.push("[::1]:9001".parse().unwrap());
+
+        assert!(!caps.supports_dual_stack());
+        assert!(!caps.has_ipv4());
+        assert!(caps.has_ipv6());
+    }
+
+    #[test]
+    fn test_peer_capabilities_can_bridge() {
+        let mut caps = PeerCapabilities::default();
+        caps.external_addresses
+            .push("127.0.0.1:9000".parse().unwrap());
+        caps.external_addresses.push("[::1]:9001".parse().unwrap());
+
+        let v4_src: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let v4_dst: SocketAddr = "192.168.1.2:2000".parse().unwrap();
+        let v6_src: SocketAddr = "[2001:db8::1]:1000".parse().unwrap();
+        let v6_dst: SocketAddr = "[2001:db8::2]:2000".parse().unwrap();
+
+        // Same version - always OK
+        assert!(caps.can_bridge(&v4_src, &v4_dst));
+        assert!(caps.can_bridge(&v6_src, &v6_dst));
+
+        // Cross version - OK for dual-stack
+        assert!(caps.can_bridge(&v4_src, &v6_dst));
+        assert!(caps.can_bridge(&v6_src, &v4_dst));
+    }
+
+    #[test]
+    fn test_peer_capabilities_cannot_bridge_ipv4_only() {
+        let mut caps = PeerCapabilities::default();
+        caps.external_addresses
+            .push("127.0.0.1:9000".parse().unwrap());
+
+        let v4_addr: SocketAddr = "192.168.1.1:1000".parse().unwrap();
+        let v6_addr: SocketAddr = "[2001:db8::1]:1000".parse().unwrap();
+
+        // Same version - OK
+        assert!(caps.can_bridge(&v4_addr, &v4_addr));
+
+        // Cross version - NOT OK for IPv4-only
+        assert!(!caps.can_bridge(&v4_addr, &v6_addr));
+        assert!(!caps.can_bridge(&v6_addr, &v4_addr));
+    }
+
+    #[test]
+    fn test_addresses_by_version() {
+        let mut caps = PeerCapabilities::default();
+        caps.external_addresses
+            .push("127.0.0.1:9000".parse().unwrap());
+        caps.external_addresses
+            .push("10.0.0.1:9001".parse().unwrap());
+        caps.external_addresses.push("[::1]:9002".parse().unwrap());
+
+        let v4_addrs = caps.addresses_by_version(true);
+        assert_eq!(v4_addrs.len(), 2);
+
+        let v6_addrs = caps.addresses_by_version(false);
+        assert_eq!(v6_addrs.len(), 1);
+    }
+}

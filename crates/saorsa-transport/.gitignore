@@ -1,0 +1,57 @@
+# Build artifacts
+**/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+.zed/
+.DS_Store
+
+# Test artifacts
+cargo-test-*
+*.log
+*_output.txt
+test-results.json
+server_addr.tmp
+
+# Coverage
+tarpaulin-report.html
+coverage/
+
+# Claude Code
+.claude/
+
+# GitHub Actions local runner
+.act-cache/
+act-logs/
+
+# Build artifacts
+release-build/
+release-artifacts/
+frame_test
+multi_node_test
+platform_test
+
+# Temporary files
+tmp/
+*.tmp
+*.bak
+
+# Old config files (removed from repo)
+compliance_report/
+results/
+docker/
+
+# Temporary files
+temp_clones/
+dave
+*_issues_*.json
+issues.txt
+prs.txt
+
+# Planning files
+.planning/
+
+# Proptest regressions
+*.proptest-regressions

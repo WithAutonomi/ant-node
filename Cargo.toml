@@ -1,3 +1,12 @@
+[workspace]
+members = [
+    ".",
+    "crates/saorsa-core",
+    "crates/saorsa-transport",
+    "crates/saorsa-transport/saorsa-transport-workspace-hack",
+]
+resolver = "2"
+
 [package]
 name = "ant-node"
 version = "0.10.0-rc.1"
@@ -24,7 +33,7 @@ path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.22.0"
+saorsa-core = { path = "crates/saorsa-core" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment

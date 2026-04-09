@@ -1,0 +1,21 @@
+[profile.default]
+test-timeout = "120s"
+slow-timeout = { period = "30s", terminate-after = 3 }
+retries = 1
+fail-fast = false
+status-level = "failures-only"
+
+[[profile.default.overrides]]
+binary = "identity_management_test"
+test-timeout = "180s"
+slow-timeout = { period = "45s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+binary = "multi_device_tests"
+test-timeout = "600s"
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[[profile.default.overrides]]
+binary = "full_network_simulation"
+test-timeout = "420s"
+slow-timeout = { period = "60s", terminate-after = 3 }

@@ -1,0 +1,78 @@
+[package]
+name = "saorsa-core"
+# 0.10.3: postcard serialization migration (PR #14)
+# 0.10.4: refocus on phonebook + trust signals, remove user-facing APIs (PR #15)
+# 0.11.0: remove feature gates — adaptive/trust/placement always compiled
+# 0.11.1: fix Kademlia protocol violations in iterative lookups
+# 0.12.0: configurable max_message_size, bump saorsa-transport to 0.22.0
+# 0.12.1: patch release
+# 0.13.0: multi-channel transport, PeerId ownership, BLAKE3 migration (PR #32)
+# 0.14.0: user-agent DHT gating — exclude ephemeral clients from DHT routing table
+# 0.14.1: fix deterministic identity generation to use real ML-DSA keypairs
+# 0.15.0: routing table single-source-of-truth fixes
+# 0.16.0: delegate transport addressing to saorsa-transport's TransportAddr (PR #39)
+# 0.17.0: remove configuration system, streamline network setup
+# 0.17.1: keep logging macros crate-internal, strip from public API
+# 0.17.2: bump saorsa-transport to 0.27
+# 0.18.0: harden send_message reconnect logic
+# 0.18.1: enforce address invariants in KBucket::add_node
+# 0.19.0: NAT traversal timeouts, dual-stack normalisation, connection reliability
+# 0.20.0: simplify IP diversity, stale-peer fixes, cache atomicity improvements
+# 0.21.0: penalty-only trust model, distance-sorted lookup candidates, stale docs cleanup
+# 0.22.0: MASQUE relay data plane, upgrade saorsa-transport to 0.31.0
+version = "0.22.0"
+edition = "2024"
+authors = ["Saorsa Labs Limited <david@saorsalabs.com>"]
+license = "AGPL-3.0"
+homepage = "https://github.com/dirvine/saorsa-core-foundation"
+repository = "https://github.com/dirvine/saorsa-core-foundation"
+description = "Saorsa - Core P2P networking library with DHT, QUIC transport, and post-quantum cryptography"
+keywords = ["p2p", "networking", "dht", "quic", "decentralized"]
+categories = ["network-programming", "asynchronous", "cryptography"]
+readme = "README.md"
+documentation = "https://docs.rs/saorsa-core"
+
+# Docs.rs configuration to handle build script issues
+[package.metadata.docs.rs]
+no-default-features = false
+default-target = "x86_64-unknown-linux-gnu"
+
+[dependencies]
+# Core async and serialization
+tokio = { version = "1.49", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+thiserror = "2.0"
+tracing = "0.1"
+uuid = { version = "1.14", features = ["v4", "serde"] }
+bytes = "1.10"
+hex = "0.4"
+
+# Cryptography - Primary source of truth: saorsa-pqc
+saorsa-pqc = "0.5"
+rand = "0.8"
+blake3 = "1.6"
+
+# Performance optimization
+parking_lot = "0.12"
+once_cell = "1.21"
+
+# Networking
+saorsa-transport = { path = "../saorsa-transport" }
+
+# Core-specific dependencies
+dirs = "6.0"
+postcard = { version = "1.1.3", features = ["use-std"] }
+lru = "0.16"
+tempfile = "3.17"
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Fix wyz 0.5.0 compatibility issue with tap 1.0 (CI build failure)
+wyz = "=0.5.1"
+
+
+[dev-dependencies]
+tempfile = "3.17"

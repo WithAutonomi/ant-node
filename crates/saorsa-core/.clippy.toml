@@ -1,0 +1,13 @@
+# Clippy configuration aligned with repo policy
+
+# Tests may use unwrap/expect/panic for clarity and speed
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+
+# Pedantic is not required to be zero; CI enforces only critical lints via flags
+
+# Reasonable thresholds for noise control
+cognitive-complexity-threshold = 30
+too-many-arguments-threshold = 10
+type-complexity-threshold = 250
