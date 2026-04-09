@@ -10,10 +10,6 @@
 //! This module provides production-ready network interface enumeration and monitoring
 //! for Windows platforms using the IP Helper API and Windows Sockets API.
 
-// Many Windows API imports are only used inside tracing/logging macros which
-// compile to no-ops when the `logging` feature is disabled.
-#![allow(unused_imports)]
-
 use std::{
     collections::HashMap,
     ffi::{CStr, OsString, c_char},

@@ -10,8 +10,6 @@
 //! This module implements network interface discovery for Windows using the
 //! IP Helper API. It provides comprehensive error handling and interface caching.
 
-#![allow(unused_imports)]
-
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};

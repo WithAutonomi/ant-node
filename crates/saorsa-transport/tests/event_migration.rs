@@ -76,6 +76,7 @@ fn test_peer_connected_event_construction_udp() {
         addr: TransportAddr::Udp(socket_addr),
         public_key: Some(test_public_key.clone()),
         side: saorsa_transport::Side::Client,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     // Verify we can destructure it correctly
@@ -83,6 +84,7 @@ fn test_peer_connected_event_construction_udp() {
         addr,
         public_key,
         side,
+        ..
     } = event
     {
         assert_eq!(public_key.unwrap(), test_public_key);
@@ -128,6 +130,7 @@ fn test_event_clone_for_broadcast() {
         addr: TransportAddr::Udp(socket_addr),
         public_key: Some(vec![0xaa; 32]),
         side: saorsa_transport::Side::Server,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     // Clone is required for broadcast channel
@@ -140,11 +143,13 @@ fn test_event_clone_for_broadcast() {
                 addr: a1,
                 public_key: pk1,
                 side: s1,
+                ..
             },
             P2pEvent::PeerConnected {
                 addr: a2,
                 public_key: pk2,
                 side: s2,
+                ..
             },
         ) => {
             assert_eq!(pk1, pk2);
@@ -166,6 +171,7 @@ fn test_multi_transport_events() {
         addr: TransportAddr::Udp(udp_addr),
         public_key: Some(vec![0x01; 32]),
         side: saorsa_transport::Side::Client,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     // BLE event
@@ -176,6 +182,7 @@ fn test_multi_transport_events() {
         },
         public_key: Some(vec![0x02; 32]),
         side: saorsa_transport::Side::Server,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     // Verify we can distinguish between them
@@ -202,6 +209,7 @@ fn test_transport_aware_event_handling() {
             addr: TransportAddr::Udp("10.0.0.1:8080".parse().expect("valid")),
             public_key: Some(vec![0x01; 32]),
             side: saorsa_transport::Side::Client,
+            traversal_method: saorsa_transport::TraversalMethod::Direct,
         },
         P2pEvent::PeerConnected {
             addr: TransportAddr::Ble {
@@ -210,6 +218,7 @@ fn test_transport_aware_event_handling() {
             },
             public_key: Some(vec![0x02; 32]),
             side: saorsa_transport::Side::Server,
+            traversal_method: saorsa_transport::TraversalMethod::Direct,
         },
         P2pEvent::ExternalAddressDiscovered {
             addr: TransportAddr::Udp("203.0.113.1:9000".parse().expect("valid")),
@@ -248,6 +257,7 @@ fn test_backward_compatibility_with_as_socket_addr() {
         addr: TransportAddr::Udp(socket_addr),
         public_key: Some(vec![0xff; 32]),
         side: saorsa_transport::Side::Client,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     // Simulate legacy code that expects SocketAddr
@@ -291,6 +301,7 @@ fn test_event_debug_formatting() {
         addr: TransportAddr::Udp("192.168.0.100:9001".parse().expect("valid")),
         public_key: Some(vec![0x55; 32]),
         side: saorsa_transport::Side::Client,
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
     };
 
     let debug = format!("{:?}", event);

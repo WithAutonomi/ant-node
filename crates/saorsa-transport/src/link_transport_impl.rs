@@ -489,14 +489,26 @@ impl P2pLinkTransport {
                         P2pEvent::PeerConnected {
                             addr,
                             public_key,
-                            side: _,
+                            side,
+                            traversal_method,
                         } => {
                             // Extract SocketAddr (currently UDP-only)
                             let socket_addr = addr.as_socket_addr().unwrap_or_else(|| {
                                 // Fallback for non-UDP transports - use unspecified address
                                 SocketAddr::from(([0, 0, 0, 0], 0))
                             });
-                            let caps = Capabilities::new_connected(socket_addr);
+                            let mut caps = Capabilities::new_connected(socket_addr);
+                            // Only promote relay/coordinator when we connected to
+                            // them directly (Client side), proving they accept
+                            // inbound connections. A peer that connected to us
+                            // (Server side) only proves they can make outbound
+                            // connections, not that they are reachable by others.
+                            if traversal_method.is_direct() && side.is_client() {
+                                caps.supports_relay = true;
+                                caps.supports_coordination = true;
+                                caps.direct_reachability_scope =
+                                    crate::reachability::socket_addr_scope(socket_addr);
+                            }
                             // Update capabilities cache keyed by address
                             if let Ok(mut state) = state.write() {
                                 state.capabilities.insert(socket_addr, caps.clone());
@@ -537,6 +549,9 @@ impl P2pLinkTransport {
                             if let Ok(mut state) = state.write() {
                                 if let Some(caps) = state.capabilities.get_mut(&socket_addr) {
                                     caps.is_connected = false;
+                                    caps.supports_relay = false;
+                                    caps.supports_coordination = false;
+                                    caps.direct_reachability_scope = None;
                                 }
                             }
                             Some(LinkEvent::PeerDisconnected {

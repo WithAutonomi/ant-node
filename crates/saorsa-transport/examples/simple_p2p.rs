@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
                     addr,
                     public_key,
                     side,
+                    ..
                 } => {
                     println!(
                         "Connected to peer at {} (side: {:?}, has key: {})",

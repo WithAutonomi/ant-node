@@ -39,6 +39,7 @@
 //! automatically enables saorsa-transport's prometheus metrics collection.
 
 use crate::error::{GeoRejectionError, GeographicConfig};
+use crate::quantum_crypto::saorsa_transport_integration::{MlDsaPublicKey, MlDsaSecretKey};
 use crate::transport::observed_address_cache::ObservedAddressCache;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -188,16 +189,30 @@ impl P2PNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        Self::new_with_options(bind_addr, max_connections, max_msg_size, false).await
+        Self::new_with_options(bind_addr, max_connections, max_msg_size, false, None).await
     }
 
     /// Create a new P2P network node with full control over connection
-    /// limits, message size, and loopback address acceptance.
+    /// limits, message size, loopback acceptance, and TLS keypair injection.
+    ///
+    /// When `keypair` is `Some`, the supplied ML-DSA-65 keypair is installed
+    /// as the transport's TLS identity, so the SPKI carried in every QUIC
+    /// handshake authenticates the same peer ID that signs application
+    /// messages. saorsa-core threads its `NodeIdentity` keys through here so
+    /// the lifecycle monitor can derive the app-level peer ID directly from
+    /// the TLS-handshake bytes — no separate identity-announce protocol is
+    /// required.
+    ///
+    /// When `keypair` is `None`, saorsa-transport generates a fresh keypair
+    /// internally; the resulting peer ID will not match anything stored in
+    /// saorsa-core, so this branch is only suitable for tests that don't
+    /// cross the identity boundary.
     pub async fn new_with_options(
         bind_addr: SocketAddr,
         max_connections: usize,
         max_msg_size: Option<usize>,
         allow_loopback: bool,
+        keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     ) -> Result<Self> {
         let mut builder = P2pConfig::builder()
             .bind_addr(bind_addr)
@@ -212,6 +227,9 @@ impl P2PNetworkNode<P2pLinkTransport> {
                 allow_loopback: true,
                 ..NatConfig::default()
             });
+        }
+        if let Some((public_key, secret_key)) = keypair {
+            builder = builder.keypair(public_key, secret_key);
         }
         let config = builder
             .build()
@@ -856,18 +874,30 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         }
     }
 
-    /// Set a preferred coordinator for hole-punching to a specific target.
-    /// The preferred coordinator is a peer that referred us to the target
-    /// during a DHT lookup, so it has a connection to the target.
-    pub async fn set_hole_punch_preferred_coordinator(
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// The list is iterated front to back at hole-punch time: every
+    /// coordinator except the last gets a short per-attempt timeout
+    /// (~1.5s) so a busy or unreachable referrer is abandoned quickly,
+    /// and the final coordinator gets the strategy's full hole-punch
+    /// timeout to give it time to actually complete the punch.
+    ///
+    /// The caller (`DhtNetworkManager::dial_candidate`) is expected to
+    /// rank the list best-first using DHT signals — round observed,
+    /// trust score, etc. — via [`DhtNetworkManager::rank_referrers`].
+    ///
+    /// Empty `coordinators` removes any preferred coordinators for
+    /// `target`.
+    pub async fn set_hole_punch_preferred_coordinators(
         &self,
         target: SocketAddr,
-        coordinator: SocketAddr,
+        coordinators: Vec<SocketAddr>,
     ) {
         for node in [&self.v6, &self.v4].into_iter().flatten() {
             node.transport
                 .endpoint()
-                .set_hole_punch_preferred_coordinator(target, coordinator)
+                .set_hole_punch_preferred_coordinators(target, coordinators.clone())
                 .await;
         }
     }
@@ -1063,17 +1093,22 @@ impl DualStackNetworkNode<P2pLinkTransport> {
         max_connections: usize,
         max_msg_size: Option<usize>,
     ) -> Result<Self> {
-        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false).await
+        Self::new_with_options(v6_addr, v4_addr, max_connections, max_msg_size, false, None).await
     }
 
     /// Create dual nodes with full control over connection limits, message
-    /// size, and loopback address acceptance.
+    /// size, loopback acceptance, and TLS keypair injection.
+    ///
+    /// When `keypair` is `Some`, both stacks share the same ML-DSA-65
+    /// identity, so the SPKI carried in every QUIC handshake authenticates
+    /// the same peer ID regardless of which stack the connection arrived on.
     pub async fn new_with_options(
         v6_addr: Option<SocketAddr>,
         v4_addr: Option<SocketAddr>,
         max_connections: usize,
         max_msg_size: Option<usize>,
         allow_loopback: bool,
+        keypair: Option<(MlDsaPublicKey, MlDsaSecretKey)>,
     ) -> Result<Self> {
         let v6 = if let Some(addr) = v6_addr {
             Some(
@@ -1082,6 +1117,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                     max_connections,
                     max_msg_size,
                     allow_loopback,
+                    keypair.clone(),
                 )
                 .await?,
             )
@@ -1094,6 +1130,7 @@ impl DualStackNetworkNode<P2pLinkTransport> {
                 max_connections,
                 max_msg_size,
                 allow_loopback,
+                keypair.clone(),
             )
             .await
             {

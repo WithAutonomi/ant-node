@@ -132,17 +132,17 @@ const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 25;
 /// Number of cached bootstrap peers to retrieve.
 const BOOTSTRAP_PEER_BATCH_SIZE: usize = 20;
 
-/// Timeout in seconds for waiting on a bootstrap peer's identity exchange.
+/// Defensive upper bound on the wait for a bootstrap peer's
+/// TLS-authenticated identity to be registered after `connect_peer`.
 ///
-/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. On a LAN this completes in
-/// well under a second; on congested cellular or cross-region links it can
-/// blow past 5s with retransmits. The previous 5s default fired
-/// spuriously on slow networks during testnet validation, forcing
-/// reconnect loops that masqueraded as NAT traversal failures, so we
-/// budget enough headroom for two QUIC handshake retries on a high-latency
-/// link.
-const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 15;
+/// Since identity is now derived synchronously from the TLS-handshake
+/// SPKI inside the connection lifecycle monitor, the typical wait is a
+/// scheduler tick. This timeout only fires if the lifecycle monitor is
+/// wedged (e.g. broadcast lag) or the peer presented an SPKI that fails
+/// the saorsa-pqc parse — both cases that should be loud test failures
+/// rather than silent stalls. 2 s is generous and still well below any
+/// outer caller timeout, so this constant exists purely as a safety net.
+const BOOTSTRAP_IDENTITY_TIMEOUT_SECS: u64 = 2;
 
 /// Serde helper — returns `true`.
 const fn default_true() -> bool {

@@ -168,6 +168,9 @@ pub mod node_status;
 /// Unified events for P2P nodes
 pub mod node_event;
 
+/// Reachability scope and traversal metadata shared across APIs
+pub mod reachability;
+
 // Core implementation modules
 /// Configuration structures and validation
 pub mod config;
@@ -200,8 +203,8 @@ pub mod tracing;
 /// Best-effort UPnP IGD port mapping for NAT traversal assistance.
 ///
 /// This module is feature-gated behind `upnp` (enabled by default). When
-/// disabled, [`UpnpMappingService`](upnp::UpnpMappingService) is still present but is a no-op stub
-/// that always reports [`UpnpState::Unavailable`](upnp::UpnpState::Unavailable).
+/// disabled, [`upnp::UpnpMappingService`] is still present but is a no-op stub
+/// that always reports [`upnp::UpnpState::Unavailable`].
 pub mod upnp;
 
 // Public modules with new structure
@@ -333,6 +336,7 @@ pub use nat_traversal_api::{
     BootstrapNode, CandidateAddress, NatTraversalConfig, NatTraversalEndpoint, NatTraversalError,
     NatTraversalEvent, NatTraversalStatistics,
 };
+pub use reachability::{ReachabilityScope, TraversalMethod};
 
 // ============================================================================
 // SIMPLE API EXPORTS - Zero Configuration P2P (RECOMMENDED)
@@ -348,7 +352,7 @@ pub use node_config::{NodeConfig, NodeConfigBuilder};
 pub use node_status::{NatType, NodeStatus};
 
 /// Unified events for P2P nodes
-pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent, TraversalMethod};
+pub use node_event::{DisconnectReason as NodeDisconnectReason, NodeEvent};
 
 // ============================================================================
 // P2P API EXPORTS (for advanced use)

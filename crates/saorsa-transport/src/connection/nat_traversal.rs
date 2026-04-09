@@ -481,7 +481,7 @@ impl SecurityValidationState {
             max_candidates_per_window: 20, // Max 20 candidates per 60 seconds
             rate_window: Duration::from_secs(60),
             coordination_requests: VecDeque::new(),
-            max_coordination_per_window: 50, // Max 50 coordination requests per 60 seconds
+            max_coordination_per_window: 300, // Max 300 coordination requests per 60 seconds
             address_validation_cache: HashMap::new(),
             validation_cache_timeout: Duration::from_secs(300), // 5 minute cache
             allow_loopback,
@@ -3603,11 +3603,19 @@ struct ObservedPeer {
     observed_addr: SocketAddr,
 }
 
+/// How long a coordination entry is kept before being reaped. Coordination
+/// should complete within a few seconds; 60 s is a generous upper bound.
+const COORDINATION_ENTRY_TTL: Duration = Duration::from_secs(60);
+
 /// Minimal coordination record linking two peers for a round
 #[derive(Debug, Clone)]
 struct CoordinationEntry {
     peer_b: Option<PeerId>,
     address_hint: SocketAddr,
+    /// When this entry was created (used for expiry).
+    created_at: Instant,
+    /// Set to `true` once the response/echo path has been reached.
+    completed: bool,
 }
 /// Record of observed peer information
 #[derive(Debug, Clone)]
@@ -3871,20 +3879,27 @@ impl BootstrapCoordinator {
             }
         }
 
+        // Periodic housekeeping: reap stale / completed entries so the
+        // table cannot grow without bound.
+        self.cleanup_expired_sessions(now);
+        self.cleanup_completed_sessions(now);
+
         // Track coordination entry minimally
-        let _entry = self
+        let entry = self
             .coordination_table
             .entry(frame.round)
             .or_insert(CoordinationEntry {
                 peer_b: frame.target_peer_id,
                 address_hint: frame.address,
+                created_at: now,
+                completed: false,
             });
         // Update target if provided later
         if let Some(peer_b) = frame.target_peer_id {
-            if _entry.peer_b.is_none() {
-                _entry.peer_b = Some(peer_b);
+            if entry.peer_b.is_none() {
+                entry.peer_b = Some(peer_b);
             }
-            _entry.address_hint = frame.address;
+            entry.address_hint = frame.address;
         }
 
         // If we have a target, echo back with swapped target to coordinate
@@ -3898,7 +3913,8 @@ impl BootstrapCoordinator {
             self.stats.total_coordinations += 1;
             Ok(Some(coordination_frame))
         } else {
-            // Response path: increment success metric
+            // Response path: mark entry completed and increment success metric
+            entry.completed = true;
             self.stats.successful_coordinations += 1;
             Ok(None)
         }
@@ -3909,8 +3925,11 @@ impl BootstrapCoordinator {
 
     // Perform comprehensive security validation for coordination requests (legacy removed)
 
-    #[allow(dead_code)]
-    pub(crate) fn cleanup_expired_sessions(&mut self, _now: Instant) {}
+    /// Remove coordination entries that have exceeded the TTL.
+    pub(crate) fn cleanup_expired_sessions(&mut self, now: Instant) {
+        self.coordination_table
+            .retain(|_round, entry| now.duration_since(entry.created_at) < COORDINATION_ENTRY_TTL);
+    }
 
     // Get bootstrap statistics (legacy removed)
 
@@ -3925,8 +3944,12 @@ impl BootstrapCoordinator {
     // Check if a session should advance its state (legacy removed)
     // Advance session state based on event (legacy removed)
 
-    #[allow(dead_code)]
-    fn cleanup_completed_sessions(&mut self, _now: Instant) {}
+    /// Remove coordination entries that have already completed (response
+    /// path reached). Called opportunistically so the table stays compact.
+    fn cleanup_completed_sessions(&mut self, _now: Instant) {
+        self.coordination_table
+            .retain(|_round, entry| !entry.completed);
+    }
 
     // Legacy retry mechanism removed
 

@@ -713,6 +713,7 @@ async fn handle_event(
             addr,
             public_key: _,
             side,
+            traversal_method: _,
         } => {
             let direction = if side.is_client() {
                 "outbound"

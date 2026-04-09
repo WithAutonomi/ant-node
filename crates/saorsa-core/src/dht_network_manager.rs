@@ -29,12 +29,13 @@ use crate::{
     network::NodeConfig,
 };
 use anyhow::Context as _;
+use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::{RwLock, Semaphore, broadcast, oneshot};
+use tokio::sync::{Notify, RwLock, Semaphore, broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
@@ -60,18 +61,16 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The local node is always considered fully reliable for its own lookups.
 const SELF_RELIABILITY_SCORE: f64 = 1.0;
 
-/// Maximum time to wait for the identity-exchange handshake after dialling
-/// a peer. The actual timeout is `min(request_timeout, this)`.
+/// Defensive upper bound on the wait for a freshly-dialled peer's
+/// TLS-authenticated identity to be registered.
 ///
-/// Identity exchange is two RTTs over a freshly-handshaken QUIC connection
-/// plus an ML-DSA-65 signature verification. On a LAN this completes in
-/// well under a second; on congested cellular or cross-region links it can
-/// blow past 5s with retransmits. Kept in lockstep with
-/// `BOOTSTRAP_IDENTITY_TIMEOUT_SECS` in `network.rs` — both budgets exist
-/// to absorb the same slow-link failure mode (the bootstrap variant covers
-/// the initial join, this one covers every subsequent peer dial via
-/// `send_dht_request`).
-const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Since identity is now derived synchronously from the TLS-handshake
+/// SPKI by the connection lifecycle monitor, this wait completes within
+/// a scheduler tick of `connect_peer` returning. The 2 s budget exists
+/// only as a safety net for the lifecycle monitor being wedged or the
+/// peer presenting an unparseable SPKI. The effective wait remains
+/// `min(request_timeout, this)`.
+const IDENTITY_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum time to wait for a stale peer's ping response during admission contention.
 const STALE_REVALIDATION_TIMEOUT: Duration = Duration::from_secs(1);
@@ -96,6 +95,20 @@ const BUCKET_REFRESH_INTERVAL: Duration = Duration::from_secs(600); // 10 minute
 
 /// Routing table size below which automatic re-bootstrap is triggered.
 const AUTO_REBOOTSTRAP_THRESHOLD: usize = 3;
+
+/// Maximum number of distinct referrers stored per discovered peer during an
+/// iterative DHT lookup. The list is ranked at dial-time to pick the best
+/// hole-punch coordinator candidate (see [`DhtNetworkManager::rank_referrers_for_target`]).
+///
+/// Bound exists to cap per-lookup memory; in practice 4 is more than enough
+/// because Kademlia typically converges before any peer is referred more than
+/// 2-3 times within a single lookup. Compile-time asserted >= 2 because
+/// collecting only one referrer would defeat the purpose of ranking.
+const MAX_REFERRERS_PER_TARGET: usize = 4;
+const _: () = assert!(
+    MAX_REFERRERS_PER_TARGET >= 2,
+    "MAX_REFERRERS_PER_TARGET must be >= 2 for ranking to matter"
+);
 
 /// Minimum time between consecutive auto re-bootstrap attempts.
 const REBOOTSTRAP_COOLDOWN: Duration = Duration::from_secs(300); // 5 minutes
@@ -261,6 +274,44 @@ pub struct DhtNetworkManager {
     /// Timestamp of the last automatic re-bootstrap attempt, guarded by a
     /// cooldown to avoid hammering bootstrap peers during transient churn.
     last_rebootstrap: tokio::sync::Mutex<Option<Instant>>,
+    /// Per-peer dial coalescing.
+    ///
+    /// When [`Self::send_dht_request`] needs to dial a peer that no other
+    /// task is already dialling, it inserts a fresh `Notify` here and runs
+    /// the dial inline. Concurrent callers targeting the same peer find an
+    /// existing entry, await `notified()`, and then re-check whether the
+    /// peer is now connected. This prevents N parallel iterative lookups
+    /// from each kicking off their own coordinator-rotation cascade against
+    /// the same peer — under symmetric NAT that cascade is what produced
+    /// the "duplicate" connection-close storm during identity exchange.
+    ///
+    /// Entries are removed by the dialing task as soon as the dial returns
+    /// (success or failure), so the map only ever holds peers that have a
+    /// dial actively in progress.
+    inflight_dials: Arc<DashMap<PeerId, Arc<Notify>>>,
+}
+
+/// One observation of a peer being referred during an iterative DHT lookup.
+///
+/// When peer R answers a `FindNode` query and returns peer T, R becomes a
+/// referrer for T: R has T in its routing table and presumably has (or
+/// recently had) a connection to T, making R a good candidate to coordinate
+/// hole-punching to T.
+///
+/// During a single iterative lookup we collect up to
+/// [`MAX_REFERRERS_PER_TARGET`] referrers per discovered peer and rank them
+/// at dial-time via [`DhtNetworkManager::rank_referrers_for_target`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReferrerInfo {
+    /// Peer ID of the referring node (used for trust score lookup and tiebreak).
+    peer_id: PeerId,
+    /// Dialable socket address of the referring node — what we hand to
+    /// saorsa-transport as the preferred coordinator.
+    addr: SocketAddr,
+    /// 0-based iteration round in which this referral was observed.
+    /// Higher round = closer to the lookup target in XOR space = more likely
+    /// to actually have a live connection to the target.
+    round_observed: u32,
 }
 
 /// DHT operation context
@@ -372,6 +423,29 @@ impl Drop for BucketRevalidationGuard {
     }
 }
 
+/// RAII guard for the dial-coalescing slot owned by a single
+/// [`DhtNetworkManager::dial_or_await_inflight`] caller.
+///
+/// On drop the inflight entry is removed and `notify_waiters()` is called,
+/// so any concurrent callers awaiting on `notified()` are unblocked even if
+/// the owning caller's dial future panicked or was cancelled. Without this
+/// guard, a panic inside `dial_addresses` would leave waiters blocked
+/// indefinitely, because they have no timeout of their own.
+struct InflightDialGuard {
+    inflight: Arc<DashMap<PeerId, Arc<Notify>>>,
+    peer_id: PeerId,
+    notify: Arc<Notify>,
+}
+
+impl Drop for InflightDialGuard {
+    fn drop(&mut self) {
+        // Remove the inflight entry first so any waiter that re-enters
+        // `dial_or_await_inflight` after waking sees a clean state.
+        self.inflight.remove(&self.peer_id);
+        self.notify.notify_waiters();
+    }
+}
+
 impl DhtNetworkManager {
     fn new_from_components(
         transport: Arc<crate::transport_handle::TransportHandle>,
@@ -418,6 +492,7 @@ impl DhtNetworkManager {
             self_lookup_handle: Arc::new(RwLock::new(None)),
             bucket_refresh_handle: Arc::new(RwLock::new(None)),
             last_rebootstrap: tokio::sync::Mutex::new(None),
+            inflight_dials: Arc::new(DashMap::new()),
         })
     }
 
@@ -599,7 +674,7 @@ impl DhtNetworkManager {
                                 if dht_node.peer_id == this.config.peer_id {
                                     continue;
                                 }
-                                this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                                this.dial_addresses(&dht_node.peer_id, &dht_node.addresses, &[])
                                     .await;
                             }
                         }
@@ -634,8 +709,10 @@ impl DhtNetworkManager {
                     }
                     // Dial if not already connected — try every advertised
                     // address, not just the first, so a stale NAT binding on
-                    // one entry doesn't kill the dial.
-                    self.dial_addresses(&dht_node.peer_id, &dht_node.addresses, None)
+                    // one entry doesn't kill the dial. Routed through the
+                    // coalescing helper so a concurrent self-lookup and
+                    // send_dht_request to the same peer share one dial.
+                    self.dial_or_await_inflight(&dht_node.peer_id, &dht_node.addresses, &[])
                         .await;
                 }
                 Ok(())
@@ -714,29 +791,80 @@ impl DhtNetworkManager {
         min + jitter
     }
 
+    /// Return `[0, len)` in a per-call shuffled order using a Fisher-Yates
+    /// pass driven by [`PeerId::random()`] entropy.
+    ///
+    /// Used to randomise the order in which we visit a fixed input slice
+    /// (e.g. the bootstrap peer list in [`Self::bootstrap_from_peers`]) so
+    /// that across a fleet of nodes the load on any individual element of
+    /// the input is statistically uniform rather than concentrated on
+    /// `input[0]`.
+    ///
+    /// For `len <= 1` this returns a trivial unshuffled vector — there is
+    /// nothing to randomise. The entropy source is not cryptographically
+    /// secure but is more than sufficient for load distribution.
+    fn shuffled_indices(len: usize) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..len).collect();
+        if len <= 1 {
+            return indices;
+        }
+        // Build a 32-byte entropy buffer per call. PeerId::random() gives us
+        // 32 bytes, which covers ~16 two-byte swap decisions — well above
+        // the bootstrap-list sizes we expect (typically 2-5).
+        let entropy_owner = PeerId::random();
+        let entropy = entropy_owner.to_bytes();
+        let entropy_len = entropy.len();
+        // Fisher-Yates: for i from len-1 down to 1, swap indices[i] with
+        // indices[j] where j is uniform in [0, i].
+        for i in (1..len).rev() {
+            // Draw a 16-bit window (two bytes) instead of one byte. With a
+            // single byte the modulo bias `byte % (i + 1)` slightly
+            // over-represents low values whenever `(i + 1)` does not
+            // divide 256 — at i = 4 the bias on slot 0 is ~0.4%, which is
+            // exactly the opposite of the load-spreading goal. A 16-bit
+            // window cuts the bias to ~1/65536 for any realistic list
+            // size at zero added complexity.
+            let idx = (len - 1 - i) * 2;
+            let byte = ((entropy[idx % entropy_len] as usize) << 8)
+                | (entropy[(idx + 1) % entropy_len] as usize);
+            let j = byte % (i + 1);
+            indices.swap(i, j);
+        }
+        indices
+    }
+
     /// Perform DHT peer discovery from already-connected bootstrap peers.
     ///
     /// Sends FIND_NODE(self) to each peer using the DHT postcard protocol,
     /// then dials any newly-discovered candidates. Returns the total number
     /// of new peers discovered.
+    ///
+    /// **Coordinator selection note**: previously this function pinned the
+    /// bootstrap peer's socket address as the preferred hole-punch
+    /// coordinator for every peer it returned. That concentrated load on
+    /// the small handful of bootstrap nodes (since every cold-starting node
+    /// queried the same ones). The pinning is removed: subsequent
+    /// iterative DHT lookups via `find_closest_nodes_network` collect
+    /// referrers across multiple rounds and rank them via
+    /// [`Self::rank_referrers_for_target`], naturally de-preferring round-0
+    /// bootstrap referrers as the routing table grows.
+    ///
+    /// **Iteration order**: bootstrap peers are visited in a per-call
+    /// shuffled order (PeerId-derived entropy) so that in a fleet of N
+    /// nodes with M bootstrap peers, each bootstrap is the "first asked"
+    /// by ~N/M peers rather than all N hitting `peers[0]`.
     pub async fn bootstrap_from_peers(&self, peers: &[PeerId]) -> Result<usize> {
         let key = *self.config.peer_id.as_bytes();
         let mut seen = HashSet::new();
-        for peer_id in peers {
-            // Resolve the bootstrap peer's socket address so we can set it as
-            // the preferred coordinator for any peers it returns. The bootstrap
-            // peer has connections to those peers, making it a good relay.
-            let bootstrap_addr = self
-                .peer_addresses_for_dial(peer_id)
-                .await
-                .first()
-                .and_then(|a| a.dialable_socket_addr());
-
-            // The bootstrap peer is the natural NAT-traversal referrer for
-            // every node it returns: it has a live connection to us (we just
-            // queried it) and presumably also to the nodes it tells us about.
-            // Passing its socket address as the preferred coordinator lets
-            // hole-punch PUNCH_ME_NOW be relayed through it.
+        let visit_order = Self::shuffled_indices(peers.len());
+        for &idx in &visit_order {
+            // `shuffled_indices(peers.len())` is guaranteed to return values
+            // in `[0, peers.len())`, so this `.get()` always succeeds. We
+            // use `.get()` rather than direct indexing to keep this code
+            // panic-free even if the contract changes in future.
+            let Some(peer_id) = peers.get(idx) else {
+                continue;
+            };
             let op = DhtNetworkOperation::FindNode { key };
             match self.send_dht_request(peer_id, op, None).await {
                 Ok(DhtNetworkResult::NodesFound { nodes, .. }) => {
@@ -749,7 +877,13 @@ impl DhtNetworkManager {
                             dialable.len()
                         );
                         if seen.insert(node.peer_id) && !dialable.is_empty() {
-                            self.dial_addresses(&node.peer_id, &node.addresses, bootstrap_addr)
+                            // Pass an empty referrer list: the bootstrap
+                            // peer is no longer hard-pinned as the
+                            // hole-punch coordinator for these freshly-
+                            // discovered peers. The next iterative lookup
+                            // will populate proper referrers via the
+                            // round-aware ranking.
+                            self.dial_or_await_inflight(&node.peer_id, &node.addresses, &[])
                                 .await;
                         }
                     }
@@ -971,12 +1105,18 @@ impl DhtNetworkManager {
         let target_key = DhtKey::from_bytes(*key);
         let mut queried_nodes: HashSet<PeerId> = HashSet::new();
         let mut best_nodes: Vec<DHTNode> = Vec::new();
-        // Track which peer referred us to each discovered peer. When node A
-        // responds to FindNode with node B, node A has B in its routing table
-        // and has a connection to B. We use A as the preferred coordinator
-        // when hole-punching to B.
-        let mut referrers: std::collections::HashMap<PeerId, std::net::SocketAddr> =
-            std::collections::HashMap::new();
+        // Track every peer that referred us to each discovered peer. When
+        // node R responds to FindNode with node T, R has T in its routing
+        // table and presumably has a connection to T — making R a candidate
+        // hole-punch coordinator for T.
+        //
+        // We collect up to MAX_REFERRERS_PER_TARGET observations and rank
+        // them at dial-time via `rank_referrers_for_target`. The ranking prefers
+        // referrers seen in later iteration rounds (closer to the target in
+        // XOR space) over earlier rounds, which naturally de-prefers the
+        // round-0 bootstrap referrers without any explicit bootstrap
+        // tagging.
+        let mut referrers: HashMap<PeerId, Vec<ReferrerInfo>> = HashMap::new();
 
         // Kademlia correctness: the local node must compete on distance in the
         // final K-closest result, but we must never send an RPC to ourselves.
@@ -1050,15 +1190,26 @@ impl DhtNetworkManager {
                 .map(|node| {
                     let peer_id = node.peer_id;
                     let addresses = node.addresses.clone();
-                    let referrer = referrers.get(&peer_id).copied();
+                    // Build the full ranked list of preferred coordinators
+                    // for this target. saorsa-transport rotates through
+                    // them in order with a short per-attempt timeout for
+                    // all but the final candidate, so handing over the
+                    // full list (instead of just the best) lets the
+                    // hole-punch loop fall through busy or unreachable
+                    // referrers without waiting on the strategy timeout.
+                    let referrer_list =
+                        self.rank_referrers_for_target(referrers.get(&peer_id).map(Vec::as_slice));
                     let op = DhtNetworkOperation::FindNode { key: *key };
                     async move {
                         // Try every dialable address, not just the first.
                         // If at least one succeeds the peer is connected and
                         // `send_dht_request` will reuse that channel; if all
                         // fail, `send_dht_request`'s own fallback will retry
-                        // with the routing-table addresses.
-                        self.dial_addresses(&peer_id, &addresses, referrer).await;
+                        // with the routing-table addresses. The coalescing
+                        // helper ensures the parallel iterative-lookup batch
+                        // shares one dial per peer rather than racing.
+                        self.dial_or_await_inflight(&peer_id, &addresses, &referrer_list)
+                            .await;
                         let address_hint = Self::first_dialable_address(&addresses);
                         (
                             peer_id,
@@ -1081,7 +1232,7 @@ impl DhtNetworkManager {
                             best_nodes.push(queried_node.clone());
                         }
 
-                        // Track this peer as the referrer for all nodes it returned.
+                        // Track this peer as a referrer for all nodes it returned.
                         let referrer_addr = batch
                             .iter()
                             .find(|n| n.peer_id == peer_id)
@@ -1099,18 +1250,32 @@ impl DhtNetworkManager {
                             {
                                 continue;
                             }
-                            // Record the referrer (first referrer wins)
-                            if let Some(ref_addr) = referrer_addr
-                                && let std::collections::hash_map::Entry::Vacant(e) =
-                                    referrers.entry(node.peer_id)
-                            {
-                                info!(
-                                    "find_closest_nodes_network: peer {} referred by {} ({})",
-                                    hex::encode(&node.peer_id.to_bytes()[..8]),
-                                    hex::encode(&peer_id.to_bytes()[..8]),
-                                    ref_addr
+                            // Append this referrer to the candidate list for
+                            // the discovered peer. We keep up to
+                            // MAX_REFERRERS_PER_TARGET observations and rank
+                            // them at dial-time, so we no longer pin the
+                            // first-seen referrer.
+                            //
+                            // When the slot table is full, we still want to
+                            // accept a *strictly later round* observation by
+                            // evicting the lowest-round entry. Otherwise a
+                            // burst of round-0 referrers (e.g. several
+                            // bootstraps all returning the same hot peer)
+                            // would lock out the higher-round referrers we
+                            // actually prefer at dial-time, defeating the
+                            // round-aware ranking in exactly the case we
+                            // care about.
+                            if let Some(ref_addr) = referrer_addr {
+                                let entry = referrers.entry(node.peer_id).or_default();
+                                Self::merge_referrer_observation(
+                                    entry,
+                                    ReferrerInfo {
+                                        peer_id,
+                                        addr: ref_addr,
+                                        round_observed: iteration as u32,
+                                    },
+                                    &node.peer_id,
                                 );
-                                e.insert(ref_addr);
                             }
                             let dist = node.peer_id.distance(&target_key);
                             let cand_key = (dist, node.peer_id);
@@ -1344,6 +1509,145 @@ impl DhtNetworkManager {
         Self::dialable_addresses(addresses).into_iter().next()
     }
 
+    /// Rank a slice of referrer observations into an ordered list of
+    /// hole-punch coordinator addresses, best-first, using this manager's
+    /// [`TrustEngine`] (or default neutral trust when none is configured).
+    ///
+    /// Thin wrapper around the pure function [`Self::rank_referrers`] —
+    /// see that for the actual ranking logic. The returned `Vec` is what
+    /// gets handed to
+    /// [`crate::transport::saorsa_transport_adapter::SaorsaDualStackTransport::set_hole_punch_preferred_coordinators`]
+    /// so the transport's hole-punch loop can rotate through coordinators
+    /// in order.
+    fn rank_referrers_for_target(&self, referrers: Option<&[ReferrerInfo]>) -> Vec<SocketAddr> {
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            self.trust_engine
+                .as_ref()
+                .map(|engine| engine.score(peer_id))
+                .unwrap_or(DEFAULT_NEUTRAL_TRUST)
+        };
+        Self::rank_referrers(referrers, trust_for)
+    }
+
+    /// Pure ranking function that sorts a slice of referrer observations
+    /// into a best-first list of coordinator addresses.
+    ///
+    /// Ranking (highest priority first):
+    /// 1. **`round_observed` DESC** — referrers seen in later iteration
+    ///    rounds are by XOR-distance closer to the lookup target and so
+    ///    much more likely to actually have a live connection to it. This
+    ///    naturally de-prefers round-0 bootstrap referrers without any
+    ///    explicit bootstrap tagging, which is exactly the load-shedding
+    ///    behaviour we want.
+    /// 2. **trust score DESC** — when two referrers were observed in the
+    ///    same round, prefer the one with the higher trust score returned
+    ///    by `trust_for`.
+    /// 3. **deterministic hash tiebreak** — when round and trust both tie,
+    ///    prefer the referrer whose `peer_id` byte 0 is **larger**. Using
+    ///    a pure peer-id ordering instead of a random RNG keeps the choice
+    ///    reproducible across runs (useful for tests) while still
+    ///    spreading load across coordinators because different targets
+    ///    see different referrer sets.
+    ///
+    /// Returns an empty `Vec` when the slice is empty or `None` itself,
+    /// so the caller can pass-through directly to
+    /// `set_hole_punch_preferred_coordinators` (which treats an empty
+    /// list as "remove the entry").
+    ///
+    /// Pure function (no `&self`) so it can be unit-tested without
+    /// constructing a full [`DhtNetworkManager`].
+    fn rank_referrers(
+        referrers: Option<&[ReferrerInfo]>,
+        trust_for: impl Fn(&PeerId) -> f64,
+    ) -> Vec<SocketAddr> {
+        let Some(list) = referrers else {
+            return Vec::new();
+        };
+        if list.is_empty() {
+            return Vec::new();
+        }
+
+        // Pre-compute trust scores once per referrer so the comparator
+        // doesn't re-invoke the closure repeatedly during sort.
+        let mut scored: Vec<(f64, &ReferrerInfo)> =
+            list.iter().map(|r| (trust_for(&r.peer_id), r)).collect();
+
+        scored.sort_by(|a, b| {
+            // Primary: higher round wins → reverse so DESC sort.
+            b.1.round_observed
+                .cmp(&a.1.round_observed)
+                // Secondary: higher trust wins (total_cmp sidesteps NaN
+                // issues — score is bounded but total_cmp is safe
+                // regardless). Reverse for DESC.
+                .then_with(|| b.0.total_cmp(&a.0))
+                // Tertiary: deterministic tiebreak — larger peer_id
+                // byte 0 wins. Reverse for DESC.
+                .then_with(|| b.1.peer_id.to_bytes()[0].cmp(&a.1.peer_id.to_bytes()[0]))
+        });
+
+        scored.into_iter().map(|(_, r)| r.addr).collect()
+    }
+
+    /// Merge a single referrer observation into the per-target slot table,
+    /// preserving the round-aware ranking invariant.
+    ///
+    /// Behaviour:
+    /// - Duplicate referrer (same `peer_id` already present): no-op.
+    /// - Slot table not yet full: append.
+    /// - Slot table full AND `new.round_observed` is strictly greater than
+    ///   the current minimum round in the table: evict the lowest-round
+    ///   entry and replace it with `new`.
+    /// - Slot table full AND `new.round_observed <= min(table.rounds)`:
+    ///   drop `new` (it would lose the dial-time ranking against every
+    ///   existing entry anyway).
+    ///
+    /// The eviction path exists so that a burst of round-0 referrers (e.g.
+    /// every bootstrap returning the same hot peer in the first DHT round)
+    /// cannot lock out the higher-round referrers we actually prefer at
+    /// dial-time. Without this, the slot cap silently degrades the
+    /// round-aware ranking in exactly the case the PR is targeting.
+    ///
+    /// Pure function (no `&self`) so it can be unit-tested directly.
+    fn merge_referrer_observation(
+        entry: &mut Vec<ReferrerInfo>,
+        new: ReferrerInfo,
+        target_peer_id: &PeerId,
+    ) {
+        if entry.iter().any(|r| r.peer_id == new.peer_id) {
+            return;
+        }
+        if entry.len() < MAX_REFERRERS_PER_TARGET {
+            info!(
+                "find_closest_nodes_network: peer {} referred by {} ({}) round {}",
+                hex::encode(&target_peer_id.to_bytes()[..8]),
+                hex::encode(&new.peer_id.to_bytes()[..8]),
+                new.addr,
+                new.round_observed,
+            );
+            entry.push(new);
+            return;
+        }
+        // Slot full — evict the lowest-round entry only if `new` is
+        // strictly later.
+        if let Some((min_idx, min_referrer)) = entry
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, r)| r.round_observed)
+            && min_referrer.round_observed < new.round_observed
+        {
+            info!(
+                "find_closest_nodes_network: peer {} referrer slot full — evicting round {} entry ({}) for round {} entry from {} ({})",
+                hex::encode(&target_peer_id.to_bytes()[..8]),
+                min_referrer.round_observed,
+                min_referrer.addr,
+                new.round_observed,
+                hex::encode(&new.peer_id.to_bytes()[..8]),
+                new.addr,
+            );
+            entry[min_idx] = new;
+        }
+    }
+
     /// Try dialing each dialable address in `addresses` in order until one
     /// succeeds. Returns the channel ID of the first successful dial, or
     /// `None` if every address was rejected, failed, or timed out.
@@ -1358,7 +1662,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         addresses: &[MultiAddr],
-        referrer: Option<SocketAddr>,
+        referrers: &[SocketAddr],
     ) -> Option<String> {
         let dialable = Self::dialable_addresses(addresses);
         if dialable.is_empty() {
@@ -1369,7 +1673,7 @@ impl DhtNetworkManager {
             return None;
         }
         for addr in &dialable {
-            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrer).await {
+            if let Some(channel_id) = self.dial_candidate(peer_id, addr, referrers).await {
                 return Some(channel_id);
             }
         }
@@ -1387,6 +1691,112 @@ impl DhtNetworkManager {
                 peer_id,
                 crate::adaptive::NodeStatisticsUpdate::FailedResponse,
             );
+        }
+    }
+
+    /// Dial coalescing: ensure at most one in-flight `dial_addresses` per
+    /// `peer_id` across all concurrent `send_dht_request` calls.
+    ///
+    /// # Outcome shape
+    ///
+    /// Returns `Ok(Some(channel_id))` when this call (or a coalesced
+    /// predecessor) successfully established a channel to `peer_id`.
+    /// Returns `Ok(None)` when the dial attempt completed without yielding
+    /// a usable channel (the peer is unreachable on every candidate
+    /// address). Returns `Err` only if the underlying transport call panics
+    /// out of the dial future — the dial path itself swallows individual
+    /// connect errors and surfaces them as `Ok(None)`.
+    ///
+    /// # Coalescing semantics
+    ///
+    /// 1. The first caller to a peer inserts a fresh `Notify` into
+    ///    `inflight_dials`, runs the dial inline, removes the entry, and
+    ///    finally calls `notify_waiters()` to wake every secondary caller
+    ///    blocked on the same peer.
+    /// 2. Secondary callers find an existing entry, await `notified()`
+    ///    *before* re-checking, and then ask the transport whether the
+    ///    peer is now connected. They do **not** receive the channel_id
+    ///    from the first caller — saorsa-transport's connection map is the
+    ///    canonical source, and querying it after the wake handles every
+    ///    success path uniformly (direct connect, hole-punch, relay).
+    /// 3. If the first caller fails, secondary callers see no live
+    ///    connection after their re-check and propagate the same `None`
+    ///    result rather than starting their own racing dial. They will
+    ///    retry on the *next* `send_dht_request` call, which is the right
+    ///    granularity for backoff.
+    ///
+    /// This eliminates the racing-dial cascade that previously caused N
+    /// concurrent DHT lookups against the same peer to each issue their
+    /// own coordinator-rotation pass, producing the "duplicate connection"
+    /// close storm under symmetric NAT.
+    async fn dial_or_await_inflight(
+        &self,
+        peer_id: &PeerId,
+        addresses: &[MultiAddr],
+        referrers: &[SocketAddr],
+    ) -> Option<String> {
+        // Fast path: peer is already connected — no dial needed.
+        if self.transport.is_peer_connected(peer_id).await {
+            return self
+                .transport
+                .channels_for_peer(peer_id)
+                .await
+                .into_iter()
+                .next();
+        }
+
+        // Try to claim the dial slot for this peer. The DashMap entry API
+        // is the single point of mutual exclusion: exactly one caller
+        // observes `Vacant` and proceeds to dial; everyone else observes
+        // `Occupied` and falls into the wait branch below.
+        enum Slot {
+            Owner(Arc<Notify>),
+            Waiter(Arc<Notify>),
+        }
+        let slot = match self.inflight_dials.entry(*peer_id) {
+            dashmap::mapref::entry::Entry::Vacant(v) => {
+                let notify = Arc::new(Notify::new());
+                v.insert(Arc::clone(&notify));
+                Slot::Owner(notify)
+            }
+            dashmap::mapref::entry::Entry::Occupied(o) => Slot::Waiter(Arc::clone(o.get())),
+        };
+
+        match slot {
+            Slot::Owner(notify) => {
+                // RAII guard ensures the inflight entry is removed and
+                // waiters are notified even if `dial_addresses` panics or
+                // the future is cancelled. Without this, a panic in the
+                // dial path would leave waiters blocked on `notified()`
+                // forever, since they have no timeout of their own.
+                let _guard = InflightDialGuard {
+                    inflight: Arc::clone(&self.inflight_dials),
+                    peer_id: *peer_id,
+                    notify: Arc::clone(&notify),
+                };
+                self.dial_addresses(peer_id, addresses, referrers).await
+            }
+            Slot::Waiter(notify) => {
+                debug!(
+                    peer = %peer_id.to_hex(),
+                    "Dial coalescing: awaiting in-flight dial",
+                );
+                notify.notified().await;
+                // The owning caller's dial has finished. If it succeeded,
+                // the peer is now connected and we can pick up its channel
+                // from the transport. If it failed, we return None and let
+                // the caller surface the failure exactly as it would have
+                // for a direct dial.
+                if self.transport.is_peer_connected(peer_id).await {
+                    self.transport
+                        .channels_for_peer(peer_id)
+                        .await
+                        .into_iter()
+                        .next()
+                } else {
+                    None
+                }
+            }
         }
     }
 
@@ -1521,7 +1931,7 @@ impl DhtNetworkManager {
                 candidate_addresses.len()
             );
             if let Some(channel_id) = self
-                .dial_addresses(peer_id, &candidate_addresses, None)
+                .dial_or_await_inflight(peer_id, &candidate_addresses, &[])
                 .await
             {
                 let identity_timeout = self.config.request_timeout.min(IDENTITY_EXCHANGE_TIMEOUT);
@@ -1682,7 +2092,7 @@ impl DhtNetworkManager {
         &self,
         peer_id: &PeerId,
         address: &MultiAddr,
-        referrer: Option<std::net::SocketAddr>,
+        referrers: &[std::net::SocketAddr],
     ) -> Option<String> {
         let peer_hex = peer_id.to_hex();
 
@@ -1714,18 +2124,23 @@ impl DhtNetworkManager {
                 .await;
         }
 
-        // If we know which peer referred us to this target (from a DHT
-        // FindNode response), set it as the preferred coordinator for
-        // hole-punching. That peer has a connection to the target.
-        if let Some(coordinator_addr) = referrer
-            && let Some(socket_addr) = address.dialable_socket_addr()
-        {
+        // Hand the full ranked list of referrers to saorsa-transport so its
+        // hole-punch loop can rotate through them in order. The first
+        // `K - 1` get a short per-attempt timeout (~1.5s) so a busy or
+        // unreachable referrer is abandoned quickly; the final entry gets
+        // the strategy's full hole-punch timeout to give it time to
+        // actually complete the punch. An empty list removes any prior
+        // preference for this target — see
+        // [`Self::rank_referrers_for_target`].
+        if let Some(socket_addr) = address.dialable_socket_addr() {
             info!(
-                "dial_candidate: setting preferred coordinator for {} = {} (DHT referrer)",
-                socket_addr, coordinator_addr
+                "dial_candidate: setting {} preferred coordinator(s) for {} (DHT referrers): {:?}",
+                referrers.len(),
+                socket_addr,
+                referrers
             );
             self.transport
-                .set_hole_punch_preferred_coordinator(socket_addr, coordinator_addr)
+                .set_hole_punch_preferred_coordinators(socket_addr, referrers.to_vec())
                 .await;
         }
 
@@ -2188,6 +2603,23 @@ impl DhtNetworkManager {
     /// only fires after identity verification.
     async fn handle_peer_connected(&self, node_id: PeerId, user_agent: &str) {
         let app_peer_id_hex = node_id.to_hex();
+
+        // The first `PeerConnected` event for a peer is emitted by the
+        // lifecycle monitor at TLS-handshake time, when the peer's identity
+        // is known but no signed application message has arrived yet — so
+        // its user-agent string is empty. Routing-table classification
+        // requires `is_dht_participant(user_agent)`, which would
+        // misclassify every peer as ephemeral on this first call. Defer
+        // until the shard consumer re-emits `PeerConnected` with the
+        // user-agent extracted from the first signed message (typically a
+        // DHT ping or find_node within one round trip of the handshake).
+        if user_agent.is_empty() {
+            debug!(
+                "DHT peer connected (TLS handshake): app_id={} — deferring routing classification until user_agent learned",
+                app_peer_id_hex
+            );
+            return;
+        }
 
         info!(
             "DHT peer connected: app_id={}, user_agent={}",
@@ -2904,6 +3336,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inflight_dial_guard_releases_slot_and_wakes_waiters_on_drop() {
+        // Verify the InflightDialGuard's RAII semantics: dropping the
+        // guard (which happens whether the owning future returns
+        // normally, panics, or is cancelled) must remove the inflight
+        // entry AND wake every blocked waiter. Without this, a panic in
+        // the dial path would leave secondary callers blocked on
+        // `notified()` forever.
+        let inflight: Arc<DashMap<PeerId, Arc<Notify>>> = Arc::new(DashMap::new());
+        let peer = PeerId::random();
+        let notify = Arc::new(Notify::new());
+        inflight.insert(peer, Arc::clone(&notify));
+
+        let waiter_inflight = Arc::clone(&inflight);
+        let waiter_notify = Arc::clone(&notify);
+        let waiter = tokio::spawn(async move {
+            waiter_notify.notified().await;
+            // After the wake, the entry must be gone so the waiter that
+            // re-enters the dial path sees a clean state.
+            assert!(
+                !waiter_inflight.contains_key(&peer),
+                "inflight entry should be removed before notify_waiters fires",
+            );
+        });
+
+        // Give the waiter task a chance to register with the Notify.
+        tokio::task::yield_now().await;
+
+        // Drop the guard — this is what `dial_or_await_inflight`'s Owner
+        // branch does on every exit path (success, error, panic, cancel).
+        let guard = InflightDialGuard {
+            inflight: Arc::clone(&inflight),
+            peer_id: peer,
+            notify: Arc::clone(&notify),
+        };
+        drop(guard);
+
+        // The waiter should wake immediately and complete its assertion.
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter must wake within 1s of guard drop")
+            .expect("waiter task should not panic");
+
+        assert!(
+            !inflight.contains_key(&peer),
+            "guard drop must remove the inflight entry",
+        );
+    }
+
     #[test]
     fn test_peer_rejected_response_message_preserves_request_payload() {
         let request = DhtNetworkMessage {
@@ -2943,6 +3424,321 @@ mod tests {
         assert!(
             matches!(decoded.payload, DhtNetworkOperation::Ping),
             "response should echo the request's Ping payload"
+        );
+    }
+
+    // ---- Tier 1.2 + 1.4: hole-punch coordinator selection ----
+
+    /// Helper: build a [`ReferrerInfo`] with a deterministic peer_id whose
+    /// byte 0 is set to `tag`. The remaining bytes come from
+    /// [`PeerId::random()`] so the IDs collide on byte 0 but stay
+    /// otherwise unique.
+    fn make_referrer(tag: u8, addr_octet: u8, round: u32) -> ReferrerInfo {
+        let mut bytes = *PeerId::random().to_bytes();
+        bytes[0] = tag;
+        ReferrerInfo {
+            peer_id: PeerId::from_bytes(bytes),
+            addr: SocketAddr::from(([10, 0, 0, addr_octet], 9000)),
+            round_observed: round,
+        }
+    }
+
+    fn neutral_trust(_: &PeerId) -> f64 {
+        DEFAULT_NEUTRAL_TRUST
+    }
+
+    #[test]
+    fn rank_referrers_returns_empty_for_empty_or_missing() {
+        assert!(
+            DhtNetworkManager::rank_referrers(None, neutral_trust).is_empty(),
+            "None input must yield an empty list"
+        );
+        assert!(
+            DhtNetworkManager::rank_referrers(Some(&[]), neutral_trust).is_empty(),
+            "empty slice must yield an empty list"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_single_referrer_returned() {
+        let only = make_referrer(0x01, 1, 0);
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[only]), neutral_trust);
+        assert_eq!(ranked, vec![only.addr]);
+    }
+
+    #[test]
+    fn rank_referrers_prefers_later_round_over_earlier() {
+        // Round 0 (bootstrap-equivalent) vs round 3 (deep iteration).
+        // Round 3 must come first regardless of input order or trust.
+        let round_zero = make_referrer(0xFF, 1, 0);
+        let round_three = make_referrer(0x01, 2, 3);
+
+        let ranked_a =
+            DhtNetworkManager::rank_referrers(Some(&[round_zero, round_three]), neutral_trust);
+        let ranked_b =
+            DhtNetworkManager::rank_referrers(Some(&[round_three, round_zero]), neutral_trust);
+
+        assert_eq!(
+            ranked_a,
+            vec![round_three.addr, round_zero.addr],
+            "later round must come first regardless of input order"
+        );
+        assert_eq!(
+            ranked_b,
+            vec![round_three.addr, round_zero.addr],
+            "later round must come first regardless of input order (reversed)"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_tiebreaks_round_with_trust() {
+        // Same round, different trust. Higher-trust comes first.
+        let low_trust = make_referrer(0x55, 1, 2);
+        let high_trust = make_referrer(0xAA, 2, 2);
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            if peer_id.to_bytes()[0] == 0xAA {
+                0.95
+            } else {
+                0.10
+            }
+        };
+
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[low_trust, high_trust]), trust_for);
+        assert_eq!(
+            ranked,
+            vec![high_trust.addr, low_trust.addr],
+            "higher trust must come first when rounds tie"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_tiebreaks_round_and_trust_with_peer_id_byte_zero() {
+        // Same round, same (neutral) trust. The referrer with the larger
+        // byte-0 comes first deterministically.
+        let small = make_referrer(0x01, 1, 1);
+        let large = make_referrer(0xF0, 2, 1);
+
+        let ranked_a = DhtNetworkManager::rank_referrers(Some(&[small, large]), neutral_trust);
+        let ranked_b = DhtNetworkManager::rank_referrers(Some(&[large, small]), neutral_trust);
+
+        assert_eq!(
+            ranked_a,
+            vec![large.addr, small.addr],
+            "larger peer_id byte 0 must come first via tertiary tiebreak"
+        );
+        assert_eq!(
+            ranked_b,
+            vec![large.addr, small.addr],
+            "tiebreak must be order-independent"
+        );
+    }
+
+    #[test]
+    fn rank_referrers_full_list_is_sorted_best_first() {
+        // Mixed rounds and trust scores: verify the entire list is sorted
+        // correctly, not just the head.
+        let r0 = make_referrer(0x01, 1, 0); // round 0
+        let r1 = make_referrer(0x02, 2, 1); // round 1
+        let r2_low = make_referrer(0x03, 3, 2); // round 2, low trust
+        let r2_high = make_referrer(0x04, 4, 2); // round 2, high trust
+        let trust_for = |peer_id: &PeerId| -> f64 {
+            if peer_id.to_bytes()[0] == 0x04 {
+                0.9
+            } else {
+                0.5
+            }
+        };
+        let ranked = DhtNetworkManager::rank_referrers(Some(&[r0, r1, r2_low, r2_high]), trust_for);
+        assert_eq!(
+            ranked,
+            vec![r2_high.addr, r2_low.addr, r1.addr, r0.addr],
+            "full list must be sorted (round DESC, trust DESC) end-to-end"
+        );
+    }
+
+    // ---- merge_referrer_observation ----
+
+    fn dummy_target() -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0xCC;
+        PeerId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn merge_referrer_observation_appends_until_full() {
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 0),
+                &target,
+            );
+        }
+        assert_eq!(
+            entry.len(),
+            MAX_REFERRERS_PER_TARGET,
+            "first MAX_REFERRERS_PER_TARGET observations must all land in the slot table"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_drops_duplicate_peer() {
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        let original = make_referrer(0x42, 1, 0);
+        DhtNetworkManager::merge_referrer_observation(&mut entry, original, &target);
+        // True duplicate: identical peer_id, different addr and round.
+        // (`make_referrer` randomises bytes 1..32 per call, so we cannot
+        // produce a duplicate by re-tagging — we have to reuse the
+        // original peer_id directly.)
+        let duplicate = ReferrerInfo {
+            peer_id: original.peer_id,
+            addr: SocketAddr::from(([10, 0, 0, 99], 9000)),
+            round_observed: 5,
+        };
+        DhtNetworkManager::merge_referrer_observation(&mut entry, duplicate, &target);
+        assert_eq!(
+            entry.len(),
+            1,
+            "duplicate referrer (same peer_id) must not consume an additional slot"
+        );
+        assert_eq!(
+            entry[0].addr, original.addr,
+            "duplicate must NOT overwrite — first observation wins for the same peer"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_evicts_lowest_round_when_full_and_new_is_later() {
+        // Fill all 4 slots with round-0 referrers — the worst case the
+        // reviewer flagged: 4+ bootstraps all returning the same hot peer
+        // in round 0 would otherwise lock out later-round referrers.
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 0),
+                &target,
+            );
+        }
+        assert_eq!(entry.len(), MAX_REFERRERS_PER_TARGET);
+        assert!(
+            entry.iter().all(|r| r.round_observed == 0),
+            "all 4 slots should hold round-0 referrers"
+        );
+
+        // A round-3 referrer arrives — must evict one round-0 entry.
+        let later = make_referrer(0xAA, 99, 3);
+        DhtNetworkManager::merge_referrer_observation(&mut entry, later, &target);
+
+        assert_eq!(
+            entry.len(),
+            MAX_REFERRERS_PER_TARGET,
+            "table size must remain at the cap after eviction"
+        );
+        assert!(
+            entry.iter().any(|r| r.peer_id == later.peer_id),
+            "the new round-3 referrer must be present in the slot table"
+        );
+        // Exactly one round-0 entry was evicted, three remain.
+        let round_zero_count = entry.iter().filter(|r| r.round_observed == 0).count();
+        assert_eq!(
+            round_zero_count,
+            MAX_REFERRERS_PER_TARGET - 1,
+            "exactly one round-0 entry must have been evicted"
+        );
+    }
+
+    #[test]
+    fn merge_referrer_observation_does_not_evict_when_new_is_same_or_lower_round() {
+        // Fill all 4 slots with round-2 referrers, then submit a round-2
+        // and a round-0 referrer. Neither should evict — both would tie
+        // or lose against the existing entries at dial-time anyway.
+        let mut entry: Vec<ReferrerInfo> = Vec::new();
+        let target = dummy_target();
+        for i in 0..MAX_REFERRERS_PER_TARGET as u8 {
+            DhtNetworkManager::merge_referrer_observation(
+                &mut entry,
+                make_referrer(0x10 + i, i + 1, 2),
+                &target,
+            );
+        }
+        let snapshot: Vec<ReferrerInfo> = entry.clone();
+
+        // Same-round arrival: must NOT evict (strictly-greater check).
+        DhtNetworkManager::merge_referrer_observation(
+            &mut entry,
+            make_referrer(0x80, 50, 2),
+            &target,
+        );
+        assert_eq!(
+            entry, snapshot,
+            "same-round referrer must not evict the existing slot table"
+        );
+
+        // Earlier-round arrival: must NOT evict.
+        DhtNetworkManager::merge_referrer_observation(
+            &mut entry,
+            make_referrer(0x90, 60, 0),
+            &target,
+        );
+        assert_eq!(
+            entry, snapshot,
+            "lower-round referrer must not evict the existing slot table"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_empty_and_singleton_are_identity() {
+        assert_eq!(
+            DhtNetworkManager::shuffled_indices(0),
+            Vec::<usize>::new(),
+            "len 0 must yield an empty vec"
+        );
+        assert_eq!(
+            DhtNetworkManager::shuffled_indices(1),
+            vec![0],
+            "len 1 must yield [0] unchanged"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_returns_valid_permutation() {
+        // For a wider input, every call must produce a permutation of
+        // [0, len) — same set, possibly different order.
+        const LEN: usize = 10;
+        let result = DhtNetworkManager::shuffled_indices(LEN);
+        assert_eq!(result.len(), LEN, "permutation must have the right length");
+        let mut sorted = result.clone();
+        sorted.sort_unstable();
+        let expected: Vec<usize> = (0..LEN).collect();
+        assert_eq!(
+            sorted, expected,
+            "shuffled output must be a permutation of [0, len)"
+        );
+    }
+
+    #[test]
+    fn shuffled_indices_distributes_across_calls() {
+        // Run many shuffles and assert the position-0 element is not
+        // always the same. With true randomisation across calls, the
+        // probability that 100 calls all return position-0 == 0 for a
+        // 5-element shuffle is negligible.
+        const TRIALS: usize = 100;
+        const LEN: usize = 5;
+        let mut first_positions = std::collections::HashSet::new();
+        for _ in 0..TRIALS {
+            let result = DhtNetworkManager::shuffled_indices(LEN);
+            first_positions.insert(result[0]);
+            if first_positions.len() >= 2 {
+                return; // pass — we observed at least two distinct positions
+            }
+        }
+        panic!(
+            "shuffled_indices(5) returned the same first element across {TRIALS} \
+             calls — entropy source is broken"
         );
     }
 }

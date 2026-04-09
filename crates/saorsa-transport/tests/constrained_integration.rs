@@ -753,6 +753,8 @@ fn test_peer_connection_transport_addr() {
     let peer_conn_udp = PeerConnection {
         public_key: Some(vec![0x11; 32]),
         remote_addr: udp_addr.clone(),
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
+        side: saorsa_transport::Side::Client,
         authenticated: true,
         connected_at: Instant::now(),
         last_activity: Instant::now(),
@@ -771,6 +773,8 @@ fn test_peer_connection_transport_addr() {
     let peer_conn_ble = PeerConnection {
         public_key: None,
         remote_addr: ble_addr.clone(),
+        traversal_method: saorsa_transport::TraversalMethod::Direct,
+        side: saorsa_transport::Side::Client,
         authenticated: false,
         connected_at: Instant::now(),
         last_activity: Instant::now(),

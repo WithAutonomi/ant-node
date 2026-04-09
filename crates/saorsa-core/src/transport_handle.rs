@@ -21,17 +21,19 @@ use crate::MultiAddr;
 use crate::PeerId;
 use crate::bgp_geo_provider::BgpGeoProvider;
 use crate::error::{NetworkError, P2PError, P2pResult as Result};
-use crate::identity::node_identity::NodeIdentity;
+use crate::identity::node_identity::{NodeIdentity, peer_id_from_public_key};
 use crate::network::{
     ConnectionStatus, MAX_ACTIVE_REQUESTS, MAX_REQUEST_TIMEOUT, MESSAGE_RECV_CHANNEL_CAPACITY,
     NetworkSender, P2PEvent, ParsedMessage, PeerInfo, PeerResponse, PendingRequest,
     RequestResponseEnvelope, WireMessage, broadcast_event, normalize_wildcard_to_loopback,
     parse_protocol_message, register_new_channel,
 };
+use crate::quantum_crypto::saorsa_transport_integration::MlDsaPublicKey;
 use crate::transport::observed_address_cache::ObservedAddressCache;
 use crate::transport::saorsa_transport_adapter::{ConnectionEvent, DualStackNetworkNode};
 use crate::validation::{RateLimitConfig, RateLimiter};
 
+use saorsa_transport::crypto::raw_public_keys::extract_public_key_from_spki;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -39,7 +41,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, broadcast};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -51,10 +53,6 @@ const TEST_MAX_REQUESTS: u32 = 100;
 const TEST_BURST_SIZE: u32 = 100;
 const TEST_RATE_LIMIT_WINDOW_SECS: u64 = 1;
 const TEST_CONNECTION_TIMEOUT_SECS: u64 = 30;
-
-/// Internal protocol for automatic identity announcement on connect.
-/// Filtered from P2PEvent::Message emission — not visible to applications.
-const IDENTITY_ANNOUNCE_PROTOCOL: &str = "/saorsa/identity/1.0";
 
 /// Configuration for transport initialization, derived from [`NodeConfig`](crate::network::NodeConfig).
 pub struct TransportConfig {
@@ -150,14 +148,31 @@ pub struct TransportHandle {
     /// Maps app-level [`PeerId`] → set of channel IDs (QUIC, Bluetooth, …).
     ///
     /// A single peer may communicate over multiple channels simultaneously.
+    /// Populated synchronously when a `ConnectionEvent::Established` arrives —
+    /// the peer's identity is derived from the TLS-authenticated SPKI carried
+    /// in the event, so the entry is ready before any application bytes flow.
     peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-    /// Reverse index: channel ID → set of app-level [`PeerId`]s on that channel.
-    channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
-    /// Maps app-level [`PeerId`] → user agent string received during authentication.
+    /// Reverse index: channel ID → authenticated app-level [`PeerId`].
     ///
-    /// Stored so that late subscribers (e.g. DHT manager reconciliation) can look
-    /// up a peer's mode without re-receiving the `PeerConnected` event.
+    /// One channel maps to exactly one peer because TLS authenticates a single
+    /// identity per QUIC connection. The previous `HashSet<PeerId>` shape was
+    /// a vestige of the now-retired identity-announce protocol.
+    channel_to_peer: Arc<RwLock<HashMap<String, PeerId>>>,
+    /// Maps app-level [`PeerId`] → user agent string received from a signed
+    /// application message.
+    ///
+    /// Lazy: TLS doesn't carry a user-agent string, so this map stays empty
+    /// until the first signed wire message from the peer is parsed. Late
+    /// subscribers fall back to "node/unknown" until then.
     peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
+    /// Wakes [`Self::wait_for_peer_identity`] callers whenever a new
+    /// `channel_to_peer` entry is inserted.
+    ///
+    /// `notify_waiters` is broadcast on every insert; callers re-check the map
+    /// after each wake. Inserts happen at the moment a TLS-authenticated
+    /// connection is established, so a waiter typically returns within a few
+    /// scheduler ticks of the underlying QUIC handshake completing.
+    identity_notify: Arc<Notify>,
 }
 
 // ============================================================================
@@ -188,6 +203,12 @@ impl TransportHandle {
             }
         }
 
+        // Install the node's NodeIdentity as the transport's TLS keypair so
+        // the SPKI carried in every QUIC handshake authenticates the same
+        // peer ID that signs application messages. The lifecycle monitor
+        // depends on this equality to register peers synchronously without a
+        // separate identity-announce round trip.
+        let tls_keypair = config.node_identity.clone_keypair();
         let dual_node = Arc::new(
             DualStackNetworkNode::new_with_options(
                 v6_opt,
@@ -195,6 +216,7 @@ impl TransportHandle {
                 config.max_connections,
                 config.max_message_size,
                 config.allow_loopback,
+                Some(tls_keypair),
             )
             .await
             .map_err(|e| {
@@ -230,9 +252,10 @@ impl TransportHandle {
         let connection_event_rx = dual_node.subscribe_connection_events();
 
         let peer_to_channel = Arc::new(RwLock::new(HashMap::new()));
-        let channel_to_peers = Arc::new(RwLock::new(HashMap::new()));
+        let channel_to_peer = Arc::new(RwLock::new(HashMap::new()));
         let peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let identity_notify = Arc::new(Notify::new());
         // (peer_addr_update_tx removed — dedicated forwarder creates its own)
 
         let connection_monitor_handle = {
@@ -243,10 +266,10 @@ impl TransportHandle {
             let geo_provider_clone = Arc::clone(&geo_provider);
             let shutdown_token = shutdown.clone();
             let p2c = Arc::clone(&peer_to_channel);
-            let c2p = Arc::clone(&channel_to_peers);
+            let c2p = Arc::clone(&channel_to_peer);
             let pua = Arc::clone(&peer_user_agents);
-            let identity_clone = config.node_identity.clone();
-            let user_agent_clone = config.user_agent.clone();
+            let notify = Arc::clone(&identity_notify);
+            let self_peer_id = *config.node_identity.peer_id();
 
             let handle = tokio::spawn(async move {
                 Self::connection_lifecycle_monitor_with_rx(
@@ -260,8 +283,8 @@ impl TransportHandle {
                     p2c,
                     c2p,
                     pua,
-                    identity_clone,
-                    user_agent_clone,
+                    notify,
+                    self_peer_id,
                 )
                 .await;
             });
@@ -288,8 +311,9 @@ impl TransportHandle {
             node_identity: config.node_identity,
             user_agent: config.user_agent,
             peer_to_channel,
-            channel_to_peers,
+            channel_to_peer,
             peer_user_agents,
+            identity_notify,
         })
     }
 
@@ -362,8 +386,9 @@ impl TransportHandle {
             node_identity: identity,
             user_agent: crate::network::user_agent_for_mode(crate::network::NodeMode::Node),
             peer_to_channel: Arc::new(RwLock::new(HashMap::new())),
-            channel_to_peers: Arc::new(RwLock::new(HashMap::new())),
+            channel_to_peer: Arc::new(RwLock::new(HashMap::new())),
             peer_user_agents: Arc::new(RwLock::new(HashMap::new())),
+            identity_notify: Arc::new(Notify::new()),
         })
     }
 }
@@ -593,11 +618,11 @@ impl TransportHandle {
 
     /// Look up the peer ID for a given connection address.
     pub async fn peer_id_for_addr(&self, addr: &SocketAddr) -> Option<PeerId> {
-        let c2p = self.channel_to_peers.read().await;
+        let c2p = self.channel_to_peer.read().await;
 
         // Try the exact stringified address first.
         let channel_id = addr.to_string();
-        if let Some(peer_id) = c2p.get(&channel_id).and_then(|p| p.iter().next().copied()) {
+        if let Some(peer_id) = c2p.get(&channel_id).copied() {
             return Some(peer_id);
         }
 
@@ -605,8 +630,7 @@ impl TransportHandle {
         // while the lookup address was normalized to IPv4 ("1.2.3.4:PORT"), or vice versa.
         let alt_addr = saorsa_transport::shared::dual_stack_alternate(addr)?;
         let alt_channel_id = alt_addr.to_string();
-        c2p.get(&alt_channel_id)
-            .and_then(|p| p.iter().next().copied())
+        c2p.get(&alt_channel_id).copied()
     }
 
     /// Drain pending peer address updates from ADD_ADDRESS frames.
@@ -668,14 +692,14 @@ impl TransportHandle {
 
     /// Remove channel mappings for a disconnected channel.
     ///
-    /// Removes the channel from `channel_to_peers` and scrubs it from every
-    /// affected peer's channel set in `peer_to_channel`. When a peer's last
-    /// channel is removed, emits `PeerDisconnected`.
+    /// Removes the channel from `channel_to_peer` and scrubs it from the
+    /// peer's channel set in `peer_to_channel`. When the peer's last channel
+    /// is removed, emits `PeerDisconnected`.
     async fn remove_channel_mappings(&self, channel_id: &str) {
         Self::remove_channel_mappings_static(
             channel_id,
             &self.peer_to_channel,
-            &self.channel_to_peers,
+            &self.channel_to_peer,
             &self.peer_user_agents,
             &self.event_tx,
         )
@@ -687,22 +711,20 @@ impl TransportHandle {
     async fn remove_channel_mappings_static(
         channel_id: &str,
         peer_to_channel: &RwLock<HashMap<PeerId, HashSet<String>>>,
-        channel_to_peers: &RwLock<HashMap<String, HashSet<PeerId>>>,
+        channel_to_peer: &RwLock<HashMap<String, PeerId>>,
         peer_user_agents: &RwLock<HashMap<PeerId, String>>,
         event_tx: &broadcast::Sender<P2PEvent>,
     ) {
         let mut p2c = peer_to_channel.write().await;
-        let mut c2p = channel_to_peers.write().await;
-        if let Some(app_peers) = c2p.remove(channel_id) {
-            for app_peer in &app_peers {
-                if let Some(channels) = p2c.get_mut(app_peer) {
-                    channels.remove(channel_id);
-                    if channels.is_empty() {
-                        p2c.remove(app_peer);
-                        peer_user_agents.write().await.remove(app_peer);
-                        let _ = event_tx.send(P2PEvent::PeerDisconnected(*app_peer));
-                    }
-                }
+        let mut c2p = channel_to_peer.write().await;
+        if let Some(app_peer) = c2p.remove(channel_id)
+            && let Some(channels) = p2c.get_mut(&app_peer)
+        {
+            channels.remove(channel_id);
+            if channels.is_empty() {
+                p2c.remove(&app_peer);
+                peer_user_agents.write().await.remove(&app_peer);
+                let _ = event_tx.send(P2PEvent::PeerDisconnected(app_peer));
             }
         }
     }
@@ -721,16 +743,18 @@ impl TransportHandle {
             .await;
     }
 
-    /// Set a preferred coordinator for hole-punching to a specific target.
-    /// The preferred coordinator is a peer that referred us to the target
-    /// during a DHT lookup, so it has a connection to the target.
-    pub async fn set_hole_punch_preferred_coordinator(
+    /// Set an ordered list of preferred coordinators for hole-punching to a
+    /// specific target.
+    ///
+    /// See [`crate::transport::saorsa_transport_adapter::SaorsaDualStackTransport::set_hole_punch_preferred_coordinators`]
+    /// for the rotation semantics.
+    pub async fn set_hole_punch_preferred_coordinators(
         &self,
         target: SocketAddr,
-        coordinator: SocketAddr,
+        coordinators: Vec<SocketAddr>,
     ) {
         self.dual_node
-            .set_hole_punch_preferred_coordinator(target, coordinator)
+            .set_hole_punch_preferred_coordinators(target, coordinators)
             .await;
     }
 
@@ -831,11 +855,12 @@ impl TransportHandle {
     pub async fn disconnect_peer(&self, peer_id: &PeerId) -> Result<()> {
         info!("Disconnecting from peer: {}", peer_id);
 
-        // Remove this peer from the bidirectional maps, collecting channels
-        // that have no remaining peers and should be closed at QUIC level.
+        // Remove this peer from the bidirectional maps. Each channel maps to
+        // exactly one peer, so removing a peer always orphans all of its
+        // channels — they need to be torn down at the QUIC level too.
         let orphaned_channels = {
             let mut p2c = self.peer_to_channel.write().await;
-            let mut c2p = self.channel_to_peers.write().await;
+            let mut c2p = self.channel_to_peer.write().await;
 
             let channel_ids = match p2c.remove(peer_id) {
                 Some(chs) => chs,
@@ -848,18 +873,10 @@ impl TransportHandle {
                 }
             };
 
-            let mut orphaned = Vec::new();
             for channel_id in &channel_ids {
-                if let Some(peers) = c2p.get_mut(channel_id) {
-                    peers.remove(peer_id);
-                    if peers.is_empty() {
-                        c2p.remove(channel_id);
-                        orphaned.push(channel_id.clone());
-                    }
-                }
+                c2p.remove(channel_id);
             }
-
-            orphaned
+            channel_ids.into_iter().collect::<Vec<_>>()
         };
 
         self.peer_user_agents.write().await.remove(peer_id);
@@ -1083,14 +1100,9 @@ impl TransportHandle {
             .unwrap_or_default()
     }
 
-    /// Get all authenticated app-level peer IDs communicating over a channel.
-    pub(crate) async fn peers_on_channel(&self, channel_id: &str) -> Vec<PeerId> {
-        self.channel_to_peers
-            .read()
-            .await
-            .get(channel_id)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default()
+    /// Get the authenticated app-level peer ID for a channel, if any.
+    pub(crate) async fn peer_on_channel(&self, channel_id: &str) -> Option<PeerId> {
+        self.channel_to_peer.read().await.get(channel_id).copied()
     }
 
     /// Return true if `peer_id` is a known authenticated app-level peer ID.
@@ -1098,32 +1110,55 @@ impl TransportHandle {
         self.peer_to_channel.read().await.contains_key(peer_id)
     }
 
-    /// Wait for the identity exchange to complete on `channel_id` and return
-    /// the authenticated app-level [`PeerId`].
+    /// Wait for the channel's TLS-authenticated [`PeerId`] to be available.
     ///
     /// After [`connect_peer`](Self::connect_peer) returns a channel ID, the
-    /// remote's identity is not yet known — it arrives asynchronously via a
-    /// signed identity-announce message. This helper polls the
-    /// `channel_to_peers` index until the channel has an associated peer,
-    /// or the timeout expires.
+    /// `ConnectionEvent::Established` may not yet have been processed by the
+    /// background lifecycle monitor — at which point the `channel_to_peer`
+    /// map has not yet been populated. This helper does a fast initial
+    /// lookup, then `await`s on `identity_notify` for the next insert and
+    /// re-checks. The whole flow is event-driven (no polling), so a typical
+    /// caller resolves within a few scheduler ticks of the QUIC handshake
+    /// completing — far below the supplied `timeout`.
+    ///
+    /// `timeout` is a defence-in-depth bound for cases where the lifecycle
+    /// monitor is slow or the SPKI parse fails (e.g. a non-PQC peer slipped
+    /// past the TLS verifier). In normal operation it never fires.
     pub async fn wait_for_peer_identity(
         &self,
         channel_id: &str,
         timeout: Duration,
     ) -> Result<PeerId> {
         let deadline = Instant::now() + timeout;
-        let poll_interval = Duration::from_millis(50);
-
         loop {
-            // Check if any app-level peer has been authenticated on this channel.
-            let peers = self.peers_on_channel(channel_id).await;
-            if let Some(peer_id) = peers.into_iter().next() {
+            // Subscribe to the next notification BEFORE the map check.
+            //
+            // `Notify::notified()` only registers with the underlying
+            // `Notify` on first poll, *not* on creation. Without an
+            // explicit `enable()` call there is a race window: if the
+            // lifecycle monitor inserts the mapping and calls
+            // `notify_waiters()` between our `peer_on_channel` read and
+            // the subsequent `await`, the wake is missed and we sleep
+            // until the timeout.
+            //
+            // `enable()` synchronously registers the future with the
+            // `Notify`, so any `notify_waiters()` after this point reaches
+            // us even before the future is polled.
+            let notified = self.identity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if let Some(peer_id) = self.peer_on_channel(channel_id).await {
                 return Ok(peer_id);
             }
-            if Instant::now() >= deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(P2PError::Timeout(timeout));
             }
-            tokio::time::sleep(poll_interval).await;
+            match tokio::time::timeout(remaining, notified.as_mut()).await {
+                Ok(()) => continue,
+                Err(_) => return Err(P2PError::Timeout(timeout)),
+            }
         }
     }
 
@@ -1264,29 +1299,6 @@ impl TransportHandle {
 
         Self::sign_wire_message(&mut message, &self.node_identity)?;
 
-        Self::serialize_wire_message(&message)
-    }
-
-    /// Build a signed identity announce as serialized bytes (static — no `&self`).
-    ///
-    /// Used by the lifecycle monitor to send an announce immediately after a
-    /// transport connection is established, before the full `TransportHandle`
-    /// is available in that context.
-    fn create_identity_announce_bytes(
-        identity: &NodeIdentity,
-        user_agent: &str,
-    ) -> Result<Vec<u8>> {
-        let mut message = WireMessage {
-            protocol: IDENTITY_ANNOUNCE_PROTOCOL.to_string(),
-            data: vec![],
-            from: *identity.peer_id(),
-            timestamp: Self::current_timestamp_secs()?,
-            user_agent: user_agent.to_owned(),
-            public_key: Vec::new(),
-            signature: Vec::new(),
-        };
-
-        Self::sign_wire_message(&mut message, identity)?;
         Self::serialize_wire_message(&message)
     }
 
@@ -1521,20 +1533,19 @@ impl TransportHandle {
     /// The previous implementation used a single consumer task to drain
     /// every inbound message in the entire node. At 60 peers this kept up
     /// comfortably, but at 1000 peers it became the dominant serialisation
-    /// point: each message pass through this loop took three async write
-    /// locks (`peer_to_channel`, `channel_to_peers`, `peer_user_agents`)
-    /// and an awaited `register_connection_peer_id` call before the next
-    /// message could even be looked at. Responses arrived late, past the
-    /// 25 s caller timeout, producing the `[STEP 6 FAILED]` and
-    /// `[STEP 5a FAILED] Response channel closed (receiver timed out)`
-    /// cascades observed in the 1000-node testnet logs.
+    /// point — every message ran through the same task before the next
+    /// could even be looked at, and responses arrived past the caller's
+    /// 25 s timeout. Sharding by hash of the source IP gives each shard
+    /// its own consumer running in parallel, so per-peer lock contention
+    /// is distributed across N simultaneous workers. Messages from the
+    /// **same source IP** always route to the **same shard**, preserving
+    /// per-source ordering. The dispatcher task is light (hash + channel
+    /// send) so it is never the bottleneck.
     ///
-    /// Sharding by hash of the source IP gives each shard its own consumer
-    /// running in parallel, so lock contention is now distributed across N
-    /// simultaneous writers instead of serialised behind a single task.
-    /// Messages from the **same peer** always route to the **same shard**
-    /// (ordering is preserved per peer). The dispatcher task is light
-    /// (hash + channel send) so it is never the bottleneck.
+    /// Note that since the identity-exchange refactor, the shard consumer
+    /// only writes to `active_requests` and `peer_user_agents`. Peer↔channel
+    /// registration moved to [`Self::connection_lifecycle_monitor_with_rx`]
+    /// where it runs once per QUIC handshake instead of once per message.
     async fn start_message_receiving_system(&self) -> Result<()> {
         info!(
             "Starting message receiving system ({} dispatch shards)",
@@ -1565,11 +1576,8 @@ impl TransportHandle {
 
             let event_tx = self.event_tx.clone();
             let active_requests = Arc::clone(&self.active_requests);
-            let peer_to_channel = Arc::clone(&self.peer_to_channel);
-            let channel_to_peers = Arc::clone(&self.channel_to_peers);
             let peer_user_agents = Arc::clone(&self.peer_user_agents);
             let self_peer_id = *self.node_identity.peer_id();
-            let dual_node_for_peer_reg = Arc::clone(&self.dual_node);
 
             handles.push(tokio::spawn(async move {
                 Self::run_shard_consumer(
@@ -1577,11 +1585,8 @@ impl TransportHandle {
                     shard_rx,
                     event_tx,
                     active_requests,
-                    peer_to_channel,
-                    channel_to_peers,
                     peer_user_agents,
                     self_peer_id,
-                    dual_node_for_peer_reg,
                 )
                 .await;
             }));
@@ -1651,21 +1656,24 @@ impl TransportHandle {
     /// Each shard runs one of these in its own `tokio::spawn` task. Shard
     /// assignment is by hash of the source IP, so messages from the same
     /// peer always go through the same shard (ordering is preserved per
-    /// peer). Shared state (`peer_to_channel`, `active_requests`, etc.) is
-    /// still behind global `RwLock`s but the lock hold times are now
-    /// spread across [`MESSAGE_DISPATCH_SHARDS`] concurrent consumers
-    /// instead of being fully serialised.
+    /// peer). Shared state (`active_requests`, `peer_user_agents`) is
+    /// behind `RwLock`s but lock hold times are spread across
+    /// [`MESSAGE_DISPATCH_SHARDS`] concurrent consumers.
+    ///
+    /// The peer↔channel mapping is *not* maintained here — it is established
+    /// synchronously by [`Self::connection_lifecycle_monitor_with_rx`] when
+    /// the TLS handshake completes. The shard consumer's job is purely
+    /// message dispatch: parse the wire frame, route request/response
+    /// envelopes, opportunistically refresh the peer's user-agent string,
+    /// and broadcast unsolicited messages as `P2PEvent::Message`.
     #[allow(clippy::too_many_arguments)]
     async fn run_shard_consumer(
         shard_idx: usize,
         mut shard_rx: tokio::sync::mpsc::Receiver<(SocketAddr, Vec<u8>)>,
         event_tx: broadcast::Sender<P2PEvent>,
         active_requests: Arc<RwLock<HashMap<String, PendingRequest>>>,
-        peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
         peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
         self_peer_id: PeerId,
-        dual_node_for_peer_reg: Arc<DualStackNetworkNode>,
     ) {
         info!("Message dispatch shard {shard_idx} started");
         while let Some((from_addr, bytes)) = shard_rx.recv().await {
@@ -1683,63 +1691,40 @@ impl TransportHandle {
                     authenticated_node_id,
                     user_agent: peer_user_agent,
                 }) => {
-                    // If the message was signed, record the app↔channel mapping.
-                    // A peer may be reachable over multiple channels simultaneously
-                    // (e.g. QUIC + Bluetooth), so we add to the set — never replace.
-                    // Skip our own identity to avoid self-registration via echoed messages.
+                    // Lazily refresh the peer's user-agent string from any
+                    // signed message. The peer↔channel mapping is already
+                    // populated by the lifecycle monitor at TLS-handshake
+                    // time, so we don't touch it here. Skip echoes of our
+                    // own identity.
+                    //
+                    // When the user-agent is learned for the first time (or
+                    // changes), re-emit `PeerConnected` so subscribers that
+                    // branch on the user-agent — notably the DHT bridge,
+                    // which uses `is_dht_participant` to gate routing-table
+                    // admission — can re-classify. The original handshake-
+                    // time `PeerConnected` is emitted with an empty
+                    // user-agent because TLS doesn't carry one; this is the
+                    // follow-up that delivers the application-level
+                    // capability bits within one signed-message round trip.
                     if let Some(ref app_id) = authenticated_node_id
                         && *app_id != self_peer_id
+                        && !peer_user_agent.is_empty()
                     {
-                        // Hold `peer_to_channel` across the transport-level
-                        // `register_connection_peer_id` call so the app-level
-                        // map and the transport's internal addr→peer map are
-                        // consistent for any concurrent reader. Without this,
-                        // there is a microsecond window in which a hole-punch
-                        // lookup that depends on the registration can fail
-                        // spuriously even though the app-level map already
-                        // says the peer is known.
-                        let mut p2c = peer_to_channel.write().await;
-                        let is_new_peer = !p2c.contains_key(app_id);
-                        let channels = p2c.entry(*app_id).or_default();
-                        let inserted = channels.insert(channel_id.clone());
-                        if inserted {
-                            channel_to_peers
-                                .write()
-                                .await
-                                .entry(channel_id.clone())
-                                .or_default()
-                                .insert(*app_id);
-                        }
-
-                        // Register peer ID at the low-level transport
-                        // endpoint so PUNCH_ME_NOW relay can find this
-                        // peer by identity instead of socket address.
-                        dual_node_for_peer_reg
-                            .register_connection_peer_id(from_addr, *app_id.to_bytes())
-                            .await;
-
-                        // Drop the lock before emitting events so subscribers
-                        // that re-enter the registry don't deadlock.
-                        drop(p2c);
-
-                        if is_new_peer {
-                            peer_user_agents
-                                .write()
-                                .await
-                                .insert(*app_id, peer_user_agent.clone());
+                        let mut uas = peer_user_agents.write().await;
+                        let changed = match uas.get(app_id) {
+                            Some(existing) => existing != &peer_user_agent,
+                            None => true,
+                        };
+                        if changed {
+                            uas.insert(*app_id, peer_user_agent.clone());
+                            // Drop the lock before emitting so subscribers
+                            // re-entering the registry don't deadlock.
+                            drop(uas);
                             broadcast_event(
                                 &event_tx,
-                                P2PEvent::PeerConnected(*app_id, peer_user_agent.clone()),
+                                P2PEvent::PeerConnected(*app_id, peer_user_agent),
                             );
                         }
-                    }
-
-                    // Identity announces are internal plumbing — don't
-                    // emit as app-level messages.
-                    if let P2PEvent::Message { ref topic, .. } = event
-                        && topic == IDENTITY_ANNOUNCE_PROTOCOL
-                    {
-                        continue;
                     }
 
                     if let P2PEvent::Message {
@@ -1909,6 +1894,14 @@ impl TransportHandle {
 
 impl TransportHandle {
     /// Connection lifecycle monitor — processes saorsa-transport connection events.
+    ///
+    /// On `ConnectionEvent::Established` the peer's app-level [`PeerId`] is
+    /// derived synchronously from the TLS-authenticated SPKI carried in the
+    /// event, and the `peer_to_channel` / `channel_to_peer` maps are
+    /// populated immediately. This eliminates the asynchronous identity
+    /// announce protocol and the 15 s wait window that came with it: by the
+    /// time `connect_peer` returns, the peer identity is either already
+    /// resolved or will be within a few scheduler ticks.
     #[allow(clippy::too_many_arguments)]
     async fn connection_lifecycle_monitor_with_rx(
         dual_node: Arc<DualStackNetworkNode>,
@@ -1921,10 +1914,10 @@ impl TransportHandle {
         _geo_provider: Arc<BgpGeoProvider>,
         shutdown: CancellationToken,
         peer_to_channel: Arc<RwLock<HashMap<PeerId, HashSet<String>>>>,
-        channel_to_peers: Arc<RwLock<HashMap<String, HashSet<PeerId>>>>,
+        channel_to_peer: Arc<RwLock<HashMap<String, PeerId>>>,
         peer_user_agents: Arc<RwLock<HashMap<PeerId, String>>>,
-        node_identity: Arc<NodeIdentity>,
-        user_agent: String,
+        identity_notify: Arc<Notify>,
+        self_peer_id: PeerId,
     ) {
         info!("Connection lifecycle monitor started (pre-subscribed receiver)");
 
@@ -1938,7 +1931,8 @@ impl TransportHandle {
                     match recv {
                         Ok(event) => match event {
                             ConnectionEvent::Established {
-                                remote_address, ..
+                                remote_address,
+                                public_key,
                             } => {
                                 let channel_id = remote_address.to_string();
                                 debug!(
@@ -1948,43 +1942,99 @@ impl TransportHandle {
 
                                 active_connections.write().await.insert(channel_id.clone());
 
-                                let mut peers_lock = peers.write().await;
-                                if let Some(peer_info) = peers_lock.get_mut(&channel_id) {
-                                    peer_info.status = ConnectionStatus::Connected;
-                                    peer_info.connected_at = Instant::now();
-                                } else {
-                                    debug!("Registering new incoming channel: {}", channel_id);
-                                    peers_lock.insert(
-                                        channel_id.clone(),
-                                        PeerInfo {
-                                            channel_id: channel_id.clone(),
-                                            addresses: vec![MultiAddr::quic(remote_address)],
-                                            status: ConnectionStatus::Connected,
-                                            last_seen: Instant::now(),
-                                            connected_at: Instant::now(),
-                                            protocols: Vec::new(),
-                                            heartbeat_count: 0,
-                                        },
+                                {
+                                    let mut peers_lock = peers.write().await;
+                                    if let Some(peer_info) = peers_lock.get_mut(&channel_id) {
+                                        peer_info.status = ConnectionStatus::Connected;
+                                        peer_info.connected_at = Instant::now();
+                                    } else {
+                                        debug!("Registering new incoming channel: {}", channel_id);
+                                        peers_lock.insert(
+                                            channel_id.clone(),
+                                            PeerInfo {
+                                                channel_id: channel_id.clone(),
+                                                addresses: vec![MultiAddr::quic(remote_address)],
+                                                status: ConnectionStatus::Connected,
+                                                last_seen: Instant::now(),
+                                                connected_at: Instant::now(),
+                                                protocols: Vec::new(),
+                                                heartbeat_count: 0,
+                                            },
+                                        );
+                                    }
+                                }
+
+                                // Resolve the peer's app-level identity from the
+                                // SPKI bytes carried in the TLS handshake. The
+                                // raw-public-key TLS verifier already validated
+                                // the signature; here we just decode the same
+                                // bytes back into a PeerId.
+                                let Some(spki_bytes) = public_key else {
+                                    warn!(
+                                        channel = %channel_id,
+                                        "Connection established without TLS public key — \
+                                         channel will not be authenticated and is unusable",
+                                    );
+                                    continue;
+                                };
+
+                                let app_peer_id = match decode_peer_id_from_spki(&spki_bytes) {
+                                    Ok(pid) => pid,
+                                    Err(e) => {
+                                        warn!(
+                                            channel = %channel_id,
+                                            error = %e,
+                                            "Failed to decode peer SPKI into PeerId — \
+                                             channel will not be authenticated",
+                                        );
+                                        continue;
+                                    }
+                                };
+
+                                if app_peer_id == self_peer_id {
+                                    debug!(
+                                        channel = %channel_id,
+                                        "Skipping self-connection in lifecycle monitor",
+                                    );
+                                    continue;
+                                }
+
+                                // Register peer↔channel mapping immediately,
+                                // holding the peer_to_channel lock across the
+                                // transport-level peer-id registration so the
+                                // app map and the transport addr→peer map are
+                                // consistent for any concurrent reader.
+                                let is_new_peer;
+                                {
+                                    let mut p2c = peer_to_channel.write().await;
+                                    let mut c2p = channel_to_peer.write().await;
+                                    is_new_peer = !p2c.contains_key(&app_peer_id);
+                                    p2c.entry(app_peer_id)
+                                        .or_default()
+                                        .insert(channel_id.clone());
+                                    c2p.insert(channel_id.clone(), app_peer_id);
+                                    dual_node
+                                        .register_connection_peer_id(
+                                            remote_address,
+                                            *app_peer_id.to_bytes(),
+                                        )
+                                        .await;
+                                }
+
+                                // Wake any wait_for_peer_identity callers
+                                // blocked on this channel becoming authenticated.
+                                identity_notify.notify_waiters();
+
+                                // Emit PeerConnected for the first sighting.
+                                // The user_agent stays empty until the first
+                                // signed wire message arrives — see
+                                // run_shard_consumer.
+                                if is_new_peer {
+                                    broadcast_event(
+                                        &event_tx,
+                                        P2PEvent::PeerConnected(app_peer_id, String::new()),
                                     );
                                 }
-
-                                // Send identity announce so the remote peer can authenticate us.
-                                match Self::create_identity_announce_bytes(&node_identity, &user_agent) {
-                                    Ok(announce_bytes) => {
-                                        if let Err(e) = dual_node
-                                            .send_to_peer_optimized(&remote_address, &announce_bytes)
-                                            .await
-                                        {
-                                            warn!("Failed to send identity announce to {channel_id}: {e}");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!("Failed to create identity announce: {e}");
-                                    }
-                                }
-
-                                // PeerConnected is emitted when the remote receives and
-                                // verifies our identity announce — not at transport level.
                             }
                             ConnectionEvent::Lost { remote_address, reason }
                             | ConnectionEvent::Failed { remote_address, reason } => {
@@ -1998,7 +2048,7 @@ impl TransportHandle {
                                 Self::remove_channel_mappings_static(
                                     &channel_id,
                                     &peer_to_channel,
-                                    &channel_to_peers,
+                                    &channel_to_peer,
                                     &peer_user_agents,
                                     &event_tx,
                                 ).await;
@@ -2022,6 +2072,27 @@ impl TransportHandle {
             }
         }
     }
+}
+
+/// Decode a TLS-carried SPKI byte string into the corresponding [`PeerId`].
+///
+/// The bytes come from saorsa-transport's `extract_public_key_bytes_from_connection`,
+/// which returns the contents of the rustls `CertificateDer`. For raw-public-key
+/// connections (RFC 7250) those bytes are the X.509 SubjectPublicKeyInfo
+/// containing the ML-DSA-65 public key — the same encoding produced by
+/// `create_subject_public_key_info`. The TLS verifier already validated the
+/// signature; this is purely a byte-to-PeerId derivation.
+///
+/// Both `extract_public_key_from_spki` and `peer_id_from_public_key` operate
+/// on the same `MlDsaPublicKey` type re-exported from `saorsa-transport`, so
+/// no intermediate copy through raw bytes is necessary.
+fn decode_peer_id_from_spki(spki_bytes: &[u8]) -> Result<PeerId> {
+    let public_key: MlDsaPublicKey = extract_public_key_from_spki(spki_bytes).map_err(|e| {
+        P2PError::Identity(crate::error::IdentityError::InvalidFormat(
+            format!("invalid SPKI bytes from TLS handshake: {e:?}").into(),
+        ))
+    })?;
+    Ok(peer_id_from_public_key(&public_key))
 }
 
 // ============================================================================
@@ -2069,8 +2140,11 @@ impl TransportHandle {
     }
 
     /// Map an app-level PeerId to a channel ID in both `peer_to_channel` and
-    /// `channel_to_peers` (test helper). The bidirectional mapping ensures
-    /// `remove_channel` correctly cleans up both maps.
+    /// `channel_to_peer` (test helper). The bidirectional mapping ensures
+    /// `remove_channel` correctly cleans up both maps. Also fires
+    /// `identity_notify` so any blocked `wait_for_peer_identity` callers
+    /// observe the new mapping immediately, mirroring the production
+    /// lifecycle-monitor path.
     pub(crate) async fn inject_peer_to_channel(&self, peer_id: PeerId, channel_id: String) {
         self.peer_to_channel
             .write()
@@ -2078,11 +2152,95 @@ impl TransportHandle {
             .entry(peer_id)
             .or_default()
             .insert(channel_id.clone());
-        self.channel_to_peers
+        self.channel_to_peer
             .write()
             .await
-            .entry(channel_id)
-            .or_default()
-            .insert(peer_id);
+            .insert(channel_id, peer_id);
+        self.identity_notify.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `wait_for_peer_identity` must return immediately when the channel
+    /// is already populated. This is the fast path after the identity
+    /// refactor: TLS-derived peer registration happens synchronously in
+    /// the lifecycle monitor, so by the time most callers reach this
+    /// helper the mapping is already in place.
+    ///
+    /// Uses `multi_thread` because `new_for_tests` internally calls
+    /// `Handle::current().block_on(...)` and the single-threaded test
+    /// runtime forbids nested blocking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_peer_identity_returns_pre_populated_immediately() {
+        let handle =
+            tokio::task::spawn_blocking(|| TransportHandle::new_for_tests().expect("test handle"))
+                .await
+                .expect("spawn_blocking must succeed");
+        let peer = PeerId::random();
+        let channel_id = "127.0.0.1:1234".to_string();
+
+        handle
+            .inject_peer_to_channel(peer, channel_id.clone())
+            .await;
+
+        let resolved = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.wait_for_peer_identity(&channel_id, Duration::from_secs(5)),
+        )
+        .await
+        .expect("must resolve well below timeout")
+        .expect("must return Ok for known channel");
+
+        assert_eq!(
+            resolved, peer,
+            "wait_for_peer_identity must return the injected peer ID",
+        );
+    }
+
+    /// When a `channel_to_peer` insert lands AFTER the waiter starts but
+    /// BEFORE its first poll of `notified()`, the waiter must still wake.
+    /// This guards against the `Notify::notified()` registration race
+    /// that the previous polling-loop implementation tolerated by accident
+    /// and that the new event-driven path must handle correctly via
+    /// `Notified::enable()`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_peer_identity_wakes_on_concurrent_insert() {
+        let handle = Arc::new(
+            tokio::task::spawn_blocking(|| TransportHandle::new_for_tests().expect("test handle"))
+                .await
+                .expect("spawn_blocking must succeed"),
+        );
+        let peer = PeerId::random();
+        let channel_id = "127.0.0.1:5678".to_string();
+
+        let waiter_handle = Arc::clone(&handle);
+        let waiter_channel = channel_id.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_handle
+                .wait_for_peer_identity(&waiter_channel, Duration::from_secs(5))
+                .await
+        });
+
+        // Yield so the waiter has a chance to enter wait_for_peer_identity
+        // and reach `notified.as_mut().enable()`.
+        tokio::task::yield_now().await;
+
+        handle
+            .inject_peer_to_channel(peer, channel_id.clone())
+            .await;
+
+        let resolved = tokio::time::timeout(Duration::from_millis(500), waiter)
+            .await
+            .expect("waiter must wake within 500ms of insert")
+            .expect("waiter task should not panic")
+            .expect("waiter should return Ok for the inserted channel");
+
+        assert_eq!(
+            resolved, peer,
+            "wait_for_peer_identity must return the inserted peer ID",
+        );
     }
 }

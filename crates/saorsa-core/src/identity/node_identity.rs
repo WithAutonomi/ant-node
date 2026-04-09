@@ -185,6 +185,17 @@ impl NodeIdentity {
         self.secret_key.as_bytes()
     }
 
+    /// Clone the underlying ML-DSA-65 keypair.
+    ///
+    /// Used to install the node's identity as the transport's TLS keypair so
+    /// that the SPKI carried in the QUIC handshake authenticates the same
+    /// peer ID that signs application messages. Without this, the
+    /// transport-level and application-level identities are distinct and
+    /// must be reconciled by a wire-level handshake.
+    pub fn clone_keypair(&self) -> (MlDsaPublicKey, MlDsaSecretKey) {
+        (self.public_key.clone(), self.secret_key.clone())
+    }
+
     /// Sign a message
     pub fn sign(&self, message: &[u8]) -> Result<MlDsaSignature> {
         crate::quantum_crypto::ml_dsa_sign(&self.secret_key, message).map_err(|e| {

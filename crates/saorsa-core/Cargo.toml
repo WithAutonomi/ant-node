@@ -59,6 +59,7 @@ blake3 = "1.6"
 # Performance optimization
 parking_lot = "0.12"
 once_cell = "1.21"
+dashmap = "6"
 
 # Networking
 saorsa-transport = { path = "../saorsa-transport" }
