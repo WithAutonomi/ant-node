@@ -99,6 +99,10 @@ pub async fn replicate_fresh(
             // Acquire a permit before sending — this caps the number of
             // concurrent outbound replication transfers across the engine.
             let _permit = sem.acquire().await;
+            debug!(
+                "Replication send permit acquired for peer {peer_id} ({} available)",
+                sem.available_permits()
+            );
             if let Err(e) = p2p
                 .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
                 .await
