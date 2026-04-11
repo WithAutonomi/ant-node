@@ -38,7 +38,7 @@ use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
-use tokio::sync::{mpsc, Notify, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -46,7 +46,9 @@ use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
-use crate::replication::config::{max_parallel_fetch, ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{
+    max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
@@ -122,6 +124,9 @@ pub struct ReplicationEngine {
     sync_trigger: Arc<Notify>,
     /// Notified when `is_bootstrapping` transitions from `true` to `false`.
     bootstrap_complete_notify: Arc<Notify>,
+    /// Limits concurrent outbound replication sends to prevent bandwidth
+    /// saturation on home broadband connections.
+    send_semaphore: Arc<Semaphore>,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -173,6 +178,7 @@ impl ReplicationEngine {
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
             bootstrap_complete_notify: Arc::new(Notify::new()),
+            send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
             task_handles: Vec::new(),
@@ -272,6 +278,7 @@ impl ReplicationEngine {
             &self.p2p_node,
             &self.paid_list,
             &self.config,
+            &self.send_semaphore,
         )
         .await;
     }
@@ -289,6 +296,7 @@ impl ReplicationEngine {
         let p2p = Arc::clone(&self.p2p_node);
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
+        let send_semaphore = Arc::clone(&self.send_semaphore);
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -304,6 +312,7 @@ impl ReplicationEngine {
                             &p2p,
                             &paid_list,
                             &config,
+                            &send_semaphore,
                         )
                         .await;
                     }

@@ -11,6 +11,7 @@ use crate::logging::{debug, warn};
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::sync::Semaphore;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
@@ -38,6 +39,10 @@ pub struct FreshWriteEvent {
 /// Sends fresh offers to close group members and `PaidNotify` to
 /// `PaidCloseGroup`. Both are fire-and-forget (no ack tracking or retry per
 /// Section 6.1, rule 8).
+///
+/// The `send_semaphore` limits how many outbound chunk transfers can be
+/// in-flight concurrently across the entire replication engine, preventing
+/// bandwidth saturation on home broadband connections.
 pub async fn replicate_fresh(
     key: &XorName,
     data: &[u8],
@@ -45,6 +50,7 @@ pub async fn replicate_fresh(
     p2p_node: &Arc<P2PNode>,
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
+    send_semaphore: &Arc<Semaphore>,
 ) {
     let self_id = *p2p_node.peer_id();
 
@@ -88,7 +94,11 @@ pub async fn replicate_fresh(
         let p2p = Arc::clone(p2p_node);
         let data = encoded.clone();
         let peer_id = *peer;
+        let sem = Arc::clone(send_semaphore);
         tokio::spawn(async move {
+            // Acquire a permit before sending — this caps the number of
+            // concurrent outbound replication transfers across the engine.
+            let _permit = sem.acquire().await;
             if let Err(e) = p2p
                 .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
                 .await
@@ -99,6 +109,8 @@ pub async fn replicate_fresh(
     }
 
     // Rule 7-8: Send PaidNotify to every member of PaidCloseGroup(K).
+    // PaidNotify messages are small metadata (no chunk data), so they don't
+    // need semaphore gating.
     send_paid_notify(key, proof_of_payment, p2p_node, config).await;
 
     debug!(

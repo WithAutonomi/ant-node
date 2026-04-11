@@ -70,6 +70,15 @@ pub const SELF_LOOKUP_INTERVAL_MIN: Duration = Duration::from_secs(SELF_LOOKUP_I
 /// Periodic self-lookup cadence range (max).
 pub const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(SELF_LOOKUP_INTERVAL_MAX_SECS);
 
+/// Maximum number of concurrent outbound replication sends.
+///
+/// Caps how many fresh-replication chunk transfers can be in-flight at once
+/// across the entire replication engine. Prevents bandwidth saturation on
+/// home broadband connections when multiple chunks arrive simultaneously.
+/// Each send transfers up to 4 MB (MAX_CHUNK_SIZE), so a limit of 3 means
+/// at most ~12 MB queued for the upload link at any instant.
+pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
+
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
 /// Uses `std::thread::available_parallelism()` so the node scales to the
