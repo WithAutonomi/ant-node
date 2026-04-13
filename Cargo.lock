@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.0-rc.17"
+version = "0.10.0-rc.18"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
