@@ -70,9 +70,9 @@ impl UpgradeMonitor {
     ///
     /// * `repo` - GitHub repository in "owner/repo" format
     /// * `channel` - Release channel to track (Stable or Beta)
-    /// * `check_interval_hours` - How often to check for updates
+    /// * `check_interval_minutes` - How often to check for updates
     #[must_use]
-    pub fn new(repo: String, channel: UpgradeChannel, check_interval_hours: u64) -> Self {
+    pub fn new(repo: String, channel: UpgradeChannel, check_interval_minutes: u64) -> Self {
         let current_version =
             Version::parse(env!("CARGO_PKG_VERSION")).unwrap_or_else(|_| Version::new(0, 0, 0));
 
@@ -88,7 +88,7 @@ impl UpgradeMonitor {
         Self {
             repo,
             channel,
-            check_interval: Duration::from_secs(check_interval_hours * 3600),
+            check_interval: Duration::from_secs(check_interval_minutes * 60),
             current_version,
             client,
             staged_rollout: None,
@@ -130,7 +130,7 @@ impl UpgradeMonitor {
     pub fn with_version(
         repo: String,
         channel: UpgradeChannel,
-        check_interval_hours: u64,
+        check_interval_minutes: u64,
         current_version: Version,
     ) -> Self {
         let client = reqwest::Client::builder()
@@ -145,7 +145,7 @@ impl UpgradeMonitor {
         Self {
             repo,
             channel,
-            check_interval: Duration::from_secs(check_interval_hours * 3600),
+            check_interval: Duration::from_secs(check_interval_minutes * 60),
             current_version,
             client,
             staged_rollout: None,
@@ -779,11 +779,11 @@ mod tests {
     /// Test 10: Monitor check interval
     #[test]
     fn test_check_interval() {
-        let monitor = UpgradeMonitor::new("test/repo".to_string(), UpgradeChannel::Stable, 24);
-        assert_eq!(monitor.check_interval(), Duration::from_secs(24 * 3600));
+        let monitor = UpgradeMonitor::new("test/repo".to_string(), UpgradeChannel::Stable, 60);
+        assert_eq!(monitor.check_interval(), Duration::from_secs(60 * 60));
 
-        let monitor2 = UpgradeMonitor::new("test/repo".to_string(), UpgradeChannel::Stable, 6);
-        assert_eq!(monitor2.check_interval(), Duration::from_secs(6 * 3600));
+        let monitor2 = UpgradeMonitor::new("test/repo".to_string(), UpgradeChannel::Stable, 20);
+        assert_eq!(monitor2.check_interval(), Duration::from_secs(20 * 60));
     }
 
     /// Test 11: Process release - upgrade available
