@@ -75,7 +75,7 @@ pub const SELF_LOOKUP_INTERVAL_MAX: Duration = Duration::from_secs(SELF_LOOKUP_I
 /// Caps how many fresh-replication chunk transfers can be in-flight at once
 /// across the entire replication engine. Prevents bandwidth saturation on
 /// home broadband connections when multiple chunks arrive simultaneously.
-/// Each send transfers up to 4 MB (MAX_CHUNK_SIZE), so a limit of 3 means
+/// Each send transfers up to 4 MB (`MAX_CHUNK_SIZE`), so a limit of 3 means
 /// at most ~12 MB queued for the upload link at any instant.
 pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 

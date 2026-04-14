@@ -47,7 +47,8 @@ use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
 use crate::replication::config::{
-    max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+    max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -448,7 +449,7 @@ impl ReplicationEngine {
                 // the full round to complete.
                 tokio::select! {
                     () = shutdown.cancelled() => break,
-                    _ = run_neighbor_sync_round(
+                    () = run_neighbor_sync_round(
                         &p2p,
                         &storage,
                         &paid_list,
