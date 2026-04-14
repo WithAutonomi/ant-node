@@ -255,8 +255,16 @@ impl ReplicationEngine {
     /// released (e.g. before reopening the same LMDB environment).
     pub async fn shutdown(&mut self) {
         self.shutdown.cancel();
-        for handle in self.task_handles.drain(..) {
-            let _ = handle.await;
+        for (i, mut handle) in self.task_handles.drain(..).enumerate() {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) if e.is_cancelled() => {}
+                Ok(Err(e)) => warn!("Replication task {i} panicked during shutdown: {e}"),
+                Err(_) => {
+                    warn!("Replication task {i} did not stop within 10s, aborting");
+                    handle.abort();
+                }
+            }
         }
     }
 
@@ -435,18 +443,23 @@ impl ReplicationEngine {
                         debug!("Neighbor sync triggered by topology change");
                     }
                 }
-                run_neighbor_sync_round(
-                    &p2p,
-                    &storage,
-                    &paid_list,
-                    &queues,
-                    &config,
-                    &sync_state,
-                    &sync_history,
-                    &is_bootstrapping,
-                    &bootstrap_state,
-                )
-                .await;
+                // Wrap the sync round in a select so shutdown cancels
+                // in-progress network operations rather than waiting for
+                // the full round to complete.
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = run_neighbor_sync_round(
+                        &p2p,
+                        &storage,
+                        &paid_list,
+                        &queues,
+                        &config,
+                        &sync_state,
+                        &sync_history,
+                        &is_bootstrapping,
+                        &bootstrap_state,
+                    ) => {}
+                }
             }
             debug!("Neighbor sync loop shut down");
         });
