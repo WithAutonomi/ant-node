@@ -122,9 +122,9 @@ jobs:
             echo "profile_dir=debug" >> $GITHUB_OUTPUT
             echo "Building DEBUG (RC pre-release: logging enabled)"
           else
-            echo "build_flags=--release --no-default-features" >> $GITHUB_OUTPUT
+            echo "build_flags=--release --no-default-features --features logging" >> $GITHUB_OUTPUT
             echo "profile_dir=release" >> $GITHUB_OUTPUT
-            echo "Building RELEASE (logging stripped)"
+            echo "Building RELEASE (logging enabled, other defaults stripped)"
           fi
 
       - name: Install Rust toolchain
