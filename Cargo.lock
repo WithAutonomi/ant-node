@@ -2941,9 +2941,9 @@ dependencies = [
 
 [[package]]
 name = "hyper-rustls"
-version = "0.27.8"
+version = "0.27.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2b52f86d1d4bc0d6b4e6826d960b1b333217e07d36b882dca570a5e1c48895b"
+checksum = "33ca68d021ef39cf6463ab54c1d0f5daf03377b70561305bb89a8f83aab66e0f"
 dependencies = [
  "http",
  "hyper",
@@ -4759,8 +4759,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#7d739775b8d1c6164f8407acf63d7ed6d75dd02a"
+version = "0.23.0"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?tag=v0.23.0#caa559518ff3eea8c49b4cbd54ef3e65445f92ce"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4872,8 +4872,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.31.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.1#7986b01604b745fc9e7c3714d46486485d0771cf"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "250826f52ac60992947359218d83c21f658aa85407e3980a5dbb258eff4c0cc3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5668,9 +5669,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.51.1"
+version = "1.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f66bf9585cda4b724d3e78ab34b73fb2bbaba9011b9bfdf69dc836382ea13b8c"
+checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
  "bytes",
  "libc",
