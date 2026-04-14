@@ -4760,12 +4760,13 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.1#7d739775b8d1c6164f8407acf63d7ed6d75dd02a"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=fix/accept-loop-serialize-registration#b38fe0c1c1fe70188e2f5f640d5d8856b391ea06"
 dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
  "bytes",
+ "dashmap",
  "dirs 6.0.0",
  "futures",
  "hex",
