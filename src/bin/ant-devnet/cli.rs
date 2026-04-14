@@ -44,7 +44,16 @@ pub struct Cli {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
+    /// Enable logging output.
+    /// When omitted, the tracing subscriber is not installed and no log
+    /// records are emitted, even if the binary was built with the
+    /// `logging` feature. `--log-level` is ignored unless this flag is set.
+    #[cfg(feature = "logging")]
+    #[arg(long, env = "ANT_ENABLE_LOGGING")]
+    pub enable_logging: bool,
+
     /// Log level for devnet process.
+    #[cfg(feature = "logging")]
     #[arg(long, default_value = "info")]
     pub log_level: String,
 

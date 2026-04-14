@@ -12,6 +12,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(name = "ant-node")]
 #[command(author, version, about, long_about = None)]
+#[allow(clippy::struct_excessive_bools)] // unrelated CLI toggles, not a state machine
 pub struct Cli {
     /// Root directory for node data.
     #[arg(long, env = "ANT_ROOT_DIR")]
@@ -60,6 +61,15 @@ pub struct Cli {
     /// Metrics port for Prometheus scraping (0 to disable).
     #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
     pub metrics_port: u16,
+
+    /// Enable logging output.
+    /// When omitted, the tracing subscriber is not installed and no log
+    /// records are emitted, even if the binary was built with the
+    /// `logging` feature. The remaining `--log-*` options are ignored
+    /// unless this flag is set.
+    #[cfg(feature = "logging")]
+    #[arg(long, env = "ANT_ENABLE_LOGGING")]
+    pub enable_logging: bool,
 
     /// Log level.
     #[cfg(feature = "logging")]
