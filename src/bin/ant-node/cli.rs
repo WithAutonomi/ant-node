@@ -50,6 +50,9 @@ pub struct Cli {
     pub rewards_address: Option<String>,
 
     /// EVM network for payment processing.
+    ///
+    /// Ignored when `--evm-rpc-url` is set (which selects a custom EVM
+    /// network instead — used by the local-Anvil testnet flow).
     #[arg(
         long,
         value_enum,
@@ -57,6 +60,22 @@ pub struct Cli {
         env = "ANT_EVM_NETWORK"
     )]
     pub evm_network: CliEvmNetwork,
+
+    /// HTTP RPC URL of a custom EVM (e.g. a local Anvil instance).
+    /// When set, --evm-payment-token and --evm-payment-vault must also
+    /// be set, and they together override --evm-network.
+    #[arg(long, env = "ANT_EVM_RPC_URL")]
+    pub evm_rpc_url: Option<String>,
+
+    /// ANT token contract address on the custom EVM.
+    /// Required iff --evm-rpc-url is set.
+    #[arg(long, env = "ANT_EVM_PAYMENT_TOKEN")]
+    pub evm_payment_token: Option<String>,
+
+    /// Payment vault contract address on the custom EVM.
+    /// Required iff --evm-rpc-url is set.
+    #[arg(long, env = "ANT_EVM_PAYMENT_VAULT")]
+    pub evm_payment_vault: Option<String>,
 
     /// Metrics port for Prometheus scraping (0 to disable).
     #[arg(long, default_value = "9100", env = "ANT_METRICS_PORT")]
@@ -239,10 +258,27 @@ impl Cli {
         config.upgrade.stop_on_upgrade = self.stop_on_upgrade;
 
         // Payment config (payment verification is always on)
+        // Custom EVM (--evm-rpc-url) overrides the --evm-network preset.
+        let evm_network = if let Some(rpc_url) = self.evm_rpc_url {
+            let payment_token_address = self.evm_payment_token.ok_or_else(|| {
+                color_eyre::eyre::eyre!("--evm-payment-token is required when --evm-rpc-url is set")
+            })?;
+            let payment_vault_address = self.evm_payment_vault.ok_or_else(|| {
+                color_eyre::eyre::eyre!("--evm-payment-vault is required when --evm-rpc-url is set")
+            })?;
+            EvmNetworkConfig::Custom {
+                rpc_url,
+                payment_token_address,
+                payment_vault_address,
+            }
+        } else {
+            self.evm_network.into()
+        };
+
         config.payment = PaymentConfig {
             cache_capacity: self.cache_capacity,
             rewards_address: self.rewards_address,
-            evm_network: self.evm_network.into(),
+            evm_network,
             metrics_port: self.metrics_port,
         };
 

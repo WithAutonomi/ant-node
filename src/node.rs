@@ -2,8 +2,7 @@
 
 use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{
-    default_nodes_dir, default_root_dir, EvmNetworkConfig, NetworkMode, NodeConfig,
-    NODE_IDENTITY_FILENAME,
+    default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
 };
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
@@ -18,7 +17,6 @@ use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
 };
-use evmlib::Network as EvmNetwork;
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
@@ -375,10 +373,7 @@ impl NodeBuilder {
         };
 
         // Create payment verifier
-        let evm_network = match config.payment.evm_network {
-            EvmNetworkConfig::ArbitrumOne => EvmNetwork::ArbitrumOne,
-            EvmNetworkConfig::ArbitrumSepolia => EvmNetwork::ArbitrumSepoliaTest,
-        };
+        let evm_network = config.payment.evm_network.clone().into_evm_network();
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,

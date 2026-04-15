@@ -30,11 +30,7 @@ impl WalletConfig {
     /// Returns an error if the address string is invalid.
     pub fn new(rewards_address: Option<&str>, evm_network: EvmNetworkConfig) -> Result<Self> {
         let rewards_address = rewards_address.map(parse_rewards_address).transpose()?;
-
-        let network = match evm_network {
-            EvmNetworkConfig::ArbitrumOne => EvmNetwork::ArbitrumOne,
-            EvmNetworkConfig::ArbitrumSepolia => EvmNetwork::ArbitrumSepoliaTest,
-        };
+        let network = evm_network.into_evm_network();
 
         Ok(Self {
             rewards_address,
