@@ -15,7 +15,7 @@ use evmlib::merkle_payments::MerklePaymentCandidateNode;
 use evmlib::PaymentQuote;
 use evmlib::RewardsAddress;
 use saorsa_core::MlDsa65;
-use saorsa_pqc::pqc::types::{MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature};
+use saorsa_pqc::pqc::types::MlDsaSecretKey;
 use saorsa_pqc::pqc::MlDsaOperations;
 use std::time::SystemTime;
 
@@ -245,131 +245,10 @@ impl QuoteGenerator {
     }
 }
 
-/// Verify a payment quote's content address and ML-DSA-65 signature.
-///
-/// # Arguments
-///
-/// * `quote` - The quote to verify
-/// * `expected_content` - The expected content `XorName`
-///
-/// # Returns
-///
-/// `true` if the content matches and the ML-DSA-65 signature is valid.
-#[must_use]
-pub fn verify_quote_content(quote: &PaymentQuote, expected_content: &XorName) -> bool {
-    // Check content matches
-    if quote.content.0 != *expected_content {
-        if crate::logging::enabled!(crate::logging::Level::DEBUG) {
-            debug!(
-                "Quote content mismatch: expected {}, got {}",
-                hex::encode(expected_content),
-                hex::encode(quote.content.0)
-            );
-        }
-        return false;
-    }
-    true
-}
-
-/// Verify that a payment quote has a valid ML-DSA-65 signature.
-///
-/// This replaces ant-evm's `check_is_signed_by_claimed_peer()` which only
-/// handles Ed25519/libp2p signatures. Autonomi uses ML-DSA-65 post-quantum
-/// signatures for quote signing.
-///
-/// # Arguments
-///
-/// * `quote` - The quote to verify
-///
-/// # Returns
-///
-/// `true` if the ML-DSA-65 signature is valid for the quote's content.
-#[must_use]
-pub fn verify_quote_signature(quote: &PaymentQuote) -> bool {
-    // Parse public key from quote
-    let pub_key = match MlDsaPublicKey::from_bytes(&quote.pub_key) {
-        Ok(pk) => pk,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 public key from quote: {e}");
-            return false;
-        }
-    };
-
-    // Parse signature from quote
-    let signature = match MlDsaSignature::from_bytes(&quote.signature) {
-        Ok(sig) => sig,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 signature from quote: {e}");
-            return false;
-        }
-    };
-
-    // Get the bytes that were signed
-    let bytes = quote.bytes_for_sig();
-
-    // Verify using ML-DSA-65 implementation
-    let ml_dsa = MlDsa65::new();
-    match ml_dsa.verify(&pub_key, &bytes, &signature) {
-        Ok(valid) => {
-            if !valid {
-                debug!("ML-DSA-65 quote signature verification failed");
-            }
-            valid
-        }
-        Err(e) => {
-            debug!("ML-DSA-65 verification error: {e}");
-            false
-        }
-    }
-}
-
-/// Verify a `MerklePaymentCandidateNode` signature using ML-DSA-65.
-///
-/// Autonomi uses ML-DSA-65 post-quantum signatures for merkle candidate signing,
-/// rather than the ed25519 signatures used by the upstream `ant-evm` library.
-/// The `pub_key` field contains the raw ML-DSA-65 public key bytes, and
-/// `signature` contains the ML-DSA-65 signature over `bytes_to_sign()`.
-///
-/// This replaces `MerklePaymentCandidateNode::verify_signature()` which
-/// expects libp2p ed25519 keys.
-#[must_use]
-pub fn verify_merkle_candidate_signature(candidate: &MerklePaymentCandidateNode) -> bool {
-    let pub_key = match MlDsaPublicKey::from_bytes(&candidate.pub_key) {
-        Ok(pk) => pk,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 public key from merkle candidate: {e}");
-            return false;
-        }
-    };
-
-    let signature = match MlDsaSignature::from_bytes(&candidate.signature) {
-        Ok(sig) => sig,
-        Err(e) => {
-            debug!("Failed to parse ML-DSA-65 signature from merkle candidate: {e}");
-            return false;
-        }
-    };
-
-    let msg = MerklePaymentCandidateNode::bytes_to_sign(
-        &candidate.price,
-        &candidate.reward_address,
-        candidate.merkle_payment_timestamp,
-    );
-
-    let ml_dsa = MlDsa65::new();
-    match ml_dsa.verify(&pub_key, &msg, &signature) {
-        Ok(valid) => {
-            if !valid {
-                debug!("ML-DSA-65 merkle candidate signature verification failed");
-            }
-            valid
-        }
-        Err(e) => {
-            debug!("ML-DSA-65 merkle candidate verification error: {e}");
-            false
-        }
-    }
-}
+// Wire-side signature verification (`verify_quote_content`,
+// `verify_quote_signature`, `verify_merkle_candidate_signature`) lives
+// in `ant_protocol::payment::verify`. Re-exported from
+// `crate::payment` for backwards compatibility.
 
 /// Wire ML-DSA-65 signing from a node identity into a `QuoteGenerator`.
 ///
@@ -410,6 +289,13 @@ pub fn wire_ml_dsa_signer(
 mod tests {
     use super::*;
     use crate::payment::metrics::QuotingMetricsTracker;
+    // Verification helpers live in ant-protocol; import them here so the
+    // long-standing node-side negative tests (tampered keys, swapped
+    // pub keys, wrong timestamp, etc.) keep running against the canonical
+    // wire-side implementation.
+    use ant_protocol::payment::verify::{
+        verify_merkle_candidate_signature, verify_quote_content, verify_quote_signature,
+    };
     use evmlib::common::Amount;
     use saorsa_pqc::pqc::types::MlDsaSecretKey;
 

@@ -138,14 +138,18 @@ impl AntProtocol {
                     self.handle_merkle_candidate_quote(req),
                 )
             }
-            // Response messages are handled by client subscribers
-            // (e.g. send_and_await_chunk_response), not by the protocol
-            // handler. Returning None prevents the caller from sending a
-            // reply, which would create an infinite ping-pong loop.
-            ChunkMessageBody::PutResponse(_)
-            | ChunkMessageBody::GetResponse(_)
-            | ChunkMessageBody::QuoteResponse(_)
-            | ChunkMessageBody::MerkleCandidateQuoteResponse(_) => return Ok(None),
+            // Anything else — response messages are handled by client
+            // subscribers (e.g. send_and_await_chunk_response), not by the
+            // protocol handler. Returning None prevents the caller from
+            // sending a reply, which would create an infinite ping-pong
+            // loop.
+            //
+            // `ChunkMessageBody` is `#[non_exhaustive]` in ant-protocol, so
+            // a future wire variant added on a protocol minor bump also
+            // lands here and is dropped. The CHUNK_PROTOCOL_ID multistream-
+            // select handshake version-gates peers, so this arm should
+            // only be reached by a misconfigured peer.
+            _ => return Ok(None),
         };
 
         let response = ChunkMessage {
@@ -824,7 +828,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_candidate_quote_request() {
-        use crate::payment::quote::verify_merkle_candidate_signature;
+        use ant_protocol::payment::verify::verify_merkle_candidate_signature;
         use evmlib::merkle_payments::MerklePaymentCandidateNode;
 
         // create_test_protocol already wires ML-DSA-65 signing

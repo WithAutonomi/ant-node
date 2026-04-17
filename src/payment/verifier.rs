@@ -10,8 +10,8 @@ use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
-use crate::payment::quote::{verify_quote_content, verify_quote_signature};
 use crate::payment::single_node::SingleNodePayment;
+use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
@@ -369,6 +369,15 @@ impl PaymentVerifier {
                             let tag = proof.first().copied().unwrap_or(0);
                             return Err(Error::Payment(format!(
                                 "Unknown payment proof type tag: 0x{tag:02x}"
+                            )));
+                        }
+                        // ant-protocol marks `ProofType` as `#[non_exhaustive]`.
+                        // A future proof variant that this node does not yet
+                        // understand must be rejected, not silently accepted.
+                        Some(_) => {
+                            let tag = proof.first().copied().unwrap_or(0);
+                            return Err(Error::Payment(format!(
+                                "Unsupported payment proof type tag: 0x{tag:02x} (this node's protocol version does not handle it — upgrade ant-node)"
                             )));
                         }
                     }

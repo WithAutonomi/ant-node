@@ -1,49 +1,36 @@
 //! Protocol helpers for ant-node client operations.
 //!
-//! This module provides low-level protocol support for client-node communication.
-//! For high-level client operations, use the `ant-client` crate instead.
+//! This module provides low-level protocol support for client-node
+//! communication. For high-level client operations, use the `ant-client`
+//! crate instead.
 //!
 //! # Architecture
 //!
-//! This module contains:
-//!
-//! 1. **Protocol message handlers**: Send/await pattern for chunks
-//! 2. **Data types**: Common types like `XorName`, `DataChunk`, address computation
-//!
-//! # Migration Note
-//!
-//! The `QuantumClient` has been deprecated and consolidated into `ant-client::Client`.
-//! Use `ant-client` for all client operations.
+//! As of 0.11, the shared protocol types and helpers live in the
+//! [`ant_protocol`] crate. This module re-exports them so existing
+//! callers of `ant_node::client::*` continue to compile; new code
+//! should prefer `ant_protocol::*` directly.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use ant_client::Client; // Use ant-client instead of QuantumClient
+//! use ant_client::Client;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // High-level client API
 //!     let client = Client::connect(&bootstrap_peers, Default::default()).await?;
-//!
-//!     // Store data with payment
 //!     let address = client.chunk_put(bytes::Bytes::from("hello world")).await?;
-//!
-//!     // Retrieve data
 //!     let chunk = client.chunk_get(&address).await?;
-//!
 //!     Ok(())
 //! }
 //! ```
 
-mod chunk_protocol;
-mod data_types;
-
-pub use chunk_protocol::send_and_await_chunk_response;
-pub use data_types::{
-    compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk, XorName,
+pub use ant_protocol::chunk_protocol::send_and_await_chunk_response;
+pub use ant_protocol::data_types::{
+    compute_address, peer_id_to_xor_name, xor_distance, ChunkStats, DataChunk,
 };
+pub use ant_protocol::XorName;
 
-// Re-export hex_node_id_to_encoded_peer_id for payment operations
 use crate::error::{Error, Result};
 use evmlib::EncodedPeerId;
 

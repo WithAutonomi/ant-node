@@ -1,66 +1,25 @@
-//! ANT protocol implementation for the Autonomi network.
+//! Wire protocol re-exports from the [`ant_protocol`] crate.
 //!
-//! This module implements the wire protocol for storing and retrieving
-//! data on the Autonomi network.
+//! This module existed as first-party ant-node code until version 0.11.
+//! The wire contract now lives in the [`ant_protocol`] crate so
+//! `ant-client` and `ant-node` can evolve their release cycles
+//! independently. Everything this module previously exported is
+//! re-exported below verbatim, including the `chunk` submodule path so
+//! downstream callers of `ant_node::ant_protocol::chunk::*` keep working.
 //!
-//! # Data Types
-//!
-//! The ANT protocol supports a single data type:
-//!
-//! - **Chunk**: Immutable, content-addressed data (hash == address)
-//!
-//! # Protocol Overview
-//!
-//! The protocol uses postcard serialization for compact, fast encoding.
-//! Each data type has its own message types for PUT/GET operations.
-//!
-//! ## Chunk Messages
-//!
-//! - `ChunkPutRequest` / `ChunkPutResponse` - Store chunks
-//! - `ChunkGetRequest` / `ChunkGetResponse` - Retrieve chunks
-//! - `ChunkQuoteRequest` / `ChunkQuoteResponse` - Request storage quotes
-//!
-//! ## Payment Flow
-//!
-//! 1. Client requests a quote via `ChunkQuoteRequest`
-//! 2. Node returns signed `PaymentQuote` in `ChunkQuoteResponse`
-//! 3. Client pays on Arbitrum via `PaymentVault.payForQuotes()`
-//! 4. Client sends `ChunkPutRequest` with `payment_proof`
-//! 5. Node verifies payment and stores chunk
-//!
-//! # Example
-//!
-//! ```rust,ignore
-//! use ant_node::ant_protocol::{ChunkMessage, ChunkPutRequest, ChunkGetRequest};
-//!
-//! // Create a PUT request
-//! let address = compute_address(&data);
-//! let request = ChunkPutRequest::with_payment(address, data, payment_proof);
-//! let message = ChunkMessage::PutRequest(request);
-//! let bytes = message.encode()?;
-//!
-//! // Decode a response
-//! let response = ChunkMessage::decode(&response_bytes)?;
-//! ```
+//! Internal ant-node code can keep using `crate::ant_protocol::…`; the
+//! imports resolve to the same types they always did. New code should
+//! prefer `ant_protocol::…` directly.
 
-pub mod chunk;
+// Re-export the submodule so `ant_node::ant_protocol::chunk::*` keeps
+// resolving. Using the fully-qualified path `::ant_protocol::chunk`
+// disambiguates from `crate::ant_protocol` (this module).
+pub use ::ant_protocol::chunk;
 
-/// Number of nodes in a Kademlia close group.
-///
-/// Clients fetch quotes from the `CLOSE_GROUP_SIZE` closest nodes to a target
-/// address and select the median-priced quote for payment.
-pub const CLOSE_GROUP_SIZE: usize = 7;
-
-/// Minimum number of close group members that must agree for a decision to be valid.
-///
-/// This is a simple majority: `(CLOSE_GROUP_SIZE / 2) + 1`.
-pub const CLOSE_GROUP_MAJORITY: usize = (CLOSE_GROUP_SIZE / 2) + 1;
-
-// Re-export chunk types for convenience
-pub use chunk::{
+pub use ::ant_protocol::chunk::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse, ProtocolError, XorName, CHUNK_PROTOCOL_ID, DATA_TYPE_CHUNK,
-    MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE, PROOF_TAG_MERKLE, PROOF_TAG_SINGLE_NODE,
-    PROTOCOL_VERSION, XORNAME_LEN,
+    MerkleCandidateQuoteResponse, ProtocolError, XorName, CHUNK_PROTOCOL_ID, CLOSE_GROUP_MAJORITY,
+    CLOSE_GROUP_SIZE, DATA_TYPE_CHUNK, MAX_CHUNK_SIZE, MAX_WIRE_MESSAGE_SIZE, PROOF_TAG_MERKLE,
+    PROOF_TAG_SINGLE_NODE, PROTOCOL_VERSION, XORNAME_LEN,
 };

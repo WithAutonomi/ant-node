@@ -23,6 +23,18 @@ name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
+# Wire protocol — the single version-pin shared with ant-client.
+# Bumping ant-protocol's `evmlib`/`saorsa-core`/`saorsa-pqc` pins ripples
+# through here automatically; we keep a direct saorsa-core dep for
+# node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
+# Cargo unifies with ant-protocol's version constraint.
+#
+# TODO: swap to `ant-protocol = "2.0.0"` once 2.0.0 is on crates.io.
+# Until then, the git pin tracks the matching saorsa-core lineage
+# (the rc-2026.4.2 branch) so Cargo can unify the wire types here
+# with ant-protocol's re-exports.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "chore/repin-saorsa-core-rc-2026.4.2" }
+
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.24.0"
 saorsa-pqc = "0.5"
