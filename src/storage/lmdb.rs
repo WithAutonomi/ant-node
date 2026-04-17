@@ -686,7 +686,7 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
 
     // The MDB data file may not exist yet on first run.
     let mdb_file = db_dir.join("data.mdb");
-    let current_db_bytes = std::fs::metadata(&mdb_file).map(|m| m.len()).unwrap_or(0);
+    let current_db_bytes = std::fs::metadata(&mdb_file).map_or(0, |m| m.len());
 
     // available_space excludes the DB file, so we add it back to get the
     // total space the DB could occupy while still leaving `reserve` free.
