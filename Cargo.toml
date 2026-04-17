@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -24,7 +24,7 @@ path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.23.0"
+saorsa-core = "0.23.1"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
