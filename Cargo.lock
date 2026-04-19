@@ -4776,7 +4776,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#70ef2086e83451da3a7f84512f9c9f75b8ffa8b3"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#84e12623349a434b187be415aa0942061fbbce5a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4890,8 +4890,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "250826f52ac60992947359218d83c21f658aa85407e3980a5dbb258eff4c0cc3"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=debug/identity-exchange-probe#99659550789646702cd4067203c77dd6c36d9f92"
 dependencies = [
  "anyhow",
  "async-trait",
