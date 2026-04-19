@@ -4776,8 +4776,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d459ba0e4f1a3ac918a1d6b17db392cccde2ee74569545d171d7644fc6463cc7"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#b38d8c58796735f8f06653e97ed930c4ede4e704"
 dependencies = [
  "anyhow",
  "async-trait",
