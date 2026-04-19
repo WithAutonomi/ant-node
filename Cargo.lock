@@ -4776,7 +4776,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#84e12623349a434b187be415aa0942061fbbce5a"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#d64ab0a47c76bc3358dec434d8dadca896e7398a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4890,7 +4890,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.32.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=debug/identity-exchange-probe#99659550789646702cd4067203c77dd6c36d9f92"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=debug/identity-exchange-probe#6a5e3531c2a3f5dc162b495a05f15cb160b78ee4"
 dependencies = [
  "anyhow",
  "async-trait",
