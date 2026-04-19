@@ -4776,7 +4776,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.23.1"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#b38d8c58796735f8f06653e97ed930c4ede4e704"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=debug/identity-exchange-probe#70ef2086e83451da3a7f84512f9c9f75b8ffa8b3"
 dependencies = [
  "anyhow",
  "async-trait",
