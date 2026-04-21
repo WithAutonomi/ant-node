@@ -325,7 +325,7 @@ impl NodeBuilder {
         let mut monitor = UpgradeMonitor::new(
             config.upgrade.github_repo.clone(),
             config.upgrade.channel,
-            config.upgrade.check_interval_hours,
+            config.upgrade.check_interval_minutes,
         );
 
         if let Ok(cache_dir) = upgrade_cache_dir() {
