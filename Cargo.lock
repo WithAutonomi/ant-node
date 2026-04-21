@@ -2292,6 +2292,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum_dispatch"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
+dependencies = [
+ "once_cell",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4775,9 +4787,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d459ba0e4f1a3ac918a1d6b17db392cccde2ee74569545d171d7644fc6463cc7"
+version = "0.22.0"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick/always-masque-relay-rebased#007e06c8759da23cfc5eeb942093a59578bb238e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4891,8 +4902,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "250826f52ac60992947359218d83c21f658aa85407e3980a5dbb258eff4c0cc3"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick/always-masque-relay-rebased#87f92d022d10d00d874fc69e3fb4b268e84719b0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4904,6 +4914,7 @@ dependencies = [
  "core-foundation 0.9.4",
  "dashmap",
  "dirs 5.0.1",
+ "enum_dispatch",
  "futures-util",
  "hex",
  "igd-next",
