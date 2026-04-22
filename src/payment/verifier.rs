@@ -126,10 +126,11 @@ pub struct PaymentVerifier {
     /// within a batch (256 chunks × 1 pool = 1 lookup instead of 256).
     closeness_pass_cache: Mutex<LruCache<PoolHash, ()>>,
     /// In-flight closeness lookups, keyed by pool hash. Lets concurrent PUTs
-    /// for the same pool coalesce onto a single Kademlia lookup, which bounds
-    /// `DoS` amplification: `N` concurrent forged-pool PUTs cost at most one
-    /// lookup, not `N`.
-    inflight_closeness: Mutex<LruCache<PoolHash, Arc<tokio::sync::Notify>>>,
+    /// for the same pool coalesce onto a single Kademlia lookup AND share
+    /// its result — on both success and failure — which bounds `DoS`
+    /// amplification to one lookup per unique `pool_hash` regardless of
+    /// concurrency.
+    inflight_closeness: Mutex<LruCache<PoolHash, Arc<ClosenessSlot>>>,
     /// P2P node handle, attached post-construction so merkle verification can
     /// check that candidate `pub_keys` map to peers actually close to the pool
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
@@ -139,20 +140,79 @@ pub struct PaymentVerifier {
     config: PaymentVerifierConfig,
 }
 
-/// Drop guard that clears the inflight-closeness slot and wakes all waiters
-/// when the leader of a pool-hash verification finishes (success, failure,
-/// panic, or early return all run the guard).
+/// Shared state for an inflight closeness verification. The leader publishes
+/// its result via the `OnceLock`; waiters read that result directly instead
+/// of racing on a cache re-check. Wrapped in an `Arc` and held both by the
+/// leader's drop guard and by each waiting task.
+struct ClosenessSlot {
+    notify: Arc<tokio::sync::Notify>,
+    /// `Some(Ok(()))` on success, `Some(Err(msg))` on failure, `None` if the
+    /// leader disappeared without publishing (panic, cancellation).
+    result: std::sync::OnceLock<std::result::Result<(), String>>,
+}
+
+impl ClosenessSlot {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(tokio::sync::Notify::new()),
+            result: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Build an owned `Notified` future that snapshots the `notify_waiters`
+    /// counter at call time. Awaiting this future after dropping external
+    /// locks is race-free: if `notify_waiters` fires between construction
+    /// and the first poll, the snapshot mismatch resolves the future
+    /// immediately.
+    fn notified_owned(&self) -> tokio::sync::futures::OwnedNotified {
+        Arc::clone(&self.notify).notified_owned()
+    }
+}
+
+/// Drop guard that publishes the leader's result, clears the inflight slot,
+/// and wakes all waiters. Fires on every exit path: success, failure, panic,
+/// future-cancellation.
+///
+/// The guard owns its own `Arc<ClosenessSlot>` so `notify_waiters` still
+/// fires even if LRU pressure evicted the slot before the leader finished.
+/// Waiters see the published result via `result.get()`; the `Notify` is only
+/// the wake-up signal.
 struct InflightGuard<'a> {
-    slot: &'a Mutex<LruCache<PoolHash, Arc<tokio::sync::Notify>>>,
+    slot_cache: &'a Mutex<LruCache<PoolHash, Arc<ClosenessSlot>>>,
     pool_hash: PoolHash,
+    slot: Arc<ClosenessSlot>,
+}
+
+impl InflightGuard<'_> {
+    /// Publish the leader's result. Called exactly once by the leader on
+    /// every successful or explicit-error exit. If dropped without calling
+    /// (panic, cancellation) the guard still wakes waiters but leaves
+    /// `result` empty, which waiters treat as a transient failure and retry.
+    fn publish(&self, result: &Result<()>) {
+        let stored: std::result::Result<(), String> = match result {
+            Ok(()) => Ok(()),
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = self.slot.result.set(stored);
+    }
 }
 
 impl Drop for InflightGuard<'_> {
     fn drop(&mut self) {
-        let mut slot = self.slot.lock();
-        if let Some(notify) = slot.pop(&self.pool_hash) {
-            notify.notify_waiters();
+        // Remove the slot entry if it's still ours. A separate leader may
+        // have inserted a new slot for the same pool_hash after LRU
+        // eviction — don't pop someone else's entry.
+        {
+            let mut cache = self.slot_cache.lock();
+            if let Some(existing) = cache.peek(&self.pool_hash) {
+                if Arc::ptr_eq(existing, &self.slot) {
+                    cache.pop(&self.pool_hash);
+                }
+            }
         }
+        // Wake every waiter registered against OUR slot, regardless of
+        // whether the cache entry is still ours.
+        self.slot.notify.notify_waiters();
     }
 }
 
@@ -173,6 +233,18 @@ impl PaymentVerifier {
 
         let cache_capacity = config.cache_capacity;
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
+
+        // Loud warning if a production binary was accidentally built with
+        // `test-utils`: that feature flips the closeness-check fail-open
+        // switch, disabling the pay-yourself defence when P2PNode isn't
+        // attached. Safe in tests, never intended for prod.
+        #[cfg(feature = "test-utils")]
+        crate::logging::error!(
+            "PaymentVerifier: built with `test-utils` feature — merkle closeness \
+             defence falls back to fail-open when no P2PNode is attached. This \
+             feature is for test binaries only; production nodes must be built \
+             without it."
+        );
 
         Self {
             cache,
@@ -587,54 +659,85 @@ impl PaymentVerifier {
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
         pool_hash: PoolHash,
     ) -> Result<()> {
-        // Fast path: this node already verified closeness for this pool.
+        // Fast path: this node already verified this pool successfully.
         // A batch of 256 chunks shares one winner_pool, so without this cache
         // we'd pay a Kademlia lookup per chunk.
-        {
-            let mut cache = self.closeness_pass_cache.lock();
-            if cache.get(&pool_hash).is_some() {
-                return Ok(());
-            }
+        if self.closeness_pass_cache.lock().get(&pool_hash).is_some() {
+            return Ok(());
         }
 
-        // Single-flight: if another task is already verifying this pool,
-        // wait on its completion and re-check the cache. Collapses a
-        // concurrent storm of forged-pool PUTs to at most one live Kademlia
-        // lookup per unique pool_hash.
-        let wait_for = {
-            let mut inflight = self.inflight_closeness.lock();
-            let existing = inflight.get(&pool_hash).map(Arc::clone);
-            if existing.is_none() {
-                let notify = Arc::new(tokio::sync::Notify::new());
-                inflight.put(pool_hash, notify);
+        // Single-flight: on each attempt, either claim leadership by
+        // inserting a fresh `ClosenessSlot`, or wait on an existing leader
+        // and read its published result. The leader holds an `Arc` to the
+        // slot independent of the LruCache so waiters are still woken if
+        // eviction pressure kicked the cache entry.
+        //
+        // The `notified_owned()` future snapshots the `notify_waiters`
+        // counter at the moment of construction (while we hold the lock),
+        // which makes the subsequent `.await` race-free: if the leader
+        // calls `notify_waiters` between our construction and our poll, the
+        // counter has advanced and the future resolves immediately on first
+        // poll.
+        loop {
+            // Release the mutex guard explicitly before any await below.
+            // Clippy wants `if let ... else` written as `map_or_else`, but
+            // any such rewrite re-borrows the locked `inflight` inside the
+            // closure and fails the borrow checker — so the lint is
+            // silenced here.
+            #[allow(clippy::option_if_let_else)]
+            let (waiter_slot, leader_slot) = {
+                let mut inflight = self.inflight_closeness.lock();
+                let chosen = if let Some(existing) = inflight.get(&pool_hash) {
+                    (Some(Arc::clone(existing)), None)
+                } else {
+                    let slot = Arc::new(ClosenessSlot::new());
+                    inflight.put(pool_hash, Arc::clone(&slot));
+                    (None, Some(slot))
+                };
+                drop(inflight);
+                chosen
+            };
+
+            if let Some(slot) = waiter_slot {
+                // Build the owned-notified future BEFORE awaiting, so it
+                // snapshots the `notify_waiters` counter now. The slot
+                // already existed when we locked, so the leader is either
+                // running or finished; in both cases the snapshot + counter
+                // check ensures we wake up correctly.
+                let notified = slot.notified_owned();
+                notified.await;
+
+                // Leader published a result — use it directly.
+                if let Some(result) = slot.result.get() {
+                    return result.clone().map_err(Error::Payment);
+                }
+                // Leader disappeared without publishing (panic or
+                // cancellation). Slot was cleared by the leader's drop
+                // guard; loop to become the new leader.
+                continue;
             }
-            existing
-        };
 
-        if let Some(notify) = wait_for {
-            notify.notified().await;
-            // Leader finished. Re-check the pass cache: hit = leader passed;
-            // miss = leader failed or cache pressure evicted. Fall through on
-            // miss and run our own verification (rare; bounded because the
-            // inflight slot was cleared when the leader completed).
-            let mut cache = self.closeness_pass_cache.lock();
-            if cache.get(&pool_hash).is_some() {
-                return Ok(());
+            // Leader path. Drop guard clears the slot and wakes waiters on
+            // every exit (success, failure, panic, cancellation).
+            let Some(slot) = leader_slot else {
+                // Unreachable by construction.
+                return Err(Error::Payment(
+                    "internal error: neither leader nor waiter in closeness check".into(),
+                ));
+            };
+            let guard = InflightGuard {
+                slot_cache: &self.inflight_closeness,
+                pool_hash,
+                slot,
+            };
+
+            let result = self.verify_merkle_candidate_closeness_inner(pool).await;
+            guard.publish(&result);
+            if result.is_ok() {
+                self.closeness_pass_cache.lock().put(pool_hash, ());
             }
+            return result;
         }
-
-        // We are the leader for this pool_hash. Wake waiters and clear the
-        // inflight slot on all exits via a drop guard.
-        let _guard = InflightGuard {
-            slot: &self.inflight_closeness,
-            pool_hash,
-        };
-
-        let result = self.verify_merkle_candidate_closeness_inner(pool).await;
-        if result.is_ok() {
-            self.closeness_pass_cache.lock().put(pool_hash, ());
-        }
-        result
     }
 
     /// Inner closeness check: the actual DHT lookup + set-membership test.
@@ -1004,6 +1107,7 @@ impl PaymentVerifier {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use evmlib::merkle_payments::MerklePaymentCandidatePool;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
     /// pre-populate the cache to bypass on-chain verification.
@@ -1744,6 +1848,89 @@ mod tests {
             let found = verifier.pool_cache.lock().get(&other_hash).cloned();
             assert!(found.is_none(), "Unknown pool hash should not be in cache");
         }
+    }
+
+    #[tokio::test]
+    async fn closeness_pass_cache_short_circuits_second_call() {
+        // When a pool_hash is in the closeness_pass_cache, the outer
+        // verify_merkle_candidate_closeness must return Ok(()) without
+        // running the inner lookup — even if no P2PNode is attached.
+        // That second half (no-p2p → would normally fail-closed in release)
+        // is the proof the cache short-circuit ran first.
+        let verifier = create_test_verifier();
+        let pool_hash = [0xAAu8; 32];
+        verifier.closeness_pass_cache.lock().put(pool_hash, ());
+
+        // Construct a dummy pool — contents don't matter because the cache
+        // hit means we never look at them.
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: fake_midpoint_proof(),
+            candidate_nodes: make_candidate_nodes(1_700_000_000),
+        };
+
+        let result = verifier
+            .verify_merkle_candidate_closeness(&pool, pool_hash)
+            .await;
+        assert!(
+            result.is_ok(),
+            "cached pool hash must bypass the inner check and return Ok(()), got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closeness_single_flight_concurrent_readers_share_one_verification() {
+        // Two concurrent callers for the same pool_hash should produce the
+        // same outcome, and the cache should end up populated exactly once.
+        // We use the test-utils fail-open path to short-circuit the inner
+        // DHT lookup; the purpose of this test is the single-flight
+        // plumbing, not the lookup itself.
+        let verifier = Arc::new(create_test_verifier());
+        let pool_hash = [0x77u8; 32];
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: fake_midpoint_proof(),
+            candidate_nodes: make_candidate_nodes(1_700_000_000),
+        };
+
+        let v1 = Arc::clone(&verifier);
+        let p1 = pool.clone();
+        let v2 = Arc::clone(&verifier);
+        let p2 = pool.clone();
+
+        let (r1, r2) = tokio::join!(
+            async move { v1.verify_merkle_candidate_closeness(&p1, pool_hash).await },
+            async move { v2.verify_merkle_candidate_closeness(&p2, pool_hash).await },
+        );
+
+        assert_eq!(r1.is_ok(), r2.is_ok(), "concurrent callers must agree");
+        assert!(
+            r1.is_ok(),
+            "both callers must succeed on the test-utils path"
+        );
+        assert!(
+            verifier
+                .closeness_pass_cache
+                .lock()
+                .get(&pool_hash)
+                .is_some(),
+            "success path must populate the pass cache"
+        );
+        assert!(
+            verifier.inflight_closeness.lock().get(&pool_hash).is_none(),
+            "inflight slot must be cleared after the leader finishes"
+        );
+    }
+
+    /// Build a deterministic but otherwise-unused `MidpointProof` so unit
+    /// tests can construct a `MerklePaymentCandidatePool` without spinning
+    /// up a real merkle tree. The closeness path only calls `.address()`
+    /// on it, which is a pure BLAKE3 of the branch's leaf/root/timestamp —
+    /// the values don't need to be tree-valid for these tests.
+    fn fake_midpoint_proof() -> evmlib::merkle_payments::MidpointProof {
+        // Build a minimal tree of two leaves so we get a real branch.
+        let leaves = vec![xor_name::XorName([1u8; 32]), xor_name::XorName([2u8; 32])];
+        let tree = evmlib::merkle_payments::MerkleTree::from_xornames(leaves).expect("tree");
+        let candidates = tree.reward_candidates(1_700_000_000).expect("candidates");
+        candidates.first().expect("at least one").clone()
     }
 
     // =========================================================================
