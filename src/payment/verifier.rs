@@ -121,6 +121,15 @@ pub struct PaymentVerifier {
     cache: VerifiedCache,
     /// LRU cache of verified merkle pool hashes → on-chain payment info.
     pool_cache: Mutex<LruCache<PoolHash, OnChainPaymentInfo>>,
+    /// LRU cache of pool hashes whose candidate closeness has already been
+    /// verified by this node. Collapses the per-chunk Kademlia lookup cost
+    /// within a batch (256 chunks × 1 pool = 1 lookup instead of 256).
+    closeness_pass_cache: Mutex<LruCache<PoolHash, ()>>,
+    /// In-flight closeness lookups, keyed by pool hash. Lets concurrent PUTs
+    /// for the same pool coalesce onto a single Kademlia lookup, which bounds
+    /// `DoS` amplification: `N` concurrent forged-pool PUTs cost at most one
+    /// lookup, not `N`.
+    inflight_closeness: Mutex<LruCache<PoolHash, Arc<tokio::sync::Notify>>>,
     /// P2P node handle, attached post-construction so merkle verification can
     /// check that candidate `pub_keys` map to peers actually close to the pool
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
@@ -128,6 +137,23 @@ pub struct PaymentVerifier {
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
     /// Configuration.
     config: PaymentVerifierConfig,
+}
+
+/// Drop guard that clears the inflight-closeness slot and wakes all waiters
+/// when the leader of a pool-hash verification finishes (success, failure,
+/// panic, or early return all run the guard).
+struct InflightGuard<'a> {
+    slot: &'a Mutex<LruCache<PoolHash, Arc<tokio::sync::Notify>>>,
+    pool_hash: PoolHash,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.slot.lock();
+        if let Some(notify) = slot.pop(&self.pool_hash) {
+            notify.notify_waiters();
+        }
+    }
 }
 
 impl PaymentVerifier {
@@ -142,6 +168,8 @@ impl PaymentVerifier {
         let pool_cache_size =
             NonZeroUsize::new(DEFAULT_POOL_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
         let pool_cache = Mutex::new(LruCache::new(pool_cache_size));
+        let closeness_pass_cache = Mutex::new(LruCache::new(pool_cache_size));
+        let inflight_closeness = Mutex::new(LruCache::new(pool_cache_size));
 
         let cache_capacity = config.cache_capacity;
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
@@ -149,6 +177,8 @@ impl PaymentVerifier {
         Self {
             cache,
             pool_cache,
+            closeness_pass_cache,
+            inflight_closeness,
             p2p_node: RwLock::new(None),
             config,
         }
@@ -159,10 +189,12 @@ impl PaymentVerifier {
     /// pool midpoint.
     ///
     /// Production startup MUST call this once the `P2PNode` exists. Without
-    /// it, the closeness check fails open (logs a warning and skips) so that
-    /// unit tests which never exercise merkle verification still work.
+    /// it, the closeness check fails CLOSED in release builds (rejects the
+    /// PUT with a visible error) and fails open in test builds. Idempotent:
+    /// calling twice replaces the handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
         *self.p2p_node.write() = Some(node);
+        debug!("PaymentVerifier: P2PNode attached for merkle closeness checks");
     }
 
     /// Check if payment is required for the given `XorName`.
@@ -488,19 +520,31 @@ impl PaymentVerifier {
     /// Minimum number of candidate `pub_keys` (out of 16) whose derived `PeerId`
     /// must match the DHT's actual closest peers to the pool midpoint address.
     ///
-    /// Set to a majority rather than 16/16 so routing-table skew between the
-    /// payer's view and this node's view is tolerated. 9/16 absorbs small
-    /// divergence while still biting on fabricated pools: BLAKE3 of a random
-    /// ML-DSA key lands uniformly in the 2^256 ID space, so an attacker
-    /// without real peer identities cannot plant 9 `pub_keys` into the exact
-    /// close group of an arbitrary target address.
-    const CANDIDATE_CLOSENESS_REQUIRED: usize = 9;
+    /// Set below 16/16 to absorb normal routing-table skew between the
+    /// payer's view and this node's view — on a well-connected network the
+    /// divergence between two nodes' closest-set views is typically 1-2
+    /// peers, occasionally 3 during churn. 13/16 tolerates 3 divergent
+    /// peers while still limiting how many candidates an attacker can
+    /// fabricate before the check bites. A lower threshold (e.g. 9/16)
+    /// would let an attacker who controls 7 real neighbourhood peers plant
+    /// 7 fabricated candidates and still pass.
+    ///
+    /// This is the pure "fabricated key" defence; it does not stop an
+    /// attacker who can grind the pool midpoint address to land near 13
+    /// pre-chosen keys AND run those keys as Sybil DHT participants. That
+    /// requires an orthogonal Sybil-resistance layer and is out of scope
+    /// for this check.
+    const CANDIDATE_CLOSENESS_REQUIRED: usize = 13;
 
     /// Timeout for the authoritative network lookup used by the closeness
-    /// check. A forged pool can trigger exactly one bounded Kademlia lookup;
-    /// subsequent chunks from the same batch hit the pool cache and pay no
-    /// extra cost.
-    const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// check.
+    ///
+    /// Iterative Kademlia lookups can cascade through up to 20 iterations,
+    /// and a single unresponsive peer's dial can take 20-30s before timing
+    /// out. 60s leaves room for the lookup to converge even under churn
+    /// while still capping `DoS` amplification at roughly one bounded lookup
+    /// per forged `pool_hash`.
+    const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
     /// Verify that the candidate pool's `pub_keys` correspond to peers that
     /// are actually XOR-closest to the pool midpoint address, by querying
@@ -526,7 +570,78 @@ impl PaymentVerifier {
     /// node that receives the proof independently re-runs this check against
     /// that same pool, so a forged pool is rejected at every node it
     /// reaches.
+    ///
+    /// **Known limitation — Sybil-grinding**: `midpoint_proof.address()` is a
+    /// BLAKE3 hash of attacker-controllable inputs (leaf bytes, tree root,
+    /// timestamp). A determined attacker who *also* runs Sybil DHT nodes can
+    /// grind the midpoint until it lands in a region where 13 of their
+    /// Sybil keys are the true network-closest — at which point this check
+    /// passes for the attacker. Closing that gap requires binding the
+    /// midpoint to an attacker-uncontrolled value (e.g. a block hash at
+    /// payment time or an on-chain VRF) or a Sybil-resistant identity
+    /// layer. This defence raises the attack cost from "free" to "run N
+    /// Sybil nodes AND grind", which is a meaningful but not complete
+    /// improvement.
     async fn verify_merkle_candidate_closeness(
+        &self,
+        pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
+        pool_hash: PoolHash,
+    ) -> Result<()> {
+        // Fast path: this node already verified closeness for this pool.
+        // A batch of 256 chunks shares one winner_pool, so without this cache
+        // we'd pay a Kademlia lookup per chunk.
+        {
+            let mut cache = self.closeness_pass_cache.lock();
+            if cache.get(&pool_hash).is_some() {
+                return Ok(());
+            }
+        }
+
+        // Single-flight: if another task is already verifying this pool,
+        // wait on its completion and re-check the cache. Collapses a
+        // concurrent storm of forged-pool PUTs to at most one live Kademlia
+        // lookup per unique pool_hash.
+        let wait_for = {
+            let mut inflight = self.inflight_closeness.lock();
+            let existing = inflight.get(&pool_hash).map(Arc::clone);
+            if existing.is_none() {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                inflight.put(pool_hash, notify);
+            }
+            existing
+        };
+
+        if let Some(notify) = wait_for {
+            notify.notified().await;
+            // Leader finished. Re-check the pass cache: hit = leader passed;
+            // miss = leader failed or cache pressure evicted. Fall through on
+            // miss and run our own verification (rare; bounded because the
+            // inflight slot was cleared when the leader completed).
+            let mut cache = self.closeness_pass_cache.lock();
+            if cache.get(&pool_hash).is_some() {
+                return Ok(());
+            }
+        }
+
+        // We are the leader for this pool_hash. Wake waiters and clear the
+        // inflight slot on all exits via a drop guard.
+        let _guard = InflightGuard {
+            slot: &self.inflight_closeness,
+            pool_hash,
+        };
+
+        let result = self.verify_merkle_candidate_closeness_inner(pool).await;
+        if result.is_ok() {
+            self.closeness_pass_cache.lock().put(pool_hash, ());
+        }
+        result
+    }
+
+    /// Inner closeness check: the actual DHT lookup + set-membership test.
+    /// Wrapped by [`verify_merkle_candidate_closeness`] with a pass-cache and
+    /// single-flight guard so a batch of chunks and a storm of forged PUTs
+    /// don't multiply the lookup cost.
+    async fn verify_merkle_candidate_closeness_inner(
         &self,
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
     ) -> Result<()> {
@@ -534,15 +649,35 @@ impl PaymentVerifier {
         // across an iterative Kademlia lookup.
         let attached = self.p2p_node.read().as_ref().map(Arc::clone);
         let Some(p2p_node) = attached else {
-            // Production startup must call attach_p2p_node. The fail-open
-            // path is only reachable in unit-test setups that construct a
-            // PaymentVerifier directly without exercising merkle checks.
-            crate::logging::warn!(
-                "PaymentVerifier: no P2PNode attached; merkle pay-yourself \
-                 defence DISABLED. Call PaymentVerifier::attach_p2p_node \
-                 during node startup."
-            );
-            return Ok(());
+            // Production must call attach_p2p_node at startup. Fail CLOSED
+            // to avoid silently disabling the defence if a startup path
+            // regresses and loses the attach call. Unit-test builds that
+            // construct a PaymentVerifier directly without exercising merkle
+            // verification are opted-in via `test-utils` to fall back to
+            // fail-open.
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                crate::logging::warn!(
+                    "PaymentVerifier: no P2PNode attached; merkle pay-yourself \
+                     defence SKIPPED (test build). Production startup MUST call \
+                     PaymentVerifier::attach_p2p_node."
+                );
+                return Ok(());
+            }
+            #[cfg(not(any(test, feature = "test-utils")))]
+            {
+                crate::logging::error!(
+                    "PaymentVerifier: no P2PNode attached; rejecting merkle \
+                     payment. This is a node-startup bug — \
+                     PaymentVerifier::attach_p2p_node must be called before \
+                     any PUT handler runs."
+                );
+                return Err(Error::Payment(
+                    "Merkle candidate pool rejected: verifier is not wired to \
+                     the P2P layer; cannot verify candidate closeness."
+                        .into(),
+                ));
+            }
         };
 
         let pool_address = pool.midpoint_proof.address();
@@ -674,8 +809,10 @@ impl PaymentVerifier {
         // this, an attacker can point all 16 reward_address fields at a
         // self-owned wallet and drain their own payment. Every storing node
         // runs this check against the single `winner_pool` in the proof, so a
-        // forged pool is rejected everywhere it lands.
-        self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool)
+        // forged pool is rejected everywhere it lands. The pass cache and
+        // single-flight keyed on pool_hash collapse the Kademlia lookup cost
+        // within a batch and across concurrent PUTs for the same pool.
+        self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool, pool_hash)
             .await?;
 
         // Check pool cache first
