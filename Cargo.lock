@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.10.1"
+version = "0.24.0-rc.1"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
@@ -4650,9 +4650,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.38"
+version = "0.23.39"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69f9466fb2c14ea04357e91413efb882e2a6d4a406e625449bc0a5d360d53a21"
+checksum = "7c2c118cb077cca2822033836dfb1b975355dfb784b5e8da48f7b6c5db74e60e"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -4788,8 +4788,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.22.0"
-source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick/always-masque-relay-rebased#d37491fd2ead4b2e81f85a8d3c43e707bbafacc7"
+version = "0.24.0-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=rc-2026.4.2#a2813e83526c70048f5a564848b05e8088d786e4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4902,8 +4902,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.31.0"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick/always-masque-relay-rebased#ec163406f526f42667f12a1ed4f5b6ec0ed4e02e"
+version = "0.33.0-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.2#8b44b242fd62023c1a96728382ddd72917a63a4a"
 dependencies = [
  "anyhow",
  "async-trait",
