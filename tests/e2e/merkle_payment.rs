@@ -9,8 +9,9 @@
 //! - Merkle proof with tampered candidate signatures rejected
 //! - Merkle proof construction, serialization, and size validation
 //! - Concurrent merkle proof verification across multiple nodes
+//! - Pay-yourself attack rejected (fabricated candidate pool)
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::harness::TestHarness;
 use super::testnet::TestNetworkConfig;
@@ -25,7 +26,7 @@ use ant_node::payment::{
 use evmlib::common::Amount;
 use evmlib::merkle_payments::{
     MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
-    CANDIDATES_PER_POOL,
+    OnChainPaymentInfo, CANDIDATES_PER_POOL,
 };
 use evmlib::testnet::Testnet;
 use evmlib::RewardsAddress;
@@ -469,6 +470,121 @@ async fn test_attack_merkle_proof_cross_address_replay() -> Result<(), Box<dyn s
         "Cross-address replay MUST be rejected, got: {response:?}"
     );
     info!("Correctly rejected: cross-address replay within same tree");
+
+    harness.teardown().await?;
+    Ok(())
+}
+
+// ===========================================================================
+// Category 7: Pay-yourself attack — fabricated candidate pool
+// ===========================================================================
+
+/// Attack: build a merkle proof where all 16 candidate `pub_keys` are
+/// attacker-generated (not real network peers) and all 16 `reward_address`
+/// fields point to a single attacker-controlled wallet. The payer funds the
+/// on-chain merkle payment themselves; every reward is paid back to them.
+///
+/// The storing node MUST detect that the candidate `pub_keys` are NOT the
+/// network's actual closest peers to the pool midpoint, and reject the PUT.
+///
+/// **Test design**: the on-chain `completedMerklePayments` lookup is bypassed
+/// by pre-populating the storing node's pool cache with a matching
+/// [`OnChainPaymentInfo`]. This isolates the closeness check — the test fails
+/// if and only if the verifier accepts fabricated candidates. Before the
+/// defence is wired, the proof passes every other check and the PUT is
+/// accepted; after the defence, the PUT is rejected with a closeness error.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn std::error::Error>>
+{
+    info!("MERKLE ATTACK TEST: pay-yourself via fabricated candidate pool");
+
+    // Minimal testnet (5 nodes) — attacker-generated candidate pub_keys hash
+    // to PeerIds uniformly across the 2^256 ID space and will not match any
+    // of these 5 nodes' PeerIds with any meaningful probability.
+    let config = TestNetworkConfig::minimal();
+    let harness = TestHarness::setup_with_config(config).await?;
+    // Let routing tables settle so find_closest_nodes_network returns a
+    // stable set.
+    sleep(Duration::from_secs(5)).await;
+
+    let proof = build_valid_merkle_proof();
+
+    // Deserialize to compute the pool hash, then pre-populate the storing
+    // node's pool cache so the on-chain lookup is bypassed. The fake
+    // `OnChainPaymentInfo` is crafted so the proof would pass every OTHER
+    // check (address-proof depth, per-node payment formula, paid-node
+    // addresses). That way the ONLY check capable of rejecting the proof is
+    // the pay-yourself closeness check — giving the test a clean signal.
+    let parsed = ant_node::payment::deserialize_merkle_proof(&proof.tagged_proof)
+        .expect("deserialize forged proof");
+    let pool_hash = parsed.winner_pool_hash();
+    let ts = parsed
+        .winner_pool
+        .candidate_nodes
+        .first()
+        .expect("pool has candidates")
+        .merkle_payment_timestamp;
+    // 4-leaf tree → depth 2 (log2(4)). Prices are all 1024 in
+    // build_candidate_nodes, so per-node payment = 1024 * 2^2 / 2 = 2048.
+    let depth: u8 = 2;
+    let per_node = Amount::from(4096u64);
+    let paid_node_addresses = vec![
+        (RewardsAddress::new([0u8; 20]), 0usize, per_node),
+        (RewardsAddress::new([1u8; 20]), 1usize, per_node),
+    ];
+    let fake_info = OnChainPaymentInfo {
+        depth,
+        merkle_payment_timestamp: ts,
+        paid_node_addresses,
+    };
+
+    let node = harness.test_node(0).ok_or("no test node 0")?;
+    let protocol = node
+        .ant_protocol
+        .as_ref()
+        .ok_or("no ant_protocol on node")?;
+    protocol
+        .payment_verifier()
+        .pool_cache_insert(pool_hash, fake_info);
+
+    let request = ChunkPutRequest::with_payment(
+        proof.target.address.0,
+        proof.target.content.clone(),
+        proof.tagged_proof,
+    );
+
+    let response = send_put_to_node(&harness, 0, request)
+        .await
+        .map_err(|e| format!("Send failed: {e}"))?;
+
+    // Extract the error message so the test can report WHY verification
+    // passed or failed. The pay-yourself defence is the ONLY layer capable of
+    // rejecting this proof once on-chain lookup is bypassed — if the response
+    // is a Success or an unrelated error, the attack works.
+    match response.body {
+        ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::PaymentFailed(
+            ref msg,
+        ))) if msg.contains("closest peers")
+            || msg.contains("closeness")
+            || msg.contains("authoritative network") =>
+        {
+            info!("Correctly rejected pay-yourself attack: {msg}");
+        }
+        ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. }) => {
+            panic!(
+                "Pay-yourself attack SUCCEEDED: verifier accepted a pool of 16 attacker-generated \
+                 candidates all rewarding the payer. Merkle closeness defence is missing."
+            );
+        }
+        other => {
+            panic!(
+                "Pay-yourself attack was rejected for the WRONG reason — expected a closeness \
+                 rejection, got: {other:?}. The closeness defence is missing; the proof only \
+                 failed because of an unrelated check."
+            );
+        }
+    }
 
     harness.teardown().await?;
     Ok(())

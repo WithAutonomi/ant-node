@@ -130,6 +130,15 @@ impl NodeBuilder {
 
         let p2p_arc = Arc::new(p2p_node);
 
+        // Wire the P2PNode handle into the payment verifier so merkle-payment
+        // checks can query the live DHT for peers actually closest to a pool
+        // midpoint (pay-yourself defence).
+        if let Some(ref protocol) = ant_protocol {
+            protocol
+                .payment_verifier_arc()
+                .attach_p2p_node(Arc::clone(&p2p_arc));
+        }
+
         // Initialize replication engine (if storage is enabled)
         let replication_engine =
             if let (Some(ref protocol), Some(fresh_rx)) = (&ant_protocol, fresh_write_rx) {

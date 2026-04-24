@@ -635,6 +635,11 @@ impl Devnet {
         *node.state.write().await = NodeState::Running;
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
+            // Wire the P2PNode into the payment verifier for merkle-closeness checks.
+            protocol
+                .payment_verifier_arc()
+                .attach_p2p_node(Arc::clone(p2p));
+
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);

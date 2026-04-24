@@ -1176,6 +1176,11 @@ impl TestNetwork {
 
         // Start protocol handler that routes incoming P2P messages to AntProtocol
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
+            // Wire the P2PNode into the payment verifier so merkle-payment
+            // verification can run the pay-yourself closeness check against
+            // the live DHT.
+            protocol.payment_verifier().attach_p2p_node(Arc::clone(p2p));
+
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);
             let protocol_clone = Arc::clone(protocol);

@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -24,7 +24,7 @@ path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core.git", branch = "mick/always-masque-relay-rebased" }
+saorsa-core = "0.24.0"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
