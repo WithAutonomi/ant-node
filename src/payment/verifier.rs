@@ -780,10 +780,49 @@ impl PaymentVerifier {
     /// Wrapped by [`verify_merkle_candidate_closeness`] with a pass-cache and
     /// single-flight guard so a batch of chunks and a storm of forged PUTs
     /// don't multiply the lookup cost.
+    /// Derive each candidate's `PeerId` from its `pub_key` and reject the
+    /// pool if any `PeerId` appears more than once.
+    ///
+    /// This is a pure-validation pre-check, runnable without a `P2PNode`:
+    /// catches the case where one real peer's `pub_key` is repeated to
+    /// inflate the closeness match count, without paying for a Kademlia
+    /// lookup. An honest pool has [`evmlib::merkle_payments::CANDIDATES_PER_POOL`]
+    /// distinct candidate `pub_keys` by construction.
+    fn derive_distinct_candidate_peer_ids(
+        pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
+    ) -> Result<Vec<PeerId>> {
+        let mut candidate_peer_ids = Vec::with_capacity(pool.candidate_nodes.len());
+        let mut seen = std::collections::HashSet::with_capacity(pool.candidate_nodes.len());
+        for candidate in &pool.candidate_nodes {
+            let pid = peer_id_from_public_key_bytes(&candidate.pub_key).map_err(|e| {
+                Error::Payment(format!(
+                    "Invalid ML-DSA public key in merkle candidate: {e}"
+                ))
+            })?;
+            if !seen.insert(pid) {
+                return Err(Error::Payment(
+                    "Merkle candidate pool rejected: duplicate candidate PeerId. An \
+                     honest pool has 16 distinct candidate pub_keys; duplicates would \
+                     let a single real peer satisfy the closeness threshold by being \
+                     counted multiple times."
+                        .into(),
+                ));
+            }
+            candidate_peer_ids.push(pid);
+        }
+        Ok(candidate_peer_ids)
+    }
+
+    #[allow(clippy::too_many_lines)]
     async fn verify_merkle_candidate_closeness_inner(
         &self,
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
     ) -> Result<()> {
+        // Pre-check: catch malformed/hostile pools (duplicate candidate
+        // PeerIds) before paying for the Kademlia lookup. Runs in unit
+        // tests without a P2PNode too.
+        let candidate_peer_ids = Self::derive_distinct_candidate_peer_ids(pool)?;
+
         // Release the RwLock guard before any await to avoid holding it
         // across an iterative Kademlia lookup.
         let attached = self.p2p_node.read().as_ref().map(Arc::clone);
@@ -820,20 +859,6 @@ impl PaymentVerifier {
         };
 
         let pool_address = pool.midpoint_proof.address();
-
-        // Derive each candidate's would-be PeerId from its pub_key. Fail
-        // closed on malformed keys — the candidate signature check ran
-        // upstream so a valid-looking pool ought to parse cleanly here.
-        let mut candidate_peer_ids = Vec::with_capacity(pool.candidate_nodes.len());
-        for candidate in &pool.candidate_nodes {
-            let pid = peer_id_from_public_key_bytes(&candidate.pub_key).map_err(|e| {
-                Error::Payment(format!(
-                    "Invalid ML-DSA public key in merkle candidate: {e}"
-                ))
-            })?;
-            candidate_peer_ids.push(pid);
-        }
-
         let lookup_count = pool.candidate_nodes.len();
         let network_lookup = p2p_node
             .dht_manager()
@@ -866,10 +891,32 @@ impl PaymentVerifier {
                 }
             };
 
-        // Set-membership check against the returned closest-peers list. The
-        // lookup may return fewer than `lookup_count` on a sparse network,
-        // which only tightens the bar — any candidate not in the returned
-        // list counts as unmatched.
+        // Sparse-network short-circuit: if the DHT itself returned fewer
+        // peers than the closeness threshold, the proof can never pass —
+        // not because the candidates are forged, but because we don't
+        // have an authoritative view to compare against. Surface this
+        // distinct cause so operators can tell "retry once the network
+        // settles" apart from "this peer sent a forged pool".
+        if network_peers.len() < Self::CANDIDATE_CLOSENESS_REQUIRED {
+            debug!(
+                "Merkle closeness deferred: network lookup returned {} peers \
+                 for pool midpoint {} (need at least {} to verify)",
+                network_peers.len(),
+                hex::encode(pool_address.0),
+                Self::CANDIDATE_CLOSENESS_REQUIRED,
+            );
+            return Err(Error::Payment(format!(
+                "Merkle candidate pool rejected: authoritative DHT lookup returned \
+                 only {} peers, less than the {} required to verify candidate \
+                 closeness. Retry once the routing table populates further.",
+                network_peers.len(),
+                Self::CANDIDATE_CLOSENESS_REQUIRED,
+            )));
+        }
+
+        // Set-membership check against the returned closest-peers list.
+        // Candidate `PeerId`s are deduplicated upstream, so each match
+        // corresponds to a distinct peer.
         let network_set: std::collections::HashSet<PeerId> =
             network_peers.iter().map(|n| n.peer_id).collect();
         let matched = candidate_peer_ids
@@ -2004,6 +2051,40 @@ mod tests {
         assert!(
             err.to_string().contains("forged pool"),
             "waiter must surface the leader's error message, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closeness_rejects_pool_with_duplicate_candidate_pub_keys() {
+        // An attacker who submits 16 copies of the same real peer's pub_key
+        // would otherwise satisfy the 13/16 closeness threshold trivially:
+        // that one peer's membership in the DHT-returned set would count
+        // 16 times. The dedupe check in verify_merkle_candidate_closeness_inner
+        // must reject the pool BEFORE the network lookup runs (so this test
+        // works even with no P2PNode attached).
+        let verifier = create_test_verifier();
+        let pool_hash = [0xDDu8; 32];
+
+        // Build a normal pool, then overwrite every candidate's pub_key
+        // with a single shared key so all 16 derive to the same PeerId.
+        let mut candidates = make_candidate_nodes(1_700_000_000);
+        let shared_pub_key = candidates[0].pub_key.clone();
+        for c in &mut candidates {
+            c.pub_key = shared_pub_key.clone();
+        }
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: fake_midpoint_proof(),
+            candidate_nodes: candidates,
+        };
+
+        let result = verifier
+            .verify_merkle_candidate_closeness(&pool, pool_hash)
+            .await;
+        let err = result.expect_err("duplicate candidate PeerIds must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate candidate PeerId"),
+            "rejection must be the duplicate-PeerId branch, got: {msg}"
         );
     }
 
