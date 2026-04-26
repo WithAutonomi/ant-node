@@ -889,8 +889,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=chore/repin-saorsa-core-rc-2026.4.2#b4360b1802bc6090047a6a67cc2b593402bf52fb"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe630f23f4adae05beba7e2c0861ab9c1a6d2cc88c98898e3742bed3a5a4ce35"
 dependencies = [
  "blake3",
  "bytes",
