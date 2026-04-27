@@ -374,6 +374,7 @@ else
     fi
 
     echo "  Uploading with --merkle (no Auto fallback, surfaces merkle errors)..."
+    UPLOAD_OK=true
     SECRET_KEY="${WALLET_KEY}" RUST_LOG=info "${ANT_CLI}" \
         --devnet-manifest "${MANIFEST_FILE}" \
         --evm-network local \
@@ -383,29 +384,58 @@ else
         -v \
         file upload --merkle "${MERKLE_FILE}" \
         > "${CLI_STDOUT}" 2>"${MERKLE_LOG}" || {
+            UPLOAD_OK=false
             fail "Merkle batch upload" "Upload command failed (exit $?)"
             echo "  Last log lines:"
             tail -20 "${MERKLE_LOG}" 2>/dev/null || true
         }
 
-    if grep -q "Upload complete" "${CLI_STDOUT}" 2>/dev/null; then
-        MERKLE_CHUNKS=$(grep "Chunks:" "${CLI_STDOUT}" | head -1 | grep -oE '[0-9]+' | head -1)
-        # The fixed client logs "Submitting merkle batch payment on-chain (depth=N)" at info level
-        # before calling payForMerkleTree. Confirms we did not hit some other code path
-        # (e.g. a silent Auto-mode fallback to per-chunk `payForQuotes`).
-        if grep -q "Submitting merkle batch payment on-chain" "${MERKLE_LOG}" 2>/dev/null; then
-            MERKLE_DEPTH=$(grep -oE "depth=[0-9]+" "${MERKLE_LOG}" | head -1 | cut -d= -f2)
-            pass "Merkle batch upload (${MERKLE_CHUNKS:-?} chunks, depth=${MERKLE_DEPTH:-?})"
+    # Verify the merkle path actually ran. We assert two independent markers so
+    # a future change that swallows the contract revert (or relabels the success
+    # message) fails this step loudly rather than passing silently.
+    #
+    # Marker 1: stdout "Upload complete" line — proves the CLI itself reported
+    #           success rather than the upload bailing without saying so.
+    # Marker 2: stderr "Submitting merkle batch payment on-chain" log line —
+    #           proves we actually called `payForMerkleTree` and didn't drop
+    #           into Auto-mode per-chunk fallback.
+    if [ "${UPLOAD_OK}" = true ]; then
+        MERKLE_CHUNKS=""
+        MERKLE_DEPTH=""
+
+        if ! grep -q "Upload complete" "${CLI_STDOUT}" 2>/dev/null; then
+            fail "Merkle batch upload" "Upload exited 0 but no 'Upload complete' marker in stdout"
+            echo "  Stdout tail:"
+            tail -10 "${CLI_STDOUT}" 2>/dev/null || true
+            UPLOAD_OK=false
         else
-            fail "Merkle batch upload" "Upload reported success but merkle log line not found in stderr — possible silent fallback"
-            echo "  Stderr tail:"
-            tail -10 "${MERKLE_LOG}" 2>/dev/null || true
+            MERKLE_CHUNKS=$(grep "Chunks:" "${CLI_STDOUT}" | head -1 | grep -oE '[0-9]+' | head -1)
         fi
 
-        # Round-trip: download and SHA256-compare. Client writes the datamap
-        # alongside the source by replacing the extension (foo.bin -> foo.datamap).
+        if ! grep -q "Submitting merkle batch payment on-chain" "${MERKLE_LOG}" 2>/dev/null; then
+            fail "Merkle batch upload" "Merkle log line not found in stderr — possible silent fallback"
+            echo "  Stderr tail:"
+            tail -10 "${MERKLE_LOG}" 2>/dev/null || true
+            UPLOAD_OK=false
+        else
+            MERKLE_DEPTH=$(grep -oE "depth=[0-9]+" "${MERKLE_LOG}" | head -1 | cut -d= -f2)
+        fi
+
+        if [ "${UPLOAD_OK}" = true ]; then
+            pass "Merkle batch upload (${MERKLE_CHUNKS:-?} chunks, depth=${MERKLE_DEPTH:-?})"
+        fi
+    fi
+
+    # Round-trip: download and SHA256-compare. Client writes the datamap
+    # alongside the source by replacing the extension (foo.bin -> foo.datamap).
+    # Only attempted when the upload claim has been corroborated by both
+    # markers — a failed upload has nothing to download.
+    if [ "${UPLOAD_OK}" = true ]; then
         DATAMAP_PATH="${MERKLE_FILE%.bin}.datamap"
-        if [ -f "${DATAMAP_PATH}" ]; then
+        if [ ! -f "${DATAMAP_PATH}" ]; then
+            fail "Merkle batch round-trip" "Datamap not found at ${DATAMAP_PATH}"
+        else
+            DOWNLOAD_OK=true
             SECRET_KEY="${WALLET_KEY}" "${ANT_CLI}" \
                 --devnet-manifest "${MANIFEST_FILE}" \
                 --evm-network local \
@@ -413,17 +443,22 @@ else
                 --store-timeout-secs 300 \
                 file download --datamap "${DATAMAP_PATH}" -o "${MERKLE_DOWNLOAD}" \
                 > /dev/null 2>"${MERKLE_LOG}" || {
-                    fail "Merkle batch download" "Download command failed"
+                    DOWNLOAD_OK=false
+                    fail "Merkle batch round-trip" "Download command failed"
                     tail -10 "${MERKLE_LOG}" 2>/dev/null || true
                 }
 
-            if [ -f "${MERKLE_DOWNLOAD}" ]; then
-                ORIG_HASH=$(shasum -a 256 "${MERKLE_FILE}" | cut -d' ' -f1)
-                DOWN_HASH=$(shasum -a 256 "${MERKLE_DOWNLOAD}" | cut -d' ' -f1)
-                if [ "${ORIG_HASH}" = "${DOWN_HASH}" ]; then
-                    pass "Merkle batch round-trip (SHA256 match)"
+            if [ "${DOWNLOAD_OK}" = true ]; then
+                if [ ! -f "${MERKLE_DOWNLOAD}" ]; then
+                    fail "Merkle batch round-trip" "Download exited 0 but output file missing"
                 else
-                    fail "Merkle batch round-trip" "SHA256 mismatch"
+                    ORIG_HASH=$(shasum -a 256 "${MERKLE_FILE}" | cut -d' ' -f1)
+                    DOWN_HASH=$(shasum -a 256 "${MERKLE_DOWNLOAD}" | cut -d' ' -f1)
+                    if [ "${ORIG_HASH}" = "${DOWN_HASH}" ]; then
+                        pass "Merkle batch round-trip (SHA256 match)"
+                    else
+                        fail "Merkle batch round-trip" "SHA256 mismatch"
+                    fi
                 fi
             fi
         fi
