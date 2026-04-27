@@ -38,6 +38,7 @@ async fn create_testnet_client() -> P2PNode {
     println!("Connecting to testnet via: {bootstrap_addrs:?}");
 
     let mut config = CoreNodeConfig::builder()
+        .ipv6(false)
         .local(true)
         .build()
         .expect("Failed to create config");
