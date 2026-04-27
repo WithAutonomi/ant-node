@@ -1145,8 +1145,14 @@ impl TestNetwork {
 
         // Build configuration for saorsa-core P2PNode (saorsa-core is an external crate).
         // .local(true) auto-enables allow_loopback for test nodes on 127.0.0.1.
+        // .ipv6(false) keeps the bind on 127.0.0.1 only; Windows GitHub
+        // Actions runners (and some macOS runners) can't bind a dual-stack
+        // v6 socket and the whole testnet startup fails with
+        // "Failed to create dual-stack network nodes: Failed to create transport".
+        // Loopback-only tests don't need v6.
         let mut core_config = CoreNodeConfig::builder()
             .port(node.port)
+            .ipv6(false)
             .local(true)
             .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
             .max_message_size(MAX_REPLICATION_MESSAGE_SIZE.max(MAX_WIRE_MESSAGE_SIZE))
