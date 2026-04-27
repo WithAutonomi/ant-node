@@ -499,10 +499,15 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
 {
     info!("MERKLE ATTACK TEST: pay-yourself via fabricated candidate pool");
 
-    // Minimal testnet (5 nodes) — attacker-generated candidate pub_keys hash
-    // to PeerIds uniformly across the 2^256 ID space and will not match any
-    // of these 5 nodes' PeerIds with any meaningful probability.
-    let config = TestNetworkConfig::minimal();
+    // Need at least CANDIDATE_CLOSENESS_REQUIRED (13) nodes so the
+    // closeness check exercises the matched-count branch rather than the
+    // sparse-network short-circuit. The attacker's 16 fabricated pub_keys
+    // hash to PeerIds uniformly across the 2^256 ID space, so 0 of 16
+    // will match the network's 13 closest — we expect rejection at the
+    // matched-count step (matched < CANDIDATE_CLOSENESS_REQUIRED).
+    let mut config = TestNetworkConfig::minimal();
+    config.node_count = 14;
+    config.stabilization_timeout = Duration::from_secs(60);
     let harness = TestHarness::setup_with_config(config).await?;
     // Let routing tables settle so find_closest_nodes_network returns a
     // stable set.
@@ -563,13 +568,17 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
     // rejecting this proof once on-chain lookup is bypassed — if the response
     // is a Success or an unrelated error, the attack works.
     match response.body {
+        // Match the specific matched-count rejection wording, not just any
+        // "closeness" substring. The sparse-network short-circuit (returns
+        // <13 peers) and the matched-count check (matched < 13) both
+        // contain "closeness" in their messages, so a loose match would
+        // accept a passing test for the wrong reason on undersized
+        // testnets. The matched-count message is "candidate pub_keys do
+        // not match the network's closest peers".
         ChunkMessageBody::PutResponse(ChunkPutResponse::Error(ProtocolError::PaymentFailed(
             ref msg,
-        ))) if msg.contains("closest peers")
-            || msg.contains("closeness")
-            || msg.contains("authoritative network") =>
-        {
-            info!("Correctly rejected pay-yourself attack: {msg}");
+        ))) if msg.contains("candidate pub_keys do not match") => {
+            info!("Correctly rejected pay-yourself attack at matched-count check: {msg}");
         }
         ChunkMessageBody::PutResponse(ChunkPutResponse::Success { .. }) => {
             panic!(
@@ -579,9 +588,10 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         }
         other => {
             panic!(
-                "Pay-yourself attack was rejected for the WRONG reason — expected a closeness \
-                 rejection, got: {other:?}. The closeness defence is missing; the proof only \
-                 failed because of an unrelated check."
+                "Pay-yourself attack was rejected for the WRONG reason — expected the \
+                 matched-count rejection (\"candidate pub_keys do not match...\"), got: \
+                 {other:?}. Either the testnet was too sparse (<13 peers returned) and the \
+                 sparse-network short-circuit fired instead, or some other check failed first."
             );
         }
     }
