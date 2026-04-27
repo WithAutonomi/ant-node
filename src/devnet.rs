@@ -18,7 +18,6 @@ use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
     IPDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent, P2PNode, PeerId,
 };
-use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -214,36 +213,10 @@ impl DevnetConfig {
     }
 }
 
-/// Devnet manifest for client discovery.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevnetManifest {
-    /// Base port for nodes.
-    pub base_port: u16,
-    /// Node count.
-    pub node_count: usize,
-    /// Bootstrap addresses.
-    pub bootstrap: Vec<MultiAddr>,
-    /// Data directory.
-    pub data_dir: PathBuf,
-    /// Creation time in RFC3339.
-    pub created_at: String,
-    /// EVM configuration (present when EVM payment enforcement is enabled).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evm: Option<DevnetEvmInfo>,
-}
-
-/// EVM configuration info included in the devnet manifest.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DevnetEvmInfo {
-    /// Anvil RPC URL.
-    pub rpc_url: String,
-    /// Funded wallet private key (hex-encoded with 0x prefix).
-    pub wallet_private_key: String,
-    /// Payment token contract address.
-    pub payment_token_address: String,
-    /// Unified payment vault contract address (handles both single-node and merkle payments).
-    pub payment_vault_address: String,
-}
+// The manifest types are shared with ant-client (CLI reads them, devnet
+// writes them), so they live in ant-protocol. Re-exported here for
+// backwards compatibility.
+pub use ant_protocol::devnet_manifest::{DevnetEvmInfo, DevnetManifest};
 
 /// Network state for devnet startup lifecycle.
 #[derive(Debug, Clone)]
