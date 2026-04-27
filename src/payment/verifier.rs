@@ -2059,7 +2059,11 @@ mod tests {
         // Build a normal pool, then overwrite every candidate's pub_key
         // with a single shared key so all 16 derive to the same PeerId.
         let mut candidates = make_candidate_nodes(1_700_000_000);
-        let shared_pub_key = candidates[0].pub_key.clone();
+        let shared_pub_key = candidates
+            .first()
+            .expect("make_candidate_nodes returns CANDIDATES_PER_POOL entries")
+            .pub_key
+            .clone();
         for c in &mut candidates {
             c.pub_key = shared_pub_key.clone();
         }
