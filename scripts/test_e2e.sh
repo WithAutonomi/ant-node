@@ -8,6 +8,7 @@
 # 3. Uploads each file in ./ugly_files/ with payment
 # 4. Verifies on-chain payment via Anvil RPC
 # 5. Downloads and verifies file integrity (SHA256 checksum)
+# 5b. Exercises the merkle batch payment path with a synthesized large file
 # 6. Tests client-side payment rejection (CLI rejects without SECRET_KEY)
 # 7. Tests server-side payment rejection (node rejects unpaid PUT)
 # 8. Stops the devnet and reports results
@@ -101,8 +102,16 @@ if [ ! -f "${ANT_CLI}" ]; then
 fi
 
 # Step 2: Start devnet with EVM
-DEVNET_NODES="${ANT_TEST_DEVNET_NODES:-5}"
-BOOTSTRAP_COUNT="${ANT_TEST_BOOTSTRAP_COUNT:-2}"
+#
+# Default node count is 16 to clear the merkle batch payment threshold.
+# `pay_for_merkle_batch` (ant-core) requires CANDIDATES_PER_POOL = 16 peers
+# per pool. With fewer nodes the merkle path returns InsufficientPeers and
+# Auto payment mode silently falls back to per-chunk `payForQuotes` — which
+# has no pool-count validation, so contract-side bugs in `payForMerkleTree`
+# would never surface in this script. The Step 5b merkle test below relies
+# on the devnet being merkle-capable.
+DEVNET_NODES="${ANT_TEST_DEVNET_NODES:-16}"
+BOOTSTRAP_COUNT="${ANT_TEST_BOOTSTRAP_COUNT:-3}"
 echo "=== Step 2: Starting devnet with EVM (${DEVNET_NODES} nodes, ${BOOTSTRAP_COUNT} bootstrap) ==="
 mkdir -p "${DOWNLOAD_DIR}"
 
@@ -327,6 +336,138 @@ else
     else
         fail "On-chain payment verification" "No TXs could be verified on Anvil"
     fi
+fi
+
+echo ""
+
+# Step 5b: Merkle batch payment path
+#
+# The standard test files in ugly_files/ are kept small (< 1 MB by default),
+# so they only produce one or two chunks and never trigger the merkle batch
+# payment threshold (DEFAULT_MERKLE_THRESHOLD = 64 chunks). This step uploads
+# a synthesized large file with `--merkle` to exercise `payForMerkleTree` on
+# the deployed contract, including the on-chain `WrongPoolCount` validation.
+#
+# `--merkle` disables Auto-mode fallback, so InsufficientPeers (or any other
+# merkle-path failure, including a contract revert) fails the upload rather
+# than silently dropping back to per-chunk `payForQuotes`. With the default
+# 16-node devnet this should always cross the CANDIDATES_PER_POOL threshold.
+#
+# Default file size is 280 MiB to land in the depth-7 chunk band (65-128
+# chunks) — the production failure band for the WrongPoolCount(16, 8) bug.
+# Override with ANT_TEST_MERKLE_FILE_MB. Set ANT_TEST_SKIP_MERKLE=1 to skip
+# (e.g. on disk-constrained CI).
+echo "=== Step 5b: Merkle batch payment test ==="
+
+if [ "${ANT_TEST_SKIP_MERKLE:-0}" = "1" ]; then
+    echo "  Skipping (ANT_TEST_SKIP_MERKLE=1)"
+else
+    MERKLE_TEST_SIZE_MB="${ANT_TEST_MERKLE_FILE_MB:-280}"
+    MERKLE_FILE="/tmp/ant_e2e_merkle_${TEST_RUN_ID}.bin"
+    MERKLE_DOWNLOAD="${DOWNLOAD_DIR}/merkle_${TEST_RUN_ID}.bin"
+    MERKLE_LOG="/tmp/ant_e2e_merkle_${TEST_RUN_ID}.log"
+
+    echo "  Generating ${MERKLE_TEST_SIZE_MB} MiB of random data..."
+    if ! dd if=/dev/urandom of="${MERKLE_FILE}" bs=1m count="${MERKLE_TEST_SIZE_MB}" 2>/dev/null; then
+        # Fall back to GNU dd block syntax if BSD dd unavailable (Linux CI).
+        dd if=/dev/urandom of="${MERKLE_FILE}" bs=1M count="${MERKLE_TEST_SIZE_MB}" status=none
+    fi
+
+    echo "  Uploading with --merkle (no Auto fallback, surfaces merkle errors)..."
+    UPLOAD_OK=true
+    SECRET_KEY="${WALLET_KEY}" RUST_LOG=info "${ANT_CLI}" \
+        --devnet-manifest "${MANIFEST_FILE}" \
+        --evm-network local \
+        --allow-loopback \
+        --quote-timeout-secs 60 \
+        --store-timeout-secs 300 \
+        -v \
+        file upload --merkle "${MERKLE_FILE}" \
+        > "${CLI_STDOUT}" 2>"${MERKLE_LOG}" || {
+            UPLOAD_OK=false
+            fail "Merkle batch upload" "Upload command failed (exit $?)"
+            echo "  Last log lines:"
+            tail -20 "${MERKLE_LOG}" 2>/dev/null || true
+        }
+
+    # Verify the merkle path actually ran. We assert two independent markers so
+    # a future change that swallows the contract revert (or relabels the success
+    # message) fails this step loudly rather than passing silently.
+    #
+    # Marker 1: stdout "Upload complete" line — proves the CLI itself reported
+    #           success rather than the upload bailing without saying so.
+    # Marker 2: stderr "Submitting merkle batch payment on-chain" log line —
+    #           proves we actually called `payForMerkleTree` and didn't drop
+    #           into Auto-mode per-chunk fallback.
+    if [ "${UPLOAD_OK}" = true ]; then
+        MERKLE_CHUNKS=""
+        MERKLE_DEPTH=""
+
+        if ! grep -q "Upload complete" "${CLI_STDOUT}" 2>/dev/null; then
+            fail "Merkle batch upload" "Upload exited 0 but no 'Upload complete' marker in stdout"
+            echo "  Stdout tail:"
+            tail -10 "${CLI_STDOUT}" 2>/dev/null || true
+            UPLOAD_OK=false
+        else
+            MERKLE_CHUNKS=$(grep "Chunks:" "${CLI_STDOUT}" | head -1 | grep -oE '[0-9]+' | head -1)
+        fi
+
+        if ! grep -q "Submitting merkle batch payment on-chain" "${MERKLE_LOG}" 2>/dev/null; then
+            fail "Merkle batch upload" "Merkle log line not found in stderr — possible silent fallback"
+            echo "  Stderr tail:"
+            tail -10 "${MERKLE_LOG}" 2>/dev/null || true
+            UPLOAD_OK=false
+        else
+            MERKLE_DEPTH=$(grep -oE "depth=[0-9]+" "${MERKLE_LOG}" | head -1 | cut -d= -f2)
+        fi
+
+        if [ "${UPLOAD_OK}" = true ]; then
+            pass "Merkle batch upload (${MERKLE_CHUNKS:-?} chunks, depth=${MERKLE_DEPTH:-?})"
+        fi
+    fi
+
+    # Round-trip: download and SHA256-compare. Client writes the datamap
+    # alongside the source by replacing the extension (foo.bin -> foo.datamap).
+    # Only attempted when the upload claim has been corroborated by both
+    # markers — a failed upload has nothing to download.
+    if [ "${UPLOAD_OK}" = true ]; then
+        DATAMAP_PATH="${MERKLE_FILE%.bin}.datamap"
+        if [ ! -f "${DATAMAP_PATH}" ]; then
+            fail "Merkle batch round-trip" "Datamap not found at ${DATAMAP_PATH}"
+        else
+            DOWNLOAD_OK=true
+            SECRET_KEY="${WALLET_KEY}" "${ANT_CLI}" \
+                --devnet-manifest "${MANIFEST_FILE}" \
+                --evm-network local \
+                --allow-loopback \
+                --store-timeout-secs 300 \
+                file download --datamap "${DATAMAP_PATH}" -o "${MERKLE_DOWNLOAD}" \
+                > /dev/null 2>"${MERKLE_LOG}" || {
+                    DOWNLOAD_OK=false
+                    fail "Merkle batch round-trip" "Download command failed"
+                    tail -10 "${MERKLE_LOG}" 2>/dev/null || true
+                }
+
+            if [ "${DOWNLOAD_OK}" = true ]; then
+                if [ ! -f "${MERKLE_DOWNLOAD}" ]; then
+                    fail "Merkle batch round-trip" "Download exited 0 but output file missing"
+                else
+                    ORIG_HASH=$(shasum -a 256 "${MERKLE_FILE}" | cut -d' ' -f1)
+                    DOWN_HASH=$(shasum -a 256 "${MERKLE_DOWNLOAD}" | cut -d' ' -f1)
+                    if [ "${ORIG_HASH}" = "${DOWN_HASH}" ]; then
+                        pass "Merkle batch round-trip (SHA256 match)"
+                    else
+                        fail "Merkle batch round-trip" "SHA256 mismatch"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
+    # Clean up the large file even on failure to avoid filling /tmp
+    [ -f "${MERKLE_FILE}" ] && rm -f "${MERKLE_FILE}"
+    [ -f "${MERKLE_FILE%.bin}.datamap" ] && rm -f "${MERKLE_FILE%.bin}.datamap"
+    [ -f "${MERKLE_DOWNLOAD}" ] && rm -f "${MERKLE_DOWNLOAD}"
 fi
 
 echo ""
