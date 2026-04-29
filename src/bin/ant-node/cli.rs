@@ -1,8 +1,8 @@
 //! Command-line interface definition.
 
 use ant_node::config::{
-    BootstrapCacheConfig, BootstrapPeersConfig, BootstrapSource, EvmNetworkConfig, NetworkMode,
-    NodeConfig, PaymentConfig, UpgradeChannel,
+    BootstrapPeersConfig, BootstrapSource, EvmNetworkConfig, NetworkMode, NodeConfig,
+    PaymentConfig, UpgradeChannel,
 };
 use clap::{Parser, ValueEnum};
 use std::net::SocketAddr;
@@ -133,18 +133,6 @@ pub struct Cli {
     /// that will restart the process automatically.
     #[arg(long)]
     pub stop_on_upgrade: bool,
-
-    /// Disable persistent bootstrap cache.
-    #[arg(long)]
-    pub disable_bootstrap_cache: bool,
-
-    /// Directory for bootstrap cache files.
-    #[arg(long, env = "ANT_BOOTSTRAP_CACHE_DIR")]
-    pub bootstrap_cache_dir: Option<PathBuf>,
-
-    /// Maximum peers to cache in the bootstrap cache.
-    #[arg(long, default_value = "10000", env = "ANT_BOOTSTRAP_CACHE_CAPACITY")]
-    pub bootstrap_cache_capacity: usize,
 }
 
 /// Upgrade channel CLI enum.
@@ -280,14 +268,6 @@ impl Cli {
             rewards_address: self.rewards_address,
             evm_network,
             metrics_port: self.metrics_port,
-        };
-
-        // Bootstrap cache config
-        config.bootstrap_cache = BootstrapCacheConfig {
-            enabled: !self.disable_bootstrap_cache,
-            cache_dir: self.bootstrap_cache_dir,
-            max_contacts: self.bootstrap_cache_capacity,
-            ..config.bootstrap_cache
         };
 
         // Determine bootstrap source and apply auto-discovery if needed.
