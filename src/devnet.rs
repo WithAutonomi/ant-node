@@ -179,7 +179,7 @@ pub struct DevnetConfig {
     /// mode so inter-node bootstrap (which still uses loopback addresses
     /// on the lab host) continues to work.
     ///
-    /// Passed through to [`saorsa_core::NodeConfigBuilder::local`].
+    /// Passed through to saorsa-core's `NodeConfigBuilder::local`.
     pub loopback_only: bool,
 }
 
