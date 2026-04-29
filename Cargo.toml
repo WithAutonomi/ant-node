@@ -33,10 +33,10 @@ path = "src/bin/ant-devnet/main.rs"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.0.1"
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol.git", branch = "mick/remove-bootstrap-cache" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.24.0"
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core.git", branch = "mick/remove-bootstrap-cache" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment

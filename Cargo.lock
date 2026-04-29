@@ -890,8 +890,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe630f23f4adae05beba7e2c0861ab9c1a6d2cc88c98898e3742bed3a5a4ce35"
+source = "git+https://github.com/WithAutonomi/ant-protocol.git?branch=mick/remove-bootstrap-cache#70fe8a035899e784c9b3d4520b62dc9151a93f45"
 dependencies = [
  "blake3",
  "bytes",
@@ -4792,8 +4791,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ed544b4fb88a5615649893ee2d1394e0f48633f63dc72700e51f6b133fdfc1c"
+source = "git+https://github.com/saorsa-labs/saorsa-core.git?branch=mick/remove-bootstrap-cache#37d13d8b1f447f3dcb35995e9d7ccd68b6eb54f7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4907,8 +4905,7 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.33.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9df373519d88540825f435bf3c5c6e300377871b28f16cdd461db3c3f4bb5323"
+source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=mick/remove-bootstrap-cache#f3ad915d1395755675f41108b1391ea346267ef2"
 dependencies = [
  "anyhow",
  "async-trait",
