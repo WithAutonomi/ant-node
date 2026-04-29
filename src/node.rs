@@ -20,7 +20,6 @@ use crate::upgrade::{
 use rand::Rng;
 use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{
-    BootstrapConfig as CoreBootstrapConfig, BootstrapManager,
     IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
     P2PNode,
 };
@@ -108,14 +107,6 @@ impl NodeBuilder {
             Some(Self::build_upgrade_monitor(&self.config, node_id_seed))
         };
 
-        // Initialize bootstrap cache manager if enabled
-        let bootstrap_manager = if self.config.bootstrap_cache.enabled {
-            Self::build_bootstrap_manager(&self.config).await
-        } else {
-            info!("Bootstrap cache disabled");
-            None
-        };
-
         // Initialize ANT protocol handler for chunk storage and
         // wire the fresh-write channel so PUTs trigger replication.
         let (ant_protocol, fresh_write_rx) = if self.config.storage.enabled {
@@ -173,7 +164,6 @@ impl NodeBuilder {
             events_tx,
             events_rx: Some(events_rx),
             upgrade_monitor,
-            bootstrap_manager,
             ant_protocol,
             replication_engine,
             protocol_task: None,
@@ -410,41 +400,6 @@ impl NodeBuilder {
 
         Ok(protocol)
     }
-
-    /// Build the bootstrap cache manager from config.
-    async fn build_bootstrap_manager(config: &NodeConfig) -> Option<BootstrapManager> {
-        let cache_dir = config
-            .bootstrap_cache
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| config.root_dir.join("bootstrap_cache"));
-
-        // Create cache directory
-        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
-            warn!("Failed to create bootstrap cache directory: {e}");
-            return None;
-        }
-
-        let bootstrap_config = CoreBootstrapConfig {
-            cache_dir,
-            max_peers: config.bootstrap_cache.max_contacts,
-            ..CoreBootstrapConfig::default()
-        };
-
-        match BootstrapManager::with_config(bootstrap_config).await {
-            Ok(manager) => {
-                info!(
-                    "Bootstrap cache initialized with {} max contacts",
-                    config.bootstrap_cache.max_contacts
-                );
-                Some(manager)
-            }
-            Err(e) => {
-                warn!("Failed to initialize bootstrap cache: {e}");
-                None
-            }
-        }
-    }
 }
 
 /// A running Ant node.
@@ -455,8 +410,6 @@ pub struct RunningNode {
     events_tx: NodeEventsSender,
     events_rx: Option<NodeEventsChannel>,
     upgrade_monitor: Option<UpgradeMonitor>,
-    /// Bootstrap cache manager for persistent peer storage.
-    bootstrap_manager: Option<BootstrapManager>,
     /// ANT protocol handler for chunk storage.
     ant_protocol: Option<Arc<AntProtocol>>,
     /// Replication engine (manages neighbor sync, verification, audits).
@@ -690,15 +643,6 @@ impl RunningNode {
 
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
-
-        // Log bootstrap cache stats before shutdown
-        if let Some(ref manager) = self.bootstrap_manager {
-            let stats = manager.stats().await;
-            info!(
-                "Bootstrap cache shutdown: {} peers, avg quality {:.2}",
-                stats.total_peers, stats.average_quality
-            );
-        }
 
         // Shutdown replication engine before P2P so background tasks don't
         // use a dead P2P layer, and Arc<LmdbStorage> references are released.

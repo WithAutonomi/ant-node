@@ -64,7 +64,7 @@ pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,
     XorName,
 };
-pub use config::{BootstrapCacheConfig, NodeConfig, StorageConfig};
+pub use config::{NodeConfig, StorageConfig};
 pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};

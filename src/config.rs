@@ -116,10 +116,6 @@ pub struct NodeConfig {
     #[serde(default)]
     pub payment: PaymentConfig,
 
-    /// Bootstrap cache configuration for persistent peer storage.
-    #[serde(default)]
-    pub bootstrap_cache: BootstrapCacheConfig,
-
     /// Storage configuration for chunk persistence.
     #[serde(default)]
     pub storage: StorageConfig,
@@ -282,7 +278,6 @@ impl Default for NodeConfig {
             testnet: TestnetConfig::default(),
             upgrade: UpgradeConfig::default(),
             payment: PaymentConfig::default(),
-            bootstrap_cache: BootstrapCacheConfig::default(),
             storage: StorageConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
@@ -407,61 +402,6 @@ const fn default_staged_rollout_hours() -> u64 {
 
 // ============================================================================
 // Bootstrap Cache Configuration
-// ============================================================================
-
-/// Bootstrap cache configuration for persistent peer storage.
-///
-/// The bootstrap cache stores discovered peers across node restarts,
-/// ranking them by quality metrics (success rate, latency, recency).
-/// This reduces dependency on hardcoded bootstrap nodes and enables
-/// faster network reconnection after restarts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapCacheConfig {
-    /// Enable persistent bootstrap cache.
-    /// Default: true
-    #[serde(default = "default_bootstrap_cache_enabled")]
-    pub enabled: bool,
-
-    /// Directory for cache files.
-    /// Default: `{root_dir}/bootstrap_cache/`
-    #[serde(default)]
-    pub cache_dir: Option<PathBuf>,
-
-    /// Maximum contacts to store in the cache.
-    /// Default: 10,000
-    #[serde(default = "default_bootstrap_max_contacts")]
-    pub max_contacts: usize,
-
-    /// Stale contact threshold in days.
-    /// Contacts older than this are removed during cleanup.
-    /// Default: 7 days
-    #[serde(default = "default_bootstrap_stale_days")]
-    pub stale_threshold_days: u64,
-}
-
-impl Default for BootstrapCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_bootstrap_cache_enabled(),
-            cache_dir: None,
-            max_contacts: default_bootstrap_max_contacts(),
-            stale_threshold_days: default_bootstrap_stale_days(),
-        }
-    }
-}
-
-const fn default_bootstrap_cache_enabled() -> bool {
-    true
-}
-
-const fn default_bootstrap_max_contacts() -> usize {
-    10_000
-}
-
-const fn default_bootstrap_stale_days() -> u64 {
-    7
-}
-
 // ============================================================================
 // Storage Configuration
 // ============================================================================
