@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.11.0"
+version = "0.11.1-rc.2"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -33,14 +33,14 @@ path = "src/bin/ant-devnet/main.rs"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.0.1"
+ant-protocol = "2.0.2"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.24.0"
+saorsa-core = "0.24.1"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = "0.8"
+evmlib = "0.8.1"
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames
