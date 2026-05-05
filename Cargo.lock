@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.1-rc.4"
+version = "0.11.1-rc.5"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
@@ -890,8 +890,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.3-rc.2"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.4.4#6178efb83e11890749b0d74c46a1cde1cd3b0e04"
+version = "2.0.3-rc.3"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.4.4#0c1c0b3ddc235d028b263bd68c8bf70fd98ca9c7"
 dependencies = [
  "blake3",
  "bytes",
@@ -3992,18 +3992,18 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.1.11"
+version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1749c7ed4bcaf4c3d0a3efc28538844fb29bcdd7d2b67b2be7e20ba861ff517"
+checksum = "cbf0d9e68100b3a7989b4901972f265cd542e560a3a8a724e1e20322f4d06ce9"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.11"
+version = "1.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9b20ed30f105399776b9c883e68e536ef602a16ae6f596d2c473591d6ad64c6"
+checksum = "a990e22f43e84855daf260dded30524ef4a9021cc7541c26540500a50b624389"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4858,8 +4858,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.2-rc.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.4#3177efe4285e286711e19f48ae589b7f7787d2dd"
+version = "0.24.2-rc.3"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.4#21811aec823a90b2acb67db8b36119230cba5e99"
 dependencies = [
  "anyhow",
  "async-trait",
