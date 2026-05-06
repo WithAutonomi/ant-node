@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.1-rc.5"
+version = "0.11.1"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
@@ -890,8 +890,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.3-rc.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.4.4#0c1c0b3ddc235d028b263bd68c8bf70fd98ca9c7"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edaf05019466da9ff9055dbbc1428db3414440a8f0a1ac929febcf4fb0608a6d"
 dependencies = [
  "blake3",
  "bytes",
@@ -3234,16 +3235,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
-name = "iri-string"
-version = "0.7.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25e659a4bb38e810ebc252e53b5814ff908a8c58c2a9ce2fae1bbec24cbf4e20"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4858,8 +4849,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.2-rc.3"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.4.4#21811aec823a90b2acb67db8b36119230cba5e99"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03e194874b524ad2a50d0976eb4ebcb81aea326dfb475373de9a2942a90cb2cc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4972,8 +4964,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.34.1-rc.1"
-source = "git+https://github.com/saorsa-labs/saorsa-transport.git?branch=rc-2026.4.4#09fa0703d4e456a70e6f82d30dd8aab35a99ddf5"
+version = "0.34.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31ebc09fb51e2c325e61ff09892f1256c60ef4f3beb881fd2980befe3e53e9bc"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5952,20 +5945,20 @@ dependencies = [
 
 [[package]]
 name = "tower-http"
-version = "0.6.8"
+version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4e6559d53cc268e5031cd8429d05415bc4cb4aefc4aa5d6cc35fbf5b924a1f8"
+checksum = "a28f0d049ccfaa566e14e9663d304d8577427b368cb4710a20528690287a738b"
 dependencies = [
  "bitflags",
  "bytes",
  "futures-util",
  "http",
  "http-body",
- "iri-string",
  "pin-project-lite",
  "tower",
  "tower-layer",
  "tower-service",
+ "url",
 ]
 
 [[package]]
