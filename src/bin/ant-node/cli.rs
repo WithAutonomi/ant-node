@@ -4,7 +4,7 @@ use ant_node::config::{
     BootstrapCacheConfig, BootstrapPeersConfig, BootstrapSource, EvmNetworkConfig, NetworkMode,
     NodeConfig, PaymentConfig, UpgradeChannel,
 };
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -145,6 +145,49 @@ pub struct Cli {
     /// Maximum peers to cache in the bootstrap cache.
     #[arg(long, default_value = "10000", env = "ANT_BOOTSTRAP_CACHE_CAPACITY")]
     pub bootstrap_cache_capacity: usize,
+
+    /// Optional subcommand. When omitted, `ant-node` runs as a network node
+    /// using the top-level flags above (the default and pre-existing behavior).
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+/// Subcommands that change `ant-node` from "run as a network node" to a
+/// different one-shot operation. Adding subcommands here is non-breaking:
+/// invocations without a subcommand still launch the node.
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Estimate the size of the live network.
+    ///
+    /// Bootstraps into the network in client mode (does not participate
+    /// in DHT routing), performs many random-key iterative `FIND_NODE`
+    /// lookups to sample keyspace density, prints an averaged estimate
+    /// with a confidence interval, then exits.
+    EstimateSize {
+        /// Number of random-key samples to take. More samples → tighter
+        /// confidence interval; the standard error scales as 1/sqrt(n).
+        #[arg(long, default_value = "32")]
+        samples: usize,
+
+        /// Number of closest peers to retrieve per lookup (Kademlia `k`).
+        /// When `0`, the saorsa-core default is used.
+        #[arg(long, default_value = "0")]
+        k: usize,
+
+        /// Per-lookup timeout, in seconds. Defaults to 90s — saorsa-core's
+        /// iterative lookup can take this long when a dead peer's dial
+        /// cascade drags out an early iteration.
+        #[arg(long, default_value = "90")]
+        lookup_timeout_secs: u64,
+
+        /// Bootstrap-completion timeout, in seconds.
+        #[arg(long, default_value = "60")]
+        bootstrap_timeout_secs: u64,
+
+        /// Print per-sample peer counts alongside each density estimate as we go.
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 /// Upgrade channel CLI enum.

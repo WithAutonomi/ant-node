@@ -6,11 +6,13 @@ mod cli;
 mod platform;
 
 use ant_node::config::BootstrapSource;
+use ant_node::estimator::{estimate_network_size, EstimatorParams};
 use ant_node::NodeBuilder;
 use clap::Parser;
-use cli::Cli;
 #[cfg(feature = "logging")]
 use cli::CliLogFormat;
+use cli::{Cli, Command};
+use std::time::Duration;
 #[cfg(feature = "logging")]
 use tracing_subscriber::prelude::*;
 #[cfg(feature = "logging")]
@@ -96,7 +98,7 @@ fn init_logging(
 async fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
     // _guard must live for the duration of main() to ensure log flushing.
     #[cfg(feature = "logging")]
@@ -121,6 +123,9 @@ async fn main() -> color_eyre::Result<()> {
             None
         }
     };
+
+    // Extract subcommand (if any) before consuming `cli` via `into_config()`.
+    let command = cli.command.take();
 
     // Build configuration
     let (config, bootstrap_source) = cli.into_config()?;
@@ -152,9 +157,45 @@ async fn main() -> color_eyre::Result<()> {
         }
     }
 
-    let mut node = NodeBuilder::new(config).build().await?;
-    node.run().await?;
+    match command {
+        None => {
+            let mut node = NodeBuilder::new(config).build().await?;
+            node.run().await?;
+            ant_node::logging::info!("Goodbye!");
+        }
+        Some(Command::EstimateSize {
+            samples,
+            k,
+            lookup_timeout_secs,
+            bootstrap_timeout_secs,
+            verbose,
+        }) => {
+            let params = EstimatorParams {
+                samples,
+                k,
+                lookup_timeout: Duration::from_secs(lookup_timeout_secs),
+                bootstrap_timeout: Duration::from_secs(bootstrap_timeout_secs),
+                verbose,
+            };
+            let estimate = estimate_network_size(&config, params).await?;
+            print_estimate(&estimate);
+        }
+    }
 
-    ant_node::logging::info!("Goodbye!");
     Ok(())
+}
+
+fn print_estimate(est: &ant_node::estimator::SizeEstimate) {
+    println!("Network size estimate:");
+    println!("  mean       : {:>12.0}", est.mean);
+    println!("  median     : {:>12.0}", est.median);
+    println!(
+        "  95% confidence interval : [{:.0}, {:.0}]",
+        est.ci_low, est.ci_high
+    );
+    println!(
+        "  samples    : {} successful / {} attempted",
+        est.samples_successful, est.samples_attempted
+    );
+    println!("  k (per-lookup): {}", est.k_used);
 }

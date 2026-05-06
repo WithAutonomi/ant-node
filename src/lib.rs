@@ -47,6 +47,7 @@ pub mod client;
 pub mod config;
 pub mod devnet;
 pub mod error;
+pub mod estimator;
 pub mod event;
 pub mod logging;
 pub mod node;
