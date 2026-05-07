@@ -677,7 +677,7 @@ impl PaymentVerifier {
     /// the dominant cost is still Sybil-grinding midpoint addresses or
     /// running real nodes near the target — same security floor.
     /// `CANDIDATE_CLOSENESS_REQUIRED` (13/16) is unchanged.
-    const CLOSENESS_LOOKUP_WIDTH: usize = 32;
+    const CLOSENESS_LOOKUP_WIDTH: usize = 2 * evmlib::merkle_payments::CANDIDATES_PER_POOL;
 
     /// Maximum waiter → leader retries when the leader's future was cancelled
     /// or panicked before publishing a result. Beyond this the waiter returns
