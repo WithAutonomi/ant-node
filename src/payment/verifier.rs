@@ -2662,22 +2662,21 @@ mod tests {
     fn validate_peer_bindings_rejects_bad_binding_proofs() {
         let proof = proof_with_bad_binding();
         let result = PaymentVerifier::validate_peer_bindings(&proof);
-        match result {
-            Err(Error::Payment(msg)) => {
-                assert!(
-                    msg.contains("Quote pub_key does not belong to claimed peer")
-                        || msg.contains("Invalid ML-DSA public key"),
-                    "expected the bad-binding error message, got: {msg}"
-                );
-            }
-            other => {
-                panic!("expected Err(Error::Payment(..)) for bad-binding proof, got {other:?}")
-            }
+        assert!(
+            matches!(result, Err(Error::Payment(_))),
+            "expected Err(Error::Payment(..)) for bad-binding proof, got {result:?}"
+        );
+        if let Err(Error::Payment(msg)) = &result {
+            assert!(
+                msg.contains("Quote pub_key does not belong to claimed peer")
+                    || msg.contains("Invalid ML-DSA public key"),
+                "expected the bad-binding error message, got: {msg}"
+            );
         }
     }
 
     /// C2: A `ProofOfPayment` whose every quote has a self-consistent
-    /// pub_key/peer_id pair passes `validate_peer_bindings` cleanly.
+    /// `pub_key`/`peer_id` pair passes `validate_peer_bindings` cleanly.
     #[test]
     fn validate_peer_bindings_passes_through_when_all_quotes_clean() {
         use crate::payment::metrics::QuotingMetricsTracker;
