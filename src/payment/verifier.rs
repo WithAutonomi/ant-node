@@ -634,11 +634,16 @@ impl PaymentVerifier {
     ///
     /// 60s caps the lookup at ~7 iterations and rejects honest pools whose
     /// candidates only emerge after iteration 7. 240s gives ~1.2× headroom
-    /// over the ~200s natural worst-case runtime on a 1k-node testnet
-    /// while still capping `DoS` amplification at roughly one bounded
-    /// lookup per forged `pool_hash` (the per-pool single-flight cache
-    /// at `closeness_pass_cache` + `inflight_closeness` ensures at most
-    /// one in-flight lookup per `pool_hash` regardless of concurrency).
+    /// over the ~200s natural worst-case runtime on a 1k-node testnet.
+    ///
+    /// `DoS` amplification stays bounded at roughly one in-flight lookup
+    /// per unique `pool_hash` under typical load, via
+    /// [`closeness_pass_cache`] + [`inflight_closeness`]. The bound is
+    /// "typical" because `inflight_closeness` is an LRU and a sustained
+    /// flood of unique `pool_hash` entries can evict an in-flight slot,
+    /// at which point a second leader can race for the same pool (see
+    /// [`InflightGuard::drop`]). At steady state the pool cache and pool
+    /// signature verification gate keep this rare in practice.
     const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
 
     /// Width of the storer's authoritative network lookup, in peers.
@@ -659,6 +664,13 @@ impl PaymentVerifier {
     /// widening from K=16 to K=32 dropped client-side closeness
     /// mismatches from ~115 to ~31 per 5 min, a 73% reduction.
     ///
+    /// Performance note: `count` does not just truncate the lookup —
+    /// `find_closest_nodes_network` keeps iterating until either
+    /// `MAX_ITERATIONS` is reached or `best_nodes.len() >= count`. K=32
+    /// can therefore extend lookups by a few iterations on sparse
+    /// networks vs K=16, which reinforces (rather than undermines) the
+    /// timeout bump above.
+    ///
     /// Security: the pay-yourself attack still requires the attacker's
     /// fabricated `PeerId`s to land in the storer's authoritative top-K.
     /// K=32 doubles the window vs K=16 (≈1 extra bit of grinding), but
@@ -671,7 +683,33 @@ impl PaymentVerifier {
     /// or panicked before publishing a result. Beyond this the waiter returns
     /// a visible error rather than spinning indefinitely through a
     /// cancellation cascade.
-    const MAX_LEADER_RETRIES: usize = 4;
+    ///
+    /// Worst-case waiter wall-clock is `(MAX_LEADER_RETRIES + 1) *
+    /// CLOSENESS_LOOKUP_TIMEOUT` (one wait per attempt). Kept low (1)
+    /// because the only realistic trigger is leader future-cancellation,
+    /// which should be extraordinarily rare; under sustained adversarial
+    /// cancellation a higher cap doesn't add resilience, it just hides
+    /// the symptom. With `CLOSENESS_LOOKUP_TIMEOUT = 240s` this caps a
+    /// single user-visible verification at ~8 min worst case (vs ~20 min
+    /// at the previous value of 4).
+    const MAX_LEADER_RETRIES: usize = 1;
+
+    /// Compute the storer's authoritative-lookup width for a candidate pool.
+    ///
+    /// Returns `max(CLOSENESS_LOOKUP_WIDTH, pool_len)`: matches the client's
+    /// over-query width today, and scales with the pool if a future protocol
+    /// bump grows pool size beyond `CLOSENESS_LOOKUP_WIDTH`. Truncating to
+    /// `CLOSENESS_LOOKUP_WIDTH` in that future case would re-open the
+    /// K-too-small failure mode (the storer would reject honest pools whose
+    /// candidates legitimately span a wider XOR range than the storer
+    /// fetched). Pinned by `closeness_lookup_count_uses_max_of_width_and_pool_len`.
+    const fn closeness_lookup_count(pool_len: usize) -> usize {
+        if Self::CLOSENESS_LOOKUP_WIDTH > pool_len {
+            Self::CLOSENESS_LOOKUP_WIDTH
+        } else {
+            pool_len
+        }
+    }
 
     /// Verify that the candidate pool's `pub_keys` correspond to peers that
     /// are actually XOR-closest to the pool midpoint address, by querying
@@ -905,9 +943,18 @@ impl PaymentVerifier {
         // routinely include peers from positions 17–32 of the network's true
         // ranking when the closer peers are slow or NAT-stuck. The storer
         // must look at the same window or it will reject honest pools with
-        // no security benefit. `.max(...)` is defensive against any future
-        // protocol bump that grows pool size beyond `CLOSENESS_LOOKUP_WIDTH`.
-        let lookup_count = Self::CLOSENESS_LOOKUP_WIDTH.max(pool.candidate_nodes.len());
+        // no security benefit.
+        //
+        // `pool.candidate_nodes` is currently a fixed-size array of length
+        // `CANDIDATES_PER_POOL` (= 16), so `.max(...)` always evaluates to
+        // `CLOSENESS_LOOKUP_WIDTH` today. The compile-time
+        // `const _: () = assert!(WIDTH >= CANDIDATES_PER_POOL)` in the test
+        // module pins that invariant. The `.max(...)` form is belt-and-braces
+        // for a hypothetical future protocol that grows pool size to a
+        // `Vec`-typed candidate set: the storer would scale its lookup with
+        // the pool rather than truncating, which would otherwise re-open the
+        // K-too-small failure mode.
+        let lookup_count = Self::closeness_lookup_count(pool.candidate_nodes.len());
         let network_lookup = p2p_node
             .dht_manager()
             .find_closest_nodes_network(&pool_address.0, lookup_count);
@@ -2689,9 +2736,41 @@ mod tests {
         );
     }
 
-    // Compile-time invariant: the `lookup_count = WIDTH.max(pool.len())`
-    // expression in verify_merkle_candidate_closeness_inner relies on
-    // WIDTH being ≥ CANDIDATES_PER_POOL so we never request fewer peers
+    #[test]
+    fn closeness_lookup_count_uses_max_of_width_and_pool_len() {
+        // The honest case: a 16-candidate pool must trigger a 32-peer
+        // network lookup. This is the K=16-rejects-honest-pool fix from
+        // the STG-01 investigation — without it, the storer never
+        // observes the peers at network-true positions 17–32 that the
+        // client legitimately picks from.
+        let standard =
+            PaymentVerifier::closeness_lookup_count(evmlib::merkle_payments::CANDIDATES_PER_POOL);
+        assert_eq!(
+            standard, 32,
+            "honest 16-candidate pool must trigger a 32-peer DHT lookup"
+        );
+
+        // Future-proof: if a protocol bump ever produces a pool larger
+        // than CLOSENESS_LOOKUP_WIDTH, lookup_count must scale with the
+        // pool — not truncate to WIDTH. Truncating would let an attacker
+        // hide candidates by padding the pool past the storer's window.
+        assert_eq!(
+            PaymentVerifier::closeness_lookup_count(64),
+            64,
+            "lookup_count must scale up if pool exceeds CLOSENESS_LOOKUP_WIDTH"
+        );
+
+        // Lower bound (also covered by the const-assert below; pin the
+        // runtime path too in case the const-assert is ever removed).
+        assert_eq!(
+            PaymentVerifier::closeness_lookup_count(1),
+            PaymentVerifier::CLOSENESS_LOOKUP_WIDTH,
+            "lookup_count must never drop below CLOSENESS_LOOKUP_WIDTH"
+        );
+    }
+
+    // Compile-time invariant: the `closeness_lookup_count` formula relies
+    // on WIDTH being ≥ CANDIDATES_PER_POOL so we never request fewer peers
     // than the pool itself contains.
     const _: () = assert!(
         PaymentVerifier::CLOSENESS_LOOKUP_WIDTH >= evmlib::merkle_payments::CANDIDATES_PER_POOL,
