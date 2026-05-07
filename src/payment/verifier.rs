@@ -25,7 +25,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Minimum allowed size for a payment proof in bytes.
 ///
@@ -42,12 +42,15 @@ pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
 
 /// Maximum age of a payment quote before it's considered expired (24 hours).
-/// Prevents replaying old cheap quotes against nearly-full nodes.
+/// Prevents replaying old cheap quotes against nearly-full nodes. Past-side
+/// clock skew is absorbed entirely by this window — there is no separate
+/// past-skew tolerance.
 const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 
-/// Maximum allowed clock skew for quote timestamps (60 seconds).
-/// Accounts for NTP synchronization differences between P2P nodes.
-const QUOTE_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
+/// Maximum tolerated forward skew when a quote's timestamp is ahead of the
+/// verifying node's wall clock (300 seconds). Applies exclusively to the
+/// future direction; past-dated quotes are governed by `QUOTE_MAX_AGE_SECS`.
+const QUOTE_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 
 /// Configuration for EVM payment verification.
 ///
@@ -547,31 +550,34 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// Verify quote freshness — reject stale or excessively future quotes.
+    /// Verify quote freshness — reject stale quotes and ones too far in the future.
+    ///
+    /// A quote whose timestamp is in the past is accepted as long as its age
+    /// does not exceed `QUOTE_MAX_AGE_SECS`. A quote whose timestamp is in
+    /// the future relative to this node is accepted only if the forward skew
+    /// does not exceed `QUOTE_FUTURE_SKEW_TOLERANCE_SECS`.
     fn validate_quote_timestamps(payment: &ProofOfPayment) -> Result<()> {
         let now = SystemTime::now();
+        let max_age = Duration::from_secs(QUOTE_MAX_AGE_SECS);
+        let max_future_skew = Duration::from_secs(QUOTE_FUTURE_SKEW_TOLERANCE_SECS);
+
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             match now.duration_since(quote.timestamp) {
                 Ok(age) => {
-                    if age.as_secs() > QUOTE_MAX_AGE_SECS {
+                    if age > max_age {
                         return Err(Error::Payment(format!(
                             "Quote from peer {encoded_peer_id:?} expired: age {}s exceeds max {QUOTE_MAX_AGE_SECS}s",
                             age.as_secs()
                         )));
                     }
                 }
-                Err(_) => {
-                    if let Ok(skew) = quote.timestamp.duration_since(now) {
-                        if skew.as_secs() > QUOTE_CLOCK_SKEW_TOLERANCE_SECS {
-                            return Err(Error::Payment(format!(
-                                "Quote from peer {encoded_peer_id:?} has timestamp {}s in the future \
-                                 (exceeds {QUOTE_CLOCK_SKEW_TOLERANCE_SECS}s tolerance)",
-                                skew.as_secs()
-                            )));
-                        }
-                    } else {
+                Err(future) => {
+                    let skew = future.duration();
+                    if skew > max_future_skew {
                         return Err(Error::Payment(format!(
-                            "Quote from peer {encoded_peer_id:?} has invalid timestamp"
+                            "Quote from peer {encoded_peer_id:?} has timestamp {}s in the future \
+                             (exceeds {QUOTE_FUTURE_SKEW_TOLERANCE_SECS}s tolerance)",
+                            skew.as_secs()
                         )));
                     }
                 }
@@ -1639,7 +1645,7 @@ mod tests {
         let xorname = [0xD1u8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
-        // Quote 30 seconds in the future — within 60s tolerance
+        // Quote 30 seconds in the future — well within 300s tolerance
         let future_timestamp = SystemTime::now() + Duration::from_secs(30);
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
@@ -1668,8 +1674,8 @@ mod tests {
         let xorname = [0xD2u8; 32];
         let rewards_addr = RewardsAddress::new([1u8; 20]);
 
-        // Quote 120 seconds in the future — exceeds 60s tolerance
-        let future_timestamp = SystemTime::now() + Duration::from_secs(120);
+        // Quote 360 seconds in the future — exceeds 300s tolerance
+        let future_timestamp = SystemTime::now() + Duration::from_secs(360);
         let quote = make_fake_quote(xorname, future_timestamp, rewards_addr);
 
         let mut peer_quotes = Vec::new();
