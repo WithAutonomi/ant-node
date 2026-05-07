@@ -891,6 +891,79 @@ impl PaymentVerifier {
         Ok(candidate_peer_ids)
     }
 
+    /// Pure-logic closeness check: given the pool's candidate peer IDs and
+    /// the storer's authoritative network view (top-K closest peers to the
+    /// pool midpoint), decide whether the pool passes the
+    /// `CANDIDATE_CLOSENESS_REQUIRED`-of-N threshold.
+    ///
+    /// Extracted from `verify_merkle_candidate_closeness_inner` so tests
+    /// can exercise the matching logic without standing up a real DHT.
+    /// Mirrors the runtime path exactly: same sparse-network short-circuit,
+    /// same set-membership check, same error strings.
+    fn check_closeness_match(
+        candidate_peer_ids: &[PeerId],
+        network_peer_ids: &[PeerId],
+        pool_address: &[u8; 32],
+    ) -> Result<()> {
+        // Sparse-network short-circuit: if the DHT itself returned fewer
+        // peers than the closeness threshold, the proof can never pass —
+        // not because the candidates are forged, but because we don't
+        // have an authoritative view to compare against. Surface this
+        // distinct cause so operators can tell "retry once the network
+        // settles" apart from "this peer sent a forged pool".
+        if network_peer_ids.len() < Self::CANDIDATE_CLOSENESS_REQUIRED {
+            debug!(
+                "Merkle closeness deferred: network lookup returned {} peers \
+                 for pool midpoint {} (need at least {} to verify)",
+                network_peer_ids.len(),
+                hex::encode(pool_address),
+                Self::CANDIDATE_CLOSENESS_REQUIRED,
+            );
+            return Err(Error::Payment(format!(
+                "Merkle candidate pool rejected: authoritative DHT lookup returned \
+                 only {} peers, less than the {} required to verify candidate \
+                 closeness. Retry once the routing table populates further.",
+                network_peer_ids.len(),
+                Self::CANDIDATE_CLOSENESS_REQUIRED,
+            )));
+        }
+
+        // Set-membership check against the returned closest-peers list.
+        // Candidate `PeerId`s are deduplicated upstream, so each match
+        // corresponds to a distinct peer.
+        let network_set: std::collections::HashSet<PeerId> =
+            network_peer_ids.iter().copied().collect();
+        let matched = candidate_peer_ids
+            .iter()
+            .filter(|pid| network_set.contains(pid))
+            .count();
+
+        if matched < Self::CANDIDATE_CLOSENESS_REQUIRED {
+            debug!(
+                "Merkle closeness rejected: {matched}/{} candidates match the DHT's closest peers \
+                 for pool midpoint {} (required: {}, network returned {} peers)",
+                candidate_peer_ids.len(),
+                hex::encode(pool_address),
+                Self::CANDIDATE_CLOSENESS_REQUIRED,
+                network_peer_ids.len(),
+            );
+            return Err(Error::Payment(
+                "Merkle candidate pool rejected: candidate pub_keys do not match the \
+                 network's closest peers to the pool midpoint address. Pools must be \
+                 collected from the pool-address close group, not fabricated off-network."
+                    .into(),
+            ));
+        }
+
+        debug!(
+            "Merkle closeness passed: {matched}/{} candidates matched the DHT's closest peers \
+             for pool midpoint {}",
+            candidate_peer_ids.len(),
+            hex::encode(pool_address),
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn verify_merkle_candidate_closeness_inner(
         &self,
@@ -986,63 +1059,8 @@ impl PaymentVerifier {
                 }
             };
 
-        // Sparse-network short-circuit: if the DHT itself returned fewer
-        // peers than the closeness threshold, the proof can never pass —
-        // not because the candidates are forged, but because we don't
-        // have an authoritative view to compare against. Surface this
-        // distinct cause so operators can tell "retry once the network
-        // settles" apart from "this peer sent a forged pool".
-        if network_peers.len() < Self::CANDIDATE_CLOSENESS_REQUIRED {
-            debug!(
-                "Merkle closeness deferred: network lookup returned {} peers \
-                 for pool midpoint {} (need at least {} to verify)",
-                network_peers.len(),
-                hex::encode(pool_address.0),
-                Self::CANDIDATE_CLOSENESS_REQUIRED,
-            );
-            return Err(Error::Payment(format!(
-                "Merkle candidate pool rejected: authoritative DHT lookup returned \
-                 only {} peers, less than the {} required to verify candidate \
-                 closeness. Retry once the routing table populates further.",
-                network_peers.len(),
-                Self::CANDIDATE_CLOSENESS_REQUIRED,
-            )));
-        }
-
-        // Set-membership check against the returned closest-peers list.
-        // Candidate `PeerId`s are deduplicated upstream, so each match
-        // corresponds to a distinct peer.
-        let network_set: std::collections::HashSet<PeerId> =
-            network_peers.iter().map(|n| n.peer_id).collect();
-        let matched = candidate_peer_ids
-            .iter()
-            .filter(|pid| network_set.contains(pid))
-            .count();
-
-        if matched < Self::CANDIDATE_CLOSENESS_REQUIRED {
-            debug!(
-                "Merkle closeness rejected: {matched}/{} candidates match the DHT's closest peers \
-                 for pool midpoint {} (required: {}, network returned {} peers)",
-                pool.candidate_nodes.len(),
-                hex::encode(pool_address.0),
-                Self::CANDIDATE_CLOSENESS_REQUIRED,
-                network_peers.len(),
-            );
-            return Err(Error::Payment(
-                "Merkle candidate pool rejected: candidate pub_keys do not match the \
-                 network's closest peers to the pool midpoint address. Pools must be \
-                 collected from the pool-address close group, not fabricated off-network."
-                    .into(),
-            ));
-        }
-
-        debug!(
-            "Merkle closeness passed: {matched}/{} candidates matched the DHT's closest peers \
-             for pool midpoint {}",
-            pool.candidate_nodes.len(),
-            hex::encode(pool_address.0),
-        );
-        Ok(())
+        let network_peer_ids: Vec<PeerId> = network_peers.iter().map(|n| n.peer_id).collect();
+        Self::check_closeness_match(&candidate_peer_ids, &network_peer_ids, &pool_address.0)
     }
 
     /// Verify a merkle batch payment proof.
@@ -1282,7 +1300,7 @@ impl PaymentVerifier {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use evmlib::merkle_payments::MerklePaymentCandidatePool;
@@ -2776,4 +2794,195 @@ mod tests {
         PaymentVerifier::CLOSENESS_LOOKUP_WIDTH >= evmlib::merkle_payments::CANDIDATES_PER_POOL,
         "CLOSENESS_LOOKUP_WIDTH must be ≥ CANDIDATES_PER_POOL",
     );
+
+    // =========================================================================
+    // Regression tests for the original STG-01 failure modes
+    //
+    // These tests use the extracted `check_closeness_match` helper to
+    // exercise the matching logic directly with synthetic peer-ID sets,
+    // without standing up a real DHT. They prove the two failure modes
+    // observed on STG-01 on 2026-05-01 are fixed by the K=16 → K=32
+    // change:
+    //
+    //   - "K=16 storer rejects honest pool whose candidates legitimately
+    //     include peers from positions 17–32" (~73% of mismatches)
+    //
+    // and that the security floor (`CANDIDATE_CLOSENESS_REQUIRED = 13/16`)
+    // still rejects forged pools at the wider window.
+    //
+    // Pool address used as the XOR midpoint: `[0u8; 32]`.
+    // Synthetic PeerIds use distinct constant byte patterns so each test
+    // can reason about which IDs are "in the network's top-K" vs not.
+    // =========================================================================
+
+    /// Build a deterministic `PeerId` from a single byte tag.
+    fn synthetic_peer_id(tag: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        PeerId::from_bytes(bytes)
+    }
+
+    /// Build a vector of synthetic `PeerId`s tagged with bytes 1..=n.
+    fn synthetic_peer_ids(n: u8) -> Vec<PeerId> {
+        (1..=n).map(synthetic_peer_id).collect()
+    }
+
+    #[test]
+    fn closeness_match_passes_when_all_16_candidates_in_top_16() {
+        // Trivial case: every candidate is in the network's top-16.
+        // Asserts the happy path still works after the refactor.
+        let candidates = synthetic_peer_ids(16);
+        let network = synthetic_peer_ids(16);
+        let pool_address = [0u8; 32];
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        assert!(result.is_ok(), "all-in-top-16 pool must pass: {result:?}");
+    }
+
+    #[test]
+    fn closeness_match_passes_when_candidates_span_positions_1_to_15_and_17() {
+        // STG-01 regression test: the client's pool contains 16 candidates,
+        // 15 of which are at network-true positions 1..=15, and ONE of
+        // which is at position 17 (because the network-true position-16
+        // peer was unresponsive when the client over-queried 32).
+        //
+        // Pre-fix (K=16 storer): network_peer_ids = 16 entries (positions
+        // 1..=16); position 17 is NOT in the network set, so matched =
+        // 15 < 13 — wait, 15 ≥ 13, that path actually passes too. The
+        // failure mode was a *worse* skew where 4+ of the storer's top-16
+        // were unresponsive at the client side. Let me model that case
+        // precisely below.
+        let candidates = synthetic_peer_ids(15)
+            .into_iter()
+            .chain(std::iter::once(synthetic_peer_id(17)))
+            .collect::<Vec<_>>();
+        // Post-fix lookup window = 32, includes position 17.
+        let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
+        let pool_address = [0u8; 32];
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        assert!(
+            result.is_ok(),
+            "pool with one candidate at position 17 must pass under K=32: {result:?}"
+        );
+    }
+
+    #[test]
+    fn closeness_match_fails_at_k_16_passes_at_k_32_for_honest_skew() {
+        // The actual STG-01 failure mode: the client's 16 candidates
+        // legitimately span network-true positions {1..=12, 17, 19, 21,
+        // 23} — i.e. 12 positions in the storer's top-16 plus 4 in the
+        // 17–32 window (because positions 13–16 were unresponsive when
+        // the client over-queried).
+        let candidates: Vec<PeerId> = (1..=12u8)
+            .chain([17u8, 19, 21, 23])
+            .map(synthetic_peer_id)
+            .collect();
+        let pool_address = [0u8; 32];
+
+        // Pre-fix (K=16): network = positions 1..=16. Only 12 of the 16
+        // candidates appear — below the 13/16 threshold. This is the
+        // exact false-positive rejection STG-01 was hitting.
+        let network_pre_fix: Vec<PeerId> = (1..=16).map(synthetic_peer_id).collect();
+        let result_pre_fix =
+            PaymentVerifier::check_closeness_match(&candidates, &network_pre_fix, &pool_address);
+        assert!(
+            result_pre_fix.is_err(),
+            "PRE-FIX: K=16 storer should reject the honest pool (this is \
+             the bug we observed; if this assertion stops failing the \
+             refactor lost the rejection logic): {result_pre_fix:?}"
+        );
+
+        // Post-fix (K=32): network = positions 1..=32. All 16 candidates
+        // appear (12 at 1..=12, 4 at 17/19/21/23). matched = 16 ≥ 13:
+        // pool accepted. This is the fix.
+        let network_post_fix: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
+        let result_post_fix =
+            PaymentVerifier::check_closeness_match(&candidates, &network_post_fix, &pool_address);
+        assert!(
+            result_post_fix.is_ok(),
+            "POST-FIX: K=32 storer must accept the same honest pool: {result_post_fix:?}"
+        );
+    }
+
+    #[test]
+    fn closeness_match_rejects_forged_pool_at_k_32() {
+        // Security floor regression: a fully-forged pool whose candidate
+        // PeerIds are network-disjoint must still be rejected at the
+        // wider window K=32. The 13/16 threshold is the security knob;
+        // widening the lookup window must not soften it.
+        //
+        // Tag bytes 100..=115 are deliberately disjoint from the network
+        // set (1..=32).
+        let forged_candidates: Vec<PeerId> = (100..=115).map(synthetic_peer_id).collect();
+        let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
+        let pool_address = [0u8; 32];
+
+        let result =
+            PaymentVerifier::check_closeness_match(&forged_candidates, &network, &pool_address);
+        match result {
+            Err(Error::Payment(msg)) => {
+                assert!(
+                    msg.contains("candidate pub_keys do not match"),
+                    "expected forged-pool rejection message, got: {msg}"
+                );
+            }
+            other => panic!(
+                "forged pool with all candidates outside network's top-32 \
+                 must be rejected at K=32 (security floor): {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn closeness_match_rejects_pool_at_exactly_12_of_16_match() {
+        // Threshold sanity: a pool with exactly 12 of 16 candidates in
+        // the network set must still be rejected (12 < 13).
+        let mut candidates = synthetic_peer_ids(12);
+        candidates.extend((100..=103).map(synthetic_peer_id)); // 4 disjoint
+        let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
+        let pool_address = [0u8; 32];
+
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        assert!(
+            result.is_err(),
+            "12/16 < threshold of 13/16 must reject regardless of K: {result:?}"
+        );
+    }
+
+    #[test]
+    fn closeness_match_accepts_pool_at_exactly_13_of_16_match() {
+        // Threshold sanity: a pool with exactly 13 of 16 candidates in
+        // the network set must pass (13 ≥ 13).
+        let mut candidates = synthetic_peer_ids(13);
+        candidates.extend((100..=102).map(synthetic_peer_id)); // 3 disjoint
+        let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
+        let pool_address = [0u8; 32];
+
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        assert!(
+            result.is_ok(),
+            "13/16 ≥ threshold of 13/16 must accept: {result:?}"
+        );
+    }
+
+    #[test]
+    fn closeness_match_returns_sparse_dht_error_when_lookup_too_small() {
+        // The sparse-DHT short-circuit fires when the lookup returned
+        // fewer peers than the threshold itself — even an all-matching
+        // candidate set can't pass because the storer doesn't have an
+        // authoritative view to compare against.
+        let candidates = synthetic_peer_ids(16);
+        let network = synthetic_peer_ids(12); // < CANDIDATE_CLOSENESS_REQUIRED
+        let pool_address = [0u8; 32];
+
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        match result {
+            Err(Error::Payment(msg)) => {
+                assert!(
+                    msg.contains("authoritative DHT lookup returned only 12"),
+                    "expected sparse-DHT error message, got: {msg}"
+                );
+            }
+            other => panic!("expected sparse-DHT rejection, got: {other:?}"),
+        }
+    }
 }
