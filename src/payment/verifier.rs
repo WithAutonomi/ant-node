@@ -15,6 +15,7 @@ use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
+use evmlib::EncodedPeerId;
 use evmlib::Network as EvmNetwork;
 use evmlib::ProofOfPayment;
 use evmlib::RewardsAddress;
@@ -48,6 +49,15 @@ const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 /// Maximum allowed clock skew for quote timestamps (60 seconds).
 /// Accounts for NTP synchronization differences between P2P nodes.
 const QUOTE_CLOCK_SKEW_TOLERANCE_SECS: u64 = 60;
+
+/// Trust weight applied for a verifiable bad-binding detection at the
+/// storer side. Sized to drop a peer below the production swap-out
+/// threshold in a single event so this storer's own routing-table view
+/// evicts the offender on the next admission cycle. Mirrors the
+/// client-side `BAD_BINDING_TRUST_WEIGHT` in
+/// `ant-client/ant-core/src/data/client/quote.rs`. Clamped by saorsa-core's
+/// `MAX_CONSUMER_WEIGHT`.
+const BAD_BINDING_TRUST_WEIGHT: f64 = 5.0;
 
 /// Configuration for EVM payment verification.
 ///
@@ -457,7 +467,7 @@ impl PaymentVerifier {
         Self::validate_quote_structure(payment)?;
         Self::validate_quote_content(payment, xorname)?;
         Self::validate_quote_timestamps(payment)?;
-        Self::validate_peer_bindings(payment)?;
+        self.validate_peer_bindings(payment).await?;
         self.validate_local_recipient(payment)?;
 
         // Verify quote signatures (CPU-bound, run off async runtime)
@@ -581,14 +591,28 @@ impl PaymentVerifier {
     }
 
     /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
-    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
+    ///
+    /// On detection, reports a trust-engine penalty against the offending
+    /// peer so this storer's own routing-table view evicts the bad ID on the
+    /// next admission cycle (see `notes/plan-1-bad-node-eviction.md`).
+    /// Cleaner storer views feed cleaner close-K answers back to clients,
+    /// which is the second-order win.
+    async fn validate_peer_bindings(&self, payment: &ProofOfPayment) -> Result<()> {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
-                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
+            let expected_peer_id = match peer_id_from_public_key_bytes(&quote.pub_key) {
+                Ok(p) => p,
+                Err(e) => {
+                    self.report_bad_binding(encoded_peer_id).await;
+                    return Err(Error::Payment(format!(
+                        "Invalid ML-DSA public key in quote: {e}"
+                    )));
+                }
+            };
 
             if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
                 let expected_hex = expected_peer_id.to_hex();
                 let actual_hex = hex::encode(encoded_peer_id.as_bytes());
+                self.report_bad_binding(encoded_peer_id).await;
                 return Err(Error::Payment(format!(
                     "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
                      BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
@@ -596,6 +620,25 @@ impl PaymentVerifier {
             }
         }
         Ok(())
+    }
+
+    /// Report a verifiable bad-binding event for `encoded_peer_id` to the
+    /// trust engine via `P2PNode::report_application_failure`. No-op when
+    /// `P2PNode` isn't attached (unit-test builds that don't exercise merkle
+    /// verification go this path).
+    ///
+    /// `EncodedPeerId::as_bytes()` returns a `&[u8; 32]` so the conversion
+    /// to `PeerId` is infallible — both types share the same 32-byte BLAKE3
+    /// representation.
+    async fn report_bad_binding(&self, encoded_peer_id: &EncodedPeerId) {
+        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
+        let Some(p2p_node) = attached else {
+            return;
+        };
+        let peer_id = PeerId::from_bytes(*encoded_peer_id.as_bytes());
+        p2p_node
+            .report_application_failure(&peer_id, BAD_BINDING_TRUST_WEIGHT)
+            .await;
     }
 
     /// Minimum number of candidate `pub_keys` (out of 16) whose derived `PeerId`
@@ -2580,5 +2623,124 @@ mod tests {
             err_msg.contains("Underpayment"),
             "Error should mention underpayment: {err_msg}"
         );
+    }
+
+    // ============================================================
+    // Plan-1 §C: storer-side bad-binding rejection + trust report.
+    //
+    // The trust-engine downscore path lives in `report_bad_binding` and
+    // forwards to `P2PNode::report_application_failure`. Unit tests
+    // without an attached `P2PNode` exercise the rejection logic only —
+    // the no-op trust-report path is verified to not crash. The
+    // event-emission wiring itself is covered by integration tests that
+    // run real `P2PNode` instances; the storer-side path is structurally
+    // identical to the client-side reporter wiring tested in
+    // `ant-client/ant-core/src/data/client/quote.rs`.
+    // ============================================================
+
+    /// Build a `ProofOfPayment` containing a single quote whose `pub_key`
+    /// is a fresh ML-DSA-65 public key paired with a deliberately *random*
+    /// `EncodedPeerId` — so `BLAKE3(pub_key) != peer_id` and the validator
+    /// must reject it.
+    fn proof_with_bad_binding() -> evmlib::ProofOfPayment {
+        use crate::payment::metrics::QuotingMetricsTracker;
+        use crate::payment::quote::{QuoteGenerator, XorName};
+        use evmlib::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let rewards_address = RewardsAddress::new([0u8; 20]);
+        let metrics_tracker = QuotingMetricsTracker::new(0);
+        let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let sk_bytes = secret_key.as_bytes().to_vec();
+        generator.set_signer(pub_key_bytes, move |msg| {
+            let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("sk parse");
+            let ml_dsa = MlDsa65::new();
+            ml_dsa.sign(&sk, msg).expect("sign").as_bytes().to_vec()
+        });
+        let content: XorName = [0u8; 32];
+        let quote = generator.create_quote(content, 4096, 0).expect("quote");
+
+        // The crossed-key shape: the EncodedPeerId is random rather than
+        // BLAKE3(pub_key), exactly mirroring the production failure pattern
+        // (an operator running two co-located identities with crossed keys).
+        let bad_peer_id = EncodedPeerId::new(rand::random());
+        evmlib::ProofOfPayment {
+            peer_quotes: vec![(bad_peer_id, quote)],
+        }
+    }
+
+    /// C1: A `ProofOfPayment` with one bad-binding quote is rejected with
+    /// the expected `Error::Payment` and the `report_bad_binding` path runs
+    /// without panicking when no `P2PNode` is attached. The actual trust-
+    /// event emission requires an attached `P2PNode` and is exercised by
+    /// integration tests.
+    #[tokio::test]
+    async fn validate_peer_bindings_rejects_and_runs_report_path() {
+        let verifier = create_test_verifier();
+        let proof = proof_with_bad_binding();
+
+        let result = verifier.validate_peer_bindings(&proof).await;
+        match result {
+            Err(Error::Payment(msg)) => {
+                assert!(
+                    msg.contains("Quote pub_key does not belong to claimed peer")
+                        || msg.contains("Invalid ML-DSA public key"),
+                    "expected the bad-binding error message, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected Err(Error::Payment(..)) for bad-binding proof, got {other:?}")
+            }
+        }
+    }
+
+    /// C2: A `ProofOfPayment` whose every quote has a self-consistent
+    /// pub_key/peer_id pair passes `validate_peer_bindings` cleanly.
+    #[tokio::test]
+    async fn validate_peer_bindings_passes_through_when_all_quotes_clean() {
+        use crate::payment::metrics::QuotingMetricsTracker;
+        use crate::payment::quote::{QuoteGenerator, XorName};
+        use evmlib::{EncodedPeerId, RewardsAddress};
+        use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::types::MlDsaSecretKey;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let verifier = create_test_verifier();
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+
+        for _ in 0..3u8 {
+            let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let rewards_address = RewardsAddress::new([0u8; 20]);
+            let metrics_tracker = QuotingMetricsTracker::new(0);
+            let mut generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let sk_bytes = secret_key.as_bytes().to_vec();
+            generator.set_signer(pub_key_bytes.clone(), move |msg| {
+                let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("sk parse");
+                let ml_dsa = MlDsa65::new();
+                ml_dsa.sign(&sk, msg).expect("sign").as_bytes().to_vec()
+            });
+            let content: XorName = [0u8; 32];
+            let quote = generator.create_quote(content, 4096, 0).expect("quote");
+
+            // The well-bound shape: PeerId derives from BLAKE3(pub_key).
+            let derived = peer_id_from_public_key_bytes(&pub_key_bytes).expect("derive");
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(derived.as_bytes());
+            peer_quotes.push((EncodedPeerId::new(bytes), quote));
+        }
+
+        let proof = evmlib::ProofOfPayment { peer_quotes };
+        verifier
+            .validate_peer_bindings(&proof)
+            .await
+            .expect("clean proof must validate");
     }
 }
