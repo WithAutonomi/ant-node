@@ -15,6 +15,7 @@ use ant_node::ant_protocol::{
 };
 use ant_node::compute_address;
 use ant_node::payment::PaymentProof;
+use bytes::Bytes;
 use evmlib::testnet::Testnet;
 use evmlib::ProofOfPayment;
 use rand::Rng;
@@ -96,7 +97,7 @@ async fn test_attack_no_payment_proof() -> Result<(), Box<dyn std::error::Error>
 
     let test_data = b"Attack: no payment proof whatsoever";
     let address = compute_address(test_data);
-    let request = ChunkPutRequest::new(address, test_data.to_vec());
+    let request = ChunkPutRequest::new(address, Bytes::copy_from_slice(test_data));
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -123,7 +124,7 @@ async fn test_attack_empty_proof_bytes() -> Result<(), Box<dyn std::error::Error
 
     let test_data = b"Attack: empty proof bytes";
     let address = compute_address(test_data);
-    let request = ChunkPutRequest::with_payment(address, test_data.to_vec(), vec![]);
+    let request = ChunkPutRequest::with_payment(address, Bytes::copy_from_slice(test_data), vec![]);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -151,7 +152,8 @@ async fn test_attack_garbage_bytes_as_proof() -> Result<(), Box<dyn std::error::
     let test_data = b"Attack: garbage bytes as proof";
     let address = compute_address(test_data);
     let garbage: Vec<u8> = (0..64).map(|_| rand::thread_rng().gen()).collect();
-    let request = ChunkPutRequest::with_payment(address, test_data.to_vec(), garbage);
+    let request =
+        ChunkPutRequest::with_payment(address, Bytes::copy_from_slice(test_data), garbage);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -195,7 +197,7 @@ async fn test_attack_valid_msgpack_empty_quotes() -> Result<(), Box<dyn std::err
         padded.push(0);
     }
 
-    let request = ChunkPutRequest::with_payment(address, test_data.to_vec(), padded);
+    let request = ChunkPutRequest::with_payment(address, Bytes::copy_from_slice(test_data), padded);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -223,7 +225,8 @@ async fn test_attack_proof_too_large() -> Result<(), Box<dyn std::error::Error>>
     let test_data = b"Attack: oversized proof bytes";
     let address = compute_address(test_data);
     let oversized: Vec<u8> = vec![0xAA; 200 * 1024]; // 200KB of junk
-    let request = ChunkPutRequest::with_payment(address, test_data.to_vec(), oversized);
+    let request =
+        ChunkPutRequest::with_payment(address, Bytes::copy_from_slice(test_data), oversized);
 
     let response = send_put_to_node(&harness, 0, request)
         .await

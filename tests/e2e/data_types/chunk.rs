@@ -485,7 +485,11 @@ mod tests {
 
         // Create PUT request with empty payment
         let request_id: u64 = rand::random();
-        let request = ChunkPutRequest::with_payment(address, data.to_vec(), empty_payment);
+        let request = ChunkPutRequest::with_payment(
+            address,
+            bytes::Bytes::copy_from_slice(data),
+            empty_payment,
+        );
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),

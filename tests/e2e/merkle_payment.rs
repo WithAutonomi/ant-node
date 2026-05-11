@@ -23,6 +23,7 @@ use ant_node::compute_address;
 use ant_node::payment::{
     serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use bytes::Bytes;
 use evmlib::common::Amount;
 use evmlib::merkle_payments::{
     MerklePaymentCandidateNode, MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree,
@@ -220,7 +221,8 @@ async fn test_attack_merkle_tagged_garbage() -> Result<(), Box<dyn std::error::E
         garbage.push(0x00);
     }
 
-    let request = ChunkPutRequest::with_payment(address, test_data.to_vec(), garbage);
+    let request =
+        ChunkPutRequest::with_payment(address, Bytes::copy_from_slice(test_data), garbage);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -256,8 +258,11 @@ async fn test_attack_merkle_proof_wrong_xorname() -> Result<(), Box<dyn std::err
     let wrong_data = b"This chunk was never paid for via this merkle proof";
     let wrong_address = compute_address(wrong_data);
 
-    let request =
-        ChunkPutRequest::with_payment(wrong_address, wrong_data.to_vec(), proof.tagged_proof);
+    let request = ChunkPutRequest::with_payment(
+        wrong_address,
+        Bytes::copy_from_slice(wrong_data),
+        proof.tagged_proof,
+    );
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -304,7 +309,7 @@ async fn test_attack_merkle_tampered_candidate_signature() -> Result<(), Box<dyn
     // Build request with correct content whose BLAKE3 hash matches the proof address
     let content = proof.target.content;
     let address = proof.target.address.0;
-    let request = ChunkPutRequest::with_payment(address, content, tagged_proof);
+    let request = ChunkPutRequest::with_payment(address, Bytes::from(content), tagged_proof);
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -391,8 +396,11 @@ async fn test_attack_merkle_garbage_all_nodes_concurrent() -> Result<(), Box<dyn
 
     for i in 0..node_count {
         if harness.test_node(i).is_some() {
-            let request =
-                ChunkPutRequest::with_payment(address, test_data.to_vec(), garbage.clone());
+            let request = ChunkPutRequest::with_payment(
+                address,
+                Bytes::copy_from_slice(test_data),
+                garbage.clone(),
+            );
             let msg = ChunkMessage {
                 request_id: rand::thread_rng().gen(),
                 body: ChunkMessageBody::PutRequest(request),
@@ -458,8 +466,11 @@ async fn test_attack_merkle_proof_cross_address_replay() -> Result<(), Box<dyn s
 
     // Build request with second entry's correct content/address pair,
     // but using the proof that was bound to entries[0].
-    let request =
-        ChunkPutRequest::with_payment(second.address.0, second.content.clone(), proof.tagged_proof);
+    let request = ChunkPutRequest::with_payment(
+        second.address.0,
+        Bytes::from(second.content.clone()),
+        proof.tagged_proof,
+    );
 
     let response = send_put_to_node(&harness, 0, request)
         .await
@@ -555,7 +566,7 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
 
     let request = ChunkPutRequest::with_payment(
         proof.target.address.0,
-        proof.target.content.clone(),
+        Bytes::from(proof.target.content.clone()),
         proof.tagged_proof,
     );
 

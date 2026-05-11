@@ -499,7 +499,7 @@ impl TestNode {
         protocol.payment_verifier().cache_insert(address);
 
         let request_id: u64 = rand::thread_rng().gen();
-        let request = ChunkPutRequest::new(address, data.to_vec());
+        let request = ChunkPutRequest::new(address, Bytes::copy_from_slice(data));
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
@@ -669,7 +669,7 @@ impl TestNode {
         let address = Self::compute_chunk_address(data);
 
         let request_id: u64 = rand::thread_rng().gen();
-        let request = ChunkPutRequest::new(address, data.to_vec());
+        let request = ChunkPutRequest::new(address, Bytes::copy_from_slice(data));
         let message = ChunkMessage {
             request_id,
             body: ChunkMessageBody::PutRequest(request),
