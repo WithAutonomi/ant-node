@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.2"
+version = "0.11.3-rc.1"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
@@ -891,8 +891,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=main#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
+version = "2.1.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.5.2#971c7778840f647cdb76e6e03f4aeffd79e703ea"
 dependencies = [
  "blake3",
  "bytes",
@@ -4848,8 +4848,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix/stability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"
+version = "0.24.3-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.5.2#8293fa50ca1397c9619b8d2de8ef5eb4e78c53c4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4962,8 +4962,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.34.1"
-source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=fix/stability-improvements#55f423ca5e3312e31ba22475b68a76f4ffd50285"
+version = "0.34.2-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=rc-2026.5.2#0e0de4d8992b06ef2c93701024ce509527db05e0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7244,3 +7244,13 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
+
+[[patch.unused]]
+name = "ant-protocol"
+version = "2.0.3"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=main#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
+
+[[patch.unused]]
+name = "saorsa-core"
+version = "0.24.2"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix/stability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"
