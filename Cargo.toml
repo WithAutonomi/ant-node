@@ -33,10 +33,10 @@ path = "src/bin/ant-devnet/main.rs"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.0.3"
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "main" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.24.2"
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -171,23 +171,14 @@ cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
 
-# Pin ant-protocol to the perf/chunk-put-bytes branch so ChunkPutRequest's
-# `content` field is `Bytes` (not `Vec<u8>`). The storage handler reads the
-# field but holds it as a slice / converts to Vec at the boundary, so the
-# wire-level type swap is transparent to existing logic.
-# Remove once https://github.com/WithAutonomi/ant-protocol/pull/6 lands and a
-# crates.io release containing it is published.
+# Pin ant-protocol to the WithAutonomi `fix/stability-improvements` branch
+# until a crates.io release containing the matching stability fixes is
+# published.
 #
-# Two patch tables are needed:
-#   * `[patch.crates-io]` overrides ant-protocol on `main`, which consumes
-#     from crates.io.
-#   * `[patch."https://github.com/WithAutonomi/ant-protocol"]` overrides it
-#     on testnet branches where saorsa-core / saorsa-transport pin
-#     ant-protocol to a WithAutonomi git branch.
-# Whichever table doesn't match the active resolution path emits a benign
-# "patch not used in the crate graph" warning.
+# `[patch.crates-io]` overrides ant-protocol/saorsa-core where transitive deps
+# (e.g. evmlib, saorsa-transport) pull them from crates.io, so they unify
+# with our direct git branch pins instead of producing two versions in the
+# graph (which would split `MultiAddr` / DHT types).
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "4aac7d35b69a5d0906a6f2acd5d1d0beb52dcbb8" }
-
-[patch."https://github.com/WithAutonomi/ant-protocol"]
-ant-protocol = { git = "https://github.com/jacderida/ant-protocol.git", rev = "4aac7d35b69a5d0906a6f2acd5d1d0beb52dcbb8" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "main" }
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }

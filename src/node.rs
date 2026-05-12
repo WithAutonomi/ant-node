@@ -803,6 +803,7 @@ impl RunningNode {
                     topic,
                     source: Some(source),
                     data,
+                    ..
                 } = event
                 {
                     let handler_info: Option<(&str, &str)> = if topic == CHUNK_PROTOCOL_ID {

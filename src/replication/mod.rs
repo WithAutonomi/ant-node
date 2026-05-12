@@ -358,6 +358,7 @@ impl ReplicationEngine {
                             topic,
                             source: Some(source),
                             data,
+                            ..
                         } = event {
                             // Determine if this is a replication message
                             // and whether it arrived via the /rr/ request-response

@@ -623,6 +623,7 @@ impl Devnet {
                         topic,
                         source: Some(source),
                         data,
+                        ..
                     } = event
                     {
                         if topic == CHUNK_PROTOCOL_ID {
