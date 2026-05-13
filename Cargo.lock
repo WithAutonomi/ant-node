@@ -892,7 +892,8 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.1.0"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.5.2#241732f3a75626081ef09638f98b47fbf466046a"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aa2c58065ac6486b506fab559e4cebdbc18e416ed697112d268f3c440ba08f"
 dependencies = [
  "blake3",
  "bytes",
@@ -4849,7 +4850,8 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.24.3"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.5.2#15b3e8a5d7b041726c4f887dd7ca5f0838048055"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d7d172c24312750ed8196ec9d58eb763e8aca259f836ce1f5c21cf70023a93e"
 dependencies = [
  "anyhow",
  "async-trait",
