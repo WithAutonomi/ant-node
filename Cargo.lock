@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.11.2"
+version = "0.11.3"
 dependencies = [
  "aes-gcm-siv",
  "alloy",
@@ -891,8 +891,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.0.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=main#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1aa2c58065ac6486b506fab559e4cebdbc18e416ed697112d268f3c440ba08f"
 dependencies = [
  "blake3",
  "bytes",
@@ -1241,9 +1242,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.16.3"
+version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
+checksum = "5ec2f1fc3ec205783a5da9a7e6c1509cc69dedf09a1949e412c1e18469326d00"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -1251,9 +1252,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.40.0"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
+checksum = "1a2f9779ce85b93ab6170dd940ad0169b5766ff848247aff13bb788b832fe3f4"
 dependencies = [
  "cc",
  "cmake",
@@ -3411,9 +3412,9 @@ dependencies = [
 
 [[package]]
 name = "keccak-asm"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa468878266ad91431012b3e5ef1bf9b170eab22883503a318d46857afa4579a"
+checksum = "1766b89733097006f3a1388a02849865d6bc98c89273cb622e29fdd209922183"
 dependencies = [
  "digest 0.10.7",
  "sha3-asm",
@@ -3997,18 +3998,18 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbf0d9e68100b3a7989b4901972f265cd542e560a3a8a724e1e20322f4d06ce9"
+checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a990e22f43e84855daf260dded30524ef4a9021cc7541c26540500a50b624389"
+checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4848,8 +4849,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.24.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix/stability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"
+version = "0.24.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d7d172c24312750ed8196ec9d58eb763e8aca259f836ce1f5c21cf70023a93e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4962,8 +4964,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.34.1"
-source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=fix/stability-improvements#55f423ca5e3312e31ba22475b68a76f4ffd50285"
+version = "0.34.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "852400712537856ab6fec5293be4290daf0130df0dbcb249a6e8280f9257665f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5365,9 +5368,9 @@ dependencies = [
 
 [[package]]
 name = "sha3-asm"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59cbb88c189d6352cc8ae96a39d19c7ecad8f7330b29461187f2587fdc2988d5"
+checksum = "9f3f15d4e239ebe08413eed880e0f9b5af4b40ee0472543320efa91d488e96a7"
 dependencies = [
  "cc",
  "cfg-if",

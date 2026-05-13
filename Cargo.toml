@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.11.2"
+version = "0.11.3"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -33,10 +33,10 @@ path = "src/bin/ant-devnet/main.rs"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "main" }
+ant-protocol = "2.1.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }
+saorsa-core = "0.24.3"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -170,15 +170,3 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
-
-# Pin ant-protocol to the WithAutonomi `fix/stability-improvements` branch
-# until a crates.io release containing the matching stability fixes is
-# published.
-#
-# `[patch.crates-io]` overrides ant-protocol/saorsa-core where transitive deps
-# (e.g. evmlib, saorsa-transport) pull them from crates.io, so they unify
-# with our direct git branch pins instead of producing two versions in the
-# graph (which would split `MultiAddr` / DHT types).
-[patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "main" }
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }
