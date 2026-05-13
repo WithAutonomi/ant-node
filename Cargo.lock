@@ -7244,13 +7244,3 @@ dependencies = [
  "cc",
  "pkg-config",
 ]
-
-[[patch.unused]]
-name = "ant-protocol"
-version = "2.0.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=main#93e63b8a41a97c37c24d1164a3ee5525e002ddcd"
-
-[[patch.unused]]
-name = "saorsa-core"
-version = "0.24.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=fix/stability-improvements#5586795740eafd9818e827baa2eb2677ff3ba942"

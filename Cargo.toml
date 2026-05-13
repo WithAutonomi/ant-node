@@ -180,5 +180,5 @@ missing_const_for_fn = "allow"
 # with our direct git branch pins instead of producing two versions in the
 # graph (which would split `MultiAddr` / DHT types).
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "main" }
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "fix/stability-improvements" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.5.2" }
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "rc-2026.5.2" }
