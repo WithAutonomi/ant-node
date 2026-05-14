@@ -164,6 +164,23 @@ pub struct DevnetConfig {
     /// When `Some`, nodes will use this network (e.g. Anvil testnet) for
     /// on-chain verification. Defaults to Arbitrum One when `None`.
     pub evm_network: Option<EvmNetwork>,
+
+    /// Bind nodes to loopback addresses (`127.0.0.1`/`::1`) only.
+    ///
+    /// When `true` (the default), nodes listen on loopback only — the
+    /// historical single-host devnet behavior, suitable for development
+    /// and integration tests where every node and every client run on
+    /// the same machine.
+    ///
+    /// When `false`, nodes bind to all interfaces (`0.0.0.0`/`::`), which
+    /// is required for cross-host LAN devnets where client machines need
+    /// to reach the devnet's nodes via the lab server's LAN IP. The
+    /// transport-layer `allow_loopback` flag is enabled explicitly in this
+    /// mode so inter-node bootstrap (which still uses loopback addresses
+    /// on the lab host) continues to work.
+    ///
+    /// Passed through to saorsa-core's `NodeConfigBuilder::local`.
+    pub loopback_only: bool,
 }
 
 impl Default for DevnetConfig {
@@ -185,6 +202,7 @@ impl Default for DevnetConfig {
             enable_node_logging: false,
             cleanup_data_dir: true,
             evm_network: None,
+            loopback_only: true,
         }
     }
 }
@@ -574,9 +592,17 @@ impl Devnet {
         debug!("Starting node {} on port {}", node.index, node.port);
         *node.state.write().await = NodeState::Starting;
 
-        let mut core_config = CoreNodeConfig::builder()
-            .port(node.port)
-            .local(true)
+        let builder = CoreNodeConfig::builder().port(node.port);
+        // Historical single-host devnet path uses local(true), which auto-enables
+        // allow_loopback for routing. LAN devnet path binds all interfaces and
+        // re-enables allow_loopback explicitly so inter-node bootstrap via
+        // loopback addresses continues to work.
+        let builder = if self.config.loopback_only {
+            builder.local(true)
+        } else {
+            builder.local(false).allow_loopback(true)
+        };
+        let mut core_config = builder
             .max_message_size(crate::ant_protocol::MAX_WIRE_MESSAGE_SIZE)
             .build()
             .map_err(|e| DevnetError::Core(format!("Failed to create core config: {e}")))?;
