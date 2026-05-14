@@ -170,6 +170,8 @@ cobertura.xml
 test_data/
 tmp/
 temp/
+/test-*.bin
+/test-*.datamap
 
 # Benchmark results
 criterion/

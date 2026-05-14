@@ -116,7 +116,7 @@ pub const BOOTSTRAP_CLAIM_GRACE_PERIOD: Duration =
     Duration::from_secs(BOOTSTRAP_CLAIM_GRACE_PERIOD_SECS);
 
 /// Minimum continuous out-of-range duration before pruning a key.
-const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 6 * 60 * 60; // 6 h
+const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
@@ -146,6 +146,9 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 2.0;
+
+/// Maximum number of prune-confirmation audit challenges sent per prune pass.
+pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
 
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
@@ -243,6 +246,12 @@ impl ReplicationConfig {
             return Err(format!(
                 "quorum_threshold ({}) must satisfy 1 <= quorum_threshold <= close_group_size ({})",
                 self.quorum_threshold, self.close_group_size,
+            ));
+        }
+        if self.close_group_size > MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS {
+            return Err(format!(
+                "close_group_size ({}) must be <= MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS ({})",
+                self.close_group_size, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
             ));
         }
         if self.paid_list_close_group_size == 0 {
@@ -387,6 +396,15 @@ mod tests {
     }
 
     #[test]
+    fn default_prune_hysteresis_is_three_days() {
+        let config = ReplicationConfig::default();
+        assert_eq!(
+            config.prune_hysteresis_duration,
+            Duration::from_secs(3 * 24 * 60 * 60)
+        );
+    }
+
+    #[test]
     fn quorum_threshold_zero_rejected() {
         let config = ReplicationConfig {
             quorum_threshold: 0,
@@ -412,6 +430,22 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn close_group_size_exceeding_prune_audit_budget_rejected() {
+        let config = ReplicationConfig {
+            close_group_size: MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS + 1,
+            quorum_threshold: QUORUM_THRESHOLD,
+            ..ReplicationConfig::default()
+        };
+
+        let err = config.validate().unwrap_err();
+
+        assert!(
+            err.contains("MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS"),
+            "error should mention prune audit budget: {err}"
+        );
     }
 
     #[test]

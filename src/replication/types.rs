@@ -270,6 +270,9 @@ pub struct NeighborSyncState {
     /// perpetually claiming bootstrap, this map grows unboundedly. In practice
     /// the trust engine limits Sybil impact before this becomes a memory issue.
     pub bootstrap_claims: HashMap<PeerId, Instant>,
+    /// Cursor used by post-cycle pruning to rotate through stored records when
+    /// the per-pass prune-confirmation budget is exhausted.
+    pub prune_cursor: usize,
 }
 
 impl NeighborSyncState {
@@ -281,6 +284,7 @@ impl NeighborSyncState {
             cursor: 0,
             last_sync_times: HashMap::new(),
             bootstrap_claims: HashMap::new(),
+            prune_cursor: 0,
         }
     }
 

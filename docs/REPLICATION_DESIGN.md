@@ -73,7 +73,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | *(dynamic)* | Audit sample count per round: `floor(sqrt(local_key_count))` | scales with store size |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
 | `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status before penalties apply | `24h`                               |
-| `PRUNE_HYSTERESIS_DURATION` | Minimum continuous out-of-range duration before pruning a key | `6h`                                |
+| `PRUNE_HYSTERESIS_DURATION` | Minimum continuous out-of-range duration before pruning a key | `3 days`                            |
 
 Parameter safety constraints (MUST hold):
 
@@ -104,7 +104,7 @@ Parameter safety constraints (MUST hold):
 19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys, filtered through local authenticated routing state (`LocalRT(self)`), and further filtered to peers for which `RepairOpportunity` holds; random global peers and never-synced peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
-22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: for stored records where `IsResponsible(self, K)` is false, record `RecordOutOfRangeFirstSeen` if not already set and delete only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`; clear `RecordOutOfRangeFirstSeen` when back in range. For `PaidForList` entries where `self ∉ PaidCloseGroup(K)`, record `PaidOutOfRangeFirstSeen` if not already set and delete only when `now - PaidOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`; clear `PaidOutOfRangeFirstSeen` when back in range. The two timestamps are independent.
+22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: for stored records where `IsResponsible(self, K)` is false, record `RecordOutOfRangeFirstSeen` if not already set and delete only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every currently-known `CloseGroup(K)` member returns a positive nonce-bound audit proof for the record. If any close-group peer does not prove storage, pruning is deferred and the retained local record continues participating in normal neighbor-sync repair. Prune-confirmation failures emit trust penalties after fresh responsibility confirmation; bootstrap claims use the same `BOOTSTRAP_CLAIM_GRACE_PERIOD` tracking before abuse penalties apply. Clear `RecordOutOfRangeFirstSeen` when back in range. For `PaidForList` entries where `self ∉ PaidCloseGroup(K)`, record `PaidOutOfRangeFirstSeen` if not already set and delete only when `now - PaidOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`; clear `PaidOutOfRangeFirstSeen` when back in range. The two timestamps are independent.
 23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`).
 24. Audit trust-penalty signals require responsibility confirmation: on audit failure, challenger MUST perform fresh local RT closest-peer lookups for each challenged key and only penalize the peer for keys where it is confirmed responsible.
 
@@ -359,11 +359,11 @@ Post-cycle responsibility pruning (triggered by `NeighborSyncCycleComplete(self)
 
 1. For each locally stored key `K`, recompute `IsResponsible(self, K)` using current `SelfInclusiveRT(self)`:
    a. If in range: clear `RecordOutOfRangeFirstSeen(self, K)` (set to `None`).
-   b. If out of range: if `RecordOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Delete the record only when `now - RecordOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION`.
+   b. If out of range: if `RecordOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Once the hysteresis duration has elapsed, request a nonce-bound audit proof from every current `CloseGroup(K)` peer, subject to a bounded per-pass prune-confirmation budget. If any peer does not prove storage, defer pruning and emit trust penalties after fresh responsibility confirmation; valid bootstrap claims are penalized only after the bootstrap grace period. Delete the local record only when `now - RecordOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer proves storage for `K`.
 2. For each key `K` in `PaidForList(self)`, recompute `PaidCloseGroup(K)` membership using current `SelfInclusiveRT(self)`:
    a. If `self ∈ PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen(self, K)` (set to `None`).
    b. If `self ∉ PaidCloseGroup(K)`: if `PaidOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Delete the entry only when `now - PaidOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION`.
-3. This prune pass is local-state-only and MUST NOT require remote confirmations.
+3. Paid-list entry pruning remains local-state-only and does not require remote confirmations.
 
 Effect:
 
@@ -605,7 +605,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 35. Neighbor-sync round-robin batch selection with cooldown skip:
 - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds scan forward from cursor, skip and remove cooldown peers, and sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` non-cooldown peers. Cycle completes when all snapshot peers have been synced, skipped (cooldown), or removed (unreachable).
 36. Post-cycle responsibility pruning with time-based hysteresis:
-- When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `RecordOutOfRangeFirstSeen` recorded (if not already set) but are deleted only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`. Keys that are in range have their `RecordOutOfRangeFirstSeen` cleared. Same logic applies independently to `PaidForList` entries where `self ∉ PaidCloseGroup(K)` using `PaidOutOfRangeFirstSeen`.
+- When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `RecordOutOfRangeFirstSeen` recorded (if not already set) but are deleted only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer returns a positive nonce-bound audit proof for the key. Missing or failed proofs defer pruning and emit trust penalties after fresh responsibility confirmation; valid bootstrap claims are penalized only after the bootstrap grace period. Prune-confirmation work is bounded per pass. Keys that are in range have their `RecordOutOfRangeFirstSeen` cleared. Same hysteresis timing applies independently to `PaidForList` entries where `self ∉ PaidCloseGroup(K)` using `PaidOutOfRangeFirstSeen`, but paid-list pruning does not require remote storage confirmation.
 37. Non-`LocalRT` inbound sync behavior:
 - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
 38. Neighbor-sync snapshot stability under peer join:
@@ -633,7 +633,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 49. Bootstrap claim cleared on normal response:
 - Peer `P` previously claimed bootstrapping. `P` later responds normally to a sync or audit request. Node clears `BootstrapClaimFirstSeen(self, P)`. No residual penalty tracking.
 50. Prune hysteresis prevents premature deletion:
-- Key `K` goes out of range at time `T`. `RecordOutOfRangeFirstSeen(self, K)` is set to `T`. Key is NOT deleted. At `T + 3h` (less than `PRUNE_HYSTERESIS_DURATION`), key is still retained. At `T + 6h` (`>= PRUNE_HYSTERESIS_DURATION`), key is deleted on the next prune pass.
+- Key `K` goes out of range at time `T`. `RecordOutOfRangeFirstSeen(self, K)` is set to `T`. Key is NOT deleted. At `T + 24h` (less than `PRUNE_HYSTERESIS_DURATION`), key is still retained. At `T + 3 days` (`>= PRUNE_HYSTERESIS_DURATION`), key is eligible for deletion on the next prune pass only if all current close-group peers return positive nonce-bound audit proofs.
 51. Prune hysteresis timestamp reset on partition heal:
 - Key `K` goes out of range at time `T`. `RecordOutOfRangeFirstSeen(self, K)` is set to `T`. At `T + 4h`, partition heals, peers return, `K` is back in range. `RecordOutOfRangeFirstSeen` is cleared. Key is retained. If `K` later goes out of range again, the clock restarts from zero.
 52. Prune hysteresis applies to paid-list entries:

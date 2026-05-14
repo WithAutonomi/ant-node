@@ -1503,7 +1503,19 @@ async fn run_neighbor_sync_round(
     let cycle_complete = sync_state.read().await.is_cycle_complete();
     if cycle_complete {
         // Post-cycle pruning (Section 11) — runs without holding sync_state.
-        pruning::run_prune_pass(&self_id, storage, paid_list, p2p_node, config).await;
+        // Remote prune-confirmation audits are storage-proof audits and only
+        // run after bootstrap has drained.
+        let allow_remote_prune_audits = !bootstrapping && bootstrap_state.read().await.is_drained();
+        pruning::run_prune_pass(
+            &self_id,
+            storage,
+            paid_list,
+            p2p_node,
+            config,
+            sync_state,
+            allow_remote_prune_audits,
+        )
+        .await;
 
         // Increment `cycles_since_sync` for all peers.
         {
@@ -1526,9 +1538,11 @@ async fn run_neighbor_sync_round(
             // would reset the abuse detection timer every cycle.
             let old_sync_times = std::mem::take(&mut state.last_sync_times);
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
+            let old_prune_cursor = state.prune_cursor;
             *state = NeighborSyncState::new_cycle(neighbors);
             state.last_sync_times = old_sync_times;
             state.bootstrap_claims = old_bootstrap_claims;
+            state.prune_cursor = old_prune_cursor;
         }
     }
 
