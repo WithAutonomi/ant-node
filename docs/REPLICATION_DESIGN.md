@@ -50,7 +50,7 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `QuorumNeeded(K)`: effective presence confirmation count for key `K`, defined as `min(QUORUM_THRESHOLD, floor(|QuorumTargets(K)|/2)+1)`.
 - `BootstrapDrained(N)`: bootstrap-completion gate for node `N`; true only when peer discovery closest to `N`'s own address has populated `LocalRT(N)`, bootstrap peer requests are finished (response or timeout), and bootstrap work queues are empty (`PendingVerify`, `FetchQueue`, `InFlightFetch` for bootstrap-discovered keys).
 - `RepairOpportunity(P, KSet)`: evidence that peer `P` has previously received replication hints/offers for keys in `KSet` and had at least one subsequent neighbor-sync cycle to repair before audit evaluation.
-- `BootstrapClaimFirstSeen(N, P)`: timestamp when node `N` first observed peer `P` responding with a bootstrapping claim to a sync or audit request. Reset when `P` stops claiming bootstrap status.
+- `BootstrapClaimFirstSeen(N, P)`: timestamp when node `N` first observed peer `P` responding with a bootstrapping claim to a sync, audit, or prune-confirmation request. Each peer gets at most one bootstrap-claim grace window. When `P` stops claiming bootstrap status, the active claim is cleared but the first-seen history is retained; any later bootstrap claim by the same peer is `BootstrapClaimAbuse`.
 - `TrustEngine`: local trust subsystem (EMA-based response-rate scoring with time decay) that consumes replication evidence events via `AdaptiveDHT::report_trust_event`, updates peer trust scores, and triggers peer eviction when scores fall below `block_threshold`. Consumer-reported events use `TrustEvent::ApplicationSuccess(weight)` / `TrustEvent::ApplicationFailure(weight)` with weight clamped to `MAX_CONSUMER_WEIGHT` (5.0).
 
 ## 4. Tunable Parameters
@@ -72,7 +72,7 @@ All parameters are configurable. Values below are a reference profile used for l
 | `AUDIT_TICK_INTERVAL` | Audit scheduler cadence | random in `[30 min, 1 hour]`        |
 | *(dynamic)* | Audit sample count per round: `floor(sqrt(local_key_count))` | scales with store size |
 | `AUDIT_RESPONSE_TIMEOUT` | Audit response deadline | `12s`                               |
-| `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status before penalties apply | `24h`                               |
+| `BOOTSTRAP_CLAIM_GRACE_PERIOD` | Max duration a peer may claim bootstrap status during its one allowed grace window before penalties apply | `24h`                               |
 | `PRUNE_HYSTERESIS_DURATION` | Minimum continuous out-of-range duration before pruning a key | `3 days`                            |
 
 Parameter safety constraints (MUST hold):
@@ -104,8 +104,8 @@ Parameter safety constraints (MUST hold):
 19. Storage-proof audits start only after `BootstrapDrained(self)` becomes true.
 20. Storage-proof audits target only peers derived from closest-peer lookups for sampled local keys, filtered through local authenticated routing state (`LocalRT(self)`), and further filtered to peers for which `RepairOpportunity` holds; random global peers and never-synced peers are never audited.
 21. Verification-request batching is mandatory for unknown-key neighbor-sync verification and preserves per-key quorum semantics: each key receives explicit per-key evidence, and missing/timeout evidence is unresolved per key.
-22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: for stored records where `IsResponsible(self, K)` is false, record `RecordOutOfRangeFirstSeen` if not already set and delete only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every currently-known `CloseGroup(K)` member returns a positive nonce-bound audit proof for the record. If any close-group peer does not prove storage, pruning is deferred and the retained local record continues participating in normal neighbor-sync repair. Prune-confirmation failures emit trust penalties after fresh responsibility confirmation; bootstrap claims use the same `BOOTSTRAP_CLAIM_GRACE_PERIOD` tracking before abuse penalties apply. Clear `RecordOutOfRangeFirstSeen` when back in range. For `PaidForList` entries where `self ∉ PaidCloseGroup(K)`, record `PaidOutOfRangeFirstSeen` if not already set and delete only when `now - PaidOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`; clear `PaidOutOfRangeFirstSeen` when back in range. The two timestamps are independent.
-23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`).
+22. On every `NeighborSyncCycleComplete(self)`, node MUST run a prune pass using current `SelfInclusiveRT(self)`: for stored records where `IsResponsible(self, K)` is false, record `RecordOutOfRangeFirstSeen` if not already set and delete only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every currently-known `CloseGroup(K)` member returns a positive nonce-bound audit proof for the record. If any close-group peer does not prove storage, pruning is deferred and the retained local record continues participating in normal neighbor-sync repair. Prune-confirmation failures emit trust penalties after fresh responsibility confirmation; first-time bootstrap claims use the same one-time `BOOTSTRAP_CLAIM_GRACE_PERIOD` tracking before abuse penalties apply. Clear `RecordOutOfRangeFirstSeen` when back in range. For `PaidForList` entries where `self ∉ PaidCloseGroup(K)`, record `PaidOutOfRangeFirstSeen` if not already set and delete only when `now - PaidOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`; clear `PaidOutOfRangeFirstSeen` when back in range. The two timestamps are independent.
+23. Peers claiming bootstrap status are skipped for sync and audit without penalty for up to `BOOTSTRAP_CLAIM_GRACE_PERIOD` from first observation. After the grace period, each continued bootstrap claim emits `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`). If a peer stops claiming bootstrap and later claims bootstrap again, the repeated claim emits `BootstrapClaimAbuse` immediately; the grace period is not reset.
 24. Audit trust-penalty signals require responsibility confirmation: on audit failure, challenger MUST perform fresh local RT closest-peer lookups for each challenged key and only penalize the peer for keys where it is confirmed responsible.
 
 ## 6. Replication
@@ -140,7 +140,7 @@ Rules:
    c. Stop when `|NeighborSyncSet(self)| = NEIGHBOR_SYNC_PEER_COUNT` or no unscanned peers remain in the snapshot.
 3. Node initiates sync with each peer in `NeighborSyncSet(self)`. If a peer cannot be synced, remove it from `NeighborSyncOrder(self)` and attempt to fill the vacated slot by resuming the scan from where rule 2 left off. A peer cannot be synced if:
    a. Unreachable (connection failure/timeout).
-   b. Peer responds with a bootstrapping claim. On first observation, record `BootstrapClaimFirstSeen(self, peer)`. If `now - BootstrapClaimFirstSeen(self, peer) <= BOOTSTRAP_CLAIM_GRACE_PERIOD`, accept the claim and skip without penalty. If the grace period has elapsed, emit `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) and skip.
+   b. Peer responds with a bootstrapping claim. On first observation, record `BootstrapClaimFirstSeen(self, peer)`. If `now - BootstrapClaimFirstSeen(self, peer) <= BOOTSTRAP_CLAIM_GRACE_PERIOD`, accept the claim and skip without penalty. If the grace period has elapsed, emit `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) and skip. If the peer had previously stopped claiming bootstrap, emit `BootstrapClaimAbuse` immediately for the repeated claim and skip.
 4. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
 5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
 6. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
@@ -359,7 +359,7 @@ Post-cycle responsibility pruning (triggered by `NeighborSyncCycleComplete(self)
 
 1. For each locally stored key `K`, recompute `IsResponsible(self, K)` using current `SelfInclusiveRT(self)`:
    a. If in range: clear `RecordOutOfRangeFirstSeen(self, K)` (set to `None`).
-   b. If out of range: if `RecordOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Once the hysteresis duration has elapsed, request a nonce-bound audit proof from every current `CloseGroup(K)` peer, subject to a bounded per-pass prune-confirmation budget. If any peer does not prove storage, defer pruning and emit trust penalties after fresh responsibility confirmation; valid bootstrap claims are penalized only after the bootstrap grace period. Delete the local record only when `now - RecordOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer proves storage for `K`.
+   b. If out of range: if `RecordOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Once the hysteresis duration has elapsed, request a nonce-bound audit proof from every current `CloseGroup(K)` peer, subject to a bounded per-pass prune-confirmation budget. If any peer does not prove storage, defer pruning and emit trust penalties after fresh responsibility confirmation; first-time bootstrap claims are penalized only after the bootstrap grace period, while repeated bootstrap claims are penalized immediately. Delete the local record only when `now - RecordOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer proves storage for `K`.
 2. For each key `K` in `PaidForList(self)`, recompute `PaidCloseGroup(K)` membership using current `SelfInclusiveRT(self)`:
    a. If `self ∈ PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen(self, K)` (set to `None`).
    b. If `self ∉ PaidCloseGroup(K)`: if `PaidOutOfRangeFirstSeen(self, K)` is `None`, set it to `now`. Delete the entry only when `now - PaidOutOfRangeFirstSeen(self, K) >= PRUNE_HYSTERESIS_DURATION`.
@@ -420,7 +420,7 @@ Failure evidence types include:
 
 - `ReplicationFailure`: failed fetch attempt from a source peer.
 - `AuditFailure`: timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence (emitted per confirmed failed key).
-- `BootstrapClaimAbuse`: peer continues claiming bootstrap status after `BOOTSTRAP_CLAIM_GRACE_PERIOD` has elapsed since `BootstrapClaimFirstSeen`.
+- `BootstrapClaimAbuse`: peer continues claiming bootstrap status after `BOOTSTRAP_CLAIM_GRACE_PERIOD` has elapsed since `BootstrapClaimFirstSeen`, or claims bootstrap status again after previously stopping.
 
 Rules:
 
@@ -430,8 +430,8 @@ Rules:
 4. Replication SHOULD mark fetch-failure evidence as stale/low-confidence if the key later succeeds via an alternate verified source.
 5. On audit failure, replication MUST first run the responsibility confirmation (Section 15 step 9). If the confirmed failure set is non-empty, emit `AuditFailure` evidence with `challenge_id`, `challenged_peer_id`, confirmed failure keys, and failure reason. If the confirmed failure set is empty, no `AuditFailure` is emitted.
 6. Replication MUST emit a trust-penalty signal to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) for audit failure only when both conditions hold: the confirmed failure set from responsibility confirmation is non-empty (Section 15 step 9d) AND `RepairOpportunity(challenged_peer_id, confirmed_failure_keys)` is true.
-7. On bootstrap claim past grace period, replication MUST emit `BootstrapClaimAbuse` evidence with `peer_id` and `BootstrapClaimFirstSeen` timestamp. Evidence is emitted on each sync or audit attempt where the peer claims bootstrapping after `BOOTSTRAP_CLAIM_GRACE_PERIOD`.
-8. When a peer that previously claimed bootstrap status stops claiming it (responds normally to sync or audit), node MUST clear `BootstrapClaimFirstSeen(self, peer)`.
+7. On bootstrap claim past grace period, replication MUST emit `BootstrapClaimAbuse` evidence with `peer_id` and `BootstrapClaimFirstSeen` timestamp. Evidence is emitted on each sync or audit attempt where the peer claims bootstrapping after `BOOTSTRAP_CLAIM_GRACE_PERIOD`. A repeated bootstrap claim after the peer previously stopped claiming bootstrap also MUST emit `BootstrapClaimAbuse` immediately.
+8. When a peer that previously claimed bootstrap status stops claiming it (responds normally to sync or audit), node MUST clear the active bootstrap claim but MUST retain the first-seen history. The peer MUST NOT receive a second bootstrap grace window.
 9. Final trust-score updates and any eventual peer eviction are determined by `TrustEngine` / `AdaptiveDHT`, not by replication logic.
 
 ## 15. Storage Audit Protocol (Anti-Outsourcing)
@@ -446,7 +446,7 @@ Challenge-response for claimed holders:
 6. Challenger sends `challenged_peer_id` an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
 7. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
     a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = H(nonce || challenged_peer_id || K_i || record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
-    b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period. Audit tick ends (no digest verification).
+    b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within the one-time `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period or if this is a repeated claim after the peer previously stopped claiming bootstrap. Audit tick ends (no digest verification).
 8. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
 9. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
     a. For each failed key `K` in `PeerKeySet(challenged_peer_id)`, perform a fresh local RT closest-peer lookup for `K`.
@@ -471,7 +471,7 @@ Audit challenge bound:
 Failure conditions:
 
 - Timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 9) before penalty.
-- Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD` (emits `BootstrapClaimAbuse`, not `AuditFailure`).
+- Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD`, or repeated after the peer previously stopped claiming bootstrap (emits `BootstrapClaimAbuse`, not `AuditFailure`).
 
 Audit trigger and target selection:
 
@@ -605,7 +605,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 35. Neighbor-sync round-robin batch selection with cooldown skip:
 - With more than `NEIGHBOR_SYNC_PEER_COUNT` eligible peers, consecutive rounds scan forward from cursor, skip and remove cooldown peers, and sync the next batch of up to `NEIGHBOR_SYNC_PEER_COUNT` non-cooldown peers. Cycle completes when all snapshot peers have been synced, skipped (cooldown), or removed (unreachable).
 36. Post-cycle responsibility pruning with time-based hysteresis:
-- When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `RecordOutOfRangeFirstSeen` recorded (if not already set) but are deleted only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer returns a positive nonce-bound audit proof for the key. Missing or failed proofs defer pruning and emit trust penalties after fresh responsibility confirmation; valid bootstrap claims are penalized only after the bootstrap grace period. Prune-confirmation work is bounded per pass. Keys that are in range have their `RecordOutOfRangeFirstSeen` cleared. Same hysteresis timing applies independently to `PaidForList` entries where `self ∉ PaidCloseGroup(K)` using `PaidOutOfRangeFirstSeen`, but paid-list pruning does not require remote storage confirmation.
+- When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `RecordOutOfRangeFirstSeen` recorded (if not already set) but are deleted only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION` and every current close-group peer returns a positive nonce-bound audit proof for the key. Missing or failed proofs defer pruning and emit trust penalties after fresh responsibility confirmation; first-time bootstrap claims are penalized only after the bootstrap grace period, while repeated bootstrap claims are penalized immediately. Prune-confirmation work is bounded per pass. Keys that are in range have their `RecordOutOfRangeFirstSeen` cleared. Same hysteresis timing applies independently to `PaidForList` entries where `self ∉ PaidCloseGroup(K)` using `PaidOutOfRangeFirstSeen`, but paid-list pruning does not require remote storage confirmation.
 37. Non-`LocalRT` inbound sync behavior:
 - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
 38. Neighbor-sync snapshot stability under peer join:
@@ -630,8 +630,8 @@ Each scenario should assert exact expected outcomes and state transitions.
 - Challenged peer responds with bootstrapping claim during audit. Node records `BootstrapClaimFirstSeen`. Audit tick ends without `AuditFailure`. No penalty emitted.
 48. Bootstrap claim abuse after grace period:
 - Peer `P` first claimed bootstrapping 25 hours ago (`> BOOTSTRAP_CLAIM_GRACE_PERIOD`). On next sync or audit attempt where `P` still claims bootstrapping, node emits `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) with `peer_id` and `BootstrapClaimFirstSeen` timestamp.
-49. Bootstrap claim cleared on normal response:
-- Peer `P` previously claimed bootstrapping. `P` later responds normally to a sync or audit request. Node clears `BootstrapClaimFirstSeen(self, P)`. No residual penalty tracking.
+49. Bootstrap active claim cleared on normal response, with history retained:
+- Peer `P` previously claimed bootstrapping. `P` later responds normally to a sync or audit request. Node clears the active bootstrap claim but retains `BootstrapClaimFirstSeen(self, P)` history. If `P` later claims bootstrapping again, node emits `BootstrapClaimAbuse` immediately instead of granting a second grace period.
 50. Prune hysteresis prevents premature deletion:
 - Key `K` goes out of range at time `T`. `RecordOutOfRangeFirstSeen(self, K)` is set to `T`. Key is NOT deleted. At `T + 24h` (less than `PRUNE_HYSTERESIS_DURATION`), key is still retained. At `T + 3 days` (`>= PRUNE_HYSTERESIS_DURATION`), key is eligible for deletion on the next prune pass only if all current close-group peers return positive nonce-bound audit proofs.
 51. Prune hysteresis timestamp reset on partition heal:

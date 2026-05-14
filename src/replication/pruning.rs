@@ -26,7 +26,7 @@ use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
-use crate::replication::types::NeighborSyncState;
+use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
 use crate::storage::LmdbStorage;
 
 use super::REPLICATION_TRUST_WEIGHT;
@@ -780,32 +780,46 @@ async fn report_prune_bootstrap_claim(
         return;
     }
 
-    let claim_age = {
+    let observation = {
         let now = Instant::now();
         let mut state = sync_state.write().await;
-        let first_seen = state.bootstrap_claims.entry(*peer).or_insert(now);
-        let claim_age = now.duration_since(*first_seen);
-        if claim_age > config.bootstrap_claim_grace_period {
-            Some(claim_age)
-        } else {
-            debug!("Prune audit: peer {peer} claims bootstrapping (within grace period)");
-            None
-        }
+        (
+            now,
+            state.observe_bootstrap_claim(*peer, now, config.bootstrap_claim_grace_period),
+        )
     };
 
-    let Some(claim_age) = claim_age else {
-        return;
-    };
-    if !reserve_prune_bootstrap_abuse_report(report_state, peer).await {
-        debug!("Prune audit: peer {peer} bootstrap abuse already reported this pass");
-        return;
+    let (now, observation) = observation;
+    match observation {
+        BootstrapClaimObservation::WithinGrace { .. } => {
+            debug!("Prune audit: peer {peer} claims bootstrapping (within grace period)");
+            return;
+        }
+        BootstrapClaimObservation::PastGrace { first_seen } => {
+            if !reserve_prune_bootstrap_abuse_report(report_state, peer).await {
+                debug!("Prune audit: peer {peer} bootstrap abuse already reported this pass");
+                return;
+            }
+            warn!(
+                "Prune audit: peer {peer} claiming bootstrap past grace period \
+                 ({:?} > {:?}), reporting abuse",
+                now.duration_since(first_seen),
+                config.bootstrap_claim_grace_period,
+            );
+        }
+        BootstrapClaimObservation::Repeated { first_seen } => {
+            if !reserve_prune_bootstrap_abuse_report(report_state, peer).await {
+                debug!("Prune audit: peer {peer} bootstrap abuse already reported this pass");
+                return;
+            }
+            warn!(
+                "Prune audit: peer {peer} repeated bootstrap claim after previously stopping; \
+                 first claim was {:?} ago, reporting abuse",
+                now.duration_since(first_seen),
+            );
+        }
     }
 
-    warn!(
-        "Prune audit: peer {peer} claiming bootstrap past grace period \
-         ({:?} > {:?}), reporting abuse",
-        claim_age, config.bootstrap_claim_grace_period,
-    );
     p2p_node
         .report_trust_event(
             peer,
@@ -817,10 +831,10 @@ async fn report_prune_bootstrap_claim(
 async fn clear_prune_bootstrap_claim(peer: &PeerId, sync_state: &Arc<RwLock<NeighborSyncState>>) {
     let removed = {
         let mut state = sync_state.write().await;
-        state.bootstrap_claims.remove(peer).is_some()
+        state.clear_active_bootstrap_claim(peer)
     };
     if removed {
-        debug!("Prune audit: cleared stale bootstrap claim for {peer}");
+        debug!("Prune audit: cleared active bootstrap claim for {peer}");
     }
 }
 
@@ -981,15 +995,23 @@ mod tests {
     async fn prune_audit_normal_response_clears_stale_bootstrap_claim() {
         let peer = peer_id_from_byte(1);
         let state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![peer])));
+        let first_seen = Instant::now();
         state
             .write()
             .await
             .bootstrap_claims
-            .insert(peer, Instant::now());
+            .insert(peer, first_seen);
+        state
+            .write()
+            .await
+            .bootstrap_claim_history
+            .insert(peer, first_seen);
 
         clear_prune_bootstrap_claim(&peer, &state).await;
 
-        assert!(!state.read().await.bootstrap_claims.contains_key(&peer));
+        let state = state.read().await;
+        assert!(!state.bootstrap_claims.contains_key(&peer));
+        assert!(state.bootstrap_claim_history.contains_key(&peer));
     }
 
     #[tokio::test]

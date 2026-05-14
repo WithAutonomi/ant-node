@@ -558,7 +558,7 @@ pub async fn handle_audit_challenge(
 mod tests {
     use super::*;
     use crate::replication::protocol::compute_audit_digest;
-    use crate::replication::types::NeighborSyncState;
+    use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
     use crate::storage::LmdbStorageConfig;
     use tempfile::TempDir;
 
@@ -1354,11 +1354,23 @@ mod tests {
         let peer = PeerId::from_bytes([0x47; 32]);
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
         let now = Instant::now();
-        state.bootstrap_claims.entry(peer).or_insert(now);
+        let observed = state.observe_bootstrap_claim(
+            peer,
+            now,
+            crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD,
+        );
 
+        assert_eq!(
+            observed,
+            BootstrapClaimObservation::WithinGrace { first_seen: now }
+        );
         assert!(
             state.bootstrap_claims.contains_key(&peer),
             "BootstrapClaimFirstSeen should be recorded after grace-period claim"
+        );
+        assert!(
+            state.bootstrap_claim_history.contains_key(&peer),
+            "Bootstrap claim history should remember that the grace window was used"
         );
     }
 

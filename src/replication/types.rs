@@ -6,7 +6,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -251,10 +251,31 @@ impl PeerSyncRecord {
 // Neighbor sync cycle state
 // ---------------------------------------------------------------------------
 
+/// Result of observing a peer's bootstrap claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootstrapClaimObservation {
+    /// The peer is inside its first and only bootstrap-claim grace window.
+    WithinGrace {
+        /// First time this peer claimed bootstrap status.
+        first_seen: Instant,
+    },
+    /// The peer has continuously claimed bootstrap status past the grace period.
+    PastGrace {
+        /// First time this peer claimed bootstrap status.
+        first_seen: Instant,
+    },
+    /// The peer previously stopped claiming bootstrap and then claimed it again.
+    Repeated {
+        /// First time this peer ever claimed bootstrap status.
+        first_seen: Instant,
+    },
+}
+
 /// Neighbor sync cycle state.
 ///
 /// Tracks a deterministic walk through the current close-group snapshot,
-/// per-peer cooldown times, and bootstrap claim first-seen timestamps.
+/// per-peer cooldown times, active bootstrap claims, and peers that have already
+/// used their one bootstrap-claim window.
 #[derive(Debug)]
 pub struct NeighborSyncState {
     /// Deterministic ordering of peers for the current cycle (snapshot).
@@ -263,13 +284,20 @@ pub struct NeighborSyncState {
     pub cursor: usize,
     /// Per-peer last successful sync time (for cooldown).
     pub last_sync_times: HashMap<PeerId, Instant>,
-    /// Bootstrap claim first-seen timestamps per peer.
+    /// Active bootstrap claim first-seen timestamps per peer.
     ///
-    /// Entries are removed when a peer passes or fails audit (i.e. stops
-    /// claiming bootstrap). Under Sybil attack with many distinct peer IDs
-    /// perpetually claiming bootstrap, this map grows unboundedly. In practice
-    /// the trust engine limits Sybil impact before this becomes a memory issue.
+    /// Entries are removed when a peer stops claiming bootstrap. The peer
+    /// remains in `bootstrap_claim_history`, so a later claim is repeated-claim
+    /// abuse instead of a fresh grace period.
     pub bootstrap_claims: HashMap<PeerId, Instant>,
+    /// First-ever bootstrap claim timestamp per peer.
+    ///
+    /// This is retained after active claims are cleared so each peer gets at
+    /// most one bootstrap-claim grace window. Under Sybil attack with many
+    /// distinct peer IDs claiming bootstrap, this map grows unboundedly. In
+    /// practice the trust engine limits Sybil impact before this becomes a
+    /// memory issue.
+    pub bootstrap_claim_history: HashMap<PeerId, Instant>,
     /// Cursor used by post-cycle pruning to rotate through stored records when
     /// the per-pass prune-confirmation budget is exhausted.
     pub prune_cursor: usize,
@@ -284,8 +312,42 @@ impl NeighborSyncState {
             cursor: 0,
             last_sync_times: HashMap::new(),
             bootstrap_claims: HashMap::new(),
+            bootstrap_claim_history: HashMap::new(),
             prune_cursor: 0,
         }
+    }
+
+    /// Observe a peer claiming bootstrap status.
+    ///
+    /// A peer receives one grace window from its first observed bootstrap claim.
+    /// If it later stops claiming bootstrap, callers should clear only the
+    /// active claim with [`Self::clear_active_bootstrap_claim`]. A subsequent
+    /// claim is then reported as [`BootstrapClaimObservation::Repeated`].
+    #[must_use]
+    pub fn observe_bootstrap_claim(
+        &mut self,
+        peer: PeerId,
+        now: Instant,
+        grace_period: Duration,
+    ) -> BootstrapClaimObservation {
+        if let Some(first_seen) = self.bootstrap_claims.get(&peer).copied() {
+            if now.duration_since(first_seen) > grace_period {
+                BootstrapClaimObservation::PastGrace { first_seen }
+            } else {
+                BootstrapClaimObservation::WithinGrace { first_seen }
+            }
+        } else if let Some(first_seen) = self.bootstrap_claim_history.get(&peer).copied() {
+            BootstrapClaimObservation::Repeated { first_seen }
+        } else {
+            self.bootstrap_claims.insert(peer, now);
+            self.bootstrap_claim_history.insert(peer, now);
+            BootstrapClaimObservation::WithinGrace { first_seen: now }
+        }
+    }
+
+    /// Clear the active bootstrap claim for a peer, retaining claim history.
+    pub fn clear_active_bootstrap_claim(&mut self, peer: &PeerId) -> bool {
+        self.bootstrap_claims.remove(peer).is_some()
     }
 
     /// Whether the current cycle is complete.
@@ -561,6 +623,50 @@ mod tests {
         assert!(
             state.is_cycle_complete(),
             "cursor past end should still report complete"
+        );
+    }
+
+    #[test]
+    fn bootstrap_claim_history_prevents_second_grace_window() {
+        let peer = peer_id_from_byte(9);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let first_seen = Instant::now();
+        let grace = Duration::from_secs(60);
+
+        assert_eq!(
+            state.observe_bootstrap_claim(peer, first_seen, grace),
+            BootstrapClaimObservation::WithinGrace { first_seen }
+        );
+        assert!(state.clear_active_bootstrap_claim(&peer));
+        assert!(!state.bootstrap_claims.contains_key(&peer));
+        assert!(state.bootstrap_claim_history.contains_key(&peer));
+
+        assert_eq!(
+            state.observe_bootstrap_claim(peer, first_seen + Duration::from_secs(1), grace),
+            BootstrapClaimObservation::Repeated { first_seen }
+        );
+        assert!(
+            !state.bootstrap_claims.contains_key(&peer),
+            "repeated claims must not recreate an active grace window"
+        );
+        assert_eq!(
+            state.observe_bootstrap_claim(peer, first_seen + Duration::from_secs(2), grace),
+            BootstrapClaimObservation::Repeated { first_seen }
+        );
+    }
+
+    #[test]
+    fn bootstrap_claim_active_window_reports_past_grace() {
+        let peer = peer_id_from_byte(10);
+        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let first_seen = Instant::now();
+        let grace = Duration::from_secs(60);
+
+        let _ = state.observe_bootstrap_claim(peer, first_seen, grace);
+
+        assert_eq!(
+            state.observe_bootstrap_claim(peer, first_seen + grace + Duration::from_secs(1), grace),
+            BootstrapClaimObservation::PastGrace { first_seen }
         );
     }
 

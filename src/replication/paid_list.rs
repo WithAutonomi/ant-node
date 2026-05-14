@@ -394,7 +394,9 @@ impl PaidList {
 mod tests {
     use super::*;
     use crate::replication::config::{BOOTSTRAP_CLAIM_GRACE_PERIOD, PRUNE_HYSTERESIS_DURATION};
-    use crate::replication::types::{FailureEvidence, NeighborSyncState};
+    use crate::replication::types::{
+        BootstrapClaimObservation, FailureEvidence, NeighborSyncState,
+    };
     use saorsa_core::identity::PeerId;
     use tempfile::TempDir;
 
@@ -824,11 +826,16 @@ mod tests {
         let peer = PeerId::from_bytes([0x46; 32]);
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
 
-        // Insert a first-seen timestamp.
         let first_ts = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3))
             .unwrap_or_else(Instant::now);
-        state.bootstrap_claims.insert(peer, first_ts);
+        let observed = state.observe_bootstrap_claim(peer, first_ts, BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        assert_eq!(
+            observed,
+            BootstrapClaimObservation::WithinGrace {
+                first_seen: first_ts
+            }
+        );
 
         // Verify recorded.
         assert_eq!(
@@ -836,10 +843,22 @@ mod tests {
             Some(&first_ts),
             "first-seen timestamp should be recorded"
         );
+        assert_eq!(
+            state.bootstrap_claim_history.get(&peer),
+            Some(&first_ts),
+            "first-ever timestamp should be retained"
+        );
 
-        // Insert again — must NOT overwrite (first-observation-wins).
+        // Observe again while still active — must NOT overwrite
+        // (first-observation-wins).
         let later_ts = Instant::now();
-        state.bootstrap_claims.entry(peer).or_insert(later_ts);
+        let observed = state.observe_bootstrap_claim(peer, later_ts, BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        assert_eq!(
+            observed,
+            BootstrapClaimObservation::WithinGrace {
+                first_seen: first_ts
+            }
+        );
         assert_eq!(
             state.bootstrap_claims.get(&peer),
             Some(&first_ts),
@@ -866,6 +885,7 @@ mod tests {
             .checked_sub(grace_plus_margin)
             .unwrap_or_else(Instant::now);
         state.bootstrap_claims.insert(peer, first_seen);
+        state.bootstrap_claim_history.insert(peer, first_seen);
 
         // On platforms that support the backdated instant, verify claim age.
         let claim_age = Instant::now().duration_since(first_seen);
@@ -897,17 +917,30 @@ mod tests {
         let mut state = NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a bootstrap claim.
-        state.bootstrap_claims.insert(peer, Instant::now());
+        let first_seen = Instant::now();
+        let _ = state.observe_bootstrap_claim(peer, first_seen, BOOTSTRAP_CLAIM_GRACE_PERIOD);
         assert!(
             state.bootstrap_claims.contains_key(&peer),
             "claim should exist after insert"
         );
 
-        // Peer responded normally — clear the claim.
-        state.bootstrap_claims.remove(&peer);
+        // Peer responded normally — clear only the active claim.
+        state.clear_active_bootstrap_claim(&peer);
         assert!(
             !state.bootstrap_claims.contains_key(&peer),
             "claim should be gone after normal response"
+        );
+        assert!(
+            state.bootstrap_claim_history.contains_key(&peer),
+            "claim history should remain so the peer cannot claim bootstrapping again"
+        );
+
+        let repeated =
+            state.observe_bootstrap_claim(peer, Instant::now(), BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        assert_eq!(
+            repeated,
+            BootstrapClaimObservation::Repeated { first_seen },
+            "a second bootstrap claim should be classified as repeated abuse"
         );
     }
 }
