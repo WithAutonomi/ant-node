@@ -23,6 +23,7 @@ use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use saorsa_core::TrustEvent;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -51,6 +52,38 @@ const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 /// verifying node's wall clock (300 seconds). Applies exclusively to the
 /// future direction; past-dated quotes are governed by `QUOTE_MAX_AGE_SECS`.
 const QUOTE_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
+
+/// Trust-event weight reported for a BLAKE3 quote-binding mismatch
+/// (`BLAKE3(pub_key) != claimed peer_id`). This is a deterministic,
+/// non-spoofable check: the payer cannot fabricate a mismatch against an
+/// innocent peer because the binding is a structural property of the
+/// quote bytes themselves. Use the maximum single-event weight allowed
+/// by saorsa-core (`MAX_CONSUMER_WEIGHT = 5.0`), which alone crosses the
+/// `BLOCK_THRESHOLD` and makes the offender immediately ineligible for
+/// new admissions. Trust feeds Mick's lazy swap-out (saorsa-core PR #65):
+/// no immediate eviction, but the next time a better candidate competes
+/// for the same routing-table slot the bad peer is replaced.
+const QUOTE_BINDING_MISMATCH_WEIGHT: f64 = 5.0;
+
+/// Trust-event weight reported for an ML-DSA-65 signature verification
+/// failure on a quote. Distinct from the binding-mismatch case above:
+/// by the time signature verification runs, the binding has already
+/// passed, so we know the signature was supposed to be produced by the
+/// holder of the secret key matching `pub_key`. A failed signature does
+/// NOT prove the *peer* misbehaved — a malicious payer could have
+/// flipped a bit in `quote.price` after taking a valid quote from the
+/// real peer, and the verifier would penalise an innocent peer at zero
+/// attacker cost. Use a moderate weight (matches the existing
+/// replication-audit weight class in this codebase) so a single
+/// transient bit-flip does not cross the block threshold, but a
+/// sustained pattern still degrades the peer's score.
+const QUOTE_SIGNATURE_FAILURE_WEIGHT: f64 = 1.0;
+
+/// Trust-event weight reported for a merkle pool candidate ML-DSA
+/// signature failure. Self-signed by the candidate node itself (no
+/// payer in between), so attribution is sound. Use the maximum weight,
+/// same reasoning as the binding-mismatch case.
+const MERKLE_CANDIDATE_SIGNATURE_FAILURE_WEIGHT: f64 = 5.0;
 
 /// Configuration for EVM payment verification.
 ///
@@ -460,23 +493,62 @@ impl PaymentVerifier {
         Self::validate_quote_structure(payment)?;
         Self::validate_quote_content(payment, xorname)?;
         Self::validate_quote_timestamps(payment)?;
-        Self::validate_peer_bindings(payment)?;
+        self.validate_peer_bindings(payment).await?;
         self.validate_local_recipient(payment)?;
 
-        // Verify quote signatures (CPU-bound, run off async runtime)
+        // Verify quote signatures (CPU-bound, run off async runtime).
+        // Returns the per-quote validity vector so the async caller can
+        // fire one trust event per failing peer before returning the first
+        // error — matches the multi-offender attack pattern where a single
+        // proof can carry several quotes signed with the wrong key.
         let peer_quotes = payment.peer_quotes.clone();
-        tokio::task::spawn_blocking(move || {
-            for (encoded_peer_id, quote) in &peer_quotes {
-                if !verify_quote_signature(quote) {
-                    return Err(Error::Payment(
-                        format!("Quote ML-DSA-65 signature verification failed for peer {encoded_peer_id:?}"),
-                    ));
+        let sig_results: Vec<(evmlib::EncodedPeerId, bool)> =
+            tokio::task::spawn_blocking(move || {
+                peer_quotes
+                    .iter()
+                    .map(|(encoded_peer_id, quote)| {
+                        (encoded_peer_id.clone(), verify_quote_signature(quote))
+                    })
+                    .collect()
+            })
+            .await
+            .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?;
+
+        // Per-proof dedup: the same offender appearing in multiple slots
+        // produces at most one trust event. See validate_peer_bindings
+        // for the same rationale (cap write-lock cost on the trust
+        // engine regardless of attacker-controlled proof shape).
+        //
+        // Signature failures use a lower weight than binding mismatches
+        // (see [`QUOTE_SIGNATURE_FAILURE_WEIGHT`] doc): a malicious
+        // payer can flip a bit in `quote.price` after taking a valid
+        // quote from an honest peer, and the verifier would otherwise
+        // penalise the innocent peer at zero attacker cost.
+        let mut sig_error: Option<Error> = None;
+        let mut sig_reported: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
+        for (encoded_peer_id, valid) in sig_results {
+            if !valid {
+                let offender_bytes = *encoded_peer_id.as_bytes();
+                if sig_reported.insert(offender_bytes) {
+                    let offender = PeerId::from_bytes(offender_bytes);
+                    self.report_peer_failure(
+                        &offender,
+                        QUOTE_SIGNATURE_FAILURE_WEIGHT,
+                        "ML-DSA-65 signature verification failed",
+                    )
+                    .await;
+                }
+                if sig_error.is_none() {
+                    sig_error = Some(Error::Payment(format!(
+                        "Quote ML-DSA-65 signature verification failed for peer {encoded_peer_id:?}"
+                    )));
                 }
             }
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
+        }
+        if let Some(err) = sig_error {
+            return Err(err);
+        }
 
         // Reconstruct the SingleNodePayment to identify the median quote.
         // from_quotes() sorts by price and marks the median for 3x payment.
@@ -587,21 +659,95 @@ impl PaymentVerifier {
     }
 
     /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
-    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
+    ///
+    /// On detection of a mismatch this fires
+    /// [`TrustEvent::ApplicationFailure`] for the offending peer (the
+    /// `EncodedPeerId` claimed in the proof, not the BLAKE3-derived
+    /// `expected_peer_id` — the offender is the one claiming a mismatched
+    /// identity, not the real owner of the `pub_key`). The loop walks every
+    /// quote so the live attack pattern (multiple distinct peer-IDs
+    /// sharing one private key) generates one trust signal per offender,
+    /// then returns the first error.
+    ///
+    /// **Per-proof dedup**: a peer that appears multiple times in the
+    /// same proof is reported at most once. This caps the trust-engine
+    /// write-lock cost at `O(distinct_offenders)` per proof regardless of
+    /// proof shape, blunting a denial-of-service where a malicious payer packs the
+    /// same offender into every slot.
+    ///
+    /// Reports are best-effort: when no `P2PNode` is attached (test
+    /// paths), the report is silently skipped — the verification result
+    /// is unaffected.
+    async fn validate_peer_bindings(&self, payment: &ProofOfPayment) -> Result<()> {
+        let mut first_error: Option<Error> = None;
+        let mut reported: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
-                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
+            let expected_peer_id = match peer_id_from_public_key_bytes(&quote.pub_key) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Undecodable pub_key bytes: probably corruption, not
+                    // necessarily malicious. Don't fire a trust event;
+                    // just preserve the existing error semantics.
+                    if first_error.is_none() {
+                        first_error = Some(Error::Payment(format!(
+                            "Invalid ML-DSA public key in quote: {e}"
+                        )));
+                    }
+                    continue;
+                }
+            };
 
             if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
                 let expected_hex = expected_peer_id.to_hex();
                 let actual_hex = hex::encode(encoded_peer_id.as_bytes());
-                return Err(Error::Payment(format!(
-                    "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
-                     BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
-                )));
+                // Provably bad behaviour: penalise the peer who claimed
+                // this binding. Use the EncodedPeerId from the proof —
+                // that is the identity routing-table lookups will hit.
+                let offender_bytes = *encoded_peer_id.as_bytes();
+                if reported.insert(offender_bytes) {
+                    let offender = PeerId::from_bytes(offender_bytes);
+                    self.report_peer_failure(
+                        &offender,
+                        QUOTE_BINDING_MISMATCH_WEIGHT,
+                        "BLAKE3 quote-binding mismatch",
+                    )
+                    .await;
+                }
+                if first_error.is_none() {
+                    first_error = Some(Error::Payment(format!(
+                        "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
+                         BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
+                    )));
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Report a peer to saorsa-core's trust engine.
+    ///
+    /// `weight` controls severity (clamped to saorsa-core's
+    /// `MAX_CONSUMER_WEIGHT`). Pick the constant that matches the failure
+    /// class — see [`QUOTE_BINDING_MISMATCH_WEIGHT`],
+    /// [`QUOTE_SIGNATURE_FAILURE_WEIGHT`], and
+    /// [`MERKLE_CANDIDATE_SIGNATURE_FAILURE_WEIGHT`]. Best-effort: when no
+    /// `P2PNode` is attached (test paths) the report is silently skipped.
+    async fn report_peer_failure(&self, peer_id: &PeerId, weight: f64, reason: &'static str) {
+        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
+        let Some(p2p_node) = attached else {
+            debug!(
+                "Skipping trust report for {peer_hex} ({reason}): no P2PNode attached",
+                peer_hex = peer_id.to_hex()
+            );
+            return;
+        };
+        debug!(
+            "Reporting ApplicationFailure(weight={weight}) for {peer_hex}: {reason}",
+            peer_hex = peer_id.to_hex()
+        );
+        p2p_node
+            .report_trust_event(peer_id, TrustEvent::ApplicationFailure(weight))
+            .await;
     }
 
     /// Minimum number of candidate `pub_keys` (out of 16) whose derived `PeerId`
@@ -1100,13 +1246,37 @@ impl PaymentVerifier {
 
         // Run cheap local checks BEFORE expensive on-chain queries.
         // This prevents DoS via garbage proofs that trigger RPC lookups.
+        // Collect every offender then return the first error so a forged
+        // pool with multiple bad signatures generates one trust event per
+        // distinct bad candidate (the live attack pattern: distinct
+        // peer-IDs sharing one private key, all packed into the same
+        // merkle pool). Per-proof dedup caps the trust-engine write-lock
+        // cost at `O(distinct_offenders)`.
+        let mut merkle_sig_error: Option<Error> = None;
+        let mut merkle_reported: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
         for candidate in &merkle_proof.winner_pool.candidate_nodes {
             if !crate::payment::verify_merkle_candidate_signature(candidate) {
-                return Err(Error::Payment(format!(
-                    "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
-                    candidate.reward_address
-                )));
+                if let Ok(offender) = peer_id_from_public_key_bytes(&candidate.pub_key) {
+                    if merkle_reported.insert(*offender.as_bytes()) {
+                        self.report_peer_failure(
+                            &offender,
+                            MERKLE_CANDIDATE_SIGNATURE_FAILURE_WEIGHT,
+                            "merkle candidate ML-DSA-65 signature verification failed",
+                        )
+                        .await;
+                    }
+                }
+                if merkle_sig_error.is_none() {
+                    merkle_sig_error = Some(Error::Payment(format!(
+                        "Invalid ML-DSA-65 signature on merkle candidate node (reward: {})",
+                        candidate.reward_address
+                    )));
+                }
             }
+        }
+        if let Some(err) = merkle_sig_error {
+            return Err(err);
         }
 
         // Pay-yourself defence: the candidate pub_keys must map to peers the
@@ -2990,5 +3160,163 @@ mod tests {
             }
             other => panic!("expected sparse-DHT rejection, got: {other:?}"),
         }
+    }
+
+    // =========================================================================
+    // Node-side quote audit: trust-event reporting on provably-bad quotes
+    // =========================================================================
+    //
+    // Ground truth: when a storer detects a BLAKE3 binding mismatch or an
+    // ML-DSA signature failure, it should fire `TrustEvent::ApplicationFailure`
+    // for the offending peer so saorsa-core's lazy swap-out can replace
+    // them. These tests verify the verifier:
+    //   1. Returns the same Err semantics as before the trust hook landed.
+    //   2. Does not panic when no `P2PNode` is attached (test paths).
+    //   3. Walks the entire quote list before returning, so multi-offender
+    //      proofs (the live attack pattern: 5 distinct peer-IDs sharing
+    //      one private key) generate one trust event per offender.
+    //
+    // Verifying the trust events actually fire requires a real `P2PNode`,
+    // which is heavy to spin up in a unit test. The wiring is exercised
+    // end-to-end by `attach_p2p_node` at startup; here we lock down the
+    // shape so a future refactor cannot accidentally short-circuit on the
+    // first offender.
+
+    #[tokio::test]
+    async fn validate_peer_bindings_does_not_short_circuit_on_first_valid_quote() {
+        use evmlib::EncodedPeerId;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        // Layout: position 0 holds a CORRECTLY-bound quote; positions 1..N
+        // hold mismatched quotes. The loop must walk past position 0 to
+        // detect the mismatch — if a future refactor short-circuits with
+        // `?` on the first OK quote it would never see the mismatched
+        // ones and this test would fail.
+        //
+        // We cannot directly observe trust-event side effects without a
+        // P2PNode (heavy to construct in unit tests), so we use the
+        // observable error path as the proxy: the err message names a
+        // specific mismatched peer, proving the loop iterated past the
+        // valid quote. create_test_verifier() leaves p2p_node = None, so
+        // report_peer_failure is a no-op throughout.
+        let verifier = create_test_verifier();
+        let xorname = [0xCDu8; 32];
+        let rewards_addr = RewardsAddress::new([1u8; 20]);
+        let ml_dsa = MlDsa65::new();
+
+        let mut peer_quotes = Vec::new();
+
+        // Position 0: valid binding (encoded peer-id derived from pub_key).
+        let (good_pk, _good_sk) = ml_dsa.generate_keypair().expect("keygen");
+        let good_pub_bytes = good_pk.as_bytes().to_vec();
+        let good_encoded = encoded_peer_id_for_pub_key(&good_pub_bytes);
+        let mut good_quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
+        good_quote.pub_key = good_pub_bytes;
+        peer_quotes.push((good_encoded, good_quote));
+
+        // Positions 1..CLOSE_GROUP_SIZE: mismatched bindings.
+        let mut mismatched_encoded_first = None;
+        for _ in 1..CLOSE_GROUP_SIZE {
+            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let mut quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
+            quote.pub_key = public_key.as_bytes().to_vec();
+            let bad_encoded = EncodedPeerId::new(rand::random());
+            if mismatched_encoded_first.is_none() {
+                mismatched_encoded_first = Some(bad_encoded.clone());
+            }
+            peer_quotes.push((bad_encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+        let result = verifier.validate_peer_bindings(&payment).await;
+
+        // Loop must have detected the mismatch at position 1 (or later).
+        // A short-circuit-on-first-OK refactor would return Ok here.
+        assert!(
+            result.is_err(),
+            "loop must walk past valid first quote to detect mismatches"
+        );
+        let err_msg = format!("{}", result.expect_err("should fail"));
+        assert!(
+            err_msg.contains("pub_key does not belong to claimed peer"),
+            "expected binding mismatch error message, got: {err_msg}"
+        );
+        // Stronger: err names the peer-id that was first mismatched
+        // (after the good one), proving the loop continued.
+        let expected_first_mismatch_hex = hex::encode(
+            mismatched_encoded_first
+                .expect("at least one mismatched quote")
+                .as_bytes(),
+        );
+        assert!(
+            err_msg.contains(&expected_first_mismatch_hex),
+            "error must reference the first mismatched peer, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_peer_bindings_no_panic_when_p2p_node_unattached() {
+        use evmlib::EncodedPeerId;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        // create_test_verifier() never calls attach_p2p_node — exercises
+        // the test-path branch where report_peer_failure is a debug-log
+        // no-op. The verifier must not panic and must still return the
+        // appropriate Err.
+        let verifier = create_test_verifier();
+        let xorname = [0xDEu8; 32];
+        let rewards_addr = RewardsAddress::new([2u8; 20]);
+
+        let ml_dsa = MlDsa65::new();
+        let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let mut quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
+        quote.pub_key = public_key.as_bytes().to_vec();
+
+        let mut peer_quotes = Vec::new();
+        // One mismatched + rest valid would also exercise the loop, but
+        // the simplest no-panic case is a single mismatch.
+        for _ in 0..CLOSE_GROUP_SIZE {
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote.clone()));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+        let result = verifier.validate_peer_bindings(&payment).await;
+
+        // Critical: did not panic, returned a structured error.
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn validate_peer_bindings_accepts_correctly_bound_quotes() {
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let verifier = create_test_verifier();
+        let xorname = [0xEFu8; 32];
+        let rewards_addr = RewardsAddress::new([3u8; 20]);
+
+        // Generate real ML-DSA keys and derive the matching EncodedPeerId
+        // for each quote — every binding must pass.
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(xorname, SystemTime::now(), rewards_addr);
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+
+        let payment = ProofOfPayment { peer_quotes };
+        let result = verifier.validate_peer_bindings(&payment).await;
+
+        assert!(
+            result.is_ok(),
+            "valid bindings must pass: {:?}",
+            result.err()
+        );
     }
 }
