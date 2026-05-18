@@ -536,30 +536,35 @@ async fn peer_proves_record(
     let encoded = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
     let Some(decoded) = send_prune_audit_challenge(&peer, &key, encoded, p2p_node, config).await
     else {
-        let reported =
-            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
-        if reported {
-            clear_prune_bootstrap_claim(&peer, sync_state).await;
-        }
+        // No decoded response means we did not observe the peer stop claiming
+        // bootstrap status. Preserve any active claim so a later claim is not
+        // misclassified as repeated abuse.
+        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
         return None;
     };
 
-    match prune_audit_response_status(decoded, challenge_id, &peer, &key, &nonce, &local_bytes) {
-        PruneAuditStatus::Proven => {
-            clear_prune_bootstrap_claim(&peer, sync_state).await;
-            Some((peer, key))
-        }
+    let status =
+        prune_audit_response_status(decoded, challenge_id, &peer, &key, &nonce, &local_bytes);
+    if prune_audit_response_clears_bootstrap_claim(status) {
+        clear_prune_bootstrap_claim(&peer, sync_state).await;
+    }
+
+    match status {
+        PruneAuditStatus::Proven => Some((peer, key)),
         PruneAuditStatus::Bootstrapping => {
             report_prune_bootstrap_claim(&peer, &key, p2p_node, config, sync_state, report_state)
                 .await;
             None
         }
         PruneAuditStatus::Failed => {
-            clear_prune_bootstrap_claim(&peer, sync_state).await;
             report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
             None
         }
     }
+}
+
+fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool {
+    matches!(status, PruneAuditStatus::Proven | PruneAuditStatus::Failed)
 }
 
 fn encode_prune_audit_challenge(
@@ -1012,6 +1017,19 @@ mod tests {
         let state = state.read().await;
         assert!(!state.bootstrap_claims.contains_key(&peer));
         assert!(state.bootstrap_claim_history.contains_key(&peer));
+    }
+
+    #[test]
+    fn prune_audit_clear_policy_requires_decoded_non_bootstrap_response() {
+        assert!(prune_audit_response_clears_bootstrap_claim(
+            PruneAuditStatus::Proven
+        ));
+        assert!(prune_audit_response_clears_bootstrap_claim(
+            PruneAuditStatus::Failed
+        ));
+        assert!(!prune_audit_response_clears_bootstrap_claim(
+            PruneAuditStatus::Bootstrapping
+        ));
     }
 
     #[tokio::test]

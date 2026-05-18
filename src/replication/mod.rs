@@ -58,8 +58,8 @@ use crate::replication::protocol::{
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
-    BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline, NeighborSyncState,
-    PeerSyncRecord, VerificationEntry, VerificationState,
+    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
+    NeighborSyncState, PeerSyncRecord, VerificationEntry, VerificationState,
 };
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
@@ -518,20 +518,9 @@ impl ReplicationEngine {
             // Run one audit tick immediately after bootstrap drain.
             {
                 let bootstrapping = *is_bootstrapping.read().await;
-                // Lock ordering: sync_state before sync_history (consistent
-                // with run_neighbor_sync_round and handle_sync_response).
                 let result = {
-                    let claims = sync_state.read().await;
                     let history = sync_history.read().await;
-                    audit::audit_tick(
-                        &p2p,
-                        &storage,
-                        &config,
-                        &history,
-                        &claims.bootstrap_claims,
-                        bootstrapping,
-                    )
-                    .await
+                    audit::audit_tick(&p2p, &storage, &config, &history, bootstrapping).await
                 };
                 handle_audit_result(&result, &p2p, &sync_state, &config).await;
             }
@@ -543,13 +532,13 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
                         let bootstrapping = *is_bootstrapping.read().await;
-                        // Lock ordering: sync_state before sync_history.
                         let result = {
-                            let claims = sync_state.read().await;
                             let history = sync_history.read().await;
                             audit::audit_tick(
-                                &p2p, &storage, &config, &history,
-                                &claims.bootstrap_claims,
+                                &p2p,
+                                &storage,
+                                &config,
+                                &history,
                                 bootstrapping,
                             )
                             .await
@@ -2236,6 +2225,7 @@ async fn handle_audit_result(
             if let FailureEvidence::AuditFailure {
                 challenged_peer,
                 confirmed_failed_keys,
+                reason,
                 ..
             } = evidence
             {
@@ -2243,11 +2233,13 @@ async fn handle_audit_result(
                     "Audit failure for {challenged_peer}: {} confirmed failed keys",
                     confirmed_failed_keys.len()
                 );
-                // Peer responded with digests (not a bootstrap claim) — clear
-                // the active claim while retaining claim history.
-                {
+                if audit_failure_clears_bootstrap_claim(reason) {
+                    // Peer returned a non-bootstrap response — clear the active
+                    // claim while retaining claim history.
                     let mut state = sync_state.write().await;
                     state.clear_active_bootstrap_claim(challenged_peer);
+                } else {
+                    debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
                 p2p_node
                     .report_trust_event(
@@ -2302,4 +2294,37 @@ async fn handle_audit_result(
     }
 }
 
+fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
+    !matches!(reason, AuditFailureReason::Timeout)
+}
+
 // `admit_bootstrap_hints` was consolidated into `admit_and_queue_hints`.
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::audit_failure_clears_bootstrap_claim;
+    use crate::replication::types::AuditFailureReason;
+
+    #[test]
+    fn audit_timeout_preserves_active_bootstrap_claim() {
+        assert!(!audit_failure_clears_bootstrap_claim(
+            &AuditFailureReason::Timeout
+        ));
+    }
+
+    #[test]
+    fn decoded_audit_failures_clear_active_bootstrap_claim() {
+        for reason in [
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::KeyAbsent,
+            AuditFailureReason::Rejected,
+        ] {
+            assert!(
+                audit_failure_clears_bootstrap_claim(&reason),
+                "decoded non-bootstrap failure {reason:?} should clear active claim"
+            );
+        }
+    }
+}
