@@ -13,6 +13,67 @@ use crate::ant_protocol::XorName;
 use crate::replication::types::{FetchCandidate, VerificationEntry};
 use saorsa_core::identity::PeerId;
 
+/// Global hard upper bound on the number of keys held in `pending_verify`.
+///
+/// Without a bound, a peer in the local routing table can flood
+/// `NeighborSyncRequest` messages (each capped only by
+/// `MAX_REPLICATION_MESSAGE_SIZE` ≈ 10 MiB, i.e. ~320k 32-byte hints per
+/// message) and grow this map without limit, exhausting node memory and
+/// driving a self-amplifying storm of outbound verification requests.
+///
+/// `131_072` entries is far above any legitimate aggregate need while
+/// bounding worst-case memory to a few tens of MiB (each `VerificationEntry`
+/// is on the order of a few hundred bytes; its sub-collections are populated
+/// only from close-group-sized verification evidence, never from attacker
+/// hint volume).
+///
+/// This global cap alone is **not** sufficient: with blind capacity-reject a
+/// single malicious routing-table peer could fill the whole map with cheap
+/// admission-passing junk and starve every honest peer's hints until the
+/// 30-minute `evict_stale` backstop fires (and re-fill immediately after).
+/// Honest-replication fairness is therefore enforced by
+/// [`MAX_PENDING_VERIFY_PER_PEER`] below; this global value is only the
+/// memory backstop.
+pub const MAX_PENDING_VERIFY: usize = 131_072;
+
+/// Per-source hard cap on `pending_verify` entries attributed to a single
+/// `hint_sender` peer.
+///
+/// This is the actual D1 defence. Each pending entry records the peer that
+/// hinted it (`VerificationEntry::hint_sender`); a single source may occupy
+/// at most this many slots. A flooding peer can therefore consume only its
+/// own quota — it can never deny slots to honest peers, because honest
+/// sources are accounted independently. Set well above any legitimate
+/// per-peer hint working set (a healthy neighbour syncs at most a few
+/// thousand keys to us per cycle) yet small enough that
+/// `MAX_PENDING_VERIFY / MAX_PENDING_VERIFY_PER_PEER` distinct malicious
+/// peers would be required to approach the global cap.
+///
+/// Residual (accepted, follow-up): with the current ratio, ~16 distinct
+/// `PeerId`s that are *all* simultaneously in the victim's routing table
+/// (gated by `sender_in_rt`) could still collectively reach the global
+/// `MAX_PENDING_VERIFY` backstop. `hint_sender` is the cryptographically
+/// authenticated connection identity (not a forgeable payload field), so
+/// this requires running ~16 real Kademlia-adjacent Sybil nodes — a large
+/// step up from the single-peer pre-fix attack, and the worst case degrades
+/// only to the bounded memory backstop, not silent permanent starvation of
+/// non-Sybil peers (each keeps its independent quota). A future hardening
+/// (reserved headroom for under-quota sources, or a per-source cap that
+/// scales with distinct-source pressure) is tracked as a follow-up and is
+/// intentionally out of scope for this `DoS` fix.
+pub const MAX_PENDING_VERIFY_PER_PEER: usize = 8_192;
+
+/// Hard upper bound on the number of keys held in `fetch_queue`.
+///
+/// `fetch_queue` is fed only by `enqueue_fetch`, which is reached **after** a
+/// key passes quorum verification in `run_verification_cycle` — attacker junk
+/// keys (no real holder) fail quorum and never reach this stage, so the
+/// bounded-and-fair `pending_verify` upstream is the primary protection. This
+/// global cap remains as a defence-in-depth memory backstop and is dropped
+/// (consistent with the existing cross-queue-dedup no-op contract of
+/// `enqueue_fetch`) when full.
+pub const MAX_FETCH_QUEUE: usize = 131_072;
+
 // ---------------------------------------------------------------------------
 // In-flight entry
 // ---------------------------------------------------------------------------
@@ -44,17 +105,26 @@ pub struct InFlightEntry {
 /// 3. **`InFlightFetch`** -- keys actively being downloaded.
 pub struct ReplicationQueues {
     /// Keys awaiting quorum result (dedup by key).
-    // TODO: Add capacity bound to prevent unbounded growth under network flood.
-    // Consider evicting farthest-distance entries when at capacity.
+    ///
+    /// Capacity-bounded by [`MAX_PENDING_VERIFY`]: admissions are rejected
+    /// once full, preventing unbounded growth under a network hint flood.
     pending_verify: HashMap<XorName, VerificationEntry>,
     /// Presence-quorum-passed or paid-list-authorized keys waiting for fetch.
-    // TODO: Add capacity bound (e.g. MAX_FETCH_QUEUE_SIZE) to prevent
-    // unbounded growth. Reject or evict farthest-distance candidates when full.
+    ///
+    /// Capacity-bounded by [`MAX_FETCH_QUEUE`]: enqueues are dropped once
+    /// full, preventing unbounded growth under a network hint flood.
     fetch_queue: BinaryHeap<FetchCandidate>,
     /// Keys present in `fetch_queue` for O(1) dedup.
     fetch_queue_keys: HashSet<XorName>,
     /// Active downloads keyed by `XorName`.
     in_flight_fetch: HashMap<XorName, InFlightEntry>,
+    /// Number of `pending_verify` entries currently attributed to each
+    /// `hint_sender` peer. Maintained in lockstep with `pending_verify`
+    /// (insert/remove/evict) so the per-peer quota
+    /// ([`MAX_PENDING_VERIFY_PER_PEER`]) can be enforced in O(1). An entry is
+    /// removed from this map when its count reaches zero so the map itself is
+    /// bounded by the number of distinct currently-pending sources.
+    pending_per_sender: HashMap<PeerId, usize>,
 }
 
 impl Default for ReplicationQueues {
@@ -72,6 +142,7 @@ impl ReplicationQueues {
             fetch_queue: BinaryHeap::new(),
             fetch_queue_keys: HashSet::new(),
             in_flight_fetch: HashMap::new(),
+            pending_per_sender: HashMap::new(),
         }
     }
 
@@ -82,12 +153,55 @@ impl ReplicationQueues {
     /// Add a key to pending verification if not already present in any queue.
     ///
     /// Returns `true` if the key was newly added (Rule 8: cross-queue dedup).
+    ///
+    /// Returns `false` — without inserting — when either:
+    /// * the global [`MAX_PENDING_VERIFY`] memory backstop is reached, or
+    /// * the entry's `hint_sender` already holds [`MAX_PENDING_VERIFY_PER_PEER`]
+    ///   pending entries (per-source fairness — a flooding peer can only
+    ///   exhaust its own quota and can never starve honest peers).
+    ///
+    /// Callers already treat a `false` result as "not admitted".
     pub fn add_pending_verify(&mut self, key: XorName, entry: VerificationEntry) -> bool {
         if self.contains_key(&key) {
             return false;
         }
+        if self.pending_verify.len() >= MAX_PENDING_VERIFY {
+            debug!(
+                "pending_verify at global capacity ({MAX_PENDING_VERIFY}); rejecting key {}",
+                hex::encode(key)
+            );
+            return false;
+        }
+        let sender = entry.hint_sender;
+        let sender_count = self.pending_per_sender.get(&sender).copied().unwrap_or(0);
+        if sender_count >= MAX_PENDING_VERIFY_PER_PEER {
+            debug!(
+                "peer {sender} at per-source pending cap ({MAX_PENDING_VERIFY_PER_PEER}); \
+                 rejecting key {} (honest peers are unaffected)",
+                hex::encode(key)
+            );
+            return false;
+        }
         self.pending_verify.insert(key, entry);
+        *self.pending_per_sender.entry(sender).or_insert(0) += 1;
         true
+    }
+
+    /// Decrement (and prune at zero) the per-sender counter for `sender`.
+    ///
+    /// Kept private so the counter can only move in lockstep with
+    /// `pending_verify` mutations. The decrement uses `saturating_sub` so a
+    /// hypothetical future invariant break (a release without a matching
+    /// admission) self-heals to zero instead of panicking on `usize`
+    /// underflow; `debug_assert!` still surfaces such a break in test builds.
+    fn release_sender_slot(pending_per_sender: &mut HashMap<PeerId, usize>, sender: &PeerId) {
+        if let Some(count) = pending_per_sender.get_mut(sender) {
+            debug_assert!(*count > 0, "per-sender counter underflow for {sender}");
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                pending_per_sender.remove(sender);
+            }
+        }
     }
 
     /// Get a reference to a pending verification entry.
@@ -97,13 +211,25 @@ impl ReplicationQueues {
     }
 
     /// Get a mutable reference to a pending verification entry.
+    ///
+    /// INVARIANT: callers MUST NOT reassign `entry.hint_sender` through the
+    /// returned reference. The per-source quota counter
+    /// (`pending_per_sender`) is keyed by the `hint_sender` recorded at
+    /// admission; re-attributing a live entry to a different peer here would
+    /// orphan a count (decremented against the wrong peer on removal/eviction)
+    /// and silently desync the quota. Mutate only verification-progress
+    /// fields (e.g. `state`, `verified_sources`, `tried_sources`).
     pub fn get_pending_mut(&mut self, key: &XorName) -> Option<&mut VerificationEntry> {
         self.pending_verify.get_mut(key)
     }
 
     /// Remove a key from pending verification.
     pub fn remove_pending(&mut self, key: &XorName) -> Option<VerificationEntry> {
-        self.pending_verify.remove(key)
+        let removed = self.pending_verify.remove(key);
+        if let Some(entry) = &removed {
+            Self::release_sender_slot(&mut self.pending_per_sender, &entry.hint_sender);
+        }
+        removed
     }
 
     /// Collect all pending verification keys (for batch processing).
@@ -125,12 +251,21 @@ impl ReplicationQueues {
     /// Enqueue a key for fetch with its distance and verified sources.
     ///
     /// No-op if the key is already in any pipeline stage (Rule 8: cross-queue
-    /// dedup).
+    /// dedup), or if `fetch_queue` is already at [`MAX_FETCH_QUEUE`]. The
+    /// capacity drop bounds memory (and the outbound `FetchRequest` storm)
+    /// under a network hint flood.
     pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) {
         if self.pending_verify.contains_key(&key)
             || self.fetch_queue_keys.contains(&key)
             || self.in_flight_fetch.contains_key(&key)
         {
+            return;
+        }
+        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
+            debug!(
+                "fetch_queue at capacity ({MAX_FETCH_QUEUE}); dropping new key {}",
+                hex::encode(key)
+            );
             return;
         }
         self.fetch_queue_keys.insert(key);
@@ -240,12 +375,25 @@ impl ReplicationQueues {
     pub fn evict_stale(&mut self, max_age: Duration) {
         let now = Instant::now();
         let before = self.pending_verify.len();
-        self.pending_verify
-            .retain(|_, entry| now.duration_since(entry.created_at) < max_age);
+        let pending_per_sender = &mut self.pending_per_sender;
+        self.pending_verify.retain(|_, entry| {
+            let fresh = now.duration_since(entry.created_at) < max_age;
+            if !fresh {
+                Self::release_sender_slot(pending_per_sender, &entry.hint_sender);
+            }
+            fresh
+        });
         let evicted = before.saturating_sub(self.pending_verify.len());
         if evicted > 0 {
             debug!("Evicted {evicted} stale pending-verification entries");
         }
+    }
+
+    /// Number of `pending_verify` entries currently attributed to `sender`.
+    /// Exposed for tests and observability of the per-source fairness quota.
+    #[must_use]
+    pub fn pending_count_for_sender(&self, sender: &PeerId) -> usize {
+        self.pending_per_sender.get(sender).copied().unwrap_or(0)
     }
 }
 
