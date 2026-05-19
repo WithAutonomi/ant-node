@@ -63,6 +63,9 @@ mod replication;
 #[cfg(test)]
 mod security_attacks;
 
+#[cfg(test)]
+mod f2_f5_pay_yourself;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};

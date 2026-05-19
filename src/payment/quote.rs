@@ -17,6 +17,7 @@ use evmlib::RewardsAddress;
 use saorsa_core::MlDsa65;
 use saorsa_pqc::pqc::types::MlDsaSecretKey;
 use saorsa_pqc::pqc::MlDsaOperations;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 /// Content address type (32-byte `XorName`).
@@ -32,8 +33,10 @@ pub type SignFn = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 pub struct QuoteGenerator {
     /// The rewards address for receiving payments.
     rewards_address: RewardsAddress,
-    /// Metrics tracker for quoting.
-    metrics_tracker: QuotingMetricsTracker,
+    /// Metrics tracker for quoting. Shared (`Arc`) so the payment verifier's
+    /// price-floor defence (F2/F5) reads the exact same live `records_stored`
+    /// this generator prices quotes from.
+    metrics_tracker: Arc<QuotingMetricsTracker>,
     /// Signing function provided by the node.
     /// Takes bytes and returns a signature.
     sign_fn: Option<SignFn>,
@@ -49,12 +52,21 @@ impl QuoteGenerator {
     /// # Arguments
     ///
     /// * `rewards_address` - The EVM address for receiving payments
-    /// * `metrics_tracker` - Tracker for quoting metrics
+    /// * `metrics_tracker` - Shared tracker for quoting metrics (also read by
+    ///   the payment verifier's price-floor defence)
+    ///
+    /// Accepts either an owned `QuotingMetricsTracker` or a shared
+    /// `Arc<QuotingMetricsTracker>` (via `Into`), so production can share the
+    /// tracker with the verifier's price-floor defence while tests can keep
+    /// passing an owned tracker.
     #[must_use]
-    pub fn new(rewards_address: RewardsAddress, metrics_tracker: QuotingMetricsTracker) -> Self {
+    pub fn new(
+        rewards_address: RewardsAddress,
+        metrics_tracker: impl Into<Arc<QuotingMetricsTracker>>,
+    ) -> Self {
         Self {
             rewards_address,
-            metrics_tracker,
+            metrics_tracker: metrics_tracker.into(),
             sign_fn: None,
             pub_key: Vec::new(),
         }

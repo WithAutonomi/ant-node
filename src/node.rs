@@ -381,18 +381,29 @@ impl NodeBuilder {
             }
         };
 
-        // Create payment verifier
+        // Shared quoting metrics: the quote generator prices quotes from it,
+        // and the payment verifier reads the SAME live `records_stored` to
+        // enforce its price floor (F2/F5 defence).
+        let metrics_tracker = Arc::new(QuotingMetricsTracker::new(0));
+
+        // Create payment verifier with a live price floor wired to the same
+        // metrics tracker, so an attacker cannot get this node to accept a
+        // self-signed, far-underpriced single-node proof.
         let evm_network = config.payment.evm_network.clone().into_evm_network();
+        let floor_metrics = Arc::clone(&metrics_tracker);
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,
             },
             cache_capacity: config.payment.cache_capacity,
             local_rewards_address: rewards_address,
+            price_floor: Some(crate::payment::PriceFloorProvider::new(Arc::new(
+                move || crate::payment::calculate_price(floor_metrics.records_stored()),
+            ))),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        let metrics_tracker = QuotingMetricsTracker::new(0);
-        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator =
+            QuoteGenerator::new(rewards_address, Arc::clone(&metrics_tracker));
 
         // Wire ML-DSA-65 signing from node identity.
         // This same signer is used for both regular quotes and merkle candidate quotes.

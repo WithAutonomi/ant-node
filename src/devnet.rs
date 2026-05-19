@@ -550,14 +550,21 @@ impl Devnet {
         };
 
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
+        // Shared quoting metrics: generator prices from it, verifier reads the
+        // same live count for its F2/F5 price-floor defence.
+        let metrics_tracker = Arc::new(QuotingMetricsTracker::new(DEVNET_INITIAL_RECORDS));
+        let floor_metrics = Arc::clone(&metrics_tracker);
         let payment_config = PaymentVerifierConfig {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
             local_rewards_address: rewards_address,
+            price_floor: Some(crate::payment::PriceFloorProvider::new(Arc::new(
+                move || crate::payment::calculate_price(floor_metrics.records_stored()),
+            ))),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        let metrics_tracker = QuotingMetricsTracker::new(DEVNET_INITIAL_RECORDS);
-        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
+        let mut quote_generator =
+            QuoteGenerator::new(rewards_address, Arc::clone(&metrics_tracker));
 
         // Wire ML-DSA-65 signing from the devnet node's identity
         crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)
