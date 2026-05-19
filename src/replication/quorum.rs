@@ -211,14 +211,10 @@ pub fn evaluate_key_evidence(
     // Count presence evidence from QuorumTargets.
     let mut presence_positive = 0usize;
     let mut presence_unresolved = 0usize;
-    let mut present_peers = Vec::new();
 
     for peer in quorum_peers {
         match evidence.presence.get(peer) {
-            Some(PresenceEvidence::Present) => {
-                presence_positive += 1;
-                present_peers.push(*peer);
-            }
+            Some(PresenceEvidence::Present) => presence_positive += 1,
             Some(PresenceEvidence::Absent) => {}
             Some(PresenceEvidence::Unresolved) | None => {
                 presence_unresolved += 1;
@@ -228,14 +224,7 @@ pub fn evaluate_key_evidence(
 
     // Also collect Present peers from paid targets for fetch sources.
     let paid_peers = targets.paid_targets.get(key).map_or(&[][..], Vec::as_slice);
-
-    for peer in paid_peers {
-        if matches!(evidence.presence.get(peer), Some(PresenceEvidence::Present))
-            && !present_peers.contains(peer)
-        {
-            present_peers.push(*peer);
-        }
-    }
+    let present_peers = collect_present_sources(evidence, quorum_peers, paid_peers);
 
     // Count paid-list evidence from PaidTargets.
     let mut paid_confirmed = 0usize;
@@ -297,23 +286,28 @@ pub fn present_sources_for_key(
     evidence: &KeyVerificationEvidence,
     targets: &VerificationTargets,
 ) -> Vec<PeerId> {
+    let quorum_peers = targets
+        .quorum_targets
+        .get(key)
+        .map_or(&[][..], Vec::as_slice);
+    let paid_peers = targets.paid_targets.get(key).map_or(&[][..], Vec::as_slice);
+
+    collect_present_sources(evidence, quorum_peers, paid_peers)
+}
+
+fn collect_present_sources(
+    evidence: &KeyVerificationEvidence,
+    quorum_peers: &[PeerId],
+    paid_peers: &[PeerId],
+) -> Vec<PeerId> {
     let mut present_peers = Vec::new();
+    let mut seen = HashSet::new();
 
-    if let Some(quorum_peers) = targets.quorum_targets.get(key) {
-        for peer in quorum_peers {
-            if matches!(evidence.presence.get(peer), Some(PresenceEvidence::Present)) {
-                present_peers.push(*peer);
-            }
-        }
-    }
-
-    if let Some(paid_peers) = targets.paid_targets.get(key) {
-        for peer in paid_peers {
-            if matches!(evidence.presence.get(peer), Some(PresenceEvidence::Present))
-                && !present_peers.contains(peer)
-            {
-                present_peers.push(*peer);
-            }
+    for peer in quorum_peers.iter().chain(paid_peers.iter()) {
+        if matches!(evidence.presence.get(peer), Some(PresenceEvidence::Present))
+            && seen.insert(*peer)
+        {
+            present_peers.push(*peer);
         }
     }
 
@@ -594,6 +588,44 @@ mod tests {
             presence: presence.into_iter().collect(),
             paid_list: paid_list.into_iter().collect(),
         }
+    }
+
+    #[test]
+    fn present_sources_for_key_filters_targets_and_deduplicates() {
+        let key = xor_name_from_byte(0x11);
+        let q_present = peer_id_from_byte(1);
+        let overlap = peer_id_from_byte(2);
+        let q_absent = peer_id_from_byte(3);
+        let q_unresolved = peer_id_from_byte(4);
+        let paid_present = peer_id_from_byte(5);
+        let paid_absent = peer_id_from_byte(6);
+        let outside_target = peer_id_from_byte(7);
+
+        let targets = single_key_targets(
+            &key,
+            vec![q_present, overlap, q_absent, q_unresolved],
+            vec![overlap, paid_present, paid_absent],
+        );
+        let evidence = build_evidence(
+            vec![
+                (q_present, PresenceEvidence::Present),
+                (overlap, PresenceEvidence::Present),
+                (q_absent, PresenceEvidence::Absent),
+                (q_unresolved, PresenceEvidence::Unresolved),
+                (paid_present, PresenceEvidence::Present),
+                (paid_absent, PresenceEvidence::Absent),
+                (outside_target, PresenceEvidence::Present),
+            ],
+            vec![],
+        );
+
+        let sources = present_sources_for_key(&key, &evidence, &targets);
+
+        assert_eq!(
+            sources,
+            vec![q_present, overlap, paid_present],
+            "sources should preserve quorum-first order, de-duplicate overlap, and ignore non-target/negative evidence"
+        );
     }
 
     // -----------------------------------------------------------------------
