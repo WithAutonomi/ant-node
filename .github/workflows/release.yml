@@ -82,13 +82,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Use ubuntu-22.04 for GLIBC 2.35 compatibility with server deployments
-          - target: x86_64-unknown-linux-gnu
+          # Linux builds use musl for portability across glibc and musl distros
+          # (e.g. Alpine). Built via `cross` so the musl toolchain is provided
+          # by the cross-rs container image.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-22.04
             binary: ant-node
             archive: tar.gz
+            cross: true
             friendly_name: linux-x64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-22.04
             binary: ant-node
             archive: tar.gz
