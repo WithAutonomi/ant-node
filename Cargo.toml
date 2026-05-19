@@ -23,6 +23,12 @@ name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
+# Global allocator. musl's default malloc is significantly slower than
+# glibc's under concurrent allocation churn, which matches the node's
+# steady-state workload. mimalloc neutralises that regression for the
+# musl Linux builds (and tends to beat glibc's allocator too).
+mimalloc = "0.1"
+
 # Wire protocol — the single version-pin shared with ant-client.
 # Bumping ant-protocol's `evmlib`/`saorsa-core`/`saorsa-pqc` pins ripples
 # through here automatically; we keep a direct saorsa-core dep for

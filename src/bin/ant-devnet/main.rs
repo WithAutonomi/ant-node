@@ -2,6 +2,9 @@
 
 #![cfg_attr(not(feature = "logging"), allow(unused_variables))]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod cli;
 
 use ant_node::devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
