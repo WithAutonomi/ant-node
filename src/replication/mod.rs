@@ -1530,8 +1530,12 @@ async fn handle_audit_challenge_msg(
 // Message sending helper
 // ---------------------------------------------------------------------------
 
-/// Send a replication response message. Fire-and-forget: logs errors but
-/// does not propagate them.
+/// Send a replication response message.
+///
+/// Returns `true` after the message is encoded and accepted by the P2P send
+/// path. Returns `false` after logging an encode or send failure. Most callers
+/// only need best-effort responses, but repair-proof recording uses this to
+/// avoid trusting hints that were not actually sent.
 ///
 /// When `rr_message_id` is `Some`, the response is sent via the `/rr/`
 /// request-response path so saorsa-core can route it back to the caller's

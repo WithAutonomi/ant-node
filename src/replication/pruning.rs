@@ -147,6 +147,13 @@ struct PruneAuditReportState {
 /// - If self is in `PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen`.
 /// - If not in group: set timestamp if not already set; remove entry if the
 ///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old.
+///
+/// Compatibility wrapper for callers that have not adopted repair-proof
+/// tracking. It preserves the original public signature, but it has no proof
+/// table or advanced sync epoch to pass into record prune-confirmation audits.
+/// Out-of-range records are therefore marked/deferred rather than deleted via
+/// remote confirmation. The replication engine calls
+/// [`run_prune_pass_with_context`] so it can pass real repair proofs.
 pub async fn run_prune_pass(
     self_id: &PeerId,
     storage: &Arc<LmdbStorage>,
