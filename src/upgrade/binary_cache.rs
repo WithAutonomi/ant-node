@@ -51,9 +51,17 @@ use fs2::FileExt;
 use saorsa_pqc::api::sig::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+
+/// Maximum size accepted for the `.meta.json` sidecar.
+///
+/// A well-formed `CachedArchiveMeta` serialises to roughly 120 bytes; the
+/// 4 KiB cap is comfortably above any legitimate payload and tight enough
+/// that an attacker who plants a metadata file the size of `/dev/zero`
+/// cannot stall the metadata read into a hang or OOM.
+const MAX_META_BYTES: u64 = 4 * 1024;
 
 /// On-disk cache for downloaded, signature-verified upgrade archives.
 #[derive(Clone)]
@@ -157,13 +165,40 @@ impl BinaryCache {
     /// The caller MUST extract the binary from the returned (private) archive
     /// path, so the executed bytes always derive from signature-verified
     /// input that no other principal could have modified post-verification.
+    // The verifier-side cache-hit gate is read top-to-bottom by anyone
+    // auditing the security model. Splitting it into smaller helpers just
+    // to placate clippy's line limit would scatter the threat model across
+    // call sites without improving safety.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub fn get_verified_archive(&self, version: &str, private_dir: &Path) -> Option<PathBuf> {
         let cached_archive = self.cached_archive_path(version);
         let cached_sig = self.cached_signature_path(version);
         let meta_path = self.meta_path(version);
 
-        let meta_data = fs::read_to_string(&meta_path).ok()?;
+        // Read the metadata sidecar with a small, opened-handle size cap so
+        // an attacker with cache-dir write cannot plant `meta.json` as a
+        // symlink to `/dev/zero` (or any large/special file) and force a
+        // hang/OOM here before the archive/sig hardening runs.
+        let meta_data = {
+            let (mut meta_file, meta_len) = match open_regular_capped(&meta_path, MAX_META_BYTES) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    debug!("Rejecting cache metadata for {version}: {e}");
+                    return None;
+                }
+            };
+            // `meta_len` is capped at MAX_META_BYTES (4 KiB), so this
+            // truncation can never happen in practice; saturating_cast
+            // makes that explicit for clippy on 32-bit targets.
+            let cap = usize::try_from(meta_len).unwrap_or(usize::MAX);
+            let mut buf = String::with_capacity(cap);
+            if let Err(e) = meta_file.read_to_string(&mut buf) {
+                debug!("Failed to read cache metadata for {version}: {e}");
+                return None;
+            }
+            buf
+        };
         let meta: CachedArchiveMeta = serde_json::from_str(&meta_data).ok()?;
 
         if meta.version != version {
@@ -171,88 +206,77 @@ impl BinaryCache {
             return None;
         }
 
-        // Size policy gate — runs BEFORE we copy or read the cached files.
+        // Open archive + signature ONCE each with size and file-type
+        // validation on the opened handles. Subsequent reads / hash /
+        // signature verification all go through the FDs opened here — there
+        // is no second path-based stat or open after this point, so an
+        // attacker who races a swap on the cache-dir paths (symlink, FIFO,
+        // device, oversized file) after these validations cannot redirect
+        // what gets staged into the private dir.
         //
-        // `signature::verify_from_file*` and `sha256_file` both load the
-        // archive into memory in full. An attacker with cache-dir write
-        // access could otherwise drop a multi-GB `.archive` and force disk
-        // exhaustion in the staging dir or an OOM during re-verification
-        // before the entry is rejected. The download path already enforces
-        // `MAX_ARCHIVE_SIZE_BYTES`; cache hits must honour the same bound,
-        // plus the fixed `SIGNATURE_SIZE`.
-        // Use `symlink_metadata` (does NOT follow symlinks) and require a
-        // regular file. Otherwise a cache-dir writer could plant
-        // `ant-node-X.archive -> /dev/zero` (or a FIFO/device) whose `.len()`
-        // stats as 0 — passing a `fs::metadata` size check while
-        // `fs::copy` then reads indefinitely from the underlying special
-        // file, exhausting disk in the private staging dir.
-        let archive_meta = match fs::symlink_metadata(&cached_archive) {
-            Ok(m) => m,
+        // Memory pressure note: `signature::verify_from_file*` reads the
+        // archive into memory in full (it is the FIPS-204 verifier's
+        // contract — message must be provided as a slice). `sha256_file`
+        // streams in 8 KiB chunks and is not an OOM vector. The
+        // `MAX_ARCHIVE_SIZE_BYTES` cap bounds the in-memory load and the
+        // staging-dir disk footprint together.
+        let (mut archive_file, archive_len) = match open_regular_capped(
+            &cached_archive,
+            crate::upgrade::apply::MAX_ARCHIVE_SIZE_BYTES as u64,
+        ) {
+            Ok(pair) => pair,
             Err(e) => {
-                debug!("Cannot stat cached archive for {version}: {e}");
+                warn!("Rejecting cached archive for {version}: {e}");
                 return None;
             }
         };
-        if !archive_meta.file_type().is_file() {
+        let (mut sig_file, sig_len) =
+            match open_regular_capped(&cached_sig, signature::SIGNATURE_SIZE as u64) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Rejecting cached signature for {version}: {e}");
+                    return None;
+                }
+            };
+        if sig_len != signature::SIGNATURE_SIZE as u64 {
+            // open_regular_capped enforces ≤ max; we additionally require
+            // EXACTLY SIGNATURE_SIZE (a shorter sig is not valid ML-DSA-65).
             warn!(
-                "Cached archive for {version} is not a regular file \
-                 (symlink/special); discarding cache entry"
-            );
-            return None;
-        }
-        if archive_meta.len() > crate::upgrade::apply::MAX_ARCHIVE_SIZE_BYTES as u64 {
-            warn!(
-                "Cached archive for {version} exceeds MAX_ARCHIVE_SIZE_BYTES \
-                 ({} bytes); discarding cache entry",
-                archive_meta.len()
-            );
-            return None;
-        }
-        let sig_meta = match fs::symlink_metadata(&cached_sig) {
-            Ok(m) => m,
-            Err(e) => {
-                debug!("Cannot stat cached signature for {version}: {e}");
-                return None;
-            }
-        };
-        if !sig_meta.file_type().is_file() {
-            warn!(
-                "Cached signature for {version} is not a regular file \
-                 (symlink/special); discarding cache entry"
-            );
-            return None;
-        }
-        if sig_meta.len() != signature::SIGNATURE_SIZE as u64 {
-            warn!(
-                "Cached signature for {version} has wrong size ({} bytes, \
-                 expected {}); discarding cache entry",
-                sig_meta.len(),
+                "Cached signature for {version} has wrong size ({sig_len} bytes, \
+                 expected {})",
                 signature::SIGNATURE_SIZE
             );
             return None;
         }
 
-        // Copy archive + signature into the caller-private directory.
-        // Everything below operates only on these private copies, which the
-        // attacker cannot reach — eliminating any verify/extract TOCTOU on
-        // the shared cache files.
+        // Stream the validated archive + signature into the caller-private
+        // directory FROM THE ALREADY-OPEN HANDLES (not from the path), so
+        // the bytes the verifier reads are the exact bytes the open-handle
+        // metadata checks were performed against. `take()` is belt-and-
+        // braces against an attacker who extends the file after open.
         let private_archive = private_dir.join(format!("cached-{version}.archive"));
         let private_sig = private_dir.join(format!("cached-{version}.sig"));
 
-        // Cleanup helper defined BEFORE any copy so even a partially-created
-        // destination from a failed copy is removed on every rejection path.
         let cleanup = |reason: &str| {
             debug!("Cleaning staged cache copy for {version}: {reason}");
             let _ = fs::remove_file(&private_archive);
             let _ = fs::remove_file(&private_sig);
         };
 
-        if let Err(e) = fs::copy(&cached_archive, &private_archive) {
+        if let Err(e) = (|| -> io::Result<()> {
+            let mut dest = File::create(&private_archive)?;
+            io::copy(&mut (&mut archive_file).take(archive_len), &mut dest)?;
+            Ok(())
+        })() {
             debug!("Could not stage cached archive for {version}: {e}");
             cleanup("archive copy failed");
             return None;
         }
-        if let Err(e) = fs::copy(&cached_sig, &private_sig) {
+        if let Err(e) = (|| -> io::Result<()> {
+            let mut dest = File::create(&private_sig)?;
+            io::copy(&mut (&mut sig_file).take(sig_len), &mut dest)?;
+            Ok(())
+        })() {
             debug!("Could not stage cached signature for {version}: {e}");
             cleanup("signature copy failed");
             return None;
@@ -390,8 +414,9 @@ impl BinaryCache {
             cached_at_epoch_secs: now,
         };
 
-        let meta_json = serde_json::to_string(&meta)
-            .map_err(|e| Error::Upgrade(format!("Failed to serialize binary cache meta: {e}")))?;
+        let meta_json = serde_json::to_string(&meta).map_err(|e| {
+            Error::Upgrade(format!("Failed to serialize cached archive metadata: {e}"))
+        })?;
 
         // Metadata written last so a reader never sees a complete meta file
         // pointing at an incomplete archive/signature pair.
@@ -454,6 +479,39 @@ impl BinaryCache {
 /// The underlying file lock is released when this guard is dropped.
 pub struct DownloadLockGuard {
     _file: File,
+}
+
+/// Open `path` as a regular file with size at most `max_len`, validating
+/// the metadata on the **opened handle** so a race between any prior stat
+/// and the read cannot substitute a special file (FIFO/device/socket) or
+/// an oversized payload. A symlink whose target is a regular file is
+/// accepted (it's just an indirect path to a regular file — the attacker
+/// who placed the link already needed write access to the cache dir, the
+/// same access level as directly editing the regular file); a symlink
+/// whose target is a special file is rejected by the `is_file()` check on
+/// the opened handle.
+///
+/// Returns `(File, len)` on success; the returned `File` is positioned at
+/// offset 0 and may be `io::copy`'d into a destination — callers should
+/// wrap with `Read::take(max_len)` so an attacker who extends the file
+/// after the metadata read cannot stream beyond the cap.
+fn open_regular_capped(path: &Path, max_len: u64) -> io::Result<(File, u64)> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (FIFO/device/socket/dir)",
+        ));
+    }
+    let len = meta.len();
+    if len > max_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file exceeds size cap ({len} > {max_len})"),
+        ));
+    }
+    Ok((file, len))
 }
 
 /// Compute the hex-encoded SHA-256 digest of a file.
@@ -751,5 +809,53 @@ mod tests {
         );
         // Nothing should have been staged.
         assert!(!pd.path().join("cached-4.0.0.archive").exists());
+    }
+
+    /// `.meta.json` is read through the same size/file-type gate as the
+    /// archive and signature: planting a multi-MB metadata file (or a
+    /// metadata symlink to a special file) is rejected pre-parse without
+    /// risking a hang or large allocation.
+    #[test]
+    fn test_oversized_meta_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_test_key(tmp.path());
+        let pd = priv_dir();
+
+        // Establish a valid entry so archive/sig are well-formed.
+        let (archive, sig) = make_signed_archive(tmp.path(), b"legit");
+        cache.store_archive("5.0.0", &archive, &sig).unwrap();
+
+        // Overwrite meta with a file well above MAX_META_BYTES of garbage.
+        let meta_path = cache.meta_path("5.0.0");
+        let huge = vec![b'a'; usize::try_from(MAX_META_BYTES).unwrap_or(usize::MAX) + 1024];
+        fs::write(&meta_path, &huge).unwrap();
+
+        assert!(
+            cache.get_verified_archive("5.0.0", pd.path()).is_none(),
+            "oversized metadata file must be rejected before parsing"
+        );
+    }
+
+    /// `.meta.json` planted as a symlink to a special file (e.g.
+    /// `/dev/zero`) is rejected by the open-handle file-type check,
+    /// without hanging or OOM'ing on the read.
+    #[cfg(unix)]
+    #[test]
+    fn test_meta_symlink_to_special_file_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_test_key(tmp.path());
+        let pd = priv_dir();
+
+        let (archive, sig) = make_signed_archive(tmp.path(), b"legit");
+        cache.store_archive("5.1.0", &archive, &sig).unwrap();
+
+        let meta_path = cache.meta_path("5.1.0");
+        fs::remove_file(&meta_path).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &meta_path).unwrap();
+
+        assert!(
+            cache.get_verified_archive("5.1.0", pd.path()).is_none(),
+            "metadata symlink to a special file must be rejected"
+        );
     }
 }
