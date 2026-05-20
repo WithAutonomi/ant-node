@@ -874,18 +874,14 @@ impl ReplicationEngine {
                                 .await;
                             }
 
-                            // Record capacity rejections so the drain check
-                            // does NOT mark bootstrap complete while work
-                            // was silently dropped at the queue caps. The
-                            // source's next periodic hint will replay the
-                            // rejected keys once `pending_verify` has
-                            // drained.
+                            // Record / retire capacity rejections so the
+                            // drain check correctly reflects whether each
+                            // source still owes us re-hinted work after
+                            // queue overflow.
                             if outcome.capacity_rejected_count > 0 {
-                                bootstrap::note_capacity_rejected(
-                                    &bootstrap_state,
-                                    outcome.capacity_rejected_count,
-                                )
-                                .await;
+                                bootstrap::note_capacity_rejected(&bootstrap_state, *peer).await;
+                            } else {
+                                bootstrap::clear_capacity_rejected(&bootstrap_state, peer).await;
                             }
                         }
                     }
@@ -1331,16 +1327,17 @@ async fn handle_neighbor_sync_request(
     .await;
 
     // Track discovered keys for bootstrap drain detection so that hints
-    // admitted via inbound sync requests are not missed. If any hints were
-    // capacity-rejected, mark the bootstrap "not yet drained" so the next
-    // sync from this source can re-admit them once queues free up.
+    // admitted via inbound sync requests are not missed. Capacity-rejected
+    // hints keep this source on the "not yet drained" list until its next
+    // sync re-admits them; a clean cycle clears the source.
     if is_bootstrapping {
         if !outcome.discovered.is_empty() {
             bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
         }
         if outcome.capacity_rejected_count > 0 {
-            bootstrap::note_capacity_rejected(bootstrap_state, outcome.capacity_rejected_count)
-                .await;
+            bootstrap::note_capacity_rejected(bootstrap_state, *source).await;
+        } else {
+            bootstrap::clear_capacity_rejected(bootstrap_state, source).await;
         }
     }
 
@@ -1757,15 +1754,16 @@ async fn handle_sync_response(
 
         // Track discovered keys for bootstrap drain detection so that hints
         // admitted via regular neighbor sync are not missed. Capacity-
-        // rejected keys keep bootstrap "not yet drained" until the next
-        // sync replays them post-drain.
+        // rejected hints keep this source on the "not yet drained" list
+        // until its next sync replays them; a clean cycle clears it.
         if bootstrapping {
             if !outcome.discovered.is_empty() {
                 bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
             }
             if outcome.capacity_rejected_count > 0 {
-                bootstrap::note_capacity_rejected(bootstrap_state, outcome.capacity_rejected_count)
-                    .await;
+                bootstrap::note_capacity_rejected(bootstrap_state, *peer).await;
+            } else {
+                bootstrap::clear_capacity_rejected(bootstrap_state, peer).await;
             }
         }
     }
