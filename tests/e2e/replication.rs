@@ -150,12 +150,7 @@ async fn record_repair_proofs_for_peers(
     let mut proofs = repair_proofs.write().await;
     for peer in peers {
         assert!(
-            proofs.record_replica_hint_sent_with_snapshot(
-                *peer,
-                *key,
-                &close_peers,
-                hinted_at_epoch
-            ),
+            proofs.record_replica_hint_sent(*peer, *key, &close_peers, hinted_at_epoch),
             "test target should be in close group for repair-proof recording"
         );
     }

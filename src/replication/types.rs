@@ -305,27 +305,6 @@ impl RepairProofs {
         &mut self,
         peer: PeerId,
         key: XorName,
-        current_close_peers: &[PeerId],
-        hinted_at_epoch: u64,
-    ) -> bool {
-        let current_close_peers = close_peer_set(current_close_peers);
-        self.record_replica_hint_sent_with_snapshot(
-            peer,
-            key,
-            &current_close_peers,
-            hinted_at_epoch,
-        )
-    }
-
-    /// Record that `peer` was sent a replica repair hint for `key`, using a
-    /// precomputed self-inclusive close-group snapshot.
-    ///
-    /// This avoids rebuilding the same snapshot when one key is checked or
-    /// recorded for multiple peers in a hot path.
-    pub fn record_replica_hint_sent_with_snapshot(
-        &mut self,
-        peer: PeerId,
-        key: XorName,
         current_close_peers: &HashSet<PeerId>,
         hinted_at_epoch: u64,
     ) -> bool {
@@ -358,22 +337,6 @@ impl RepairProofs {
     /// group differs from the group observed when the proof was recorded. A
     /// proof is mature only after at least one later local sync-cycle epoch.
     pub fn has_mature_replica_hint(
-        &mut self,
-        peer: &PeerId,
-        key: &XorName,
-        current_close_peers: &[PeerId],
-        current_epoch: u64,
-    ) -> bool {
-        let current_close_peers = close_peer_set(current_close_peers);
-        self.has_mature_replica_hint_with_snapshot(peer, key, &current_close_peers, current_epoch)
-    }
-
-    /// Whether this node has mature repair-hint evidence for `(peer, key)`,
-    /// using a precomputed self-inclusive close-group snapshot.
-    ///
-    /// The check invalidates all key proofs if the current snapshot differs
-    /// from the group observed when the proof was recorded.
-    pub fn has_mature_replica_hint_with_snapshot(
         &mut self,
         peer: &PeerId,
         key: &XorName,
@@ -417,10 +380,6 @@ impl RepairProofs {
         }
         changed
     }
-}
-
-fn close_peer_set(peers: &[PeerId]) -> HashSet<PeerId> {
-    peers.iter().copied().collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -768,7 +727,7 @@ mod tests {
 
         let key = [0xA1; 32];
         let peer = peer_id_from_byte(1);
-        let close_peers = vec![peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
@@ -786,7 +745,7 @@ mod tests {
 
         let key = [0xA2; 32];
         let peer = peer_id_from_byte(1);
-        let close_peers = vec![peer_id_from_byte(2), peer_id_from_byte(3)];
+        let close_peers = HashSet::from([peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(!proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
@@ -804,7 +763,7 @@ mod tests {
 
         let key = [0xA3; 32];
         let peer = peer_id_from_byte(1);
-        let close_peers = vec![peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
@@ -826,7 +785,7 @@ mod tests {
 
         let key = [0xA5; 32];
         let peer = peer_id_from_byte(1);
-        let close_peers = vec![peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
@@ -849,8 +808,8 @@ mod tests {
         let key = [0xA3; 32];
         let returning_peer = peer_id_from_byte(1);
         let new_peer = peer_id_from_byte(4);
-        let old_group = vec![returning_peer, peer_id_from_byte(2), peer_id_from_byte(3)];
-        let changed_group = vec![new_peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let old_group = HashSet::from([returning_peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let changed_group = HashSet::from([new_peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(proofs.record_replica_hint_sent(returning_peer, key, &old_group, FIRST_HINT_EPOCH,));
@@ -884,7 +843,7 @@ mod tests {
 
         let key = [0xA6; 32];
         let peer = peer_id_from_byte(1);
-        let close_peers = vec![peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
         let mut proofs = RepairProofs::new();
 
         assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, FIRST_HINT_EPOCH));
@@ -909,13 +868,14 @@ mod tests {
 
         let key = [0xA4; 32];
         let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer]);
         let mut proofs = RepairProofs::new();
 
-        assert!(proofs.record_replica_hint_sent(peer, key, &[peer], HINT_EPOCH));
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
         proofs.remove_key(&key);
 
         assert!(
-            !proofs.has_mature_replica_hint(&peer, &key, &[peer], CURRENT_EPOCH),
+            !proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
             "deleted local key should not retain repair proof entries"
         );
     }

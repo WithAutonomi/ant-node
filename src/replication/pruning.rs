@@ -455,12 +455,7 @@ async fn target_peers_have_mature_repair_proofs(
 ) -> bool {
     let mut proofs = repair_proofs.write().await;
     target_peers.iter().all(|peer| {
-        proofs.has_mature_replica_hint_with_snapshot(
-            peer,
-            key,
-            current_close_peers,
-            current_sync_epoch,
-        )
+        proofs.has_mature_replica_hint(peer, key, current_close_peers, current_sync_epoch)
     })
 }
 

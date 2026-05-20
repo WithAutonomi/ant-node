@@ -354,12 +354,7 @@ fn mature_audit_keys_for_peer(
         .into_iter()
         .filter_map(|(key, close_peers)| {
             repair_proofs
-                .has_mature_replica_hint_with_snapshot(
-                    challenged_peer,
-                    &key,
-                    &close_peers,
-                    current_sync_epoch,
-                )
+                .has_mature_replica_hint(challenged_peer, &key, &close_peers, current_sync_epoch)
                 .then_some(key)
         })
         .collect()
@@ -1223,19 +1218,19 @@ mod tests {
         let changed_close_group = HashSet::from([challenged_peer, new_peer]);
         let mut repair_proofs = RepairProofs::new();
 
-        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
+        assert!(repair_proofs.record_replica_hint_sent(
             challenged_peer,
             mature_key,
             &close_group,
             HINT_EPOCH,
         ));
-        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
+        assert!(repair_proofs.record_replica_hint_sent(
             challenged_peer,
             same_epoch_key,
             &close_group,
             CURRENT_EPOCH,
         ));
-        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
+        assert!(repair_proofs.record_replica_hint_sent(
             challenged_peer,
             stale_snapshot_key,
             &close_group,
