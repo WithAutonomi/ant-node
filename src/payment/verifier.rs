@@ -91,8 +91,9 @@ impl Default for EvmVerifierConfig {
 /// A live provider of this node's own minimum acceptable per-record price.
 ///
 /// In atto (wei). Wraps `calculate_price(records_stored)` so the verifier can
-/// reject single-node proofs whose attacker-chosen median price is far below
+/// reject single-node proofs whose attacker-chosen quote prices are far below
 /// what this node would itself charge a client right now (finding F2/F5).
+/// Enforcement is per-candidate, not median-based.
 /// Cloneable (shares one `Arc`) and `Debug` so it can live in
 /// [`PaymentVerifierConfig`].
 #[derive(Clone)]
@@ -134,9 +135,10 @@ pub struct PaymentVerifierConfig {
     /// Live source of this node's own minimum acceptable per-record price.
     ///
     /// `Some` in production (wired to the node's quoting metrics): the
-    /// single-node payment path rejects proofs whose median price is below
-    /// this floor (minus a bounded tolerance), defeating the F2/F5 free-storage
-    /// attack where an attacker submits self-signed 1-atto / baseline quotes.
+    /// single-node payment path rejects proofs in which no candidate quote
+    /// that pays this node meets this floor (minus a bounded tolerance),
+    /// defeating the F2/F5 free-storage attack where an attacker submits
+    /// self-signed 1-atto / baseline quotes.
     ///
     /// `None` only in unit tests / devnet harnesses that pre-populate the
     /// verified cache and never exercise on-chain single-node verification;
