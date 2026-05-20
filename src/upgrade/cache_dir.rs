@@ -26,6 +26,27 @@ pub fn upgrade_cache_dir() -> Result<PathBuf> {
     let cache_dir = project_dirs.data_dir().join("upgrades");
     fs::create_dir_all(&cache_dir)?;
 
+    // Defence in depth: restrict the shared upgrade cache to the owning
+    // user (0700) so a co-located low-privilege process cannot
+    // write/tamper with cached archives in the first place. The ML-DSA
+    // re-verification on every cache hit is the primary control; this just
+    // shrinks the attack surface. Best-effort on Unix; a failure to tighten
+    // permissions must not break upgrades (the crypto gate still holds).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fs::metadata(&cache_dir) {
+            let mut perms = meta.permissions();
+            perms.set_mode(0o700);
+            if let Err(e) = fs::set_permissions(&cache_dir, perms) {
+                crate::logging::warn!(
+                    "Could not tighten upgrade cache dir permissions to 0700 ({e}); \
+                     ML-DSA re-verification still protects cached archives"
+                );
+            }
+        }
+    }
+
     Ok(cache_dir)
 }
 

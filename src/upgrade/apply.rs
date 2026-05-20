@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use tar::Archive;
 
 /// Maximum allowed upgrade archive size (200 MiB).
-const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE_SIZE_BYTES: usize = 200 * 1024 * 1024;
 
 /// Exit code that signals the service manager to restart the process.
 ///
@@ -176,9 +176,24 @@ impl AutoApplyUpgrader {
             .parent()
             .ok_or_else(|| Error::Upgrade("Cannot determine binary directory".to_string()))?;
 
-        // Create temp directory for upgrade
-        let temp_dir = tempfile::Builder::new()
-            .prefix("ant-upgrade-")
+        // Create temp directory for upgrade.
+        //
+        // On Unix, create it with 0700 so a same-host attacker on a different
+        // UID cannot read/write the staging area between when the cache
+        // re-verifies the ML-DSA signature on a private copy and when
+        // `extract_binary` reads it (closes a verify-vs-extract TOCTOU on
+        // the staging directory). The `tempfile::Builder::permissions`
+        // path is supported on tempfile 3 — on platforms that don't honour
+        // it the call is a no-op and the ML-DSA verification on the
+        // private copy still bounds the residual.
+        let mut tempdir_builder = tempfile::Builder::new();
+        tempdir_builder.prefix("ant-upgrade-");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tempdir_builder.permissions(std::fs::Permissions::from_mode(0o700));
+        }
+        let temp_dir = tempdir_builder
             .tempdir_in(binary_dir)
             .map_err(|e| Error::Upgrade(format!("Failed to create temp dir: {e}")))?;
 
@@ -317,21 +332,26 @@ impl AutoApplyUpgrader {
         version_str: &str,
     ) -> Result<PathBuf> {
         if let Some(ref cache) = self.binary_cache {
-            // Fast path — cache hit without locking
-            if let Some(cached_path) = cache.get_verified(version_str) {
-                info!("Cached binary verified for version {}", version_str);
-                let dest = dest_dir.join(
-                    cached_path
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("ant-node")),
-                );
-                if let Err(e) = fs::copy(&cached_path, &dest) {
-                    warn!("Failed to copy from cache, will re-download: {e}");
-                    return self
-                        .download_verify_extract(info, dest_dir, Some(cache))
-                        .await;
+            // Fast path — cache hit without locking. The cache re-verifies
+            // the ML-DSA signature over the archive on every call, so a
+            // tampered cache entry returns None here and we fall through to
+            // a fresh, fully verified download.
+            // `dest_dir` is this upgrade's process-private temp dir, so the
+            // cache stages + verifies the archive there; extraction then
+            // reads exactly the verified bytes (no shared-file TOCTOU).
+            if let Some(verified_archive) = cache.get_verified_archive(version_str, dest_dir) {
+                match Self::extract_binary(&verified_archive, dest_dir) {
+                    Ok(binary) => {
+                        info!("Reused signature-verified cached archive for {version_str}");
+                        return Ok(binary);
+                    }
+                    Err(e) => {
+                        warn!("Failed to extract from cached archive, will re-download: {e}");
+                        return self
+                            .download_verify_extract(info, dest_dir, Some(cache))
+                            .await;
+                    }
                 }
-                return Ok(dest);
             }
 
             // Cache miss — acquire exclusive download lock via spawn_blocking
@@ -345,19 +365,15 @@ impl AutoApplyUpgrader {
                     .await
                     .map_err(|e| Error::Upgrade(format!("Lock task failed: {e}")))??;
 
-            // Re-check cache under the lock — another node may have populated it
-            if let Some(cached_path) = cache.get_verified(version_str) {
-                info!(
-                    "Cached binary became available under lock for version {}",
-                    version_str
-                );
-                let dest = dest_dir.join(
-                    cached_path
-                        .file_name()
-                        .unwrap_or_else(|| std::ffi::OsStr::new("ant-node")),
-                );
-                fs::copy(&cached_path, &dest)?;
-                return Ok(dest);
+            // Re-check cache under the lock — another node may have populated
+            // it. Same re-verification guarantee as the fast path.
+            if let Some(verified_archive) = cache.get_verified_archive(version_str, dest_dir) {
+                if let Ok(binary) = Self::extract_binary(&verified_archive, dest_dir) {
+                    info!(
+                        "Signature-verified cached archive became available under lock for {version_str}"
+                    );
+                    return Ok(binary);
+                }
             }
 
             // Still missing — download while holding the lock
@@ -400,15 +416,22 @@ impl AutoApplyUpgrader {
         signature::verify_from_file(&archive_path, &sig_path)?;
         info!("Archive signature verified successfully");
 
-        // Step 4: Extract binary from verified archive
+        // Step 4: Extract binary from the just-verified archive.
         info!("Extracting binary from archive...");
         let extracted_binary = Self::extract_binary(&archive_path, dest_dir)?;
 
-        // Store in binary cache if available
+        // Step 5: Cache the signature-verified ARCHIVE (+ its signature)
+        // AFTER successful extraction. We cache the signed artifact, never
+        // the extracted binary, so every later cache hit can re-verify the
+        // signature. Caching only after extract proves the archive is
+        // actually usable on this platform avoids turning a
+        // validly-signed-but-malformed release into a shared cache poison
+        // pill (every later node would hit cache, fail extract, and
+        // re-download).
         if let Some(c) = cache {
             let version_str = info.version.to_string();
-            if let Err(e) = c.store(&version_str, &extracted_binary) {
-                warn!("Failed to store binary in cache: {e}");
+            if let Err(e) = c.store_archive(&version_str, &archive_path, &sig_path) {
+                warn!("Failed to store verified archive in cache: {e}");
             }
         }
 
