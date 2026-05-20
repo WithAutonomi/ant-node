@@ -76,6 +76,34 @@ pub const MAX_PENDING_VERIFY_PER_PEER: usize = 8_192;
 /// `enqueue_fetch`) when full.
 pub const MAX_FETCH_QUEUE: usize = 131_072;
 
+/// Outcome of [`ReplicationQueues::add_pending_verify`].
+///
+/// Distinguishes "the key is already being handled" from "the key was
+/// silently dropped due to a queue capacity bound". Bootstrap drain
+/// accounting and source-side retry logic MUST treat `CapacityRejected` as
+/// outstanding work; treating it like a dedup hit was the silent-drop
+/// regression introduced when the queues first became bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionResult {
+    /// New entry inserted into `pending_verify`.
+    Admitted,
+    /// Key was already in some pipeline stage; the existing entry is left
+    /// in place. No retry required.
+    AlreadyPresent,
+    /// Global or per-source capacity bound rejected the entry. The caller
+    /// MUST treat this as work still to do (not as silently completed).
+    CapacityRejected,
+}
+
+impl AdmissionResult {
+    /// `true` only for [`AdmissionResult::Admitted`]. Preserves call sites
+    /// that only want to know "did the insert happen".
+    #[must_use]
+    pub fn admitted(self) -> bool {
+        matches!(self, Self::Admitted)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // In-flight entry
 // ---------------------------------------------------------------------------
@@ -154,25 +182,30 @@ impl ReplicationQueues {
 
     /// Add a key to pending verification if not already present in any queue.
     ///
-    /// Returns `true` if the key was newly added (Rule 8: cross-queue dedup).
-    ///
-    /// Returns `false` — without inserting — when either:
-    /// * the global [`MAX_PENDING_VERIFY`] memory backstop is reached, or
-    /// * the entry's `hint_sender` already holds [`MAX_PENDING_VERIFY_PER_PEER`]
-    ///   pending entries (per-source fairness — a flooding peer can only
-    ///   exhaust its own quota and can never starve honest peers).
-    ///
-    /// Callers already treat a `false` result as "not admitted".
-    pub fn add_pending_verify(&mut self, key: XorName, entry: VerificationEntry) -> bool {
+    /// Returns an [`AdmissionResult`] distinguishing the three outcomes:
+    /// * `Admitted` — newly inserted.
+    /// * `AlreadyPresent` — Rule 8 cross-queue dedup (the key is already in
+    ///   `pending_verify`, `fetch_queue`, or `in_flight_fetch`); the existing
+    ///   entry remains and there is no work to retry.
+    /// * `CapacityRejected` — global or per-source bound hit; the work is
+    ///   genuinely lost and the caller (e.g. bootstrap drain accounting,
+    ///   source-side retry) MUST treat this as still-outstanding work, not as
+    ///   "done". Without this distinction a bootstrap snapshot whose hints
+    ///   are capacity-rejected would silently mark itself drained.
+    pub fn add_pending_verify(
+        &mut self,
+        key: XorName,
+        entry: VerificationEntry,
+    ) -> AdmissionResult {
         if self.contains_key(&key) {
-            return false;
+            return AdmissionResult::AlreadyPresent;
         }
         if self.pending_verify.len() >= MAX_PENDING_VERIFY {
             debug!(
                 "pending_verify at global capacity ({MAX_PENDING_VERIFY}); rejecting key {}",
                 hex::encode(key)
             );
-            return false;
+            return AdmissionResult::CapacityRejected;
         }
         let sender = entry.hint_sender;
         let sender_count = self.pending_per_sender.get(&sender).copied().unwrap_or(0);
@@ -182,11 +215,11 @@ impl ReplicationQueues {
                  rejecting key {} (honest peers are unaffected)",
                 hex::encode(key)
             );
-            return false;
+            return AdmissionResult::CapacityRejected;
         }
         self.pending_verify.insert(key, entry);
         *self.pending_per_sender.entry(sender).or_insert(0) += 1;
-        true
+        AdmissionResult::Admitted
     }
 
     /// Decrement (and prune at zero) the per-sender counter for `sender`.
@@ -260,23 +293,28 @@ impl ReplicationQueues {
 
     /// Enqueue a key for fetch with its distance and verified sources.
     ///
-    /// No-op if the key is already in any pipeline stage (Rule 8: cross-queue
-    /// dedup), or if `fetch_queue` is already at [`MAX_FETCH_QUEUE`]. The
-    /// capacity drop bounds memory (and the outbound `FetchRequest` storm)
-    /// under a network hint flood.
-    pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) {
+    /// Returns `true` if the candidate was enqueued, `false` if it was
+    /// already present in any pipeline stage (Rule 8: cross-queue dedup) or
+    /// the `fetch_queue` is at [`MAX_FETCH_QUEUE`].
+    ///
+    /// Callers that have removed the key from `pending_verify` immediately
+    /// before this call should prefer [`promote_pending_to_fetch`](Self::promote_pending_to_fetch),
+    /// which performs the move atomically and leaves the pending entry in
+    /// place when the fetch queue is full (so verified work is retried on
+    /// the next cycle instead of being silently lost).
+    pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) -> bool {
         if self.pending_verify.contains_key(&key)
             || self.fetch_queue_keys.contains(&key)
             || self.in_flight_fetch.contains_key(&key)
         {
-            return;
+            return false;
         }
         if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
             debug!(
                 "fetch_queue at capacity ({MAX_FETCH_QUEUE}); dropping new key {}",
                 hex::encode(key)
             );
-            return;
+            return false;
         }
         self.fetch_queue_keys.insert(key);
         self.fetch_queue.push(FetchCandidate {
@@ -284,6 +322,41 @@ impl ReplicationQueues {
             distance,
             sources,
         });
+        true
+    }
+
+    /// Atomically promote a key from `pending_verify` to `fetch_queue`.
+    ///
+    /// Checks `fetch_queue` capacity FIRST, then removes the pending entry
+    /// and enqueues the fetch candidate. If `fetch_queue` is full, the
+    /// pending entry is **left in place** so the next verification cycle
+    /// can retry — preventing the silent-drop regression where a verified
+    /// key removed from `pending_verify` could be dropped by a full fetch
+    /// queue and lost from every stage.
+    ///
+    /// Returns `true` on successful promotion, `false` when the fetch queue
+    /// is at capacity (pending entry preserved).
+    pub fn promote_pending_to_fetch(
+        &mut self,
+        key: XorName,
+        distance: XorName,
+        sources: Vec<PeerId>,
+    ) -> bool {
+        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
+            debug!(
+                "fetch_queue at capacity ({MAX_FETCH_QUEUE}); leaving {} pending \
+                 for retry next cycle",
+                hex::encode(key)
+            );
+            return false;
+        }
+        // Capacity confirmed; safe to release the pending slot and enqueue.
+        let _ = self.remove_pending(&key);
+        // enqueue_fetch returns false only on capacity or already-queued; the
+        // capacity check above and the just-removed pending state make this
+        // succeed. If a concurrent path put the key into fetch_queue/in_flight
+        // between, dropping the duplicate is fine.
+        self.enqueue_fetch(key, distance, sources)
     }
 
     /// Dequeue the nearest fetch candidate.
@@ -449,7 +522,7 @@ mod tests {
     fn add_pending_verify_new_key_succeeds() {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
-        assert!(queues.add_pending_verify(key, test_entry(1)));
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
         assert_eq!(queues.pending_count(), 1);
     }
 
@@ -457,8 +530,8 @@ mod tests {
     fn add_pending_verify_duplicate_rejected() {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
-        assert!(queues.add_pending_verify(key, test_entry(1)));
-        assert!(!queues.add_pending_verify(key, test_entry(2)));
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+        assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
         assert_eq!(queues.pending_count(), 1);
     }
 
@@ -470,7 +543,7 @@ mod tests {
         queues.enqueue_fetch(key, distance, vec![peer_id_from_byte(1)]);
 
         assert!(
-            !queues.add_pending_verify(key, test_entry(1)),
+            !queues.add_pending_verify(key, test_entry(1)).admitted(),
             "should reject key already in fetch queue"
         );
     }
@@ -483,7 +556,7 @@ mod tests {
         queues.start_fetch(key, source, vec![source]);
 
         assert!(
-            !queues.add_pending_verify(key, test_entry(1)),
+            !queues.add_pending_verify(key, test_entry(1)).admitted(),
             "should reject key already in-flight"
         );
     }
@@ -638,20 +711,32 @@ mod tests {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
 
-        // Create entry with a backdated timestamp. Use a small subtraction
-        // to avoid `checked_sub` returning `None` on freshly-booted CI runners.
+        // Go through the public `add_pending_verify` so the per-sender
+        // counter is correctly bumped — the entry's `hint_sender` slot must
+        // be released by `evict_stale` and we want to exercise that path.
         let mut entry = test_entry(1);
+        let sender = entry.hint_sender;
+        // Backdate via the same defensive checked_sub used elsewhere so
+        // freshly-booted CI clocks don't trip us up.
         entry.created_at = Instant::now()
             .checked_sub(Duration::from_secs(2))
             .unwrap_or_else(Instant::now);
-        queues.pending_verify.insert(key, entry);
+        assert!(queues.add_pending_verify(key, entry).admitted());
 
         assert_eq!(queues.pending_count(), 1);
+        assert_eq!(queues.pending_count_for_sender(&sender), 1);
+
         queues.evict_stale(Duration::from_secs(1));
         assert_eq!(
             queues.pending_count(),
             0,
             "entry older than max_age should be evicted"
+        );
+        // Per-sender counter must be released alongside the map removal.
+        assert_eq!(
+            queues.pending_count_for_sender(&sender),
+            0,
+            "evict_stale must release the per-sender slot"
         );
     }
 
@@ -703,7 +788,7 @@ mod tests {
 
         // Step 1: Add to PendingVerify.
         assert!(
-            queues.add_pending_verify(key, test_entry(1)),
+            queues.add_pending_verify(key, test_entry(1)).admitted(),
             "first add to PendingVerify should succeed"
         );
         assert!(
@@ -726,7 +811,7 @@ mod tests {
 
         // Step 4: Attempt to re-add to PendingVerify -> should fail.
         assert!(
-            !queues.add_pending_verify(key, test_entry(4)),
+            !queues.add_pending_verify(key, test_entry(4)).admitted(),
             "key in FetchQueue should be rejected from PendingVerify"
         );
 
@@ -740,7 +825,7 @@ mod tests {
 
         // Step 6: Attempt to add to PendingVerify while in-flight -> reject.
         assert!(
-            !queues.add_pending_verify(key, test_entry(5)),
+            !queues.add_pending_verify(key, test_entry(5)).admitted(),
             "key in-flight should be rejected from PendingVerify"
         );
 
@@ -773,7 +858,7 @@ mod tests {
             hint_sender: peer_id_from_byte(1),
         };
 
-        assert!(queues.add_pending_verify(key, entry));
+        assert!(queues.add_pending_verify(key, entry).admitted());
 
         let pending = queues.get_pending(&key).expect("should be pending");
         assert_eq!(
@@ -793,7 +878,7 @@ mod tests {
         };
 
         assert!(
-            !queues.add_pending_verify(key, paid_entry),
+            !queues.add_pending_verify(key, paid_entry).admitted(),
             "duplicate key should be rejected regardless of pipeline"
         );
 
@@ -832,7 +917,7 @@ mod tests {
             hint_sender,
         };
         assert!(
-            queues.add_pending_verify(key, entry),
+            queues.add_pending_verify(key, entry).admitted(),
             "new key should be admitted to PendingVerify"
         );
         assert!(queues.contains_key(&key));

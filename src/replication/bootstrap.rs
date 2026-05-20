@@ -122,12 +122,52 @@ pub async fn check_bootstrap_drained(
         return false;
     }
 
+    // Hints capacity-rejected at the pending_verify bounds during bootstrap
+    // must be re-delivered by the source before drain can be claimed;
+    // otherwise we'd silently mark ourselves complete with outstanding work
+    // the source still owes us (codex round-2 BLOCKER).
+    if state.capacity_rejected_outstanding > 0 {
+        debug!(
+            "Bootstrap NOT drained: {} hints capacity-rejected and awaiting re-admission",
+            state.capacity_rejected_outstanding
+        );
+        return false;
+    }
+
     if queues.is_bootstrap_work_empty(&state.pending_keys) {
         state.drained = true;
         info!("Bootstrap drained: all peer requests completed and work queues empty");
         true
     } else {
         false
+    }
+}
+
+/// Record `n` capacity-rejected bootstrap hints.
+///
+/// Hints rejected at the `pending_verify` capacity bounds during bootstrap.
+/// Bootstrap cannot drain while this counter is non-zero; the source's next
+/// periodic hint will replay them once the pending queue has space.
+pub async fn note_capacity_rejected(bootstrap_state: &Arc<RwLock<BootstrapState>>, n: usize) {
+    let mut state = bootstrap_state.write().await;
+    state.capacity_rejected_outstanding = state.capacity_rejected_outstanding.saturating_add(n);
+    debug!(
+        "Bootstrap: +{n} capacity-rejected hints (now {})",
+        state.capacity_rejected_outstanding
+    );
+}
+
+/// Clear the capacity-rejected counter. Called by an admission cycle that
+/// observed zero rejections (the source successfully re-delivered all
+/// previously-overflowed hints).
+pub async fn clear_capacity_rejected(bootstrap_state: &Arc<RwLock<BootstrapState>>) {
+    let mut state = bootstrap_state.write().await;
+    if state.capacity_rejected_outstanding > 0 {
+        debug!(
+            "Bootstrap: clearing {} previously-outstanding capacity-rejected hints",
+            state.capacity_rejected_outstanding
+        );
+        state.capacity_rejected_outstanding = 0;
     }
 }
 
@@ -193,6 +233,7 @@ mod tests {
             drained: true,
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
+            capacity_rejected_outstanding: 0,
         }));
         let queues = ReplicationQueues::new();
 
@@ -208,6 +249,7 @@ mod tests {
             drained: false,
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
+            capacity_rejected_outstanding: 0,
         }));
         let queues = ReplicationQueues::new();
 
@@ -223,6 +265,7 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
+            capacity_rejected_outstanding: 0,
         }));
         let queues = ReplicationQueues::new();
 
@@ -237,6 +280,7 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
+            capacity_rejected_outstanding: 0,
         }));
         let mut queues = ReplicationQueues::new();
 

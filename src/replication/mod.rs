@@ -852,7 +852,7 @@ impl ReplicationEngine {
                     if let Some(resp) = response {
                         if !resp.bootstrapping {
                             // Admit hints into verification pipeline.
-                            let admitted_keys = admit_and_queue_hints(
+                            let outcome = admit_and_queue_hints(
                                 &self_id,
                                 peer,
                                 &resp.replica_hints,
@@ -866,9 +866,26 @@ impl ReplicationEngine {
                             .await;
 
                             // Track discovered keys for drain detection.
-                            if !admitted_keys.is_empty() {
-                                bootstrap::track_discovered_keys(&bootstrap_state, &admitted_keys)
-                                    .await;
+                            if !outcome.discovered.is_empty() {
+                                bootstrap::track_discovered_keys(
+                                    &bootstrap_state,
+                                    &outcome.discovered,
+                                )
+                                .await;
+                            }
+
+                            // Record capacity rejections so the drain check
+                            // does NOT mark bootstrap complete while work
+                            // was silently dropped at the queue caps. The
+                            // source's next periodic hint will replay the
+                            // rejected keys once `pending_verify` has
+                            // drained.
+                            if outcome.capacity_rejected_count > 0 {
+                                bootstrap::note_capacity_rejected(
+                                    &bootstrap_state,
+                                    outcome.capacity_rejected_count,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -1300,7 +1317,7 @@ async fn handle_neighbor_sync_request(
     }
 
     // Admit inbound hints and queue for verification.
-    let admitted_keys = admit_and_queue_hints(
+    let outcome = admit_and_queue_hints(
         &self_id,
         source,
         &request.replica_hints,
@@ -1313,10 +1330,18 @@ async fn handle_neighbor_sync_request(
     )
     .await;
 
-    // Track discovered keys for bootstrap drain detection so that
-    // hints admitted via inbound sync requests are not missed.
-    if is_bootstrapping && !admitted_keys.is_empty() {
-        bootstrap::track_discovered_keys(bootstrap_state, &admitted_keys).await;
+    // Track discovered keys for bootstrap drain detection so that hints
+    // admitted via inbound sync requests are not missed. If any hints were
+    // capacity-rejected, mark the bootstrap "not yet drained" so the next
+    // sync from this source can re-admit them once queues free up.
+    if is_bootstrapping {
+        if !outcome.discovered.is_empty() {
+            bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
+        }
+        if outcome.capacity_rejected_count > 0 {
+            bootstrap::note_capacity_rejected(bootstrap_state, outcome.capacity_rejected_count)
+                .await;
+        }
     }
 
     Ok(())
@@ -1717,7 +1742,7 @@ async fn handle_sync_response(
             let mut state = sync_state.write().await;
             state.clear_active_bootstrap_claim(peer);
         }
-        let admitted_keys = admit_and_queue_hints(
+        let outcome = admit_and_queue_hints(
             self_id,
             peer,
             &resp.replica_hints,
@@ -1730,10 +1755,18 @@ async fn handle_sync_response(
         )
         .await;
 
-        // Track discovered keys for bootstrap drain detection so that
-        // hints admitted via regular neighbor sync are not missed.
-        if bootstrapping && !admitted_keys.is_empty() {
-            bootstrap::track_discovered_keys(bootstrap_state, &admitted_keys).await;
+        // Track discovered keys for bootstrap drain detection so that hints
+        // admitted via regular neighbor sync are not missed. Capacity-
+        // rejected keys keep bootstrap "not yet drained" until the next
+        // sync replays them post-drain.
+        if bootstrapping {
+            if !outcome.discovered.is_empty() {
+                bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
+            }
+            if outcome.capacity_rejected_count > 0 {
+                bootstrap::note_capacity_rejected(bootstrap_state, outcome.capacity_rejected_count)
+                    .await;
+            }
         }
     }
 }
@@ -1742,6 +1775,19 @@ async fn handle_sync_response(
 ///
 /// Shared by neighbor-sync request handling, response handling, and bootstrap
 /// sync so that admission + queueing logic lives in one place.
+#[allow(clippy::too_many_arguments)]
+/// Outcome of [`admit_and_queue_hints`].
+///
+/// `capacity_rejected_count` is non-zero when one or more legitimately
+/// admissible hints were dropped because `pending_verify`'s global or
+/// per-source bound was hit. Callers that care about completeness
+/// (bootstrap drain accounting) MUST NOT treat their work as complete while
+/// this is > 0 — the source will need to re-hint after capacity frees up.
+struct AdmissionOutcome {
+    discovered: HashSet<XorName>,
+    capacity_rejected_count: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn admit_and_queue_hints(
     self_id: &PeerId,
@@ -1753,7 +1799,7 @@ async fn admit_and_queue_hints(
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
-) -> HashSet<XorName> {
+) -> AdmissionOutcome {
     let pending_keys: HashSet<XorName> = {
         let q = queues.read().await;
         q.pending_keys().into_iter().collect()
@@ -1772,12 +1818,13 @@ async fn admit_and_queue_hints(
     .await;
 
     let mut discovered = HashSet::new();
+    let mut capacity_rejected_count: usize = 0;
     let mut q = queues.write().await;
     let now = Instant::now();
 
     for key in admitted.replica_keys {
         if !storage.exists(&key).unwrap_or(false) {
-            let added = q.add_pending_verify(
+            let result = q.add_pending_verify(
                 key,
                 VerificationEntry {
                     state: VerificationState::PendingVerify,
@@ -1788,14 +1835,20 @@ async fn admit_and_queue_hints(
                     hint_sender: *source_peer,
                 },
             );
-            if added {
-                discovered.insert(key);
+            match result {
+                crate::replication::scheduling::AdmissionResult::Admitted => {
+                    discovered.insert(key);
+                }
+                crate::replication::scheduling::AdmissionResult::AlreadyPresent => {}
+                crate::replication::scheduling::AdmissionResult::CapacityRejected => {
+                    capacity_rejected_count += 1;
+                }
             }
         }
     }
 
     for key in admitted.paid_only_keys {
-        let added = q.add_pending_verify(
+        let result = q.add_pending_verify(
             key,
             VerificationEntry {
                 state: VerificationState::PendingVerify,
@@ -1806,12 +1859,28 @@ async fn admit_and_queue_hints(
                 hint_sender: *source_peer,
             },
         );
-        if added {
-            discovered.insert(key);
+        match result {
+            crate::replication::scheduling::AdmissionResult::Admitted => {
+                discovered.insert(key);
+            }
+            crate::replication::scheduling::AdmissionResult::AlreadyPresent => {}
+            crate::replication::scheduling::AdmissionResult::CapacityRejected => {
+                capacity_rejected_count += 1;
+            }
         }
     }
 
-    discovered
+    if capacity_rejected_count > 0 {
+        debug!(
+            "admit_and_queue_hints from {source_peer}: {capacity_rejected_count} hints \
+             rejected at queue capacity; source will need to re-hint after pending_verify drains"
+        );
+    }
+
+    AdmissionOutcome {
+        discovered,
+        capacity_rejected_count,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1938,8 +2007,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             let sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
-            q.remove_pending(&key);
             if sources.is_empty() {
+                // Terminal failure: remove pending and report. No fetch path.
+                q.remove_pending(&key);
                 warn!(
                     "Locally paid key {} has no responding holders (possible data loss)",
                     hex::encode(key)
@@ -1947,7 +2017,10 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 terminal_keys.push(key);
             } else {
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
-                q.enqueue_fetch(key, distance, sources);
+                // Atomic remove+enqueue: if fetch_queue is at capacity, the
+                // pending entry is preserved and retried next cycle (no
+                // silent drop of verified replica-repair work).
+                let _ = q.promote_pending_to_fetch(key, distance, sources);
             }
         }
     }
@@ -2026,9 +2099,12 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     if fetch_eligible && !sources.is_empty() {
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
-                        q.remove_pending(&key);
-                        q.enqueue_fetch(key, distance, sources);
-                        // Not terminal — key moved to fetch queue.
+                        // Atomic remove+enqueue: on fetch_queue capacity miss
+                        // the pending entry is preserved so this verified key
+                        // is retried on the next cycle (no silent drop).
+                        let _ = q.promote_pending_to_fetch(key, distance, sources);
+                        // Not terminal — either moved to fetch queue, or
+                        // retained as pending until queue drains.
                     } else if fetch_eligible && sources.is_empty() {
                         warn!(
                             "Verified responsible key {} has no holders (possible data loss)",

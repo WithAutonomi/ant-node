@@ -371,6 +371,16 @@ pub struct BootstrapState {
     /// Keys discovered during bootstrap that are still in the verification /
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
+    /// Hints that were silently dropped at the `pending_verify` capacity
+    /// bounds during bootstrap, awaiting re-admission once queues drain.
+    /// While this is non-zero `check_bootstrap_drained` refuses to mark the
+    /// node fully drained: the source has not yet successfully delivered
+    /// every key, even though the explicitly-admitted ones may have
+    /// completed. Decremented when the next admission cycle sees that
+    /// `pending_verify` has space again (logically the source can now
+    /// re-deliver) — or, conservatively, when explicit drain replay logic
+    /// observes "no rejections this cycle".
+    pub capacity_rejected_outstanding: usize,
 }
 
 impl BootstrapState {
@@ -381,6 +391,7 @@ impl BootstrapState {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
+            capacity_rejected_outstanding: 0,
         }
     }
 

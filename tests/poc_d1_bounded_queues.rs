@@ -145,7 +145,10 @@ fn poc_d1_flooding_peer_cannot_starve_honest_peer() {
     let attacker_flood: u32 = (MAX_PENDING_VERIFY_PER_PEER as u32).saturating_add(10_000);
     let mut attacker_admitted = 0usize;
     for i in 0..attacker_flood {
-        if queues.add_pending_verify(unique_xorname(i), entry_from(attacker)) {
+        if queues
+            .add_pending_verify(unique_xorname(i), entry_from(attacker))
+            .admitted()
+        {
             attacker_admitted += 1;
         }
     }
@@ -173,7 +176,10 @@ fn poc_d1_flooding_peer_cannot_starve_honest_peer() {
     let mut honest_admitted = 0usize;
     for j in 0..2_000u32 {
         let key = unique_xorname(10_000_000 + j);
-        if queues.add_pending_verify(key, entry_from(honest)) {
+        if queues
+            .add_pending_verify(key, entry_from(honest))
+            .admitted()
+        {
             honest_admitted += 1;
         }
     }
@@ -192,7 +198,9 @@ fn poc_d1_per_sender_counter_is_consistent() {
     let peer = peer_id_from_byte(0xCC);
 
     for i in 0..100u32 {
-        assert!(queues.add_pending_verify(unique_xorname(i), entry_from(peer)));
+        assert!(queues
+            .add_pending_verify(unique_xorname(i), entry_from(peer))
+            .admitted());
     }
     assert_eq!(queues.pending_count_for_sender(&peer), 100);
 
@@ -217,7 +225,9 @@ fn poc_d1_per_sender_counter_is_consistent() {
     );
 
     // Quota fully reusable after release.
-    assert!(queues.add_pending_verify(unique_xorname(999), entry_from(peer)));
+    assert!(queues
+        .add_pending_verify(unique_xorname(999), entry_from(peer))
+        .admitted());
     assert_eq!(queues.pending_count_for_sender(&peer), 1);
 }
 
@@ -229,7 +239,9 @@ fn poc_d1_bound_preserves_legitimate_entries() {
 
     for i in 0..1_000u32 {
         assert!(
-            queues.add_pending_verify(unique_xorname(i), entry_from(peer)),
+            queues
+                .add_pending_verify(unique_xorname(i), entry_from(peer))
+                .admitted(),
             "legitimate entries well under both caps are always admitted"
         );
     }
@@ -237,7 +249,9 @@ fn poc_d1_bound_preserves_legitimate_entries() {
 
     // Cross-queue dedup still holds (existing key not re-admitted, no
     // double-count of the per-source quota).
-    assert!(!queues.add_pending_verify(unique_xorname(0), entry_from(peer)));
+    assert!(!queues
+        .add_pending_verify(unique_xorname(0), entry_from(peer))
+        .admitted());
     assert_eq!(
         queues.pending_count(),
         1_000,
@@ -261,7 +275,7 @@ fn poc_d1_set_pending_state_keeps_counter_consistent() {
     let peer = peer_id_from_byte(0xEE);
     let key = unique_xorname(1);
 
-    assert!(queues.add_pending_verify(key, entry_from(peer)));
+    assert!(queues.add_pending_verify(key, entry_from(peer)).admitted());
     assert_eq!(queues.pending_count_for_sender(&peer), 1);
 
     // Exactly what run_verification_cycle does: advance the FSM state.
