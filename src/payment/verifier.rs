@@ -10,6 +10,7 @@ use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
+use crate::payment::single_node::SingleNodePayment;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
@@ -51,25 +52,6 @@ const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 /// future direction; past-dated quotes are governed by `QUOTE_MAX_AGE_SECS`.
 const QUOTE_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 
-/// Single-node price-floor tolerance divisor (finding F2/F5).
-///
-/// `verify_evm_payment` requires every candidate quote (each quote that pays
-/// this node) to satisfy `Q.price >= local_price / PRICE_FLOOR_TOLERANCE_DIVISOR`,
-/// where `local_price = calculate_price(records_stored)` is what this node
-/// would itself quote right now. There is no median selection — the floor is
-/// enforced per-candidate before the on-chain check.
-///
-/// Why a divisor rather than exact equality: close-group peers legitimately
-/// differ in `records_stored` (and therefore price), and a quote can be up
-/// to `QUOTE_MAX_AGE_SECS` old (price grows monotonically with this node's
-/// stored count, so our own floor only rises after a quote was issued). A
-/// divisor of 4 tolerates a 4× legitimate spread between this node's current
-/// price and an honest candidate — far more than real close-group variance —
-/// while still rejecting the F2/F5 underpricing attack, where the attacker's
-/// self-signed quotes are priced at 1 atto / baseline, i.e. many orders of
-/// magnitude below `local_price` on any non-empty node.
-const PRICE_FLOOR_TOLERANCE_DIVISOR: u64 = 4;
-
 /// Configuration for EVM payment verification.
 ///
 /// EVM verification is always on. All new data requires on-chain
@@ -88,37 +70,6 @@ impl Default for EvmVerifierConfig {
     }
 }
 
-/// A live provider of this node's own minimum acceptable per-record price.
-///
-/// In atto (wei). Wraps `calculate_price(records_stored)` so the verifier can
-/// reject single-node proofs whose attacker-chosen quote prices are far below
-/// what this node would itself charge a client right now (finding F2/F5).
-/// Enforcement is per-candidate, not median-based.
-/// Cloneable (shares one `Arc`) and `Debug` so it can live in
-/// [`PaymentVerifierConfig`].
-#[derive(Clone)]
-pub struct PriceFloorProvider(Arc<dyn Fn() -> Amount + Send + Sync>);
-
-impl PriceFloorProvider {
-    /// Build a provider from any closure returning the current floor price.
-    #[must_use]
-    pub fn new(f: Arc<dyn Fn() -> Amount + Send + Sync>) -> Self {
-        Self(f)
-    }
-
-    /// The current minimum acceptable per-record price.
-    #[must_use]
-    pub fn current(&self) -> Amount {
-        (self.0)()
-    }
-}
-
-impl std::fmt::Debug for PriceFloorProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "PriceFloorProvider(current={})", self.current())
-    }
-}
-
 /// Configuration for the payment verifier.
 ///
 /// All new data requires EVM payment on Arbitrum. The cache stores
@@ -132,19 +83,6 @@ pub struct PaymentVerifierConfig {
     /// Local node's rewards address.
     /// The verifier rejects payments that don't include this node as a recipient.
     pub local_rewards_address: RewardsAddress,
-    /// Live source of this node's own minimum acceptable per-record price.
-    ///
-    /// `Some` in production (wired to the node's quoting metrics): the
-    /// single-node payment path rejects proofs in which no candidate quote
-    /// that pays this node meets this floor (minus a bounded tolerance),
-    /// defeating the F2/F5 free-storage attack where an attacker submits
-    /// self-signed 1-atto / baseline quotes.
-    ///
-    /// `None` only in unit tests / devnet harnesses that pre-populate the
-    /// verified cache and never exercise on-chain single-node verification;
-    /// when `None`, a loud warning is emitted if the single-node path is ever
-    /// reached, since a production node MUST configure a floor.
-    pub price_floor: Option<PriceFloorProvider>,
 }
 
 /// Status returned by payment verification.
@@ -506,17 +444,8 @@ impl PaymentVerifier {
     /// 4. Peer ID bindings match the ML-DSA-65 public keys
     /// 5. This node is among the quoted recipients
     /// 6. All ML-DSA-65 signatures are valid (offloaded to `spawn_blocking`)
-    /// 7. Per-candidate F2/F5 binding: there exists a quote `Q` where ALL of
-    ///    the following hold on the SAME `Q` — (a) `Q.rewards_address` is
-    ///    THIS node's `local_rewards_address`, (b) `Q.price` is at or above
-    ///    this node's live price floor (`calculate_price(records_stored)` /
-    ///    `PRICE_FLOOR_TOLERANCE_DIVISOR`), (c) on-chain
-    ///    `completedPayments(Q.hash).amount >= 3 * Q.price`, AND (d) on-chain
-    ///    `completedPayments(Q.hash).rewardsAddress` (the 16-byte
-    ///    truncation the contract actually stores) matches this node's
-    ///    address. There is NO median selection — the floor and recipient
-    ///    binding are enforced per-candidate so neither the underpricing
-    ///    primitive nor the pay-yourself primitive survives.
+    /// 7. The median-priced quote was paid at least 3x its price on-chain
+    ///    (looked up via `completedPayments(quoteHash)` on the payment vault)
     ///
     /// For unit tests that don't need on-chain verification, pre-populate
     /// the cache so `verify_payment` returns `CachedAsVerified` before
@@ -549,160 +478,36 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        // F2/F5 DEFENCE — the core of the single-node trust decision.
-        //
-        // The single-node path has no DHT/identity binding (unlike merkle).
-        // Two attacker primitives must be closed here, and neither is closed
-        // by the upstream `SingleNodePayment::verify` "any quote tied at the
-        // median price was paid 3x" rule:
-        //
-        //  * pay-yourself: `validate_local_recipient` only checks our address
-        //    appears in *some* quote (`.any()`). An attacker includes one
-        //    quote with our address (to pass that check) but routes the
-        //    actual on-chain 3x payment to a quote whose `rewards_address` is
-        //    the attacker's OWN wallet. The store is then "paid" but we earn
-        //    nothing — free storage.
-        //  * underpricing: the attacker sets the priced-and-paid quote to a
-        //    nominal value far below what this node would legitimately quote,
-        //    so the 3x on-chain amount is negligible.
-        //
-        // Sound invariant enforced below: accept ONLY if there exists a quote
-        // `Q` in the proof such that ALL of the following hold on the SAME Q:
-        //   (a) `Q.rewards_address == this node's local_rewards_address`
-        //       (the proof attributes payment to *us*, not the attacker),
-        //   (b) `Q.price >= price_floor` (a fair price for *this* node),
-        //   (c) on-chain `completedPayments(Q.hash).amount >= 3 * Q.price`,
-        //   (d) on-chain `completedPayments(Q.hash).rewardsAddress` (a 16-byte
-        //       truncation the contract stores; see the `local_first16`
-        //       derivation below) matches this node's address — i.e. the ANT
-        //       was actually sent to us on-chain, not redirected to the
-        //       attacker's own wallet by `payForQuotes`.
-        //
-        // (a)+(b) gate the candidate set; (c)+(d) check the trusted on-chain
-        // record for the same Q. Decoy/tied-price tricks and self-payment
-        // are both defeated because the same quote that meets the pre-RPC
-        // gate is also the quote whose on-chain payment we verify.
-
-        // `map_or_else` would force the side-effecting `warn!` into a closure
-        // and hurt readability; the explicit branch is clearer here.
-        #[allow(clippy::option_if_let_else)]
-        let min_acceptable = if let Some(floor) = &self.config.price_floor {
-            // Bounded tolerance for legitimate close-group price spread and
-            // quote age (prices only grow with our own stored count, so our
-            // floor only rises after a quote was issued).
-            floor.current() / Amount::from(PRICE_FLOOR_TOLERANCE_DIVISOR)
-        } else {
-            // A production node MUST configure a price floor. Without one the
-            // underpricing leg (b) is not bounded — surface loudly. The
-            // recipient bindings (a) + (d) and the 3x amount check (c) still
-            // apply, so this is not silently
-            // exploitable, but it is not a supported prod configuration.
-            crate::logging::warn!(
-                "PaymentVerifier has no price_floor configured; single-node \
-                 underpricing defence (F2/F5) is DISABLED. Expected only in \
-                 unit/devnet harnesses, never in production."
-            );
-            Amount::from(1u64) // still reject zero-priced quotes
-        };
-
-        let local_addr = self.config.local_rewards_address;
-
-        // Candidate quotes that pay THIS node a fair price. Only these are
-        // eligible to satisfy the payment — a quote paying the attacker can
-        // never authorise storage on us, regardless of what was paid on-chain.
-        let mut paying_candidates: Vec<&evmlib::PaymentQuote> = payment
+        // Reconstruct the SingleNodePayment to identify the median quote.
+        // from_quotes() sorts by price and marks the median for 3x payment.
+        let quotes_with_prices: Vec<_> = payment
             .peer_quotes
             .iter()
-            .map(|(_, quote)| quote)
-            .filter(|q| q.rewards_address == local_addr && q.price >= min_acceptable)
+            .map(|(_, quote)| (quote.clone(), quote.price))
             .collect();
+        let single_payment = SingleNodePayment::from_quotes(quotes_with_prices).map_err(|e| {
+            Error::Payment(format!(
+                "Failed to reconstruct payment for verification: {e}"
+            ))
+        })?;
 
-        if paying_candidates.is_empty() {
+        // Verify the median quote was paid at least 3x its price on-chain
+        // via completedPayments(quoteHash) on the payment vault contract.
+        let verified_amount = single_payment
+            .verify(&self.config.evm.network)
+            .await
+            .map_err(|e| {
+                let xorname_hex = hex::encode(xorname);
+                Error::Payment(format!(
+                    "Median quote payment verification failed for {xorname_hex}: {e}"
+                ))
+            })?;
+
+        if crate::logging::enabled!(crate::logging::Level::INFO) {
             let xorname_hex = hex::encode(xorname);
-            return Err(Error::Payment(format!(
-                "No quote in the single-node proof both pays this node \
-                 (rewards_address match) and meets the price floor \
-                 ({min_acceptable} atto) for {xorname_hex}; rejecting \
-                 suspected self-paid/underpriced proof (F2/F5)"
-            )));
+            info!("EVM payment verified for {xorname_hex} (median paid {verified_amount} atto)");
         }
-
-        // Prefer the cheapest qualifying quote so a legitimately-paid proof
-        // is found with the fewest RPC calls; all candidates already satisfy
-        // (a) and (b), so a candidate that ALSO satisfies (c) and (d)
-        // on-chain is a sound accept.
-        paying_candidates.sort_by_key(|q| q.price);
-
-        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
-        let vault_address = *self.config.evm.network.payment_vault_address();
-        let contract =
-            evmlib::contract::payment_vault::interface::IPaymentVault::new(vault_address, provider);
-
-        // The on-chain recipient the contract actually paid, truncated to 16
-        // bytes exactly as `PaymentVaultV2.getFirst16Bytes` does:
-        //   bytes16(uint128(uint160(addr) >> 32))
-        // i.e. the high 16 bytes of the 20-byte address. THIS is the trust
-        // anchor. `payForQuotes` lets an unauthenticated caller set
-        // {quoteHash, rewardsAddress, amount} independently and sends the ANT
-        // to the caller-chosen `rewardsAddress`; it stores that recipient in
-        // `completedPayments[quoteHash].rewardsAddress`. So an attacker can
-        // register a record for a victim-addressed quote's hash while paying
-        // their OWN wallet. Checking the quote's `rewards_address` (attacker
-        // data) is therefore insufficient — we MUST check the on-chain
-        // record's `rewardsAddress` equals this node's address. Without this,
-        // the pay-yourself free-storage primitive (F2/F5) stays open.
-        // The contract stores only `bytes16` of the recipient, so this
-        // binding has 128-bit (not 160-bit) preimage resistance. That is
-        // still cryptographically infeasible to forge: an EVM address is
-        // `keccak256(pubkey)[12..]`, not an attacker-structured
-        // `high16 ++ low4`, so producing a keypair whose address shares a
-        // chosen 128-bit prefix is ~2^128 work, not 2^32. (Documented so this
-        // is not re-derived as a concern in future reviews.)
-        let local_first16: [u8; 16] = {
-            let bytes = local_addr.into_array(); // 20-byte address, big-endian
-            let mut first16 = [0u8; 16];
-            first16.copy_from_slice(&bytes[..16]);
-            first16
-        };
-
-        let mut last_seen: Option<(Amount, Vec<u8>)> = None;
-        for quote in &paying_candidates {
-            let expected = quote.price.saturating_mul(Amount::from(3u64));
-            let quote_hash = quote.hash();
-            let result = contract
-                .completedPayments(quote_hash)
-                .call()
-                .await
-                .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
-            let on_chain = Amount::from(result.amount);
-            let on_chain_recipient = result.rewardsAddress.0; // [u8; 16]
-            last_seen = Some((on_chain, on_chain_recipient.to_vec()));
-
-            // Both must hold on the SAME on-chain record: enough was paid AND
-            // it was paid to THIS node (not redirected to the attacker).
-            let paid_enough = on_chain >= expected;
-            let paid_to_us = on_chain_recipient == local_first16;
-            if paid_enough && paid_to_us {
-                if crate::logging::enabled!(crate::logging::Level::INFO) {
-                    let xorname_hex = hex::encode(xorname);
-                    info!(
-                        "EVM payment verified for {xorname_hex}: {on_chain} atto paid \
-                         on-chain (>= 3x {} atto) to this node's rewards address",
-                        quote.price
-                    );
-                }
-                return Ok(());
-            }
-        }
-
-        let xorname_hex = hex::encode(xorname);
-        Err(Error::Payment(format!(
-            "No quote paying this node at/above the price floor was paid >=3x \
-             on-chain TO THIS NODE's rewards address for {xorname_hex} (checked \
-             {} candidate(s); last on-chain (amount, recipient16) {last_seen:?}, \
-             expected recipient16 {local_first16:?}); rejecting (F2/F5)",
-            paying_candidates.len()
-        )))
+        Ok(())
     }
 
     /// Validate quote count, uniqueness, and basic structure.
@@ -1513,7 +1318,6 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
-            price_floor: None,
         };
         PaymentVerifier::new(config)
     }
@@ -2055,7 +1859,6 @@ mod tests {
             },
             cache_capacity: 100,
             local_rewards_address: local_addr,
-            price_floor: None,
         };
         let verifier = PaymentVerifier::new(config);
 
@@ -2605,7 +2408,6 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
-            price_floor: None,
         };
         let verifier = PaymentVerifier::new(config);
 

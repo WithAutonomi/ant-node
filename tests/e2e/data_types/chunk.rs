@@ -443,7 +443,6 @@ mod tests {
             evm: EvmVerifierConfig { network },
             cache_capacity: 100,
             local_rewards_address: rewards_address,
-            price_floor: None,
         });
         let metrics_tracker = QuotingMetricsTracker::new(100);
         let quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);

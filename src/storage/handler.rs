@@ -524,7 +524,6 @@ mod tests {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100_000,
             local_rewards_address: rewards_address,
-            price_floor: None,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(100);

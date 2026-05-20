@@ -381,49 +381,18 @@ impl NodeBuilder {
             }
         };
 
-        // Shared quoting metrics: the quote generator prices quotes from it,
-        // and the payment verifier reads the SAME live `records_stored` to
-        // enforce its price floor (F2/F5 defence).
-        //
-        // Hydrate `records_stored` from the LMDB row count on startup so the
-        // floor reflects this node's actual disk state immediately. Otherwise
-        // a restarted node would briefly accept proofs priced at baseline/4
-        // even though its real load (and therefore real quote price) is
-        // much higher — weakening the F2/F5 underpricing defence across
-        // restarts. `current_chunks` is a fast metadata read; on the rare
-        // case it fails we fall back to 0 and log (the recipient binding (d)
-        // still defeats pay-yourself unconditionally; this only affects the
-        // underpricing tolerance).
-        let initial_records = match storage.current_chunks() {
-            Ok(n) => usize::try_from(n).unwrap_or(usize::MAX),
-            Err(e) => {
-                warn!(
-                    "Failed to read stored-chunk count for price floor hydration: {e}; \
-                     starting at 0 (floor will rise as new PUTs land)"
-                );
-                0
-            }
-        };
-        let metrics_tracker = Arc::new(QuotingMetricsTracker::new(initial_records));
-
-        // Create payment verifier with a live price floor wired to the same
-        // metrics tracker, so an attacker cannot get this node to accept a
-        // self-signed, far-underpriced single-node proof.
+        // Create payment verifier
         let evm_network = config.payment.evm_network.clone().into_evm_network();
-        let floor_metrics = Arc::clone(&metrics_tracker);
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network,
             },
             cache_capacity: config.payment.cache_capacity,
             local_rewards_address: rewards_address,
-            price_floor: Some(crate::payment::PriceFloorProvider::new(Arc::new(
-                move || crate::payment::calculate_price(floor_metrics.records_stored()),
-            ))),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
-        let mut quote_generator =
-            QuoteGenerator::new(rewards_address, Arc::clone(&metrics_tracker));
+        let metrics_tracker = QuotingMetricsTracker::new(0);
+        let mut quote_generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
         // Wire ML-DSA-65 signing from node identity.
         // This same signer is used for both regular quotes and merkle candidate quotes.
