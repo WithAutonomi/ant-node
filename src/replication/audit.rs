@@ -15,7 +15,9 @@ use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
-use crate::replication::types::{AuditFailureReason, FailureEvidence, PeerSyncRecord};
+use crate::replication::types::{
+    AuditFailureReason, FailureEvidence, PeerSyncRecord, RepairProofs,
+};
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -67,6 +69,7 @@ pub async fn audit_tick(
     storage: &Arc<LmdbStorage>,
     config: &ReplicationConfig,
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
+    repair_proofs: &RepairProofs,
     is_bootstrapping: bool,
 ) -> AuditTickResult {
     // Invariant 19: never audit while still bootstrapping.
@@ -119,13 +122,17 @@ pub async fn audit_tick(
             .collect()
     };
 
-    // Step 4: Filter to keys where the chosen peer is in the close group.
+    // Step 4: Filter to keys where the chosen peer is in the close group and
+    // this node has proof that it already sent the peer a repair hint for the
+    // specific key.
     let mut peer_keys = Vec::new();
     for key in &sampled_keys {
         let closest = dht
             .find_closest_nodes_local_with_self(key, config.close_group_size)
             .await;
-        if closest.iter().any(|n| n.peer_id == challenged_peer) {
+        if closest.iter().any(|n| n.peer_id == challenged_peer)
+            && repair_proofs.has_replica_hint(&challenged_peer, key)
+        {
             peer_keys.push(*key);
         }
     }

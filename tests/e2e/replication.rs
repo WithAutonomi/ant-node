@@ -15,7 +15,7 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::pruning;
 use ant_node::replication::scheduling::ReplicationQueues;
-use ant_node::replication::types::NeighborSyncState;
+use ant_node::replication::types::{NeighborSyncState, RepairProofs};
 use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
@@ -128,6 +128,29 @@ async fn store_record_on_peers(
 ) {
     for peer in peers {
         store_record_on_peer(harness, peer, address, content).await;
+    }
+}
+
+async fn record_repair_proofs_for_peers(
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    peers: &[PeerId],
+    key: &[u8; 32],
+) {
+    let close_peers: Vec<PeerId> = p2p_node
+        .dht_manager()
+        .find_closest_nodes_local_with_self(key, config.close_group_size)
+        .await
+        .iter()
+        .map(|node| node.peer_id)
+        .collect();
+    let mut proofs = repair_proofs.write().await;
+    for peer in peers {
+        assert!(
+            proofs.record_replica_hint_sent(*peer, *key, &close_peers),
+            "test target should be in close group for repair-proof recording"
+        );
     }
 }
 
@@ -455,6 +478,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     let close_group_size = 2;
     let config = prune_test_config(close_group_size);
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
+    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -478,16 +502,25 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         .await
         .expect("put gate record on pruner");
     store_record_on_peers(&harness, &gate_targets, &gate_address, &gate_content).await;
-
-    let blocked = pruning::run_prune_pass(
-        &pruner_peer,
-        &pruner_storage,
-        &pruner_paid_list,
+    record_repair_proofs_for_peers(
+        &repair_proofs,
         &pruner_p2p,
         &config,
-        &sync_state,
-        false,
+        &gate_targets,
+        &gate_address,
     )
+    .await;
+
+    let blocked = pruning::run_prune_pass(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: false,
+    })
     .await;
     assert_eq!(blocked.records_pruned, 0);
     assert!(
@@ -495,15 +528,16 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         "record must not be pruned before remote audits are allowed"
     );
 
-    let confirmed = pruning::run_prune_pass(
-        &pruner_peer,
-        &pruner_storage,
-        &pruner_paid_list,
-        &pruner_p2p,
-        &config,
-        &sync_state,
-        true,
-    )
+    let confirmed = pruning::run_prune_pass(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+    })
     .await;
     assert_eq!(confirmed.records_pruned, 1);
     assert!(
@@ -526,16 +560,25 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         &missing_content,
     )
     .await;
-
-    let incomplete = pruning::run_prune_pass(
-        &pruner_peer,
-        &pruner_storage,
-        &pruner_paid_list,
+    record_repair_proofs_for_peers(
+        &repair_proofs,
         &pruner_p2p,
         &config,
-        &sync_state,
-        true,
+        &missing_targets,
+        &missing_address,
     )
+    .await;
+
+    let incomplete = pruning::run_prune_pass(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+    })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
     assert!(
@@ -551,15 +594,16 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     )
     .await;
 
-    let complete = pruning::run_prune_pass(
-        &pruner_peer,
-        &pruner_storage,
-        &pruner_paid_list,
-        &pruner_p2p,
-        &config,
-        &sync_state,
-        true,
-    )
+    let complete = pruning::run_prune_pass(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        allow_remote_prune_audits: true,
+    })
     .await;
     assert_eq!(complete.records_pruned, 1);
     assert!(

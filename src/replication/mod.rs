@@ -59,7 +59,7 @@ use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
-    NeighborSyncState, PeerSyncRecord, VerificationEntry, VerificationState,
+    NeighborSyncState, PeerSyncRecord, RepairProofs, VerificationEntry, VerificationState,
 };
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
@@ -129,6 +129,8 @@ pub struct ReplicationEngine {
     /// are lightweight (`PeerSyncRecord` is two fields) and peer IDs are
     /// naturally bounded by the routing table's k-bucket capacity.
     sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    /// Per-key repair proof tracking for audit eligibility.
+    repair_proofs: Arc<RwLock<RepairProofs>>,
     /// Bootstrap state tracking.
     bootstrap_state: Arc<RwLock<BootstrapState>>,
     /// Whether this node is currently bootstrapping.
@@ -187,6 +189,7 @@ impl ReplicationEngine {
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
+            repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
@@ -358,6 +361,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_history = Arc::clone(&self.sync_history);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
@@ -399,6 +403,7 @@ impl ReplicationEngine {
                                     &is_bootstrapping,
                                     &bootstrap_state,
                                     &sync_history,
+                                    &repair_proofs,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -443,6 +448,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let sync_state = Arc::clone(&self.sync_state);
         let sync_history = Arc::clone(&self.sync_history);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
@@ -470,6 +476,7 @@ impl ReplicationEngine {
                         &config,
                         &sync_state,
                         &sync_history,
+                        &repair_proofs,
                         &is_bootstrapping,
                         &bootstrap_state,
                     ) => {}
@@ -508,6 +515,7 @@ impl ReplicationEngine {
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
         let sync_history = Arc::clone(&self.sync_history);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
@@ -532,7 +540,9 @@ impl ReplicationEngine {
                 let bootstrapping = *is_bootstrapping.read().await;
                 let result = {
                     let history = sync_history.read().await;
-                    audit::audit_tick(&p2p, &storage, &config, &history, bootstrapping).await
+                    let proofs = repair_proofs.read().await.clone();
+                    audit::audit_tick(&p2p, &storage, &config, &history, &proofs, bootstrapping)
+                        .await
                 };
                 handle_audit_result(&result, &p2p, &sync_state, &config).await;
             }
@@ -546,11 +556,13 @@ impl ReplicationEngine {
                         let bootstrapping = *is_bootstrapping.read().await;
                         let result = {
                             let history = sync_history.read().await;
+                            let proofs = repair_proofs.read().await.clone();
                             audit::audit_tick(
                                 &p2p,
                                 &storage,
                                 &config,
                                 &history,
+                                &proofs,
                                 bootstrapping,
                             )
                             .await
@@ -790,6 +802,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -837,7 +850,7 @@ impl ReplicationEngine {
 
                     bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
 
-                    let response = neighbor_sync::sync_with_peer(
+                    let outcome = neighbor_sync::sync_with_peer(
                         peer,
                         &p2p,
                         &storage,
@@ -849,14 +862,22 @@ impl ReplicationEngine {
 
                     bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
 
-                    if let Some(resp) = response {
-                        if !resp.bootstrapping {
+                    if let Some(outcome) = outcome {
+                        if !outcome.response.bootstrapping {
+                            record_sent_replica_hints(
+                                peer,
+                                &outcome.sent_replica_hints,
+                                &repair_proofs,
+                                &p2p,
+                                &config,
+                            )
+                            .await;
                             // Admit hints into verification pipeline.
                             let outcome = admit_and_queue_hints(
                                 &self_id,
                                 peer,
-                                &resp.replica_hints,
-                                &resp.paid_hints,
+                                &outcome.response.replica_hints,
+                                &outcome.response.paid_hints,
                                 &p2p,
                                 &config,
                                 &storage,
@@ -924,6 +945,7 @@ async fn handle_replication_message(
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
@@ -968,6 +990,7 @@ async fn handle_replication_message(
                 bootstrapping,
                 bootstrap_state,
                 sync_history,
+                repair_proofs,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1263,6 +1286,7 @@ async fn handle_neighbor_sync_request(
     is_bootstrapping: bool,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1287,11 +1311,11 @@ async fn handle_neighbor_sync_request(
     .await;
 
     // Send response.
-    send_replication_response(
+    let response_sent = send_replication_response(
         source,
         p2p_node,
         request_id,
-        ReplicationMessageBody::NeighborSyncResponse(response),
+        ReplicationMessageBody::NeighborSyncResponse(response.clone()),
         rr_message_id,
     )
     .await;
@@ -1299,6 +1323,17 @@ async fn handle_neighbor_sync_request(
     // Process inbound hints only if sender is in LocalRT (Rule 4-6).
     if !sender_in_rt {
         return Ok(());
+    }
+
+    if response_sent && !request.bootstrapping {
+        record_sent_replica_hints(
+            source,
+            &response.replica_hints,
+            repair_proofs,
+            p2p_node,
+            config,
+        )
+        .await;
     }
 
     // Update sync history for this peer.
@@ -1484,13 +1519,13 @@ async fn send_replication_response(
     request_id: u64,
     body: ReplicationMessageBody,
     rr_message_id: Option<&str>,
-) {
+) -> bool {
     let msg = ReplicationMessage { request_id, body };
     let encoded = match msg.encode() {
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to encode replication response: {e}");
-            return;
+            return false;
         }
     };
     let result = if let Some(msg_id) = rr_message_id {
@@ -1504,6 +1539,42 @@ async fn send_replication_response(
     };
     if let Err(e) = result {
         debug!("Failed to send replication response to {peer}: {e}");
+        return false;
+    }
+    true
+}
+
+async fn record_sent_replica_hints(
+    peer: &PeerId,
+    keys: &[XorName],
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) {
+    if keys.is_empty() {
+        return;
+    }
+
+    let dht = p2p_node.dht_manager();
+    let mut records = Vec::with_capacity(keys.len());
+    for key in keys {
+        let close_peers: Vec<PeerId> = dht
+            .find_closest_nodes_local_with_self(key, config.close_group_size)
+            .await
+            .iter()
+            .map(|node| node.peer_id)
+            .collect();
+        records.push((*key, close_peers));
+    }
+
+    let mut proofs = repair_proofs.write().await;
+    for (key, close_peers) in records {
+        if proofs.record_replica_hint_sent(*peer, key, &close_peers) {
+            debug!(
+                "Recorded repair hint proof for peer {peer} and key {}",
+                hex::encode(key)
+            );
+        }
     }
 }
 
@@ -1521,6 +1592,7 @@ async fn run_neighbor_sync_round(
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
 ) {
@@ -1536,15 +1608,16 @@ async fn run_neighbor_sync_round(
         // Remote prune-confirmation audits are storage-proof audits and only
         // run after bootstrap has drained.
         let allow_remote_prune_audits = !bootstrapping && bootstrap_state.read().await.is_drained();
-        pruning::run_prune_pass(
-            &self_id,
+        pruning::run_prune_pass(pruning::PrunePassContext {
+            self_id: &self_id,
             storage,
             paid_list,
             p2p_node,
             config,
             sync_state,
+            repair_proofs,
             allow_remote_prune_audits,
-        )
+        })
         .await;
 
         // Increment `cycles_since_sync` for all peers.
@@ -1596,7 +1669,7 @@ async fn run_neighbor_sync_round(
 
     // Sync with each peer in the batch.
     for peer in &batch {
-        let response = neighbor_sync::sync_with_peer(
+        let outcome = neighbor_sync::sync_with_peer(
             peer,
             p2p_node,
             storage,
@@ -1606,11 +1679,12 @@ async fn run_neighbor_sync_round(
         )
         .await;
 
-        if let Some(resp) = response {
+        if let Some(outcome) = outcome {
             handle_sync_response(
                 &self_id,
                 peer,
-                &resp,
+                &outcome.response,
+                &outcome.sent_replica_hints,
                 p2p_node,
                 config,
                 bootstrapping,
@@ -1620,6 +1694,7 @@ async fn run_neighbor_sync_round(
                 queues,
                 sync_state,
                 sync_history,
+                repair_proofs,
             )
             .await;
         } else {
@@ -1631,7 +1706,7 @@ async fn run_neighbor_sync_round(
 
             // Attempt sync with the replacement peer (if one was found).
             if let Some(replacement_peer) = replacement {
-                let replacement_resp = neighbor_sync::sync_with_peer(
+                let replacement_outcome = neighbor_sync::sync_with_peer(
                     &replacement_peer,
                     p2p_node,
                     storage,
@@ -1641,11 +1716,12 @@ async fn run_neighbor_sync_round(
                 )
                 .await;
 
-                if let Some(resp) = replacement_resp {
+                if let Some(outcome) = replacement_outcome {
                     handle_sync_response(
                         &self_id,
                         &replacement_peer,
-                        &resp,
+                        &outcome.response,
+                        &outcome.sent_replica_hints,
                         p2p_node,
                         config,
                         bootstrapping,
@@ -1655,6 +1731,7 @@ async fn run_neighbor_sync_round(
                         queues,
                         sync_state,
                         sync_history,
+                        repair_proofs,
                     )
                     .await;
                 }
@@ -1670,6 +1747,7 @@ async fn handle_sync_response(
     self_id: &PeerId,
     peer: &PeerId,
     resp: &NeighborSyncResponse,
+    sent_replica_hints: &[XorName],
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     bootstrapping: bool,
@@ -1679,6 +1757,7 @@ async fn handle_sync_response(
     queues: &Arc<RwLock<ReplicationQueues>>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
 ) {
     // Record successful sync.
     {
@@ -1739,6 +1818,7 @@ async fn handle_sync_response(
             let mut state = sync_state.write().await;
             state.clear_active_bootstrap_claim(peer);
         }
+        record_sent_replica_hints(peer, sent_replica_hints, repair_proofs, p2p_node, config).await;
         let outcome = admit_and_queue_hints(
             self_id,
             peer,

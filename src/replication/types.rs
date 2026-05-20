@@ -248,6 +248,74 @@ impl PeerSyncRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Repair proof tracking
+// ---------------------------------------------------------------------------
+
+/// Evidence that this node has sent a replica repair hint for a key to a peer.
+///
+/// The map is keyed by record key so each key retains at most the currently
+/// relevant close-group peers. This bounds memory by local key count times the
+/// replication close-group size rather than by churn history.
+#[derive(Debug, Clone, Default)]
+pub struct RepairProofs {
+    /// Peers that have received a replica hint for each key.
+    peers_by_key: HashMap<XorName, HashSet<PeerId>>,
+}
+
+impl RepairProofs {
+    /// Create an empty repair-proof table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `peer` was sent a replica repair hint for `key`.
+    ///
+    /// `current_close_peers` must be the current self-inclusive close group for
+    /// `key`. Entries for peers outside that set are dropped before recording,
+    /// so each key stays bounded to the close group.
+    pub fn record_replica_hint_sent(
+        &mut self,
+        peer: PeerId,
+        key: XorName,
+        current_close_peers: &[PeerId],
+    ) -> bool {
+        let retained_peers: HashSet<PeerId> = current_close_peers.iter().copied().collect();
+        self.prune_key_to_peers(&key, &retained_peers);
+
+        if !retained_peers.contains(&peer) {
+            return false;
+        }
+
+        self.peers_by_key.entry(key).or_default().insert(peer)
+    }
+
+    /// Whether this node has repair-hint evidence for `(peer, key)`.
+    #[must_use]
+    pub fn has_replica_hint(&self, peer: &PeerId, key: &XorName) -> bool {
+        self.peers_by_key
+            .get(key)
+            .is_some_and(|peers| peers.contains(peer))
+    }
+
+    /// Remove all repair proofs for a key, e.g. after local deletion.
+    pub fn remove_key(&mut self, key: &XorName) {
+        self.peers_by_key.remove(key);
+    }
+
+    fn prune_key_to_peers(&mut self, key: &XorName, retained_peers: &HashSet<PeerId>) {
+        let should_remove = self.peers_by_key.get_mut(key).is_some_and(|peers| {
+            peers.retain(|peer| retained_peers.contains(peer));
+            peers.is_empty()
+        });
+
+        if should_remove {
+            self.peers_by_key.remove(key);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Neighbor sync cycle state
 // ---------------------------------------------------------------------------
 
@@ -580,6 +648,81 @@ mod tests {
         assert!(
             !record.has_repair_opportunity(),
             "never-synced peer has no repair opportunity regardless of cycle count"
+        );
+    }
+
+    // -- RepairProofs --------------------------------------------------------
+
+    #[test]
+    fn repair_proofs_record_sent_hint_for_close_peer() {
+        let key = [0xA1; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = vec![peer, peer_id_from_byte(2), peer_id_from_byte(3)];
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers));
+
+        assert!(
+            proofs.has_replica_hint(&peer, &key),
+            "sent hint should make key auditable for that peer"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_reject_peer_outside_current_close_group() {
+        let key = [0xA2; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = vec![peer_id_from_byte(2), peer_id_from_byte(3)];
+        let mut proofs = RepairProofs::new();
+
+        assert!(!proofs.record_replica_hint_sent(peer, key, &close_peers));
+
+        assert!(
+            !proofs.has_replica_hint(&peer, &key),
+            "peers outside current close group must not get repair proof"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_prune_key_to_latest_close_group() {
+        let key = [0xA3; 32];
+        let old_peer = peer_id_from_byte(1);
+        let new_peer = peer_id_from_byte(4);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(
+            old_peer,
+            key,
+            &[old_peer, peer_id_from_byte(2), peer_id_from_byte(3)],
+        ));
+        assert!(proofs.record_replica_hint_sent(
+            new_peer,
+            key,
+            &[new_peer, peer_id_from_byte(5), peer_id_from_byte(6)],
+        ));
+
+        assert!(
+            !proofs.has_replica_hint(&old_peer, &key),
+            "old close-group peer should be pruned from repair proofs"
+        );
+        assert!(
+            proofs.has_replica_hint(&new_peer, &key),
+            "new close-group peer should retain repair proof"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_remove_key_clears_all_peer_entries() {
+        let key = [0xA4; 32];
+        let peer = peer_id_from_byte(1);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &[peer]));
+        proofs.remove_key(&key);
+
+        assert!(
+            !proofs.has_replica_hint(&peer, &key),
+            "deleted local key should not retain repair proof entries"
         );
     }
 

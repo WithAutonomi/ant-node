@@ -20,6 +20,15 @@ use crate::replication::protocol::{
 use crate::replication::types::NeighborSyncState;
 use crate::storage::LmdbStorage;
 
+/// Result of an outbound neighbor-sync exchange.
+#[derive(Debug)]
+pub struct NeighborSyncOutcome {
+    /// The peer's sync response.
+    pub response: NeighborSyncResponse,
+    /// Replica hints sent to the peer in our request.
+    pub sent_replica_hints: Vec<XorName>,
+}
+
 /// Build replica hints for a specific peer.
 ///
 /// Returns keys that we believe the peer should hold (peer is among the
@@ -147,7 +156,7 @@ pub async fn sync_with_peer(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
-) -> Option<NeighborSyncResponse> {
+) -> Option<NeighborSyncOutcome> {
     // Build peer-targeted hint sets (Rule 7).
     let replica_hints =
         build_replica_hints_for_peer(peer, storage, p2p_node, config.close_group_size).await;
@@ -155,6 +164,7 @@ pub async fn sync_with_peer(
         build_paid_hints_for_peer(peer, paid_list, p2p_node, config.paid_list_close_group_size)
             .await;
 
+    let sent_replica_hints = replica_hints.clone();
     let request = NeighborSyncRequest {
         replica_hints,
         paid_hints,
@@ -193,7 +203,10 @@ pub async fn sync_with_peer(
     match ReplicationMessage::decode(&response.data) {
         Ok(decoded) => {
             if let ReplicationMessageBody::NeighborSyncResponse(resp) = decoded.body {
-                Some(resp)
+                Some(NeighborSyncOutcome {
+                    response: resp,
+                    sent_replica_hints,
+                })
             } else {
                 warn!("Unexpected response type from {peer} during sync");
                 None
