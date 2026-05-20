@@ -2,7 +2,7 @@
 //!
 //! Challenge-response for claimed holders. Anti-outsourcing protection.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::logging::{debug, info, warn};
@@ -159,7 +159,7 @@ pub async fn audit_tick_with_repair_proofs(
         let closest = dht
             .find_closest_nodes_local_with_self(key, config.close_group_size)
             .await;
-        let close_peers: Vec<PeerId> = closest.iter().map(|node| node.peer_id).collect();
+        let close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
         if close_peers.contains(&challenged_peer) {
             sampled_key_groups.push((*key, close_peers));
         }
@@ -346,7 +346,7 @@ fn eligible_audit_peers(sync_history: &HashMap<PeerId, PeerSyncRecord>) -> Vec<P
 
 fn mature_audit_keys_for_peer(
     challenged_peer: &PeerId,
-    sampled_key_groups: Vec<(XorName, Vec<PeerId>)>,
+    sampled_key_groups: Vec<(XorName, HashSet<PeerId>)>,
     repair_proofs: &mut RepairProofs,
     current_sync_epoch: u64,
 ) -> Vec<XorName> {
@@ -354,7 +354,12 @@ fn mature_audit_keys_for_peer(
         .into_iter()
         .filter_map(|(key, close_peers)| {
             repair_proofs
-                .has_mature_replica_hint(challenged_peer, &key, &close_peers, current_sync_epoch)
+                .has_mature_replica_hint_with_snapshot(
+                    challenged_peer,
+                    &key,
+                    &close_peers,
+                    current_sync_epoch,
+                )
                 .then_some(key)
         })
         .collect()
@@ -1214,23 +1219,23 @@ mod tests {
         let same_epoch_key = [SAME_EPOCH_KEY_BYTE; XOR_NAME_LEN];
         let missing_proof_key = [MISSING_PROOF_KEY_BYTE; XOR_NAME_LEN];
         let stale_snapshot_key = [STALE_SNAPSHOT_KEY_BYTE; XOR_NAME_LEN];
-        let close_group = vec![challenged_peer, other_peer];
-        let changed_close_group = vec![challenged_peer, new_peer];
+        let close_group = HashSet::from([challenged_peer, other_peer]);
+        let changed_close_group = HashSet::from([challenged_peer, new_peer]);
         let mut repair_proofs = RepairProofs::new();
 
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
             challenged_peer,
             mature_key,
             &close_group,
             HINT_EPOCH,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
             challenged_peer,
             same_epoch_key,
             &close_group,
             CURRENT_EPOCH,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_with_snapshot(
             challenged_peer,
             stale_snapshot_key,
             &close_group,

@@ -1584,7 +1584,12 @@ async fn record_sent_replica_hints(
     let hinted_at_epoch = *sync_cycle_epoch.read().await;
     let mut proofs = repair_proofs.write().await;
     for hint in hints {
-        if proofs.record_replica_hint_sent(*peer, hint.key, &hint.close_peers, hinted_at_epoch) {
+        if proofs.record_replica_hint_sent_with_snapshot(
+            *peer,
+            hint.key,
+            &hint.close_peers,
+            hinted_at_epoch,
+        ) {
             debug!(
                 "Recorded repair hint proof for peer {peer} and key {}",
                 hex::encode(hint.key)

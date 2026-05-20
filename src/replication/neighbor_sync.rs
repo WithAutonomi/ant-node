@@ -3,6 +3,7 @@
 //! Round-robin cycle management: snapshot close neighbors, iterate through
 //! them in batches of `NEIGHBOR_SYNC_PEER_COUNT`, exchanging hint sets.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -27,7 +28,7 @@ pub(crate) struct SentReplicaHint {
     /// Key included in the replica hint set.
     pub(crate) key: XorName,
     /// Self-inclusive close group observed during hint construction.
-    pub(crate) close_peers: Vec<PeerId>,
+    pub(crate) close_peers: HashSet<PeerId>,
 }
 
 /// Result of an outbound neighbor-sync exchange.
@@ -81,7 +82,7 @@ pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
         let closest = dht
             .find_closest_nodes_local_with_self(&key, close_group_size)
             .await;
-        let close_peers = closest.iter().map(|n| n.peer_id).collect::<Vec<_>>();
+        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
         if close_peers.contains(peer) {
             hints.push(SentReplicaHint { key, close_peers });
         }

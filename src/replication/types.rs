@@ -309,8 +309,28 @@ impl RepairProofs {
         hinted_at_epoch: u64,
     ) -> bool {
         let current_close_peers = close_peer_set(current_close_peers);
+        self.record_replica_hint_sent_with_snapshot(
+            peer,
+            key,
+            &current_close_peers,
+            hinted_at_epoch,
+        )
+    }
+
+    /// Record that `peer` was sent a replica repair hint for `key`, using a
+    /// precomputed self-inclusive close-group snapshot.
+    ///
+    /// This avoids rebuilding the same snapshot when one key is checked or
+    /// recorded for multiple peers in a hot path.
+    pub fn record_replica_hint_sent_with_snapshot(
+        &mut self,
+        peer: PeerId,
+        key: XorName,
+        current_close_peers: &HashSet<PeerId>,
+        hinted_at_epoch: u64,
+    ) -> bool {
         if !current_close_peers.contains(&peer) {
-            self.invalidate_key_if_close_group_changed(&key, &current_close_peers);
+            self.invalidate_key_if_close_group_changed(&key, current_close_peers);
             return false;
         }
 
@@ -318,8 +338,8 @@ impl RepairProofs {
             .proofs_by_key
             .entry(key)
             .or_insert_with(|| RepairProofEntry::new(current_close_peers.clone()));
-        if entry.close_peers != current_close_peers {
-            *entry = RepairProofEntry::new(current_close_peers);
+        if entry.close_peers != *current_close_peers {
+            *entry = RepairProofEntry::new(current_close_peers.clone());
         }
 
         if entry.peer_proofs.contains_key(&peer) {
@@ -345,7 +365,22 @@ impl RepairProofs {
         current_epoch: u64,
     ) -> bool {
         let current_close_peers = close_peer_set(current_close_peers);
-        if self.invalidate_key_if_close_group_changed(key, &current_close_peers) {
+        self.has_mature_replica_hint_with_snapshot(peer, key, &current_close_peers, current_epoch)
+    }
+
+    /// Whether this node has mature repair-hint evidence for `(peer, key)`,
+    /// using a precomputed self-inclusive close-group snapshot.
+    ///
+    /// The check invalidates all key proofs if the current snapshot differs
+    /// from the group observed when the proof was recorded.
+    pub fn has_mature_replica_hint_with_snapshot(
+        &mut self,
+        peer: &PeerId,
+        key: &XorName,
+        current_close_peers: &HashSet<PeerId>,
+        current_epoch: u64,
+    ) -> bool {
+        if self.invalidate_key_if_close_group_changed(key, current_close_peers) {
             return false;
         }
 

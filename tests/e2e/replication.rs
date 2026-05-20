@@ -20,6 +20,7 @@ use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -139,7 +140,7 @@ async fn record_repair_proofs_for_peers(
     key: &[u8; 32],
     hinted_at_epoch: u64,
 ) {
-    let close_peers: Vec<PeerId> = p2p_node
+    let close_peers: HashSet<PeerId> = p2p_node
         .dht_manager()
         .find_closest_nodes_local_with_self(key, config.close_group_size)
         .await
@@ -149,7 +150,12 @@ async fn record_repair_proofs_for_peers(
     let mut proofs = repair_proofs.write().await;
     for peer in peers {
         assert!(
-            proofs.record_replica_hint_sent(*peer, *key, &close_peers, hinted_at_epoch),
+            proofs.record_replica_hint_sent_with_snapshot(
+                *peer,
+                *key,
+                &close_peers,
+                hinted_at_epoch
+            ),
             "test target should be in close group for repair-proof recording"
         );
     }

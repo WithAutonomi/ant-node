@@ -346,7 +346,7 @@ async fn evaluate_record_prune_key(
         return outcome;
     }
 
-    let current_close_peers: Vec<PeerId> = closest.iter().map(|node| node.peer_id).collect();
+    let current_close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
     if !target_peers_have_mature_repair_proofs(
         key,
         &target_peers,
@@ -449,13 +449,18 @@ fn remote_close_group_peers(close_group: &[DHTNode], self_id: &PeerId) -> Vec<Pe
 async fn target_peers_have_mature_repair_proofs(
     key: &XorName,
     target_peers: &[PeerId],
-    current_close_peers: &[PeerId],
+    current_close_peers: &HashSet<PeerId>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     current_sync_epoch: u64,
 ) -> bool {
     let mut proofs = repair_proofs.write().await;
     target_peers.iter().all(|peer| {
-        proofs.has_mature_replica_hint(peer, key, current_close_peers, current_sync_epoch)
+        proofs.has_mature_replica_hint_with_snapshot(
+            peer,
+            key,
+            current_close_peers,
+            current_sync_epoch,
+        )
     })
 }
 
