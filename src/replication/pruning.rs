@@ -26,7 +26,7 @@ use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
-use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
+use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState, RepairProofs};
 use crate::storage::LmdbStorage;
 
 use super::REPLICATION_TRUST_WEIGHT;
@@ -52,6 +52,28 @@ pub struct PruneResult {
     pub paid_entries_marked: usize,
     /// Number of `PaidForList` entries cleared (back in range).
     pub paid_entries_cleared: usize,
+}
+
+/// Shared dependencies and switches for one prune pass.
+pub struct PrunePassContext<'a> {
+    /// Local peer id.
+    pub self_id: &'a PeerId,
+    /// Local record storage.
+    pub storage: &'a Arc<LmdbStorage>,
+    /// Persistent paid-list state.
+    pub paid_list: &'a Arc<PaidList>,
+    /// P2P node used for routing lookups and prune-confirmation audits.
+    pub p2p_node: &'a Arc<P2PNode>,
+    /// Replication configuration.
+    pub config: &'a ReplicationConfig,
+    /// Neighbor-sync state, including prune cursor and bootstrap claims.
+    pub sync_state: &'a Arc<RwLock<NeighborSyncState>>,
+    /// Key-specific repair proofs used to gate prune-confirmation audits.
+    pub repair_proofs: &'a Arc<RwLock<RepairProofs>>,
+    /// Current local neighbor-sync cycle epoch.
+    pub current_sync_epoch: u64,
+    /// Whether remote prune-confirmation audits are allowed this pass.
+    pub allow_remote_prune_audits: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,6 +103,28 @@ struct RecordPruneCandidate {
     target_peers: Vec<PeerId>,
 }
 
+struct RecordPruneKeyOutcome {
+    marked: bool,
+    state: RecordPruneKeyState,
+}
+
+impl Default for RecordPruneKeyOutcome {
+    fn default() -> Self {
+        Self {
+            marked: false,
+            state: RecordPruneKeyState::None,
+        }
+    }
+}
+
+enum RecordPruneKeyState {
+    None,
+    Cleared,
+    BootstrapDeferred,
+    BudgetDeferred,
+    Candidate(RecordPruneCandidate),
+}
+
 #[derive(Default)]
 struct PruneAuditReportState {
     audit_failures: RwLock<HashSet<PeerId>>,
@@ -103,6 +147,13 @@ struct PruneAuditReportState {
 /// - If self is in `PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen`.
 /// - If not in group: set timestamp if not already set; remove entry if the
 ///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old.
+///
+/// Compatibility wrapper for callers that have not adopted repair-proof
+/// tracking. It preserves the original public signature, but it has no proof
+/// table or advanced sync epoch to pass into record prune-confirmation audits.
+/// Out-of-range records are therefore marked/deferred rather than deleted via
+/// remote confirmation. The replication engine calls
+/// [`run_prune_pass_with_context`] so it can pass real repair proofs.
 pub async fn run_prune_pass(
     self_id: &PeerId,
     storage: &Arc<LmdbStorage>,
@@ -112,19 +163,27 @@ pub async fn run_prune_pass(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     allow_remote_prune_audits: bool,
 ) -> PruneResult {
-    let (stored_count, record_stats) = prune_stored_records(
+    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    run_prune_pass_with_context(PrunePassContext {
         self_id,
         storage,
         paid_list,
         p2p_node,
         config,
         sync_state,
+        repair_proofs: &repair_proofs,
+        current_sync_epoch: 0,
         allow_remote_prune_audits,
-    )
-    .await;
+    })
+    .await
+}
+
+/// Execute one prune pass with repair-proof-gated remote confirmations.
+pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResult {
+    let (stored_count, record_stats) = prune_stored_records(&ctx).await;
     let now = Instant::now();
     let (paid_count, paid_stats) =
-        prune_paid_entries(self_id, paid_list, p2p_node, config, now).await;
+        prune_paid_entries(ctx.self_id, ctx.paid_list, ctx.p2p_node, ctx.config, now).await;
 
     let result = PruneResult {
         records_pruned: record_stats.pruned,
@@ -143,16 +202,8 @@ pub async fn run_prune_pass(
     result
 }
 
-async fn prune_stored_records(
-    self_id: &PeerId,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    allow_remote_prune_audits: bool,
-) -> (usize, RecordPruneStats) {
-    let stored_keys = match storage.all_keys().await {
+async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPruneStats) {
+    let stored_keys = match ctx.storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
             warn!("Failed to read stored keys for pruning: {e}");
@@ -161,67 +212,44 @@ async fn prune_stored_records(
     };
 
     let now = Instant::now();
-    let dht = p2p_node.dht_manager();
+    let dht = ctx.p2p_node.dht_manager();
     let mut stats = RecordPruneStats::default();
     let mut candidates = Vec::new();
     let mut audit_challenge_budget = MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS;
     let mut budget_deferred = 0usize;
     let mut bootstrap_deferred = 0usize;
-    let scan_start = prune_scan_start(sync_state, stored_keys.len()).await;
+    let scan_start = prune_scan_start(ctx.sync_state, stored_keys.len()).await;
     let mut last_selected_offset = None;
 
     for offset in 0..stored_keys.len() {
         let key = &stored_keys[(scan_start + offset) % stored_keys.len()];
         let closest: Vec<DHTNode> = dht
-            .find_closest_nodes_local_with_self(key, config.close_group_size)
+            .find_closest_nodes_local_with_self(key, ctx.config.close_group_size)
             .await;
-        let is_responsible = closest.iter().any(|n| n.peer_id == *self_id);
 
-        if is_responsible {
-            if paid_list.record_out_of_range_since(key).is_some() {
-                paid_list.clear_record_out_of_range(key);
-                stats.cleared += 1;
+        let outcome =
+            evaluate_record_prune_key(ctx, key, &closest, now, &mut audit_challenge_budget).await;
+        if outcome.marked {
+            stats.marked += 1;
+        }
+        match outcome.state {
+            RecordPruneKeyState::None => {}
+            RecordPruneKeyState::Cleared => stats.cleared += 1,
+            RecordPruneKeyState::BootstrapDeferred => {
+                bootstrap_deferred = bootstrap_deferred.saturating_add(1);
             }
-        } else {
-            if paid_list.record_out_of_range_since(key).is_none() {
-                stats.marked += 1;
+            RecordPruneKeyState::BudgetDeferred => {
+                budget_deferred = budget_deferred.saturating_add(1);
             }
-            paid_list.set_record_out_of_range(key);
-
-            if let Some(first_seen) = paid_list.record_out_of_range_since(key) {
-                let elapsed = now
-                    .checked_duration_since(first_seen)
-                    .unwrap_or(Duration::ZERO);
-                if elapsed >= config.prune_hysteresis_duration {
-                    if !allow_remote_prune_audits {
-                        bootstrap_deferred = bootstrap_deferred.saturating_add(1);
-                        continue;
-                    }
-                    let target_peers = remote_close_group_peers(&closest, self_id);
-                    if target_peers.is_empty() {
-                        warn!(
-                            "Cannot prune {}: current close group has no remote peers",
-                            hex::encode(key)
-                        );
-                        continue;
-                    }
-                    if target_peers.len() > audit_challenge_budget {
-                        budget_deferred = budget_deferred.saturating_add(1);
-                        continue;
-                    }
-                    audit_challenge_budget -= target_peers.len();
-                    last_selected_offset = Some(offset);
-                    candidates.push(RecordPruneCandidate {
-                        key: *key,
-                        target_peers,
-                    });
-                }
+            RecordPruneKeyState::Candidate(candidate) => {
+                last_selected_offset = Some(offset);
+                candidates.push(candidate);
             }
         }
     }
 
     advance_prune_cursor(
-        sync_state,
+        ctx.sync_state,
         stored_keys.len(),
         scan_start,
         last_selected_offset,
@@ -242,21 +270,110 @@ async fn prune_stored_records(
         );
     }
 
-    let present_by_key =
-        collect_record_prune_proofs(&candidates, storage, p2p_node, config, sync_state).await;
+    let present_by_key = collect_record_prune_proofs(
+        &candidates,
+        ctx.storage,
+        ctx.p2p_node,
+        ctx.config,
+        ctx.sync_state,
+    )
+    .await;
     let (keys_to_delete, revalidated_cleared) = revalidated_record_prune_keys(
         &candidates,
         &present_by_key,
-        self_id,
-        paid_list,
-        p2p_node,
-        config,
+        ctx.self_id,
+        ctx.paid_list,
+        ctx.p2p_node,
+        ctx.config,
     )
     .await;
     stats.cleared += revalidated_cleared;
-    stats.pruned = delete_stored_records(&keys_to_delete, storage, paid_list).await;
+    stats.pruned = delete_stored_records(
+        &keys_to_delete,
+        ctx.storage,
+        ctx.paid_list,
+        ctx.repair_proofs,
+    )
+    .await;
 
     (stored_keys.len(), stats)
+}
+
+async fn evaluate_record_prune_key(
+    ctx: &PrunePassContext<'_>,
+    key: &XorName,
+    closest: &[DHTNode],
+    now: Instant,
+    audit_challenge_budget: &mut usize,
+) -> RecordPruneKeyOutcome {
+    let mut outcome = RecordPruneKeyOutcome::default();
+    let is_responsible = closest.iter().any(|node| node.peer_id == *ctx.self_id);
+
+    if is_responsible {
+        if ctx.paid_list.record_out_of_range_since(key).is_some() {
+            ctx.paid_list.clear_record_out_of_range(key);
+            outcome.state = RecordPruneKeyState::Cleared;
+        }
+        return outcome;
+    }
+
+    if ctx.paid_list.record_out_of_range_since(key).is_none() {
+        outcome.marked = true;
+    }
+    ctx.paid_list.set_record_out_of_range(key);
+
+    let Some(first_seen) = ctx.paid_list.record_out_of_range_since(key) else {
+        return outcome;
+    };
+    let elapsed = now
+        .checked_duration_since(first_seen)
+        .unwrap_or(Duration::ZERO);
+    if elapsed < ctx.config.prune_hysteresis_duration {
+        return outcome;
+    }
+
+    if !ctx.allow_remote_prune_audits {
+        outcome.state = RecordPruneKeyState::BootstrapDeferred;
+        return outcome;
+    }
+
+    let target_peers = remote_close_group_peers(closest, ctx.self_id);
+    if target_peers.is_empty() {
+        warn!(
+            "Cannot prune {}: current close group has no remote peers",
+            hex::encode(key)
+        );
+        return outcome;
+    }
+
+    let current_close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
+    if !target_peers_have_mature_repair_proofs(
+        key,
+        &target_peers,
+        &current_close_peers,
+        ctx.repair_proofs,
+        ctx.current_sync_epoch,
+    )
+    .await
+    {
+        debug!(
+            "Deferring prune for {} until current close group has mature repair proofs",
+            hex::encode(key)
+        );
+        return outcome;
+    }
+
+    if target_peers.len() > *audit_challenge_budget {
+        outcome.state = RecordPruneKeyState::BudgetDeferred;
+        return outcome;
+    }
+
+    *audit_challenge_budget -= target_peers.len();
+    outcome.state = RecordPruneKeyState::Candidate(RecordPruneCandidate {
+        key: *key,
+        target_peers,
+    });
+    outcome
 }
 
 async fn prune_paid_entries(
@@ -329,6 +446,19 @@ fn remote_close_group_peers(close_group: &[DHTNode], self_id: &PeerId) -> Vec<Pe
         .collect()
 }
 
+async fn target_peers_have_mature_repair_proofs(
+    key: &XorName,
+    target_peers: &[PeerId],
+    current_close_peers: &HashSet<PeerId>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
+    current_sync_epoch: u64,
+) -> bool {
+    let mut proofs = repair_proofs.write().await;
+    target_peers.iter().all(|peer| {
+        proofs.has_mature_replica_hint(peer, key, current_close_peers, current_sync_epoch)
+    })
+}
+
 async fn prune_scan_start(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     stored_key_count: usize,
@@ -358,6 +488,7 @@ async fn delete_stored_records(
     keys_to_delete: &[XorName],
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
 ) -> usize {
     let mut pruned = 0;
 
@@ -367,6 +498,7 @@ async fn delete_stored_records(
         } else {
             pruned += 1;
             paid_list.clear_record_out_of_range(key);
+            repair_proofs.write().await.remove_key(key);
             // Seed the PaidForList out-of-range timer so the second pass can
             // prune the entry sooner, closing the re-admission window between
             // the storage delete and the PaidForList prune pass.
