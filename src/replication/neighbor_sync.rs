@@ -3,6 +3,7 @@
 //! Round-robin cycle management: snapshot close neighbors, iterate through
 //! them in batches of `NEIGHBOR_SYNC_PEER_COUNT`, exchanging hint sets.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,25 @@ use crate::replication::protocol::{
 use crate::replication::types::NeighborSyncState;
 use crate::storage::LmdbStorage;
 
+/// Replica hint sent to a peer, with the close-group snapshot used to decide
+/// that hint.
+#[derive(Debug)]
+pub(crate) struct SentReplicaHint {
+    /// Key included in the replica hint set.
+    pub(crate) key: XorName,
+    /// Self-inclusive close group observed during hint construction.
+    pub(crate) close_peers: HashSet<PeerId>,
+}
+
+/// Result of an outbound neighbor-sync exchange.
+#[derive(Debug)]
+pub(crate) struct NeighborSyncOutcome {
+    /// The peer's sync response.
+    pub(crate) response: NeighborSyncResponse,
+    /// Replica hints sent to the peer in our request.
+    pub(crate) sent_replica_hints: Vec<SentReplicaHint>,
+}
+
 /// Build replica hints for a specific peer.
 ///
 /// Returns keys that we believe the peer should hold (peer is among the
@@ -35,6 +55,19 @@ pub async fn build_replica_hints_for_peer(
     p2p_node: &Arc<P2PNode>,
     close_group_size: usize,
 ) -> Vec<XorName> {
+    build_replica_hints_for_peer_with_close_groups(peer, storage, p2p_node, close_group_size)
+        .await
+        .into_iter()
+        .map(|hint| hint.key)
+        .collect()
+}
+
+pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
+    peer: &PeerId,
+    storage: &Arc<LmdbStorage>,
+    p2p_node: &Arc<P2PNode>,
+    close_group_size: usize,
+) -> Vec<SentReplicaHint> {
     let all_keys = match storage.all_keys().await {
         Ok(keys) => keys,
         Err(e) => {
@@ -49,8 +82,9 @@ pub async fn build_replica_hints_for_peer(
         let closest = dht
             .find_closest_nodes_local_with_self(&key, close_group_size)
             .await;
-        if closest.iter().any(|n| n.peer_id == *peer) {
-            hints.push(key);
+        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
+        if close_peers.contains(peer) {
+            hints.push(SentReplicaHint { key, close_peers });
         }
     }
     hints
@@ -148,9 +182,31 @@ pub async fn sync_with_peer(
     config: &ReplicationConfig,
     is_bootstrapping: bool,
 ) -> Option<NeighborSyncResponse> {
+    sync_with_peer_with_outcome(peer, p2p_node, storage, paid_list, config, is_bootstrapping)
+        .await
+        .map(|outcome| outcome.response)
+}
+
+pub(crate) async fn sync_with_peer_with_outcome(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+) -> Option<NeighborSyncOutcome> {
     // Build peer-targeted hint sets (Rule 7).
-    let replica_hints =
-        build_replica_hints_for_peer(peer, storage, p2p_node, config.close_group_size).await;
+    let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
+        peer,
+        storage,
+        p2p_node,
+        config.close_group_size,
+    )
+    .await;
+    let replica_hints = sent_replica_hints
+        .iter()
+        .map(|hint| hint.key)
+        .collect::<Vec<_>>();
     let paid_hints =
         build_paid_hints_for_peer(peer, paid_list, p2p_node, config.paid_list_close_group_size)
             .await;
@@ -193,7 +249,10 @@ pub async fn sync_with_peer(
     match ReplicationMessage::decode(&response.data) {
         Ok(decoded) => {
             if let ReplicationMessageBody::NeighborSyncResponse(resp) = decoded.body {
-                Some(resp)
+                Some(NeighborSyncOutcome {
+                    response: resp,
+                    sent_replica_hints,
+                })
             } else {
                 warn!("Unexpected response type from {peer} during sync");
                 None
@@ -261,18 +320,49 @@ pub fn record_successful_sync(state: &mut NeighborSyncState, peer: &PeerId) {
 /// indicates whether the caller should process the sender's inbound hints.
 pub async fn handle_sync_request(
     sender: &PeerId,
-    _request: &NeighborSyncRequest,
+    request: &NeighborSyncRequest,
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
 ) -> (NeighborSyncResponse, bool) {
+    let (response, _, sender_in_rt) = handle_sync_request_with_proofs(
+        sender,
+        request,
+        p2p_node,
+        storage,
+        paid_list,
+        config,
+        is_bootstrapping,
+    )
+    .await;
+    (response, sender_in_rt)
+}
+
+pub(crate) async fn handle_sync_request_with_proofs(
+    sender: &PeerId,
+    _request: &NeighborSyncRequest,
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+) -> (NeighborSyncResponse, Vec<SentReplicaHint>, bool) {
     let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(sender).await;
 
     // Build outbound hints (always sent, even to non-RT peers).
-    let replica_hints =
-        build_replica_hints_for_peer(sender, storage, p2p_node, config.close_group_size).await;
+    let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
+        sender,
+        storage,
+        p2p_node,
+        config.close_group_size,
+    )
+    .await;
+    let replica_hints = sent_replica_hints
+        .iter()
+        .map(|hint| hint.key)
+        .collect::<Vec<_>>();
     let paid_hints = build_paid_hints_for_peer(
         sender,
         paid_list,
@@ -289,7 +379,7 @@ pub async fn handle_sync_request(
     };
 
     // Rule 4-6: accept inbound hints only if sender is in LocalRT.
-    (response, sender_in_rt)
+    (response, sent_replica_hints, sender_in_rt)
 }
 
 // ---------------------------------------------------------------------------

@@ -248,6 +248,141 @@ impl PeerSyncRecord {
 }
 
 // ---------------------------------------------------------------------------
+// Repair proof tracking
+// ---------------------------------------------------------------------------
+
+/// Evidence that this node has sent a replica repair hint for a key to a peer.
+#[derive(Debug, Clone)]
+struct RepairProof {
+    /// Local neighbor-sync cycle epoch when the hint was sent.
+    hinted_at_epoch: u64,
+}
+
+/// Repair proofs for one key, tied to the close-group snapshot they were
+/// recorded against.
+#[derive(Debug, Clone)]
+struct RepairProofEntry {
+    /// Self-inclusive close group observed when these proofs were recorded.
+    close_peers: HashSet<PeerId>,
+    /// Per-peer proof metadata for peers in `close_peers`.
+    peer_proofs: HashMap<PeerId, RepairProof>,
+}
+
+impl RepairProofEntry {
+    fn new(close_peers: HashSet<PeerId>) -> Self {
+        Self {
+            close_peers,
+            peer_proofs: HashMap::new(),
+        }
+    }
+}
+
+/// Evidence that this node has sent replica repair hints for local keys.
+///
+/// The map is keyed by record key so each key retains only one close-group
+/// snapshot and at most that snapshot's peers. This bounds memory by local key
+/// count times the replication close-group size rather than by churn history.
+#[derive(Debug, Clone, Default)]
+pub struct RepairProofs {
+    /// Key-scoped repair proofs.
+    proofs_by_key: HashMap<XorName, RepairProofEntry>,
+}
+
+impl RepairProofs {
+    /// Create an empty repair-proof table.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that `peer` was sent a replica repair hint for `key`.
+    ///
+    /// `current_close_peers` must be the current self-inclusive close group for
+    /// `key`. If that close group differs from the previous proof snapshot, all
+    /// old proofs for the key are invalidated before recording. This forces a
+    /// fresh hint after a peer leaves and later re-enters the close group.
+    pub fn record_replica_hint_sent(
+        &mut self,
+        peer: PeerId,
+        key: XorName,
+        current_close_peers: &HashSet<PeerId>,
+        hinted_at_epoch: u64,
+    ) -> bool {
+        if !current_close_peers.contains(&peer) {
+            self.invalidate_key_if_close_group_changed(&key, current_close_peers);
+            return false;
+        }
+
+        let entry = self
+            .proofs_by_key
+            .entry(key)
+            .or_insert_with(|| RepairProofEntry::new(current_close_peers.clone()));
+        if entry.close_peers != *current_close_peers {
+            *entry = RepairProofEntry::new(current_close_peers.clone());
+        }
+
+        if entry.peer_proofs.contains_key(&peer) {
+            return false;
+        }
+
+        entry
+            .peer_proofs
+            .insert(peer, RepairProof { hinted_at_epoch });
+        true
+    }
+
+    /// Whether this node has mature repair-hint evidence for `(peer, key)`.
+    ///
+    /// The check invalidates all key proofs if the current self-inclusive close
+    /// group differs from the group observed when the proof was recorded. A
+    /// proof is mature only after at least one later local sync-cycle epoch.
+    pub fn has_mature_replica_hint(
+        &mut self,
+        peer: &PeerId,
+        key: &XorName,
+        current_close_peers: &HashSet<PeerId>,
+        current_epoch: u64,
+    ) -> bool {
+        if self.invalidate_key_if_close_group_changed(key, current_close_peers) {
+            return false;
+        }
+
+        self.proofs_by_key
+            .get(key)
+            .and_then(|entry| entry.peer_proofs.get(peer))
+            .is_some_and(|proof| proof.hinted_at_epoch < current_epoch)
+    }
+
+    /// Remove all repair proofs for a key, e.g. after local deletion.
+    pub fn remove_key(&mut self, key: &XorName) {
+        self.proofs_by_key.remove(key);
+    }
+
+    /// Remove all repair proofs for a peer, e.g. after routing-table removal.
+    pub fn remove_peer(&mut self, peer: &PeerId) {
+        self.proofs_by_key.retain(|_, entry| {
+            entry.peer_proofs.remove(peer);
+            !entry.peer_proofs.is_empty()
+        });
+    }
+
+    fn invalidate_key_if_close_group_changed(
+        &mut self,
+        key: &XorName,
+        current_close_peers: &HashSet<PeerId>,
+    ) -> bool {
+        let changed = self
+            .proofs_by_key
+            .get(key)
+            .is_some_and(|entry| entry.close_peers != *current_close_peers);
+        if changed {
+            self.proofs_by_key.remove(key);
+        }
+        changed
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Neighbor sync cycle state
 // ---------------------------------------------------------------------------
 
@@ -580,6 +715,168 @@ mod tests {
         assert!(
             !record.has_repair_opportunity(),
             "never-synced peer has no repair opportunity regardless of cycle count"
+        );
+    }
+
+    // -- RepairProofs --------------------------------------------------------
+
+    #[test]
+    fn repair_proofs_record_sent_hint_for_close_peer() {
+        const HINT_EPOCH: u64 = 7;
+        const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
+
+        let key = [0xA1; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
+
+        assert!(
+            proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "sent hint should make key auditable for that peer"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_reject_peer_outside_current_close_group() {
+        const HINT_EPOCH: u64 = 7;
+        const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
+
+        let key = [0xA2; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(!proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
+
+        assert!(
+            !proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "peers outside current close group must not get repair proof"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_require_later_epoch() {
+        const HINT_EPOCH: u64 = 7;
+        const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
+
+        let key = [0xA3; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
+
+        assert!(
+            !proofs.has_mature_replica_hint(&peer, &key, &close_peers, HINT_EPOCH),
+            "same-cycle proof should not be audit-eligible"
+        );
+        assert!(
+            proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "proof should mature after a later local sync-cycle epoch"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_repeated_hint_does_not_reset_maturity() {
+        const HINT_EPOCH: u64 = 7;
+        const REPEATED_HINT_EPOCH: u64 = HINT_EPOCH + 1;
+
+        let key = [0xA5; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
+        assert!(
+            !proofs.record_replica_hint_sent(peer, key, &close_peers, REPEATED_HINT_EPOCH),
+            "duplicate hint in the same close group should keep existing proof"
+        );
+        assert!(
+            proofs.has_mature_replica_hint(&peer, &key, &close_peers, REPEATED_HINT_EPOCH),
+            "duplicate hint must not reset an already mature proof"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_invalidate_on_close_group_change() {
+        const FIRST_HINT_EPOCH: u64 = 7;
+        const SECOND_HINT_EPOCH: u64 = FIRST_HINT_EPOCH + 1;
+        const CURRENT_EPOCH: u64 = SECOND_HINT_EPOCH + 1;
+
+        let key = [0xA3; 32];
+        let returning_peer = peer_id_from_byte(1);
+        let new_peer = peer_id_from_byte(4);
+        let old_group = HashSet::from([returning_peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let changed_group = HashSet::from([new_peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(returning_peer, key, &old_group, FIRST_HINT_EPOCH,));
+
+        assert!(
+            !proofs.has_mature_replica_hint(&new_peer, &key, &changed_group, SECOND_HINT_EPOCH),
+            "close-group change should invalidate stale key proofs"
+        );
+        assert!(
+            !proofs.has_mature_replica_hint(&returning_peer, &key, &old_group, CURRENT_EPOCH),
+            "a peer that re-enters must receive a fresh repair hint"
+        );
+
+        assert!(proofs.record_replica_hint_sent(
+            returning_peer,
+            key,
+            &old_group,
+            SECOND_HINT_EPOCH,
+        ));
+        assert!(
+            proofs.has_mature_replica_hint(&returning_peer, &key, &old_group, CURRENT_EPOCH),
+            "fresh repair hint after re-entry should be eligible once mature"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_remove_peer_requires_fresh_hint_after_reentry() {
+        const FIRST_HINT_EPOCH: u64 = 7;
+        const SECOND_HINT_EPOCH: u64 = FIRST_HINT_EPOCH + 1;
+        const CURRENT_EPOCH: u64 = SECOND_HINT_EPOCH + 1;
+
+        let key = [0xA6; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer, peer_id_from_byte(2), peer_id_from_byte(3)]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, FIRST_HINT_EPOCH));
+        proofs.remove_peer(&peer);
+
+        assert!(
+            !proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "routing-table removal should clear proof even if peer re-enters same close group"
+        );
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, SECOND_HINT_EPOCH));
+        assert!(
+            proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "fresh hint after re-entry should become eligible after a later epoch"
+        );
+    }
+
+    #[test]
+    fn repair_proofs_remove_key_clears_all_peer_entries() {
+        const HINT_EPOCH: u64 = 7;
+        const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
+
+        let key = [0xA4; 32];
+        let peer = peer_id_from_byte(1);
+        let close_peers = HashSet::from([peer]);
+        let mut proofs = RepairProofs::new();
+
+        assert!(proofs.record_replica_hint_sent(peer, key, &close_peers, HINT_EPOCH));
+        proofs.remove_key(&key);
+
+        assert!(
+            !proofs.has_mature_replica_hint(&peer, &key, &close_peers, CURRENT_EPOCH),
+            "deleted local key should not retain repair proof entries"
         );
     }
 
