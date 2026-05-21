@@ -1,12 +1,12 @@
-//! Quadratic pricing with a baseline floor for ant-node (Phase 1 recalibration).
+//! Quadratic pricing with a baseline floor for ant-node.
 //!
 //! Formula: `price_per_chunk_ANT(n) = BASELINE + K × (n / D)²`
 //!
-//! This recalibration introduces a non-zero `BASELINE` so that empty nodes
-//! charge a meaningful spam-barrier price, and re-anchors `K` so per-GB USD
-//! pricing matches real-world targets at the current ~$0.10/ANT token price.
-//! The legacy formula produced ~$25/GB at the lower stable boundary and ~$0/GB
-//! when nodes were empty — both unreasonable.
+//! The non-zero `BASELINE` makes empty nodes charge a meaningful spam-barrier
+//! price, and `K` is anchored so per-GB USD pricing matches real-world targets
+//! at the current ~$0.10/ANT token price. An earlier formula produced ~$25/GB
+//! at the lower stable boundary and ~$0/GB when nodes were empty — both
+//! unreasonable.
 //!
 //! ## Parameters
 //!
