@@ -9,6 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
+  FOUNDRY_VERSION: v1.7.1
 
 jobs:
   fmt:
@@ -46,7 +47,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: nightly
+          version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests
         run: cargo test --lib --features test-utils
       - name: Run e2e tests
@@ -88,7 +89,7 @@ jobs:
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: nightly
+          version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests without logging
         run: cargo test --lib --no-default-features
 
