@@ -27,11 +27,12 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
+#[cfg(test)]
+use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
     ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
-    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, DATA_TYPE_CHUNK,
-    MAX_CHUNK_SIZE,
+    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
 };
 use crate::client::compute_address;
 use crate::error::{Error, Result};
@@ -256,9 +257,8 @@ impl AntProtocol {
             Ok(_) => {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
-                // Record the store and payment in metrics
-                self.quote_generator.record_store(DATA_TYPE_CHUNK);
-                self.quote_generator.record_payment();
+                // Increment the close-records counter consumed by calculate_price.
+                self.quote_generator.record_store();
 
                 // 6. Notify replication engine for fresh fan-out.
                 //    Only emit when a real proof is present — cached-as-verified

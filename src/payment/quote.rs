@@ -175,14 +175,9 @@ impl QuoteGenerator {
         self.metrics_tracker.records_stored()
     }
 
-    /// Record a payment received (delegates to metrics tracker).
-    pub fn record_payment(&self) {
-        self.metrics_tracker.record_payment();
-    }
-
     /// Record data stored (delegates to metrics tracker).
-    pub fn record_store(&self, data_type: u32) {
-        self.metrics_tracker.record_store(data_type);
+    pub fn record_store(&self) {
+        self.metrics_tracker.record_store();
     }
 
     /// Create a merkle candidate quote for batch payment using ML-DSA-65.
@@ -429,9 +424,9 @@ mod tests {
         let metrics_tracker = QuotingMetricsTracker::new(0);
         let generator = QuoteGenerator::new(rewards_address, metrics_tracker);
 
-        generator.record_store(0);
-        generator.record_store(1);
-        generator.record_store(0);
+        generator.record_store();
+        generator.record_store();
+        generator.record_store();
 
         assert_eq!(generator.records_stored(), 3);
     }
