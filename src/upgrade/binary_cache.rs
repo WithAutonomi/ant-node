@@ -491,12 +491,78 @@ pub struct DownloadLockGuard {
 /// whose target is a special file is rejected by the `is_file()` check on
 /// the opened handle.
 ///
+/// On Unix, `open()` of a FIFO/named-pipe for reading blocks until a
+/// writer connects, so a cache-dir attacker could otherwise hang the
+/// upgrade indefinitely by planting a FIFO at the cache entry's path. We
+/// (a) reject non-regular files via a `fs::metadata()` pre-check (follows
+/// symlinks, so a symlink-to-regular is still accepted), and (b) on Unix
+/// also open with `O_NONBLOCK` as a belt-and-braces defence in case the
+/// pre-check races a swap. The post-open `is_file()` on the opened handle
+/// remains the TOCTOU-safe gate.
+///
 /// Returns `(File, len)` on success; the returned `File` is positioned at
 /// offset 0 and may be `io::copy`'d into a destination — callers should
 /// wrap with `Read::take(max_len)` so an attacker who extends the file
 /// after the metadata read cannot stream beyond the cap.
 fn open_regular_capped(path: &Path, max_len: u64) -> io::Result<(File, u64)> {
-    let file = OpenOptions::new().read(true).open(path)?;
+    // Pre-check: refuse to even open a non-regular file. This is the
+    // first line of defence against an attacker who planted a FIFO at
+    // `path` — opening a FIFO for reading on Unix blocks until a writer
+    // connects, hanging the upgrade indefinitely. `fs::metadata` follows
+    // symlinks, so a symlink whose target is a regular file is accepted
+    // here and a symlink whose target is a FIFO/device/socket is rejected.
+    let pre_meta = fs::metadata(path)?;
+    if !pre_meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file (FIFO/device/socket/dir)",
+        ));
+    }
+
+    // Belt-and-braces against a pre-check vs open() race: on Unix also
+    // open with O_NONBLOCK, so even if an attacker swaps the regular file
+    // for a FIFO between the metadata read and open(), the open() returns
+    // immediately instead of blocking on a writer. Reads on a regular file
+    // ignore O_NONBLOCK, so this is a no-op for the happy path. The
+    // post-open is_file() check below still catches the swap.
+    let file = {
+        let mut opts = OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NONBLOCK is platform-specific: 0o4000 on Linux, 0x0004 on
+            // macOS/*BSD. Reads on a regular file ignore O_NONBLOCK on all
+            // these platforms, so this is a no-op for the happy path.
+            #[cfg(target_os = "linux")]
+            const O_NONBLOCK: i32 = 0o4000;
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            ))]
+            const O_NONBLOCK: i32 = 0x0004;
+            // Fallback for other unix-likes: skip the flag rather than
+            // guess wrong. The pre-check + post-open is_file() still gate.
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "macos",
+                target_os = "ios",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly",
+            )))]
+            const O_NONBLOCK: i32 = 0;
+            if O_NONBLOCK != 0 {
+                opts.custom_flags(O_NONBLOCK);
+            }
+        }
+        opts.open(path)?
+    };
     let meta = file.metadata()?;
     if !meta.file_type().is_file() {
         return Err(io::Error::new(
@@ -834,6 +900,60 @@ mod tests {
             cache.get_verified_archive("5.0.0", pd.path()).is_none(),
             "oversized metadata file must be rejected before parsing"
         );
+    }
+
+    /// A cache-dir attacker who replaces the cached archive with a FIFO
+    /// must not be able to hang `get_verified_archive` waiting for a
+    /// writer to connect. The pre-check + O_NONBLOCK belt-and-braces
+    /// returns immediately with an error, the cache hit is abandoned, and
+    /// the caller falls back to a fresh verified download.
+    #[cfg(unix)]
+    #[test]
+    fn test_fifo_cached_archive_does_not_hang() {
+        use std::time::{Duration, Instant};
+        let tmp = TempDir::new().unwrap();
+        let cache = cache_with_test_key(tmp.path());
+        let pd = priv_dir();
+
+        // Plant a legit signed entry so meta/version/sig-size are good,
+        // then replace the cached archive with a FIFO. Without the
+        // pre-check + O_NONBLOCK, opening the FIFO for reading would
+        // block until a writer connected.
+        let (archive, sig) = make_signed_archive(tmp.path(), b"legit");
+        cache.store_archive("6.0.0", &archive, &sig).unwrap();
+        let cached_archive = cache.cached_archive_path("6.0.0");
+        fs::remove_file(&cached_archive).unwrap();
+        let cstr = std::ffi::CString::new(cached_archive.as_os_str().as_encoded_bytes()).unwrap();
+        // mkfifo via libc-equivalent: use the nix-free path through
+        // `std::process::Command` to avoid pulling a libc dep just for
+        // the test. `mkfifo` is in coreutils on Linux and bundled on
+        // macOS — both CI targets.
+        let mkfifo_ok = std::process::Command::new("mkfifo")
+            .arg(cstr.to_str().unwrap())
+            .status()
+            .ok()
+            .is_some_and(|s| s.success());
+        if !mkfifo_ok {
+            // If mkfifo isn't available skip rather than fail the suite.
+            eprintln!("mkfifo unavailable, skipping FIFO test");
+            return;
+        }
+
+        let start = Instant::now();
+        let got = cache.get_verified_archive("6.0.0", pd.path());
+        let elapsed = start.elapsed();
+
+        assert!(
+            got.is_none(),
+            "a FIFO planted at the cached archive path must be rejected"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "open of FIFO returned in {elapsed:?}, expected ≪ 2s — \
+             pre-check or O_NONBLOCK is not catching this"
+        );
+        // Nothing should have been staged.
+        assert!(!pd.path().join("cached-6.0.0.archive").exists());
     }
 
     /// `.meta.json` planted as a symlink to a special file (e.g.
