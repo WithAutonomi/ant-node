@@ -17,6 +17,7 @@
 pub mod admission;
 pub mod audit;
 pub mod bootstrap;
+pub mod commitment;
 pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
