@@ -316,7 +316,7 @@ pub fn build_commitment_bound_audit_response(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::replication::commitment::{commitment_hash, leaf_hash, verify_path};
