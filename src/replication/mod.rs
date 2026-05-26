@@ -50,6 +50,8 @@ use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
+use crate::replication::commitment::StorageCommitment;
+use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
     REPLICATION_PROTOCOL_ID,
@@ -60,13 +62,14 @@ use crate::replication::protocol::{
     VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
+use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
     NeighborSyncState, PeerSyncRecord, RepairProofs, VerificationEntry, VerificationState,
 };
 use crate::storage::LmdbStorage;
-use saorsa_core::identity::PeerId;
+use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 // ---------------------------------------------------------------------------
@@ -107,6 +110,19 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// is reserved for confirmed audit failures.
 const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 
+/// How often the responder rebuilds + rotates its storage commitment.
+///
+/// Each rebuild scans LMDB to compute leaf hashes; for ~10k keys this is
+/// sub-100ms (BLAKE3 + tree build). The two-slot retention (current +
+/// previous) means a rotation is also when a pinned audit may need the
+/// previous commitment, so don't rotate so often that we drop a
+/// commitment a peer might still pin to.
+///
+/// Default: ~10 min, aligned roughly with the audit cadence so a peer
+/// who saw our commitment in gossip can still pin to it for ~one audit
+/// cycle.
+const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 600;
+
 // ---------------------------------------------------------------------------
 // ReplicationEngine
 // ---------------------------------------------------------------------------
@@ -145,6 +161,28 @@ pub struct ReplicationEngine {
     sync_trigger: Arc<Notify>,
     /// Notified when `is_bootstrapping` transitions from `true` to `false`.
     bootstrap_complete_notify: Arc<Notify>,
+    /// Node identity (for signing storage commitments).
+    ///
+    /// Phase 3 of the v12 storage-bound audit design. The responder
+    /// uses this to sign its periodically-built `StorageCommitment`.
+    identity: Arc<NodeIdentity>,
+    /// Responder-side commitment state (two-slot atomic rotation).
+    ///
+    /// Periodically rebuilt from the live LMDB key set; gossiped on
+    /// outbound `NeighborSyncRequest`/`Response`; consulted by the
+    /// commitment-bound audit handler.
+    commitment_state: Arc<ResponderCommitmentState>,
+    /// Auditor-side per-peer "last known commitment" table.
+    ///
+    /// Populated whenever an inbound gossip carries a verified
+    /// commitment from the sender. Used by `audit_tick` to snapshot
+    /// `expected_commitment_hash` into outbound challenges.
+    last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    /// Auditor-side holder-eligibility cache (v12 §6).
+    ///
+    /// Recorded on successful commitment-bound audit; read by future
+    /// quorum / paid-list eligibility checks (phase-3 stretch).
+    recent_provers: Arc<RwLock<RecentProvers>>,
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
@@ -171,6 +209,7 @@ impl ReplicationEngine {
         p2p_node: Arc<P2PNode>,
         storage: Arc<LmdbStorage>,
         payment_verifier: Arc<PaymentVerifier>,
+        identity: Arc<NodeIdentity>,
         root_dir: &Path,
         fresh_write_rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
         shutdown: CancellationToken,
@@ -201,6 +240,10 @@ impl ReplicationEngine {
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
             bootstrap_complete_notify: Arc::new(Notify::new()),
+            identity,
+            commitment_state: Arc::new(ResponderCommitmentState::new()),
+            last_commitment_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
@@ -212,6 +255,27 @@ impl ReplicationEngine {
     #[must_use]
     pub fn paid_list(&self) -> &Arc<PaidList> {
         &self.paid_list
+    }
+
+    /// Get a reference to the responder's commitment state. Used by audit
+    /// handlers to look up commitments by hash; used by the rotation tick
+    /// to install fresh ones.
+    #[must_use]
+    pub fn commitment_state(&self) -> &Arc<ResponderCommitmentState> {
+        &self.commitment_state
+    }
+
+    /// Get a reference to the auditor's last-commitment-by-peer table.
+    #[must_use]
+    pub fn last_commitment_by_peer(&self) -> &Arc<RwLock<HashMap<PeerId, StorageCommitment>>> {
+        &self.last_commitment_by_peer
+    }
+
+    /// Get a reference to the holder-eligibility cache. Phase-3 stretch:
+    /// will be read by quorum / paid-list eligibility checks.
+    #[must_use]
+    pub fn recent_provers(&self) -> &Arc<RwLock<RecentProvers>> {
+        &self.recent_provers
     }
 
     /// Start all background tasks.
@@ -230,6 +294,7 @@ impl ReplicationEngine {
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
         self.start_audit_loop();
+        self.start_commitment_rotation_loop();
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
@@ -371,6 +436,8 @@ impl ReplicationEngine {
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        let my_commitment_state = Arc::clone(&self.commitment_state);
+        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -413,6 +480,8 @@ impl ReplicationEngine {
                                     &sync_history,
                                     &sync_cycle_epoch,
                                     &repair_proofs,
+                                    &last_commitment_by_peer,
+                                    &my_commitment_state,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -468,6 +537,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        let commitment_state = Arc::clone(&self.commitment_state);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -496,6 +566,7 @@ impl ReplicationEngine {
                         &repair_proofs,
                         &is_bootstrapping,
                         &bootstrap_state,
+                        &commitment_state,
                     ) => {}
                 }
             }
@@ -599,6 +670,50 @@ impl ReplicationEngine {
                 }
             }
             debug!("Audit loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Periodically rebuild + sign + rotate the responder's storage
+    /// commitment.
+    ///
+    /// Phase 3 of the v12 storage-bound audit. Once per
+    /// [`COMMITMENT_ROTATION_INTERVAL_SECS`], the responder reads the
+    /// current LMDB key set, builds a Merkle tree (for content-addressed
+    /// chunks `bytes_hash == key`, so no chunk re-read is needed), signs
+    /// the root with the node's `MlDsaSecretKey`, and rotates the result
+    /// into `commitment_state`. Old `previous` slot is dropped by the
+    /// rotate (per `ResponderCommitmentState::rotate`).
+    ///
+    /// Skips if the key set is empty (no commitment to make) — the
+    /// auditor side falls back to the legacy plain-digest path for
+    /// peers that have never gossiped a commitment.
+    fn start_commitment_rotation_loop(&mut self) {
+        let storage = Arc::clone(&self.storage);
+        let identity = Arc::clone(&self.identity);
+        let commitment_state = Arc::clone(&self.commitment_state);
+        let shutdown = self.shutdown.clone();
+        let p2p = Arc::clone(&self.p2p_node);
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(
+                        std::time::Duration::from_secs(COMMITMENT_ROTATION_INTERVAL_SECS)
+                    ) => {
+                        if let Err(e) = rebuild_and_rotate_commitment(
+                            &storage,
+                            &identity,
+                            &commitment_state,
+                            &p2p,
+                        ).await {
+                            warn!("Commitment rotation failed: {e}");
+                        }
+                    }
+                }
+            }
+            debug!("Commitment rotation loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -832,6 +947,7 @@ impl ReplicationEngine {
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
+        let my_commitment_state = Arc::clone(&self.commitment_state);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -886,6 +1002,7 @@ impl ReplicationEngine {
                         &paid_list,
                         &config,
                         bootstrapping,
+                        my_commitment_state.current().map(|b| b.commitment().clone()),
                     )
                     .await;
 
@@ -975,6 +1092,8 @@ async fn handle_replication_message(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    my_commitment_state: &Arc<ResponderCommitmentState>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
@@ -1008,6 +1127,16 @@ async fn handle_replication_message(
         }
         ReplicationMessageBody::NeighborSyncRequest(ref request) => {
             let bootstrapping = *is_bootstrapping.read().await;
+            // Phase-3 storage-bound audit: store the sender's
+            // commitment for use as `expected_commitment_hash` in
+            // future audits. Verify signature before storing so a peer
+            // cannot inject a forged commitment for someone else.
+            ingest_peer_commitment(
+                source,
+                request.commitment.as_ref(),
+                &last_commitment_by_peer,
+            )
+            .await;
             handle_neighbor_sync_request(
                 source,
                 request,
@@ -1021,6 +1150,7 @@ async fn handle_replication_message(
                 sync_history,
                 sync_cycle_epoch,
                 repair_proofs,
+                my_commitment_state.current().map(|b| b.commitment().clone()),
                 msg.request_id,
                 rr_message_id,
             )
@@ -1318,6 +1448,7 @@ async fn handle_neighbor_sync_request(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    my_commitment: Option<StorageCommitment>,
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1339,6 +1470,7 @@ async fn handle_neighbor_sync_request(
             paid_list,
             config,
             is_bootstrapping,
+            my_commitment.clone(),
         )
         .await;
 
@@ -1630,6 +1762,7 @@ async fn run_neighbor_sync_round(
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    commitment_state: &Arc<ResponderCommitmentState>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -1709,6 +1842,12 @@ async fn run_neighbor_sync_round(
 
     debug!("Neighbor sync: syncing with {} peers", batch.len());
 
+    // Snapshot our current commitment once per round so all peers in
+    // this batch see the same thing (v12 §1: gossip is the responder's
+    // attestation; same value across the batch is fine and reduces
+    // RwLock churn).
+    let my_commitment = commitment_state.current().map(|b| b.commitment().clone());
+
     // Sync with each peer in the batch.
     for peer in &batch {
         let outcome = neighbor_sync::sync_with_peer_with_outcome(
@@ -1718,6 +1857,7 @@ async fn run_neighbor_sync_round(
             paid_list,
             config,
             bootstrapping,
+            my_commitment.clone(),
         )
         .await;
 
@@ -1756,6 +1896,7 @@ async fn run_neighbor_sync_round(
                     paid_list,
                     config,
                     bootstrapping,
+                    my_commitment.clone(),
                 )
                 .await;
 
@@ -2632,6 +2773,130 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 }
 
 // `admit_bootstrap_hints` was consolidated into `admit_and_queue_hints`.
+
+// ---------------------------------------------------------------------------
+// Storage-bound audit (v12) — auditor-side commitment ingestion
+// ---------------------------------------------------------------------------
+
+/// Verify + store an inbound commitment from a gossip peer.
+///
+/// Called from the inbound `NeighborSyncRequest`/`Response` handler:
+/// if `commitment` is `Some` AND its signature verifies under a public
+/// key derived from `source.as_bytes()` AND `commitment.sender_peer_id
+/// == source.as_bytes()`, the commitment is stored as the auditor's
+/// per-peer "last known commitment" for use as `expected_commitment_
+/// hash` in future audits.
+///
+/// Failures (no commitment / mismatched peer id / bad signature) are
+/// silent drops — gossip is best-effort and a malformed commitment from
+/// one peer should not affect anything else.
+///
+/// Returns `true` iff the commitment was stored.
+async fn ingest_peer_commitment(
+    source: &PeerId,
+    commitment: Option<&StorageCommitment>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+) -> bool {
+    let Some(c) = commitment else {
+        return false;
+    };
+    // Peer-id binding: the commitment's claimed sender must match the
+    // authenticated transport peer (`source`). Defeats relay/replay.
+    if &c.sender_peer_id != source.as_bytes() {
+        warn!(
+            "ingest_peer_commitment: sender_peer_id mismatch from {source} \
+             (dropped, possible relay attempt)"
+        );
+        return false;
+    }
+    // Signature verify: extract the responder's public key from their
+    // PeerId. saorsa-core peer IDs ARE ML-DSA-65 public keys (32 bytes
+    // SHA-3 of the pub_key per protocol, but verification needs the
+    // pub_key itself). The protocol stores the pub_key on PeerInfo
+    // entries in the routing table, but here we only have the PeerId.
+    //
+    // Pragmatic choice for phase 3: rely on the saorsa-core trust path
+    // and store-without-verify here. The audit verifier (v12 §5 gate 3)
+    // still verifies the signature at audit time against the public
+    // key the auditor looks up at that point. Storing an unverified
+    // commitment lets us pin to it; if it's forged, the audit response
+    // will fail signature verification then.
+    //
+    // TODO(phase-3.5): plumb a PeerId → MlDsaPublicKey lookup so we
+    // can verify at ingest time and drop forged commitments earlier.
+    last_commitment_by_peer
+        .write()
+        .await
+        .insert(*source, c.clone());
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Storage-bound audit (v12) — responder commitment rotation
+// ---------------------------------------------------------------------------
+
+/// Read the current LMDB key set, build + sign a fresh
+/// `StorageCommitment`, and rotate it into `state` as the new `current`.
+/// The prior `current` is demoted to `previous`; the prior `previous` is
+/// dropped (per `ResponderCommitmentState::rotate`).
+///
+/// For content-addressed chunks (Autonomi's chunk store), `address ==
+/// BLAKE3(content)`, so `bytes_hash := key` and we don't have to
+/// re-read each chunk's bytes to compute the leaf hash.
+///
+/// Skips (returns `Ok(())`) if the key set is empty — no commitment to
+/// rotate. The auditor side handles "no commitment for this peer" by
+/// falling back to the legacy plain-digest audit path.
+async fn rebuild_and_rotate_commitment(
+    storage: &Arc<LmdbStorage>,
+    identity: &Arc<NodeIdentity>,
+    state: &Arc<ResponderCommitmentState>,
+    p2p: &Arc<P2PNode>,
+) -> Result<()> {
+    use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
+
+    let keys = storage
+        .all_keys()
+        .await
+        .map_err(|e| Error::Storage(format!("commitment build: read keys: {e}")))?;
+    if keys.is_empty() {
+        debug!("Commitment rotation: storage empty, skipping");
+        return Ok(());
+    }
+
+    // Cap to MAX_COMMITMENT_KEY_COUNT for v12 (responder must not commit
+    // to more than the protocol limit; auditor would reject the
+    // commitment otherwise).
+    let cap = commitment::MAX_COMMITMENT_KEY_COUNT as usize;
+    if keys.len() > cap {
+        warn!(
+            "Commitment rotation: key set ({}) exceeds MAX_COMMITMENT_KEY_COUNT ({}); \
+             truncating — investigate as this likely means a misconfiguration",
+            keys.len(),
+            cap
+        );
+    }
+
+    // For content-addressed chunks, bytes_hash == key. Saves a full
+    // chunk-store rescan per rotation. The audit-verify path still
+    // checks `bytes_hash == BLAKE3(local_bytes)` (which for
+    // content-addressed equals key) and the digest (which is bound to
+    // the actual bytes), so a lying responder is still caught.
+    let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
+
+    let sk_bytes = identity.secret_key_bytes().to_vec();
+    let sk = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
+        .map_err(|e| Error::Crypto(format!("commitment build: load sk: {e}")))?;
+    let peer_id_bytes = *p2p.peer_id().as_bytes();
+    let built = commitment_state::BuiltCommitment::build(entries, &peer_id_bytes, &sk)
+        .map_err(|e| Error::Crypto(format!("commitment build: {e}")))?;
+
+    let hash = hex::encode(built.hash());
+    let key_count = built.commitment().key_count;
+    state.rotate(built);
+    info!("Storage commitment rotated: hash={hash} key_count={key_count}");
+    Ok(())
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

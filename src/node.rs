@@ -150,6 +150,7 @@ impl NodeBuilder {
                     Arc::clone(&p2p_arc),
                     storage_arc,
                     payment_verifier_arc,
+                    Arc::clone(&identity),
                     &self.config.root_dir,
                     fresh_rx,
                     shutdown.clone(),
