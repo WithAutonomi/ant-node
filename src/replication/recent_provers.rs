@@ -52,12 +52,15 @@ pub const MAX_PROVERS_PER_KEY: usize = 16;
 ///
 /// A proof older than this is treated as "no credit" by
 /// [`RecentProvers::is_credited_holder`] even if the commitment hash
-/// still matches. Sized at 4× the responder rotation interval (4 × 1 h
-/// = 4 h) to comfortably cover one full audit cycle plus retry margin.
-/// David's PR review (round-12) flagged the lack of time-based
-/// expiry; the LRU-by-cap path alone leaves rarely-audited keys with
-/// stale entries lingering until cap pressure evicts them.
-pub const PROVER_ENTRY_TTL: Duration = Duration::from_secs(4 * 3600);
+/// still matches.
+///
+/// v10/v12 §6 spec: `RECENT_PROOF_TTL = 2 × max audit interval` (≈40 min
+/// at the default 20 min max). Setting too low → peers fall out of
+/// credit between audits. Setting too high → lazy node has more leeway
+/// before re-audit is required. 40 min comfortably covers one audit
+/// cycle on the average peer while still requiring re-proof inside the
+/// rotation window.
+pub const PROVER_ENTRY_TTL: Duration = Duration::from_secs(40 * 60);
 
 /// One cached prover entry: who proved the key, when, and against which
 /// commitment.
