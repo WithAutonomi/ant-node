@@ -710,6 +710,11 @@ fn encode_prune_audit_challenge(
         nonce,
         challenged_peer_id: *peer.as_bytes(),
         keys: vec![key],
+        // Prune-audit challenges keep legacy plain-digest semantics
+        // (caller does its own per-key digest comparison). Commitment-
+        // bound prune audits are out of scope for phase 2; revisit in
+        // phase 3 if we choose to extend coverage there.
+        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: challenge_id,

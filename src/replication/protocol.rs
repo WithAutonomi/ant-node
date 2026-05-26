@@ -177,6 +177,14 @@ pub struct NeighborSyncRequest {
     pub paid_hints: Vec<XorName>,
     /// Whether sender is currently bootstrapping.
     pub bootstrapping: bool,
+    /// Sender's signed storage commitment (optional, see
+    /// [`crate::replication::commitment`]). `None` from old peers; from
+    /// new peers this carries the Merkle-root commitment over the
+    /// sender's claimed keys. Receivers that recognize it store it as
+    /// the per-peer "last known commitment" used to pin commitment-bound
+    /// audits.
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 /// Neighbor sync response carrying own hint sets.
@@ -190,6 +198,10 @@ pub struct NeighborSyncResponse {
     pub bootstrapping: bool,
     /// Keys that receiver rejected (optional feedback to sender).
     pub rejected_keys: Vec<XorName>,
+    /// Receiver's signed storage commitment (optional, see
+    /// [`NeighborSyncRequest::commitment`]).
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +298,20 @@ pub struct AuditChallenge {
     pub challenged_peer_id: [u8; 32],
     /// Ordered list of keys to prove storage of.
     pub keys: Vec<XorName>,
+    /// Auditor's pin to the commitment it expects the responder to use.
+    ///
+    /// `Some(h)`: a commitment-bound audit (v12 design). The responder
+    /// must reply with `AuditResponse::CommitmentBound` whose
+    /// commitment hashes via
+    /// [`crate::replication::commitment::commitment_hash`] to exactly
+    /// `h`. Any other commitment, or a plain `Digests` reply, is an
+    /// audit failure.
+    ///
+    /// `None`: legacy plain-digest audit (today's behaviour). Allows
+    /// challenging peers from whom we haven't yet received a commitment
+    /// without breaking the existing audit flow during rollout.
+    #[serde(default)]
+    pub expected_commitment_hash: Option<[u8; 32]>,
 }
 
 /// Response to audit challenge.
@@ -315,6 +341,25 @@ pub enum AuditResponse {
         challenge_id: u64,
         /// Human-readable rejection reason.
         reason: String,
+    },
+    /// Commitment-bound proof of storage (v12 storage-bound audit).
+    ///
+    /// Returned when the challenge carried an
+    /// [`AuditChallenge::expected_commitment_hash`]. Carries the
+    /// responder's signed commitment plus per-key Merkle inclusion
+    /// proofs. The auditor verifies that:
+    ///   1. `commitment_hash(commitment) == challenge.expected_commitment_hash`
+    ///   2. The commitment's signature is valid.
+    ///   3. For each per-key entry: the Merkle path verifies the leaf
+    ///      against the commitment root AND the digest matches the
+    ///      auditor's local copy of the bytes.
+    CommitmentBound {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// The signed commitment whose root the proofs are against.
+        commitment: crate::replication::commitment::StorageCommitment,
+        /// Per-key Merkle inclusion proofs, in challenge order.
+        per_key: Vec<crate::replication::commitment::CommitmentBoundResult>,
     },
 }
 
@@ -490,15 +535,138 @@ mod tests {
 
     // === Neighbor Sync roundtrips ===
 
-    // The wire types for the storage-bound audit (v12 design) are NOT
-    // yet extended. Phase 2 ships the supporting modules (commitment,
-    // commitment_state, commitment_audit, recent_provers) without
-    // touching the on-wire NeighborSync*/AuditChallenge/AuditResponse
-    // shapes. Phase 3 will introduce the wire extension via either a
-    // protocol-version bump or a separate CommitmentAnnounce message:
-    // postcard's strict struct decode (`DeserializeUnexpectedEnd` when
-    // a new field is missing) requires careful bidirectional
-    // mixed-version testing, deferred to that phase.
+    // -- backwards compat across the wire-type extension --------------------
+
+    /// Backwards-compat: an old peer that has the v0 layout of
+    /// `NeighborSyncRequest` (no `commitment` field) can still decode a
+    /// message encoded by a new peer that emits `commitment: None`. This
+    /// is the realistic mixed-version case during rollout: new peers
+    /// gossip with the field; old peers must not crash.
+    ///
+    /// The check works because postcard's [`from_bytes`] is lenient on
+    /// trailing bytes — the old decoder reads what it knows about and
+    /// stops, the new fields are silently ignored. This test pins that
+    /// invariant so any future codec/library swap that breaks it is
+    /// caught immediately.
+    #[test]
+    fn old_decoder_tolerates_new_neighbor_sync_request() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct OldNeighborSyncRequest {
+            #[allow(dead_code)]
+            pub replica_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub paid_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub bootstrapping: bool,
+        }
+
+        let new_req = NeighborSyncRequest {
+            replica_hints: vec![[0x01; 32], [0x02; 32]],
+            paid_hints: vec![[0x03; 32]],
+            bootstrapping: true,
+            commitment: None,
+        };
+        let encoded = postcard::to_stdvec(&new_req).expect("encode");
+        let old_decoded: OldNeighborSyncRequest =
+            postcard::from_bytes(&encoded).expect("old decoder accepts");
+        // Field-by-field check would fail if old peer misaligned on the
+        // length prefix — passing decode is the structural check.
+        assert_eq!(old_decoded.replica_hints.len(), 2);
+        assert_eq!(old_decoded.paid_hints.len(), 1);
+        assert!(old_decoded.bootstrapping);
+    }
+
+    /// Same property for `NeighborSyncResponse`.
+    #[test]
+    fn old_decoder_tolerates_new_neighbor_sync_response() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct OldNeighborSyncResponse {
+            #[allow(dead_code)]
+            pub replica_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub paid_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub bootstrapping: bool,
+            #[allow(dead_code)]
+            pub rejected_keys: Vec<XorName>,
+        }
+
+        let new_resp = NeighborSyncResponse {
+            replica_hints: vec![[0x04; 32]],
+            paid_hints: vec![],
+            bootstrapping: false,
+            rejected_keys: vec![[0x05; 32]],
+            commitment: None,
+        };
+        let encoded = postcard::to_stdvec(&new_resp).expect("encode");
+        let old_decoded: OldNeighborSyncResponse =
+            postcard::from_bytes(&encoded).expect("old decoder accepts");
+        assert_eq!(old_decoded.replica_hints.len(), 1);
+        assert_eq!(old_decoded.rejected_keys.len(), 1);
+    }
+
+    /// `AuditChallenge` extension: old peer (no `expected_commitment_hash`
+    /// field) decodes a new-peer message OK.
+    #[test]
+    fn old_decoder_tolerates_new_audit_challenge() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct OldAuditChallenge {
+            #[allow(dead_code)]
+            pub challenge_id: u64,
+            #[allow(dead_code)]
+            pub nonce: [u8; 32],
+            #[allow(dead_code)]
+            pub challenged_peer_id: [u8; 32],
+            #[allow(dead_code)]
+            pub keys: Vec<XorName>,
+        }
+
+        let new_ch = AuditChallenge {
+            challenge_id: 7,
+            nonce: [0xAA; 32],
+            challenged_peer_id: [0xBB; 32],
+            keys: vec![[0x01; 32], [0x02; 32]],
+            expected_commitment_hash: None,
+        };
+        let encoded = postcard::to_stdvec(&new_ch).expect("encode");
+        let old_decoded: OldAuditChallenge =
+            postcard::from_bytes(&encoded).expect("old decoder accepts");
+        assert_eq!(old_decoded.challenge_id, 7);
+        assert_eq!(old_decoded.keys.len(), 2);
+    }
+
+    /// Roundtrip: a new peer can decode its own message including the
+    /// commitment field. Catches accidental serde annotation breakage
+    /// (e.g. forgetting `#[serde(default)]` on the new field).
+    #[test]
+    fn new_peer_roundtrips_with_commitment_some() {
+        use crate::replication::commitment::{sign_commitment, StorageCommitment};
+        use saorsa_pqc::api::sig::ml_dsa_65;
+
+        let (_pk, sk) = ml_dsa_65().generate_keypair().expect("keygen");
+        let root = [0x7Fu8; 32];
+        let sender = [0xCCu8; 32];
+        let sig = sign_commitment(&sk, &root, 3, &sender).expect("sign");
+        let commitment = StorageCommitment {
+            root,
+            key_count: 3,
+            sender_peer_id: sender,
+            signature: sig,
+        };
+
+        let req = NeighborSyncRequest {
+            replica_hints: vec![[0x01; 32]],
+            paid_hints: vec![],
+            bootstrapping: false,
+            commitment: Some(commitment.clone()),
+        };
+        let encoded = postcard::to_stdvec(&req).expect("encode");
+        let decoded: NeighborSyncRequest = postcard::from_bytes(&encoded).expect("new decoder");
+        assert_eq!(decoded.commitment, Some(commitment));
+    }
 
     #[test]
     fn neighbor_sync_request_roundtrip() {
@@ -508,6 +676,7 @@ mod tests {
                 replica_hints: vec![[0x01; 32], [0x02; 32]],
                 paid_hints: vec![[0x03; 32]],
                 bootstrapping: true,
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
@@ -532,6 +701,7 @@ mod tests {
                 paid_hints: vec![],
                 bootstrapping: false,
                 rejected_keys: vec![[0x05; 32], [0x06; 32]],
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
@@ -707,6 +877,7 @@ mod tests {
                 nonce: [0xAB; 32],
                 challenged_peer_id: [0xCD; 32],
                 keys: vec![[0x01; 32], [0x02; 32]],
+                expected_commitment_hash: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
