@@ -425,6 +425,20 @@ pub async fn audit_tick_with_repair_proofs(
                 );
                 return AuditTickResult::Idle;
             }
+            // v12 paragraph 5: "key not in commitment" is also a benign
+            // staleness signal, NOT a failure. The auditor sampled a key
+            // it holds and that the peer SHOULD hold (close-group), but
+            // which the peer hasn't yet committed to (e.g. just-replicated
+            // after their last rotation). Penalising this would punish
+            // honest peers who have the bytes but haven't rebuilt their
+            // Merkle tree yet (codex round-11 MAJOR #2).
+            if expected_commitment_hash.is_some() && reason.starts_with("key not in commitment") {
+                info!(
+                    "Audit: peer {challenged_peer} reports key-not-in-commitment; \
+                     skipping (responder commitment is stale relative to its key set)"
+                );
+                return AuditTickResult::Idle;
+            }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
                 &challenged_peer,
