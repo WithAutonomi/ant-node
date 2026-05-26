@@ -543,6 +543,35 @@ pub async fn handle_audit_challenge(
     is_bootstrapping: bool,
     stored_chunks: usize,
 ) -> AuditResponse {
+    handle_audit_challenge_with_commitment(
+        challenge,
+        storage,
+        self_peer_id,
+        is_bootstrapping,
+        stored_chunks,
+        None,
+    )
+    .await
+}
+
+/// Like [`handle_audit_challenge`] but also accepts a responder's
+/// `ResponderCommitmentState`. If the challenge carries
+/// `expected_commitment_hash: Some(h)`, dispatches to the v12
+/// commitment-bound response path (gates: structural / pin / signature
+/// / per-key path+digest); otherwise falls through to the legacy
+/// plain-digest path.
+///
+/// Backwards-compatible: existing callers that don't have a
+/// `ResponderCommitmentState` keep calling `handle_audit_challenge`,
+/// which forwards here with `commitment_state = None`.
+pub async fn handle_audit_challenge_with_commitment(
+    challenge: &AuditChallenge,
+    storage: &LmdbStorage,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    stored_chunks: usize,
+    commitment_state: Option<&std::sync::Arc<crate::replication::commitment_state::ResponderCommitmentState>>,
+) -> AuditResponse {
     if is_bootstrapping {
         return AuditResponse::Bootstrapping {
             challenge_id: challenge.challenge_id,
@@ -577,6 +606,59 @@ pub async fn handle_audit_challenge(
         };
     }
 
+    // v12 commitment-bound path: when the auditor pinned a specific
+    // commitment, look it up in our state and produce a CommitmentBound
+    // response. If we don't have that commitment (rotated away, never
+    // gossiped, etc.) reject with reason="unknown commitment hash" —
+    // the auditor's v12 §5 handler conditionally invalidates its pin
+    // on this rejection (currently in phase-3.5 follow-up).
+    if let (Some(expected_hash), Some(state)) =
+        (challenge.expected_commitment_hash.as_ref(), commitment_state)
+    {
+        // Pre-load all challenged-key bytes since the helper closure
+        // is synchronous but storage reads are async. For a sqrt-scaled
+        // sample (~100 keys at 10k stored) this is bounded.
+        let mut local_bytes = std::collections::HashMap::with_capacity(challenge.keys.len());
+        for key in &challenge.keys {
+            if let Ok(Some(data)) = storage.get_raw(key).await {
+                local_bytes.insert(*key, data);
+            }
+        }
+
+        let outcome = crate::replication::commitment_state::build_commitment_bound_audit_response(
+            state,
+            expected_hash,
+            &challenge.keys,
+            &challenge.nonce,
+            &challenge.challenged_peer_id,
+            |k| local_bytes.get(k).cloned(),
+        );
+
+        return match outcome {
+            crate::replication::commitment_state::CommitmentBoundOutcome::Built {
+                commitment,
+                per_key,
+            } => AuditResponse::CommitmentBound {
+                challenge_id: challenge.challenge_id,
+                commitment,
+                per_key,
+            },
+            crate::replication::commitment_state::CommitmentBoundOutcome::UnknownCommitmentHash => {
+                AuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    reason: "unknown commitment hash".to_string(),
+                }
+            }
+            crate::replication::commitment_state::CommitmentBoundOutcome::KeyNotInCommitment {
+                key,
+            } => AuditResponse::Rejected {
+                challenge_id: challenge.challenge_id,
+                reason: format!("key not in commitment: {}", hex::encode(key)),
+            },
+        };
+    }
+
+    // Legacy plain-digest path (unchanged from pre-v12).
     let mut digests = Vec::with_capacity(challenge.keys.len());
 
     for key in &challenge.keys {
