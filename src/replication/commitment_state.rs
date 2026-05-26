@@ -212,6 +212,106 @@ impl ResponderCommitmentState {
 }
 
 // ---------------------------------------------------------------------------
+// Responder: commitment-bound audit handler
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`build_commitment_bound_audit_response`]: either a
+/// fully-built `CommitmentBound` response, or a typed rejection reason
+/// the caller turns into an `AuditResponse::Rejected`.
+#[derive(Debug)]
+pub enum CommitmentBoundOutcome {
+    /// Per-key proofs + commitment. Caller wraps in
+    /// `AuditResponse::CommitmentBound`.
+    Built {
+        /// The commitment whose root the proofs are against.
+        commitment: crate::replication::commitment::StorageCommitment,
+        /// Per-key Merkle inclusion proofs, in challenge order.
+        per_key: Vec<crate::replication::commitment::CommitmentBoundResult>,
+    },
+    /// The auditor pinned a commitment we don't recognize. Caller emits
+    /// `AuditResponse::Rejected { reason: "unknown commitment hash" }`.
+    /// Auditors classify this per the v12 §5 conditional-invalidation
+    /// rule: only invalidate `last_commitment` if it still matches the
+    /// rejected hash.
+    UnknownCommitmentHash,
+    /// One or more challenged keys are not in the matched commitment.
+    /// The auditor only commitment-audits keys it itself holds, so this
+    /// can happen if the responder rotated between the gossip the
+    /// auditor saw and the audit response. Caller emits
+    /// `AuditResponse::Rejected { reason: "key not in commitment" }`.
+    /// (Treated as a normal Rejected by today's auditor.)
+    KeyNotInCommitment {
+        /// The first challenged key the matched commitment didn't cover.
+        key: crate::ant_protocol::XorName,
+    },
+}
+
+/// Build a `CommitmentBound` audit response for the challenged peer
+/// using the given `state`.
+///
+/// Called by the responder when an `AuditChallenge` has
+/// `expected_commitment_hash: Some(h)`. The responder looks up `h` in
+/// its `ResponderCommitmentState` (current + previous), and produces a
+/// per-key proof against the matched tree. Per v12 §4: the responder
+/// MUST answer against the *exact* commitment whose hash matches the
+/// pin — that's what `lookup_by_hash` enforces.
+///
+/// The caller is responsible for:
+///   - Looking up record bytes for each challenged key (the per-key
+///     `digest` is bound to the bytes via
+///     [`compute_audit_digest`]). This module exposes `bytes_for`
+///     as a closure so the caller can use whatever storage handle it
+///     has without this module depending on `LmdbStorage`.
+///
+/// [`compute_audit_digest`]: crate::replication::protocol::compute_audit_digest
+///
+/// # Errors / outcome
+///
+/// See [`CommitmentBoundOutcome`].
+pub fn build_commitment_bound_audit_response(
+    state: &ResponderCommitmentState,
+    expected_commitment_hash: &[u8; 32],
+    challenge_keys: &[crate::ant_protocol::XorName],
+    challenge_nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    bytes_for: impl Fn(&crate::ant_protocol::XorName) -> Option<Vec<u8>>,
+) -> CommitmentBoundOutcome {
+    use crate::replication::commitment::CommitmentBoundResult;
+    use crate::replication::protocol::compute_audit_digest;
+
+    let Some(built) = state.lookup_by_hash(expected_commitment_hash) else {
+        return CommitmentBoundOutcome::UnknownCommitmentHash;
+    };
+
+    let mut per_key = Vec::with_capacity(challenge_keys.len());
+    for key in challenge_keys {
+        let Some((path, leaf_index)) = built.proof_for(key) else {
+            return CommitmentBoundOutcome::KeyNotInCommitment { key: *key };
+        };
+        // If we don't actually have the bytes, we can't produce a
+        // valid digest; treat as "key not in commitment" since the
+        // commitment claims we have it but we don't.
+        let Some(bytes) = bytes_for(key) else {
+            return CommitmentBoundOutcome::KeyNotInCommitment { key: *key };
+        };
+        let bytes_hash = *blake3::hash(&bytes).as_bytes();
+        let digest = compute_audit_digest(challenge_nonce, challenged_peer_id, key, &bytes);
+        per_key.push(CommitmentBoundResult {
+            key: *key,
+            digest,
+            bytes_hash,
+            leaf_index,
+            path,
+        });
+    }
+
+    CommitmentBoundOutcome::Built {
+        commitment: built.commitment().clone(),
+        per_key,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -334,6 +434,259 @@ mod tests {
         assert!(state.lookup_by_hash(&h1).is_some());
         assert!(state.lookup_by_hash(&h2).is_some());
         assert!(state.lookup_by_hash(&[0xFF; 32]).is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // build_commitment_bound_audit_response
+    // ---------------------------------------------------------------------
+
+    fn content(byte: u8) -> Vec<u8> {
+        (0..256u32).map(|i| (i as u8) ^ byte).collect()
+    }
+
+    fn bytes_hash(b: &[u8]) -> [u8; 32] {
+        *blake3::hash(b).as_bytes()
+    }
+
+    #[test]
+    fn build_response_succeeds_for_keys_in_current_commitment() {
+        let (_pk, sk) = keypair();
+        let state = ResponderCommitmentState::new();
+        let peer_id = [0xAB; 32];
+
+        let entries: Vec<_> = (1..=5u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let h = built.hash();
+        state.rotate(built);
+
+        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
+            (1..=5u8).find(|i| key(*i) == *k).map(content)
+        };
+        let outcome = build_commitment_bound_audit_response(
+            &state,
+            &h,
+            &[key(1), key(3)],
+            &[0xCD; 32],
+            &peer_id,
+            bytes_lookup,
+        );
+        match outcome {
+            CommitmentBoundOutcome::Built { commitment, per_key } => {
+                assert_eq!(commitment_hash(&commitment).unwrap(), h);
+                assert_eq!(per_key.len(), 2);
+                assert_eq!(per_key[0].key, key(1));
+                assert_eq!(per_key[1].key, key(3));
+            }
+            other => panic!("expected Built, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_response_unknown_commitment_hash() {
+        let (_pk, sk) = keypair();
+        let state = ResponderCommitmentState::new();
+        // No rotate; state has no commitment.
+        let outcome = build_commitment_bound_audit_response(
+            &state,
+            &[0xAA; 32], // arbitrary hash, nothing matches
+            &[key(1)],
+            &[0; 32],
+            &[0; 32],
+            |_| Some(content(1)),
+        );
+        let _ = sk;
+        assert!(matches!(
+            outcome,
+            CommitmentBoundOutcome::UnknownCommitmentHash
+        ));
+    }
+
+    #[test]
+    fn build_response_falls_back_to_previous_after_rotation() {
+        // INV-R2: an audit pinned to the just-demoted commitment is
+        // still answerable. v5/v12 §4.
+        let (_pk, sk) = keypair();
+        let state = ResponderCommitmentState::new();
+        let peer_id = [0xAB; 32];
+
+        let entries_c1: Vec<_> = (1..=3u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let c1 = BuiltCommitment::build(entries_c1, &peer_id, &sk).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+
+        // Rotate to a new commitment (key set unchanged for simplicity).
+        let entries_c2: Vec<_> = (1..=4u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let c2 = BuiltCommitment::build(entries_c2, &peer_id, &sk).unwrap();
+        state.rotate(c2);
+
+        // Auditor still pinned to h1.
+        let outcome = build_commitment_bound_audit_response(
+            &state,
+            &h1,
+            &[key(1)],
+            &[0; 32],
+            &peer_id,
+            |_| Some(content(1)),
+        );
+        assert!(matches!(
+            outcome,
+            CommitmentBoundOutcome::Built { commitment, .. }
+            if commitment_hash(&commitment).unwrap() == h1
+        ));
+    }
+
+    #[test]
+    fn build_response_key_not_in_commitment() {
+        let (_pk, sk) = keypair();
+        let state = ResponderCommitmentState::new();
+        let peer_id = [0xAB; 32];
+
+        let entries: Vec<_> = (1..=3u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let h = built.hash();
+        state.rotate(built);
+
+        let outcome = build_commitment_bound_audit_response(
+            &state,
+            &h,
+            &[key(99)], // not committed
+            &[0; 32],
+            &peer_id,
+            |_| Some(content(99)),
+        );
+        assert!(matches!(
+            outcome,
+            CommitmentBoundOutcome::KeyNotInCommitment { .. }
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // End-to-end: responder builds → auditor verifies
+    // ---------------------------------------------------------------------
+
+    use crate::replication::commitment_audit::verify_commitment_bound_response;
+
+    #[test]
+    fn end_to_end_responder_to_auditor_happy_path() {
+        // Honest responder + honest auditor. Auditor should verify OK.
+        let (pk, sk) = keypair();
+        let state = ResponderCommitmentState::new();
+        let peer_id = [0xAB; 32];
+        let nonce = [0xCD; 32];
+
+        let entries: Vec<_> = (1..=8u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let h = built.hash();
+        state.rotate(built);
+
+        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
+            (1..=8u8).find(|i| key(*i) == *k).map(content)
+        };
+        let challenge_keys = vec![key(1), key(4), key(7)];
+
+        let CommitmentBoundOutcome::Built { commitment, per_key } =
+            build_commitment_bound_audit_response(
+                &state,
+                &h,
+                &challenge_keys,
+                &nonce,
+                &peer_id,
+                &bytes_lookup,
+            )
+        else {
+            panic!("expected Built");
+        };
+
+        let result = verify_commitment_bound_response(
+            &challenge_keys,
+            &nonce,
+            &peer_id,
+            &h,
+            &commitment,
+            &per_key,
+            &pk,
+            bytes_lookup,
+        );
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn end_to_end_lazy_node_fresh_commitment_substitution_fails() {
+        // Concrete v12 Finding-1 attacker: a lazy node has only a few
+        // bytes. The auditor pinned an *older* commitment hash. The
+        // lazy node tries to build a fresh commitment and substitute it
+        // into the response. Auditor's pin check (gate 2) rejects.
+        let (pk, sk) = keypair();
+        let state_original = ResponderCommitmentState::new();
+        let peer_id = [0xAB; 32];
+        let nonce = [0xCD; 32];
+
+        // Honest: auditor pinned this commitment when it was current.
+        let entries_orig: Vec<_> = (1..=8u8)
+            .map(|i| (key(i), bytes_hash(&content(i))))
+            .collect();
+        let original = BuiltCommitment::build(entries_orig, &peer_id, &sk).unwrap();
+        let pinned_hash = original.hash();
+        state_original.rotate(original);
+
+        // The auditor still has the original pin. Now imagine a lazy
+        // attacker tries to substitute a NEW commitment in the
+        // response. We model this by having a separate state with a
+        // different commitment, and having the attacker draw the
+        // response from THAT.
+        let state_attacker = ResponderCommitmentState::new();
+        let entries_attacker: Vec<_> = vec![(key(1), bytes_hash(&content(1)))];
+        let attacker_built =
+            BuiltCommitment::build(entries_attacker, &peer_id, &sk).unwrap();
+        state_attacker.rotate(attacker_built);
+
+        // Attacker builds response from THEIR commitment but auditor's
+        // pin is the ORIGINAL hash. We just call the build helper with
+        // attacker's state and the attacker's matching hash to get a
+        // valid response (against attacker's commitment).
+        let attacker_hash = state_attacker.current().unwrap().hash();
+        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
+            (1..=8u8).find(|i| key(*i) == *k).map(content)
+        };
+        let CommitmentBoundOutcome::Built { commitment, per_key } =
+            build_commitment_bound_audit_response(
+                &state_attacker,
+                &attacker_hash,
+                &[key(1)],
+                &nonce,
+                &peer_id,
+                &bytes_lookup,
+            )
+        else {
+            panic!("attacker build should succeed against their own state");
+        };
+
+        // Auditor verifies against the ORIGINAL pin. Must reject at gate 2.
+        let result = verify_commitment_bound_response(
+            &[key(1)],
+            &nonce,
+            &peer_id,
+            &pinned_hash,
+            &commitment,
+            &per_key,
+            &pk,
+            bytes_lookup,
+        );
+        use crate::replication::commitment_audit::AuditVerifyError;
+        assert!(
+            matches!(result, Err(AuditVerifyError::CommitmentHashMismatch)),
+            "expected CommitmentHashMismatch, got {result:?}"
+        );
     }
 
     #[test]
