@@ -69,15 +69,23 @@ impl BuiltCommitment {
         entries: Vec<(XorName, [u8; 32])>,
         sender_peer_id: &[u8; 32],
         secret_key: &MlDsaSecretKey,
+        sender_public_key: &[u8],
     ) -> Result<Self, CommitmentError> {
         let tree = MerkleTree::build(entries)?;
         let root = tree.root();
         let key_count = tree.key_count();
-        let signature = sign_commitment(secret_key, &root, key_count, sender_peer_id)?;
+        let signature = sign_commitment(
+            secret_key,
+            &root,
+            key_count,
+            sender_peer_id,
+            sender_public_key,
+        )?;
         let commitment = StorageCommitment {
             root,
             key_count,
             sender_peer_id: *sender_peer_id,
+            sender_public_key: sender_public_key.to_vec(),
             signature,
         };
         // `commitment_hash` only returns None on a postcard serialization
@@ -339,8 +347,9 @@ mod tests {
     #[test]
     fn built_commitment_hash_matches_global_hash() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let entries: Vec<_> = (1..=5u8).map(|i| (key(i), bh(i))).collect();
-        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk).unwrap();
+        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
         let expected = commitment_hash(built.commitment()).unwrap();
         assert_eq!(built.hash(), expected);
     }
@@ -348,8 +357,9 @@ mod tests {
     #[test]
     fn built_commitment_proof_verifies_under_its_own_root() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let entries: Vec<_> = (1..=8u8).map(|i| (key(i), bh(i))).collect();
-        let built = BuiltCommitment::build(entries.clone(), &[1; 32], &sk).unwrap();
+        let built = BuiltCommitment::build(entries.clone(), &[1; 32], &sk, &pk_bytes).unwrap();
         let root = built.commitment().root;
         let key_count = built.commitment().key_count;
 
@@ -368,8 +378,14 @@ mod tests {
     #[test]
     fn proof_for_absent_key_is_none() {
         let (_pk, sk) = keypair();
-        let built =
-            BuiltCommitment::build(vec![(key(1), bh(1)), (key(2), bh(2))], &[0; 32], &sk).unwrap();
+        let pk_bytes = _pk.to_bytes();
+        let built = BuiltCommitment::build(
+            vec![(key(1), bh(1)), (key(2), bh(2))],
+            &[0; 32],
+            &sk,
+            &pk_bytes,
+        )
+        .unwrap();
         assert!(built.proof_for(&key(99)).is_none());
     }
 
@@ -383,17 +399,18 @@ mod tests {
     #[test]
     fn rotate_promotes_and_demotes() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
         // First rotation: just current, no previous.
-        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk).unwrap();
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
         state.rotate(c1);
         assert_eq!(state.current().unwrap().hash(), h1);
         assert!(state.previous().is_none());
 
         // Second rotation: c1 demoted to previous.
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk).unwrap();
+        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h2 = c2.hash();
         state.rotate(c2);
         assert_eq!(state.current().unwrap().hash(), h2);
@@ -403,12 +420,13 @@ mod tests {
     #[test]
     fn rotate_drops_oldest_after_two_rotations() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
-        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk).unwrap();
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk).unwrap();
-        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk).unwrap();
+        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
+        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h3 = c3.hash();
         state.rotate(c1);
         state.rotate(c2);
@@ -423,10 +441,11 @@ mod tests {
     #[test]
     fn lookup_finds_current_and_previous() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk).unwrap();
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk).unwrap();
+        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h2 = c2.hash();
         state.rotate(c1);
         state.rotate(c2);
@@ -451,13 +470,14 @@ mod tests {
     #[test]
     fn build_response_succeeds_for_keys_in_current_commitment() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
         let peer_id = [0xAB; 32];
 
         let entries: Vec<_> = (1..=5u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
             .collect();
-        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_bytes).unwrap();
         let h = built.hash();
         state.rotate(built);
 
@@ -488,6 +508,7 @@ mod tests {
     #[test]
     fn build_response_unknown_commitment_hash() {
         let (_pk, sk) = keypair();
+        let _ = sk;
         let state = ResponderCommitmentState::new();
         // No rotate; state has no commitment.
         let outcome = build_commitment_bound_audit_response(
@@ -498,7 +519,6 @@ mod tests {
             &[0; 32],
             |_| Some(content(1)),
         );
-        let _ = sk;
         assert!(matches!(
             outcome,
             CommitmentBoundOutcome::UnknownCommitmentHash
@@ -510,13 +530,14 @@ mod tests {
         // INV-R2: an audit pinned to the just-demoted commitment is
         // still answerable. v5/v12 §4.
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
         let peer_id = [0xAB; 32];
 
         let entries_c1: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
             .collect();
-        let c1 = BuiltCommitment::build(entries_c1, &peer_id, &sk).unwrap();
+        let c1 = BuiltCommitment::build(entries_c1, &peer_id, &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
         state.rotate(c1);
 
@@ -524,7 +545,7 @@ mod tests {
         let entries_c2: Vec<_> = (1..=4u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
             .collect();
-        let c2 = BuiltCommitment::build(entries_c2, &peer_id, &sk).unwrap();
+        let c2 = BuiltCommitment::build(entries_c2, &peer_id, &sk, &pk_bytes).unwrap();
         state.rotate(c2);
 
         // Auditor still pinned to h1.
@@ -546,13 +567,14 @@ mod tests {
     #[test]
     fn build_response_key_not_in_commitment() {
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
         let peer_id = [0xAB; 32];
 
         let entries: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
             .collect();
-        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_bytes).unwrap();
         let h = built.hash();
         state.rotate(built);
 
@@ -579,7 +601,8 @@ mod tests {
     #[test]
     fn end_to_end_responder_to_auditor_happy_path() {
         // Honest responder + honest auditor. Auditor should verify OK.
-        let (pk, sk) = keypair();
+        let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
         let peer_id = [0xAB; 32];
         let nonce = [0xCD; 32];
@@ -587,7 +610,7 @@ mod tests {
         let entries: Vec<_> = (1..=8u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
             .collect();
-        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_bytes).unwrap();
         let h = built.hash();
         state.rotate(built);
 
@@ -617,9 +640,10 @@ mod tests {
             &h,
             &commitment,
             &per_key,
-            &pk,
             bytes_lookup,
         );
+        // `_pk` is not directly used in verify (the embedded key is) but
+        // we asserted it was the signing key during build.
         assert!(result.is_ok(), "{result:?}");
     }
 
@@ -635,17 +659,18 @@ mod tests {
         // be able to finish building the response even after the state
         // rotates that commitment out.
         let (_pk, sk) = keypair();
+        let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
-        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk).unwrap();
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
         state.rotate(c1);
 
         let in_flight = state.lookup_by_hash(&h1).unwrap();
 
         // Two rotations — h1 is gone from state.
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk).unwrap();
-        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk).unwrap();
+        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
+        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
         state.rotate(c2);
         state.rotate(c3);
         assert!(state.lookup_by_hash(&h1).is_none());

@@ -93,7 +93,13 @@ impl Responder {
             .iter()
             .map(|&i| (key(i), content_hash(i)))
             .collect();
-        let built = BuiltCommitment::build(entries, &self.peer_id_bytes, &self.secret_key).unwrap();
+        let built = BuiltCommitment::build(
+            entries,
+            &self.peer_id_bytes,
+            &self.secret_key,
+            &self.public_key.to_bytes(),
+        )
+        .unwrap();
         self.state.rotate(built);
     }
 
@@ -129,9 +135,10 @@ impl Responder {
 
 /// Auditor verification — takes everything from the responder via the
 /// `CommitmentBoundOutcome::Built` arm and runs the real auditor's
-/// `verify_commitment_bound_response`.
+/// `verify_commitment_bound_response`. The responder's public key is now
+/// embedded in the commitment itself, so no external `responder_public_key`
+/// argument is needed.
 fn auditor_verifies(
-    responder_public_key: &MlDsaPublicKey,
     responder_peer_id_bytes: &[u8; 32],
     pinned_hash: &[u8; 32],
     challenge_keys: &[[u8; 32]],
@@ -147,7 +154,6 @@ fn auditor_verifies(
         pinned_hash,
         response_commitment,
         response_per_key,
-        responder_public_key,
         auditor_local_bytes,
     )
 }
@@ -195,7 +201,6 @@ fn honest_responder_passes_audit_lazy_responder_fails() {
     };
 
     let result = auditor_verifies(
-        &honest.public_key,
         &honest.peer_id_bytes,
         &pinned_hash,
         &challenge_keys,
@@ -266,7 +271,6 @@ fn fresh_commitment_substitution_rejected_by_pin() {
     };
 
     let result = auditor_verifies(
-        &lazy.public_key,
         &lazy.peer_id_bytes,
         &pinned_hash, // <-- ORIGINAL pin, not the fresh hash
         &[key(1)],
@@ -383,7 +387,6 @@ fn audit_response_replay_blocked_by_fresh_nonce() {
     // Auditor's FRESH challenge has `fresh_nonce`. Replaying the OLD
     // response (with `original_nonce`-derived digest) must fail.
     let result = auditor_verifies(
-        &responder.public_key,
         &responder.peer_id_bytes,
         &pinned_hash,
         &[key(1)],
@@ -444,8 +447,15 @@ fn rotated_commitment_drops_holder_credit() {
 // ---------------------------------------------------------------------------
 
 /// A response carrying a commitment signed by the WRONG key (somebody
-/// else's keypair) is rejected at the signature gate, not just the pin
-/// gate.
+/// else's keypair) is rejected at the signature gate.
+///
+/// Since the public key is now embedded in the commitment, the equivalent
+/// attack is for a tampering peer (e.g. the responder lying about which
+/// key actually signed) to swap the embedded `sender_public_key` to a
+/// different key. The commitment hash changes (so the pin would catch
+/// it first); to isolate the signature gate, we both swap the key and
+/// re-pin the auditor to the new hash. The signature gate then rejects
+/// because the swapped key did not sign the payload.
 #[test]
 fn wrong_signer_rejected_at_signature_gate() {
     let nonce = [0xCD; 32];
@@ -471,21 +481,24 @@ fn wrong_signer_rejected_at_signature_gate() {
         }
     };
 
-    // Auditor uses the WRONG public key (e.g. confused about which key
-    // belongs to which peer). Signature gate rejects.
+    // Swap the embedded public key to a different one. This changes the
+    // commitment hash, so re-pin to isolate the signature gate.
+    let mut bad_commit = commitment.clone();
+    bad_commit.sender_public_key = wrong_public_key.to_bytes();
+    let new_pin = commitment_hash(&bad_commit).unwrap();
+
     let result = auditor_verifies(
-        &wrong_public_key, // <-- not responder.public_key
         &responder.peer_id_bytes,
-        &pinned_hash,
+        &new_pin,
         &[key(1)],
         &nonce,
-        &commitment,
+        &bad_commit,
         &per_key,
         auditor_local,
     );
     assert!(
         matches!(result, Err(AuditVerifyError::SignatureInvalid)),
-        "wrong key must trip signature gate, got {result:?}",
+        "swapped embedded key must trip signature gate, got {result:?}",
     );
 }
 
@@ -585,7 +598,6 @@ fn on_demand_fetch_under_original_pin_succeeds_documenting_v12_limit() {
         }
     };
     let result = auditor_verifies(
-        &lazy.public_key,
         &lazy.peer_id_bytes,
         &pinned_hash,
         &challenge_keys,
@@ -632,7 +644,6 @@ fn cross_peer_commitment_substitution_rejected_by_sender_id() {
     // somehow has p_hash in its pin (modelling a mis-binding bug).
     // Q's public key, P's signed commitment.
     let q_peer_id_bytes = [0xCC; 32];
-    let (q_public_key, _) = keypair();
 
     // Q builds a response that contains P's commitment (lifted from
     // gossip). The path/digests/bytes happen to be valid for P's
@@ -657,7 +668,6 @@ fn cross_peer_commitment_substitution_rejected_by_sender_id() {
     // sender_peer_id in the commitment is P's (0xAA), not Q's (0xCC).
     // Gate 2a rejects.
     let result = auditor_verifies(
-        &q_public_key,
         &q_peer_id_bytes, // challenged peer
         &p_hash,
         &[key(1)],
@@ -779,7 +789,6 @@ fn each_gate_fires_independently() {
 
     // Baseline: valid.
     let ok = auditor_verifies(
-        &responder.public_key,
         &responder.peer_id_bytes,
         &pinned_hash,
         &[key(1)],
@@ -794,7 +803,6 @@ fn each_gate_fires_independently() {
     let mut bad = per_key.clone();
     bad[0].bytes_hash[0] ^= 1;
     let r = auditor_verifies(
-        &responder.public_key,
         &responder.peer_id_bytes,
         &pinned_hash,
         &[key(1)],
@@ -809,7 +817,6 @@ fn each_gate_fires_independently() {
     let mut bad = per_key.clone();
     bad[0].path[0][0] ^= 1;
     let r = auditor_verifies(
-        &responder.public_key,
         &responder.peer_id_bytes,
         &pinned_hash,
         &[key(1)],
@@ -824,7 +831,6 @@ fn each_gate_fires_independently() {
     let mut bad = per_key.clone();
     bad[0].digest[0] ^= 1;
     let r = auditor_verifies(
-        &responder.public_key,
         &responder.peer_id_bytes,
         &pinned_hash,
         &[key(1)],
@@ -844,23 +850,26 @@ fn each_gate_fires_independently() {
 /// lemma underwrites every "pin doesn't match" test above.
 #[test]
 fn commitment_hash_is_field_sensitive() {
-    let (_pk, sk) = keypair();
-    let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32]).unwrap();
+    let (pk, sk) = keypair();
+    let pk_bytes = pk.to_bytes();
+    let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32], &pk_bytes).unwrap();
     let c1 = StorageCommitment {
         root: [0; 32],
         key_count: 1,
         sender_peer_id: [0; 32],
+        sender_public_key: pk_bytes,
         signature: sig,
     };
     let h1 = commitment_hash(&c1).unwrap();
 
-    for mutate in 0..4u8 {
+    for mutate in 0..5u8 {
         let mut c = c1.clone();
         match mutate {
             0 => c.root[0] ^= 1,
             1 => c.key_count += 1,
             2 => c.sender_peer_id[0] ^= 1,
             3 => c.signature[0] ^= 1,
+            4 => c.sender_public_key[0] ^= 1,
             _ => unreachable!(),
         }
         let h = commitment_hash(&c).unwrap();
@@ -899,13 +908,21 @@ fn merkle_tree_root_is_deterministic_per_key_set() {
 fn signature_round_trips_correctly() {
     let (pk1, sk1) = keypair();
     let (pk2, _sk2) = keypair();
-    let sig = sign_commitment(&sk1, &[7; 32], 42, &[3; 32]).unwrap();
+    let pk1_bytes = pk1.to_bytes();
+    let pk2_bytes = pk2.to_bytes();
+    let sig = sign_commitment(&sk1, &[7; 32], 42, &[3; 32], &pk1_bytes).unwrap();
     let c = StorageCommitment {
         root: [7; 32],
         key_count: 42,
         sender_peer_id: [3; 32],
+        sender_public_key: pk1_bytes,
         signature: sig,
     };
-    assert!(verify_commitment_signature(&c, &pk1));
-    assert!(!verify_commitment_signature(&c, &pk2));
+    // Verifies via the embedded pk1 key.
+    assert!(verify_commitment_signature(&c));
+    // If we swap the embedded key to pk2 (keeping the signature signed by
+    // sk1), verification must fail because pk2 didn't sign this payload.
+    let mut c2 = c.clone();
+    c2.sender_public_key = pk2_bytes;
+    assert!(!verify_commitment_signature(&c2));
 }

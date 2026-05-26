@@ -10,11 +10,14 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
+use crate::replication::commitment::{commitment_hash, CommitmentBoundResult, StorageCommitment};
+use crate::replication::commitment_audit::verify_commitment_bound_response;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
+use crate::replication::recent_provers::RecentProvers;
 use crate::replication::types::{
     AuditFailureReason, FailureEvidence, PeerSyncRecord, RepairProofs,
 };
@@ -57,6 +60,28 @@ pub enum AuditTickResult {
 // Main audit tick
 // ---------------------------------------------------------------------------
 
+/// Read-only context the auditor uses to issue commitment-bound audits.
+///
+/// Bundled into one struct so [`audit_tick_with_repair_proofs`] stays
+/// readable when v12 enforcement is enabled. Passing `None` falls back
+/// to today's plain-digest audit; passing `Some` opts in on a per-peer
+/// basis (a peer with no entry in `last_commitment_by_peer` still gets
+/// the legacy path).
+///
+/// `last_commitment_by_peer` and `recent_provers` are owned by
+/// [`crate::replication::ReplicationEngine`]; this struct borrows them.
+pub struct CommitmentAuditCtx<'a> {
+    /// Per-peer last-known commitment (populated from gossip ingest).
+    /// The auditor pins `commitment_hash(commitment)` into the challenge
+    /// for any peer found here.
+    pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    /// Holder-eligibility cache. On a successful commitment-bound audit
+    /// the auditor records `(challenged_peer, key, commitment_hash)` so
+    /// downstream code (quorum, paid lists) can credit the peer as a
+    /// real holder.
+    pub recent_provers: &'a Arc<RwLock<RecentProvers>>,
+}
+
 /// Execute one audit tick (Section 15 steps 2-9).
 ///
 /// Returns the audit result. Caller is responsible for emitting trust events.
@@ -81,6 +106,7 @@ pub async fn audit_tick(
         &repair_proofs,
         0,
         is_bootstrapping,
+        None,
     )
     .await
 }
@@ -100,6 +126,7 @@ pub async fn audit_tick_with_repair_proofs(
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     current_sync_epoch: u64,
     is_bootstrapping: bool,
+    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
 ) -> AuditTickResult {
     // Invariant 19: never audit while still bootstrapping.
     if is_bootstrapping {
@@ -183,16 +210,38 @@ pub async fn audit_tick_with_repair_proofs(
     // so no explicit truncation needed.
 
     // Step 6: Send challenge.
+    //
+    // Phase 3: if we have a commitment audit context AND we have a last
+    // known commitment from this peer (received via gossip), pin its
+    // hash into the challenge so the responder must answer against the
+    // exact commitment whose hash we pinned. Defeats fresh-commitment
+    // substitution by lazy nodes (v12 §5 gate 2b).
+    //
+    // We snapshot the pinned commitment alongside the hash so the
+    // response-handling code can verify against the SAME commitment we
+    // pinned (avoids a race where the peer's last_commitment_by_peer
+    // entry rotates between issue and response handling).
+    let (expected_commitment_hash, pinned_commitment) = match commitment_ctx {
+        Some(ctx) => {
+            let guard = ctx.last_commitment_by_peer.read().await;
+            match guard.get(&challenged_peer) {
+                Some(c) => {
+                    let h = commitment_hash(c);
+                    let snap = c.clone();
+                    (h, Some(snap))
+                }
+                None => (None, None),
+            }
+        }
+        None => (None, None),
+    };
 
     let challenge = AuditChallenge {
         challenge_id,
         nonce,
         challenged_peer_id: *challenged_peer.as_bytes(),
         keys: peer_keys.clone(),
-        // Phase 2 keeps the default audit path on plain digests. The
-        // auditor will set `Some(hash)` once we know the challenged
-        // peer's last commitment — that wiring lands in phase 3.
-        expected_commitment_hash: None,
+        expected_commitment_hash,
     };
 
     let msg = ReplicationMessage {
@@ -314,6 +363,26 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
+            // v12 §5: if the rejection was UnknownCommitmentHash, that means
+            // we pinned a commitment the peer no longer recognizes (likely
+            // we rotated past its retention window of 2). Drop the stale
+            // entry from last_commitment_by_peer so the next audit either
+            // picks up the new gossiped commitment or falls back to the
+            // plain-digest path. Other rejection reasons (e.g.
+            // KeyNotInCommitment) leave the entry alone — the auditor may
+            // have a stale view of the peer's key set.
+            if reason.contains("unknown commitment hash") {
+                if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
+                    let mut guard = ctx.last_commitment_by_peer.write().await;
+                    let still_matches = guard
+                        .get(&challenged_peer)
+                        .and_then(commitment_hash)
+                        .is_some_and(|h| h == pin);
+                    if still_matches {
+                        guard.remove(&challenged_peer);
+                    }
+                }
+            }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
                 &challenged_peer,
@@ -322,6 +391,39 @@ pub async fn audit_tick_with_repair_proofs(
                 AuditFailureReason::Rejected,
                 p2p_node,
                 config,
+            )
+            .await
+        }
+        ReplicationMessageBody::AuditResponse(AuditResponse::CommitmentBound {
+            challenge_id: resp_id,
+            commitment,
+            per_key,
+        }) => {
+            if resp_id != challenge_id {
+                warn!("Audit: challenge ID mismatch on CommitmentBound from {challenged_peer}");
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::MalformedResponse,
+                    p2p_node,
+                    config,
+                )
+                .await;
+            }
+            verify_commitment_bound(
+                &challenged_peer,
+                challenge_id,
+                &nonce,
+                &peer_keys,
+                expected_commitment_hash.as_ref(),
+                pinned_commitment.as_ref(),
+                &commitment,
+                &per_key,
+                storage,
+                p2p_node,
+                config,
+                commitment_ctx,
             )
             .await
         }
@@ -457,6 +559,138 @@ async fn verify_digests(
 }
 
 // ---------------------------------------------------------------------------
+// Commitment-bound verification (v12)
+// ---------------------------------------------------------------------------
+
+/// Verify a `CommitmentBound` audit response (Step 8, v12 path).
+///
+/// Runs the pure verifier `verify_commitment_bound_response` against the
+/// commitment we pinned (NOT the one in the response — the response's
+/// commitment must hash-match the pin), then on success records the
+/// challenged peer as a recent prover for each verified key.
+///
+/// The verifier checks five gates: structural, peer-id binding, pin,
+/// signature (using the pubkey embedded in the commitment), and per-key
+/// (bytes_hash + Merkle path + audit digest). Any failure path → standard
+/// `AUDIT_FAILURE_TRUST_WEIGHT × keys` penalty.
+#[allow(clippy::too_many_arguments)]
+async fn verify_commitment_bound(
+    challenged_peer: &PeerId,
+    challenge_id: u64,
+    nonce: &[u8; 32],
+    keys: &[XorName],
+    expected_commitment_hash: Option<&[u8; 32]>,
+    pinned_commitment: Option<&StorageCommitment>,
+    response_commitment: &StorageCommitment,
+    response_per_key: &[CommitmentBoundResult],
+    storage: &Arc<LmdbStorage>,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
+) -> AuditTickResult {
+    // Sanity: a CommitmentBound response must have been answered to a
+    // pinned challenge. If we didn't pin (or have no ctx), this is a
+    // protocol violation by the peer.
+    let Some(pin) = expected_commitment_hash else {
+        warn!(
+            "Audit: peer {challenged_peer} sent CommitmentBound for an unpinned challenge — \
+             treating as malformed"
+        );
+        return handle_audit_failure(
+            challenged_peer,
+            challenge_id,
+            keys,
+            AuditFailureReason::MalformedResponse,
+            p2p_node,
+            config,
+        )
+        .await;
+    };
+    // `pinned_commitment` itself is not used here — the pin (hash) is
+    // sufficient because `verify_commitment_bound_response` re-hashes
+    // the response's commitment and compares to the pin. Keeping the
+    // parameter at the call site documents the contract and lets future
+    // optimizations (e.g. cache by-pin local-bytes lookup) use it
+    // without re-plumbing.
+    let _ = pinned_commitment;
+
+    // Auditor-local bytes lookup. Reads from LMDB; if the auditor doesn't
+    // hold the key (it should — we sampled from local keys), treat as a
+    // verifier-side bytes-hash mismatch.
+    //
+    // The verifier closure is sync, but storage.get_raw is async, so we
+    // pre-load the bytes for each challenged key into a map.
+    let mut local_bytes_by_key: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(keys.len());
+    for key in keys {
+        match storage.get_raw(key).await {
+            Ok(Some(b)) => {
+                local_bytes_by_key.insert(*key, b);
+            }
+            Ok(None) => {
+                debug!(
+                    "Audit: local key {} disappeared during commitment-bound audit",
+                    hex::encode(key)
+                );
+            }
+            Err(e) => {
+                warn!("Audit: failed to read local key {}: {e}", hex::encode(key));
+            }
+        }
+    }
+    let bytes_for = |k: &XorName| -> Option<Vec<u8>> { local_bytes_by_key.get(k).cloned() };
+
+    let verify = verify_commitment_bound_response(
+        keys,
+        nonce,
+        challenged_peer.as_bytes(),
+        pin,
+        response_commitment,
+        response_per_key,
+        bytes_for,
+    );
+
+    match verify {
+        Ok(()) => {
+            info!(
+                "Audit: peer {challenged_peer} passed commitment-bound audit ({} keys, pin={})",
+                keys.len(),
+                hex::encode(pin),
+            );
+            // Credit the peer as a holder for each verified key under
+            // this exact commitment hash. Downstream (quorum, paid lists)
+            // can read `recent_provers.is_credited_holder(...)`.
+            if let Some(ctx) = commitment_ctx {
+                let now = std::time::Instant::now();
+                let mut guard = ctx.recent_provers.write().await;
+                for key in keys {
+                    guard.record_proof(*key, *challenged_peer, *pin, now);
+                }
+            }
+            AuditTickResult::Passed {
+                challenged_peer: *challenged_peer,
+                keys_checked: keys.len(),
+            }
+        }
+        Err(e) => {
+            warn!(
+                "Audit: peer {challenged_peer} failed commitment-bound audit: {e} \
+                 (pin={})",
+                hex::encode(pin),
+            );
+            handle_audit_failure(
+                challenged_peer,
+                challenge_id,
+                keys,
+                AuditFailureReason::DigestMismatch,
+                p2p_node,
+                config,
+            )
+            .await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Failure handling with responsibility confirmation
 // ---------------------------------------------------------------------------
 
@@ -570,7 +804,9 @@ pub async fn handle_audit_challenge_with_commitment(
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     stored_chunks: usize,
-    commitment_state: Option<&std::sync::Arc<crate::replication::commitment_state::ResponderCommitmentState>>,
+    commitment_state: Option<
+        &std::sync::Arc<crate::replication::commitment_state::ResponderCommitmentState>,
+    >,
 ) -> AuditResponse {
     if is_bootstrapping {
         return AuditResponse::Bootstrapping {
@@ -612,9 +848,10 @@ pub async fn handle_audit_challenge_with_commitment(
     // gossiped, etc.) reject with reason="unknown commitment hash" —
     // the auditor's v12 §5 handler conditionally invalidates its pin
     // on this rejection (currently in phase-3.5 follow-up).
-    if let (Some(expected_hash), Some(state)) =
-        (challenge.expected_commitment_hash.as_ref(), commitment_state)
-    {
+    if let (Some(expected_hash), Some(state)) = (
+        challenge.expected_commitment_hash.as_ref(),
+        commitment_state,
+    ) {
         // Pre-load all challenged-key bytes since the helper closure
         // is synchronous but storage reads are async. For a sqrt-scaled
         // sample (~100 keys at 10k stored) this is bounded.

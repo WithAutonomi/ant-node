@@ -646,14 +646,16 @@ mod tests {
         use crate::replication::commitment::{sign_commitment, StorageCommitment};
         use saorsa_pqc::api::sig::ml_dsa_65;
 
-        let (_pk, sk) = ml_dsa_65().generate_keypair().expect("keygen");
+        let (pk, sk) = ml_dsa_65().generate_keypair().expect("keygen");
         let root = [0x7Fu8; 32];
         let sender = [0xCCu8; 32];
-        let sig = sign_commitment(&sk, &root, 3, &sender).expect("sign");
+        let pk_bytes = pk.to_bytes();
+        let sig = sign_commitment(&sk, &root, 3, &sender, &pk_bytes).expect("sign");
         let commitment = StorageCommitment {
             root,
             key_count: 3,
             sender_peer_id: sender,
+            sender_public_key: pk_bytes,
             signature: sig,
         };
 
