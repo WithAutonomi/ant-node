@@ -365,38 +365,41 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
-            // v12 paragraph 5 conditional invalidation: if the rejection
-            // was UnknownCommitmentHash AND we actually issued a pinned
-            // challenge, the peer simply rotated past the commitment we
-            // pinned. This is honest behaviour, NOT a failure.
+            // v12 paragraph 5 conditional invalidation, refined:
             //
-            // Strict gating: only apply when we DID pin
-            // (expected_commitment_hash.is_some()) and the reason matches
-            // the exact responder-emitted string (`reason ==`, not
-            // `contains`). For legacy unpinned challenges, the responder
-            // cannot legitimately answer "unknown commitment hash" —
-            // fall through to handle_audit_failure. Without strict gating
-            // a malicious peer could send the free-form reason string on
-            // any challenge to dodge audits (codex round-6 BLOCKER).
+            // When we issued a pinned challenge and the peer responds
+            // "unknown commitment hash", DO NOT drop the pin and DO NOT
+            // give a free pass. Two reasons:
+            //
+            //   1. If the peer genuinely rotated past our pin (honest
+            //      case), their two-slot retention (current+previous)
+            //      means they could still answer one rotation back —
+            //      so "unknown" here means we are at least two
+            //      rotations behind their gossip. The next gossip round
+            //      (a few minutes) will bring us a fresh commitment to
+            //      pin, and the cache entry will be replaced naturally
+            //      via the gossip ingest path. We don't need to drop
+            //      anything ourselves.
+            //
+            //   2. If we drop the pin on "unknown", a malicious peer
+            //      can claim "unknown" to shed every pinned audit they
+            //      receive — the next tick has no pin → legacy plain-
+            //      digest path → on-demand fetch attack reopens
+            //      (codex round-8 MAJOR).
+            //
+            // So: when the responder says "unknown" AND we pinned, log
+            // and return Idle without penalty (one tick wasted) but
+            // KEEP the pin. The honest case self-resolves via gossip;
+            // the malicious case keeps re-failing pinned audits until
+            // their trust drops naturally through other mechanisms or
+            // we receive a fresh gossiped commitment. Strict gating on
+            // exact reason + pinned challenge prevents the round-6
+            // bypass (a peer cannot trigger this path on a legacy
+            // unpinned audit because expected_commitment_hash is None).
             if expected_commitment_hash.is_some() && reason == "unknown commitment hash" {
-                if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
-                    let mut last = ctx.last_commitment_by_peer.write().await;
-                    let still_matches = last
-                        .get(&challenged_peer)
-                        .and_then(commitment_hash)
-                        .is_some_and(|h| h == pin);
-                    if still_matches {
-                        last.remove(&challenged_peer);
-                    }
-                    drop(last);
-                    // Drop credit anchored to the now-stale pin so the
-                    // peer must re-prove every key under the new
-                    // commitment to keep holder status (v12 §6).
-                    ctx.recent_provers.write().await.forget_commitment(&pin);
-                }
                 info!(
-                    "Audit: peer {challenged_peer} rotated past pinned commitment; \
-                     dropping stale entry (no trust penalty)"
+                    "Audit: peer {challenged_peer} claims unknown commitment hash; \
+                     waiting for fresh gossip (keeping pin, no trust penalty this tick)"
                 );
                 return AuditTickResult::Idle;
             }
