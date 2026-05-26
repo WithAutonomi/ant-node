@@ -189,6 +189,10 @@ pub async fn audit_tick_with_repair_proofs(
         nonce,
         challenged_peer_id: *challenged_peer.as_bytes(),
         keys: peer_keys.clone(),
+        // Phase 2 keeps the default audit path on plain digests. The
+        // auditor will set `Some(hash)` once we know the challenged
+        // peer's last commitment — that wiring lands in phase 3.
+        expected_commitment_hash: None,
     };
 
     let msg = ReplicationMessage {
@@ -648,6 +652,7 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys,
+            expected_commitment_hash: None,
         }
     }
 
@@ -698,6 +703,9 @@ mod tests {
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
             }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
+            }
         }
     }
 
@@ -733,6 +741,9 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
+            }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -774,6 +785,9 @@ mod tests {
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
             }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
+            }
         }
     }
 
@@ -798,6 +812,9 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
+            }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -830,6 +847,9 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
+            }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -977,6 +997,7 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys: vec![addr_k1, addr_k2, addr_k3],
+            expected_commitment_hash: None,
         };
         let self_id = peer_id_from_bytes(peer_id);
 
@@ -1000,6 +1021,9 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests response"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
+            }
         }
     }
 
@@ -1028,6 +1052,7 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys: vec![a1, a2, a3],
+            expected_commitment_hash: None,
         };
         let self_id = peer_id_from_bytes(peer_id);
 
@@ -1046,6 +1071,9 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
+            }
         }
     }
 
@@ -1306,6 +1334,9 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
+            }
         }
     }
 
@@ -1506,6 +1537,9 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response")
+            }
+            AuditResponse::CommitmentBound { .. } => {
+                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         };
         assert_eq!(challenge_id, 4700);
