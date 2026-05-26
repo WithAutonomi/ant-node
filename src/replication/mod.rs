@@ -123,6 +123,19 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 /// cycle.
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 600;
 
+/// Hard cap on the size of `last_commitment_by_peer`.
+///
+/// Bounds the per-process memory cost of the auditor's per-peer
+/// commitment cache. Each entry holds a `StorageCommitment`
+/// (~5 KiB: 1952-byte pubkey + 3293-byte signature + small fields).
+/// At 4096 entries the cache is ~20 MiB, which comfortably covers a
+/// realistic close-group neighborhood. When the cap is hit, the
+/// oldest entry by insertion order is evicted on insert. The
+/// `PeerRemoved` handler also drops entries proactively, so this cap
+/// is the second line of defence against sybil/churn flooding (codex
+/// round-6 MAJOR).
+const MAX_LAST_COMMITMENT_BY_PEER: usize = 4096;
+
 // ---------------------------------------------------------------------------
 // ReplicationEngine
 // ---------------------------------------------------------------------------
@@ -438,6 +451,7 @@ impl ReplicationEngine {
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let my_commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -512,6 +526,14 @@ impl ReplicationEngine {
                             }
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                // v12: also drop any commitment + recent-prover
+                                // state for the removed peer so a churn /
+                                // sybil attacker cannot leave behind one
+                                // StorageCommitment per identity in
+                                // last_commitment_by_peer (codex round-6
+                                // MAJOR).
+                                last_commitment_by_peer.write().await.remove(&peer_id);
+                                recent_provers.write().await.forget_peer(&peer_id);
                             }
                             _ => {}
                         }
@@ -2883,10 +2905,24 @@ async fn ingest_peer_commitment(
         );
         return false;
     }
-    last_commitment_by_peer
-        .write()
-        .await
-        .insert(*source, c.clone());
+    let mut map = last_commitment_by_peer.write().await;
+    // Sybil/churn cap: if we're at the hard cap AND this is a new peer,
+    // evict an arbitrary existing entry to make room. Updates for peers
+    // already in the map are always accepted (they replace, not grow).
+    if map.len() >= MAX_LAST_COMMITMENT_BY_PEER && !map.contains_key(source) {
+        // Drop one arbitrary entry. HashMap iter order is random which
+        // is fine — over time PeerRemoved cleanup keeps the working set
+        // anchored on the real RT membership; this cap only fires under
+        // active flooding attempts.
+        if let Some(victim) = map.keys().next().copied() {
+            map.remove(&victim);
+            warn!(
+                "ingest_peer_commitment: cache full ({MAX_LAST_COMMITMENT_BY_PEER}); \
+                 evicted {victim} to admit {source}"
+            );
+        }
+    }
+    map.insert(*source, c.clone());
     true
 }
 

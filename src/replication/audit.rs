@@ -365,16 +365,20 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
-            // v12 §5 conditional invalidation: if the rejection was
-            // UnknownCommitmentHash, the peer simply rotated past the
-            // commitment we pinned. This is honest behaviour, NOT a
-            // failure. Drop the stale entry from last_commitment_by_peer
-            // (only if it still matches our pin — tolerates a fresh
-            // gossip arriving between issue and processing), drop any
-            // stale credit in recent_provers, and return Idle. The next
-            // audit either picks up the new commitment from gossip or
-            // falls back to the plain-digest path. No trust penalty.
-            if reason.contains("unknown commitment hash") {
+            // v12 paragraph 5 conditional invalidation: if the rejection
+            // was UnknownCommitmentHash AND we actually issued a pinned
+            // challenge, the peer simply rotated past the commitment we
+            // pinned. This is honest behaviour, NOT a failure.
+            //
+            // Strict gating: only apply when we DID pin
+            // (expected_commitment_hash.is_some()) and the reason matches
+            // the exact responder-emitted string (`reason ==`, not
+            // `contains`). For legacy unpinned challenges, the responder
+            // cannot legitimately answer "unknown commitment hash" —
+            // fall through to handle_audit_failure. Without strict gating
+            // a malicious peer could send the free-form reason string on
+            // any challenge to dodge audits (codex round-6 BLOCKER).
+            if expected_commitment_hash.is_some() && reason == "unknown commitment hash" {
                 if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
                     let mut last = ctx.last_commitment_by_peer.write().await;
                     let still_matches = last
