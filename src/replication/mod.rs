@@ -129,11 +129,14 @@ const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 600;
 /// commitment cache. Each entry holds a `StorageCommitment`
 /// (~5 KiB: 1952-byte pubkey + 3293-byte signature + small fields).
 /// At 4096 entries the cache is ~20 MiB, which comfortably covers a
-/// realistic close-group neighborhood. When the cap is hit, the
-/// oldest entry by insertion order is evicted on insert. The
-/// `PeerRemoved` handler also drops entries proactively, so this cap
-/// is the second line of defence against sybil/churn flooding (codex
-/// round-6 MAJOR).
+/// realistic close-group neighborhood. When the cap is hit, one
+/// arbitrary existing entry is evicted on insert (HashMap iteration
+/// order is unspecified; we do not track insertion order). The
+/// `PeerRemoved` handler proactively drops entries as the DHT
+/// detects departures, and `ingest_peer_commitment` only admits
+/// commitments from peers currently in the routing table — together
+/// the cap is the third line of defence against sybil/churn flooding
+/// (codex round-6 MAJOR, refined in round-7).
 const MAX_LAST_COMMITMENT_BY_PEER: usize = 4096;
 
 // ---------------------------------------------------------------------------
@@ -1057,6 +1060,7 @@ impl ReplicationEngine {
                         ingest_peer_commitment(
                             peer,
                             outcome.response.commitment.as_ref(),
+                            &p2p,
                             &last_commitment_by_peer,
                         )
                         .await;
@@ -1186,6 +1190,7 @@ async fn handle_replication_message(
             ingest_peer_commitment(
                 source,
                 request.commitment.as_ref(),
+                p2p_node,
                 &last_commitment_by_peer,
             )
             .await;
@@ -2013,7 +2018,13 @@ async fn handle_sync_response(
     // (peer-id binding + signature). Drops forged commitments at the
     // edge; honest commitments populate `last_commitment_by_peer` so
     // the auditor can pin them on the next audit tick.
-    ingest_peer_commitment(peer, resp.commitment.as_ref(), last_commitment_by_peer).await;
+    ingest_peer_commitment(
+        peer,
+        resp.commitment.as_ref(),
+        p2p_node,
+        last_commitment_by_peer,
+    )
+    .await;
 
     // Record successful sync.
     {
@@ -2865,11 +2876,24 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 async fn ingest_peer_commitment(
     source: &PeerId,
     commitment: Option<&StorageCommitment>,
+    p2p_node: &Arc<P2PNode>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
 ) -> bool {
     let Some(c) = commitment else {
         return false;
     };
+    // RT-membership gate: only accept commitments from peers in our
+    // routing table. Off-RT senders (sybils, drive-by relays) cannot
+    // populate the cache, which closes the round-7 MAJOR where a
+    // flood of off-RT identities could fill the cap and evict honest
+    // peers. The neighbor-sync request handler applies the same gate
+    // before admitting inbound replication hints (see neighbor_sync.rs
+    // `sender_in_rt`); we mirror that policy here for the commitment
+    // piggyback.
+    if !p2p_node.dht_manager().is_in_routing_table(source).await {
+        debug!("ingest_peer_commitment: source {source} not in routing table (dropped)");
+        return false;
+    }
     // Peer-id binding: the commitment's claimed sender must match the
     // authenticated transport peer (`source`). Defeats relay/replay
     // and also pins which embedded public key we are about to verify
