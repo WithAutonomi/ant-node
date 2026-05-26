@@ -118,10 +118,21 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 /// previous commitment, so don't rotate so often that we drop a
 /// commitment a peer might still pin to.
 ///
-/// Default: ~10 min, aligned roughly with the audit cadence so a peer
-/// who saw our commitment in gossip can still pin to it for ~one audit
-/// cycle.
-const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 600;
+/// Default: 1 hour, aligned with the worst-case neighbor-sync cooldown
+/// (`NEIGHBOR_SYNC_COOLDOWN_SECS = 3600`) so that with the two-slot
+/// retention (current + previous), any commitment we gossiped is still
+/// answerable for up to ~2 hours after rotation. That covers the gap
+/// between our rotation and the next gossip arrival at a remote peer,
+/// preventing the "unknown commitment hash" -> Idle audit-skip pattern
+/// from being the common case (codex round-10 MAJOR #1).
+///
+/// Why not faster: the v12 pin is bound to a specific point-in-time
+/// commitment, so rotation isn't security-critical for pin freshness —
+/// only for keeping the committed key set current as the responder
+/// writes new keys. 1 hour is plenty for that, and slow enough that
+/// honest auditors mostly hit `current` or `previous` rather than the
+/// "rotated past" case.
+const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 
 /// Hard cap on the size of `last_commitment_by_peer`.
 ///
@@ -2892,6 +2903,27 @@ async fn ingest_peer_commitment(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
 ) -> bool {
     let Some(c) = commitment else {
+        // Commitment-downgrade signal (codex round-10 MAJOR #2): a peer
+        // that previously gossiped a commitment but now gossips None
+        // looks like a downgrade attempt to drop back onto the weaker
+        // legacy audit path. We keep the cached entry so subsequent
+        // pinned audits still apply (the responder must still answer
+        // under the cached commitment or rotate forward via gossip),
+        // and we log at warn-level so operators can correlate this
+        // with audit failures. The downgrade itself does NOT clear the
+        // cache; the auditor's "unknown commitment hash" handling keeps
+        // applying the pin until the peer either rotates forward (new
+        // gossip) or accumulates audit failures.
+        //
+        // A future PR should add a trust event here so the peer's
+        // reputation drops directly. For now the downgrade is
+        // observable in logs and indirectly via stalled audits.
+        if last_commitment_by_peer.read().await.contains_key(source) {
+            warn!(
+                "ingest_peer_commitment: peer {source} previously gossiped a commitment \
+                 but now sent None (possible commitment-downgrade attempt; keeping cached entry)"
+            );
+        }
         return false;
     };
     // RT-membership gate: only accept commitments from peers in our
