@@ -11,7 +11,9 @@ use rand::Rng;
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{commitment_hash, CommitmentBoundResult, StorageCommitment};
-use crate::replication::commitment_audit::verify_commitment_bound_response;
+use crate::replication::commitment_audit::{
+    verify_commitment_bound_metadata, verify_commitment_bound_per_key,
+};
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -363,25 +365,36 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
-            // v12 §5: if the rejection was UnknownCommitmentHash, that means
-            // we pinned a commitment the peer no longer recognizes (likely
-            // we rotated past its retention window of 2). Drop the stale
-            // entry from last_commitment_by_peer so the next audit either
-            // picks up the new gossiped commitment or falls back to the
-            // plain-digest path. Other rejection reasons (e.g.
-            // KeyNotInCommitment) leave the entry alone — the auditor may
-            // have a stale view of the peer's key set.
+            // v12 §5 conditional invalidation: if the rejection was
+            // UnknownCommitmentHash, the peer simply rotated past the
+            // commitment we pinned. This is honest behaviour, NOT a
+            // failure. Drop the stale entry from last_commitment_by_peer
+            // (only if it still matches our pin — tolerates a fresh
+            // gossip arriving between issue and processing), drop any
+            // stale credit in recent_provers, and return Idle. The next
+            // audit either picks up the new commitment from gossip or
+            // falls back to the plain-digest path. No trust penalty.
             if reason.contains("unknown commitment hash") {
                 if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
-                    let mut guard = ctx.last_commitment_by_peer.write().await;
-                    let still_matches = guard
+                    let mut last = ctx.last_commitment_by_peer.write().await;
+                    let still_matches = last
                         .get(&challenged_peer)
                         .and_then(commitment_hash)
                         .is_some_and(|h| h == pin);
                     if still_matches {
-                        guard.remove(&challenged_peer);
+                        last.remove(&challenged_peer);
                     }
+                    drop(last);
+                    // Drop credit anchored to the now-stale pin so the
+                    // peer must re-prove every key under the new
+                    // commitment to keep holder status (v12 §6).
+                    ctx.recent_provers.write().await.forget_commitment(&pin);
                 }
+                info!(
+                    "Audit: peer {challenged_peer} rotated past pinned commitment; \
+                     dropping stale entry (no trust penalty)"
+                );
+                return AuditTickResult::Idle;
             }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
@@ -614,70 +627,76 @@ async fn verify_commitment_bound(
     // without re-plumbing.
     let _ = pinned_commitment;
 
-    // Auditor-local bytes lookup. Reads from LMDB; if the auditor doesn't
-    // hold the key (it should — we sampled from local keys), treat as a
-    // verifier-side bytes-hash mismatch.
-    //
-    // The verifier closure is sync, but storage.get_raw is async, so we
-    // pre-load the bytes for each challenged key into a map.
-    let mut local_bytes_by_key: HashMap<XorName, Vec<u8>> = HashMap::with_capacity(keys.len());
-    for key in keys {
-        match storage.get_raw(key).await {
-            Ok(Some(b)) => {
-                local_bytes_by_key.insert(*key, b);
-            }
-            Ok(None) => {
-                debug!(
-                    "Audit: local key {} disappeared during commitment-bound audit",
-                    hex::encode(key)
-                );
-            }
-            Err(e) => {
-                warn!("Audit: failed to read local key {}: {e}", hex::encode(key));
-            }
-        }
-    }
-    let bytes_for = |k: &XorName| -> Option<Vec<u8>> { local_bytes_by_key.get(k).cloned() };
-
-    let verify = verify_commitment_bound_response(
+    // Metadata gates (structural / peer-id / pin / sig). One-shot, cheap.
+    if let Err(e) = verify_commitment_bound_metadata(
         keys,
-        nonce,
         challenged_peer.as_bytes(),
         pin,
         response_commitment,
         response_per_key,
-        bytes_for,
-    );
+    ) {
+        warn!(
+            "Audit: peer {challenged_peer} failed commitment-bound metadata: {e} (pin={})",
+            hex::encode(pin),
+        );
+        return handle_audit_failure(
+            challenged_peer,
+            challenge_id,
+            keys,
+            AuditFailureReason::DigestMismatch,
+            p2p_node,
+            config,
+        )
+        .await;
+    }
 
-    match verify {
-        Ok(()) => {
-            info!(
-                "Audit: peer {challenged_peer} passed commitment-bound audit ({} keys, pin={})",
-                keys.len(),
-                hex::encode(pin),
-            );
-            // Credit the peer as a holder for each verified key under
-            // this exact commitment hash. Downstream (quorum, paid lists)
-            // can read `recent_provers.is_credited_holder(...)`.
-            if let Some(ctx) = commitment_ctx {
-                let now = std::time::Instant::now();
-                let mut guard = ctx.recent_provers.write().await;
-                for key in keys {
-                    guard.record_proof(*key, *challenged_peer, *pin, now);
-                }
+    // Per-key gates streamed one chunk at a time. Avoids the
+    // sqrt(n)*MAX_CHUNK_SIZE worst case of preloading every challenged
+    // chunk (~4 GiB at 1M stored chunks) — codex round-5 BLOCKER #2.
+    for (i, result) in response_per_key.iter().enumerate() {
+        let local_bytes = match storage.get_raw(&result.key).await {
+            Ok(Some(b)) => b,
+            Ok(None) => {
+                debug!(
+                    "Audit: local key {} missing for commitment-bound check",
+                    hex::encode(result.key)
+                );
+                // Treat missing local copy as bytes-hash mismatch — we
+                // sampled it from our key set, so disappearance is rare.
+                return handle_audit_failure(
+                    challenged_peer,
+                    challenge_id,
+                    keys,
+                    AuditFailureReason::DigestMismatch,
+                    p2p_node,
+                    config,
+                )
+                .await;
             }
-            AuditTickResult::Passed {
-                challenged_peer: *challenged_peer,
-                keys_checked: keys.len(),
+            Err(e) => {
+                warn!(
+                    "Audit: failed to read local key {}: {e}",
+                    hex::encode(result.key)
+                );
+                return AuditTickResult::Idle;
             }
-        }
-        Err(e) => {
+        };
+
+        if let Err(e) = verify_commitment_bound_per_key(
+            i,
+            nonce,
+            challenged_peer.as_bytes(),
+            response_commitment,
+            result,
+            &local_bytes,
+        ) {
             warn!(
-                "Audit: peer {challenged_peer} failed commitment-bound audit: {e} \
+                "Audit: peer {challenged_peer} failed commitment-bound per-key #{i}: {e} \
                  (pin={})",
                 hex::encode(pin),
             );
-            handle_audit_failure(
+            // local_bytes drops here, bounding peak memory at one chunk.
+            return handle_audit_failure(
                 challenged_peer,
                 challenge_id,
                 keys,
@@ -685,8 +704,28 @@ async fn verify_commitment_bound(
                 p2p_node,
                 config,
             )
-            .await
+            .await;
         }
+    }
+
+    info!(
+        "Audit: peer {challenged_peer} passed commitment-bound audit ({} keys, pin={})",
+        keys.len(),
+        hex::encode(pin),
+    );
+    // Credit the peer as a holder for each verified key under
+    // this exact commitment hash. Downstream (quorum, paid lists)
+    // can read `recent_provers.is_credited_holder(...)`.
+    if let Some(ctx) = commitment_ctx {
+        let now = std::time::Instant::now();
+        let mut guard = ctx.recent_provers.write().await;
+        for key in keys {
+            guard.record_proof(*key, *challenged_peer, *pin, now);
+        }
+    }
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: keys.len(),
     }
 }
 

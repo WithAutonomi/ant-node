@@ -472,7 +472,7 @@ mod tests {
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
 
         let entries: Vec<_> = (1..=5u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -532,7 +532,7 @@ mod tests {
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
 
         let entries_c1: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -569,7 +569,7 @@ mod tests {
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
 
         let entries: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -604,7 +604,7 @@ mod tests {
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
         let nonce = [0xCD; 32];
 
         let entries: Vec<_> = (1..=8u8)

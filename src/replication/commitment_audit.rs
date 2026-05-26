@@ -170,6 +170,47 @@ pub fn verify_commitment_bound_response(
     response_per_key: &[CommitmentBoundResult],
     local_bytes_for: impl Fn(&XorName) -> Option<Vec<u8>>,
 ) -> Result<(), AuditVerifyError> {
+    verify_commitment_bound_metadata(
+        challenge_keys,
+        challenged_peer_id,
+        expected_commitment_hash,
+        response_commitment,
+        response_per_key,
+    )?;
+    for (i, result) in response_per_key.iter().enumerate() {
+        let local_bytes =
+            local_bytes_for(&result.key).ok_or(AuditVerifyError::BytesHashMismatch { index: i })?;
+        verify_commitment_bound_per_key(
+            i,
+            challenge_nonce,
+            challenged_peer_id,
+            response_commitment,
+            result,
+            &local_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+/// Verify the metadata gates (1, 2a, 2b, 3) of a commitment-bound audit
+/// response. Pure-sync, fast: structural / peer-identity / pin / signature.
+///
+/// Run this once per response before iterating per-key with
+/// [`verify_commitment_bound_per_key`]. Split out so the auditor can stream
+/// chunk bytes per-key from async storage instead of preloading them all
+/// into memory (which at sqrt-scaled sample sizes and 4 MiB chunks would
+/// be a remote memory-DoS vector — see codex round-5 BLOCKER #2).
+///
+/// # Errors
+///
+/// See [`AuditVerifyError`]. Returns the first gate failure encountered.
+pub fn verify_commitment_bound_metadata(
+    challenge_keys: &[XorName],
+    challenged_peer_id: &[u8; 32],
+    expected_commitment_hash: &[u8; 32],
+    response_commitment: &StorageCommitment,
+    response_per_key: &[CommitmentBoundResult],
+) -> Result<(), AuditVerifyError> {
     // -- Gate 1: structural ---------------------------------------------------
 
     if response_per_key.len() != challenge_keys.len() {
@@ -241,6 +282,18 @@ pub fn verify_commitment_bound_response(
         return Err(AuditVerifyError::CommitmentHashMismatch);
     }
 
+    // -- Gate 2c: peer-identity to embedded-pubkey binding ------------------
+    //
+    // The peer-id field on the commitment must match BLAKE3 of the embedded
+    // public key — otherwise a responder could sign with a throwaway key
+    // they own and lie about which identity it belongs to. saorsa-core
+    // derives PeerId as `BLAKE3(pubkey_bytes)`.
+
+    let derived_peer_id = *blake3::hash(&response_commitment.sender_public_key).as_bytes();
+    if derived_peer_id != response_commitment.sender_peer_id {
+        return Err(AuditVerifyError::SenderPeerIdMismatch);
+    }
+
     // -- Gate 3: signature ---------------------------------------------------
 
     // Verifies against the public key embedded in the commitment itself.
@@ -251,52 +304,63 @@ pub fn verify_commitment_bound_response(
         return Err(AuditVerifyError::SignatureInvalid);
     }
 
-    // -- Gate 4: per-key bytes_hash + path + digest --------------------------
+    Ok(())
+}
 
-    for (i, result) in response_per_key.iter().enumerate() {
-        // The auditor's local copy of bytes is the ground truth. If the
-        // auditor doesn't hold this key, treat it as a mismatch — we
-        // can't audit what we don't have.
-        let local_bytes =
-            local_bytes_for(&result.key).ok_or(AuditVerifyError::BytesHashMismatch { index: i })?;
-        let expected_bytes_hash = *blake3::hash(&local_bytes).as_bytes();
-        if result.bytes_hash != expected_bytes_hash {
-            return Err(AuditVerifyError::BytesHashMismatch { index: i });
-        }
-
-        // Rebuild the leaf the responder committed to, then verify the
-        // inclusion path up to commitment.root.
-        let leaf = leaf_hash(&result.key, &result.bytes_hash);
-        if u64::from(result.leaf_index) >= u64::from(key_count) {
-            return Err(AuditVerifyError::LeafIndexOutOfRange {
-                index: i,
-                leaf_index: result.leaf_index,
-                key_count,
-            });
-        }
-        if !verify_path(
-            &leaf,
-            &result.path,
-            result.leaf_index as usize,
-            key_count,
-            &response_commitment.root,
-        ) {
-            return Err(AuditVerifyError::PathInvalid { index: i });
-        }
-
-        // Legacy audit digest. Defeats replay (nonce changes per
-        // challenge) and third-party forging (peer ID is bound).
-        let expected_digest = compute_audit_digest(
-            challenge_nonce,
-            challenged_peer_id,
-            &result.key,
-            &local_bytes,
-        );
-        if result.digest != expected_digest {
-            return Err(AuditVerifyError::DigestMismatch { index: i });
-        }
+/// Verify gate 4 (bytes_hash + path + digest) for a single per-key entry.
+///
+/// Call this once per challenged key in a streaming loop after running
+/// [`verify_commitment_bound_metadata`] once on the response. Lets the
+/// caller load one chunk at a time and drop it, bounding peak memory at
+/// `MAX_CHUNK_SIZE` per challenge regardless of sample size.
+///
+/// # Errors
+///
+/// See [`AuditVerifyError`]. Returns `BytesHashMismatch`, `PathInvalid`,
+/// `LeafIndexOutOfRange`, or `DigestMismatch` on failure.
+pub fn verify_commitment_bound_per_key(
+    index: usize,
+    challenge_nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    response_commitment: &StorageCommitment,
+    result: &CommitmentBoundResult,
+    local_bytes: &[u8],
+) -> Result<(), AuditVerifyError> {
+    let expected_bytes_hash = *blake3::hash(local_bytes).as_bytes();
+    if result.bytes_hash != expected_bytes_hash {
+        return Err(AuditVerifyError::BytesHashMismatch { index });
     }
 
+    let leaf = leaf_hash(&result.key, &result.bytes_hash);
+    let key_count = response_commitment.key_count;
+    if u64::from(result.leaf_index) >= u64::from(key_count) {
+        return Err(AuditVerifyError::LeafIndexOutOfRange {
+            index,
+            leaf_index: result.leaf_index,
+            key_count,
+        });
+    }
+    if !verify_path(
+        &leaf,
+        &result.path,
+        result.leaf_index as usize,
+        key_count,
+        &response_commitment.root,
+    ) {
+        return Err(AuditVerifyError::PathInvalid { index });
+    }
+
+    // Legacy audit digest. Defeats replay (nonce changes per
+    // challenge) and third-party forging (peer ID is bound).
+    let expected_digest = compute_audit_digest(
+        challenge_nonce,
+        challenged_peer_id,
+        &result.key,
+        local_bytes,
+    );
+    if result.digest != expected_digest {
+        return Err(AuditVerifyError::DigestMismatch { index });
+    }
     Ok(())
 }
 
@@ -336,7 +400,7 @@ mod tests {
 
     fn fixture(n: u8) -> (AuditFixture, MlDsaPublicKey) {
         let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
         let nonce = [0xCD; 32];
         let entries: Vec<_> = (1..=n)
             .map(|i| {
@@ -648,7 +712,7 @@ mod tests {
         // that fresh commitment + valid proofs. The pin check rejects.
         let (_pk1, sk1) = ml_dsa_65().generate_keypair().unwrap();
         let (pk_lazy, sk_lazy) = ml_dsa_65().generate_keypair().unwrap();
-        let peer_id = [0xAB; 32];
+        let peer_id = *blake3::hash(&pk_lazy.to_bytes()).as_bytes();
         let nonce = [0xCD; 32];
         let _ = sk1;
 
