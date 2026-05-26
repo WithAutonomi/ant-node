@@ -27,6 +27,7 @@ pub mod paid_list;
 pub mod protocol;
 pub mod pruning;
 pub mod quorum;
+pub mod recent_provers;
 pub mod scheduling;
 pub mod types;
 
