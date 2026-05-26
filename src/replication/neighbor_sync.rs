@@ -215,6 +215,9 @@ pub(crate) async fn sync_with_peer_with_outcome(
         replica_hints,
         paid_hints,
         bootstrapping: is_bootstrapping,
+        // Commitment is piggybacked here once the responder-side builder
+        // wiring lands (phase 3). For now: None.
+        commitment: None,
     };
     let request_id = rand::thread_rng().gen::<u64>();
     let msg = ReplicationMessage {
@@ -376,6 +379,9 @@ pub(crate) async fn handle_sync_request_with_proofs(
         paid_hints,
         bootstrapping: is_bootstrapping,
         rejected_keys: Vec::new(),
+        // Commitment is piggybacked here once the responder-side builder
+        // wiring lands (phase 3). For now: None.
+        commitment: None,
     };
 
     // Rule 4-6: accept inbound hints only if sender is in LocalRT.
@@ -977,6 +983,7 @@ mod tests {
             paid_hints: outbound_paid_hints.clone(),
             bootstrapping: false,
             rejected_keys: Vec::new(),
+            commitment: None,
         };
 
         // Inbound hints from the sender (would be in the request).
