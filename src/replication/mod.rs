@@ -538,6 +538,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let commitment_state = Arc::clone(&self.commitment_state);
+        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -567,6 +568,7 @@ impl ReplicationEngine {
                         &is_bootstrapping,
                         &bootstrap_state,
                         &commitment_state,
+                        &last_commitment_by_peer,
                     ) => {}
                 }
             }
@@ -960,6 +962,7 @@ impl ReplicationEngine {
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let my_commitment_state = Arc::clone(&self.commitment_state);
+        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -1023,6 +1026,19 @@ impl ReplicationEngine {
                     bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
 
                     if let Some(outcome) = outcome {
+                        // v12: ingest the peer's piggybacked commitment from
+                        // the response (same verification as request path).
+                        // Bootstrap path is the FIRST gossip we receive from
+                        // most peers, so populating last_commitment_by_peer
+                        // here lets the first audit after drain be
+                        // commitment-bound.
+                        ingest_peer_commitment(
+                            peer,
+                            outcome.response.commitment.as_ref(),
+                            &last_commitment_by_peer,
+                        )
+                        .await;
+
                         if !outcome.response.bootstrapping {
                             record_sent_replica_hints(
                                 peer,
@@ -1770,6 +1786,7 @@ async fn record_sent_replica_hints(
 
 /// Run one neighbor sync round.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 async fn run_neighbor_sync_round(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
@@ -1783,6 +1800,7 @@ async fn run_neighbor_sync_round(
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     commitment_state: &Arc<ResponderCommitmentState>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -1898,6 +1916,7 @@ async fn run_neighbor_sync_round(
                 sync_history,
                 sync_cycle_epoch,
                 repair_proofs,
+                last_commitment_by_peer,
             )
             .await;
         } else {
@@ -1937,6 +1956,7 @@ async fn run_neighbor_sync_round(
                         sync_history,
                         sync_cycle_epoch,
                         repair_proofs,
+                        last_commitment_by_peer,
                     )
                     .await;
                 }
@@ -1964,7 +1984,15 @@ async fn handle_sync_response(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
 ) {
+    // v12: ingest the peer's commitment if they piggybacked one on the
+    // response. Same verification as the request path
+    // (peer-id binding + signature). Drops forged commitments at the
+    // edge; honest commitments populate `last_commitment_by_peer` so
+    // the auditor can pin them on the next audit tick.
+    ingest_peer_commitment(peer, resp.commitment.as_ref(), last_commitment_by_peer).await;
+
     // Record successful sync.
     {
         let mut state = sync_state.write().await;
@@ -2829,6 +2857,18 @@ async fn ingest_peer_commitment(
         warn!(
             "ingest_peer_commitment: sender_peer_id mismatch from {source} \
              (dropped, possible relay attempt)"
+        );
+        return false;
+    }
+    // Peer-id to embedded-pubkey binding: saorsa-core derives PeerId as
+    // BLAKE3(pubkey_bytes). Without this check, a responder could sign
+    // with a throwaway key they own and lie about which identity it
+    // belongs to (the embedded-key signature would verify trivially).
+    let derived_peer_id = *blake3::hash(&c.sender_public_key).as_bytes();
+    if derived_peer_id != c.sender_peer_id {
+        warn!(
+            "ingest_peer_commitment: embedded pubkey does not hash to claimed peer_id for \
+             {source} (dropped, throwaway-key attack)"
         );
         return false;
     }

@@ -33,6 +33,7 @@ use ant_node::replication::commitment_state::{
     build_commitment_bound_audit_response, BuiltCommitment, CommitmentBoundOutcome,
     ResponderCommitmentState,
 };
+use ant_node::replication::protocol::compute_audit_digest;
 use ant_node::replication::recent_provers::RecentProvers;
 use saorsa_core::identity::PeerId;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -74,10 +75,14 @@ struct Responder {
 }
 
 impl Responder {
-    fn new(peer_byte: u8) -> Self {
+    fn new(_peer_byte: u8) -> Self {
         let (public_key, secret_key) = keypair();
-        let mut peer_id_bytes = [0u8; 32];
-        peer_id_bytes[0] = peer_byte;
+        // Gate 2c requires peer_id == BLAKE3(public_key_bytes). The
+        // _peer_byte parameter is kept for source-compat with existing
+        // tests but is no longer respected — peer identity is derived
+        // from the actual pubkey, as in production (saorsa-core
+        // `peer_id_from_public_key`).
+        let peer_id_bytes = *blake3::hash(&public_key.to_bytes()).as_bytes();
         Self {
             state: ResponderCommitmentState::new(),
             public_key,
@@ -449,17 +454,19 @@ fn rotated_commitment_drops_holder_credit() {
 /// A response carrying a commitment signed by the WRONG key (somebody
 /// else's keypair) is rejected at the signature gate.
 ///
-/// Since the public key is now embedded in the commitment, the equivalent
-/// attack is for a tampering peer (e.g. the responder lying about which
-/// key actually signed) to swap the embedded `sender_public_key` to a
-/// different key. The commitment hash changes (so the pin would catch
-/// it first); to isolate the signature gate, we both swap the key and
-/// re-pin the auditor to the new hash. The signature gate then rejects
-/// because the swapped key did not sign the payload.
+/// Since the public key is now embedded in the commitment AND must hash
+/// to sender_peer_id (gate 2c), isolating the signature gate is fiddly.
+/// The construction here: swap the embedded pubkey to one whose
+/// signature would NOT verify under the actual signed payload, AND
+/// update peer_id to BLAKE3(swapped pubkey) so gate 2c passes, AND
+/// re-pin the auditor + the challenged peer to the new identity. Then
+/// gate 3 (signature) is the only remaining gate that can fail.
 #[test]
 fn wrong_signer_rejected_at_signature_gate() {
     let nonce = [0xCD; 32];
     let (wrong_public_key, _) = keypair();
+    let wrong_pk_bytes = wrong_public_key.to_bytes();
+    let wrong_peer_id = *blake3::hash(&wrong_pk_bytes).as_bytes();
 
     let responder = Responder::new(0xAB);
     responder.commit_to(&[1, 2, 3]);
@@ -481,19 +488,28 @@ fn wrong_signer_rejected_at_signature_gate() {
         }
     };
 
-    // Swap the embedded public key to a different one. This changes the
-    // commitment hash, so re-pin to isolate the signature gate.
+    // Swap both the embedded pubkey AND sender_peer_id so gate 2c
+    // passes; pin to the new commitment hash so gate 2b passes; then
+    // gate 3 is the only failure path because the signature was signed
+    // under responder.secret_key, not the wrong key.
     let mut bad_commit = commitment.clone();
-    bad_commit.sender_public_key = wrong_public_key.to_bytes();
+    bad_commit.sender_public_key = wrong_pk_bytes;
+    bad_commit.sender_peer_id = wrong_peer_id;
     let new_pin = commitment_hash(&bad_commit).unwrap();
 
+    // Per-key digest also bound the original challenged_peer_id; rebuild
+    // it under the new wrong_peer_id so gate 4 (digest) wouldn't trip
+    // first.
+    let mut bad_per_key = per_key.clone();
+    bad_per_key[0].digest = compute_audit_digest(&nonce, &wrong_peer_id, &key(1), &content(1));
+
     let result = auditor_verifies(
-        &responder.peer_id_bytes,
+        &wrong_peer_id, // challenged peer == new (wrong) peer_id
         &new_pin,
         &[key(1)],
         &nonce,
         &bad_commit,
-        &per_key,
+        &bad_per_key,
         auditor_local,
     );
     assert!(
@@ -679,6 +695,79 @@ fn cross_peer_commitment_substitution_rejected_by_sender_id() {
     assert!(
         matches!(result, Err(AuditVerifyError::SenderPeerIdMismatch)),
         "cross-peer substitution must trip gate 2a, got {result:?}",
+    );
+}
+
+/// Attack 1f': throwaway-key substitution. An adversary controls the
+/// peer at peer_id P. They build a commitment, fill in P's peer_id, but
+/// embed a *different* (throwaway) public key whose secret they hold.
+/// The signature verifies under the throwaway key (gate 3). Without
+/// gate 2c, the audit would accept this as a valid claim from P even
+/// though the throwaway key has no relationship to P's identity.
+///
+/// Gate 2c (peer_id == BLAKE3(embedded_pubkey)) rejects this. saorsa-
+/// core derives PeerId from the public key bytes; any commitment whose
+/// embedded pubkey doesn't match the claimed peer_id is malformed.
+#[test]
+fn throwaway_key_substitution_rejected_by_pubkey_binding() {
+    let nonce = [0xCD; 32];
+
+    // Adversary wants to impersonate peer P. Compute P's peer_id from a
+    // legitimate pubkey (which the adversary does NOT control).
+    let (p_pubkey, _) = keypair();
+    let p_peer_id = *blake3::hash(&p_pubkey.to_bytes()).as_bytes();
+
+    // They build a fresh throwaway keypair and sign with it.
+    let (throwaway_pk, throwaway_sk) = keypair();
+    let throwaway_pk_bytes = throwaway_pk.to_bytes();
+
+    // Build a commitment claiming P's peer_id but embedding the throwaway
+    // pubkey. Sign under the throwaway secret. The signature verifies
+    // under the embedded throwaway key.
+    let entries = vec![(key(1), content_hash(1))];
+    let tree = MerkleTree::build(entries).unwrap();
+    let root = tree.root();
+    let path = tree.path_for(&key(1)).unwrap();
+    let key_count = tree.key_count();
+    let sig = sign_commitment(
+        &throwaway_sk,
+        &root,
+        key_count,
+        &p_peer_id, // P's peer_id (LIE)
+        &throwaway_pk_bytes,
+    )
+    .unwrap();
+    let bad_commit = StorageCommitment {
+        root,
+        key_count,
+        sender_peer_id: p_peer_id,
+        sender_public_key: throwaway_pk_bytes.clone(),
+        signature: sig,
+    };
+
+    let pin = commitment_hash(&bad_commit).unwrap();
+    let per_key = vec![CommitmentBoundResult {
+        key: key(1),
+        digest: compute_audit_digest(&nonce, &p_peer_id, &key(1), &content(1)),
+        bytes_hash: content_hash(1),
+        leaf_index: 0,
+        path,
+    }];
+
+    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> { (k == &key(1)).then(|| content(1)) };
+
+    let result = auditor_verifies(
+        &p_peer_id, // challenged peer is P
+        &pin,
+        &[key(1)],
+        &nonce,
+        &bad_commit,
+        &per_key,
+        auditor_local,
+    );
+    assert!(
+        matches!(result, Err(AuditVerifyError::SenderPeerIdMismatch)),
+        "throwaway-key attack must trip gate 2c, got {result:?}",
     );
 }
 
