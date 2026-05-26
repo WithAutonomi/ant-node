@@ -339,7 +339,7 @@ fn overclaim_via_partial_commitment_yields_no_holder_credit() {
 /// commitment is contractually allowed to be dropped) AND the auditor
 /// can detect this via the structural response.
 #[test]
-fn responder_drops_old_commitment_after_two_rotations() {
+fn responder_drops_old_commitment_past_retention_window() {
     let nonce = [0xCD; 32];
 
     let responder = Responder::new(0xAB);
@@ -348,15 +348,17 @@ fn responder_drops_old_commitment_after_two_rotations() {
     responder.commit_to(&[1, 2, 3]);
     let h1 = responder.current_hash();
 
-    // Auditor pinned h1. Two rotations later h1 is dropped (v5/v12 §4
-    // retention is exactly one previous).
-    responder.commit_to(&[1, 2, 3, 4]);
-    responder.commit_to(&[1, 2, 3, 4, 5]);
+    // Round-11 widened retention to 4 slots (covers ~4h with the 1h
+    // rotation cadence). Rotate 4 more times → h1 ages out.
+    for batch_size in 4..=8u8 {
+        let keys: Vec<u8> = (1..=batch_size).collect();
+        responder.commit_to(&keys);
+    }
 
     let outcome = responder.build_response(&h1, &[key(1)], &nonce);
     assert!(
         matches!(outcome, CommitmentBoundOutcome::UnknownCommitmentHash),
-        "h1 must be unreachable after two rotations, got {outcome:?}",
+        "h1 must be unreachable after RETAINED_COMMITMENT_SLOTS rotations, got {outcome:?}",
     );
 }
 

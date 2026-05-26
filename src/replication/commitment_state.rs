@@ -134,20 +134,35 @@ impl BuiltCommitment {
     }
 }
 
-/// Two-slot retention state: the current commitment and the immediately
-/// previous one.
+/// Number of historical commitments retained by [`ResponderCommitmentState`].
 ///
-/// Per v12 §4: a responder MUST retain the just-demoted commitment until
-/// the next rotation so audits pinned to it can be answered. This struct
-/// enforces that as a structural invariant — rotation is the only path
-/// that drops `previous`.
+/// Per v12 paragraph 4: a responder MUST retain demoted commitments long
+/// enough that audits pinned to them can be answered.
+///
+/// Sizing: with 1h rotation interval (see `COMMITMENT_ROTATION_INTERVAL_SECS`
+/// in mod.rs) and worst-case neighbor-sync cooldown of ~3h (1h cooldown +
+/// batch staggering), keeping 4 slots gives ~4h of pin validity. That
+/// comfortably exceeds the worst-case auditor pin lag (codex round-11
+/// MAJOR #1). Memory cost: 4 × (sig + pubkey + ~64 B/key) → at 10k keys
+/// per commitment, ~2.6 MB.
+const RETAINED_COMMITMENT_SLOTS: usize = 4;
+
+/// Multi-slot retention state: the current commitment plus
+/// [`RETAINED_COMMITMENT_SLOTS`] - 1 historical ones.
+///
+/// Per v12 paragraph 4: a responder MUST retain demoted commitments
+/// until they would no longer plausibly be pinned by any remote auditor.
+/// This struct enforces that as a structural invariant — rotation is the
+/// only path that drops the oldest slot.
 pub struct ResponderCommitmentState {
     inner: RwLock<Inner>,
 }
 
 struct Inner {
-    current: Option<Arc<BuiltCommitment>>,
-    previous: Option<Arc<BuiltCommitment>>,
+    /// Newest-first: slots[0] is `current`, slots[1] is `previous`,
+    /// slots[2..] are older retained commitments. Length is at most
+    /// [`RETAINED_COMMITMENT_SLOTS`].
+    slots: Vec<Arc<BuiltCommitment>>,
 }
 
 impl Default for ResponderCommitmentState {
@@ -164,39 +179,35 @@ impl ResponderCommitmentState {
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(Inner {
-                current: None,
-                previous: None,
+                slots: Vec::with_capacity(RETAINED_COMMITMENT_SLOTS),
             }),
         }
     }
 
-    /// Rotate: the new build becomes `current`; the prior `current`
-    /// becomes `previous`; the prior `previous` is dropped.
+    /// Rotate: the new build becomes `current`; existing commitments
+    /// shift down; the oldest beyond [`RETAINED_COMMITMENT_SLOTS`] is
+    /// dropped.
     ///
-    /// Invariant INV-R2 (v7 §2): the demoted tree is reachable until the
-    /// next rotation. Callers MUST NOT clear `previous` by any other
-    /// mechanism.
+    /// Invariant INV-R2 (v7 paragraph 2): demoted trees remain reachable
+    /// until they age out past the retention window. Callers MUST NOT
+    /// clear the retention buffer by any other mechanism.
     pub fn rotate(&self, new_current: BuiltCommitment) {
         let new_current = Arc::new(new_current);
         let mut guard = self.inner.write();
-        let previous = guard.current.take();
-        guard.current = Some(new_current);
-        guard.previous = previous;
+        guard.slots.insert(0, new_current);
+        if guard.slots.len() > RETAINED_COMMITMENT_SLOTS {
+            guard.slots.truncate(RETAINED_COMMITMENT_SLOTS);
+        }
     }
 
     /// Look up a commitment by its hash. Returns `Some(arc)` if `hash`
-    /// matches either `current` or `previous`. The returned `Arc` keeps
-    /// the [`BuiltCommitment`] alive for as long as the caller holds it,
-    /// even if a concurrent `rotate` drops the slot.
+    /// matches any retained slot. The returned `Arc` keeps the
+    /// [`BuiltCommitment`] alive for as long as the caller holds it,
+    /// even if a concurrent `rotate` ages it out of the retention buffer.
     #[must_use]
     pub fn lookup_by_hash(&self, hash: &[u8; 32]) -> Option<Arc<BuiltCommitment>> {
         let guard = self.inner.read();
-        if let Some(c) = &guard.current {
-            if &c.cached_hash == hash {
-                return Some(Arc::clone(c));
-            }
-        }
-        if let Some(c) = &guard.previous {
+        for c in &guard.slots {
             if &c.cached_hash == hash {
                 return Some(Arc::clone(c));
             }
@@ -209,13 +220,13 @@ impl ResponderCommitmentState {
     /// `NeighborSyncRequest`/`Response`.
     #[must_use]
     pub fn current(&self) -> Option<Arc<BuiltCommitment>> {
-        self.inner.read().current.as_ref().map(Arc::clone)
+        self.inner.read().slots.first().map(Arc::clone)
     }
 
-    /// Test-only: snapshot of `previous`.
+    /// Test-only: snapshot of the second-newest slot (legacy "previous").
     #[cfg(test)]
     pub(crate) fn previous(&self) -> Option<Arc<BuiltCommitment>> {
-        self.inner.read().previous.as_ref().map(Arc::clone)
+        self.inner.read().slots.get(1).map(Arc::clone)
     }
 }
 
@@ -477,24 +488,32 @@ mod tests {
     }
 
     #[test]
-    fn rotate_drops_oldest_after_two_rotations() {
+    fn rotate_drops_oldest_past_retention_window() {
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
-        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
-        let h1 = c1.hash();
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
-        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
-        let h3 = c3.hash();
-        state.rotate(c1);
-        state.rotate(c2);
-        state.rotate(c3);
+        // RETAINED_COMMITMENT_SLOTS = 4. Insert 5 commitments; the
+        // oldest should be evicted, the most recent 4 retained.
+        let cs: Vec<_> = (1..=5u8)
+            .map(|i| {
+                BuiltCommitment::build(vec![(key(i), bh(i))], &[0; 32], &sk, &pk_bytes).unwrap()
+            })
+            .collect();
+        let hashes: Vec<_> = cs.iter().map(BuiltCommitment::hash).collect();
 
-        assert_eq!(state.current().unwrap().hash(), h3);
-        assert!(state.previous().is_some());
-        // h1 is no longer reachable.
-        assert!(state.lookup_by_hash(&h1).is_none());
+        for c in cs {
+            state.rotate(c);
+        }
+
+        // Newest is current.
+        assert_eq!(state.current().unwrap().hash(), hashes[4]);
+        // Slots 1-4 of the input (indices 1..=4) remain reachable.
+        for h in hashes.iter().skip(1) {
+            assert!(state.lookup_by_hash(h).is_some());
+        }
+        // The very first commitment (oldest) has been aged out.
+        assert!(state.lookup_by_hash(&hashes[0]).is_none());
     }
 
     #[test]
@@ -716,7 +735,7 @@ mod tests {
     fn lookup_arc_outlives_subsequent_rotation() {
         // INV-R2: an in-flight audit responder that grabbed an Arc must
         // be able to finish building the response even after the state
-        // rotates that commitment out.
+        // rotates that commitment out past the retention window.
         let (_pk, sk) = keypair();
         let pk_bytes = _pk.to_bytes();
         let state = ResponderCommitmentState::new();
@@ -727,11 +746,12 @@ mod tests {
 
         let in_flight = state.lookup_by_hash(&h1).unwrap();
 
-        // Two rotations — h1 is gone from state.
-        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &[0; 32], &sk, &pk_bytes).unwrap();
-        let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
-        state.rotate(c2);
-        state.rotate(c3);
+        // Rotate RETAINED_COMMITMENT_SLOTS times → h1 ages out.
+        for i in 2..=(super::RETAINED_COMMITMENT_SLOTS as u8 + 1) {
+            let c = BuiltCommitment::build(vec![(key(i), bh(i))], &[0; 32], &sk, &pk_bytes)
+                .unwrap();
+            state.rotate(c);
+        }
         assert!(state.lookup_by_hash(&h1).is_none());
 
         // But the in-flight Arc still works.

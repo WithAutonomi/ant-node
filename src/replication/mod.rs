@@ -746,6 +746,16 @@ impl ReplicationEngine {
         let p2p = Arc::clone(&self.p2p_node);
 
         let handle = tokio::spawn(async move {
+            // Build the first commitment immediately on startup so a
+            // restarted node can answer commitment-bound audits right
+            // away — otherwise current() stays None for a full rotation
+            // interval and audits silently fall back to legacy
+            // (codex round-11 MAJOR #2a).
+            if let Err(e) =
+                rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p).await
+            {
+                warn!("Initial commitment build failed: {e}");
+            }
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
