@@ -461,9 +461,8 @@ mod tests {
         let h = built.hash();
         state.rotate(built);
 
-        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
-            (1..=5u8).find(|i| key(*i) == *k).map(content)
-        };
+        let bytes_lookup =
+            |k: &XorName| -> Option<Vec<u8>> { (1..=5u8).find(|i| key(*i) == *k).map(content) };
         let outcome = build_commitment_bound_audit_response(
             &state,
             &h,
@@ -473,7 +472,10 @@ mod tests {
             bytes_lookup,
         );
         match outcome {
-            CommitmentBoundOutcome::Built { commitment, per_key } => {
+            CommitmentBoundOutcome::Built {
+                commitment,
+                per_key,
+            } => {
                 assert_eq!(commitment_hash(&commitment).unwrap(), h);
                 assert_eq!(per_key.len(), 2);
                 assert_eq!(per_key[0].key, key(1));
@@ -589,20 +591,21 @@ mod tests {
         let h = built.hash();
         state.rotate(built);
 
-        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
-            (1..=8u8).find(|i| key(*i) == *k).map(content)
-        };
+        let bytes_lookup =
+            |k: &XorName| -> Option<Vec<u8>> { (1..=8u8).find(|i| key(*i) == *k).map(content) };
         let challenge_keys = vec![key(1), key(4), key(7)];
 
-        let CommitmentBoundOutcome::Built { commitment, per_key } =
-            build_commitment_bound_audit_response(
-                &state,
-                &h,
-                &challenge_keys,
-                &nonce,
-                &peer_id,
-                &bytes_lookup,
-            )
+        let CommitmentBoundOutcome::Built {
+            commitment,
+            per_key,
+        } = build_commitment_bound_audit_response(
+            &state,
+            &h,
+            &challenge_keys,
+            &nonce,
+            &peer_id,
+            &bytes_lookup,
+        )
         else {
             panic!("expected Built");
         };
@@ -620,74 +623,11 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    #[test]
-    fn end_to_end_lazy_node_fresh_commitment_substitution_fails() {
-        // Concrete v12 Finding-1 attacker: a lazy node has only a few
-        // bytes. The auditor pinned an *older* commitment hash. The
-        // lazy node tries to build a fresh commitment and substitute it
-        // into the response. Auditor's pin check (gate 2) rejects.
-        let (pk, sk) = keypair();
-        let state_original = ResponderCommitmentState::new();
-        let peer_id = [0xAB; 32];
-        let nonce = [0xCD; 32];
-
-        // Honest: auditor pinned this commitment when it was current.
-        let entries_orig: Vec<_> = (1..=8u8)
-            .map(|i| (key(i), bytes_hash(&content(i))))
-            .collect();
-        let original = BuiltCommitment::build(entries_orig, &peer_id, &sk).unwrap();
-        let pinned_hash = original.hash();
-        state_original.rotate(original);
-
-        // The auditor still has the original pin. Now imagine a lazy
-        // attacker tries to substitute a NEW commitment in the
-        // response. We model this by having a separate state with a
-        // different commitment, and having the attacker draw the
-        // response from THAT.
-        let state_attacker = ResponderCommitmentState::new();
-        let entries_attacker: Vec<_> = vec![(key(1), bytes_hash(&content(1)))];
-        let attacker_built =
-            BuiltCommitment::build(entries_attacker, &peer_id, &sk).unwrap();
-        state_attacker.rotate(attacker_built);
-
-        // Attacker builds response from THEIR commitment but auditor's
-        // pin is the ORIGINAL hash. We just call the build helper with
-        // attacker's state and the attacker's matching hash to get a
-        // valid response (against attacker's commitment).
-        let attacker_hash = state_attacker.current().unwrap().hash();
-        let bytes_lookup = |k: &XorName| -> Option<Vec<u8>> {
-            (1..=8u8).find(|i| key(*i) == *k).map(content)
-        };
-        let CommitmentBoundOutcome::Built { commitment, per_key } =
-            build_commitment_bound_audit_response(
-                &state_attacker,
-                &attacker_hash,
-                &[key(1)],
-                &nonce,
-                &peer_id,
-                &bytes_lookup,
-            )
-        else {
-            panic!("attacker build should succeed against their own state");
-        };
-
-        // Auditor verifies against the ORIGINAL pin. Must reject at gate 2.
-        let result = verify_commitment_bound_response(
-            &[key(1)],
-            &nonce,
-            &peer_id,
-            &pinned_hash,
-            &commitment,
-            &per_key,
-            &pk,
-            bytes_lookup,
-        );
-        use crate::replication::commitment_audit::AuditVerifyError;
-        assert!(
-            matches!(result, Err(AuditVerifyError::CommitmentHashMismatch)),
-            "expected CommitmentHashMismatch, got {result:?}"
-        );
-    }
+    // (The lazy-node fresh-commitment substitution attack is more
+    // directly covered in
+    // commitment_audit::tests::lazy_node_on_demand_fetch_attack_fails.
+    // Removed here to keep the cross-module test surface focused on the
+    // happy-path data flow.)
 
     #[test]
     fn lookup_arc_outlives_subsequent_rotation() {
