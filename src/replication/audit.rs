@@ -14,6 +14,7 @@ use crate::replication::commitment::{commitment_hash, CommitmentBoundResult, Sto
 use crate::replication::commitment_audit::{
     verify_commitment_bound_metadata, verify_commitment_bound_per_key,
 };
+use crate::replication::commitment_state::PeerCommitmentRecord;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -73,10 +74,11 @@ pub enum AuditTickResult {
 /// `last_commitment_by_peer` and `recent_provers` are owned by
 /// [`crate::replication::ReplicationEngine`]; this struct borrows them.
 pub struct CommitmentAuditCtx<'a> {
-    /// Per-peer last-known commitment (populated from gossip ingest).
-    /// The auditor pins `commitment_hash(commitment)` into the challenge
-    /// for any peer found here.
-    pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    /// Per-peer record: last-known commitment + sticky `commitment_capable`
+    /// flag (populated from gossip ingest). The auditor pins
+    /// `commitment_hash(record.last_commitment)` into the challenge for
+    /// any peer whose record carries a commitment.
+    pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     /// Holder-eligibility cache. On a successful commitment-bound audit
     /// the auditor records `(challenged_peer, key, commitment_hash)` so
     /// downstream code (quorum, paid lists) can credit the peer as a
@@ -223,20 +225,42 @@ pub async fn audit_tick_with_repair_proofs(
     // response-handling code can verify against the SAME commitment we
     // pinned (avoids a race where the peer's last_commitment_by_peer
     // entry rotates between issue and response handling).
-    let (expected_commitment_hash, pinned_commitment) = match commitment_ctx {
-        Some(ctx) => {
-            let guard = ctx.last_commitment_by_peer.read().await;
-            match guard.get(&challenged_peer) {
-                Some(c) => {
-                    let h = commitment_hash(c);
-                    let snap = c.clone();
-                    (h, Some(snap))
-                }
-                None => (None, None),
-            }
-        }
+    // Snapshot the peer record once; we use it both for pinning the
+    // challenge and (below) for the §3 commitment_capable downgrade
+    // check. Record carries last_commitment + sticky `commitment_capable`.
+    let peer_record = match commitment_ctx {
+        Some(ctx) => ctx
+            .last_commitment_by_peer
+            .read()
+            .await
+            .get(&challenged_peer)
+            .cloned(),
+        None => None,
+    };
+    let (expected_commitment_hash, pinned_commitment) = match peer_record.as_ref() {
+        Some(r) => match r.last_commitment.as_ref() {
+            Some(c) => (commitment_hash(c), Some(c.clone())),
+            None => (None, None),
+        },
         None => (None, None),
     };
+
+    // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
+    // commitment (commitment_capable is sticky) but we currently have
+    // no last_commitment for them (TTL'd, lost via restart, or they
+    // stopped gossiping), we MUST NOT fall back to legacy plain-digest
+    // audits. The peer is fully expected to speak v12. Falling back
+    // would let them downgrade to the weaker path. Return Idle until
+    // they re-gossip a fresh commitment.
+    if let Some(r) = peer_record.as_ref() {
+        if r.commitment_capable && r.last_commitment.is_none() {
+            info!(
+                "Audit: peer {challenged_peer} is commitment-capable but we have no \
+                 cached commitment (TTL/restart/silence); skipping audit until fresh gossip"
+            );
+            return AuditTickResult::Idle;
+        }
+    }
 
     let challenge = AuditChallenge {
         challenge_id,
@@ -419,9 +443,40 @@ pub async fn audit_tick_with_repair_proofs(
             // bypass (a peer cannot trigger this path on a legacy
             // unpinned audit because expected_commitment_hash is None).
             if expected_commitment_hash.is_some() && reason == "unknown commitment hash" {
+                // v12 §5 conditional invalidation:
+                // - Case 1 (lazy rotation): peer dropped bytes, no fresh
+                //   gossip, still pinned to H. Stored hash == H. Clear
+                //   the pin → recent_provers entries lose their match
+                //   basis → credit dropped via is_credited_holder. This
+                //   is now safe because §3 above causes the next audit
+                //   to return Idle (commitment_capable but no
+                //   last_commitment) instead of falling back to legacy.
+                // - Case 2 (honest rotation): peer gossiped C2 between
+                //   our challenge and processing. Stored hash != H.
+                //   Keep the new C2 entry, drop credits anchored to H.
+                // - Case 3 (stale auditor): same as case 1; clear pin,
+                //   wait for next gossip.
+                if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
+                    let mut last = ctx.last_commitment_by_peer.write().await;
+                    if let Some(rec) = last.get_mut(&challenged_peer) {
+                        let stored_h = rec.last_commitment.as_ref().and_then(commitment_hash);
+                        if stored_h == Some(pin) {
+                            // Still the rejected commitment — clear it
+                            // but keep `commitment_capable` sticky.
+                            rec.last_commitment = None;
+                        }
+                        // else: a fresh commitment arrived in the meantime;
+                        // leave it untouched (don't clobber).
+                    }
+                    drop(last);
+                    // Drop credit anchored to the now-stale pin so the
+                    // peer must re-prove every key under the new
+                    // commitment to keep holder status (v12 §6).
+                    ctx.recent_provers.write().await.forget_commitment(&pin);
+                }
                 info!(
-                    "Audit: peer {challenged_peer} claims unknown commitment hash; \
-                     waiting for fresh gossip (keeping pin, no trust penalty this tick)"
+                    "Audit: peer {challenged_peer} rotated past pinned commitment; \
+                     dropped stale pin and credits (no trust penalty)"
                 );
                 return AuditTickResult::Idle;
             }

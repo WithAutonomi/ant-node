@@ -22,6 +22,7 @@
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use parking_lot::RwLock;
 use saorsa_pqc::api::sig::MlDsaSecretKey;
@@ -30,6 +31,66 @@ use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
     commitment_hash, sign_commitment, CommitmentError, MerkleTree, StorageCommitment,
 };
+
+/// Auditor-side per-peer commitment state.
+///
+/// Holds two things that together implement v10/v12 §2 step 5 and §6:
+///   - `last_commitment`: the most recently received, verified, signed
+///     commitment from this peer. `None` if we've evicted it (TTL,
+///     sybil cap, peer-removed) or never received one.
+///   - `commitment_capable`: a **sticky** boolean that flips to `true`
+///     on the first successful gossip ingest and NEVER reverts. Used
+///     by holder-eligibility (§6) and bootstrap-claim shield: a peer
+///     that has at least once proven it speaks v12 is forever held to
+///     that standard. Without stickiness, a peer could flip the flag
+///     off by silencing its gossip and downgrade to the weaker legacy
+///     audit path.
+#[derive(Debug, Clone)]
+pub struct PeerCommitmentRecord {
+    /// Last verified commitment, or `None` if evicted/expired.
+    pub last_commitment: Option<StorageCommitment>,
+    /// Sticky: true once this peer has gossiped a valid commitment.
+    /// Set on ingest. Never set back to false except by full
+    /// PeerRemoved cleanup.
+    pub commitment_capable: bool,
+    /// When `last_commitment` was received. Used for TTL on the
+    /// commitment itself (independent of the commitment_capable
+    /// stickiness — losing the commitment via TTL doesn't make us
+    /// forget the peer ever spoke v12).
+    pub received_at: Instant,
+    /// Last time we performed an ML-DSA signature verify for this
+    /// peer's commitment. Used to enforce the §2 step 3 rate limit
+    /// (at most one sig verify per peer per 60s).
+    pub last_sig_verify_at: Instant,
+}
+
+impl PeerCommitmentRecord {
+    /// Construct from a freshly-verified commitment. `commitment_capable`
+    /// is set to `true` here and must remain so for the lifetime of the
+    /// record.
+    #[must_use]
+    pub fn from_verified(commitment: StorageCommitment, now: Instant) -> Self {
+        Self {
+            last_commitment: Some(commitment),
+            commitment_capable: true,
+            received_at: now,
+            last_sig_verify_at: now,
+        }
+    }
+
+    /// Mark commitment-capable without storing a commitment (used when
+    /// we've TTL-expired the commitment itself but want to remember the
+    /// peer has spoken v12 before).
+    #[must_use]
+    pub fn capable_but_no_commitment(now: Instant) -> Self {
+        Self {
+            last_commitment: None,
+            commitment_capable: true,
+            received_at: now,
+            last_sig_verify_at: now,
+        }
+    }
+}
 
 /// A fully-built commitment: signed wire blob, cached hash, Merkle tree
 /// for inclusion proofs, and a sorted leaf-index lookup for the auditor's

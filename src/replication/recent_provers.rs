@@ -73,7 +73,7 @@ pub struct ProverEntry {
 }
 
 /// Per-key cache of recent provers, capped at [`MAX_PROVERS_PER_KEY`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct RecentProvers {
     /// `entries[K]` is the per-key bounded list. Entries are kept sorted
     /// by `proved_at` ascending so eviction is `O(1)` (drop head).

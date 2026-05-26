@@ -51,7 +51,7 @@ use crate::error::{Error, Result};
 use crate::payment::PaymentVerifier;
 use crate::replication::audit::AuditTickResult;
 use crate::replication::commitment::StorageCommitment;
-use crate::replication::commitment_state::ResponderCommitmentState;
+use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
 use crate::replication::config::{
     max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
     REPLICATION_PROTOCOL_ID,
@@ -92,6 +92,12 @@ struct VerificationCycleContext<'a> {
     bootstrap_state: &'a Arc<RwLock<BootstrapState>>,
     is_bootstrapping: &'a Arc<RwLock<bool>>,
     bootstrap_complete_notify: &'a Arc<Notify>,
+    /// v12 §6 holder-eligibility inputs. The verifier downgrades a
+    /// peer's Present claim to Unresolved unless they're a credited
+    /// holder of the key (i.e. they recently passed a commitment-bound
+    /// audit on it under their currently-credited commitment hash).
+    last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    recent_provers: &'a Arc<RwLock<RecentProvers>>,
 }
 
 /// Fetch worker polling interval in milliseconds.
@@ -133,6 +139,16 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 /// honest auditors mostly hit `current` or `previous` rather than the
 /// "rotated past" case.
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
+
+/// Minimum interval between commitment signature verifications for a
+/// single peer (v10/v12 §2 step 3 + §11 DoS).
+///
+/// A sybil that bypasses the routing-table gate (e.g. by transient
+/// bucket pollution) could otherwise force one ML-DSA-65 verify (~1 ms)
+/// per gossip message. This rate limit caps the verify-per-peer rate
+/// at 1/min, which is comfortably above the legitimate gossip cadence
+/// (the 10-20 min neighbor-sync round on each peer).
+const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Hard cap on the size of `last_commitment_by_peer`.
 ///
@@ -199,12 +215,17 @@ pub struct ReplicationEngine {
     /// outbound `NeighborSyncRequest`/`Response`; consulted by the
     /// commitment-bound audit handler.
     commitment_state: Arc<ResponderCommitmentState>,
-    /// Auditor-side per-peer "last known commitment" table.
+    /// Auditor-side per-peer commitment record (last known commitment +
+    /// sticky `commitment_capable` flag).
     ///
     /// Populated whenever an inbound gossip carries a verified
     /// commitment from the sender. Used by `audit_tick` to snapshot
-    /// `expected_commitment_hash` into outbound challenges.
-    last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    /// `expected_commitment_hash` into outbound challenges, and by
+    /// holder-eligibility (§6) to decide whether a peer's recent_provers
+    /// proof should be honoured. The sticky `commitment_capable` flag
+    /// flips true on first successful ingest and never reverts (§2
+    /// step 5).
+    last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     /// Auditor-side holder-eligibility cache (v12 §6).
     ///
     /// Recorded on successful commitment-bound audit; read by future
@@ -294,7 +315,7 @@ impl ReplicationEngine {
 
     /// Get a reference to the auditor's last-commitment-by-peer table.
     #[must_use]
-    pub fn last_commitment_by_peer(&self) -> &Arc<RwLock<HashMap<PeerId, StorageCommitment>>> {
+    pub fn last_commitment_by_peer(&self) -> &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>> {
         &self.last_commitment_by_peer
     }
 
@@ -981,6 +1002,8 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -998,6 +1021,8 @@ impl ReplicationEngine {
                             bootstrap_state: &bootstrap_state,
                             is_bootstrapping: &is_bootstrapping,
                             bootstrap_complete_notify: &bootstrap_complete_notify,
+                            last_commitment_by_peer: &last_commitment_by_peer,
+                            recent_provers: &recent_provers,
                         };
                         run_verification_cycle(ctx).await;
                     }
@@ -1197,7 +1222,7 @@ async fn handle_replication_message(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     my_commitment_state: &Arc<ResponderCommitmentState>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1876,7 +1901,7 @@ async fn run_neighbor_sync_round(
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     commitment_state: &Arc<ResponderCommitmentState>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -2060,7 +2085,7 @@ async fn handle_sync_response(
     sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
 ) {
     // v12: ingest the peer's commitment if they piggybacked one on the
     // response. Same verification as the request path
@@ -2293,6 +2318,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         bootstrap_state,
         is_bootstrapping,
         bootstrap_complete_notify,
+        last_commitment_by_peer,
+        recent_provers,
     } = ctx;
 
     // Evict stale entries that have been pending too long (e.g. unreachable
@@ -2431,6 +2458,37 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
         // Step 3: Evaluate results — collect outcomes without holding the write
         // lock across paid-list I/O.
+        //
+        // v12 §6 holder-eligibility: snapshot the per-peer last-commitment
+        // table and recent_provers cache up front so the synchronous
+        // evaluate_key_evidence_with_holder_check predicate can consult
+        // them without awaiting. The predicate downgrades a Present
+        // claim to Unresolved unless the peer is credited for that key.
+        let commitment_by_peer_snapshot: HashMap<PeerId, [u8; 32]> = {
+            let map = last_commitment_by_peer.read().await;
+            map.iter()
+                .filter_map(|(p, rec)| {
+                    rec.last_commitment.as_ref().and_then(|c| {
+                        crate::replication::commitment::commitment_hash(c).map(|h| (*p, h))
+                    })
+                })
+                .collect()
+        };
+        // Take a full snapshot of recent_provers under the read lock,
+        // then release. The cache is bounded (16/key × keys), so the
+        // clone is cheap.
+        let provers_snapshot = recent_provers.read().await.clone();
+        let holder_credit = |peer: &PeerId, key: &XorName| -> bool {
+            let Some(hash) = commitment_by_peer_snapshot.get(peer) else {
+                // Peer has no current commitment → not credited.
+                // (Mirrors §3 commitment_capable shield; a peer with
+                // no commitment can claim Present but we don't trust
+                // it for quorum until they re-prove storage.)
+                return false;
+            };
+            provers_snapshot.is_credited_holder(key, peer, hash)
+        };
+
         let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
         {
             let q = queues.read().await;
@@ -2441,7 +2499,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 let Some(entry) = q.get_pending(key) else {
                     continue;
                 };
-                let outcome = quorum::evaluate_key_evidence(key, ev, &targets, config);
+                let outcome = quorum::evaluate_key_evidence_with_holder_check(
+                    key,
+                    ev,
+                    &targets,
+                    config,
+                    &holder_credit,
+                );
                 evaluated.push((*key, outcome, entry.pipeline));
             }
         } // read lock released
@@ -2938,28 +3002,26 @@ async fn ingest_peer_commitment(
     source: &PeerId,
     commitment: Option<&StorageCommitment>,
     p2p_node: &Arc<P2PNode>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, StorageCommitment>>>,
+    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
 ) -> bool {
     let Some(c) = commitment else {
-        // Commitment-downgrade signal (codex round-10 MAJOR #2): a peer
-        // that previously gossiped a commitment but now gossips None
-        // looks like a downgrade attempt to drop back onto the weaker
-        // legacy audit path. We keep the cached entry so subsequent
-        // pinned audits still apply (the responder must still answer
-        // under the cached commitment or rotate forward via gossip),
-        // and we log at warn-level so operators can correlate this
-        // with audit failures. The downgrade itself does NOT clear the
-        // cache; the auditor's "unknown commitment hash" handling keeps
-        // applying the pin until the peer either rotates forward (new
-        // gossip) or accumulates audit failures.
-        //
-        // A future PR should add a trust event here so the peer's
-        // reputation drops directly. For now the downgrade is
-        // observable in logs and indirectly via stalled audits.
-        if last_commitment_by_peer.read().await.contains_key(source) {
+        // Commitment-downgrade signal: a peer that previously gossiped
+        // a commitment but now gossips None looks like a downgrade
+        // attempt to drop back onto the weaker legacy audit path.
+        // §2 step 5 mitigation: `commitment_capable` is sticky, so even
+        // if we evict the cached commitment (TTL, sybil cap), we
+        // remember the peer has spoken v12 — holder-eligibility (§6)
+        // then refuses credit, preventing the downgrade.
+        if last_commitment_by_peer
+            .read()
+            .await
+            .get(source)
+            .is_some_and(|r| r.commitment_capable)
+        {
             warn!(
-                "ingest_peer_commitment: peer {source} previously gossiped a commitment \
-                 but now sent None (possible commitment-downgrade attempt; keeping cached entry)"
+                "ingest_peer_commitment: commitment-capable peer {source} sent None commitment \
+                 (downgrade attempt; sticky capable flag will prevent credit until next valid \
+                 commitment arrives)"
             );
         }
         return false;
@@ -3000,6 +3062,27 @@ async fn ingest_peer_commitment(
         );
         return false;
     }
+    // §2 step 3 + §11 DoS: rate-limit per-peer to at most one ML-DSA
+    // signature verify per `COMMITMENT_SIG_VERIFY_MIN_INTERVAL`. A
+    // sybil/RT-membership-bypassing peer that flooded valid-looking
+    // gossip would otherwise burn CPU on every message. The rate
+    // limit is checked AFTER cheap structural gates (RT, peer-id
+    // binding, pubkey-binding) and BEFORE the expensive sig verify.
+    let now = Instant::now();
+    {
+        let map_read = last_commitment_by_peer.read().await;
+        if let Some(rec) = map_read.get(source) {
+            if now.saturating_duration_since(rec.last_sig_verify_at)
+                < COMMITMENT_SIG_VERIFY_MIN_INTERVAL
+            {
+                debug!(
+                    "ingest_peer_commitment: rate-limited sig verify from {source} \
+                     (< {COMMITMENT_SIG_VERIFY_MIN_INTERVAL:?} since last verify); dropped"
+                );
+                return false;
+            }
+        }
+    }
     // Signature verify, using the public key embedded in the commitment
     // itself. The pubkey is bound by the signature payload (see
     // commitment_signed_payload) so an adversary cannot keep the body
@@ -3028,7 +3111,17 @@ async fn ingest_peer_commitment(
             );
         }
     }
-    map.insert(*source, c.clone());
+    // Preserve sticky commitment_capable across updates — once true,
+    // always true. New entries start with capable = true (we just
+    // verified a valid commitment from this peer).
+    map.entry(*source)
+        .and_modify(|r| {
+            r.last_commitment = Some(c.clone());
+            r.received_at = now;
+            r.last_sig_verify_at = now;
+            r.commitment_capable = true; // sticky-redundant but explicit
+        })
+        .or_insert_with(|| PeerCommitmentRecord::from_verified(c.clone(), now));
     true
 }
 
