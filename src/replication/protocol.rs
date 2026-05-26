@@ -177,6 +177,14 @@ pub struct NeighborSyncRequest {
     pub paid_hints: Vec<XorName>,
     /// Whether sender is currently bootstrapping.
     pub bootstrapping: bool,
+    /// Sender's signed storage commitment (optional, see
+    /// [`crate::replication::commitment`]). `None` from old peers; from
+    /// new peers this carries the Merkle-root commitment over the
+    /// sender's claimed keys. Receivers that recognize it store it as
+    /// the per-peer "last known commitment" used to pin commitment-bound
+    /// audits.
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 /// Neighbor sync response carrying own hint sets.
@@ -190,6 +198,10 @@ pub struct NeighborSyncResponse {
     pub bootstrapping: bool,
     /// Keys that receiver rejected (optional feedback to sender).
     pub rejected_keys: Vec<XorName>,
+    /// Receiver's signed storage commitment (optional, see
+    /// [`NeighborSyncRequest::commitment`]).
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,6 +298,20 @@ pub struct AuditChallenge {
     pub challenged_peer_id: [u8; 32],
     /// Ordered list of keys to prove storage of.
     pub keys: Vec<XorName>,
+    /// Auditor's pin to the commitment it expects the responder to use.
+    ///
+    /// `Some(h)`: a commitment-bound audit (v12 design). The responder
+    /// must reply with `AuditResponse::CommitmentBound` whose
+    /// commitment hashes via
+    /// [`crate::replication::commitment::commitment_hash`] to exactly
+    /// `h`. Any other commitment, or a plain `Digests` reply, is an
+    /// audit failure.
+    ///
+    /// `None`: legacy plain-digest audit (today's behaviour). Allows
+    /// challenging peers from whom we haven't yet received a commitment
+    /// without breaking the existing audit flow during rollout.
+    #[serde(default)]
+    pub expected_commitment_hash: Option<[u8; 32]>,
 }
 
 /// Response to audit challenge.
@@ -315,6 +341,25 @@ pub enum AuditResponse {
         challenge_id: u64,
         /// Human-readable rejection reason.
         reason: String,
+    },
+    /// Commitment-bound proof of storage (v12 storage-bound audit).
+    ///
+    /// Returned when the challenge carried an
+    /// [`AuditChallenge::expected_commitment_hash`]. Carries the
+    /// responder's signed commitment plus per-key Merkle inclusion
+    /// proofs. The auditor verifies that:
+    ///   1. `commitment_hash(commitment) == challenge.expected_commitment_hash`
+    ///   2. The commitment's signature is valid.
+    ///   3. For each per-key entry: the Merkle path verifies the leaf
+    ///      against the commitment root AND the digest matches the
+    ///      auditor's local copy of the bytes.
+    CommitmentBound {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// The signed commitment whose root the proofs are against.
+        commitment: crate::replication::commitment::StorageCommitment,
+        /// Per-key Merkle inclusion proofs, in challenge order.
+        per_key: Vec<crate::replication::commitment::CommitmentBoundResult>,
     },
 }
 
@@ -498,6 +543,7 @@ mod tests {
                 replica_hints: vec![[0x01; 32], [0x02; 32]],
                 paid_hints: vec![[0x03; 32]],
                 bootstrapping: true,
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
@@ -522,6 +568,7 @@ mod tests {
                 paid_hints: vec![],
                 bootstrapping: false,
                 rejected_keys: vec![[0x05; 32], [0x06; 32]],
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
@@ -697,6 +744,7 @@ mod tests {
                 nonce: [0xAB; 32],
                 challenged_peer_id: [0xCD; 32],
                 keys: vec![[0x01; 32], [0x02; 32]],
+                expected_commitment_hash: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
