@@ -503,44 +503,80 @@ fn wrong_signer_rejected_at_signature_gate() {
 /// answering audits via on-demand fetch. Closing this is bandwidth
 /// economics (cost-per-audit > cost-of-storing), not cryptography.
 ///
-/// This test documents the limit of v12: a responder that committed
-/// to bytes at gossip time + can produce those bytes at audit time
-/// passes. The v12 mechanisms ensure the responder MUST have either
-/// stored the bytes or fetched them; they do not distinguish the two.
+/// **Setup to make the attack structurally distinct from the honest
+/// path**: the lazy responder's commitment is built from a fixed key
+/// set at gossip time (it HAD bytes then, per the v12 protocol
+/// invariant — you cannot compute leaf hashes without bytes). After
+/// that, we build the audit response **bypassing the responder's own
+/// `ResponderCommitmentState`** and instead **manually constructing
+/// the per-key proof entries from an alternate bytes source** that
+/// represents fetched-on-demand bytes from a neighbour. This is
+/// observationally indistinguishable from honest storage from the
+/// auditor's perspective — which is exactly the point.
 ///
 /// Pinning this test means: any future "we somehow close Path A
 /// without bandwidth economics" claim must update this test to assert
-/// the new defence.
+/// the new defence (i.e. this test must FAIL after such a fix).
 #[test]
 fn on_demand_fetch_under_original_pin_succeeds_documenting_v12_limit() {
+    use ant_node::replication::commitment::leaf_hash;
     let nonce = [0xCD; 32];
 
-    // Lazy node commits to its full claimed set at gossip time. The
-    // ResponderCommitmentState models a node that HAS the bytes at
-    // commit time (matching the v12 protocol invariant: you cannot
-    // commit without computing leaf hashes, which need the bytes).
+    // Lazy node gossipped a commitment over its full claimed set at
+    // gossip time. The protocol invariant guarantees it had the bytes
+    // then (leaf_hash requires bytes_hash).
     let lazy = Responder::new(0xAB);
     lazy.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
     let pinned_hash = lazy.current_hash();
-
-    // Auditor challenges on key 3.
     let challenge_keys = vec![key(3)];
 
-    // At audit time, the lazy node STILL has access to bytes for key 3
-    // (modeled as the bytes lookup returning content(3) — which in a
-    // real attack would be fetched from a neighbour on demand). The
-    // responder helper passes those bytes through to the audit
-    // response.
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = lazy.build_response(&pinned_hash, &challenge_keys, &nonce)
-    else {
-        panic!("lazy responder builds OK from its original commitment + fetched bytes");
-    };
+    // ATTACK MODEL: lazy node has DROPPED its local bytes for key 3.
+    // To audit, it must fetch from a "neighbour" — modeled as an
+    // alternate bytes source that the lazy node didn't have at
+    // challenge-receive time but obtains during the audit window.
+    //
+    // We construct the audit response by hand using the alternate
+    // bytes source. This bypasses Responder::build_response (which
+    // would use the lazy node's own bytes via the closure that always
+    // returns content(byte)) — making the fetched-vs-stored
+    // distinction observable in the test setup even though it's
+    // unobservable to the auditor on the wire.
+    let neighbour_fetched_bytes_for_key_3 = content(3);
 
-    // Auditor has the bytes locally (only commitment-audits keys it
-    // holds, per v12).
+    // Pull the lazy node's original commitment + proof structure for
+    // key 3 from its retained state.
+    let built = lazy.state.lookup_by_hash(&pinned_hash).expect("retained");
+    let (path, leaf_index) = built.proof_for(&key(3)).expect("key in commitment");
+    let bytes_hash = *blake3::hash(&neighbour_fetched_bytes_for_key_3).as_bytes();
+
+    // Confirm the bytes_hash from "fetched" bytes equals what the
+    // commitment leaf expects (since the commitment was honest at
+    // gossip time, the bytes_hash field is the SAME regardless of
+    // whether the bytes are local or fetched — that's the auditor's
+    // blind spot).
+    let expected_leaf = leaf_hash(&key(3), &bytes_hash);
+    let from_commitment = leaf_hash(&key(3), &content_hash(3));
+    assert_eq!(
+        expected_leaf, from_commitment,
+        "fetched bytes produce the same leaf hash as locally-stored bytes (the v12 blind spot)"
+    );
+
+    let digest = ant_node::replication::protocol::compute_audit_digest(
+        &nonce,
+        &lazy.peer_id_bytes,
+        &key(3),
+        &neighbour_fetched_bytes_for_key_3,
+    );
+    let per_key = vec![CommitmentBoundResult {
+        key: key(3),
+        digest,
+        bytes_hash,
+        leaf_index,
+        path,
+    }];
+
+    // Auditor verifies. It has its own copy of the bytes (only
+    // commitment-audits keys it holds, per v12).
     let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
         if k == &key(3) {
             Some(content(3))
@@ -548,30 +584,32 @@ fn on_demand_fetch_under_original_pin_succeeds_documenting_v12_limit() {
             None
         }
     };
-
     let result = auditor_verifies(
         &lazy.public_key,
         &lazy.peer_id_bytes,
         &pinned_hash,
         &challenge_keys,
         &nonce,
-        &commitment,
+        built.commitment(),
         &per_key,
         auditor_local,
     );
 
-    // VERDICT: the audit PASSES. v12 closes substitution attacks
-    // (gates 2a/2b/4), not the on-demand-fetch class. Mick's design
-    // note in #02_network on 2026-05-21 explicitly anchors this:
-    // "harder to fight against when there are few chunks per node...
-    // the more chunks in an audit, the harder it will become to fetch
-    // them all on-demand within the time frame." Bandwidth economics
-    // is the lever, not the audit cryptography.
+    // VERDICT: the audit PASSES. The lazy node sourced bytes from a
+    // neighbour (modeled by `neighbour_fetched_bytes_for_key_3` being
+    // a separate local that is then THROWN AWAY — the actual lazy node
+    // doesn't have those bytes after the audit ends). The verifier
+    // has no way to distinguish this from honest storage. Mick's
+    // design note in #02_network on 2026-05-21 explicitly anchors
+    // this: "harder to fight against when there are few chunks per
+    // node... the more chunks in an audit, the harder it will become
+    // to fetch them all on-demand within the time frame." Bandwidth
+    // economics is the lever, not the audit cryptography.
     assert!(
         result.is_ok(),
-        "on-demand-fetch attack with valid original commitment + valid bytes passes \
-         the v12 verifier (this is by design — v12 is an economic, not cryptographic, \
-         defence against Path A). result: {result:?}",
+        "on-demand-fetch attack with valid original commitment + alternate bytes source \
+         passes the v12 verifier — this is by design. v12 is an economic, not \
+         cryptographic, defence against Path A. result: {result:?}",
     );
 }
 
