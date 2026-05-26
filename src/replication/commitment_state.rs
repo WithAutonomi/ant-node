@@ -319,6 +319,65 @@ pub fn build_commitment_bound_audit_response(
     }
 }
 
+/// Pre-check a commitment-bound audit challenge: look up the pinned
+/// commitment in `state` and verify every challenged key is covered by
+/// it. Does NOT read any chunk bytes.
+///
+/// Used by the responder side to validate the challenge structurally
+/// before streaming chunk bytes one at a time (which can be GiB for a
+/// sqrt-scaled sample on a large store). The caller then iterates
+/// challenge_keys, reads each chunk async, and calls
+/// [`build_commitment_bound_result_for_key`] per key — bounding peak
+/// memory at one chunk regardless of sample size (codex round-9 MAJOR).
+///
+/// Returns the matched commitment Arc on success so the caller doesn't
+/// have to look it up again.
+pub fn precheck_commitment_bound_challenge(
+    state: &ResponderCommitmentState,
+    expected_commitment_hash: &[u8; 32],
+    challenge_keys: &[crate::ant_protocol::XorName],
+) -> Result<std::sync::Arc<BuiltCommitment>, CommitmentBoundOutcome> {
+    let Some(built) = state.lookup_by_hash(expected_commitment_hash) else {
+        return Err(CommitmentBoundOutcome::UnknownCommitmentHash);
+    };
+    for key in challenge_keys {
+        if built.proof_for(key).is_none() {
+            return Err(CommitmentBoundOutcome::KeyNotInCommitment { key: *key });
+        }
+    }
+    Ok(built)
+}
+
+/// Build one per-key entry of a commitment-bound audit response, given
+/// the pre-checked commitment and the chunk bytes for `key`.
+///
+/// Pairs with [`precheck_commitment_bound_challenge`] for streaming
+/// (one chunk at a time) response construction. Returns `None` if
+/// `key` is not in the commitment — precheck should have caught this,
+/// so a None here is a programmer error.
+#[must_use]
+pub fn build_commitment_bound_result_for_key(
+    built: &BuiltCommitment,
+    key: &crate::ant_protocol::XorName,
+    challenge_nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    bytes: &[u8],
+) -> Option<crate::replication::commitment::CommitmentBoundResult> {
+    use crate::replication::commitment::CommitmentBoundResult;
+    use crate::replication::protocol::compute_audit_digest;
+
+    let (path, leaf_index) = built.proof_for(key)?;
+    let bytes_hash = *blake3::hash(bytes).as_bytes();
+    let digest = compute_audit_digest(challenge_nonce, challenged_peer_id, key, bytes);
+    Some(CommitmentBoundResult {
+        key: *key,
+        digest,
+        bytes_hash,
+        leaf_index,
+        path,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

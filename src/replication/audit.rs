@@ -337,6 +337,28 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
+            // Wire-contract enforcement (codex round-9 MAJOR): when we
+            // pinned a commitment hash into the challenge, the responder
+            // MUST answer with CommitmentBound or Rejected/Bootstrapping.
+            // Falling back to plain Digests would let a peer that has
+            // already gossiped a commitment ignore the storage-bound
+            // path and pass via on-demand fetch under the weaker legacy
+            // verifier. Treat as malformed.
+            if expected_commitment_hash.is_some() {
+                warn!(
+                    "Audit: peer {challenged_peer} answered Digests to a pinned challenge \
+                     (commitment-bound contract violation) — treating as malformed"
+                );
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::MalformedResponse,
+                    p2p_node,
+                    config,
+                )
+                .await;
+            }
             verify_digests(
                 &challenged_peer,
                 challenge_id,
@@ -892,52 +914,80 @@ pub async fn handle_audit_challenge_with_commitment(
     // commitment, look it up in our state and produce a CommitmentBound
     // response. If we don't have that commitment (rotated away, never
     // gossiped, etc.) reject with reason="unknown commitment hash" —
-    // the auditor's v12 §5 handler conditionally invalidates its pin
-    // on this rejection (currently in phase-3.5 follow-up).
+    // the auditor's v12 paragraph 5 handler keeps the pin (no penalty)
+    // and waits for fresh gossip to replace it.
     if let (Some(expected_hash), Some(state)) = (
         challenge.expected_commitment_hash.as_ref(),
         commitment_state,
     ) {
-        // Pre-load all challenged-key bytes since the helper closure
-        // is synchronous but storage reads are async. For a sqrt-scaled
-        // sample (~100 keys at 10k stored) this is bounded.
-        let mut local_bytes = std::collections::HashMap::with_capacity(challenge.keys.len());
-        for key in &challenge.keys {
-            if let Ok(Some(data)) = storage.get_raw(key).await {
-                local_bytes.insert(*key, data);
-            }
-        }
-
-        let outcome = crate::replication::commitment_state::build_commitment_bound_audit_response(
+        // Precheck WITHOUT reading any chunk bytes (codex round-9 MAJOR:
+        // the prior preload-into-HashMap pattern hit O(sample×4MiB)
+        // peak memory). Cheap: hash-map lookup + per-key proof_for.
+        let built = match crate::replication::commitment_state::precheck_commitment_bound_challenge(
             state,
             expected_hash,
             &challenge.keys,
-            &challenge.nonce,
-            &challenge.challenged_peer_id,
-            |k| local_bytes.get(k).cloned(),
-        );
-
-        return match outcome {
-            crate::replication::commitment_state::CommitmentBoundOutcome::Built {
-                commitment,
-                per_key,
-            } => AuditResponse::CommitmentBound {
-                challenge_id: challenge.challenge_id,
-                commitment,
-                per_key,
-            },
-            crate::replication::commitment_state::CommitmentBoundOutcome::UnknownCommitmentHash => {
-                AuditResponse::Rejected {
+        ) {
+            Ok(b) => b,
+            Err(
+                crate::replication::commitment_state::CommitmentBoundOutcome::UnknownCommitmentHash,
+            ) => {
+                return AuditResponse::Rejected {
                     challenge_id: challenge.challenge_id,
                     reason: "unknown commitment hash".to_string(),
-                }
+                };
             }
-            crate::replication::commitment_state::CommitmentBoundOutcome::KeyNotInCommitment {
-                key,
-            } => AuditResponse::Rejected {
-                challenge_id: challenge.challenge_id,
-                reason: format!("key not in commitment: {}", hex::encode(key)),
-            },
+            Err(
+                crate::replication::commitment_state::CommitmentBoundOutcome::KeyNotInCommitment {
+                    key,
+                },
+            ) => {
+                return AuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    reason: format!("key not in commitment: {}", hex::encode(key)),
+                };
+            }
+            Err(_) => unreachable!("precheck only returns those two outcomes"),
+        };
+
+        // Stream per-key: read one chunk, build its proof entry, drop
+        // the bytes, move to the next. Peak memory is bounded at
+        // MAX_CHUNK_SIZE (4 MiB) regardless of sample size.
+        let mut per_key = Vec::with_capacity(challenge.keys.len());
+        for key in &challenge.keys {
+            let bytes = match storage.get_raw(key).await {
+                Ok(Some(b)) => b,
+                _ => {
+                    return AuditResponse::Rejected {
+                        challenge_id: challenge.challenge_id,
+                        reason: format!("key not in commitment: {}", hex::encode(key)),
+                    };
+                }
+            };
+            let Some(entry) =
+                crate::replication::commitment_state::build_commitment_bound_result_for_key(
+                    &built,
+                    key,
+                    &challenge.nonce,
+                    &challenge.challenged_peer_id,
+                    &bytes,
+                )
+            else {
+                // Precheck guaranteed proof_for(key) returns Some, so
+                // this is unreachable. Defensive only.
+                return AuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    reason: format!("key not in commitment: {}", hex::encode(key)),
+                };
+            };
+            per_key.push(entry);
+            // bytes drops here.
+        }
+
+        return AuditResponse::CommitmentBound {
+            challenge_id: challenge.challenge_id,
+            commitment: built.commitment().clone(),
+            per_key,
         };
     }
 
