@@ -65,6 +65,21 @@ pub const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
 /// to claim a different identity. The peer-id binding (gate 2a in
 /// `verify_commitment_bound_response`) still ensures the embedded key
 /// belongs to the gossiping peer.
+///
+/// # Wire size
+///
+/// One commitment is approximately 5.3 KiB:
+///   - root: 32 B
+///   - key_count: 4 B
+///   - sender_peer_id: 32 B
+///   - sender_public_key: 1952 B (ML-DSA-65 public key)
+///   - signature: 3293 B (ML-DSA-65 signature)
+///
+/// Piggybacked on every `NeighborSyncRequest`/`Response` (~1 h interval
+/// per close-group peer with the round-11 rotation cadence). At a
+/// realistic close-group size of 8 with bidirectional sync, that's
+/// roughly 8 × 2 × 5.3 KiB / hour = ~85 KiB/h of additional gossip
+/// per node. Negligible against typical chunk-transfer bandwidth.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageCommitment {
     /// Merkle root over the responder's claimed keys.

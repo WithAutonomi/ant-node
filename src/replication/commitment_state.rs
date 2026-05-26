@@ -748,8 +748,8 @@ mod tests {
 
         // Rotate RETAINED_COMMITMENT_SLOTS times → h1 ages out.
         for i in 2..=(super::RETAINED_COMMITMENT_SLOTS as u8 + 1) {
-            let c = BuiltCommitment::build(vec![(key(i), bh(i))], &[0; 32], &sk, &pk_bytes)
-                .unwrap();
+            let c =
+                BuiltCommitment::build(vec![(key(i), bh(i))], &[0; 32], &sk, &pk_bytes).unwrap();
             state.rotate(c);
         }
         assert!(state.lookup_by_hash(&h1).is_none());

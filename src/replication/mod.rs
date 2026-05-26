@@ -744,6 +744,8 @@ impl ReplicationEngine {
         let commitment_state = Arc::clone(&self.commitment_state);
         let shutdown = self.shutdown.clone();
         let p2p = Arc::clone(&self.p2p_node);
+        let sync_trigger = Arc::clone(&self.sync_trigger);
+        let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
             // Build the first commitment immediately on startup so a
@@ -751,10 +753,23 @@ impl ReplicationEngine {
             // away — otherwise current() stays None for a full rotation
             // interval and audits silently fall back to legacy
             // (codex round-11 MAJOR #2a).
+            //
+            // After the first build, trigger an immediate neighbor-sync
+            // round so the new commitment gossips out within seconds.
+            // Without this, after a restart remote auditors keep pinning
+            // the pre-restart (rotated-away) hash until their normal
+            // sync cadence elapses — up to 1 h in the worst case,
+            // during which time commitment-bound audits hit "unknown
+            // commitment hash" -> Idle no-ops (codex round-12 MAJOR #2).
+            // ML-DSA signatures are randomized so we cannot reproduce
+            // the pre-restart hash; the only honest path to recovery
+            // is fast re-gossip.
             if let Err(e) =
                 rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p).await
             {
                 warn!("Initial commitment build failed: {e}");
+            } else {
+                sync_trigger.notify_one();
             }
             loop {
                 tokio::select! {
@@ -769,6 +784,19 @@ impl ReplicationEngine {
                             &p2p,
                         ).await {
                             warn!("Commitment rotation failed: {e}");
+                        }
+                        // Piggyback a sweep of expired recent_provers
+                        // entries on the rotation tick (same cadence,
+                        // 1 h). David's PR review (round-12) flagged
+                        // the lack of TTL eviction — is_credited_holder
+                        // already honours the TTL on read, but the
+                        // sweep reclaims memory for entries we'll
+                        // never re-read.
+                        let dropped = recent_provers.write().await.sweep_expired(
+                            std::time::Instant::now()
+                        );
+                        if dropped > 0 {
+                            debug!("recent_provers: swept {dropped} expired entries");
                         }
                     }
                 }

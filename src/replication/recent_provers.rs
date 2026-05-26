@@ -26,12 +26,17 @@
 //!   *current* `commitment_hash`. A peer who proves K under C1 then
 //!   rotates to C2 loses credit until re-proving K under C2.
 //!
-//! TTL eviction (e.g. on auditor reboot, peer disappearing) is *not*
-//! handled here — the caller should call [`RecentProvers::forget_peer`]
-//! when a peer leaves the routing table.
+//! - **TTL**: entries older than [`PROVER_ENTRY_TTL`] are ignored by
+//!   [`RecentProvers::is_credited_holder`] on read, and
+//!   [`RecentProvers::sweep_expired`] reclaims their memory when a
+//!   caller invokes it (e.g. periodically from the engine).
+//! - **PeerRemoved cleanup**: the caller should call
+//!   [`RecentProvers::forget_peer`] when a peer leaves the routing
+//!   table to drop their entries immediately (faster than waiting for
+//!   TTL).
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use saorsa_core::identity::PeerId;
 
@@ -42,6 +47,17 @@ use crate::ant_protocol::XorName;
 /// Sized at 2× `CLOSE_GROUP_SIZE = 8`, giving 8 slack slots for churn
 /// without unbounded growth. LRU-evicted within the cap.
 pub const MAX_PROVERS_PER_KEY: usize = 16;
+
+/// Maximum age of a cached prover entry before it is considered stale.
+///
+/// A proof older than this is treated as "no credit" by
+/// [`RecentProvers::is_credited_holder`] even if the commitment hash
+/// still matches. Sized at 4× the responder rotation interval (4 × 1 h
+/// = 4 h) to comfortably cover one full audit cycle plus retry margin.
+/// David's PR review (round-12) flagged the lack of time-based
+/// expiry; the LRU-by-cap path alone leaves rarely-audited keys with
+/// stale entries lingering until cap pressure evicts them.
+pub const PROVER_ENTRY_TTL: Duration = Duration::from_secs(4 * 3600);
 
 /// One cached prover entry: who proved the key, when, and against which
 /// commitment.
@@ -112,10 +128,15 @@ impl RecentProvers {
 
     /// Is `peer_id` currently credited as a holder of `key`?
     ///
-    /// Returns `true` iff there is a cached entry with `peer_id` and
-    /// `commitment_hash == current_commitment_hash`. The hash binding is
-    /// the v12 §6 lever: a peer that rotates their commitment must
-    /// re-prove every key they want credit for.
+    /// Returns `true` iff there is a non-stale cached entry with `peer_id`
+    /// and `commitment_hash == current_commitment_hash`.
+    ///
+    /// "Non-stale" means `now - proved_at < PROVER_ENTRY_TTL`. The hash
+    /// binding is the v12 §6 lever: a peer that rotates their commitment
+    /// must re-prove every key they want credit for. The TTL is a
+    /// secondary safety net that revokes credit even if the hash
+    /// happens to match (e.g. a peer who proved long ago but has been
+    /// silent or offline since).
     #[must_use]
     pub fn is_credited_holder(
         &self,
@@ -123,11 +144,30 @@ impl RecentProvers {
         peer_id: &PeerId,
         current_commitment_hash: &[u8; 32],
     ) -> bool {
+        let now = Instant::now();
         self.entries.get(key).is_some_and(|bucket| {
-            bucket
-                .iter()
-                .any(|e| &e.peer_id == peer_id && &e.commitment_hash == current_commitment_hash)
+            bucket.iter().any(|e| {
+                &e.peer_id == peer_id
+                    && &e.commitment_hash == current_commitment_hash
+                    && now.saturating_duration_since(e.proved_at) < PROVER_ENTRY_TTL
+            })
         })
+    }
+
+    /// Sweep entries older than [`PROVER_ENTRY_TTL`] across all keys.
+    ///
+    /// Returns the number of entries dropped. Intended for periodic
+    /// invocation by a background task; `is_credited_holder` already
+    /// honours the TTL on read, so the sweep only reclaims memory.
+    pub fn sweep_expired(&mut self, now: Instant) -> usize {
+        let mut dropped = 0;
+        for bucket in self.entries.values_mut() {
+            let before = bucket.len();
+            bucket.retain(|e| now.saturating_duration_since(e.proved_at) < PROVER_ENTRY_TTL);
+            dropped += before - bucket.len();
+        }
+        self.entries.retain(|_, b| !b.is_empty());
+        dropped
     }
 
     /// Drop every cached entry for `peer_id` across all keys.

@@ -971,10 +971,15 @@ pub async fn handle_audit_challenge_with_commitment(
         for key in &challenge.keys {
             let bytes = match storage.get_raw(key).await {
                 Ok(Some(b)) => b,
-                _ => {
+                Ok(None) | Err(_) => {
+                    // Key IS in the commitment (precheck above ensured
+                    // it) but we cannot read the bytes anymore. That's
+                    // real storage loss / deliberate non-response, not
+                    // benign staleness. Use a distinct reason string so
+                    // the auditor penalises (codex round-12 MAJOR #1).
                     return AuditResponse::Rejected {
                         challenge_id: challenge.challenge_id,
-                        reason: format!("key not in commitment: {}", hex::encode(key)),
+                        reason: format!("missing bytes for committed key: {}", hex::encode(key)),
                     };
                 }
             };
