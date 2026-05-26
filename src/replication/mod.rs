@@ -231,6 +231,14 @@ pub struct ReplicationEngine {
     /// Recorded on successful commitment-bound audit; read by future
     /// quorum / paid-list eligibility checks (phase-3 stretch).
     recent_provers: Arc<RwLock<RecentProvers>>,
+    /// Per-peer last sig-verify attempt timestamp for the §2 step 3 /
+    /// §11 DoS rate limit. Bumped on EVERY verify attempt (success or
+    /// failure) so a peer we've never successfully verified can't burn
+    /// CPU on a flood of structurally-plausible-but-invalid gossips.
+    /// Lives separately from `last_commitment_by_peer` because that
+    /// map's records only exist after a successful verify (codex
+    /// round-13 finding).
+    sig_verify_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
@@ -292,6 +300,7 @@ impl ReplicationEngine {
             commitment_state: Arc::new(ResponderCommitmentState::new()),
             last_commitment_by_peer: Arc::new(RwLock::new(HashMap::new())),
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
+            sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
@@ -487,6 +496,7 @@ impl ReplicationEngine {
         let my_commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let recent_provers = Arc::clone(&self.recent_provers);
+        let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -530,6 +540,7 @@ impl ReplicationEngine {
                                     &sync_cycle_epoch,
                                     &repair_proofs,
                                     &last_commitment_by_peer,
+                                    &sig_verify_attempts,
                                     &my_commitment_state,
                                     rr_message_id.as_deref(),
                                 ).await {
@@ -566,9 +577,11 @@ impl ReplicationEngine {
                                 // sybil attacker cannot leave behind one
                                 // StorageCommitment per identity in
                                 // last_commitment_by_peer (codex round-6
-                                // MAJOR).
+                                // MAJOR) — and also drop the sig-verify
+                                // rate-limit timestamp (codex round-13).
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
+                                sig_verify_attempts.write().await.remove(&peer_id);
                             }
                             _ => {}
                         }
@@ -596,6 +609,7 @@ impl ReplicationEngine {
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -626,6 +640,7 @@ impl ReplicationEngine {
                         &bootstrap_state,
                         &commitment_state,
                         &last_commitment_by_peer,
+                        &sig_verify_attempts,
                     ) => {}
                 }
             }
@@ -1062,6 +1077,7 @@ impl ReplicationEngine {
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let my_commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -1136,8 +1152,9 @@ impl ReplicationEngine {
                             outcome.response.commitment.as_ref(),
                             &p2p,
                             &last_commitment_by_peer,
+                            &sig_verify_attempts,
                         )
-                        .await;
+                        .await; // sig_verify_attempts in scope from line ~1080
 
                         if !outcome.response.bootstrapping {
                             record_sent_replica_hints(
@@ -1223,6 +1240,7 @@ async fn handle_replication_message(
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     my_commitment_state: &Arc<ResponderCommitmentState>,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
@@ -1265,7 +1283,8 @@ async fn handle_replication_message(
                 source,
                 request.commitment.as_ref(),
                 p2p_node,
-                &last_commitment_by_peer,
+                last_commitment_by_peer,
+                sig_verify_attempts,
             )
             .await;
             handle_neighbor_sync_request(
@@ -1902,6 +1921,7 @@ async fn run_neighbor_sync_round(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     commitment_state: &Arc<ResponderCommitmentState>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -2018,6 +2038,7 @@ async fn run_neighbor_sync_round(
                 sync_cycle_epoch,
                 repair_proofs,
                 last_commitment_by_peer,
+                sig_verify_attempts,
             )
             .await;
         } else {
@@ -2058,6 +2079,7 @@ async fn run_neighbor_sync_round(
                         sync_cycle_epoch,
                         repair_proofs,
                         last_commitment_by_peer,
+                        sig_verify_attempts,
                     )
                     .await;
                 }
@@ -2086,6 +2108,7 @@ async fn handle_sync_response(
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) {
     // v12: ingest the peer's commitment if they piggybacked one on the
     // response. Same verification as the request path
@@ -2097,6 +2120,7 @@ async fn handle_sync_response(
         resp.commitment.as_ref(),
         p2p_node,
         last_commitment_by_peer,
+        sig_verify_attempts,
     )
     .await;
 
@@ -3003,6 +3027,7 @@ async fn ingest_peer_commitment(
     commitment: Option<&StorageCommitment>,
     p2p_node: &Arc<P2PNode>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) -> bool {
     let Some(c) = commitment else {
         // Commitment-downgrade signal: a peer that previously gossiped
@@ -3068,20 +3093,40 @@ async fn ingest_peer_commitment(
     // gossip would otherwise burn CPU on every message. The rate
     // limit is checked AFTER cheap structural gates (RT, peer-id
     // binding, pubkey-binding) and BEFORE the expensive sig verify.
+    //
+    // Tracked in `sig_verify_attempts` (separate from
+    // last_commitment_by_peer) so EVERY attempt — successful or not —
+    // bumps the rate-limit clock. Reading only from PeerCommitmentRecord
+    // would skip the cap for peers we've never successfully verified,
+    // letting a flood of invalid-but-structurally-plausible gossips
+    // burn CPU (codex round-13 finding).
     let now = Instant::now();
     {
-        let map_read = last_commitment_by_peer.read().await;
-        if let Some(rec) = map_read.get(source) {
-            if now.saturating_duration_since(rec.last_sig_verify_at)
-                < COMMITMENT_SIG_VERIFY_MIN_INTERVAL
-            {
+        let attempts = sig_verify_attempts.read().await;
+        if let Some(&last) = attempts.get(source) {
+            if now.saturating_duration_since(last) < COMMITMENT_SIG_VERIFY_MIN_INTERVAL {
                 debug!(
                     "ingest_peer_commitment: rate-limited sig verify from {source} \
-                     (< {COMMITMENT_SIG_VERIFY_MIN_INTERVAL:?} since last verify); dropped"
+                     (< {COMMITMENT_SIG_VERIFY_MIN_INTERVAL:?} since last attempt); dropped"
                 );
                 return false;
             }
         }
+    }
+    // Stamp BEFORE the verify so even if verify panics or is very slow,
+    // a concurrent message from the same peer can't slip through.
+    // Hard-cap the map size so a wide flood of distinct peer ids can't
+    // grow it unbounded (sized at the same cap as last_commitment_by_peer).
+    {
+        let mut attempts = sig_verify_attempts.write().await;
+        if attempts.len() >= MAX_LAST_COMMITMENT_BY_PEER && !attempts.contains_key(source) {
+            // Drop the entry with the oldest timestamp to make room
+            // for a fresh attempt (preserves DoS-cap semantics).
+            if let Some(victim) = attempts.iter().min_by_key(|(_, &ts)| ts).map(|(p, _)| *p) {
+                attempts.remove(&victim);
+            }
+        }
+        attempts.insert(*source, now);
     }
     // Signature verify, using the public key embedded in the commitment
     // itself. The pubkey is bound by the signature payload (see
