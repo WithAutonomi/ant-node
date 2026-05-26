@@ -2861,12 +2861,24 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 
 /// Verify + store an inbound commitment from a gossip peer.
 ///
-/// Called from the inbound `NeighborSyncRequest`/`Response` handler:
-/// if `commitment` is `Some` AND its signature verifies under a public
-/// key derived from `source.as_bytes()` AND `commitment.sender_peer_id
-/// == source.as_bytes()`, the commitment is stored as the auditor's
-/// per-peer "last known commitment" for use as `expected_commitment_
-/// hash` in future audits.
+/// Called from the inbound `NeighborSyncRequest`/`Response` handlers and
+/// the bootstrap-sync loop. Drops the commitment unless all five gates
+/// pass:
+///   1. `source` is in our DHT routing table (sybil/churn cap).
+///   2. `commitment.sender_peer_id == source.as_bytes()` (peer-id
+///      binding to the authenticated transport peer).
+///   3. `BLAKE3(commitment.sender_public_key) == commitment.sender_peer_id`
+///      (the embedded pubkey actually belongs to the claimed identity —
+///      saorsa-core derives `PeerId = BLAKE3(pubkey)`).
+///   4. `verify_commitment_signature(commitment)` succeeds against the
+///      embedded public key. The signed payload binds the pubkey, so an
+///      adversary cannot swap the key while keeping the body.
+///   5. The cache has room or this is an update for an existing entry
+///      (sybil cap, `MAX_LAST_COMMITMENT_BY_PEER`).
+///
+/// On all-pass, the commitment is stored as the auditor's per-peer
+/// "last known commitment" for use as `expected_commitment_hash` in
+/// future audits.
 ///
 /// Failures (no commitment / mismatched peer id / bad signature) are
 /// silent drops — gossip is best-effort and a malformed commitment from
