@@ -3101,8 +3101,15 @@ async fn ingest_peer_commitment(
     // letting a flood of invalid-but-structurally-plausible gossips
     // burn CPU (codex round-13 finding).
     let now = Instant::now();
+    // Atomic check-and-stamp under a single write lock. Codex round-14
+    // found that read-then-write under separate locks let two
+    // concurrent ingests from the same peer both miss the check and
+    // both reach ML-DSA verify within the 60s window. Holding the
+    // write lock across the rate-limit decision closes that race.
+    // The lock is held only for a hash-map lookup + insert (microseconds),
+    // not across the expensive verify itself.
     {
-        let attempts = sig_verify_attempts.read().await;
+        let mut attempts = sig_verify_attempts.write().await;
         if let Some(&last) = attempts.get(source) {
             if now.saturating_duration_since(last) < COMMITMENT_SIG_VERIFY_MIN_INTERVAL {
                 debug!(
@@ -3112,13 +3119,9 @@ async fn ingest_peer_commitment(
                 return false;
             }
         }
-    }
-    // Stamp BEFORE the verify so even if verify panics or is very slow,
-    // a concurrent message from the same peer can't slip through.
-    // Hard-cap the map size so a wide flood of distinct peer ids can't
-    // grow it unbounded (sized at the same cap as last_commitment_by_peer).
-    {
-        let mut attempts = sig_verify_attempts.write().await;
+        // Hard-cap the map size so a wide flood of distinct peer ids
+        // cannot grow it unbounded. Sized at the same cap as
+        // last_commitment_by_peer.
         if attempts.len() >= MAX_LAST_COMMITMENT_BY_PEER && !attempts.contains_key(source) {
             // Drop the entry with the oldest timestamp to make room
             // for a fresh attempt (preserves DoS-cap semantics).
@@ -3126,6 +3129,9 @@ async fn ingest_peer_commitment(
                 attempts.remove(&victim);
             }
         }
+        // Stamp BEFORE the verify so even if verify panics or is very
+        // slow, a concurrent message from the same peer is rejected
+        // by the 60s cap when it reaches this critical section.
         attempts.insert(*source, now);
     }
     // Signature verify, using the public key embedded in the commitment
