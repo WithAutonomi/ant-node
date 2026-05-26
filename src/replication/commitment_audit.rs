@@ -96,6 +96,11 @@ pub enum AuditVerifyError {
     /// auditor pinned.
     #[error("commitment hash mismatch (expected pin)")]
     CommitmentHashMismatch,
+    /// `response.commitment.sender_peer_id != challenged_peer_id` — the
+    /// responder embedded another peer's signed commitment. Caught
+    /// before the signature gate so callers cannot conflate keys.
+    #[error("response commitment sender_peer_id mismatch (peer impersonation)")]
+    SenderPeerIdMismatch,
     /// `commitment.signature` is not valid under `public_key`.
     #[error("commitment signature did not verify")]
     SignatureInvalid,
@@ -217,7 +222,20 @@ pub fn verify_commitment_bound_response(
         }
     }
 
-    // -- Gate 2: commitment hash pin -----------------------------------------
+    // -- Gate 2a: peer-identity binding --------------------------------------
+    //
+    // A signed commitment from a DIFFERENT peer would have a valid
+    // signature (it's a real commitment, just not from THIS peer) and
+    // could pass the hash pin if the auditor's pin was accidentally
+    // for the wrong peer. Catching this explicitly stops cross-peer
+    // substitution as a class — the responder cannot embed someone
+    // else's commitment in a response to a challenge targeting them.
+
+    if &response_commitment.sender_peer_id != challenged_peer_id {
+        return Err(AuditVerifyError::SenderPeerIdMismatch);
+    }
+
+    // -- Gate 2b: commitment hash pin ----------------------------------------
 
     let response_hash =
         commitment_hash(response_commitment).ok_or(AuditVerifyError::CommitmentHashMismatch)?;

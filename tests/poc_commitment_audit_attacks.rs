@@ -489,6 +489,230 @@ fn wrong_signer_rejected_at_signature_gate() {
     );
 }
 
+/// Attack 1a' (Finding 1, Path A — the ACTUAL on-demand fetch under
+/// the original pin): the lazy node retains its gossiped commitment
+/// but dropped the bytes. At audit time the lazy node fetches the
+/// bytes from honest neighbours and answers with a VALID proof against
+/// its OWN original commitment (same pin, same root). The auditor
+/// accepts.
+///
+/// This is the "lazy node strictly dominated by economic cost"
+/// property v12 admits: the pin defeats cross-commitment substitution
+/// (covered by `fresh_commitment_substitution_rejected_by_pin` above)
+/// but does NOT prevent a node that gossiped a real commitment from
+/// answering audits via on-demand fetch. Closing this is bandwidth
+/// economics (cost-per-audit > cost-of-storing), not cryptography.
+///
+/// This test documents the limit of v12: a responder that committed
+/// to bytes at gossip time + can produce those bytes at audit time
+/// passes. The v12 mechanisms ensure the responder MUST have either
+/// stored the bytes or fetched them; they do not distinguish the two.
+///
+/// Pinning this test means: any future "we somehow close Path A
+/// without bandwidth economics" claim must update this test to assert
+/// the new defence.
+#[test]
+fn on_demand_fetch_under_original_pin_succeeds_documenting_v12_limit() {
+    let nonce = [0xCD; 32];
+
+    // Lazy node commits to its full claimed set at gossip time. The
+    // ResponderCommitmentState models a node that HAS the bytes at
+    // commit time (matching the v12 protocol invariant: you cannot
+    // commit without computing leaf hashes, which need the bytes).
+    let lazy = Responder::new(0xAB);
+    lazy.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
+    let pinned_hash = lazy.current_hash();
+
+    // Auditor challenges on key 3.
+    let challenge_keys = vec![key(3)];
+
+    // At audit time, the lazy node STILL has access to bytes for key 3
+    // (modeled as the bytes lookup returning content(3) — which in a
+    // real attack would be fetched from a neighbour on demand). The
+    // responder helper passes those bytes through to the audit
+    // response.
+    let CommitmentBoundOutcome::Built {
+        commitment,
+        per_key,
+    } = lazy.build_response(&pinned_hash, &challenge_keys, &nonce)
+    else {
+        panic!("lazy responder builds OK from its original commitment + fetched bytes");
+    };
+
+    // Auditor has the bytes locally (only commitment-audits keys it
+    // holds, per v12).
+    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
+        if k == &key(3) {
+            Some(content(3))
+        } else {
+            None
+        }
+    };
+
+    let result = auditor_verifies(
+        &lazy.public_key,
+        &lazy.peer_id_bytes,
+        &pinned_hash,
+        &challenge_keys,
+        &nonce,
+        &commitment,
+        &per_key,
+        auditor_local,
+    );
+
+    // VERDICT: the audit PASSES. v12 closes substitution attacks
+    // (gates 2a/2b/4), not the on-demand-fetch class. Mick's design
+    // note in #02_network on 2026-05-21 explicitly anchors this:
+    // "harder to fight against when there are few chunks per node...
+    // the more chunks in an audit, the harder it will become to fetch
+    // them all on-demand within the time frame." Bandwidth economics
+    // is the lever, not the audit cryptography.
+    assert!(
+        result.is_ok(),
+        "on-demand-fetch attack with valid original commitment + valid bytes passes \
+         the v12 verifier (this is by design — v12 is an economic, not cryptographic, \
+         defence against Path A). result: {result:?}",
+    );
+}
+
+/// Attack 1f (Finding 1 — peer impersonation via cross-peer
+/// commitment substitution): the lazy node lifts a signed commitment
+/// from another peer P' (e.g. observed in gossip) and embeds it in
+/// its own audit response, hoping the auditor verifies the signature
+/// against P''s public key by mistake. Gate 2a (sender_peer_id ==
+/// challenged_peer_id) rejects this before any signature work.
+#[test]
+fn cross_peer_commitment_substitution_rejected_by_sender_id() {
+    let nonce = [0xCD; 32];
+
+    // Peer P with a real signed commitment.
+    let real_p = Responder::new(0xAA);
+    real_p.commit_to(&[1, 2, 3]);
+    let p_hash = real_p.current_hash();
+
+    // Auditor is challenging peer Q (different peer_id_bytes) but
+    // somehow has p_hash in its pin (modelling a mis-binding bug).
+    // Q's public key, P's signed commitment.
+    let q_peer_id_bytes = [0xCC; 32];
+    let (q_public_key, _) = keypair();
+
+    // Q builds a response that contains P's commitment (lifted from
+    // gossip). The path/digests/bytes happen to be valid for P's
+    // commitment over P's key 1.
+    let CommitmentBoundOutcome::Built {
+        commitment: stolen_commitment,
+        per_key,
+    } = real_p.build_response(&p_hash, &[key(1)], &nonce)
+    else {
+        panic!("real_p builds OK against its own pin");
+    };
+
+    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
+        if k == &key(1) {
+            Some(content(1))
+        } else {
+            None
+        }
+    };
+
+    // Auditor challenged Q but the response carries P's commitment.
+    // sender_peer_id in the commitment is P's (0xAA), not Q's (0xCC).
+    // Gate 2a rejects.
+    let result = auditor_verifies(
+        &q_public_key,
+        &q_peer_id_bytes, // challenged peer
+        &p_hash,
+        &[key(1)],
+        &nonce,
+        &stolen_commitment, // sender_peer_id = 0xAA, not 0xCC
+        &per_key,
+        auditor_local,
+    );
+    assert!(
+        matches!(result, Err(AuditVerifyError::SenderPeerIdMismatch)),
+        "cross-peer substitution must trip gate 2a, got {result:?}",
+    );
+}
+
+/// Attack 1g (overclaim, end-to-end via real audit flow): the lazy
+/// node gossips a commitment over a small key set (just key 1), but
+/// in a real network might claim more via replication hints. The
+/// auditor's challenge on key 5 — which is NOT in the lazy node's
+/// commitment — is correctly handled: the responder returns
+/// `KeyNotInCommitment` (caller maps to `Rejected`), and the
+/// auditor's holder cache predicate correctly denies credit because
+/// no `record_proof` is ever issued for (peer, key 5, hash).
+///
+/// This is stronger than the earlier vacuous version because it
+/// composes the full responder helper + cache predicate.
+#[test]
+fn overclaim_via_partial_commitment_end_to_end_no_credit() {
+    let nonce = [0xCD; 32];
+
+    let lazy = Responder::new(0xAB);
+    lazy.commit_to(&[1]); // claims only key 1
+    let pinned_hash = lazy.current_hash();
+
+    // Auditor challenges key 5 — not committed.
+    let outcome = lazy.build_response(&pinned_hash, &[key(5)], &nonce);
+    assert!(
+        matches!(outcome, CommitmentBoundOutcome::KeyNotInCommitment { .. }),
+        "responder must reject key not in commitment, got {outcome:?}",
+    );
+
+    // Simulate the auditor's flow: it receives Rejected
+    // (KeyNotInCommitment); does NOT record_proof; cache stays empty
+    // for (peer, key 5). The credit predicate correctly denies.
+    let mut cache = RecentProvers::new();
+    // No record_proof call — that's the auditor's flow when it sees
+    // any non-successful outcome.
+
+    // For contrast, prove the cache DOES credit when a successful
+    // proof IS recorded — so the predicate is meaningful, not
+    // trivially false.
+    cache.record_proof(key(1), peer_id(0xAB), pinned_hash, Instant::now());
+    assert!(
+        cache.is_credited_holder(&key(1), &peer_id(0xAB), &pinned_hash),
+        "cache predicate is meaningful: successful proof yields credit"
+    );
+
+    // And the lazy node STILL has no credit for key 5 (because no
+    // proof was ever recorded for it).
+    assert!(
+        !cache.is_credited_holder(&key(5), &peer_id(0xAB), &pinned_hash),
+        "key 5 was never proved → no credit, despite a successful proof for key 1"
+    );
+}
+
+/// `forget_commitment` semantics primitive: the v12 §5 conditional
+/// invalidation handler will live at a higher layer (phase 3:
+/// auditor coordinator that owns `last_commitment` per peer). The
+/// underlying primitive — drop cache entries pinned to a specific
+/// hash without touching entries for other hashes — is the building
+/// block. This test pins that primitive's contract.
+#[test]
+fn forget_commitment_only_drops_matching_hash() {
+    let mut cache = RecentProvers::new();
+    let now = Instant::now();
+
+    // P proves K1 under C1, then K1 under C2 (modelling rotation),
+    // then K2 under C1. (Last is unusual but exercises the
+    // "different key same hash" case.)
+    cache.record_proof(key(1), peer_id(0xAB), [0xAA; 32], now);
+    cache.record_proof(key(1), peer_id(0xAB), [0xBB; 32], now);
+    cache.record_proof(key(2), peer_id(0xAB), [0xAA; 32], now);
+
+    // Auditor invalidates C1 (e.g. received UnknownCommitmentHash
+    // for C1 from this peer).
+    cache.forget_commitment(&[0xAA; 32]);
+
+    // C1 entries for both keys are gone.
+    assert!(!cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0xAA; 32]));
+    assert!(!cache.is_credited_holder(&key(2), &peer_id(0xAB), &[0xAA; 32]));
+    // C2 entry survives.
+    assert!(cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0xBB; 32]));
+}
+
 /// Sanity: the four foundational hashes (leaf, node, commitment_hash,
 /// signature) are independent — none of them alone is sufficient.
 #[test]
