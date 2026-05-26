@@ -55,7 +55,16 @@ pub const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
 /// Signed storage commitment.
 ///
 /// Piggybacked on neighbour-sync gossip. The signature commits to the
-/// Merkle root, key count, and sender peer ID under [`DOMAIN_COMMITMENT`].
+/// Merkle root, key count, sender peer ID, **and the sender's ML-DSA-65
+/// public key** under [`DOMAIN_COMMITMENT`].
+///
+/// Embedding the public key lets any receiver verify the signature
+/// without an external `PeerId → MlDsaPublicKey` lookup. Binding the
+/// public key in the signed payload prevents a key-swap attack where an
+/// adversary keeps the message body but re-signs it under a different key
+/// to claim a different identity. The peer-id binding (gate 2a in
+/// `verify_commitment_bound_response`) still ensures the embedded key
+/// belongs to the gossiping peer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageCommitment {
     /// Merkle root over the responder's claimed keys.
@@ -64,6 +73,10 @@ pub struct StorageCommitment {
     pub key_count: u32,
     /// Sender peer ID, bound to the signature.
     pub sender_peer_id: [u8; 32],
+    /// Sender's ML-DSA-65 public key bytes (1952 bytes). Embedded so
+    /// receivers can verify the signature without a separate pubkey
+    /// directory. Bound by the signature.
+    pub sender_public_key: Vec<u8>,
     /// ML-DSA-65 signature over canonical commitment fields. 3293 bytes.
     pub signature: Vec<u8>,
 }
@@ -154,15 +167,25 @@ pub fn commitment_hash(c: &StorageCommitment) -> Option<[u8; 32]> {
 
 /// Canonical bytes the ML-DSA signature covers: the commitment fields
 /// minus the signature itself.
+///
+/// `sender_public_key` is included so an adversary cannot keep the body
+/// and re-sign under a different key (the audit-time verifier would
+/// otherwise accept the swap because verification uses the embedded key).
 fn commitment_signed_payload(
     root: &[u8; 32],
     key_count: u32,
     sender_peer_id: &[u8; 32],
+    sender_public_key: &[u8],
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + 4 + 32);
+    let mut v = Vec::with_capacity(32 + 4 + 32 + 4 + sender_public_key.len());
     v.extend_from_slice(root);
     v.extend_from_slice(&key_count.to_le_bytes());
     v.extend_from_slice(sender_peer_id);
+    // Length-prefix the pubkey so two different (key, suffix) splits cannot
+    // produce the same byte stream (canonical encoding).
+    let pk_len = u32::try_from(sender_public_key.len()).unwrap_or(u32::MAX);
+    v.extend_from_slice(&pk_len.to_le_bytes());
+    v.extend_from_slice(sender_public_key);
     v
 }
 
@@ -389,7 +412,8 @@ pub fn verify_path(
 // Sign + verify
 // ---------------------------------------------------------------------------
 
-/// Sign a commitment's `(root, key_count, sender_peer_id)` with `secret_key`.
+/// Sign a commitment's `(root, key_count, sender_peer_id, sender_public_key)`
+/// with `secret_key`.
 ///
 /// The signature is over the canonical signed payload (see
 /// [`commitment_signed_payload`]) under [`DOMAIN_COMMITMENT`].
@@ -402,8 +426,9 @@ pub fn sign_commitment(
     root: &[u8; 32],
     key_count: u32,
     sender_peer_id: &[u8; 32],
+    sender_public_key: &[u8],
 ) -> Result<Vec<u8>, CommitmentError> {
-    let payload = commitment_signed_payload(root, key_count, sender_peer_id);
+    let payload = commitment_signed_payload(root, key_count, sender_peer_id, sender_public_key);
     let dsa = ml_dsa_65();
     let sig = dsa
         .sign_with_context(secret_key, &payload, DOMAIN_COMMITMENT)
@@ -411,15 +436,41 @@ pub fn sign_commitment(
     Ok(sig.to_bytes())
 }
 
-/// Verify a commitment's signature.
+/// Verify a commitment's signature using the embedded `sender_public_key`.
 ///
 /// Returns `true` iff the signature is valid for `(root, key_count,
-/// sender_peer_id)` under `public_key` and [`DOMAIN_COMMITMENT`]. Returns
-/// `false` on signature-format errors so the caller can simply drop the
-/// gossip.
+/// sender_peer_id, sender_public_key)` under `c.sender_public_key` and
+/// [`DOMAIN_COMMITMENT`]. Returns `false` on key-format or signature-format
+/// errors so the caller can simply drop the gossip.
+///
+/// Verifying against the embedded key removes the need for an external
+/// `PeerId → MlDsaPublicKey` lookup. The peer-id binding (gate 2a in
+/// `commitment_audit::verify_commitment_bound_response`) still ensures the
+/// embedded key belongs to the claimed peer.
 #[must_use]
-pub fn verify_commitment_signature(c: &StorageCommitment, public_key: &MlDsaPublicKey) -> bool {
-    let payload = commitment_signed_payload(&c.root, c.key_count, &c.sender_peer_id);
+pub fn verify_commitment_signature(c: &StorageCommitment) -> bool {
+    let Ok(public_key) = MlDsaPublicKey::from_bytes(MlDsaVariant::MlDsa65, &c.sender_public_key)
+    else {
+        return false;
+    };
+    verify_commitment_signature_with_key(c, &public_key)
+}
+
+/// Verify a commitment's signature against an externally provided key.
+///
+/// Test-helper variant. Production code should use [`verify_commitment_signature`]
+/// since the key is embedded in the commitment.
+#[must_use]
+pub fn verify_commitment_signature_with_key(
+    c: &StorageCommitment,
+    public_key: &MlDsaPublicKey,
+) -> bool {
+    let payload = commitment_signed_payload(
+        &c.root,
+        c.key_count,
+        &c.sender_peer_id,
+        &c.sender_public_key,
+    );
     let Ok(sig) = MlDsaSignature::from_bytes(MlDsaVariant::MlDsa65, &c.signature) else {
         return false;
     };
@@ -655,6 +706,10 @@ mod tests {
         assert!(!verify_path(&lh, &[], 0, u32::MAX, &[0u8; 32]));
     }
 
+    fn pk_bytes(pk: &MlDsaPublicKey) -> Vec<u8> {
+        pk.to_bytes()
+    }
+
     #[test]
     fn sign_and_verify_roundtrip() {
         let dsa = ml_dsa_65();
@@ -664,14 +719,17 @@ mod tests {
         let root = tree.root();
         let key_count = tree.key_count();
         let peer_id = [0xAB; 32];
-        let signature = sign_commitment(&sk, &root, key_count, &peer_id).unwrap();
+        let pk_b = pk_bytes(&pk);
+        let signature = sign_commitment(&sk, &root, key_count, &peer_id, &pk_b).unwrap();
         let c = StorageCommitment {
             root,
             key_count,
             sender_peer_id: peer_id,
+            sender_public_key: pk_b,
             signature,
         };
-        assert!(verify_commitment_signature(&c, &pk));
+        // Verifies via embedded key, no external lookup needed.
+        assert!(verify_commitment_signature(&c));
     }
 
     #[test]
@@ -679,29 +737,37 @@ mod tests {
         let dsa = ml_dsa_65();
         let (pk, sk) = dsa.generate_keypair().unwrap();
         let root = [0u8; 32];
-        let signature = sign_commitment(&sk, &root, 1, &[0; 32]).unwrap();
+        let pk_b = pk_bytes(&pk);
+        let signature = sign_commitment(&sk, &root, 1, &[0; 32], &pk_b).unwrap();
         let c = StorageCommitment {
             root: [1u8; 32], // tampered
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: pk_b,
             signature,
         };
-        assert!(!verify_commitment_signature(&c, &pk));
+        assert!(!verify_commitment_signature(&c));
     }
 
     #[test]
-    fn signature_fails_under_wrong_public_key() {
+    fn signature_fails_under_swapped_public_key() {
         let dsa = ml_dsa_65();
-        let (_pk1, sk1) = dsa.generate_keypair().unwrap();
+        let (pk1, sk1) = dsa.generate_keypair().unwrap();
         let (pk2, _sk2) = dsa.generate_keypair().unwrap();
-        let signature = sign_commitment(&sk1, &[0u8; 32], 1, &[0; 32]).unwrap();
+        let pk1_b = pk_bytes(&pk1);
+        let pk2_b = pk_bytes(&pk2);
+        // Sign under pk1 but embed pk2 — verification (using embedded key)
+        // should fail because pk2 didn't sign this payload AND because the
+        // signed payload binds pk1, not pk2.
+        let signature = sign_commitment(&sk1, &[0u8; 32], 1, &[0; 32], &pk1_b).unwrap();
         let c = StorageCommitment {
             root: [0u8; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: pk2_b,
             signature,
         };
-        assert!(!verify_commitment_signature(&c, &pk2));
+        assert!(!verify_commitment_signature(&c));
     }
 
     #[test]
@@ -712,20 +778,37 @@ mod tests {
             root: [0u8; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: pk_bytes(&pk),
             signature: vec![0u8; 100], // too short and zero-filled
         };
-        assert!(!verify_commitment_signature(&c, &pk));
+        assert!(!verify_commitment_signature(&c));
+    }
+
+    #[test]
+    fn signature_fails_with_garbage_public_key() {
+        // Embedded pubkey is wrong length / invalid → from_bytes fails →
+        // verify returns false. Defends against malformed gossip.
+        let c = StorageCommitment {
+            root: [0u8; 32],
+            key_count: 1,
+            sender_peer_id: [0; 32],
+            sender_public_key: vec![0u8; 100], // wrong length
+            signature: vec![0u8; 3293],
+        };
+        assert!(!verify_commitment_signature(&c));
     }
 
     #[test]
     fn commitment_hash_differs_on_any_field_change() {
         let dsa = ml_dsa_65();
-        let (_pk, sk) = dsa.generate_keypair().unwrap();
-        let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32]).unwrap();
+        let (pk, sk) = dsa.generate_keypair().unwrap();
+        let pk_b = pk_bytes(&pk);
+        let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32], &pk_b).unwrap();
         let c1 = StorageCommitment {
             root: [0; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: pk_b.clone(),
             signature: sig.clone(),
         };
         let h1 = commitment_hash(&c1).unwrap();
@@ -745,17 +828,24 @@ mod tests {
         let mut c5 = c1.clone();
         c5.signature[0] ^= 1;
         assert_ne!(h1, commitment_hash(&c5).unwrap());
+
+        let (pk_other, _) = dsa.generate_keypair().unwrap();
+        let mut c6 = c1.clone();
+        c6.sender_public_key = pk_bytes(&pk_other);
+        assert_ne!(h1, commitment_hash(&c6).unwrap());
     }
 
     #[test]
     fn commitment_hash_stable_for_identical_input() {
         let dsa = ml_dsa_65();
-        let (_pk, sk) = dsa.generate_keypair().unwrap();
-        let sig = sign_commitment(&sk, &[7; 32], 42, &[3; 32]).unwrap();
+        let (pk, sk) = dsa.generate_keypair().unwrap();
+        let pk_b = pk_bytes(&pk);
+        let sig = sign_commitment(&sk, &[7; 32], 42, &[3; 32], &pk_b).unwrap();
         let c = StorageCommitment {
             root: [7; 32],
             key_count: 42,
             sender_peer_id: [3; 32],
+            sender_public_key: pk_b,
             signature: sig,
         };
         assert_eq!(commitment_hash(&c), commitment_hash(&c));
@@ -771,12 +861,14 @@ mod tests {
             root: [0; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: vec![0u8; 1952],
             signature: vec![0xAB],
         };
         let c2 = StorageCommitment {
             root: [0; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
+            sender_public_key: vec![0u8; 1952],
             signature: vec![0xAB, 0x00],
         };
         assert_ne!(commitment_hash(&c1).unwrap(), commitment_hash(&c2).unwrap());

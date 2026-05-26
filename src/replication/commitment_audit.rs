@@ -16,7 +16,8 @@
 //!    order, no duplicates; each `path.len() == ceil(log2(key_count))`.
 //! 2. **Commitment hash pin**: `commitment_hash(response.commitment) ==
 //!    expected_commitment_hash`. Defeats fresh-commitment substitution.
-//! 3. **Signature**: `verify_commitment_signature(commitment, pk)`.
+//! 3. **Signature**: `verify_commitment_signature(commitment)` — using the
+//!    public key embedded in the commitment itself; no external lookup.
 //! 4. **Per-key**: for each challenged key K, the response's `bytes_hash`
 //!    equals BLAKE3 of the auditor's local bytes for K (defeats lying
 //!    about bytes), the rebuilt Merkle leaf verifies up to the
@@ -30,8 +31,6 @@
 //! `local_bytes_for` closure encapsulates that lookup.
 
 use std::collections::HashSet;
-
-use saorsa_pqc::api::sig::MlDsaPublicKey;
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
@@ -169,7 +168,6 @@ pub fn verify_commitment_bound_response(
     expected_commitment_hash: &[u8; 32],
     response_commitment: &StorageCommitment,
     response_per_key: &[CommitmentBoundResult],
-    responder_public_key: &MlDsaPublicKey,
     local_bytes_for: impl Fn(&XorName) -> Option<Vec<u8>>,
 ) -> Result<(), AuditVerifyError> {
     // -- Gate 1: structural ---------------------------------------------------
@@ -245,7 +243,11 @@ pub fn verify_commitment_bound_response(
 
     // -- Gate 3: signature ---------------------------------------------------
 
-    if !verify_commitment_signature(response_commitment, responder_public_key) {
+    // Verifies against the public key embedded in the commitment itself.
+    // The peer-id binding above (gate 2a) ensures that key actually belongs
+    // to the challenged peer — a substituted commitment from another peer
+    // would have failed there.
+    if !verify_commitment_signature(response_commitment) {
         return Err(AuditVerifyError::SignatureInvalid);
     }
 
@@ -307,7 +309,7 @@ pub fn verify_commitment_bound_response(
 mod tests {
     use super::*;
     use crate::replication::commitment_state::BuiltCommitment;
-    use saorsa_pqc::api::sig::ml_dsa_65;
+    use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey};
     use std::collections::HashMap;
 
     fn key(byte: u8) -> XorName {
@@ -327,7 +329,6 @@ mod tests {
 
     struct AuditFixture {
         pub built: BuiltCommitment,
-        pub _pk: MlDsaPublicKey,
         pub bytes_by_key: HashMap<XorName, Vec<u8>>,
         pub peer_id: [u8; 32],
         pub nonce: [u8; 32],
@@ -345,10 +346,9 @@ mod tests {
             })
             .collect();
         let bytes_by_key: HashMap<_, _> = (1..=n).map(|i| (key(i), content(i))).collect();
-        let built = BuiltCommitment::build(entries, &peer_id, &sk).unwrap();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk.to_bytes()).unwrap();
         let fx = AuditFixture {
             built,
-            _pk: pk.clone(),
             bytes_by_key,
             peer_id,
             nonce,
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn valid_response_verifies() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1), key(2), key(3)];
         let per_key = build_valid_response(&fx, &keys);
         let result = verify_commitment_bound_response(
@@ -393,7 +393,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(result.is_ok(), "{result:?}");
@@ -401,7 +400,7 @@ mod tests {
 
     #[test]
     fn wrong_key_count_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1), key(2), key(3)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key.pop();
@@ -412,7 +411,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -423,7 +421,7 @@ mod tests {
 
     #[test]
     fn wrong_key_order_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1), key(2), key(3)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key.swap(0, 2);
@@ -434,7 +432,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -445,7 +442,7 @@ mod tests {
 
     #[test]
     fn duplicate_key_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         // Build keys=[k1, k1, k3] — a duplicate. Build the response
         // from this so structural+order pass but the duplicate-set
         // check fires.
@@ -458,7 +455,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(result, Err(AuditVerifyError::DuplicateKey { .. })));
@@ -466,7 +462,7 @@ mod tests {
 
     #[test]
     fn wrong_commitment_hash_pin_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let per_key = build_valid_response(&fx, &keys);
         let mut wrong_pin = fx.built.hash();
@@ -478,7 +474,6 @@ mod tests {
             &wrong_pin,
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -489,7 +484,7 @@ mod tests {
 
     #[test]
     fn tampered_signature_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let per_key = build_valid_response(&fx, &keys);
         // Clone the commitment + flip a byte in the signature. This
@@ -505,7 +500,6 @@ mod tests {
             &pin,
             &bad_commit,
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(result, Err(AuditVerifyError::SignatureInvalid)));
@@ -513,7 +507,7 @@ mod tests {
 
     #[test]
     fn wrong_bytes_hash_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key[0].bytes_hash[0] ^= 0x01;
@@ -524,7 +518,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -535,7 +528,7 @@ mod tests {
 
     #[test]
     fn missing_local_bytes_rejected_as_bytes_hash_mismatch() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let per_key = build_valid_response(&fx, &keys);
         // Auditor's local lookup says "I don't have this key" — the
@@ -547,7 +540,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             |_| None,
         );
         assert!(matches!(
@@ -558,7 +550,7 @@ mod tests {
 
     #[test]
     fn out_of_range_leaf_index_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key[0].leaf_index = 999;
@@ -569,7 +561,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -580,7 +571,7 @@ mod tests {
 
     #[test]
     fn tampered_path_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let mut per_key = build_valid_response(&fx, &keys);
         if let Some(p) = per_key[0].path.first_mut() {
@@ -593,7 +584,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(result, Err(AuditVerifyError::PathInvalid { .. })));
@@ -601,7 +591,7 @@ mod tests {
 
     #[test]
     fn wrong_path_length_rejected_before_hashing() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key[0].path.push([0u8; 32]);
@@ -612,7 +602,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -623,7 +612,7 @@ mod tests {
 
     #[test]
     fn wrong_digest_rejected() {
-        let (fx, pk) = fixture(8);
+        let (fx, _pk) = fixture(8);
         let keys = vec![key(1)];
         let mut per_key = build_valid_response(&fx, &keys);
         per_key[0].digest[0] ^= 0x01;
@@ -634,7 +623,6 @@ mod tests {
             &fx.built.hash(),
             fx.built.commitment(),
             &per_key,
-            &pk,
             local_lookup(&fx),
         );
         assert!(matches!(
@@ -673,7 +661,9 @@ mod tests {
                 (k, bytes_hash(&c))
             })
             .collect();
-        let original_built = BuiltCommitment::build(original_entries, &peer_id, &sk_lazy).unwrap();
+        let pk_lazy_bytes = pk_lazy.to_bytes();
+        let original_built =
+            BuiltCommitment::build(original_entries, &peer_id, &sk_lazy, &pk_lazy_bytes).unwrap();
         let pinned_hash = original_built.hash();
 
         // Auditor challenges on key 3. Lazy node fetches the bytes
@@ -685,7 +675,8 @@ mod tests {
         // hash for key 3, so per-key path verification would pass
         // against the new commitment's root.
         let fresh_entries: Vec<_> = vec![(key(3), bytes_hash(&content(3)))];
-        let fresh_built = BuiltCommitment::build(fresh_entries, &peer_id, &sk_lazy).unwrap();
+        let fresh_built =
+            BuiltCommitment::build(fresh_entries, &peer_id, &sk_lazy, &pk_lazy_bytes).unwrap();
 
         // Build a response that contains the fresh commitment + valid
         // proofs against it. Per-key entry uses the fresh tree.
@@ -710,7 +701,6 @@ mod tests {
             &pinned_hash,
             fresh_built.commitment(),
             &per_key,
-            &pk_lazy,
             local,
         );
         assert!(

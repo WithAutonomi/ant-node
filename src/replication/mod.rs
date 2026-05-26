@@ -608,6 +608,8 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
+        let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -627,6 +629,10 @@ impl ReplicationEngine {
             // Run one audit tick immediately after bootstrap drain.
             {
                 let bootstrapping = *is_bootstrapping.read().await;
+                let ctx = audit::CommitmentAuditCtx {
+                    last_commitment_by_peer: &last_commitment_by_peer,
+                    recent_provers: &recent_provers,
+                };
                 let result = {
                     let history = sync_history.read().await;
                     let current_sync_epoch = *sync_cycle_epoch.read().await;
@@ -638,6 +644,7 @@ impl ReplicationEngine {
                         &repair_proofs,
                         current_sync_epoch,
                         bootstrapping,
+                        Some(&ctx),
                     )
                     .await
                 };
@@ -651,6 +658,10 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(interval) => {
                         let bootstrapping = *is_bootstrapping.read().await;
+                        let ctx = audit::CommitmentAuditCtx {
+                            last_commitment_by_peer: &last_commitment_by_peer,
+                            recent_provers: &recent_provers,
+                        };
                         let result = {
                             let history = sync_history.read().await;
                             let current_sync_epoch = *sync_cycle_epoch.read().await;
@@ -662,6 +673,7 @@ impl ReplicationEngine {
                                 &repair_proofs,
                                 current_sync_epoch,
                                 bootstrapping,
+                                Some(&ctx),
                             )
                             .await
                         };
@@ -1002,7 +1014,9 @@ impl ReplicationEngine {
                         &paid_list,
                         &config,
                         bootstrapping,
-                        my_commitment_state.current().map(|b| b.commitment().clone()),
+                        my_commitment_state
+                            .current()
+                            .map(|b| b.commitment().clone()),
                     )
                     .await;
 
@@ -1150,7 +1164,9 @@ async fn handle_replication_message(
                 sync_history,
                 sync_cycle_epoch,
                 repair_proofs,
-                my_commitment_state.current().map(|b| b.commitment().clone()),
+                my_commitment_state
+                    .current()
+                    .map(|b| b.commitment().clone()),
                 msg.request_id,
                 rr_message_id,
             )
@@ -2805,7 +2821,10 @@ async fn ingest_peer_commitment(
         return false;
     };
     // Peer-id binding: the commitment's claimed sender must match the
-    // authenticated transport peer (`source`). Defeats relay/replay.
+    // authenticated transport peer (`source`). Defeats relay/replay
+    // and also pins which embedded public key we are about to verify
+    // against — the verify itself trusts the embedded key, so the
+    // peer-id binding is the link to a real identity.
     if &c.sender_peer_id != source.as_bytes() {
         warn!(
             "ingest_peer_commitment: sender_peer_id mismatch from {source} \
@@ -2813,21 +2832,17 @@ async fn ingest_peer_commitment(
         );
         return false;
     }
-    // Signature verify: extract the responder's public key from their
-    // PeerId. saorsa-core peer IDs ARE ML-DSA-65 public keys (32 bytes
-    // SHA-3 of the pub_key per protocol, but verification needs the
-    // pub_key itself). The protocol stores the pub_key on PeerInfo
-    // entries in the routing table, but here we only have the PeerId.
-    //
-    // Pragmatic choice for phase 3: rely on the saorsa-core trust path
-    // and store-without-verify here. The audit verifier (v12 §5 gate 3)
-    // still verifies the signature at audit time against the public
-    // key the auditor looks up at that point. Storing an unverified
-    // commitment lets us pin to it; if it's forged, the audit response
-    // will fail signature verification then.
-    //
-    // TODO(phase-3.5): plumb a PeerId → MlDsaPublicKey lookup so we
-    // can verify at ingest time and drop forged commitments earlier.
+    // Signature verify, using the public key embedded in the commitment
+    // itself. The pubkey is bound by the signature payload (see
+    // commitment_signed_payload) so an adversary cannot keep the body
+    // and swap the key to one they hold the secret for.
+    if !crate::replication::commitment::verify_commitment_signature(c) {
+        warn!(
+            "ingest_peer_commitment: signature did not verify under embedded key for {source} \
+             (dropped, forged commitment)"
+        );
+        return false;
+    }
     last_commitment_by_peer
         .write()
         .await
@@ -2891,8 +2906,9 @@ async fn rebuild_and_rotate_commitment(
     let sk_bytes = identity.secret_key_bytes().to_vec();
     let sk = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
         .map_err(|e| Error::Crypto(format!("commitment build: load sk: {e}")))?;
+    let pk_bytes = identity.public_key().as_bytes().to_vec();
     let peer_id_bytes = *p2p.peer_id().as_bytes();
-    let built = commitment_state::BuiltCommitment::build(entries, &peer_id_bytes, &sk)
+    let built = commitment_state::BuiltCommitment::build(entries, &peer_id_bytes, &sk, &pk_bytes)
         .map_err(|e| Error::Crypto(format!("commitment build: {e}")))?;
 
     let hash = hex::encode(built.hash());
