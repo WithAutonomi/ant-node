@@ -296,6 +296,16 @@ impl MerkleTree {
     pub(crate) fn iter_leaves(&self) -> impl Iterator<Item = &(XorName, [u8; 32])> {
         self.leaves.iter()
     }
+
+    /// The keys this tree commits to, in sorted order.
+    ///
+    /// `sorted_keys()[i]` is the key at leaf index `i`. Used by the
+    /// responder's audit-answer path to recover the `leaf_index` field
+    /// for a challenged key in `O(log n)` via binary search.
+    #[must_use]
+    pub fn sorted_keys(&self) -> Vec<XorName> {
+        self.leaves.iter().map(|(k, _)| *k).collect()
+    }
 }
 
 /// Build the next level up from `cur`. Odd-length levels pair the last
