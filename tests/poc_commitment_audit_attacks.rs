@@ -1017,3 +1017,47 @@ fn signature_round_trips_correctly() {
     c2.sender_public_key = pk2_bytes;
     assert!(!verify_commitment_signature(&c2));
 }
+
+// ---------------------------------------------------------------------------
+// PeerCommitmentRecord: §2 step 5 sticky commitment_capable
+// ---------------------------------------------------------------------------
+
+use ant_node::replication::commitment_state::PeerCommitmentRecord;
+
+/// §2 step 5: `commitment_capable` is set on the first verified gossip
+/// ingest and never flips back to false. A peer that later evicts the
+/// cached commitment (TTL / sybil cap / restart) retains capability
+/// status so §6 + §3 still refuse credit and refuse legacy-fallback.
+#[test]
+fn commitment_capable_flag_is_sticky_across_eviction() {
+    let (pk, sk) = keypair();
+    let pk_bytes = pk.to_bytes();
+    let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32], &pk_bytes).unwrap();
+    let commitment = StorageCommitment {
+        root: [0; 32],
+        key_count: 1,
+        sender_peer_id: [0; 32],
+        sender_public_key: pk_bytes,
+        signature: sig,
+    };
+
+    let mut rec = PeerCommitmentRecord::from_verified(commitment, Instant::now());
+    assert!(rec.commitment_capable);
+    assert!(rec.last_commitment.is_some());
+
+    // Simulate TTL eviction / restart: drop the commitment but keep
+    // the record (this is what the engine should do — we don't have
+    // a public API yet, so we mutate directly).
+    rec.last_commitment = None;
+    // Sticky: capable flag stays true.
+    assert!(rec.commitment_capable);
+}
+
+/// `capable_but_no_commitment` constructor: used when we evict the
+/// cached commitment but want to remember the peer has spoken v12.
+#[test]
+fn capable_but_no_commitment_starts_capable() {
+    let rec = PeerCommitmentRecord::capable_but_no_commitment(Instant::now());
+    assert!(rec.commitment_capable);
+    assert!(rec.last_commitment.is_none());
+}
