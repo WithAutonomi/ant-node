@@ -901,7 +901,7 @@ mod tests {
 
     /// A cache-dir attacker who replaces the cached archive with a FIFO
     /// must not be able to hang `get_verified_archive` waiting for a
-    /// writer to connect. The pre-check + O_NONBLOCK belt-and-braces
+    /// writer to connect. The pre-check + `O_NONBLOCK` belt-and-braces
     /// returns immediately with an error, the cache hit is abandoned, and
     /// the caller falls back to a fresh verified download.
     #[cfg(unix)]
