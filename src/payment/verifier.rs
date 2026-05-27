@@ -10,7 +10,7 @@ use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
-use crate::payment::single_node::{QuotePaymentInfo, SingleNodePayment};
+use crate::payment::single_node::SingleNodePayment;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
@@ -23,7 +23,6 @@ use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -53,30 +52,6 @@ const QUOTE_MAX_AGE_SECS: u64 = 86_400;
 /// future direction; past-dated quotes are governed by `QUOTE_MAX_AGE_SECS`.
 const QUOTE_FUTURE_SKEW_TOLERANCE_SECS: u64 = 300;
 
-/// Single-node payments pay one valid quote at three times its quoted price.
-const SINGLE_NODE_PRICE_MULTIPLIER: u64 = 3;
-
-/// Median index after sorting exactly `CLOSE_GROUP_SIZE` single-node quotes by price.
-const SINGLE_NODE_MEDIAN_INDEX: usize = CLOSE_GROUP_SIZE / 2;
-
-/// `PaymentVaultV2.completedPayments` stores the first 16 bytes of the
-/// 20-byte rewards address alongside the amount.
-const COMPLETED_PAYMENT_REWARDS_PREFIX_LEN: usize = 16;
-
-/// Single-node close-group validation tolerates up to two quoted peers missing
-/// from the local routing-table view to absorb normal DHT view skew.
-const SINGLE_NODE_UNKNOWN_PEER_TOLERANCE: usize = 2;
-
-/// Minimum quoted peers that must appear in this node's local close-group view.
-const SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED: usize =
-    CLOSE_GROUP_SIZE - SINGLE_NODE_UNKNOWN_PEER_TOLERANCE;
-
-const _: () = assert!(
-    SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED > 0
-        && SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED <= CLOSE_GROUP_SIZE,
-    "single-node close-group match threshold must be within 1..=CLOSE_GROUP_SIZE",
-);
-
 /// Configuration for EVM payment verification.
 ///
 /// EVM verification is always on. All new data requires on-chain
@@ -105,12 +80,8 @@ pub struct PaymentVerifierConfig {
     pub evm: EvmVerifierConfig,
     /// Cache capacity (number of `XorName` values to cache).
     pub cache_capacity: usize,
-    /// Local node's configured rewards address.
-    ///
-    /// For single-node proofs, the verifier requires the quote signed by this
-    /// node's peer identity to name this rewards address. The paid quote is
-    /// separately checked against the on-chain recipient prefix recorded for
-    /// that quote hash.
+    /// Local node's rewards address.
+    /// The verifier rejects payments that don't include this node as a recipient.
     pub local_rewards_address: RewardsAddress,
 }
 
@@ -471,12 +442,9 @@ impl PaymentVerifier {
     /// 2. All quotes target the correct content address (xorname binding)
     /// 3. Quote timestamps are fresh (not expired or future-dated)
     /// 4. Peer ID bindings match the ML-DSA-65 public keys
-    /// 5. This node's peer ID is among the quoted peers
+    /// 5. This node is among the quoted recipients
     /// 6. All ML-DSA-65 signatures are valid (offloaded to `spawn_blocking`)
-    /// 7. This node's quote is bound to the configured local rewards address
-    /// 8. At least 5 of 7 quoted peers are in this node's local close-group view
-    /// 9. A median-priced quote from that valid quote set was paid at least
-    ///    3x its price on-chain to the same rewards address prefix
+    /// 7. The median-priced quote was paid at least 3x its price on-chain
     ///    (looked up via `completedPayments(quoteHash)` on the payment vault)
     ///
     /// For unit tests that don't need on-chain verification, pre-populate
@@ -492,7 +460,8 @@ impl PaymentVerifier {
         Self::validate_quote_structure(payment)?;
         Self::validate_quote_content(payment, xorname)?;
         Self::validate_quote_timestamps(payment)?;
-        let quoted_peer_ids = Self::validate_peer_bindings(payment)?;
+        Self::validate_peer_bindings(payment)?;
+        self.validate_local_recipient(payment)?;
 
         // Verify quote signatures (CPU-bound, run off async runtime)
         let peer_quotes = payment.peer_quotes.clone();
@@ -509,9 +478,6 @@ impl PaymentVerifier {
         .await
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
 
-        self.validate_single_node_close_group(xorname, payment, &quoted_peer_ids)
-            .await?;
-
         // Reconstruct the SingleNodePayment to identify the median quote.
         // from_quotes() sorts by price and marks the median for 3x payment.
         let quotes_with_prices: Vec<_> = payment
@@ -525,9 +491,17 @@ impl PaymentVerifier {
             ))
         })?;
 
-        let verified_amount = self
-            .verify_single_node_on_chain_payment(&single_payment)
-            .await?;
+        // Verify the median quote was paid at least 3x its price on-chain
+        // via completedPayments(quoteHash) on the payment vault contract.
+        let verified_amount = single_payment
+            .verify(&self.config.evm.network)
+            .await
+            .map_err(|e| {
+                let xorname_hex = hex::encode(xorname);
+                Error::Payment(format!(
+                    "Median quote payment verification failed for {xorname_hex}: {e}"
+                ))
+            })?;
 
         if crate::logging::enabled!(crate::logging::Level::INFO) {
             let xorname_hex = hex::encode(xorname);
@@ -613,8 +587,7 @@ impl PaymentVerifier {
     }
 
     /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
-    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<Vec<PeerId>> {
-        let mut peer_ids = Vec::with_capacity(payment.peer_quotes.len());
+    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
                 .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
@@ -627,288 +600,8 @@ impl PaymentVerifier {
                      BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
                 )));
             }
-            peer_ids.push(expected_peer_id);
-        }
-        Ok(peer_ids)
-    }
-
-    /// Verify enough single-node quotes came from this node's local close-group
-    /// view for the content address to tolerate bounded routing-table skew.
-    async fn validate_single_node_close_group(
-        &self,
-        xorname: &XorName,
-        payment: &ProofOfPayment,
-        quoted_peer_ids: &[PeerId],
-    ) -> Result<()> {
-        // Release the RwLock guard before awaiting the local DHT lookup.
-        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
-        let Some(p2p_node) = attached else {
-            crate::logging::error!(
-                "PaymentVerifier: no P2PNode attached; rejecting single-node \
-                 payment. PaymentVerifier::attach_p2p_node must be called \
-                 before any PUT handler runs."
-            );
-            return Err(Error::Payment(
-                "Single-node payment rejected: verifier is not wired to the \
-                 P2P layer; cannot verify quoted peer close-group membership."
-                    .into(),
-            ));
-        };
-
-        let local_peer_id = *p2p_node.peer_id();
-        Self::validate_local_quoted_peer(local_peer_id, quoted_peer_ids)?;
-        Self::validate_local_quote_rewards_address(
-            local_peer_id,
-            quoted_peer_ids,
-            payment,
-            &self.config.local_rewards_address,
-        )?;
-
-        let close_group = p2p_node
-            .dht_manager()
-            .find_closest_nodes_local_with_self(xorname, CLOSE_GROUP_SIZE)
-            .await;
-        let close_group_peer_ids: Vec<PeerId> =
-            close_group.iter().map(|node| node.peer_id).collect();
-
-        Self::check_single_node_close_group_match(quoted_peer_ids, &close_group_peer_ids, xorname)
-    }
-
-    /// Pure set-membership check for single-node close-group validation.
-    fn check_single_node_close_group_match(
-        quoted_peer_ids: &[PeerId],
-        close_group_peer_ids: &[PeerId],
-        xorname: &XorName,
-    ) -> Result<()> {
-        let quote_count = quoted_peer_ids.len();
-        if quote_count != CLOSE_GROUP_SIZE {
-            return Err(Error::Payment(format!(
-                "Single-node payment must have exactly {CLOSE_GROUP_SIZE} quoted peers, got {quote_count}"
-            )));
-        }
-
-        let mut quoted_set = HashSet::with_capacity(quote_count);
-        for peer_id in quoted_peer_ids {
-            if !quoted_set.insert(*peer_id) {
-                return Err(Error::Payment(format!(
-                    "Single-node payment contains duplicate quoted peer {}",
-                    peer_id.to_hex()
-                )));
-            }
-        }
-
-        let close_group_count = close_group_peer_ids.len();
-        if close_group_count < SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED {
-            return Err(Error::Payment(format!(
-                "Single-node payment rejected: local close-group view for {} has only \
-                 {close_group_count} peer(s), need at least \
-                 {SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED} to verify quotes",
-                hex::encode(xorname),
-            )));
-        }
-
-        let close_group_set: HashSet<PeerId> = close_group_peer_ids.iter().copied().collect();
-        if close_group_set.len() != close_group_peer_ids.len() {
-            return Err(Error::Payment(
-                "Single-node payment rejected: local close-group view contains duplicate peer IDs"
-                    .into(),
-            ));
-        }
-
-        let unknown_peer_ids: Vec<String> = quoted_peer_ids
-            .iter()
-            .filter(|peer_id| !close_group_set.contains(peer_id))
-            .map(PeerId::to_hex)
-            .collect();
-        let matched_count = quote_count.saturating_sub(unknown_peer_ids.len());
-
-        if matched_count < SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED {
-            return Err(Error::Payment(format!(
-                "Single-node payment rejected: only {matched_count}/{CLOSE_GROUP_SIZE} quoted \
-                 peer(s) are present in this node's local close-group view for {}, need at \
-                 least {SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED}; unknown peer(s): {}",
-                hex::encode(xorname),
-                unknown_peer_ids.join(", "),
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Verify the local node's peer identity signed one of the quotes.
-    fn validate_local_quoted_peer(local_peer_id: PeerId, quoted_peer_ids: &[PeerId]) -> Result<()> {
-        if !quoted_peer_ids.contains(&local_peer_id) {
-            return Err(Error::Payment(format!(
-                "Payment proof does not include this node's peer ID as a quoted peer: {}",
-                local_peer_id.to_hex()
-            )));
         }
         Ok(())
-    }
-
-    /// Verify this node's signed quote is bound to the configured local rewards address.
-    fn validate_local_quote_rewards_address(
-        local_peer_id: PeerId,
-        quoted_peer_ids: &[PeerId],
-        payment: &ProofOfPayment,
-        local_rewards_address: &RewardsAddress,
-    ) -> Result<()> {
-        if quoted_peer_ids.len() != payment.peer_quotes.len() {
-            return Err(Error::Payment(
-                "internal error: quoted peer IDs and payment quotes have different lengths".into(),
-            ));
-        }
-
-        let Some((_, (_, quote))) = quoted_peer_ids
-            .iter()
-            .zip(payment.peer_quotes.iter())
-            .find(|(peer_id, _)| **peer_id == local_peer_id)
-        else {
-            return Err(Error::Payment(format!(
-                "Payment proof does not include this node's peer ID as a quoted peer: {}",
-                local_peer_id.to_hex()
-            )));
-        };
-
-        if quote.rewards_address != *local_rewards_address {
-            return Err(Error::Payment(format!(
-                "Payment proof includes this node's peer ID but its quote rewards address {} \
-                 does not match the configured local rewards address {}",
-                quote.rewards_address, local_rewards_address
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Verify a paid single-node quote against `completedPayments(quote.hash())`.
-    async fn verify_single_node_on_chain_payment(
-        &self,
-        single_payment: &SingleNodePayment,
-    ) -> Result<Amount> {
-        let median = single_payment.paid_quote().ok_or_else(|| {
-            Error::Payment(format!(
-                "Missing median quote at index {}: quotes array has only {} elements",
-                SINGLE_NODE_MEDIAN_INDEX,
-                single_payment.quotes.len()
-            ))
-        })?;
-        let median_price = median.price;
-        let tied_quotes = Self::ordered_median_tied_quotes(single_payment, median);
-
-        debug!(
-            "Verifying single-node quote payment: median price {median_price}, {} quote(s) tied",
-            tied_quotes.len()
-        );
-
-        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
-        let vault_address = *self.config.evm.network.payment_vault_address();
-        let contract = payment_vault::interface::IPaymentVault::new(vault_address, provider);
-
-        let mut last_rejection = None;
-        for candidate in &tied_quotes {
-            let result = contract
-                .completedPayments(candidate.quote_hash)
-                .call()
-                .await
-                .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
-            let on_chain_amount = Amount::from(result.amount);
-
-            match Self::validate_completed_single_node_payment(
-                candidate,
-                result.rewardsAddress.as_slice(),
-                on_chain_amount,
-            ) {
-                Ok(verified_amount) => {
-                    debug!(
-                        "Single-node payment verified: {verified_amount} atto paid for quote {}",
-                        candidate.quote_hash
-                    );
-                    return Ok(verified_amount);
-                }
-                Err(e) => {
-                    last_rejection = Some(e.to_string());
-                }
-            }
-        }
-
-        let detail = last_rejection
-            .map(|reason| format!(" Last rejection: {reason}"))
-            .unwrap_or_default();
-        let expected_amount = Self::expected_single_node_payment_amount(median_price)?;
-        Err(Error::Payment(format!(
-            "No median-priced quote was paid enough to the quoted rewards address: \
-             expected at least {expected_amount}, checked {} tied quote(s).{detail}",
-            tied_quotes.len()
-        )))
-    }
-
-    /// Return median-price quotes with the selected median first, so the
-    /// normal single-node path needs one on-chain lookup. Other median-price
-    /// ties are kept as fallback for deterministic tie-order drift.
-    fn ordered_median_tied_quotes<'a>(
-        single_payment: &'a SingleNodePayment,
-        median: &'a QuotePaymentInfo,
-    ) -> Vec<&'a QuotePaymentInfo> {
-        let mut tied_quotes = Vec::with_capacity(CLOSE_GROUP_SIZE);
-        tied_quotes.push(median);
-        tied_quotes.extend(
-            single_payment
-                .quotes
-                .iter()
-                .filter(|quote| quote.price == median.price && !std::ptr::eq(*quote, median)),
-        );
-        tied_quotes
-    }
-
-    /// Validate the contract record for a single quote against amount and recipient.
-    fn validate_completed_single_node_payment(
-        quote: &QuotePaymentInfo,
-        on_chain_rewards_prefix: &[u8],
-        on_chain_amount: Amount,
-    ) -> Result<Amount> {
-        if quote.price == Amount::ZERO {
-            return Err(Error::Payment(format!(
-                "Median quote has zero price for quote {}; refusing to verify as paid",
-                quote.quote_hash
-            )));
-        }
-
-        let expected_amount = Self::expected_single_node_payment_amount(quote.price)?;
-        if on_chain_amount < expected_amount {
-            return Err(Error::Payment(format!(
-                "Underpayment for quote {}: paid {on_chain_amount}, expected at least {expected_amount}",
-                quote.quote_hash
-            )));
-        }
-
-        let expected_rewards_prefix =
-            Self::completed_payment_rewards_prefix(&quote.rewards_address);
-        if on_chain_rewards_prefix != expected_rewards_prefix {
-            return Err(Error::Payment(format!(
-                "Recipient mismatch for quote {}: completedPayments recipient prefix 0x{} \
-                 does not match quote rewards address {}",
-                quote.quote_hash,
-                hex::encode(on_chain_rewards_prefix),
-                quote.rewards_address
-            )));
-        }
-
-        Ok(on_chain_amount)
-    }
-
-    fn expected_single_node_payment_amount(price: Amount) -> Result<Amount> {
-        price
-            .checked_mul(Amount::from(SINGLE_NODE_PRICE_MULTIPLIER))
-            .ok_or_else(|| {
-                Error::Payment(format!(
-                    "Price overflow when calculating {SINGLE_NODE_PRICE_MULTIPLIER}x quote price"
-                ))
-            })
-    }
-
-    fn completed_payment_rewards_prefix(rewards_address: &RewardsAddress) -> &[u8] {
-        &rewards_address.as_slice()[..COMPLETED_PAYMENT_REWARDS_PREFIX_LEN]
     }
 
     /// Minimum number of candidate `pub_keys` (out of 16) whose derived `PeerId`
@@ -1183,7 +876,7 @@ impl PaymentVerifier {
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
     ) -> Result<Vec<PeerId>> {
         let mut candidate_peer_ids = Vec::with_capacity(pool.candidate_nodes.len());
-        let mut seen = HashSet::with_capacity(pool.candidate_nodes.len());
+        let mut seen = std::collections::HashSet::with_capacity(pool.candidate_nodes.len());
         for candidate in &pool.candidate_nodes {
             let pid = peer_id_from_public_key_bytes(&candidate.pub_key).map_err(|e| {
                 Error::Payment(format!(
@@ -1244,7 +937,8 @@ impl PaymentVerifier {
         // Set-membership check against the returned closest-peers list.
         // Candidate `PeerId`s are deduplicated upstream, so each match
         // corresponds to a distinct peer.
-        let network_set: HashSet<PeerId> = network_peer_ids.iter().copied().collect();
+        let network_set: std::collections::HashSet<PeerId> =
+            network_peer_ids.iter().copied().collect();
         let matched = candidate_peer_ids
             .iter()
             .filter(|pid| network_set.contains(pid))
@@ -1594,13 +1288,27 @@ impl PaymentVerifier {
 
         Ok(())
     }
+
+    /// Verify this node is among the paid recipients.
+    fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
+        let local_addr = &self.config.local_rewards_address;
+        let is_recipient = payment
+            .peer_quotes
+            .iter()
+            .any(|(_, quote)| quote.rewards_address == *local_addr);
+        if !is_recipient {
+            return Err(Error::Payment(
+                "Payment proof does not include this node as a recipient".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use alloy::primitives::FixedBytes;
     use evmlib::merkle_payments::MerklePaymentCandidatePool;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
@@ -2131,149 +1839,55 @@ mod tests {
         );
     }
 
-    /// Build a deterministic `PeerId` from a single byte tag.
-    fn synthetic_peer_id(tag: u8) -> PeerId {
-        let mut bytes = [0u8; 32];
-        bytes[0] = tag;
-        PeerId::from_bytes(bytes)
+    /// Helper: build an `EncodedPeerId` that matches the BLAKE3 hash of an ML-DSA public key.
+    fn encoded_peer_id_for_pub_key(pub_key: &[u8]) -> evmlib::EncodedPeerId {
+        let ant_peer_id = peer_id_from_public_key_bytes(pub_key).expect("valid ML-DSA pub key");
+        evmlib::EncodedPeerId::new(*ant_peer_id.as_bytes())
     }
 
-    /// Build a vector of synthetic `PeerId`s tagged with bytes 1..=n.
-    fn synthetic_peer_ids(n: u8) -> Vec<PeerId> {
-        (1..=n).map(synthetic_peer_id).collect()
-    }
+    #[tokio::test]
+    async fn test_local_not_in_paid_set_rejected() {
+        use evmlib::RewardsAddress;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
 
-    fn encoded_peer_id(peer_id: PeerId) -> evmlib::EncodedPeerId {
-        let mut bytes = [0u8; 32];
-        bytes.copy_from_slice(peer_id.as_bytes());
-        evmlib::EncodedPeerId::new(bytes)
-    }
+        // Verifier with a local rewards address set
+        let local_addr = RewardsAddress::new([0xAAu8; 20]);
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                network: EvmNetwork::ArbitrumOne,
+            },
+            cache_capacity: 100,
+            local_rewards_address: local_addr,
+        };
+        let verifier = PaymentVerifier::new(config);
 
-    fn single_node_peer_ids() -> Vec<PeerId> {
-        (1..=CLOSE_GROUP_SIZE)
-            .map(|idx| {
-                let tag = u8::try_from(idx).expect("CLOSE_GROUP_SIZE fits in u8");
-                synthetic_peer_id(tag)
-            })
-            .collect()
-    }
+        let xorname = [0xEEu8; 32];
+        // Quotes pay a DIFFERENT rewards address
+        let other_addr = RewardsAddress::new([0xBBu8; 20]);
 
-    fn proof_of_payment_for_peer_ids(
-        xorname: XorName,
-        quoted_peer_ids: &[PeerId],
-        local_peer_id: PeerId,
-        local_rewards_address: RewardsAddress,
-    ) -> ProofOfPayment {
-        let peer_quotes = quoted_peer_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, peer_id)| {
-                let tag = u8::try_from(idx).expect("CLOSE_GROUP_SIZE fits in u8");
-                let rewards_address = if *peer_id == local_peer_id {
-                    local_rewards_address
-                } else {
-                    RewardsAddress::new([tag; 20])
-                };
-                (
-                    encoded_peer_id(*peer_id),
-                    make_fake_quote(xorname, SystemTime::now(), rewards_address),
-                )
-            })
-            .collect();
+        // Use real ML-DSA keys so the pub_key→peer_id binding check passes
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
 
-        ProofOfPayment { peer_quotes }
-    }
+            let mut quote = make_fake_quote(xorname, SystemTime::now(), other_addr);
+            quote.pub_key = pub_key_bytes;
 
-    fn make_quote_payment_info(price: Amount, rewards_address: RewardsAddress) -> QuotePaymentInfo {
-        QuotePaymentInfo {
-            quote_hash: FixedBytes::from([0xABu8; 32]),
-            rewards_address,
-            amount: PaymentVerifier::expected_single_node_payment_amount(price)
-                .expect("expected amount"),
-            price,
+            peer_quotes.push((encoded, quote));
         }
-    }
 
-    #[test]
-    fn local_quoted_peer_accepts_when_local_peer_id_was_quoted() {
-        let quoted_peer_ids = single_node_peer_ids();
-        let local_peer_id = quoted_peer_ids[0];
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
 
-        let result = PaymentVerifier::validate_local_quoted_peer(local_peer_id, &quoted_peer_ids);
-
+        assert!(result.is_err(), "Should reject payment not addressed to us");
+        let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
-            result.is_ok(),
-            "local peer ID in quoted peer set must pass: {result:?}"
-        );
-    }
-
-    #[test]
-    fn local_quoted_peer_rejects_when_local_peer_id_missing() {
-        let quoted_peer_ids = single_node_peer_ids();
-        let local_peer_id = synthetic_peer_id(0xF0);
-
-        let result = PaymentVerifier::validate_local_quoted_peer(local_peer_id, &quoted_peer_ids);
-
-        let err = result.expect_err("local peer ID outside quoted set must be rejected");
-        assert!(
-            err.to_string()
-                .contains("does not include this node's peer ID"),
-            "expected local peer ID rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn local_quote_rewards_address_accepts_matching_config() {
-        let xorname = [0x44u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let local_peer_id = quoted_peer_ids[0];
-        let local_rewards_address = RewardsAddress::new([0xA0; 20]);
-        let payment = proof_of_payment_for_peer_ids(
-            xorname,
-            &quoted_peer_ids,
-            local_peer_id,
-            local_rewards_address,
-        );
-
-        let result = PaymentVerifier::validate_local_quote_rewards_address(
-            local_peer_id,
-            &quoted_peer_ids,
-            &payment,
-            &local_rewards_address,
-        );
-
-        assert!(
-            result.is_ok(),
-            "local quote rewards address must pass when it matches config: {result:?}"
-        );
-    }
-
-    #[test]
-    fn local_quote_rewards_address_rejects_config_mismatch() {
-        let xorname = [0x45u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let local_peer_id = quoted_peer_ids[0];
-        let quoted_rewards_address = RewardsAddress::new([0xA1; 20]);
-        let configured_rewards_address = RewardsAddress::new([0xA2; 20]);
-        let payment = proof_of_payment_for_peer_ids(
-            xorname,
-            &quoted_peer_ids,
-            local_peer_id,
-            quoted_rewards_address,
-        );
-
-        let result = PaymentVerifier::validate_local_quote_rewards_address(
-            local_peer_id,
-            &quoted_peer_ids,
-            &payment,
-            &configured_rewards_address,
-        );
-
-        let err = result.expect_err("local rewards address mismatch must be rejected");
-        assert!(
-            err.to_string()
-                .contains("does not match the configured local rewards address"),
-            "expected local rewards mismatch rejection, got: {err}"
+            err_msg.contains("does not include this node as a recipient"),
+            "Error should mention recipient rejection: {err_msg}"
         );
     }
 
@@ -2311,180 +1925,6 @@ mod tests {
         assert!(
             err_msg.contains("pub_key does not belong to claimed peer"),
             "Error should mention binding mismatch: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn single_node_close_group_accepts_valid_quote_set() {
-        let xorname = [0x11u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let close_group_peer_ids = quoted_peer_ids.clone();
-
-        let result = PaymentVerifier::check_single_node_close_group_match(
-            &quoted_peer_ids,
-            &close_group_peer_ids,
-            &xorname,
-        );
-
-        assert!(
-            result.is_ok(),
-            "all quoted peers in the close-group view must pass: {result:?}"
-        );
-    }
-
-    #[test]
-    fn single_node_close_group_accepts_tolerated_unknown_peers() {
-        let xorname = [0x22u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let close_group_peer_ids =
-            quoted_peer_ids[..SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED].to_vec();
-
-        let result = PaymentVerifier::check_single_node_close_group_match(
-            &quoted_peer_ids,
-            &close_group_peer_ids,
-            &xorname,
-        );
-
-        assert!(
-            result.is_ok(),
-            "up to {SINGLE_NODE_UNKNOWN_PEER_TOLERANCE} unknown quoted peers must pass: {result:?}"
-        );
-    }
-
-    #[test]
-    fn single_node_close_group_rejects_sparse_local_view() {
-        let xorname = [0x33u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let sparse_count = SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED
-            .checked_sub(1)
-            .expect("close-group match threshold is non-zero");
-        let close_group_peer_ids = quoted_peer_ids[..sparse_count].to_vec();
-
-        let result = PaymentVerifier::check_single_node_close_group_match(
-            &quoted_peer_ids,
-            &close_group_peer_ids,
-            &xorname,
-        );
-
-        let err = result.expect_err("sparse close-group view must be rejected");
-        assert!(
-            err.to_string().contains("has only"),
-            "expected sparse-view rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn single_node_close_group_rejects_unknown_peer_tolerance_exceeded() {
-        let xorname = [0x34u8; 32];
-        let quoted_peer_ids = single_node_peer_ids();
-        let matched_count = SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED
-            .checked_sub(1)
-            .expect("close-group match threshold is non-zero");
-        let mut close_group_peer_ids = quoted_peer_ids[..matched_count].to_vec();
-        close_group_peer_ids.push(synthetic_peer_id(0xF0));
-
-        let result = PaymentVerifier::check_single_node_close_group_match(
-            &quoted_peer_ids,
-            &close_group_peer_ids,
-            &xorname,
-        );
-
-        let err = result.expect_err("excess unknown quoted peers must be rejected");
-        assert!(
-            err.to_string().contains(&format!(
-                "need at least {SINGLE_NODE_CLOSE_GROUP_MATCH_REQUIRED}"
-            )),
-            "expected close-group match threshold rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn completed_single_node_payment_accepts_matching_recipient_and_overpayment() {
-        let rewards_address = RewardsAddress::new([0x44u8; 20]);
-        let quote = make_quote_payment_info(Amount::from(10u64), rewards_address);
-        let rewards_prefix =
-            PaymentVerifier::completed_payment_rewards_prefix(&quote.rewards_address).to_vec();
-        let on_chain_amount = Amount::from(31u64);
-
-        let result = PaymentVerifier::validate_completed_single_node_payment(
-            &quote,
-            &rewards_prefix,
-            on_chain_amount,
-        );
-
-        assert_eq!(result.expect("valid completed payment"), on_chain_amount);
-    }
-
-    #[test]
-    fn ordered_median_tied_quotes_checks_selected_median_first() {
-        const TIED_PRICE_ATTO: u64 = 10;
-
-        let quotes = std::array::from_fn(|idx| {
-            let tag = u8::try_from(idx).expect("CLOSE_GROUP_SIZE fits in u8");
-            let price = Amount::from(TIED_PRICE_ATTO);
-            QuotePaymentInfo {
-                quote_hash: FixedBytes::from([tag; 32]),
-                rewards_address: RewardsAddress::new([tag; 20]),
-                amount: PaymentVerifier::expected_single_node_payment_amount(price)
-                    .expect("expected amount"),
-                price,
-            }
-        });
-        let single_payment = SingleNodePayment { quotes };
-        let median = single_payment.paid_quote().expect("median quote");
-
-        let ordered = PaymentVerifier::ordered_median_tied_quotes(&single_payment, median);
-
-        assert_eq!(ordered.len(), CLOSE_GROUP_SIZE);
-        assert_eq!(
-            ordered.first().expect("first tied quote").quote_hash,
-            median.quote_hash
-        );
-        let selected_median_count = ordered
-            .iter()
-            .filter(|quote| quote.quote_hash == median.quote_hash)
-            .count();
-        assert_eq!(selected_median_count, 1);
-    }
-
-    #[test]
-    fn completed_single_node_payment_rejects_underpayment() {
-        let rewards_address = RewardsAddress::new([0x55u8; 20]);
-        let quote = make_quote_payment_info(Amount::from(10u64), rewards_address);
-        let rewards_prefix =
-            PaymentVerifier::completed_payment_rewards_prefix(&quote.rewards_address).to_vec();
-        let on_chain_amount = Amount::from(29u64);
-
-        let result = PaymentVerifier::validate_completed_single_node_payment(
-            &quote,
-            &rewards_prefix,
-            on_chain_amount,
-        );
-
-        let err = result.expect_err("underpayment must be rejected");
-        assert!(
-            err.to_string().contains("Underpayment"),
-            "expected underpayment rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn completed_single_node_payment_rejects_recipient_mismatch() {
-        let rewards_address = RewardsAddress::new([0x66u8; 20]);
-        let quote = make_quote_payment_info(Amount::from(10u64), rewards_address);
-        let wrong_rewards_prefix = [0x77u8; COMPLETED_PAYMENT_REWARDS_PREFIX_LEN];
-        let on_chain_amount = Amount::from(30u64);
-
-        let result = PaymentVerifier::validate_completed_single_node_payment(
-            &quote,
-            &wrong_rewards_prefix,
-            on_chain_amount,
-        );
-
-        let err = result.expect_err("recipient mismatch must be rejected");
-        assert!(
-            err.to_string().contains("Recipient mismatch"),
-            "expected recipient mismatch rejection, got: {err}"
         );
     }
 
@@ -3380,6 +2820,18 @@ mod tests {
     // Synthetic PeerIds use distinct constant byte patterns so each test
     // can reason about which IDs are "in the network's top-K" vs not.
     // =========================================================================
+
+    /// Build a deterministic `PeerId` from a single byte tag.
+    fn synthetic_peer_id(tag: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = tag;
+        PeerId::from_bytes(bytes)
+    }
+
+    /// Build a vector of synthetic `PeerId`s tagged with bytes 1..=n.
+    fn synthetic_peer_ids(n: u8) -> Vec<PeerId> {
+        (1..=n).map(synthetic_peer_id).collect()
+    }
 
     #[test]
     fn closeness_match_passes_when_all_16_candidates_in_top_16() {
