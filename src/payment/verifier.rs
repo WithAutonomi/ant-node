@@ -163,14 +163,6 @@ pub struct PaymentVerifier {
     /// amplification to one lookup per unique `pool_hash` regardless of
     /// concurrency.
     inflight_closeness: Mutex<LruCache<PoolHash, Arc<ClosenessSlot>>>,
-    /// Bounds the number of concurrent authoritative *network* closeness
-    /// lookups. The local routing-table fast path serves healthy traffic, so
-    /// honest uploads rarely fall back to the network; this caps the cost when
-    /// they (or a flood of forged pools that each fail the local check) do.
-    /// `inflight_closeness` already collapses same-pool concurrency — this
-    /// bounds the distinct-`pool_hash` case so a forged-pool storm cannot spawn
-    /// unbounded `CLOSENESS_LOOKUP_TIMEOUT`-long Kademlia walks.
-    closeness_fallback_permits: Arc<tokio::sync::Semaphore>,
     /// P2P node handle, attached post-construction so merkle verification can
     /// check that candidate `pub_keys` map to peers actually close to the pool
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
@@ -270,9 +262,6 @@ impl PaymentVerifier {
         let pool_cache = Mutex::new(LruCache::new(pool_cache_size));
         let closeness_pass_cache = Mutex::new(LruCache::new(pool_cache_size));
         let inflight_closeness = Mutex::new(LruCache::new(pool_cache_size));
-        let closeness_fallback_permits = Arc::new(tokio::sync::Semaphore::new(
-            Self::CLOSENESS_NETWORK_FALLBACK_CONCURRENCY,
-        ));
 
         let cache_capacity = config.cache_capacity;
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
@@ -294,7 +283,6 @@ impl PaymentVerifier {
             pool_cache,
             closeness_pass_cache,
             inflight_closeness,
-            closeness_fallback_permits,
             p2p_node: RwLock::new(None),
             config,
         }
@@ -676,20 +664,9 @@ impl PaymentVerifier {
             &self.config.local_rewards_address,
         )?;
 
-        // Use the XOR-only `_by_distance` variant, NOT the reachability-reranked
-        // `find_closest_nodes_local_with_self`: this is a quote-closeness
-        // *verification*, so it must mirror the uploader's pure XOR-distance
-        // close-group selection (`get_store_quotes` keeps the XOR-closest
-        // CLOSE_GROUP_SIZE responders). The reachability re-rank that
-        // saorsa-labs/saorsa-core#121 added to `_with_self` demotes XOR-close
-        // relay-only / NAT'd peers out of the local top-CLOSE_GROUP_SIZE, so on a
-        // network with a meaningful NAT fraction the storer's view drops 2-3 of
-        // the uploader's quoted peers and falsely rejects honest single-node
-        // payments. This mirrors the same fix already applied to the Merkle
-        // closeness check below (verify_merkle_candidate_closeness_inner).
         let close_group = p2p_node
             .dht_manager()
-            .find_closest_nodes_local_by_distance_with_self(xorname, CLOSE_GROUP_SIZE)
+            .find_closest_nodes_local_with_self(xorname, CLOSE_GROUP_SIZE)
             .await;
         let close_group_peer_ids: Vec<PeerId> =
             close_group.iter().map(|node| node.peer_id).collect();
@@ -1013,12 +990,6 @@ impl PaymentVerifier {
     /// the dominant cost is still Sybil-grinding midpoint addresses or
     /// running real nodes near the target — same security floor.
     /// `CANDIDATE_CLOSENESS_REQUIRED` (13/16) is unchanged.
-    ///
-    /// Also doubles as the sparse-table gate in
-    /// [`verify_merkle_candidate_closeness_inner`]: the storer answers from its
-    /// local routing table and only falls back to the iterative network lookup
-    /// when the local table returns fewer than this many peers near the
-    /// midpoint (i.e. it genuinely cannot answer authoritatively).
     const CLOSENESS_LOOKUP_WIDTH: usize = 2 * evmlib::merkle_payments::CANDIDATES_PER_POOL;
 
     /// Maximum waiter → leader retries when the leader's future was cancelled
@@ -1036,20 +1007,6 @@ impl PaymentVerifier {
     /// at the previous value of 4).
     const MAX_LEADER_RETRIES: usize = 1;
 
-    /// Maximum number of authoritative *network* closeness lookups allowed to
-    /// run concurrently across all pools (see [`closeness_fallback_permits`]).
-    ///
-    /// The local routing-table fast path resolves honest traffic on a healthy,
-    /// converged network, so this cap is rarely approached in normal operation.
-    /// Its job is to bound the worst case: a flood of distinct forged pools that
-    /// each pass pool-signature verification but fail the local closeness check
-    /// would otherwise each spawn a `CLOSENESS_LOOKUP_TIMEOUT`-bounded Kademlia
-    /// walk. Beyond this many in-flight walks, further PUTs are rejected fast
-    /// with a retryable error rather than queueing. Sized generously enough to
-    /// absorb several legitimate concurrent batch uploads (each batch collapses
-    /// to a single lookup via [`inflight_closeness`]).
-    const CLOSENESS_NETWORK_FALLBACK_CONCURRENCY: usize = 16;
-
     /// Compute the storer's authoritative-lookup width for a candidate pool.
     ///
     /// Returns `max(CLOSENESS_LOOKUP_WIDTH, pool_len)`: matches the client's
@@ -1065,26 +1022,6 @@ impl PaymentVerifier {
         } else {
             pool_len
         }
-    }
-
-    /// Whether the storer's local routing table is too sparse to answer the
-    /// Merkle closeness check authoritatively on its own.
-    ///
-    /// The local k-buckets can answer authoritatively only when they hold at
-    /// least `CLOSENESS_LOOKUP_WIDTH` peers near the midpoint; below that the
-    /// table is genuinely too sparse and the network lookup is mandatory.
-    ///
-    /// Note this is no longer the *only* trigger for the network lookup: a
-    /// dense-but-disagreeing local view also escalates to the network (see
-    /// [`verify_merkle_candidate_closeness_inner`]), because on a real network
-    /// the local k-bucket sample legitimately diverges from the uploader's
-    /// network-walked candidate set. The `DoS` concern that motivated the
-    /// size-only gate — a forged pool forcing the expensive path — is instead
-    /// bounded by [`closeness_fallback_permits`]
-    /// (`CLOSENESS_NETWORK_FALLBACK_CONCURRENCY`). Extracted so the boundary can
-    /// be unit tested without a `P2PNode`.
-    const fn closeness_should_fall_back_to_network(local_peer_count: usize) -> bool {
-        local_peer_count < Self::CLOSENESS_LOOKUP_WIDTH
     }
 
     /// Verify that the candidate pool's `pub_keys` correspond to peers that
@@ -1403,129 +1340,39 @@ impl PaymentVerifier {
         // the pool rather than truncating, which would otherwise re-open the
         // K-too-small failure mode.
         let lookup_count = Self::closeness_lookup_count(pool.candidate_nodes.len());
-
-        // Fast path: answer from the local routing table. This is a pure
-        // in-memory k-bucket read (`find_closest_nodes_local_by_distance`
-        // returns `Vec<DHTNode>` with no network I/O and no `Result`), so it is
-        // safe to call from this PUT-handling request handler — unlike
-        // `find_closest_nodes_network`, which runs an iterative Kademlia lookup
-        // (up to MAX_ITERATIONS rounds, bounded by CLOSENESS_LOOKUP_TIMEOUT) and
-        // is the dominant term in slow per-chunk store times.
-        //
-        // We use the XOR-only `_by_distance` variant deliberately, NOT the
-        // reachability-reranked `find_closest_nodes_local`: this is a closeness
-        // *verification*, so it must mirror the uploader's pure XOR-distance
-        // view. The reachability re-rank (which the close-group *selection* path
-        // uses) could demote an XOR-close relay-only peer out of the compared
-        // window and falsely reject an honest candidate pool that legitimately
-        // contains that peer. See saorsa-labs/saorsa-core#121.
-        let local_peers = p2p_node
-            .dht_manager()
-            .find_closest_nodes_local_by_distance(&pool_address.0, lookup_count)
-            .await;
-
-        // When the local table is dense enough to be authoritative AND the pool
-        // already matches it, accept without paying for a network lookup — the
-        // common case on a healthy, converged network, and the #111 performance
-        // win we want to keep.
-        if Self::closeness_should_fall_back_to_network(local_peers.len()) {
-            debug!(
-                "Merkle closeness: local table returned only {} peers (< {}) for \
-                 pool midpoint {}; falling back to network lookup",
-                local_peers.len(),
-                Self::CLOSENESS_LOOKUP_WIDTH,
-                hex::encode(pool_address.0),
-            );
-        } else {
-            let local_peer_ids: Vec<PeerId> = local_peers.iter().map(|n| n.peer_id).collect();
-            if Self::check_closeness_match(&candidate_peer_ids, &local_peer_ids, &pool_address.0)
-                .is_ok()
-            {
-                return Ok(());
-            }
-            // Local view disagrees. The storer's local k-bucket sample
-            // legitimately diverges from the uploader's *network-walked*
-            // candidate set: the uploader collected reachable responders (per
-            // CLOSENESS_LOOKUP_WIDTH, often from positions 17–32) that the
-            // storer's local closest-`lookup_count` need not rank the same way.
-            // Escalate to the authoritative network lookup before rejecting an
-            // honest pool — this restores the pre-#111 correctness, but only on
-            // the (rare on a healthy net) match-failure path rather than for
-            // every chunk. The DoS exposure this reopens is bounded by
-            // `merkle_closeness_network_peer_ids`' concurrency permit.
-            debug!(
-                "Merkle closeness: local view ({} peers) disagreed for pool \
-                 midpoint {}; escalating to authoritative network lookup",
-                local_peers.len(),
-                hex::encode(pool_address.0),
-            );
-        }
-
-        // Authoritative network lookup (bounded; see
-        // `merkle_closeness_network_peer_ids`). This is the final verdict —
-        // there is no further escalation, so its result is returned directly.
-        let network_peer_ids = self
-            .merkle_closeness_network_peer_ids(&p2p_node, &pool_address.0, lookup_count)
-            .await?;
-        Self::check_closeness_match(&candidate_peer_ids, &network_peer_ids, &pool_address.0)
-    }
-
-    /// Run the authoritative iterative-Kademlia closeness lookup for a pool
-    /// midpoint, bounded both in time (`CLOSENESS_LOOKUP_TIMEOUT`) and in
-    /// concurrency ([`closeness_fallback_permits`]).
-    ///
-    /// Returns the network's closest-`lookup_count` peer IDs to the midpoint.
-    /// All error paths are retryable (the uploader can re-PUT): the verifier is
-    /// at fallback capacity, the lookup failed, or it timed out.
-    async fn merkle_closeness_network_peer_ids(
-        &self,
-        p2p_node: &Arc<P2PNode>,
-        pool_address: &[u8; 32],
-        lookup_count: usize,
-    ) -> Result<Vec<PeerId>> {
-        // Bound concurrent network walks. The local fast path handles healthy
-        // traffic, so honest uploads rarely reach here; a forged-pool flood
-        // (distinct pool_hashes that each fail the local check) could otherwise
-        // spawn unbounded CLOSENESS_LOOKUP_TIMEOUT-long walks. `inflight_closeness`
-        // already collapses same-pool concurrency; this caps the distinct-pool
-        // case. Excess PUTs are rejected fast (retryable) rather than queued.
-        let Ok(_permit) = Arc::clone(&self.closeness_fallback_permits).try_acquire_owned() else {
-            return Err(Error::Payment(
-                "Merkle candidate pool rejected: authoritative closeness lookups \
-                 are at capacity; retry shortly."
-                    .into(),
-            ));
-        };
-
         let network_lookup = p2p_node
             .dht_manager()
-            .find_closest_nodes_network(pool_address, lookup_count);
-        match tokio::time::timeout(Self::CLOSENESS_LOOKUP_TIMEOUT, network_lookup).await {
-            Ok(Ok(peers)) => Ok(peers.iter().map(|n| n.peer_id).collect()),
-            Ok(Err(e)) => {
-                debug!(
-                    "Merkle closeness network-lookup failed for pool midpoint {}: {e}",
-                    hex::encode(pool_address),
-                );
-                Err(Error::Payment(
-                    "Merkle candidate pool rejected: could not verify candidate \
+            .find_closest_nodes_network(&pool_address.0, lookup_count);
+        let network_peers =
+            match tokio::time::timeout(Self::CLOSENESS_LOOKUP_TIMEOUT, network_lookup).await {
+                Ok(Ok(peers)) => peers,
+                Ok(Err(e)) => {
+                    debug!(
+                        "Merkle closeness network-lookup failed for pool midpoint {}: {e}",
+                        hex::encode(pool_address.0),
+                    );
+                    return Err(Error::Payment(
+                        "Merkle candidate pool rejected: could not verify candidate \
                      closeness against the authoritative network view."
-                        .into(),
-                ))
-            }
-            Err(_) => {
-                debug!(
-                    "Merkle closeness network-lookup timeout ({:?}) for pool midpoint {}",
-                    Self::CLOSENESS_LOOKUP_TIMEOUT,
-                    hex::encode(pool_address),
-                );
-                Err(Error::Payment(
-                    "Merkle candidate pool rejected: authoritative network lookup \
+                            .into(),
+                    ));
+                }
+                Err(_) => {
+                    debug!(
+                        "Merkle closeness network-lookup timeout ({:?}) for pool midpoint {}",
+                        Self::CLOSENESS_LOOKUP_TIMEOUT,
+                        hex::encode(pool_address.0),
+                    );
+                    return Err(Error::Payment(
+                        "Merkle candidate pool rejected: authoritative network lookup \
                      timed out. Retry once the network lookup completes."
-                        .into(),
-                ))
-            }
-        }
+                            .into(),
+                    ));
+                }
+            };
+
+        let network_peer_ids: Vec<PeerId> = network_peers.iter().map(|n| n.peer_id).collect();
+        Self::check_closeness_match(&candidate_peer_ids, &network_peer_ids, &pool_address.0)
     }
 
     /// Verify a merkle batch payment proof.
@@ -3503,39 +3350,6 @@ mod tests {
             PaymentVerifier::closeness_lookup_count(1),
             PaymentVerifier::CLOSENESS_LOOKUP_WIDTH,
             "lookup_count must never drop below CLOSENESS_LOOKUP_WIDTH"
-        );
-    }
-
-    #[test]
-    fn closeness_falls_back_to_network_only_below_lookup_width() {
-        // Fix B: the storer answers the Merkle closeness check from its local
-        // routing table and falls back to the iterative network lookup ONLY
-        // when the local table is genuinely too sparse to be authoritative —
-        // i.e. it returns fewer than CLOSENESS_LOOKUP_WIDTH peers near the
-        // midpoint. The gate is local table size, not match outcome, so a
-        // forged pool cannot force the expensive 240s network path.
-        let width = PaymentVerifier::CLOSENESS_LOOKUP_WIDTH;
-
-        // Below the boundary: local table too sparse → must fall back.
-        assert!(
-            PaymentVerifier::closeness_should_fall_back_to_network(0),
-            "an empty local table must fall back to the network lookup"
-        );
-        assert!(
-            PaymentVerifier::closeness_should_fall_back_to_network(width - 1),
-            "WIDTH-1 local peers is still too sparse — must fall back"
-        );
-
-        // At/above the boundary: local table is authoritative → no fallback.
-        // This is the common production path: a forged pool reaching a
-        // well-connected node must NOT be able to trigger the network lookup.
-        assert!(
-            !PaymentVerifier::closeness_should_fall_back_to_network(width),
-            "exactly WIDTH local peers is authoritative — must not fall back"
-        );
-        assert!(
-            !PaymentVerifier::closeness_should_fall_back_to_network(width + 1),
-            "more than WIDTH local peers is authoritative — must not fall back"
         );
     }
 
