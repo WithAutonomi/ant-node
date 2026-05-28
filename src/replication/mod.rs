@@ -167,6 +167,16 @@ const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// (codex round-6 MAJOR, refined in round-7).
 const MAX_LAST_COMMITMENT_BY_PEER: usize = 4096;
 
+/// Cap on the sticky `ever_capable_peers` set. Bounds memory so a
+/// long-running bootstrap node cannot have the set grow without limit
+/// from peer-id churn. Sized at 4x `MAX_LAST_COMMITMENT_BY_PEER` so
+/// the set comfortably outlives normal LRU churn but still caps the
+/// blast radius of identity-rotation attacks. Once full we refuse new
+/// inserts (no eviction) — keeps the historic set stable; new v12
+/// peers above the cap are treated as legacy on rejoin, which is the
+/// pre-round-2 behaviour, not a security regression.
+const MAX_EVER_CAPABLE_PEERS: usize = 4 * MAX_LAST_COMMITMENT_BY_PEER;
+
 // ---------------------------------------------------------------------------
 // ReplicationEngine
 // ---------------------------------------------------------------------------
@@ -705,6 +715,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
@@ -727,6 +738,7 @@ impl ReplicationEngine {
                 let bootstrapping = *is_bootstrapping.read().await;
                 let ctx = audit::CommitmentAuditCtx {
                     last_commitment_by_peer: &last_commitment_by_peer,
+                    ever_capable_peers: &ever_capable_peers,
                     recent_provers: &recent_provers,
                 };
                 let result = {
@@ -756,6 +768,7 @@ impl ReplicationEngine {
                         let bootstrapping = *is_bootstrapping.read().await;
                         let ctx = audit::CommitmentAuditCtx {
                             last_commitment_by_peer: &last_commitment_by_peer,
+                            ever_capable_peers: &ever_capable_peers,
                             recent_provers: &recent_provers,
                         };
                         let result = {
@@ -3261,10 +3274,26 @@ async fn ingest_peer_commitment(
         .or_insert_with(|| PeerCommitmentRecord::from_verified(c.clone(), now));
     // Record the sticky "ever v12-capable" bit in a set independent of
     // `last_commitment_by_peer` (whose entries can be evicted by
-    // `PeerRemoved` and the sybil cap). This is what the §6
-    // holder-eligibility closure consults to decide whether to apply
-    // the v12 credit check or fall back to legacy-unconditional credit.
-    ever_capable_peers.write().await.insert(*source);
+    // `PeerRemoved` and the sybil cap). This is what the §3 audit
+    // shield and the §6 holder-eligibility closure consult to decide
+    // whether the peer is expected to speak v12.
+    //
+    // Capped at `MAX_EVER_CAPABLE_PEERS` to bound memory under
+    // identity-rotation attacks: once full, new entries are refused.
+    // Refusal degrades to pre-round-2 behaviour for over-cap peers
+    // (treated as legacy on rejoin), which is not a security regression
+    // and preserves the historic set stable.
+    {
+        let mut set = ever_capable_peers.write().await;
+        if set.contains(source) || set.len() < MAX_EVER_CAPABLE_PEERS {
+            set.insert(*source);
+        } else {
+            warn!(
+                "ingest_peer_commitment: ever_capable_peers at cap \
+                 ({MAX_EVER_CAPABLE_PEERS}); refusing to record {source} as sticky-capable"
+            );
+        }
+    }
     true
 }
 

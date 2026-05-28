@@ -79,6 +79,13 @@ pub struct CommitmentAuditCtx<'a> {
     /// `commitment_hash(record.last_commitment)` into the challenge for
     /// any peer whose record carries a commitment.
     pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    /// Sticky "ever v12-capable" set, independent of
+    /// `last_commitment_by_peer` (whose entries can be evicted by
+    /// `PeerRemoved` and the sybil cap). The §3 audit shield consults
+    /// this so a previously-v12 peer whose LRU record was evicted
+    /// still gets the no-legacy-fallback treatment until they
+    /// re-gossip a fresh commitment.
+    pub ever_capable_peers: &'a Arc<RwLock<HashSet<PeerId>>>,
     /// Holder-eligibility cache. On a successful commitment-bound audit
     /// the auditor records `(challenged_peer, key, commitment_hash)` so
     /// downstream code (quorum, paid lists) can credit the peer as a
@@ -249,20 +256,35 @@ pub async fn audit_tick_with_repair_proofs(
         });
 
     // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
-    // commitment (commitment_capable is sticky) but we currently have
-    // no last_commitment for them (TTL'd, lost via restart, or they
-    // stopped gossiping), we MUST NOT fall back to legacy plain-digest
-    // audits. The peer is fully expected to speak v12. Falling back
-    // would let them downgrade to the weaker path. Return Idle until
-    // they re-gossip a fresh commitment.
-    if let Some(r) = peer_record.as_ref() {
-        if r.commitment_capable && r.last_commitment.is_none() {
-            info!(
-                "Audit: peer {challenged_peer} is commitment-capable but we have no \
-                 cached commitment (TTL/restart/silence); skipping audit until fresh gossip"
-            );
-            return AuditTickResult::Idle;
-        }
+    // commitment we MUST NOT fall back to legacy plain-digest audits
+    // when we currently lack their cached commitment. The peer is
+    // expected to speak v12; falling back would let them downgrade to
+    // the weaker path. Return Idle until they re-gossip a fresh
+    // commitment.
+    //
+    // We consult two sources for the sticky-capable signal: the per-
+    // record `commitment_capable` bit (still set on the active LRU
+    // entry) AND the `ever_capable_peers` set (preserved across
+    // PeerRemoved cleanup and sybil-cap eviction of the LRU). Either
+    // one being true engages the shield.
+    let is_capable = peer_record.as_ref().is_some_and(|r| r.commitment_capable)
+        || match commitment_ctx {
+            Some(ctx) => ctx
+                .ever_capable_peers
+                .read()
+                .await
+                .contains(&challenged_peer),
+            None => false,
+        };
+    let has_current_commitment = peer_record
+        .as_ref()
+        .is_some_and(|r| r.last_commitment.is_some());
+    if is_capable && !has_current_commitment {
+        info!(
+            "Audit: peer {challenged_peer} is commitment-capable but we have no \
+             cached commitment (TTL/restart/silence); skipping audit until fresh gossip"
+        );
+        return AuditTickResult::Idle;
     }
 
     let challenge = AuditChallenge {
