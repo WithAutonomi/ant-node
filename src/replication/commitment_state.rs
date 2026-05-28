@@ -51,10 +51,10 @@ pub struct PeerCommitmentRecord {
     pub last_commitment: Option<StorageCommitment>,
     /// Sticky: true once this peer has gossiped a valid commitment.
     /// Set on ingest. Never set back to false except by full
-    /// PeerRemoved cleanup.
+    /// `PeerRemoved` cleanup.
     pub commitment_capable: bool,
     /// When `last_commitment` was received. Used for TTL on the
-    /// commitment itself (independent of the commitment_capable
+    /// commitment itself (independent of the `commitment_capable`
     /// stickiness — losing the commitment via TTL doesn't make us
     /// forget the peer ever spoke v12).
     pub received_at: Instant,
@@ -176,7 +176,7 @@ impl BuiltCommitment {
     }
 
     /// The cached commitment hash. Equal to
-    /// [`commitment_hash`](crate::replication::commitment::commitment_hash)
+    /// [`crate::replication::commitment::commitment_hash`]
     /// `(self.commitment())`.
     #[must_use]
     pub fn hash(&self) -> [u8; 32] {
@@ -209,7 +209,7 @@ impl BuiltCommitment {
 const RETAINED_COMMITMENT_SLOTS: usize = 4;
 
 /// Multi-slot retention state: the current commitment plus
-/// [`RETAINED_COMMITMENT_SLOTS`] - 1 historical ones.
+/// `RETAINED_COMMITMENT_SLOTS` - 1 historical ones.
 ///
 /// Per v12 paragraph 4: a responder MUST retain demoted commitments
 /// until they would no longer plausibly be pinned by any remote auditor.
@@ -246,7 +246,7 @@ impl ResponderCommitmentState {
     }
 
     /// Rotate: the new build becomes `current`; existing commitments
-    /// shift down; the oldest beyond [`RETAINED_COMMITMENT_SLOTS`] is
+    /// shift down; the oldest beyond `RETAINED_COMMITMENT_SLOTS` is
     /// dropped.
     ///
     /// Invariant INV-R2 (v7 paragraph 2): demoted trees remain reachable
@@ -398,12 +398,22 @@ pub fn build_commitment_bound_audit_response(
 /// Used by the responder side to validate the challenge structurally
 /// before streaming chunk bytes one at a time (which can be GiB for a
 /// sqrt-scaled sample on a large store). The caller then iterates
-/// challenge_keys, reads each chunk async, and calls
+/// `challenge_keys`, reads each chunk async, and calls
 /// [`build_commitment_bound_result_for_key`] per key — bounding peak
 /// memory at one chunk regardless of sample size (codex round-9 MAJOR).
 ///
 /// Returns the matched commitment Arc on success so the caller doesn't
 /// have to look it up again.
+///
+/// # Errors
+///
+/// Returns [`CommitmentBoundOutcome::UnknownCommitmentHash`] if `state`
+/// has no built commitment whose hash matches `expected_commitment_hash`
+/// (e.g. it was rotated past). Returns
+/// [`CommitmentBoundOutcome::KeyNotInCommitment`] if any entry in
+/// `challenge_keys` is absent from the matched commitment's per-key
+/// proof table.
+#[allow(clippy::result_large_err)]
 pub fn precheck_commitment_bound_challenge(
     state: &ResponderCommitmentState,
     expected_commitment_hash: &[u8; 32],
@@ -477,8 +487,8 @@ mod tests {
 
     #[test]
     fn built_commitment_hash_matches_global_hash() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let entries: Vec<_> = (1..=5u8).map(|i| (key(i), bh(i))).collect();
         let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
         let expected = commitment_hash(built.commitment()).unwrap();
@@ -487,8 +497,8 @@ mod tests {
 
     #[test]
     fn built_commitment_proof_verifies_under_its_own_root() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let entries: Vec<_> = (1..=8u8).map(|i| (key(i), bh(i))).collect();
         let built = BuiltCommitment::build(entries.clone(), &[1; 32], &sk, &pk_bytes).unwrap();
         let root = built.commitment().root;
@@ -508,8 +518,8 @@ mod tests {
 
     #[test]
     fn proof_for_absent_key_is_none() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let built = BuiltCommitment::build(
             vec![(key(1), bh(1)), (key(2), bh(2))],
             &[0; 32],
@@ -529,8 +539,8 @@ mod tests {
 
     #[test]
     fn rotate_promotes_and_demotes() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
         // First rotation: just current, no previous.
@@ -550,8 +560,8 @@ mod tests {
 
     #[test]
     fn rotate_drops_oldest_past_retention_window() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
         // RETAINED_COMMITMENT_SLOTS = 4. Insert 5 commitments; the
@@ -579,8 +589,8 @@ mod tests {
 
     #[test]
     fn lookup_finds_current_and_previous() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
         let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
@@ -599,7 +609,9 @@ mod tests {
     // ---------------------------------------------------------------------
 
     fn content(byte: u8) -> Vec<u8> {
-        (0..256u32).map(|i| (i as u8) ^ byte).collect()
+        (0..256u32)
+            .map(|i| u8::try_from(i).unwrap_or(0) ^ byte)
+            .collect()
     }
 
     fn bytes_hash(b: &[u8]) -> [u8; 32] {
@@ -608,10 +620,10 @@ mod tests {
 
     #[test]
     fn build_response_succeeds_for_keys_in_current_commitment() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
 
         let entries: Vec<_> = (1..=5u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -668,10 +680,10 @@ mod tests {
     fn build_response_falls_back_to_previous_after_rotation() {
         // INV-R2: an audit pinned to the just-demoted commitment is
         // still answerable. v5/v12 §4.
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
 
         let entries_c1: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -705,10 +717,10 @@ mod tests {
 
     #[test]
     fn build_response_key_not_in_commitment() {
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
 
         let entries: Vec<_> = (1..=3u8)
             .map(|i| (key(i), bytes_hash(&content(i))))
@@ -740,10 +752,10 @@ mod tests {
     #[test]
     fn end_to_end_responder_to_auditor_happy_path() {
         // Honest responder + honest auditor. Auditor should verify OK.
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
-        let peer_id = *blake3::hash(&_pk.to_bytes()).as_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
         let nonce = [0xCD; 32];
 
         let entries: Vec<_> = (1..=8u8)
@@ -766,7 +778,7 @@ mod tests {
             &challenge_keys,
             &nonce,
             &peer_id,
-            &bytes_lookup,
+            bytes_lookup,
         )
         else {
             panic!("expected Built");
@@ -781,7 +793,7 @@ mod tests {
             &per_key,
             bytes_lookup,
         );
-        // `_pk` is not directly used in verify (the embedded key is) but
+        // `pk` is not directly used in verify (the embedded key is) but
         // we asserted it was the signing key during build.
         assert!(result.is_ok(), "{result:?}");
     }
@@ -797,8 +809,8 @@ mod tests {
         // INV-R2: an in-flight audit responder that grabbed an Arc must
         // be able to finish building the response even after the state
         // rotates that commitment out past the retention window.
-        let (_pk, sk) = keypair();
-        let pk_bytes = _pk.to_bytes();
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
         let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
@@ -808,7 +820,7 @@ mod tests {
         let in_flight = state.lookup_by_hash(&h1).unwrap();
 
         // Rotate RETAINED_COMMITMENT_SLOTS times → h1 ages out.
-        for i in 2..=(super::RETAINED_COMMITMENT_SLOTS as u8 + 1) {
+        for i in 2..=(u8::try_from(super::RETAINED_COMMITMENT_SLOTS).unwrap_or(0) + 1) {
             let c =
                 BuiltCommitment::build(vec![(key(i), bh(i))], &[0; 32], &sk, &pk_bytes).unwrap();
             state.rotate(c);

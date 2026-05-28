@@ -70,9 +70,9 @@ pub const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
 ///
 /// One commitment is approximately 5.3 KiB:
 ///   - root: 32 B
-///   - key_count: 4 B
-///   - sender_peer_id: 32 B
-///   - sender_public_key: 1952 B (ML-DSA-65 public key)
+///   - `key_count`: 4 B
+///   - `sender_peer_id`: 32 B
+///   - `sender_public_key`: 1952 B (ML-DSA-65 public key)
 ///   - signature: 3293 B (ML-DSA-65 signature)
 ///
 /// Piggybacked on every `NeighborSyncRequest`/`Response` (~1 h interval
@@ -431,7 +431,7 @@ pub fn verify_path(
 /// with `secret_key`.
 ///
 /// The signature is over the canonical signed payload (see
-/// [`commitment_signed_payload`]) under [`DOMAIN_COMMITMENT`].
+/// `commitment_signed_payload`) under [`DOMAIN_COMMITMENT`].
 ///
 /// # Errors
 ///
@@ -565,7 +565,7 @@ mod tests {
     #[test]
     fn two_leaf_tree_root_combines_both_leaves() {
         let entries = vec![(xn(1), bh(1)), (xn(2), bh(2))];
-        let tree = MerkleTree::build(entries.clone()).unwrap();
+        let tree = MerkleTree::build(entries).unwrap();
         // Sorted order: xn(1), xn(2).
         let l1 = leaf_hash(&xn(1), &bh(1));
         let l2 = leaf_hash(&xn(2), &bh(2));
@@ -691,7 +691,7 @@ mod tests {
         let short: Vec<_> = path.iter().take(2).copied().collect();
         assert!(!verify_path(&lh, &short, 3, 8, &root));
         // Padding too long also breaks structural check.
-        let mut long = path.clone();
+        let mut long = path;
         long.push([0; 32]);
         assert!(!verify_path(&lh, &long, 3, 8, &root));
     }
@@ -823,8 +823,8 @@ mod tests {
             root: [0; 32],
             key_count: 1,
             sender_peer_id: [0; 32],
-            sender_public_key: pk_b.clone(),
-            signature: sig.clone(),
+            sender_public_key: pk_b,
+            signature: sig,
         };
         let h1 = commitment_hash(&c1).unwrap();
 
@@ -845,7 +845,7 @@ mod tests {
         assert_ne!(h1, commitment_hash(&c5).unwrap());
 
         let (pk_other, _) = dsa.generate_keypair().unwrap();
-        let mut c6 = c1.clone();
+        let mut c6 = c1;
         c6.sender_public_key = pk_bytes(&pk_other);
         assert_ne!(h1, commitment_hash(&c6).unwrap());
     }
