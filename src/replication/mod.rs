@@ -2488,26 +2488,55 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // evaluate_key_evidence_with_holder_check predicate can consult
         // them without awaiting. The predicate downgrades a Present
         // claim to Unresolved unless the peer is credited for that key.
-        let commitment_by_peer_snapshot: HashMap<PeerId, [u8; 32]> = {
+        // Snapshot per-peer commitment data. We need two views:
+        //   - `commitment_by_peer_snapshot`: peers that have gossiped a
+        //     v12 commitment (used to look up their current hash).
+        //   - `capable_peer_snapshot`: peers we've ever seen gossip a
+        //     v12 commitment (sticky `commitment_capable` flag from
+        //     §3). Legacy / pre-v12 peers that have never sent a
+        //     commitment must NOT be downgraded — they answer Present
+        //     via the legacy gossip path, and gating their evidence on
+        //     a holder credit we can never collect would break
+        //     verification liveness across a mixed-version fleet.
+        let (commitment_by_peer_snapshot, capable_peer_snapshot): (
+            HashMap<PeerId, [u8; 32]>,
+            HashSet<PeerId>,
+        ) = {
             let map = last_commitment_by_peer.read().await;
-            map.iter()
-                .filter_map(|(p, rec)| {
-                    rec.last_commitment.as_ref().and_then(|c| {
-                        crate::replication::commitment::commitment_hash(c).map(|h| (*p, h))
-                    })
-                })
-                .collect()
+            let mut commitments = HashMap::new();
+            let mut capable = HashSet::new();
+            for (p, rec) in map.iter() {
+                if rec.commitment_capable {
+                    capable.insert(*p);
+                }
+                if let Some(c) = rec.last_commitment.as_ref() {
+                    if let Some(h) = crate::replication::commitment::commitment_hash(c) {
+                        commitments.insert(*p, h);
+                    }
+                }
+            }
+            (commitments, capable)
         };
         // Take a full snapshot of recent_provers under the read lock,
         // then release. The cache is bounded (16/key × keys), so the
         // clone is cheap.
         let provers_snapshot = recent_provers.read().await.clone();
         let holder_credit = |peer: &PeerId, key: &XorName| -> bool {
+            if !capable_peer_snapshot.contains(peer) {
+                // Pre-v12 / legacy peer that has never gossiped a
+                // commitment. The v12 §6 holder-eligibility check
+                // doesn't apply: their Present evidence comes through
+                // the legacy path and we credit it unconditionally
+                // so a mixed-version network stays live during
+                // transition.
+                return true;
+            }
             let Some(hash) = commitment_by_peer_snapshot.get(peer) else {
-                // Peer has no current commitment → not credited.
-                // (Mirrors §3 commitment_capable shield; a peer with
-                // no commitment can claim Present but we don't trust
-                // it for quorum until they re-prove storage.)
+                // Peer is commitment_capable (sticky) but currently
+                // has no live commitment record on file (e.g. their
+                // last gossip was evicted from the LRU cache, or it
+                // failed verification). Withhold credit until they
+                // re-prove storage under a fresh commitment.
                 return false;
             };
             provers_snapshot.is_credited_holder(key, peer, hash)
@@ -3205,7 +3234,16 @@ async fn rebuild_and_rotate_commitment(
         .await
         .map_err(|e| Error::Storage(format!("commitment build: read keys: {e}")))?;
     if keys.is_empty() {
-        debug!("Commitment rotation: storage empty, skipping");
+        // Storage has emptied since the last rotation (pruning, manual
+        // cleanup, fresh start with stale state). Drop the previously
+        // advertised commitment so gossip stops piggybacking it; if we
+        // kept it, remote auditors would continue pinning a hash we
+        // can no longer answer (`missing bytes for committed key`) and
+        // accumulate trust failures against this node for nothing.
+        if state.current().is_some() {
+            debug!("Commitment rotation: storage empty, clearing retained slots");
+            state.clear_all();
+        }
         return Ok(());
     }
 

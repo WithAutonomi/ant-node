@@ -745,7 +745,7 @@ async fn send_prune_audit_challenge(
             peer,
             REPLICATION_PROTOCOL_ID,
             encoded,
-            config.audit_response_timeout(1),
+            config.prune_audit_response_timeout,
         )
         .await
     {

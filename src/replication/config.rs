@@ -139,6 +139,20 @@ const AUDIT_HONEST_READ_BPS: u64 = 50 * 1024 * 1024;
 /// so even at 5× the relay falls outside the envelope.
 const AUDIT_RESPONSE_HONEST_MULTIPLIER: u64 = 5;
 
+/// Single-key prune audit response deadline.
+///
+/// Prune audits ask a peer whether they still hold one specific key
+/// they previously claimed. The relay-defence rationale that motivates
+/// the tight commitment-bound timeout does NOT apply here: the
+/// auditor's own out-of-range hysteresis (`PRUNE_HYSTERESIS_DURATION`,
+/// 3 days) already makes "fetch on demand" infeasible as a sustained
+/// strategy.
+///
+/// Sized to comfortably accommodate cold cross-continent QUIC
+/// handshake plus scheduling jitter on a busy honest peer answering
+/// a single-key challenge: 10 s.
+const PRUNE_AUDIT_RESPONSE_SECS: u64 = 10;
+
 /// Maximum duration a peer may claim bootstrap status before penalties apply.
 const BOOTSTRAP_CLAIM_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60; // 24 h
 /// Maximum duration a peer may claim bootstrap status before penalties apply.
@@ -230,6 +244,11 @@ pub struct ReplicationConfig {
     /// Slack multiplier on the honest-read estimate before
     /// declaring an audit timed out.
     pub audit_response_honest_multiplier: u64,
+    /// Single-key prune-audit response deadline. Has its own constant
+    /// because the relay-defence rationale that motivates the tight
+    /// commitment-bound budget does not apply to a single-key prune
+    /// challenge.
+    pub prune_audit_response_timeout: Duration,
     /// Maximum duration a peer may claim bootstrap status.
     pub bootstrap_claim_grace_period: Duration,
     /// Minimum continuous out-of-range duration before pruning a key.
@@ -261,6 +280,7 @@ impl Default for ReplicationConfig {
             audit_response_floor: Duration::from_secs(AUDIT_RESPONSE_FLOOR_SECS),
             audit_honest_read_bps: AUDIT_HONEST_READ_BPS,
             audit_response_honest_multiplier: AUDIT_RESPONSE_HONEST_MULTIPLIER,
+            prune_audit_response_timeout: Duration::from_secs(PRUNE_AUDIT_RESPONSE_SECS),
             bootstrap_claim_grace_period: BOOTSTRAP_CLAIM_GRACE_PERIOD,
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
@@ -411,8 +431,14 @@ impl ReplicationConfig {
         let keys = u64::try_from(challenged_key_count).unwrap_or(u64::MAX);
         let total_bytes = bytes_per_key.saturating_mul(keys);
         let bps = self.audit_honest_read_bps.max(1);
-        let honest_read_secs = total_bytes / bps;
-        let scaled_secs = honest_read_secs.saturating_mul(self.audit_response_honest_multiplier);
+        // Apply the multiplier BEFORE integer-dividing by bps so each
+        // chunk contributes a fractional second rather than rounding
+        // down to zero. Otherwise k in 1..=12 would all collapse to the
+        // floor (~40 MiB / 50 MB/s = 0 secs in integer arithmetic), and
+        // an honest HDD-backed peer at sqrt(N)=10 stored chunks could
+        // miss the budget under load.
+        let multiplied = total_bytes.saturating_mul(self.audit_response_honest_multiplier);
+        let scaled_secs = multiplied / bps;
         // saturating_add avoids a panic if `scaled_secs` (or the floor
         // plus it) would overflow `Duration::MAX`.
         self.audit_response_floor
@@ -494,20 +520,46 @@ mod tests {
         let t1 = config.audit_response_timeout(1);
         let t10 = config.audit_response_timeout(10);
         let t100 = config.audit_response_timeout(100);
-        // Monotonic non-decreasing: small challenges sit at the floor
-        // (integer division collapses sub-second per-key work to 0),
-        // larger challenges accrete read time on top.
         assert!(t1 <= t10 && t10 < t100, "timeout must not decrease with k");
 
-        // For k=1 at 4 MiB: 4_194_304 / 52_428_800 = 0s honest read
-        // (integer division) × 5 = 0s, + 2s floor = 2s. The per-key
-        // contribution only starts mattering once k * 4 MiB rounds up
-        // past one second of honest-read time.
+        // Multiplier is applied before the divide so each chunk
+        // contributes ~0.4 s rather than rounding to 0 at small k.
+        // For k=1: (4_194_304 × 5) / 52_428_800 = 0 (still below 1 s),
+        // + 2 s floor = 2 s.
         assert_eq!(t1, Duration::from_secs(2));
 
-        // For k=100 at 4 MiB: 419_430_400 / 52_428_800 = 8s honest
-        // read, × 5 = 40s, + 2s floor = 42s.
+        // For k=10: (10 × 4_194_304 × 5) / 52_428_800 = 4 s scaled,
+        // + 2 s floor = 6 s. An HDD-backed honest peer at 20 MB/s reads
+        // 40 MiB in ~2 s, comfortably inside the budget; a relay
+        // attacker fetching the same 40 MiB at 5 MB/s residential
+        // bandwidth needs ~8 s for the data alone, outside.
+        assert_eq!(t10, Duration::from_secs(6));
+
+        // For k=100: (100 × 4_194_304 × 5) / 52_428_800 = 40 s scaled,
+        // + 2 s floor = 42 s.
         assert_eq!(t100, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn audit_response_timeout_fits_honest_hdd_at_typical_sample_size() {
+        // The canonical audit sample is sqrt(N) at N stored chunks.
+        // At N=100 stored chunks, sample is 10. An HDD-backed honest
+        // peer at the slowest realistic random-read throughput (20 MB/s,
+        // well below modern HDDs which sustain 80-150 MB/s sequential)
+        // reads 10 × 4 MiB = 40 MiB in ~2 s. Add 300 ms cross-continent
+        // RTT, ~10 ms scheduling, ~3 ms ML-DSA sign, and the honest
+        // envelope is ~2.3 s. The 6 s budget at k=10 leaves >3 s of
+        // slack.
+        let config = ReplicationConfig::default();
+        let budget = config.audit_response_timeout(10);
+        let realistic_hdd_bps: u64 = 20 * 1024 * 1024;
+        let bytes: u64 = 10 * 4 * 1024 * 1024;
+        let honest_envelope_secs = bytes / realistic_hdd_bps + 1; // +1 s for network/scheduling/sign
+        assert!(
+            Duration::from_secs(honest_envelope_secs) < budget,
+            "honest HDD envelope ({honest_envelope_secs}s) must fit inside k=10 budget ({}s)",
+            budget.as_secs(),
+        );
     }
 
     #[test]

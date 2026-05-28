@@ -758,21 +758,20 @@ async fn verify_commitment_bound(
         let local_bytes = match storage.get_raw(&result.key).await {
             Ok(Some(b)) => b,
             Ok(None) => {
+                // The auditor's own local copy of this key vanished
+                // between sampling (`storage.all_keys()` in the tick
+                // setup) and response verification (pruning, expiration,
+                // LMDB compaction can race here). The responder isn't
+                // at fault — we can't recompute the expected bytes
+                // hash without our own copy. Treat as benign, matching
+                // the legacy `verify_digests` `continue` semantics
+                // rather than penalising the responder for the
+                // auditor's storage churn.
                 debug!(
-                    "Audit: local key {} missing for commitment-bound check",
+                    "Audit: local key {} disappeared between sampling and verification; skipping",
                     hex::encode(result.key)
                 );
-                // Treat missing local copy as bytes-hash mismatch — we
-                // sampled it from our key set, so disappearance is rare.
-                return handle_audit_failure(
-                    challenged_peer,
-                    challenge_id,
-                    keys,
-                    AuditFailureReason::DigestMismatch,
-                    p2p_node,
-                    config,
-                )
-                .await;
+                return AuditTickResult::Idle;
             }
             Err(e) => {
                 warn!(

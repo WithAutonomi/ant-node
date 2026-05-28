@@ -284,6 +284,21 @@ impl ResponderCommitmentState {
         self.inner.read().slots.first().map(Arc::clone)
     }
 
+    /// Drop every retained slot. Called when the local store has
+    /// transitioned to empty: keeping the previously-advertised
+    /// commitment alive would invite audit failures (we can no longer
+    /// answer for any of the keys we committed to), and would leave
+    /// remote auditors pinning a hash this node will never satisfy
+    /// again. After clearing, the gossip piggyback path will emit
+    /// `commitment: None` until a fresh rotation occurs.
+    ///
+    /// This is the one sanctioned escape from the "callers MUST NOT
+    /// clear retention by any other mechanism" invariant — empty
+    /// storage means there is nothing to retain.
+    pub fn clear_all(&self) {
+        self.inner.write().slots.clear();
+    }
+
     /// Test-only: snapshot of the second-newest slot (legacy "previous").
     #[cfg(test)]
     pub(crate) fn previous(&self) -> Option<Arc<BuiltCommitment>> {
