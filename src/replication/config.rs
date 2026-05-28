@@ -413,7 +413,10 @@ impl ReplicationConfig {
         let bps = self.audit_honest_read_bps.max(1);
         let honest_read_secs = total_bytes / bps;
         let scaled_secs = honest_read_secs.saturating_mul(self.audit_response_honest_multiplier);
-        self.audit_response_floor + Duration::from_secs(scaled_secs)
+        // saturating_add avoids a panic if `scaled_secs` (or the floor
+        // plus it) would overflow `Duration::MAX`.
+        self.audit_response_floor
+            .saturating_add(Duration::from_secs(scaled_secs))
     }
 
     /// Returns a random duration in `[audit_tick_interval_min,
