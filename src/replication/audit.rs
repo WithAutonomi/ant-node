@@ -121,7 +121,11 @@ pub async fn audit_tick(
 /// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
 /// callers that have not adopted repair proofs remain conservative and do not
 /// audit peers for unproven keys.
-#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
@@ -237,13 +241,12 @@ pub async fn audit_tick_with_repair_proofs(
             .cloned(),
         None => None,
     };
-    let (expected_commitment_hash, pinned_commitment) = match peer_record.as_ref() {
-        Some(r) => match r.last_commitment.as_ref() {
-            Some(c) => (commitment_hash(c), Some(c.clone())),
-            None => (None, None),
-        },
-        None => (None, None),
-    };
+    let (expected_commitment_hash, pinned_commitment) =
+        peer_record.as_ref().map_or((None, None), |r| {
+            r.last_commitment
+                .as_ref()
+                .map_or((None, None), |c| (commitment_hash(c), Some(c.clone())))
+        });
 
     // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
     // commitment (commitment_capable is sticky) but we currently have
@@ -682,9 +685,9 @@ async fn verify_digests(
 ///
 /// The verifier checks five gates: structural, peer-id binding, pin,
 /// signature (using the pubkey embedded in the commitment), and per-key
-/// (bytes_hash + Merkle path + audit digest). Any failure path → standard
+/// (`bytes_hash` + Merkle path + audit digest). Any failure path → standard
 /// `AUDIT_FAILURE_TRUST_WEIGHT × keys` penalty.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn verify_commitment_bound(
     challenged_peer: &PeerId,
     challenge_id: u64,
@@ -935,6 +938,7 @@ pub async fn handle_audit_challenge(
 /// Backwards-compatible: existing callers that don't have a
 /// `ResponderCommitmentState` keep calling `handle_audit_challenge`,
 /// which forwards here with `commitment_state = None`.
+#[allow(clippy::too_long_first_doc_paragraph, clippy::too_many_lines)]
 pub async fn handle_audit_challenge_with_commitment(
     challenge: &AuditChallenge,
     storage: &LmdbStorage,
@@ -1024,19 +1028,16 @@ pub async fn handle_audit_challenge_with_commitment(
         // MAX_CHUNK_SIZE (4 MiB) regardless of sample size.
         let mut per_key = Vec::with_capacity(challenge.keys.len());
         for key in &challenge.keys {
-            let bytes = match storage.get_raw(key).await {
-                Ok(Some(b)) => b,
-                Ok(None) | Err(_) => {
-                    // Key IS in the commitment (precheck above ensured
-                    // it) but we cannot read the bytes anymore. That's
-                    // real storage loss / deliberate non-response, not
-                    // benign staleness. Use a distinct reason string so
-                    // the auditor penalises (codex round-12 MAJOR #1).
-                    return AuditResponse::Rejected {
-                        challenge_id: challenge.challenge_id,
-                        reason: format!("missing bytes for committed key: {}", hex::encode(key)),
-                    };
-                }
+            let Ok(Some(bytes)) = storage.get_raw(key).await else {
+                // Key IS in the commitment (precheck above ensured
+                // it) but we cannot read the bytes anymore. That's
+                // real storage loss / deliberate non-response, not
+                // benign staleness. Use a distinct reason string so
+                // the auditor penalises (codex round-12 MAJOR #1).
+                return AuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    reason: format!("missing bytes for committed key: {}", hex::encode(key)),
+                };
             };
             let Some(entry) =
                 crate::replication::commitment_state::build_commitment_bound_result_for_key(

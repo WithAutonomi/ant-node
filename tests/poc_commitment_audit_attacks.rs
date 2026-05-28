@@ -711,6 +711,7 @@ fn cross_peer_commitment_substitution_rejected_by_sender_id() {
 /// core derives PeerId from the public key bytes; any commitment whose
 /// embedded pubkey doesn't match the claimed peer_id is malformed.
 #[test]
+#[allow(clippy::similar_names)]
 fn throwaway_key_substitution_rejected_by_pubkey_binding() {
     let nonce = [0xCD; 32];
 

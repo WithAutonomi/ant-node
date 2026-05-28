@@ -307,7 +307,7 @@ pub fn verify_commitment_bound_metadata(
     Ok(())
 }
 
-/// Verify gate 4 (bytes_hash + path + digest) for a single per-key entry.
+/// Verify gate 4 (`bytes_hash` + path + digest) for a single per-key entry.
 ///
 /// Call this once per challenged key in a streaming loop after running
 /// [`verify_commitment_bound_metadata`] once on the response. Lets the
@@ -384,7 +384,9 @@ mod tests {
 
     fn content(byte: u8) -> Vec<u8> {
         // 256 bytes of deterministic content per index.
-        (0..256u32).map(|i| (i as u8) ^ byte).collect()
+        (0..256u32)
+            .map(|i| u8::try_from(i).unwrap_or(0) ^ byte)
+            .collect()
     }
 
     fn bytes_hash(bytes: &[u8]) -> [u8; 32] {
@@ -420,7 +422,7 @@ mod tests {
         (fx, pk)
     }
 
-    /// Build a valid CommitmentBoundResponse for the given challenge
+    /// Build a valid `CommitmentBoundResponse` for the given challenge
     /// keys against `fx`. Used as the baseline; tampering tests mutate
     /// the result.
     fn build_valid_response(fx: &AuditFixture, keys: &[XorName]) -> Vec<CommitmentBoundResult> {

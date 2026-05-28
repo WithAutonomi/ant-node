@@ -132,7 +132,7 @@ const AUDIT_HONEST_READ_BPS: u64 = 50 * 1024 * 1024;
 
 /// Slack multiplier on the honest-read estimate.
 ///
-/// Set so an honest peer that's slower than HONEST_READ_BPS (e.g. an
+/// Set so an honest peer that's slower than `HONEST_READ_BPS` (e.g. an
 /// HDD-backed node, or one under load) still answers within the
 /// timeout. 5× is generous; a relay peer fetching the same data
 /// over the network sees roughly 10-100× higher latency than disk,
@@ -219,7 +219,7 @@ pub struct ReplicationConfig {
     pub audit_tick_interval_max: Duration,
     /// Floor on the audit response deadline. Covers global RTT for
     /// the small request/response envelope plus scheduling jitter.
-    /// See [`AUDIT_RESPONSE_FLOOR_SECS`] for sizing.
+    /// See `AUDIT_RESPONSE_FLOOR_SECS` for sizing.
     pub audit_response_floor: Duration,
     /// Conservative honest-responder read throughput (bytes/sec).
     /// Used to scale the audit response deadline against the size of

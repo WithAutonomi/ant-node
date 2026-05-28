@@ -141,7 +141,7 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 
 /// Minimum interval between commitment signature verifications for a
-/// single peer (v10/v12 §2 step 3 + §11 DoS).
+/// single peer (v10/v12 §2 step 3 + §11 `DoS`).
 ///
 /// A sybil that bypasses the routing-table gate (e.g. by transient
 /// bucket pollution) could otherwise force one ML-DSA-65 verify (~1 ms)
@@ -157,7 +157,7 @@ const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// (~5 KiB: 1952-byte pubkey + 3293-byte signature + small fields).
 /// At 4096 entries the cache is ~20 MiB, which comfortably covers a
 /// realistic close-group neighborhood. When the cap is hit, one
-/// arbitrary existing entry is evicted on insert (HashMap iteration
+/// arbitrary existing entry is evicted on insert (`HashMap` iteration
 /// order is unspecified; we do not track insertion order). The
 /// `PeerRemoved` handler proactively drops entries as the DHT
 /// detects departures, and `ingest_peer_commitment` only admits
@@ -221,7 +221,7 @@ pub struct ReplicationEngine {
     /// Populated whenever an inbound gossip carries a verified
     /// commitment from the sender. Used by `audit_tick` to snapshot
     /// `expected_commitment_hash` into outbound challenges, and by
-    /// holder-eligibility (§6) to decide whether a peer's recent_provers
+    /// holder-eligibility (§6) to decide whether a peer's `recent_provers`
     /// proof should be honoured. The sticky `commitment_capable` flag
     /// flips true on first successful ingest and never reverts (§2
     /// step 5).
@@ -232,7 +232,7 @@ pub struct ReplicationEngine {
     /// quorum / paid-list eligibility checks (phase-3 stretch).
     recent_provers: Arc<RwLock<RecentProvers>>,
     /// Per-peer last sig-verify attempt timestamp for the §2 step 3 /
-    /// §11 DoS rate limit. Bumped on EVERY verify attempt (success or
+    /// §11 `DoS` rate limit. Bumped on EVERY verify attempt (success or
     /// failure) so a peer we've never successfully verified can't burn
     /// CPU on a flood of structurally-plausible-but-invalid gossips.
     /// Lives separately from `last_commitment_by_peer` because that
@@ -260,6 +260,7 @@ impl ReplicationEngine {
     ///
     /// Returns an error if the `PaidList` LMDB environment cannot be opened
     /// or if the configuration fails validation.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: ReplicationConfig,
         p2p_node: Arc<P2PNode>,
@@ -1224,7 +1225,7 @@ impl ReplicationEngine {
 /// When `rr_message_id` is `Some`, the request arrived via the `/rr/`
 /// request-response path and the response must be sent via `send_response`
 /// so saorsa-core can route it back to the waiting `send_request` caller.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_replication_message(
     source: &PeerId,
     data: &[u8],
@@ -1906,7 +1907,6 @@ async fn record_sent_replica_hints(
 
 /// Run one neighbor sync round.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-#[allow(clippy::too_many_arguments)]
 async fn run_neighbor_sync_round(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
@@ -2528,7 +2528,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     ev,
                     &targets,
                     config,
-                    &holder_credit,
+                    holder_credit,
                 );
                 evaluated.push((*key, outcome, entry.pipeline));
             }

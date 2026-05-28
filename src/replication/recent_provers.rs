@@ -30,7 +30,7 @@
 //!   [`RecentProvers::is_credited_holder`] on read, and
 //!   [`RecentProvers::sweep_expired`] reclaims their memory when a
 //!   caller invokes it (e.g. periodically from the engine).
-//! - **PeerRemoved cleanup**: the caller should call
+//! - **`PeerRemoved` cleanup**: the caller should call
 //!   [`RecentProvers::forget_peer`] when a peer leaves the routing
 //!   table to drop their entries immediately (faster than waiting for
 //!   TTL).
@@ -271,15 +271,19 @@ mod tests {
     fn per_key_cap_evicts_oldest() {
         let mut cache = RecentProvers::new();
         let now = Instant::now();
+        // MAX_PROVERS_PER_KEY is a small usize (16). Narrow to u8 once
+        // so the test loop can hand the peer-id byte directly to
+        // `peer(...)` without per-iteration casts.
+        let max_u8 = u8::try_from(MAX_PROVERS_PER_KEY).unwrap_or(u8::MAX);
         // Fill the bucket with MAX_PROVERS_PER_KEY + 1 distinct peers.
-        for i in 0..=MAX_PROVERS_PER_KEY {
-            let t = now + Duration::from_millis(i as u64);
-            cache.record_proof(key(1), peer(i as u8), hash(0xAB), t);
+        for i in 0..=max_u8 {
+            let t = now + Duration::from_millis(u64::from(i));
+            cache.record_proof(key(1), peer(i), hash(0xAB), t);
         }
         assert_eq!(cache.provers_for(&key(1)), MAX_PROVERS_PER_KEY);
         // The oldest (peer 0) should be evicted; peer MAX should be present.
         assert!(!cache.is_credited_holder(&key(1), &peer(0), &hash(0xAB)));
-        assert!(cache.is_credited_holder(&key(1), &peer(MAX_PROVERS_PER_KEY as u8), &hash(0xAB)));
+        assert!(cache.is_credited_holder(&key(1), &peer(max_u8), &hash(0xAB)));
     }
 
     #[test]
