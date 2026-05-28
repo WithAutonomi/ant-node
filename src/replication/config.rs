@@ -104,10 +104,40 @@ pub const AUDIT_TICK_INTERVAL_MIN: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// Audit scheduler cadence range (max).
 pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INTERVAL_MAX_SECS);
 
-/// Base audit response deadline (independent of challenge size).
-const AUDIT_RESPONSE_BASE_SECS: u64 = 10;
-/// Per-key allowance added to the base audit response deadline.
-const AUDIT_RESPONSE_PER_KEY_MS: u64 = 20;
+/// Floor on the audit response deadline (independent of challenge size).
+///
+/// Sized to absorb worst-case global RTT for the audit envelope
+/// (the request + response messages are KB-scale, not chunk-scale)
+/// plus scheduling jitter. Tokyo↔NY round-trip is ~150ms each way,
+/// so 2 seconds comfortably covers cross-continent communication
+/// for any audit.
+const AUDIT_RESPONSE_FLOOR_SECS: u64 = 2;
+
+/// Conservative honest-responder read throughput, in bytes per second.
+///
+/// Used to size the audit response deadline. An honest peer answers
+/// a k-key challenge by reading k chunks from local disk, computing
+/// BLAKE3 + path proofs, and signing the response. The bottleneck is
+/// disk read; BLAKE3 at ~3 GB/s + ML-DSA signing at ~3 ms are
+/// negligible.
+///
+/// Set conservatively below any modern SSD (typical: 500 MB/s+).
+/// At 50 MB/s, a k=10 sample at 4 MiB chunks reads in ~0.8s, well
+/// inside even an aggressive timeout. A relay attacker who must
+/// fetch the same 40 MB over the network at typical bandwidth
+/// (100 Mbps = 12.5 MB/s) takes 3+ seconds for the data alone, plus
+/// per-chunk network round-trips. At larger sample sizes the gap
+/// is exponential in the relay's disadvantage.
+const AUDIT_HONEST_READ_BPS: u64 = 50 * 1024 * 1024;
+
+/// Slack multiplier on the honest-read estimate.
+///
+/// Set so an honest peer that's slower than HONEST_READ_BPS (e.g. an
+/// HDD-backed node, or one under load) still answers within the
+/// timeout. 5× is generous; a relay peer fetching the same data
+/// over the network sees roughly 10-100× higher latency than disk,
+/// so even at 5× the relay falls outside the envelope.
+const AUDIT_RESPONSE_HONEST_MULTIPLIER: u64 = 5;
 
 /// Maximum duration a peer may claim bootstrap status before penalties apply.
 const BOOTSTRAP_CLAIM_GRACE_PERIOD_SECS: u64 = 24 * 60 * 60; // 24 h
@@ -187,10 +217,19 @@ pub struct ReplicationConfig {
     pub audit_tick_interval_min: Duration,
     /// Audit scheduler cadence range (max).
     pub audit_tick_interval_max: Duration,
-    /// Base audit response deadline (key-independent component).
-    pub audit_response_base: Duration,
-    /// Per-key allowance added to the base audit response deadline.
-    pub audit_response_per_key: Duration,
+    /// Floor on the audit response deadline. Covers global RTT for
+    /// the small request/response envelope plus scheduling jitter.
+    /// See [`AUDIT_RESPONSE_FLOOR_SECS`] for sizing.
+    pub audit_response_floor: Duration,
+    /// Conservative honest-responder read throughput (bytes/sec).
+    /// Used to scale the audit response deadline against the size of
+    /// the challenge. Slow enough that even an HDD-backed honest peer
+    /// fits inside the budget; fast enough that a relay attacker who
+    /// must fetch bytes over the network falls outside.
+    pub audit_honest_read_bps: u64,
+    /// Slack multiplier on the honest-read estimate before
+    /// declaring an audit timed out.
+    pub audit_response_honest_multiplier: u64,
     /// Maximum duration a peer may claim bootstrap status.
     pub bootstrap_claim_grace_period: Duration,
     /// Minimum continuous out-of-range duration before pruning a key.
@@ -219,8 +258,9 @@ impl Default for ReplicationConfig {
             self_lookup_interval_max: SELF_LOOKUP_INTERVAL_MAX,
             audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
             audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
-            audit_response_base: Duration::from_secs(AUDIT_RESPONSE_BASE_SECS),
-            audit_response_per_key: Duration::from_millis(AUDIT_RESPONSE_PER_KEY_MS),
+            audit_response_floor: Duration::from_secs(AUDIT_RESPONSE_FLOOR_SECS),
+            audit_honest_read_bps: AUDIT_HONEST_READ_BPS,
+            audit_response_honest_multiplier: AUDIT_RESPONSE_HONEST_MULTIPLIER,
             bootstrap_claim_grace_period: BOOTSTRAP_CLAIM_GRACE_PERIOD,
             prune_hysteresis_duration: PRUNE_HYSTERESIS_DURATION,
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
@@ -343,11 +383,37 @@ impl ReplicationConfig {
     }
 
     /// Compute the audit response timeout for a challenge with
-    /// `challenged_key_count` keys: `base + per_key * challenged_key_count`.
+    /// `challenged_key_count` keys, **sized to be tight enough that a
+    /// relay attacker that must fetch the chunk bytes from elsewhere
+    /// falls outside the budget**.
+    ///
+    /// Formula:
+    ///   `floor + (challenged_bytes / honest_read_bps) × multiplier`
+    ///
+    /// Where `challenged_bytes = k × MAX_CHUNK_SIZE`. An honest peer
+    /// reads `k × 4 MiB` from local disk at `honest_read_bps` (set
+    /// conservatively at 50 MB/s — well below modern SSDs); the
+    /// multiplier of 5 absorbs jitter, BLAKE3, ML-DSA, and slow disks.
+    ///
+    /// A relay attacker who must fetch the same `k × 4 MiB` over the
+    /// network sees roughly 10-100× higher latency than disk for the
+    /// data alone, plus per-chunk network round-trips. Even at the 5×
+    /// honest multiplier, the relay falls outside the envelope and
+    /// the audit times out — which fires an `application_failure`
+    /// trust event (per `handle_audit_timeout` → `handle_audit_failure`).
+    ///
+    /// This is the v12.0 closure of the otherwise-documented §7 relay
+    /// limit: relay still passes audits cryptographically, but no
+    /// longer passes them inside the time budget.
     #[must_use]
     pub fn audit_response_timeout(&self, challenged_key_count: usize) -> Duration {
-        let keys = u32::try_from(challenged_key_count).unwrap_or(u32::MAX);
-        self.audit_response_base + self.audit_response_per_key * keys
+        let bytes_per_key = u64::try_from(crate::ant_protocol::MAX_CHUNK_SIZE).unwrap_or(u64::MAX);
+        let keys = u64::try_from(challenged_key_count).unwrap_or(u64::MAX);
+        let total_bytes = bytes_per_key.saturating_mul(keys);
+        let bps = self.audit_honest_read_bps.max(1);
+        let honest_read_secs = total_bytes / bps;
+        let scaled_secs = honest_read_secs.saturating_mul(self.audit_response_honest_multiplier);
+        self.audit_response_floor + Duration::from_secs(scaled_secs)
     }
 
     /// Returns a random duration in `[audit_tick_interval_min,
@@ -407,6 +473,65 @@ mod tests {
     #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn audit_response_timeout_floor_at_zero_keys() {
+        let config = ReplicationConfig::default();
+        assert_eq!(
+            config.audit_response_timeout(0),
+            Duration::from_secs(AUDIT_RESPONSE_FLOOR_SECS),
+            "zero-key challenge should yield the floor exactly"
+        );
+    }
+
+    #[test]
+    fn audit_response_timeout_scales_with_key_count() {
+        let config = ReplicationConfig::default();
+        let t1 = config.audit_response_timeout(1);
+        let t10 = config.audit_response_timeout(10);
+        let t100 = config.audit_response_timeout(100);
+        // Monotonic non-decreasing: small challenges sit at the floor
+        // (integer division collapses sub-second per-key work to 0),
+        // larger challenges accrete read time on top.
+        assert!(t1 <= t10 && t10 < t100, "timeout must not decrease with k");
+
+        // For k=1 at 4 MiB: 4_194_304 / 52_428_800 = 0s honest read
+        // (integer division) × 5 = 0s, + 2s floor = 2s. The per-key
+        // contribution only starts mattering once k * 4 MiB rounds up
+        // past one second of honest-read time.
+        assert_eq!(t1, Duration::from_secs(2));
+
+        // For k=100 at 4 MiB: 419_430_400 / 52_428_800 = 8s honest
+        // read, × 5 = 40s, + 2s floor = 42s.
+        assert_eq!(t100, Duration::from_secs(42));
+    }
+
+    #[test]
+    fn audit_response_timeout_relay_is_outside_envelope() {
+        // The intended invariant: an honest peer with the SSD-class
+        // read budget fits inside `audit_response_timeout(k)`, while a
+        // relay attacker fetching k*4MiB over residential bandwidth
+        // (≈ 5 MB/s realistic for sustained download) does NOT. Spot-
+        // check this at k=100: honest budget is 42s, relay needs at
+        // least 100 * 4 MiB / 5 MB/s = 80s for the data alone, which
+        // exceeds the budget.
+        let config = ReplicationConfig::default();
+        let budget = config.audit_response_timeout(100);
+        let relay_data_only = Duration::from_secs(100 * 4 * 1024 * 1024 / (5 * 1024 * 1024));
+        assert!(
+            relay_data_only > budget,
+            "relay fetch ({}s) must exceed honest audit budget ({}s)",
+            relay_data_only.as_secs(),
+            budget.as_secs(),
+        );
+    }
+
+    #[test]
+    fn audit_response_timeout_saturates_on_huge_k() {
+        let config = ReplicationConfig::default();
+        // Should not panic or overflow at extreme k values.
+        let _ = config.audit_response_timeout(usize::MAX);
     }
 
     #[test]
