@@ -820,6 +820,31 @@ mod tests {
     // happy-path data flow.)
 
     #[test]
+    fn clear_all_drops_every_slot() {
+        // Empty-storage transition: after clear_all, the gossip path
+        // must observe `current() == None` so it stops piggybacking a
+        // commitment the node can no longer answer audits against.
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let state = ResponderCommitmentState::new();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        let c2 = BuiltCommitment::build(vec![(key(2), bh(2))], &peer_id, &sk, &pk_bytes).unwrap();
+        state.rotate(c2);
+
+        assert!(state.current().is_some());
+        assert!(state.lookup_by_hash(&h1).is_some());
+
+        state.clear_all();
+
+        assert!(state.current().is_none());
+        assert!(state.lookup_by_hash(&h1).is_none());
+    }
+
+    #[test]
     fn lookup_arc_outlives_subsequent_rotation() {
         // INV-R2: an in-flight audit responder that grabbed an Arc must
         // be able to finish building the response even after the state
