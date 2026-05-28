@@ -97,6 +97,7 @@ struct VerificationCycleContext<'a> {
     /// holder of the key (i.e. they recently passed a commitment-bound
     /// audit on it under their currently-credited commitment hash).
     last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: &'a Arc<RwLock<HashSet<PeerId>>>,
     recent_provers: &'a Arc<RwLock<RecentProvers>>,
 }
 
@@ -226,6 +227,16 @@ pub struct ReplicationEngine {
     /// flips true on first successful ingest and never reverts (§2
     /// step 5).
     last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    /// Sticky set of peer IDs we have EVER seen carrying a v12
+    /// commitment, independent of whether their commitment bytes are
+    /// still in `last_commitment_by_peer`. The §6 holder-eligibility
+    /// closure consults this set to keep treating churned-out
+    /// previously-v12 peers as v12-capable (rather than degrading them
+    /// to "legacy" credit-unconditionally) when they re-appear on the
+    /// network before their next gossip arrives. Bounded growth: even
+    /// at one million peers seen over the node's lifetime, the set is
+    /// 32 MB.
+    ever_capable_peers: Arc<RwLock<HashSet<PeerId>>>,
     /// Auditor-side holder-eligibility cache (v12 §6).
     ///
     /// Recorded on successful commitment-bound audit; read by future
@@ -300,6 +311,7 @@ impl ReplicationEngine {
             identity,
             commitment_state: Arc::new(ResponderCommitmentState::new()),
             last_commitment_by_peer: Arc::new(RwLock::new(HashMap::new())),
+            ever_capable_peers: Arc::new(RwLock::new(HashSet::new())),
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
             sig_verify_attempts: Arc::new(RwLock::new(HashMap::new())),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
@@ -496,6 +508,7 @@ impl ReplicationEngine {
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let my_commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
@@ -541,6 +554,7 @@ impl ReplicationEngine {
                                     &sync_cycle_epoch,
                                     &repair_proofs,
                                     &last_commitment_by_peer,
+                                    &ever_capable_peers,
                                     &sig_verify_attempts,
                                     &my_commitment_state,
                                     rr_message_id.as_deref(),
@@ -573,16 +587,21 @@ impl ReplicationEngine {
                             }
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 repair_proofs.write().await.remove_peer(&peer_id);
-                                // v12: also drop any commitment + recent-prover
-                                // state for the removed peer so a churn /
-                                // sybil attacker cannot leave behind one
+                                // v12: drop the commitment bytes and the
+                                // recent-prover credit so a churn / sybil
+                                // attacker cannot leave behind one
                                 // StorageCommitment per identity in
-                                // last_commitment_by_peer (codex round-6
-                                // MAJOR) — and also drop the sig-verify
-                                // rate-limit timestamp (codex round-13).
+                                // `last_commitment_by_peer`. Also drop the
+                                // sig-verify rate-limit timestamp.
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
+                                // The sticky `commitment_capable` flag is
+                                // preserved orthogonally via
+                                // `ever_capable_peers` — even after this
+                                // removal, a re-joining peer continues to
+                                // be treated as v12-capable rather than
+                                // legacy (§3 shield).
                             }
                             _ => {}
                         }
@@ -610,6 +629,7 @@ impl ReplicationEngine {
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
         let handle = tokio::spawn(async move {
@@ -641,6 +661,7 @@ impl ReplicationEngine {
                         &bootstrap_state,
                         &commitment_state,
                         &last_commitment_by_peer,
+                        &ever_capable_peers,
                         &sig_verify_attempts,
                     ) => {}
                 }
@@ -1019,6 +1040,7 @@ impl ReplicationEngine {
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let recent_provers = Arc::clone(&self.recent_provers);
 
         let handle = tokio::spawn(async move {
@@ -1038,6 +1060,7 @@ impl ReplicationEngine {
                             is_bootstrapping: &is_bootstrapping,
                             bootstrap_complete_notify: &bootstrap_complete_notify,
                             last_commitment_by_peer: &last_commitment_by_peer,
+                            ever_capable_peers: &ever_capable_peers,
                             recent_provers: &recent_provers,
                         };
                         run_verification_cycle(ctx).await;
@@ -1078,6 +1101,7 @@ impl ReplicationEngine {
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let my_commitment_state = Arc::clone(&self.commitment_state);
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
+        let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
 
         let handle = tokio::spawn(async move {
@@ -1153,6 +1177,7 @@ impl ReplicationEngine {
                             outcome.response.commitment.as_ref(),
                             &p2p,
                             &last_commitment_by_peer,
+                            &ever_capable_peers,
                             &sig_verify_attempts,
                         )
                         .await; // sig_verify_attempts in scope from line ~1080
@@ -1241,6 +1266,7 @@ async fn handle_replication_message(
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     my_commitment_state: &Arc<ResponderCommitmentState>,
     rr_message_id: Option<&str>,
@@ -1285,6 +1311,7 @@ async fn handle_replication_message(
                 request.commitment.as_ref(),
                 p2p_node,
                 last_commitment_by_peer,
+                ever_capable_peers,
                 sig_verify_attempts,
             )
             .await;
@@ -1921,6 +1948,7 @@ async fn run_neighbor_sync_round(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     commitment_state: &Arc<ResponderCommitmentState>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) {
     let self_id = *p2p_node.peer_id();
@@ -2038,6 +2066,7 @@ async fn run_neighbor_sync_round(
                 sync_cycle_epoch,
                 repair_proofs,
                 last_commitment_by_peer,
+                ever_capable_peers,
                 sig_verify_attempts,
             )
             .await;
@@ -2079,6 +2108,7 @@ async fn run_neighbor_sync_round(
                         sync_cycle_epoch,
                         repair_proofs,
                         last_commitment_by_peer,
+                        ever_capable_peers,
                         sig_verify_attempts,
                     )
                     .await;
@@ -2108,6 +2138,7 @@ async fn handle_sync_response(
     sync_cycle_epoch: &Arc<RwLock<u64>>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) {
     // v12: ingest the peer's commitment if they piggybacked one on the
@@ -2120,6 +2151,7 @@ async fn handle_sync_response(
         resp.commitment.as_ref(),
         p2p_node,
         last_commitment_by_peer,
+        ever_capable_peers,
         sig_verify_attempts,
     )
     .await;
@@ -2343,6 +2375,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         is_bootstrapping,
         bootstrap_complete_notify,
         last_commitment_by_peer,
+        ever_capable_peers,
         recent_provers,
     } = ctx;
 
@@ -2489,39 +2522,56 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // them without awaiting. The predicate downgrades a Present
         // claim to Unresolved unless the peer is credited for that key.
         // Snapshot per-peer commitment data. We need two views:
-        //   - `commitment_by_peer_snapshot`: peers that have gossiped a
-        //     v12 commitment (used to look up their current hash).
-        //   - `capable_peer_snapshot`: peers we've ever seen gossip a
-        //     v12 commitment (sticky `commitment_capable` flag from
-        //     §3). Legacy / pre-v12 peers that have never sent a
-        //     commitment must NOT be downgraded — they answer Present
-        //     via the legacy gossip path, and gating their evidence on
-        //     a holder credit we can never collect would break
-        //     verification liveness across a mixed-version fleet.
-        let (commitment_by_peer_snapshot, capable_peer_snapshot): (
-            HashMap<PeerId, [u8; 32]>,
-            HashSet<PeerId>,
-        ) = {
+        //   - `commitment_by_peer_snapshot`: peers that currently have
+        //     a verified commitment record on file (used to look up
+        //     their current hash).
+        //   - `capable_peer_snapshot`: the sticky "ever v12-capable"
+        //     set. Sourced from a separate set rather than the
+        //     commitment map so eviction (PeerRemoved cleanup, sybil
+        //     cap at `MAX_LAST_COMMITMENT_BY_PEER`) does NOT downgrade
+        //     a previously-v12 peer to "legacy" credit-unconditionally.
+        //     Legacy / pre-v12 peers that have never sent a commitment
+        //     remain absent from the set and are credited via the
+        //     legacy path so mixed-version networks stay live.
+        let commitment_by_peer_snapshot: HashMap<PeerId, [u8; 32]> = {
             let map = last_commitment_by_peer.read().await;
-            let mut commitments = HashMap::new();
-            let mut capable = HashSet::new();
-            for (p, rec) in map.iter() {
-                if rec.commitment_capable {
-                    capable.insert(*p);
-                }
-                if let Some(c) = rec.last_commitment.as_ref() {
-                    if let Some(h) = crate::replication::commitment::commitment_hash(c) {
-                        commitments.insert(*p, h);
-                    }
-                }
-            }
-            (commitments, capable)
+            map.iter()
+                .filter_map(|(p, rec)| {
+                    rec.last_commitment.as_ref().and_then(|c| {
+                        crate::replication::commitment::commitment_hash(c).map(|h| (*p, h))
+                    })
+                })
+                .collect()
         };
+        let capable_peer_snapshot: HashSet<PeerId> = ever_capable_peers.read().await.clone();
         // Take a full snapshot of recent_provers under the read lock,
         // then release. The cache is bounded (16/key × keys), so the
         // clone is cheap.
         let provers_snapshot = recent_provers.read().await.clone();
+        // For the replica-fetch path, we need to know whether THIS
+        // node already holds the key being verified. The v12 §6
+        // holder-credit gate is meant to prevent uncredited Present
+        // claims from contributing to paid-list / reward quorum for
+        // keys we DO hold (and could audit ourselves). For keys we
+        // are trying to FETCH (i.e. not in local storage), there is
+        // no possible local audit credit, and gating the presence
+        // quorum on credit would deadlock replica-repair in a
+        // fully v12-capable close group.
+        let mut locally_held: HashSet<XorName> = HashSet::new();
+        for key in &keys_needing_network {
+            if storage.exists(key).unwrap_or(false) {
+                locally_held.insert(*key);
+            }
+        }
         let holder_credit = |peer: &PeerId, key: &XorName| -> bool {
+            if !locally_held.contains(key) {
+                // Replica-fetch path: we don't hold this key, so we
+                // cannot have collected audit credit for it. Trust
+                // Present claims to drive fetch-source promotion;
+                // chunk-PUT payment_verifier is the security backstop
+                // when the bytes actually arrive.
+                return true;
+            }
             if !capable_peer_snapshot.contains(peer) {
                 // Pre-v12 / legacy peer that has never gossiped a
                 // commitment. The v12 §6 holder-eligibility check
@@ -3056,6 +3106,7 @@ async fn ingest_peer_commitment(
     commitment: Option<&StorageCommitment>,
     p2p_node: &Arc<P2PNode>,
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
 ) -> bool {
     let Some(c) = commitment else {
@@ -3066,17 +3117,23 @@ async fn ingest_peer_commitment(
         // if we evict the cached commitment (TTL, sybil cap), we
         // remember the peer has spoken v12 — holder-eligibility (§6)
         // then refuses credit, preventing the downgrade.
-        if last_commitment_by_peer
-            .read()
-            .await
-            .get(source)
-            .is_some_and(|r| r.commitment_capable)
-        {
-            warn!(
-                "ingest_peer_commitment: commitment-capable peer {source} sent None commitment \
-                 (downgrade attempt; sticky capable flag will prevent credit until next valid \
-                 commitment arrives)"
-            );
+        let mut map = last_commitment_by_peer.write().await;
+        if let Some(rec) = map.get_mut(source) {
+            if rec.commitment_capable && rec.last_commitment.is_some() {
+                warn!(
+                    "ingest_peer_commitment: commitment-capable peer {source} sent None \
+                     commitment (downgrade attempt; clearing cached commitment so the §6 \
+                     holder-credit closure withholds credit until the next valid commitment \
+                     arrives)"
+                );
+                // Clear the stale bytes immediately. Without this, the
+                // §6 closure would keep crediting `recent_provers`
+                // entries bound to the old hash until either the
+                // proof TTL (40 min) or some future audit invalidates
+                // them — letting a peer enjoy holder credit while
+                // actively downgrading.
+                rec.last_commitment = None;
+            }
         }
         return false;
     };
@@ -3202,6 +3259,12 @@ async fn ingest_peer_commitment(
             r.commitment_capable = true; // sticky-redundant but explicit
         })
         .or_insert_with(|| PeerCommitmentRecord::from_verified(c.clone(), now));
+    // Record the sticky "ever v12-capable" bit in a set independent of
+    // `last_commitment_by_peer` (whose entries can be evicted by
+    // `PeerRemoved` and the sybil cap). This is what the §6
+    // holder-eligibility closure consults to decide whether to apply
+    // the v12 credit check or fall back to legacy-unconditional credit.
+    ever_capable_peers.write().await.insert(*source);
     true
 }
 

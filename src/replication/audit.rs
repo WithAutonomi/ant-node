@@ -753,32 +753,30 @@ async fn verify_commitment_bound(
 
     // Per-key gates streamed one chunk at a time. Avoids the
     // sqrt(n)*MAX_CHUNK_SIZE worst case of preloading every challenged
-    // chunk (~4 GiB at 1M stored chunks) — codex round-5 BLOCKER #2.
+    // chunk (~4 GiB at 1M stored chunks).
+    //
+    // Verified keys are collected for holder-credit attribution at the
+    // end of the loop. A key that disappears locally between sampling
+    // and verification is skipped without penalising the responder
+    // (matches the legacy `verify_digests` `continue` semantics; the
+    // responder is not at fault for the auditor's storage churn).
+    let mut verified_keys: Vec<XorName> = Vec::with_capacity(response_per_key.len());
     for (i, result) in response_per_key.iter().enumerate() {
         let local_bytes = match storage.get_raw(&result.key).await {
             Ok(Some(b)) => b,
             Ok(None) => {
-                // The auditor's own local copy of this key vanished
-                // between sampling (`storage.all_keys()` in the tick
-                // setup) and response verification (pruning, expiration,
-                // LMDB compaction can race here). The responder isn't
-                // at fault — we can't recompute the expected bytes
-                // hash without our own copy. Treat as benign, matching
-                // the legacy `verify_digests` `continue` semantics
-                // rather than penalising the responder for the
-                // auditor's storage churn.
                 debug!(
                     "Audit: local key {} disappeared between sampling and verification; skipping",
                     hex::encode(result.key)
                 );
-                return AuditTickResult::Idle;
+                continue;
             }
             Err(e) => {
                 warn!(
                     "Audit: failed to read local key {}: {e}",
                     hex::encode(result.key)
                 );
-                return AuditTickResult::Idle;
+                continue;
             }
         };
 
@@ -806,26 +804,38 @@ async fn verify_commitment_bound(
             )
             .await;
         }
+        verified_keys.push(result.key);
+    }
+
+    if verified_keys.is_empty() {
+        // Every challenged key was locally unavailable. We have no
+        // evidence either way — return Idle without trust events.
+        debug!(
+            "Audit: peer {challenged_peer} commitment-bound audit had no locally-verifiable keys"
+        );
+        return AuditTickResult::Idle;
     }
 
     info!(
-        "Audit: peer {challenged_peer} passed commitment-bound audit ({} keys, pin={})",
+        "Audit: peer {challenged_peer} passed commitment-bound audit ({}/{} keys verified, pin={})",
+        verified_keys.len(),
         keys.len(),
         hex::encode(pin),
     );
-    // Credit the peer as a holder for each verified key under
-    // this exact commitment hash. Downstream (quorum, paid lists)
-    // can read `recent_provers.is_credited_holder(...)`.
+    // Credit the peer as a holder for each VERIFIED key under this
+    // exact commitment hash (skipped keys are not credited — we never
+    // confirmed them). Downstream (quorum, paid lists) can read
+    // `recent_provers.is_credited_holder(...)`.
     if let Some(ctx) = commitment_ctx {
         let now = std::time::Instant::now();
         let mut guard = ctx.recent_provers.write().await;
-        for key in keys {
+        for key in &verified_keys {
             guard.record_proof(*key, *challenged_peer, *pin, now);
         }
     }
     AuditTickResult::Passed {
         challenged_peer: *challenged_peer,
-        keys_checked: keys.len(),
+        keys_checked: verified_keys.len(),
     }
 }
 

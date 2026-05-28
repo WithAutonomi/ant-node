@@ -252,7 +252,7 @@ impl MerkleTree {
             return Err(CommitmentError::TooManyKeys(entries.len()));
         }
 
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|a| a.0);
         for w in entries.windows(2) {
             if w[0].0 == w[1].0 {
                 return Err(CommitmentError::DuplicateKey(w[0].0));
@@ -578,8 +578,8 @@ mod tests {
         let mut b = vec![(xn(2), bh(2)), (xn(3), bh(3)), (xn(1), bh(1))];
         let tree_a = MerkleTree::build(a.clone()).unwrap();
         let tree_b = MerkleTree::build(b.clone()).unwrap();
-        a.sort_by(|x, y| x.0.cmp(&y.0));
-        b.sort_by(|x, y| x.0.cmp(&y.0));
+        a.sort_by_key(|x| x.0);
+        b.sort_by_key(|x| x.0);
         assert_eq!(tree_a.root(), tree_b.root());
     }
 
