@@ -783,6 +783,7 @@ async fn verify_commitment_bound(
     // (matches the legacy `verify_digests` `continue` semantics; the
     // responder is not at fault for the auditor's storage churn).
     let mut verified_keys: Vec<XorName> = Vec::with_capacity(response_per_key.len());
+    let mut failed_keys: Vec<XorName> = Vec::new();
     for (i, result) in response_per_key.iter().enumerate() {
         let local_bytes = match storage.get_raw(&result.key).await {
             Ok(Some(b)) => b,
@@ -815,18 +816,28 @@ async fn verify_commitment_bound(
                  (pin={})",
                 hex::encode(pin),
             );
-            // local_bytes drops here, bounding peak memory at one chunk.
-            return handle_audit_failure(
-                challenged_peer,
-                challenge_id,
-                keys,
-                AuditFailureReason::DigestMismatch,
-                p2p_node,
-                config,
-            )
-            .await;
+            // Track only the failing key. Match the legacy
+            // `verify_digests` semantics: continue verifying other keys
+            // and penalise only the ones that actually failed, rather
+            // than escalating a single per-key failure to the whole
+            // challenge batch. `local_bytes` drops here, bounding peak
+            // memory at one chunk.
+            failed_keys.push(result.key);
+            continue;
         }
         verified_keys.push(result.key);
+    }
+
+    if !failed_keys.is_empty() {
+        return handle_audit_failure(
+            challenged_peer,
+            challenge_id,
+            &failed_keys,
+            AuditFailureReason::DigestMismatch,
+            p2p_node,
+            config,
+        )
+        .await;
     }
 
     if verified_keys.is_empty() {

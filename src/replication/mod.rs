@@ -3359,6 +3359,30 @@ async fn rebuild_and_rotate_commitment(
     // the actual bytes), so a lying responder is still caught.
     let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
 
+    // No-op-rotation guard: compute just the Merkle root from `entries`
+    // and compare against the currently-advertised commitment's root.
+    // If they match, the key set is unchanged and a new rotation would
+    // only swap a randomized ML-DSA signature for a fresh one — same
+    // content, different commitment_hash. That invalidates every
+    // outstanding `recent_provers` credit on this node across the
+    // close group with no security benefit, breaking steady-state
+    // quorum liveness on large nodes that can't re-audit every key
+    // every rotation interval. Skip the rotation entirely when the
+    // tree is unchanged.
+    let candidate_tree =
+        commitment::MerkleTree::build(entries.iter().map(|(k, bh)| (*k, *bh)).collect::<Vec<_>>())
+            .map_err(|e| Error::Crypto(format!("commitment tree build: {e}")))?;
+    let candidate_root = candidate_tree.root();
+    if let Some(current) = state.current() {
+        if current.commitment().root == candidate_root {
+            debug!(
+                "Commitment rotation: key set unchanged (root={}); skipping no-op re-sign",
+                hex::encode(candidate_root)
+            );
+            return Ok(());
+        }
+    }
+
     let sk_bytes = identity.secret_key_bytes().to_vec();
     let sk = MlDsaSecretKey::from_bytes(MlDsaVariant::MlDsa65, &sk_bytes)
         .map_err(|e| Error::Crypto(format!("commitment build: load sk: {e}")))?;
