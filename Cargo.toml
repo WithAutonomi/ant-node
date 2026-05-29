@@ -143,6 +143,13 @@ name = "poc_commitment_audit_attacks"
 path = "tests/poc_commitment_audit_attacks.rs"
 required-features = ["test-utils"]
 
+# Live responder-handler tests for the v12 audit. Use
+# LmdbStorageConfig::test_default(), gated on test-utils.
+[[test]]
+name = "poc_audit_handler_live"
+path = "tests/poc_audit_handler_live.rs"
+required-features = ["test-utils"]
+
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.
