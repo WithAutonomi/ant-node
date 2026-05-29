@@ -5,13 +5,14 @@
 
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
-use crate::logging::{debug, info};
+use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::pricing::derive_records_stored_from_price;
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
 use crate::payment::single_node::SingleNodePayment;
+use crate::storage::lmdb::LmdbStorage;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::Amount;
 use evmlib::contract::payment_vault;
@@ -25,7 +26,6 @@ use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Minimum allowed size for a payment proof in bytes.
@@ -139,10 +139,19 @@ pub struct PaymentVerifier {
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
     /// merkle verification; production startup MUST call [`attach_p2p_node`].
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
-    /// Current number of records stored by this node. Updated by the node as it
-    /// stores new data. Used for storage-delta freshness checks on incoming
-    /// quotes, replacing the wall-clock dependency.
-    records_stored: AtomicU64,
+    /// LMDB storage handle, attached post-construction so the storage-delta
+    /// freshness check can read the authoritative on-disk record count without
+    /// depending on a side counter that may drift from replication/repair/prune
+    /// paths. `None` in unit tests that pre-set [`Self::test_records_override`];
+    /// production startup MUST call [`attach_storage`].
+    storage: RwLock<Option<Arc<LmdbStorage>>>,
+    /// Test-only override for the storage-delta freshness check.
+    ///
+    /// When `Some(n)`, `validate_quote_freshness` uses `n` as the current
+    /// record count instead of querying `storage.current_chunks()`. Set via
+    /// [`Self::set_records_stored_for_tests`] so unit tests that don't wire a
+    /// real `LmdbStorage` can still drive the freshness logic.
+    test_records_override: RwLock<Option<u64>>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -259,7 +268,8 @@ impl PaymentVerifier {
             closeness_pass_cache,
             inflight_closeness,
             p2p_node: RwLock::new(None),
-            records_stored: AtomicU64::new(0),
+            storage: RwLock::new(None),
+            test_records_override: RwLock::new(None),
             config,
         }
     }
@@ -277,14 +287,48 @@ impl PaymentVerifier {
         debug!("PaymentVerifier: P2PNode attached for merkle closeness checks");
     }
 
-    /// Update the current number of records stored by this node.
+    /// Attach the node's [`LmdbStorage`] handle so storage-delta freshness
+    /// checks can query the authoritative on-disk record count.
     ///
-    /// Called by the node whenever a new record is stored. The value is used
-    /// for storage-delta freshness checks on incoming quotes, removing the
-    /// wall-clock dependency for quote validation.
-    pub fn set_records_stored(&self, count: u64) {
-        self.records_stored.store(count, Ordering::Relaxed);
-        debug!("PaymentVerifier: records_stored updated to {count}");
+    /// Production startup MUST call this once the storage exists; otherwise
+    /// `validate_quote_freshness` falls back to treating the current count as
+    /// zero, which will reject all non-trivial quotes. Idempotent: calling
+    /// twice replaces the handle.
+    pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
+        *self.storage.write() = Some(storage);
+        debug!("PaymentVerifier: LmdbStorage attached for storage-delta freshness checks");
+    }
+
+    /// Test-only setter for the current record count used by storage-delta
+    /// freshness checks. Lets unit tests drive the freshness logic without
+    /// wiring a real `LmdbStorage`. Has no effect in production code because
+    /// production code is expected to call [`Self::attach_storage`] instead.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_records_stored_for_tests(&self, count: u64) {
+        *self.test_records_override.write() = Some(count);
+    }
+
+    /// Snapshot the current record count for freshness comparisons.
+    ///
+    /// Prefers the attached `LmdbStorage` (authoritative — covers client PUTs,
+    /// replication stores, repair fetches, and prune deletes by definition).
+    /// Falls back to a test override if one was set. Returns `None` only when
+    /// no source is available (mis-configured production startup); the caller
+    /// treats that as "unknown" and skips storage-delta gating rather than
+    /// rejecting all quotes outright.
+    fn current_records_stored(&self) -> Option<u64> {
+        if let Some(storage) = self.storage.read().as_ref() {
+            match storage.current_chunks() {
+                Ok(n) => return Some(n),
+                Err(e) => {
+                    warn!(
+                        "PaymentVerifier: failed to read current_chunks() for freshness check: {e}"
+                    );
+                    return None;
+                }
+            }
+        }
+        *self.test_records_override.read()
     }
 
     /// Check if payment is required for the given `XorName`.
@@ -571,8 +615,23 @@ impl PaymentVerifier {
     /// pricing formula. Comparing that inferred count to this node's current
     /// record count removes the platform clock dependency that caused Windows/UTC
     /// false rejections. Quote timestamps are deliberately not used here.
+    ///
+    /// The verifier reads the current record count from the attached
+    /// [`LmdbStorage`] via `current_chunks()` — that's an O(1) B-tree page-
+    /// header read and is the authoritative count regardless of which path
+    /// stored the record (client PUT, replication store, repair fetch) or
+    /// removed it (prune delete). If no storage source is available (mis-
+    /// configured production startup, or a unit test that didn't set a test
+    /// override), the storage-delta gate is skipped entirely rather than
+    /// rejecting every quote — see [`Self::current_records_stored`].
     fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
-        let current_records = self.records_stored.load(Ordering::Relaxed);
+        let Some(current_records) = self.current_records_stored() else {
+            debug!(
+                "PaymentVerifier: no record-count source attached; skipping \
+                 storage-delta freshness check"
+            );
+            return Ok(());
+        };
 
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             let quoted_records = derive_records_stored_from_price(quote.price);
@@ -1705,7 +1764,7 @@ mod tests {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        verifier.set_records_stored(105);
+        verifier.set_records_stored_for_tests(105);
         let xorname = [0xE0u8; 32];
         let quote = make_fake_quote_at_records(
             xorname,
@@ -1727,7 +1786,7 @@ mod tests {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        verifier.set_records_stored(107);
+        verifier.set_records_stored_for_tests(107);
         let xorname = [0xE1u8; 32];
         let quote = make_fake_quote_at_records(
             xorname,

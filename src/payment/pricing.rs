@@ -51,6 +51,12 @@ const PRICE_PER_RECORD_SQUARED_WEI: u128 = PRICE_COEFFICIENT_WEI / DIVISOR_SQUAR
 /// freshness without relying on wall-clock timestamps. It intentionally floors
 /// to the nearest integer record count, matching the existing storage-delta
 /// tolerance behaviour.
+///
+/// Saturates to `u64::MAX` for any price that would otherwise overflow `u64`.
+/// This matters because the verifier calls this on untrusted deserialized
+/// `quote.price` values BEFORE signature verification: a panic here is a
+/// pre-auth crash vector. Saturating leaves the delta check to reject the
+/// quote as out-of-range without aborting the process.
 #[must_use]
 pub fn derive_records_stored_from_price(price: Amount) -> u64 {
     let baseline = Amount::from(PRICE_BASELINE_WEI);
@@ -60,7 +66,17 @@ pub fn derive_records_stored_from_price(price: Amount) -> u64 {
 
     let excess = price - baseline;
     let n_squared = excess / Amount::from(PRICE_PER_RECORD_SQUARED_WEI);
-    n_squared.root(2).to::<u64>()
+    let root = n_squared.root(2);
+    // ruint's `Uint::to::<u64>()` panics on overflow. We MUST NOT panic here:
+    // freshness runs on untrusted deserialized `quote.price` before signature
+    // verification, so a hostile oversized price would otherwise be a pre-auth
+    // crash vector. Saturate to `u64::MAX` instead; the delta check rejects
+    // out-of-range quotes.
+    if root > Amount::from(u64::MAX) {
+        u64::MAX
+    } else {
+        root.to::<u64>()
+    }
 }
 
 /// Calculate storage price in wei from the number of close records stored.
@@ -223,5 +239,15 @@ mod tests {
             derive_records_stored_from_price(Amount::from(PRICE_BASELINE_WEI)),
             0
         );
+    }
+
+    #[test]
+    fn test_derive_records_stored_from_max_price_saturates_no_panic() {
+        // Hostile/malformed quotes may carry an oversized U256 price.
+        // The verifier calls this BEFORE signature verification, so we MUST
+        // NOT panic on overflow — saturate to u64::MAX and let the delta
+        // check reject the quote.
+        let v = derive_records_stored_from_price(Amount::MAX);
+        assert_eq!(v, u64::MAX);
     }
 }

@@ -563,9 +563,16 @@ impl Devnet {
         crate::payment::wire_ml_dsa_signer(&mut quote_generator, identity)
             .map_err(|e| DevnetError::Startup(format!("Failed to wire ML-DSA-65 signer: {e}")))?;
 
+        let storage = Arc::new(storage);
+        let payment_verifier = Arc::new(payment_verifier);
+
+        // Attach storage so storage-delta freshness checks query the
+        // authoritative on-disk count.
+        payment_verifier.attach_storage(Arc::clone(&storage));
+
         Ok(AntProtocol::new(
-            Arc::new(storage),
-            Arc::new(payment_verifier),
+            storage,
+            payment_verifier,
             Arc::new(quote_generator),
         ))
     }
