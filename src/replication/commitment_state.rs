@@ -363,6 +363,15 @@ pub enum CommitmentBoundOutcome {
 /// # Errors / outcome
 ///
 /// See [`CommitmentBoundOutcome`].
+///
+/// Test-only one-shot convenience. Production uses the streaming pair
+/// [`precheck_commitment_bound_challenge`] +
+/// [`build_commitment_bound_result_for_key`] to bound peak memory at one
+/// chunk; this builder preloads every challenged chunk into a `Vec` and
+/// exists only so tests can assert on a fully-built response in one call.
+/// Gated out of production builds so no live caller can take the
+/// preload path.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn build_commitment_bound_audit_response(
     state: &ResponderCommitmentState,
     expected_commitment_hash: &[u8; 32],

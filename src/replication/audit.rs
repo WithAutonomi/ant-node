@@ -248,12 +248,13 @@ pub async fn audit_tick_with_repair_proofs(
             .cloned(),
         None => None,
     };
-    let (expected_commitment_hash, pinned_commitment) =
-        peer_record.as_ref().map_or((None, None), |r| {
-            r.last_commitment
-                .as_ref()
-                .map_or((None, None), |c| (commitment_hash(c), Some(c.clone())))
-        });
+    // Only the pin (hash) is needed to issue the challenge; the
+    // responder answers against its own retained commitment, so we
+    // never need to clone the full StorageCommitment here.
+    let expected_commitment_hash = peer_record
+        .as_ref()
+        .and_then(|r| r.last_commitment.as_ref())
+        .and_then(commitment_hash);
 
     // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
     // commitment we MUST NOT fall back to legacy plain-digest audits
@@ -553,7 +554,6 @@ pub async fn audit_tick_with_repair_proofs(
                 &nonce,
                 &peer_keys,
                 expected_commitment_hash.as_ref(),
-                pinned_commitment.as_ref(),
                 &commitment,
                 &per_key,
                 storage,
@@ -716,7 +716,6 @@ async fn verify_commitment_bound(
     nonce: &[u8; 32],
     keys: &[XorName],
     expected_commitment_hash: Option<&[u8; 32]>,
-    pinned_commitment: Option<&StorageCommitment>,
     response_commitment: &StorageCommitment,
     response_per_key: &[CommitmentBoundResult],
     storage: &Arc<LmdbStorage>,
@@ -742,13 +741,6 @@ async fn verify_commitment_bound(
         )
         .await;
     };
-    // `pinned_commitment` itself is not used here — the pin (hash) is
-    // sufficient because `verify_commitment_bound_response` re-hashes
-    // the response's commitment and compares to the pin. Keeping the
-    // parameter at the call site documents the contract and lets future
-    // optimizations (e.g. cache by-pin local-bytes lookup) use it
-    // without re-plumbing.
-    let _ = pinned_commitment;
 
     // Metadata gates (structural / peer-id / pin / sig). One-shot, cheap.
     if let Err(e) = verify_commitment_bound_metadata(
@@ -1062,7 +1054,16 @@ pub async fn handle_audit_challenge_with_commitment(
                     reason: format!("key not in commitment: {}", hex::encode(key)),
                 };
             }
-            Err(_) => unreachable!("precheck only returns those two outcomes"),
+            Err(_) => {
+                // precheck only returns UnknownCommitmentHash /
+                // KeyNotInCommitment today. Reject gracefully rather
+                // than panic if a future variant is added — the
+                // project bans panics on production paths.
+                return AuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    reason: "unrecognized commitment precheck outcome".to_string(),
+                };
+            }
         };
 
         // Stream per-key: read one chunk, build its proof entry, drop

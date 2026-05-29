@@ -254,8 +254,10 @@ impl MerkleTree {
 
         entries.sort_by_key(|a| a.0);
         for w in entries.windows(2) {
-            if w[0].0 == w[1].0 {
-                return Err(CommitmentError::DuplicateKey(w[0].0));
+            if let [a, b] = w {
+                if a.0 == b.0 {
+                    return Err(CommitmentError::DuplicateKey(a.0));
+                }
             }
         }
 

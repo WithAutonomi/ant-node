@@ -134,9 +134,12 @@ const AUDIT_HONEST_READ_BPS: u64 = 50 * 1024 * 1024;
 ///
 /// Set so an honest peer that's slower than `HONEST_READ_BPS` (e.g. an
 /// HDD-backed node, or one under load) still answers within the
-/// timeout. 5× is generous; a relay peer fetching the same data
-/// over the network sees roughly 10-100× higher latency than disk,
-/// so even at 5× the relay falls outside the envelope.
+/// timeout. 5× is generous; a relay peer fetching the same data over a
+/// residential link (~5-12 MB/s) sees ~10-100× higher latency than disk
+/// and misses the budget. This is an economic deterrent calibrated for
+/// residential bandwidth, NOT a hard cryptographic bound — a relay on a
+/// datacenter cross-connect could still fetch fast enough to answer in
+/// time (see the §7 note on `audit_response_timeout`).
 const AUDIT_RESPONSE_HONEST_MULTIPLIER: u64 = 5;
 
 /// Single-key prune audit response deadline.
@@ -415,16 +418,20 @@ impl ReplicationConfig {
     /// conservatively at 50 MB/s — well below modern SSDs); the
     /// multiplier of 5 absorbs jitter, BLAKE3, ML-DSA, and slow disks.
     ///
-    /// A relay attacker who must fetch the same `k × 4 MiB` over the
-    /// network sees roughly 10-100× higher latency than disk for the
-    /// data alone, plus per-chunk network round-trips. Even at the 5×
-    /// honest multiplier, the relay falls outside the envelope and
-    /// the audit times out — which fires an `application_failure`
-    /// trust event (per `handle_audit_timeout` → `handle_audit_failure`).
+    /// A relay attacker on a residential link (~5-12 MB/s) who must
+    /// fetch the same `k × 4 MiB` over the network sees ~10-100× higher
+    /// latency than disk for the data alone, plus per-chunk round-trips,
+    /// and misses the budget — firing an `application_failure` trust
+    /// event (per `handle_audit_timeout` → `handle_audit_failure`).
     ///
-    /// This is the v12.0 closure of the otherwise-documented §7 relay
-    /// limit: relay still passes audits cryptographically, but no
-    /// longer passes them inside the time budget.
+    /// This is an economic deterrent for the §7 relay limit calibrated
+    /// for residential bandwidth, NOT a hard bound: a relay on a
+    /// datacenter cross-connect (≥1 Gbps) can fetch `k × 4 MiB` fast
+    /// enough to answer in time. It raises the relay's cost (bandwidth
+    /// per audit) without claiming to make relaying impossible. The
+    /// cryptographic guarantee remains commitment-binding (the relay
+    /// must still hold or fetch the exact committed bytes); the timeout
+    /// only attacks the economics.
     #[must_use]
     pub fn audit_response_timeout(&self, challenged_key_count: usize) -> Duration {
         let bytes_per_key = u64::try_from(crate::ant_protocol::MAX_CHUNK_SIZE).unwrap_or(u64::MAX);

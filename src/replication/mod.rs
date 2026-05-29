@@ -120,15 +120,16 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 /// How often the responder rebuilds + rotates its storage commitment.
 ///
 /// Each rebuild scans LMDB to compute leaf hashes; for ~10k keys this is
-/// sub-100ms (BLAKE3 + tree build). The two-slot retention (current +
-/// previous) means a rotation is also when a pinned audit may need the
-/// previous commitment, so don't rotate so often that we drop a
-/// commitment a peer might still pin to.
+/// sub-100ms (BLAKE3 + tree build). The four-slot retention
+/// (`RETAINED_COMMITMENT_SLOTS = 4`: current + 3 previous) means a
+/// rotation is also when a pinned audit may need an older commitment,
+/// so don't rotate so often that we drop a commitment a peer might
+/// still pin to.
 ///
 /// Default: 1 hour, aligned with the worst-case neighbor-sync cooldown
-/// (`NEIGHBOR_SYNC_COOLDOWN_SECS = 3600`) so that with the two-slot
-/// retention (current + previous), any commitment we gossiped is still
-/// answerable for up to ~2 hours after rotation. That covers the gap
+/// (`NEIGHBOR_SYNC_COOLDOWN_SECS = 3600`) so that with the four-slot
+/// retention, any commitment we gossiped is still answerable for up to
+/// ~4 hours after rotation. That covers the gap
 /// between our rotation and the next gossip arrival at a remote peer,
 /// preventing the "unknown commitment hash" -> Idle audit-skip pattern
 /// from being the common case (codex round-10 MAJOR #1).

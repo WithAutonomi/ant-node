@@ -160,6 +160,13 @@ pub enum AuditVerifyError {
 /// See [`AuditVerifyError`]. Any error means the audit failed and the
 /// caller should apply the standard `AUDIT_FAILURE_TRUST_WEIGHT × keys`
 /// penalty.
+///
+/// Test-only one-shot verifier. Production uses the streaming split
+/// [`verify_commitment_bound_metadata`] + [`verify_commitment_bound_per_key`]
+/// to verify one chunk at a time; this whole-response variant exists only
+/// for tests that build a full response and assert on the verdict. Gated
+/// out of production builds.
+#[cfg(any(test, feature = "test-utils"))]
 #[allow(clippy::too_many_arguments)]
 pub fn verify_commitment_bound_response(
     challenge_keys: &[XorName],
