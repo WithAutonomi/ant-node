@@ -3126,27 +3126,29 @@ async fn ingest_peer_commitment(
         // Commitment-downgrade signal: a peer that previously gossiped
         // a commitment but now gossips None looks like a downgrade
         // attempt to drop back onto the weaker legacy audit path.
-        // §2 step 5 mitigation: `commitment_capable` is sticky, so even
-        // if we evict the cached commitment (TTL, sybil cap), we
-        // remember the peer has spoken v12 — holder-eligibility (§6)
-        // then refuses credit, preventing the downgrade.
-        let mut map = last_commitment_by_peer.write().await;
-        if let Some(rec) = map.get_mut(source) {
-            if rec.commitment_capable && rec.last_commitment.is_some() {
-                warn!(
-                    "ingest_peer_commitment: commitment-capable peer {source} sent None \
-                     commitment (downgrade attempt; clearing cached commitment so the §6 \
-                     holder-credit closure withholds credit until the next valid commitment \
-                     arrives)"
-                );
-                // Clear the stale bytes immediately. Without this, the
-                // §6 closure would keep crediting `recent_provers`
-                // entries bound to the old hash until either the
-                // proof TTL (40 min) or some future audit invalidates
-                // them — letting a peer enjoy holder credit while
-                // actively downgrading.
-                rec.last_commitment = None;
-            }
+        //
+        // We do NOT clear the cached `last_commitment` here. Clearing it
+        // would make the §3 audit shield (`is_capable && !has_current_
+        // commitment`) fire and skip the peer entirely — turning a
+        // downgrade into an audit evasion. Instead we keep the last
+        // commitment pinned so the next audit tick still challenges the
+        // peer under it: if they have genuinely dropped the data, the
+        // audit fails and the §5 `UnknownCommitmentHash` path invalidates
+        // their `recent_provers` credit. The sticky `commitment_capable`
+        // flag (and `ever_capable_peers`) keep them on the v12 path; the
+        // existing audit→§5 loop is the single mechanism that revokes
+        // credit, so we don't add a second one here.
+        if last_commitment_by_peer
+            .read()
+            .await
+            .get(source)
+            .is_some_and(|rec| rec.commitment_capable && rec.last_commitment.is_some())
+        {
+            warn!(
+                "ingest_peer_commitment: commitment-capable peer {source} sent None \
+                 commitment (downgrade attempt; keeping last commitment pinned so the \
+                 next audit re-challenges under it)"
+            );
         }
         return false;
     };

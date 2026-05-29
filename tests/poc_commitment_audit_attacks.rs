@@ -1046,11 +1046,14 @@ fn commitment_capable_flag_is_sticky_across_eviction() {
     assert!(rec.commitment_capable);
     assert!(rec.last_commitment.is_some());
 
-    // Simulate TTL eviction / restart: drop the commitment but keep
-    // the record (this is what the engine should do — we don't have
-    // a public API yet, so we mutate directly).
+    // Simulate TTL eviction / restart dropping the cached commitment.
+    // NOTE: on a `commitment: None` gossip the engine deliberately does
+    // NOT clear `last_commitment` (that would let a capable peer evade
+    // audit via the §3 shield); this manual mutation models genuine
+    // TTL/restart loss, not the downgrade path.
     rec.last_commitment = None;
-    // Sticky: capable flag stays true.
+    // Sticky: capable flag stays true regardless of how the cached
+    // commitment was lost.
     assert!(rec.commitment_capable);
 }
 
