@@ -3037,11 +3037,16 @@ async fn handle_audit_result(
                 // the §5 `forget_commitment` path only fires on an
                 // "unknown commitment hash" reply, but genuine byte loss
                 // surfaces as DigestMismatch / missing-bytes, which
-                // routed here. We do NOT revoke on `Timeout` — a single
-                // dropped packet must not strip an honest peer; the
-                // 40-min TTL is the deliberate liveness cushion there.
-                if !matches!(reason, AuditFailureReason::Timeout) {
-                    recent_provers.write().await.forget_peer(challenged_peer);
+                // routed here. The decision + revocation live in
+                // `apply_audit_failure_credit_revocation` so the wiring
+                // is unit-testable without a live P2PNode.
+                {
+                    let mut provers_guard = recent_provers.write().await;
+                    apply_audit_failure_credit_revocation(
+                        &mut provers_guard,
+                        challenged_peer,
+                        reason,
+                    );
                 }
                 p2p_node
                     .report_trust_event(
@@ -3098,6 +3103,34 @@ async fn handle_audit_result(
 
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
+}
+
+/// Whether a confirmed audit failure with this reason should revoke the
+/// peer's `recent_provers` holder credit immediately (v12 §6).
+///
+/// `true` for any reason where the peer actually answered (or admitted
+/// it cannot): `DigestMismatch`, `KeyAbsent`, `Rejected` ("missing
+/// bytes for committed key"), `MalformedResponse` — these prove the
+/// peer no longer holds what it committed to, so it must not keep
+/// holder credit for the proof TTL. `false` for `Timeout`: a single
+/// dropped packet must not strip an honest peer; the 40-min TTL is the
+/// deliberate liveness cushion there.
+fn audit_failure_revokes_holder_credit(reason: &AuditFailureReason) -> bool {
+    !matches!(reason, AuditFailureReason::Timeout)
+}
+
+/// Apply the holder-credit revocation decision for a confirmed audit
+/// failure. Pure over `RecentProvers` so the handler wiring is unit-
+/// testable without a live `P2PNode`: the production `Failed` arm of
+/// `handle_audit_result` calls exactly this.
+fn apply_audit_failure_credit_revocation(
+    provers: &mut RecentProvers,
+    challenged_peer: &PeerId,
+    reason: &AuditFailureReason,
+) {
+    if audit_failure_revokes_holder_credit(reason) {
+        provers.forget_peer(challenged_peer);
+    }
 }
 
 // `admit_bootstrap_hints` was consolidated into `admit_and_queue_hints`.
@@ -3421,14 +3454,96 @@ async fn rebuild_and_rotate_commitment(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::audit_failure_clears_bootstrap_claim;
+    use super::{
+        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
+        audit_failure_revokes_holder_credit,
+    };
+    use crate::replication::recent_provers::RecentProvers;
     use crate::replication::types::AuditFailureReason;
+    use saorsa_core::identity::PeerId;
+    use std::time::Instant;
+
+    fn test_peer(b: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = b;
+        PeerId::from_bytes(bytes)
+    }
+
+    fn test_key(b: u8) -> crate::ant_protocol::XorName {
+        let mut k = [0u8; 32];
+        k[0] = b;
+        k
+    }
 
     #[test]
     fn audit_timeout_preserves_active_bootstrap_claim() {
         assert!(!audit_failure_clears_bootstrap_claim(
             &AuditFailureReason::Timeout
         ));
+    }
+
+    /// The exact decision the `Failed` arm of `handle_audit_result`
+    /// uses: confirmed failures revoke credit, `Timeout` does not.
+    #[test]
+    fn confirmed_failures_revoke_credit_timeout_does_not() {
+        for reason in [
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::KeyAbsent,
+            AuditFailureReason::Rejected,
+        ] {
+            assert!(
+                audit_failure_revokes_holder_credit(&reason),
+                "confirmed failure {reason:?} must revoke holder credit"
+            );
+        }
+        assert!(
+            !audit_failure_revokes_holder_credit(&AuditFailureReason::Timeout),
+            "Timeout must NOT revoke credit (single dropped packet != storage loss)"
+        );
+    }
+
+    /// Wiring test for the security fix: the helper the handler calls
+    /// actually strips a credited peer on a confirmed failure
+    /// (`DigestMismatch`), and actually RETAINS credit on `Timeout`.
+    /// Records genuine credit first so neither assertion is vacuous;
+    /// this fails if `forget_peer` stops being called, or if the
+    /// `Timeout` exclusion is dropped (both verified by mutation).
+    #[test]
+    fn apply_revocation_strips_on_digest_mismatch_retains_on_timeout() {
+        let peer = test_peer(0xAB);
+        let key = test_key(1);
+        let hash = [0xCD; 32];
+
+        // Confirmed failure -> credit revoked.
+        let mut provers = RecentProvers::new();
+        provers.record_proof(key, peer, hash, Instant::now());
+        assert!(
+            provers.is_credited_holder(&key, &peer, &hash),
+            "precondition: peer credited before failure"
+        );
+        apply_audit_failure_credit_revocation(
+            &mut provers,
+            &peer,
+            &AuditFailureReason::DigestMismatch,
+        );
+        assert!(
+            !provers.is_credited_holder(&key, &peer, &hash),
+            "DigestMismatch must strip the peer's holder credit"
+        );
+
+        // Timeout -> credit retained.
+        let mut provers_timeout = RecentProvers::new();
+        provers_timeout.record_proof(key, peer, hash, Instant::now());
+        apply_audit_failure_credit_revocation(
+            &mut provers_timeout,
+            &peer,
+            &AuditFailureReason::Timeout,
+        );
+        assert!(
+            provers_timeout.is_credited_holder(&key, &peer, &hash),
+            "Timeout must retain holder credit (deliberate liveness cushion)"
+        );
     }
 
     #[test]
