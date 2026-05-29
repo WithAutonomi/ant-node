@@ -757,7 +757,7 @@ impl ReplicationEngine {
                     )
                     .await
                 };
-                handle_audit_result(&result, &p2p, &sync_state, &config).await;
+                handle_audit_result(&result, &p2p, &sync_state, &recent_provers, &config).await;
             }
 
             // Then run periodically.
@@ -787,7 +787,7 @@ impl ReplicationEngine {
                             )
                             .await
                         };
-                        handle_audit_result(&result, &p2p, &sync_state, &config).await;
+                        handle_audit_result(&result, &p2p, &sync_state, &recent_provers, &config).await;
                     }
                 }
             }
@@ -2985,6 +2985,7 @@ async fn handle_audit_result(
     result: &AuditTickResult,
     p2p_node: &Arc<P2PNode>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
+    recent_provers: &Arc<RwLock<RecentProvers>>,
     config: &ReplicationConfig,
 ) {
     match result {
@@ -3025,6 +3026,22 @@ async fn handle_audit_result(
                     state.clear_active_bootstrap_claim(challenged_peer);
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
+                }
+                // Revoke holder credit on a CONFIRMED failure (the peer
+                // actually answered and the answer was bad / it admitted
+                // it can't answer): DigestMismatch, KeyAbsent, Rejected
+                // ("missing bytes for committed key"), MalformedResponse.
+                // These mean the peer no longer provably holds what it
+                // committed to, so it must not keep §6 holder credit for
+                // the proof TTL. This completes the storage-binding loop:
+                // the §5 `forget_commitment` path only fires on an
+                // "unknown commitment hash" reply, but genuine byte loss
+                // surfaces as DigestMismatch / missing-bytes, which
+                // routed here. We do NOT revoke on `Timeout` — a single
+                // dropped packet must not strip an honest peer; the
+                // 40-min TTL is the deliberate liveness cushion there.
+                if !matches!(reason, AuditFailureReason::Timeout) {
+                    recent_provers.write().await.forget_peer(challenged_peer);
                 }
                 p2p_node
                     .report_trust_event(

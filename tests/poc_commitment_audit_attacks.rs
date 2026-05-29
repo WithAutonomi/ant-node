@@ -423,13 +423,48 @@ fn audit_response_replay_blocked_by_fresh_nonce() {
 // phase 3. Here we prove the *cache-side* property: no commitment hash
 // ⇒ no credit.
 
-/// A peer with no recent commitment (never gossipped) cannot be
-/// credited as a holder via the recent_provers cache.
+/// A confirmed audit FAILURE revokes the peer's holder credit
+/// immediately, rather than letting it linger for the proof TTL.
+///
+/// This is the cache-side property the auditor's `Failed`-result
+/// handler relies on (`handle_audit_result` → `forget_peer` on any
+/// non-`Timeout` `AuditFailureReason`): a peer that dropped bytes and
+/// got caught (DigestMismatch / "missing bytes for committed key")
+/// loses §6 credit at once. Records a genuine credit, then applies the
+/// exact revocation the handler performs, and asserts credit is gone —
+/// the assertion flips if the revocation is removed (it is NOT a
+/// vacuous empty-cache check).
+#[test]
+fn confirmed_audit_failure_revokes_holder_credit() {
+    let mut cache = RecentProvers::new();
+    let now = Instant::now();
+    let p = peer_id(0xAB);
+    let h = [0xAB; 32];
+    // Peer earned credit for two keys under commitment hash h.
+    cache.record_proof(key(1), p, h, now);
+    cache.record_proof(key(2), p, h, now);
+    assert!(
+        cache.is_credited_holder(&key(1), &p, &h) && cache.is_credited_holder(&key(2), &p, &h),
+        "precondition: peer is credited before the failed audit"
+    );
+
+    // The auditor confirms an audit failure (DigestMismatch / missing
+    // bytes). `handle_audit_result` drops the peer's credit via
+    // `forget_peer`.
+    cache.forget_peer(&p);
+
+    assert!(
+        !cache.is_credited_holder(&key(1), &p, &h) && !cache.is_credited_holder(&key(2), &p, &h),
+        "a confirmed audit failure must strip the peer's holder credit immediately"
+    );
+}
+
+/// A peer with no recent commitment (never gossipped) is not credited.
+/// Baseline empty-cache property — kept distinct from the revocation
+/// test above so each asserts one thing.
 #[test]
 fn silent_peer_earns_no_credit() {
     let cache = RecentProvers::new();
-    // Even with a non-trivial key, peer, and hash, an empty cache
-    // means no credit.
     assert!(!cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0; 32]));
 }
 

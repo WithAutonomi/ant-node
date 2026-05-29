@@ -54,6 +54,8 @@ jobs:
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs
         run: cargo test --test poc_commitment_audit_attacks --features test-utils
+      - name: Run v12 live audit-handler tests
+        run: cargo test --test poc_audit_handler_live --features test-utils
 
   doc:
     name: Documentation
