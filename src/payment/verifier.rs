@@ -7,7 +7,7 @@ use crate::ant_protocol::CLOSE_GROUP_SIZE;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
-use crate::payment::pricing::derive_records_stored_from_price;
+use crate::payment::pricing::{calculate_price, derive_records_stored_from_price};
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
@@ -42,15 +42,25 @@ pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 /// 256 KB provides headroom while still capping memory during verification.
 pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
 
-/// Minimum absolute tolerance for the storage-delta freshness check.
-/// A quote is accepted if the difference between the quoted record count inferred from price
-/// and the node's current `records_stored` is at most this many records.
-const QUOTE_STORAGE_DELTA_MIN_TOLERANCE: u64 = 5;
-
-/// Percentage tolerance for the storage-delta freshness check.
-/// The effective tolerance is the larger of the percentage and
-/// [`QUOTE_STORAGE_DELTA_MIN_TOLERANCE`].
-const QUOTE_STORAGE_DELTA_PCT_TOLERANCE: u64 = 5;
+/// Maximum percentage by which a quote's paid price may fall *below* the node's
+/// current price before the quote is rejected as stale.
+///
+/// The freshness gate is one-directional and price-based, not a symmetric
+/// record-count delta:
+///
+/// - **Over-payment is always accepted.** If the client paid at least the
+///   node's current price (e.g. the node pruned records and is now cheaper),
+///   the quote is fine — a node has no reason to reject money.
+/// - **Only meaningful under-payment is rejected.** A quote priced below the
+///   current price by more than this percentage is rejected as stale.
+///
+/// Comparing prices instead of raw record counts makes the tolerance
+/// self-scaling against the quadratic pricing curve: at low/moderate fill the
+/// curve is nearly flat, so normal in-flight churn (the node storing a handful
+/// of replicated records between quoting and verifying) is a negligible price
+/// change and passes; at high fill the curve is steep, so the same percentage
+/// still catches genuinely stale, underpriced quotes.
+const QUOTE_PRICE_STALENESS_PCT_TOLERANCE: u64 = 25;
 
 /// Configuration for EVM payment verification.
 ///
@@ -609,43 +619,60 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// Verify quote freshness using storage-delta inferred from price, not wall-clock time.
+    /// Verify quote freshness by price staleness, not wall-clock time and not a
+    /// symmetric record-count delta.
     ///
     /// The quote price encodes the quoting node's record count via the quadratic
-    /// pricing formula. Comparing that inferred count to this node's current
-    /// record count removes the platform clock dependency that caused Windows/UTC
-    /// false rejections. Quote timestamps are deliberately not used here.
+    /// pricing formula. We compute the price the node would charge *now* for its
+    /// current fullness and reject the quote only if the client under-paid that
+    /// current price by more than [`QUOTE_PRICE_STALENESS_PCT_TOLERANCE`]. This:
     ///
-    /// The verifier reads the current record count from the attached
-    /// [`LmdbStorage`] via `current_chunks()` — that's an O(1) B-tree page-
-    /// header read and is the authoritative count regardless of which path
-    /// stored the record (client PUT, replication store, repair fetch) or
-    /// removed it (prune delete). If no storage source is available (mis-
-    /// configured production startup, or a unit test that didn't set a test
-    /// override), the storage-delta gate is skipped entirely rather than
+    /// - removes the platform clock dependency that caused Windows/UTC false
+    ///   rejections (timestamps are deliberately unused);
+    /// - never rejects an over-payment (the previous symmetric `abs_diff` check
+    ///   rejected quotes where the node had *fewer* records than when it quoted,
+    ///   i.e. the client paid for a fuller, pricier node — nonsensical to
+    ///   reject); and
+    /// - self-scales with the pricing curve, so benign in-flight churn (a node
+    ///   storing a few replicated records between quoting and verifying) — a
+    ///   negligible price move where the curve is flat — no longer rejects an
+    ///   otherwise-valid payment. On a fresh, rapidly-filling testnet that churn
+    ///   routinely exceeded the old fixed 5-record tolerance and rejected ~100%
+    ///   of uploads via the multiplicative per-chunk effect.
+    ///
+    /// The current record count comes from the attached [`LmdbStorage`] via
+    /// `current_chunks()` — an O(1) B-tree page-header read, authoritative
+    /// regardless of which path stored the record (client PUT, replication
+    /// store, repair fetch) or removed it (prune delete). If no storage source
+    /// is available (mis-configured production startup, or a unit test that
+    /// didn't set a test override), the gate is skipped entirely rather than
     /// rejecting every quote — see [`Self::current_records_stored`].
     fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
         let Some(current_records) = self.current_records_stored() else {
             debug!(
                 "PaymentVerifier: no record-count source attached; skipping \
-                 storage-delta freshness check"
+                 quote price-staleness check"
             );
             return Ok(());
         };
 
+        // The price the node would charge right now for its current fullness,
+        // and the floor a quote may not drop below (one-directional: paying at
+        // or above `current_price` is always accepted).
+        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
+        let min_acceptable_price = current_price.saturating_mul(Amount::from(
+            100u64.saturating_sub(QUOTE_PRICE_STALENESS_PCT_TOLERANCE),
+        )) / Amount::from(100u64);
+
         for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let quoted_records = derive_records_stored_from_price(quote.price);
-
-            let delta = quoted_records.abs_diff(current_records);
-            let pct_tolerance = quoted_records
-                .saturating_mul(QUOTE_STORAGE_DELTA_PCT_TOLERANCE)
-                .saturating_div(100);
-            let tolerance = QUOTE_STORAGE_DELTA_MIN_TOLERANCE.max(pct_tolerance);
-
-            if delta > tolerance {
+            if quote.price < min_acceptable_price {
+                let quoted_records = derive_records_stored_from_price(quote.price);
                 return Err(Error::Payment(format!(
-                    "Quote from peer {encoded_peer_id:?} stale by {delta} records \
-                     (quoted {quoted_records} vs current {current_records}, tolerance {tolerance})"
+                    "Quote from peer {encoded_peer_id:?} stale: paid price encodes \
+                     {quoted_records} records but node currently holds {current_records} \
+                     (paid {}, minimum acceptable {min_acceptable_price} at \
+                     {QUOTE_PRICE_STALENESS_PCT_TOLERANCE}% under-payment tolerance)",
+                    quote.price
                 )));
             }
         }
@@ -1759,15 +1786,20 @@ mod tests {
         quote
     }
 
+    /// A small upward record drift between quoting and verifying — the normal
+    /// in-flight churn on a busy network — must pass. The old fixed 5-record
+    /// tolerance rejected a drift of 10 as "stale by 10 records"; the
+    /// price-based gate sees a negligible price move on the near-flat curve and
+    /// accepts it.
     #[test]
-    fn test_storage_delta_within_tolerance_accepted() {
+    fn test_small_record_drift_accepted() {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(105);
-        let xorname = [0xE0u8; 32];
+        // Node gained 10 records since quoting (100 -> 110).
+        verifier.set_records_stored_for_tests(110);
         let quote = make_fake_quote_at_records(
-            xorname,
+            [0xE0u8; 32],
             SystemTime::now(),
             RewardsAddress::new([1u8; 20]),
             100,
@@ -1778,18 +1810,47 @@ mod tests {
 
         verifier
             .validate_quote_freshness(&payment)
-            .expect("delta within tolerance should pass");
+            .expect("benign in-flight drift should pass");
     }
 
+    /// Over-payment must always be accepted: the node had MORE records when it
+    /// quoted than it does now (e.g. it pruned), so the client paid for a
+    /// fuller, pricier node. The old symmetric `abs_diff` gate wrongly rejected
+    /// this; ~36% of STG-01 rejections were exactly this case.
     #[test]
-    fn test_storage_delta_exceeds_tolerance_rejected() {
+    fn test_overpayment_accepted() {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(107);
-        let xorname = [0xE1u8; 32];
+        // Quote priced at 6000 records, but node now holds only 100.
+        verifier.set_records_stored_for_tests(100);
         let quote = make_fake_quote_at_records(
-            xorname,
+            [0xE2u8; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+            6000,
+        );
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
+        };
+
+        verifier
+            .validate_quote_freshness(&payment)
+            .expect("over-payment must never be rejected");
+    }
+
+    /// Genuine staleness — a quote that under-prices the node's current fullness
+    /// by far more than the tolerance — is still rejected. Quote encodes 100
+    /// records but the node now holds 6000, so the quadratic curve makes the
+    /// paid price a small fraction of the current price.
+    #[test]
+    fn test_underpriced_quote_rejected() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        let quote = make_fake_quote_at_records(
+            [0xE1u8; 32],
             SystemTime::now(),
             RewardsAddress::new([1u8; 20]),
             100,
@@ -1800,8 +1861,8 @@ mod tests {
 
         let err = verifier
             .validate_quote_freshness(&payment)
-            .expect_err("delta beyond tolerance should fail");
-        assert!(format!("{err}").contains("stale by 7 records"));
+            .expect_err("a quote underpricing by >25% should fail");
+        assert!(format!("{err}").contains("stale"));
     }
 
     /// Helper: wrap quotes into a tagged serialized `PaymentProof`.
