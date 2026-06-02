@@ -697,24 +697,34 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// Minimum number of candidate `pub_keys` (out of 16) whose derived `PeerId`
-    /// must match the DHT's actual closest peers to the pool midpoint address.
+    /// Minimum number of candidate `pub_keys` (out of 16) that must satisfy
+    /// the closeness check — counting BOTH exact-`PeerId` matches against the
+    /// DHT's returned closest peers AND candidates that fall within the
+    /// address-space band those peers occupy (see [`Self::check_closeness_match`]).
     ///
-    /// Set below 16/16 to absorb normal routing-table skew between the
-    /// payer's view and this node's view — on a well-connected network the
-    /// divergence between two nodes' closest-set views is typically 1-2
-    /// peers, occasionally 3 during churn. 13/16 tolerates 3 divergent
-    /// peers while still limiting how many candidates an attacker can
-    /// fabricate before the check bites. A lower threshold (e.g. 9/16)
-    /// would let an attacker who controls 7 real neighbourhood peers plant
-    /// 7 fabricated candidates and still pass.
+    /// Lowered from 13/16 to a simple majority (9/16) as the lenient arm of
+    /// an A/B comparison against the stricter RC. Rationale: on a young,
+    /// high-churn, NAT-heavy network the two nodes' closest-set views diverge
+    /// by far more than the 3 peers 13/16 tolerated, so honest pools were
+    /// being rejected wholesale (the STG-01 / PROD-UL-01 "candidate `pub_keys`
+    /// do not match" rejections — 1,808 across 311 chunks in one prod run).
+    /// A majority threshold, combined with the address-space proximity arm,
+    /// accepts pools that are genuinely drawn from the midpoint's close group
+    /// even when this storer's specific lookup doesn't reproduce the payer's
+    /// exact 16.
     ///
-    /// This is the pure "fabricated key" defence; it does not stop an
-    /// attacker who can grind the pool midpoint address to land near 13
-    /// pre-chosen keys AND run those keys as Sybil DHT participants. That
-    /// requires an orthogonal Sybil-resistance layer and is out of scope
-    /// for this check.
-    const CANDIDATE_CLOSENESS_REQUIRED: usize = 13;
+    /// Security cost (deliberate, being measured): this widens the room for
+    /// the "pay-yourself" attack — an attacker who runs several real
+    /// neighbourhood peers needs fewer fabricated/self-owned candidates to
+    /// clear a majority than to clear 13/16. No theft of funds becomes
+    /// possible (payment still goes on-chain to the bound rewards address);
+    /// the cost is that grinding storage payments back to your own nodes gets
+    /// cheaper. The address-space arm narrows this again by requiring even
+    /// non-matching candidates to actually sit near the midpoint rather than
+    /// being free off-network fabrications. Pairs with the planned
+    /// pool-midpoint consensus-anchor (D1) work, which removes the grinding
+    /// freedom that makes a low threshold dangerous.
+    const CANDIDATE_CLOSENESS_REQUIRED: usize = 9;
 
     /// Timeout for the authoritative network lookup used by the closeness
     /// check.
@@ -774,8 +784,11 @@ impl PaymentVerifier {
     /// fabricated `PeerId`s to land in the storer's authoritative top-K.
     /// K=32 doubles the window vs K=16 (≈1 extra bit of grinding), but
     /// the dominant cost is still Sybil-grinding midpoint addresses or
-    /// running real nodes near the target — same security floor.
-    /// `CANDIDATE_CLOSENESS_REQUIRED` (13/16) is unchanged.
+    /// running real nodes near the target — same security floor. The window
+    /// width is held at 32 here (wider was measured as too heavy on the
+    /// lookup path); the leniency in this arm comes from the lower
+    /// `CANDIDATE_CLOSENESS_REQUIRED` (9/16) plus the address-space band, not
+    /// from a wider lookup.
     const CLOSENESS_LOOKUP_WIDTH: usize = 2 * evmlib::merkle_payments::CANDIDATES_PER_POOL;
 
     /// Maximum waiter → leader retries when the leader's future was cancelled
@@ -838,8 +851,8 @@ impl PaymentVerifier {
     /// **Known limitation — Sybil-grinding**: `midpoint_proof.address()` is a
     /// BLAKE3 hash of attacker-controllable inputs (leaf bytes, tree root,
     /// timestamp). A determined attacker who *also* runs Sybil DHT nodes can
-    /// grind the midpoint until it lands in a region where 13 of their
-    /// Sybil keys are the true network-closest — at which point this check
+    /// grind the midpoint until it lands in a region where a majority of
+    /// their Sybil keys are the true network-closest — at which point this check
     /// passes for the attacker. Closing that gap requires binding the
     /// midpoint to an attacker-uncontrolled value (e.g. a block hash at
     /// payment time or an on-chain VRF) or a Sybil-resistant identity
@@ -990,10 +1003,37 @@ impl PaymentVerifier {
         Ok(candidate_peer_ids)
     }
 
+    /// XOR distance between a 32-byte `PeerId`/address key and the pool
+    /// midpoint, as a big-endian `[u8; 32]` that orders the same way the
+    /// Kademlia metric does (lexicographic compare on the XOR == closeness
+    /// order). Returned by value so callers can `max()`/compare directly.
+    fn xor_distance(key: &[u8; 32], midpoint: &[u8; 32]) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        for i in 0..32 {
+            out[i] = key[i] ^ midpoint[i];
+        }
+        out
+    }
+
     /// Pure-logic closeness check: given the pool's candidate peer IDs and
     /// the storer's authoritative network view (top-K closest peers to the
     /// pool midpoint), decide whether the pool passes the
     /// `CANDIDATE_CLOSENESS_REQUIRED`-of-N threshold.
+    ///
+    /// A candidate counts toward the threshold if EITHER:
+    ///
+    /// 1. **Exact match** — its `PeerId` is one of the peers the storer's own
+    ///    network lookup returned; or
+    /// 2. **Address-space proximity** — its `PeerId` key sits within the XOR
+    ///    band the returned peers occupy, i.e. its distance to the midpoint is
+    ///    no greater than the farthest peer the lookup returned. Such a
+    ///    candidate is genuinely in the midpoint's close group — it just
+    ///    wasn't in *this* storer's particular lookup result (the two nodes'
+    ///    DHT views diverge on a churny/NAT-heavy network).
+    ///
+    /// Arm 2 is the leniency that arm-1-only (exact match) lacked: it accepts
+    /// honest divergence while still rejecting fabricated keys, which by
+    /// construction land far from a midpoint the attacker did not grind.
     ///
     /// Extracted from `verify_merkle_candidate_closeness_inner` so tests
     /// can exercise the matching logic without standing up a real DHT.
@@ -1027,19 +1067,35 @@ impl PaymentVerifier {
             )));
         }
 
-        // Set-membership check against the returned closest-peers list.
-        // Candidate `PeerId`s are deduplicated upstream, so each match
-        // corresponds to a distinct peer.
+        // Arm 1 set: exact-match membership against the returned closest
+        // peers. Candidate `PeerId`s are deduplicated upstream, so each
+        // match corresponds to a distinct peer.
         let network_set: std::collections::HashSet<PeerId> =
             network_peer_ids.iter().copied().collect();
+
+        // Arm 2 band: the XOR distance of the FARTHEST peer the lookup
+        // returned. Any candidate at least this close to the midpoint is
+        // within the close group the network itself reported, so it is
+        // honest even if this storer's lookup didn't surface it. Computed
+        // over the returned peers' own key bytes (`PeerId::as_bytes()` and
+        // the midpoint share the 256-bit Kademlia keyspace).
+        let band_radius = network_peer_ids
+            .iter()
+            .map(|pid| Self::xor_distance(pid.as_bytes(), pool_address))
+            .max()
+            .unwrap_or([0xFFu8; 32]);
+
         let matched = candidate_peer_ids
             .iter()
-            .filter(|pid| network_set.contains(pid))
+            .filter(|pid| {
+                network_set.contains(pid)
+                    || Self::xor_distance(pid.as_bytes(), pool_address) <= band_radius
+            })
             .count();
 
         if matched < Self::CANDIDATE_CLOSENESS_REQUIRED {
             debug!(
-                "Merkle closeness rejected: {matched}/{} candidates match the DHT's closest peers \
+                "Merkle closeness rejected: {matched}/{} candidates within the DHT's closest band \
                  for pool midpoint {} (required: {}, network returned {} peers)",
                 candidate_peer_ids.len(),
                 hex::encode(pool_address),
@@ -1055,7 +1111,7 @@ impl PaymentVerifier {
         }
 
         debug!(
-            "Merkle closeness passed: {matched}/{} candidates matched the DHT's closest peers \
+            "Merkle closeness passed: {matched}/{} candidates within the DHT's closest band \
              for pool midpoint {}",
             candidate_peer_ids.len(),
             hex::encode(pool_address),
@@ -2355,7 +2411,7 @@ mod tests {
     #[tokio::test]
     async fn closeness_rejects_pool_with_duplicate_candidate_pub_keys() {
         // An attacker who submits 16 copies of the same real peer's pub_key
-        // would otherwise satisfy the 13/16 closeness threshold trivially:
+        // would otherwise satisfy the closeness threshold trivially:
         // that one peer's membership in the DHT-returned set would count
         // 16 times. The dedupe check in verify_merkle_candidate_closeness_inner
         // must reject the pool BEFORE the network lookup runs (so this test
@@ -2927,15 +2983,15 @@ mod tests {
     }
 
     #[test]
-    fn closeness_required_threshold_unchanged_at_13() {
-        // Sanity-check that widening the lookup did not also lower the
-        // matching threshold. The 13/16 floor is the security knob; the
-        // window widening is purely a false-positive fix for honest pools.
+    fn closeness_required_threshold_is_majority() {
+        // Pin the lenient threshold so a future change can't silently move
+        // it. This is the security knob deliberately lowered to a majority
+        // (9/16) for the lenient A/B arm; the address-space band is what
+        // keeps off-network fabrications from exploiting the lower bar.
         assert_eq!(
             PaymentVerifier::CANDIDATE_CLOSENESS_REQUIRED,
-            13,
-            "Widening the lookup window must not lower the matching \
-             threshold — that would weaken the pay-yourself defence"
+            9,
+            "lenient arm pins the closeness threshold at a 9/16 majority"
         );
     }
 
@@ -2985,19 +3041,23 @@ mod tests {
     //
     // These tests use the extracted `check_closeness_match` helper to
     // exercise the matching logic directly with synthetic peer-ID sets,
-    // without standing up a real DHT. They prove the two failure modes
-    // observed on STG-01 on 2026-05-01 are fixed by the K=16 → K=32
-    // change:
+    // without standing up a real DHT. They cover the lenient policy:
     //
-    //   - "K=16 storer rejects honest pool whose candidates legitimately
-    //     include peers from positions 17–32" (~73% of mismatches)
+    //   - threshold lowered to a majority (`CANDIDATE_CLOSENESS_REQUIRED =
+    //     9/16`), and
+    //   - a candidate counts if it is EITHER an exact match in the network's
+    //     returned set OR within the XOR band the returned peers occupy
+    //     (address-space proximity arm).
     //
-    // and that the security floor (`CANDIDATE_CLOSENESS_REQUIRED = 13/16`)
-    // still rejects forged pools at the wider window.
+    // They also prove the security floor still holds: a forged pool whose
+    // candidates are far from the (un-ground) midpoint is rejected even at
+    // the wider K=32 window and the lower threshold.
     //
     // Pool address used as the XOR midpoint: `[0u8; 32]`.
-    // Synthetic PeerIds use distinct constant byte patterns so each test
-    // can reason about which IDs are "in the network's top-K" vs not.
+    // Synthetic PeerIds put the tag in `bytes[0]`, so for the `[0u8; 32]`
+    // midpoint a smaller tag == smaller XOR distance == closer. That lets
+    // each test reason about both exact membership AND the address-space
+    // band by tag value alone.
     // =========================================================================
 
     /// Build a deterministic `PeerId` from a single byte tag.
@@ -3025,17 +3085,10 @@ mod tests {
 
     #[test]
     fn closeness_match_passes_when_candidates_span_positions_1_to_15_and_17() {
-        // STG-01 regression test: the client's pool contains 16 candidates,
-        // 15 of which are at network-true positions 1..=15, and ONE of
-        // which is at position 17 (because the network-true position-16
-        // peer was unresponsive when the client over-queried 32).
-        //
-        // Pre-fix (K=16 storer): network_peer_ids = 16 entries (positions
-        // 1..=16); position 17 is NOT in the network set, so matched =
-        // 15 < 13 — wait, 15 ≥ 13, that path actually passes too. The
-        // failure mode was a *worse* skew where 4+ of the storer's top-16
-        // were unresponsive at the client side. Let me model that case
-        // precisely below.
+        // The client's pool contains 16 candidates, 15 at network-true
+        // positions 1..=15 plus one at position 17 (the position-16 peer was
+        // unresponsive when the client over-queried). Under K=32 all 16 are
+        // exact matches, comfortably ≥ the 9/16 majority.
         let candidates = synthetic_peer_ids(15)
             .into_iter()
             .chain(std::iter::once(synthetic_peer_id(17)))
@@ -3051,52 +3104,62 @@ mod tests {
     }
 
     #[test]
-    fn closeness_match_fails_at_k_16_passes_at_k_32_for_honest_skew() {
-        // The actual STG-01 failure mode: the client's 16 candidates
-        // legitimately span network-true positions {1..=12, 17, 19, 21,
-        // 23} — i.e. 12 positions in the storer's top-16 plus 4 in the
-        // 17–32 window (because positions 13–16 were unresponsive when
-        // the client over-queried).
+    fn closeness_match_accepts_honest_skew_via_exact_matches() {
+        // STG-01-style honest skew: the client's 16 candidates span
+        // network-true positions {1..=12, 17, 19, 21, 23}. With K=32 the
+        // network set is positions 1..=32, so all 16 are exact matches —
+        // trivially ≥ the 9/16 majority.
         let candidates: Vec<PeerId> = (1..=12u8)
             .chain([17u8, 19, 21, 23])
             .map(synthetic_peer_id)
             .collect();
         let pool_address = [0u8; 32];
+        let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
 
-        // Pre-fix (K=16): network = positions 1..=16. Only 12 of the 16
-        // candidates appear — below the 13/16 threshold. This is the
-        // exact false-positive rejection STG-01 was hitting.
-        let network_pre_fix: Vec<PeerId> = (1..=16).map(synthetic_peer_id).collect();
-        let result_pre_fix =
-            PaymentVerifier::check_closeness_match(&candidates, &network_pre_fix, &pool_address);
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
         assert!(
-            result_pre_fix.is_err(),
-            "PRE-FIX: K=16 storer should reject the honest pool (this is \
-             the bug we observed; if this assertion stops failing the \
-             refactor lost the rejection logic): {result_pre_fix:?}"
-        );
-
-        // Post-fix (K=32): network = positions 1..=32. All 16 candidates
-        // appear (12 at 1..=12, 4 at 17/19/21/23). matched = 16 ≥ 13:
-        // pool accepted. This is the fix.
-        let network_post_fix: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
-        let result_post_fix =
-            PaymentVerifier::check_closeness_match(&candidates, &network_post_fix, &pool_address);
-        assert!(
-            result_post_fix.is_ok(),
-            "POST-FIX: K=32 storer must accept the same honest pool: {result_post_fix:?}"
+            result.is_ok(),
+            "honest pool fully inside the K=32 window must pass: {result:?}"
         );
     }
 
     #[test]
-    fn closeness_match_rejects_forged_pool_at_k_32() {
-        // Security floor regression: a fully-forged pool whose candidate
-        // PeerIds are network-disjoint must still be rejected at the
-        // wider window K=32. The 13/16 threshold is the security knob;
-        // widening the lookup window must not soften it.
+    fn closeness_match_accepts_via_address_space_band_without_exact_match() {
+        // The leniency arm. The storer's lookup returned peers at positions
+        // {1..=8, 20..=43} (24 peers) — note positions 9..=19 are absent
+        // from THIS storer's view (churn / NAT). The payer's pool is the
+        // genuinely-closest 16: positions 1..=16. Positions 9..=16 are NOT
+        // in the storer's returned set, so exact matches = 8 (positions
+        // 1..=8) which is below 9/16.
         //
-        // Tag bytes 100..=115 are deliberately disjoint from the network
-        // set (1..=32).
+        // But the storer's returned set includes peers as far out as
+        // position 43, so the XOR band radius easily covers positions
+        // 9..=16 — they are closer to the midpoint than peers the storer
+        // itself returned. The address-space arm therefore counts all 16,
+        // and the pool passes. Exact-match-only would have rejected it.
+        let candidates: Vec<PeerId> = (1..=16u8).map(synthetic_peer_id).collect();
+        let network: Vec<PeerId> = (1..=8u8).chain(20..=43u8).map(synthetic_peer_id).collect();
+        let pool_address = [0u8; 32];
+
+        // Sanity: exact matches alone are only 8 (< 9), so a pass here can
+        // only come from the address-space arm.
+        let exact: usize = candidates.iter().filter(|c| network.contains(c)).count();
+        assert_eq!(exact, 8, "precondition: only 8 exact matches");
+
+        let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
+        assert!(
+            result.is_ok(),
+            "pool within the returned XOR band must pass via the address-space arm: {result:?}"
+        );
+    }
+
+    #[test]
+    fn closeness_match_rejects_forged_pool_far_from_midpoint() {
+        // Security floor: a fully-forged pool whose candidate PeerIds are
+        // both disjoint from the network set AND far outside the XOR band
+        // (tags 100..=115 vs a network band that ends at tag 32) must be
+        // rejected — neither arm should count them. The lower threshold and
+        // the address-space arm must NOT let off-network fabrications pass.
         let forged_candidates: Vec<PeerId> = (100..=115).map(synthetic_peer_id).collect();
         let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
         let pool_address = [0u8; 32];
@@ -3111,41 +3174,43 @@ mod tests {
                 );
             }
             other => panic!(
-                "forged pool with all candidates outside network's top-32 \
-                 must be rejected at K=32 (security floor): {other:?}"
+                "forged pool far outside the network's XOR band must be \
+                 rejected (security floor): {other:?}"
             ),
         }
     }
 
     #[test]
-    fn closeness_match_rejects_pool_at_exactly_12_of_16_match() {
-        // Threshold sanity: a pool with exactly 12 of 16 candidates in
-        // the network set must still be rejected (12 < 13).
-        let mut candidates = synthetic_peer_ids(12);
-        candidates.extend((100..=103).map(synthetic_peer_id)); // 4 disjoint
+    fn closeness_match_rejects_pool_below_majority() {
+        // Threshold sanity: only 8 candidates qualify (8 exact in-band
+        // matches at tags 1..=8) and the other 8 are far-out fabrications
+        // (tags 100..=107) beyond the band. 8 < 9 → reject.
+        let mut candidates = synthetic_peer_ids(8);
+        candidates.extend((100..=107).map(synthetic_peer_id)); // 8 far fabrications
         let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
         let pool_address = [0u8; 32];
 
         let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
         assert!(
             result.is_err(),
-            "12/16 < threshold of 13/16 must reject regardless of K: {result:?}"
+            "8 qualifying < majority of 9/16 must reject: {result:?}"
         );
     }
 
     #[test]
-    fn closeness_match_accepts_pool_at_exactly_13_of_16_match() {
-        // Threshold sanity: a pool with exactly 13 of 16 candidates in
-        // the network set must pass (13 ≥ 13).
-        let mut candidates = synthetic_peer_ids(13);
-        candidates.extend((100..=102).map(synthetic_peer_id)); // 3 disjoint
+    fn closeness_match_accepts_at_exactly_majority() {
+        // Threshold sanity: exactly 9 candidates qualify (tags 1..=9, all
+        // exact in-band matches), the other 7 are far fabrications beyond
+        // the band (tags 100..=106). 9 ≥ 9 → accept.
+        let mut candidates = synthetic_peer_ids(9);
+        candidates.extend((100..=106).map(synthetic_peer_id)); // 7 far fabrications
         let network: Vec<PeerId> = (1..=32).map(synthetic_peer_id).collect();
         let pool_address = [0u8; 32];
 
         let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
         assert!(
             result.is_ok(),
-            "13/16 ≥ threshold of 13/16 must accept: {result:?}"
+            "9/16 ≥ majority threshold must accept: {result:?}"
         );
     }
 
@@ -3156,14 +3221,14 @@ mod tests {
         // candidate set can't pass because the storer doesn't have an
         // authoritative view to compare against.
         let candidates = synthetic_peer_ids(16);
-        let network = synthetic_peer_ids(12); // < CANDIDATE_CLOSENESS_REQUIRED
+        let network = synthetic_peer_ids(8); // < CANDIDATE_CLOSENESS_REQUIRED (9)
         let pool_address = [0u8; 32];
 
         let result = PaymentVerifier::check_closeness_match(&candidates, &network, &pool_address);
         match result {
             Err(Error::Payment(msg)) => {
                 assert!(
-                    msg.contains("authoritative DHT lookup returned only 12"),
+                    msg.contains("authoritative DHT lookup returned only 8"),
                     "expected sparse-DHT error message, got: {msg}"
                 );
             }
