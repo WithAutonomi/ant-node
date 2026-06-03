@@ -3042,17 +3042,30 @@ async fn handle_failed_audit(
             );
         }
         AuditFailureAction::TimeoutPenalize => {
-            error!(
+            // TIMEOUT-EVICTION-DISABLED: re-enable once enough nodes have
+            // upgraded. This PR is a breaking wire change (StorageCommitment
+            // gossip old nodes cannot decode), so a pre-upgrade node times out
+            // on every new audit and looks exactly like a non-storing peer.
+            // Penalising timeouts now would make upgraded nodes evict every
+            // not-yet-upgraded node — a network death spiral during rollout.
+            // Strikes are still tracked/logged so the mechanism stays
+            // observable; we just don't report the trust event that drives
+            // eviction. Confirmed storage-integrity failures (ConfirmedPenalize
+            // below) are unaffected — those only come from a peer that actually
+            // answered with bad data, never an old node. Grep
+            // TIMEOUT-EVICTION-DISABLED to restore the report in a small
+            // follow-up release.
+            warn!(
                 "Audit timeout for {challenged_peer}: reached the {}-strike threshold of \
-                 consecutive timeouts — penalizing",
+                 consecutive timeouts (eviction disabled this release — not penalizing)",
                 config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
             );
-            p2p_node
-                .report_trust_event(
-                    challenged_peer,
-                    TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                )
-                .await;
+            // p2p_node
+            //     .report_trust_event(
+            //         challenged_peer,
+            //         TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+            //     )
+            //     .await;
         }
         AuditFailureAction::ConfirmedPenalize => {
             error!(
