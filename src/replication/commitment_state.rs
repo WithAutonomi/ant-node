@@ -310,7 +310,7 @@ impl ResponderCommitmentState {
 // Responder: commitment-bound audit handler
 // ---------------------------------------------------------------------------
 
-/// Outcome of [`build_commitment_bound_audit_response`]: either a
+/// Outcome of `build_commitment_bound_audit_response`: either a
 /// fully-built `CommitmentBound` response, or a typed rejection reason
 /// the caller turns into an `AuditResponse::Rejected`.
 #[derive(Debug)]

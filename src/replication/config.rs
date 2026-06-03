@@ -194,6 +194,28 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
+/// Consecutive audit *timeouts* a peer may accumulate before a timeout is
+/// reported as an `ApplicationFailure` trust event.
+///
+/// The audit response timeout is an economic deterrent calibrated for
+/// residential bandwidth, not a hard cryptographic bound: a single slow
+/// response is routine for an honest node under transient load (GC pause,
+/// disk flush, a burst of concurrent requests). Penalizing on the first
+/// timeout false-positives those nodes.
+///
+/// Requiring `N` *consecutive* timeouts before penalizing removes that
+/// false-positive while preserving the deterrent against a peer that does not
+/// actually store the data and must fetch it at audit time: such a peer is
+/// slow on *every* audit and accumulates a fresh strike each tick until it
+/// crosses the threshold, whereas an honest node answers normally between rare
+/// slow ticks and any success resets its strike counter to zero (see
+/// `handle_audit_result`). The discriminator is *persistence* of slowness
+/// versus *transience*. This deliberately does not widen the per-challenge
+/// window. Applies ONLY to `AuditFailureReason::Timeout`; confirmed
+/// storage-integrity failures (`DigestMismatch` / `KeyAbsent` / `Rejected` /
+/// `MalformedResponse`) remain instantly punishable.
+pub const AUDIT_TIMEOUT_STRIKE_THRESHOLD: u32 = 3;
+
 /// Maximum number of prune-confirmation audit challenges sent per prune pass.
 pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
 
@@ -509,6 +531,14 @@ mod tests {
     #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn audit_timeout_strike_threshold_is_three() {
+        // Smallest threshold that tolerates back-to-back transient slowness
+        // while still penalizing a persistently-slow non-storing peer within a
+        // few audit ticks.
+        assert_eq!(AUDIT_TIMEOUT_STRIKE_THRESHOLD, 3);
     }
 
     #[test]

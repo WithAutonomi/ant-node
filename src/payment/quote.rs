@@ -180,6 +180,17 @@ impl QuoteGenerator {
         self.metrics_tracker.record_store();
     }
 
+    /// Resync the quoting metric to an authoritative count of held records.
+    ///
+    /// The quote price is driven by `records_stored()`. A monotonic store
+    /// counter would let a node delete chunks it was paid to hold yet keep
+    /// quoting as if it still held everything. Callers pass the authoritative
+    /// count of records the node ACTUALLY HOLDS (from the storage layer) so the
+    /// price reflects current holdings, including deletions and pruning.
+    pub fn resync_records(&self, count: usize) {
+        self.metrics_tracker.set_records(count);
+    }
+
     /// Create a merkle candidate quote for batch payment using ML-DSA-65.
     ///
     /// Returns a `MerklePaymentCandidateNode` constructed with the node's
