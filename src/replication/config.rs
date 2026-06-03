@@ -168,7 +168,23 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
 /// Protocol identifier for replication operations.
-pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v1";
+///
+/// Bumped to `v2` for the v12 storage-bound audit. That change extends the
+/// wire types (`NeighborSyncRequest`/`Response` carry an optional
+/// `StorageCommitment`, `AuditChallenge` carries an optional pinned hash, and
+/// `AuditResponse` gains a `CommitmentBound` variant). The encoding is NOT
+/// backward/forward compatible: postcard is non-self-describing, so a v2 node
+/// cannot decode a v1 node's shorter message (it hits end-of-buffer), and a
+/// v1 node mis-handles the v2 trailer. Rather than risk mis-decode, we route
+/// v12 replication on a distinct protocol id: a node only delivers messages
+/// whose topic matches its own id (see the topic check in `mod.rs`), so v1 and
+/// v2 nodes simply do not exchange replication traffic during a mixed-version
+/// window — they ignore each other's replication messages instead of
+/// corrupting state. This is the rollout-safe behaviour: no cross-version
+/// decode, no spurious eviction. Replication between matched-version peers is
+/// unaffected. (DHT routing/lookups are a separate protocol and continue to
+/// span both versions.)
+pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
@@ -443,8 +459,12 @@ impl ReplicationConfig {
     /// A relay attacker on a residential link (~5-12 MB/s) who must
     /// fetch the same `k × 4 MiB` over the network sees ~10-100× higher
     /// latency than disk for the data alone, plus per-chunk round-trips,
-    /// and misses the budget — firing an `application_failure` trust
-    /// event (per `handle_audit_timeout` → `handle_audit_failure`).
+    /// and misses the budget — recording a timeout strike (per
+    /// `handle_audit_timeout` → `handle_audit_failure`). After
+    /// [`AUDIT_TIMEOUT_STRIKE_THRESHOLD`] consecutive timeouts this would
+    /// fire an `application_failure` trust event — but note that report is
+    /// currently suppressed for the breaking rollout (grep
+    /// TIMEOUT-EVICTION-DISABLED); the strike accounting still runs.
     ///
     /// This is an economic deterrent for the §7 relay limit calibrated
     /// for residential bandwidth, NOT a hard bound: a relay on a
@@ -539,6 +559,16 @@ mod tests {
         // while still penalizing a persistently-slow non-storing peer within a
         // few audit ticks.
         assert_eq!(AUDIT_TIMEOUT_STRIKE_THRESHOLD, 3);
+    }
+
+    #[test]
+    fn replication_protocol_id_is_v2() {
+        // The v12 storage-bound audit is a breaking wire change. The protocol
+        // id MUST advance past v1 so v1 and v2 nodes never attempt to decode
+        // each other's replication messages (rollout safety — see the const's
+        // doc). If this regresses to v1, mixed-version nodes would mis-decode.
+        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
+        assert!(REPLICATION_PROTOCOL_ID.ends_with(".v2"));
     }
 
     #[test]

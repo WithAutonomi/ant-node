@@ -281,6 +281,13 @@ pub async fn audit_tick_with_repair_proofs(
         .as_ref()
         .is_some_and(|r| r.last_commitment.is_some());
     if is_capable && !has_current_commitment {
+        // BY DESIGN this is a no-penalty path: a capable-but-silent peer is
+        // never strike-penalised here (Idle records no strike). It gains
+        // nothing by going silent — its §6 holder credit independently
+        // expires (PROVER_ENTRY_TTL), so it stops being counted as a holder
+        // for quorum/paid-list. We skip rather than penalise because the
+        // missing commitment is indistinguishable from honest TTL/restart
+        // churn; the next fresh gossip re-enables auditing.
         info!(
             "Audit: peer {challenged_peer} is commitment-capable but we have no \
              cached commitment (TTL/restart/silence); skipping audit until fresh gossip"

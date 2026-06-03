@@ -668,10 +668,21 @@ async fn peer_proves_record(
     let encoded = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
     let Some(decoded) = send_prune_audit_challenge(&peer, &key, encoded, p2p_node, config).await
     else {
-        // No decoded response means we did not observe the peer stop claiming
-        // bootstrap status. Preserve any active claim so a later claim is not
-        // misclassified as repeated abuse.
-        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+        // No decoded response means a timeout or an undecodable reply — the
+        // same "no response" case the main audit path treats as a timeout.
+        // TIMEOUT-EVICTION-DISABLED: do NOT penalise on a prune-audit timeout
+        // during the breaking rollout (a not-yet-upgraded peer, or a briefly
+        // slow one, must not be evicted by a no-response). This mirrors the
+        // suppressed timeout penalty in handle_failed_audit; only a DECODED
+        // PruneAuditStatus::Failed below (a peer that answered with bad/absent
+        // bytes) is penalised. Grep TIMEOUT-EVICTION-DISABLED to re-enable in
+        // the follow-up release once enough nodes have upgraded.
+        debug!(
+            "Prune audit for {peer} key {} got no decodable response \
+             (eviction disabled this release — not penalising)",
+            hex::encode(key)
+        );
+        // report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
         return None;
     };
 

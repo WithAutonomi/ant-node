@@ -535,6 +535,7 @@ impl ReplicationEngine {
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
+        let audit_timeout_strikes = Arc::clone(&self.audit_timeout_strikes);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -620,6 +621,10 @@ impl ReplicationEngine {
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
+                                // Drop the timeout-strike entry too, so a
+                                // departed peer leaves no residual (keeps this
+                                // map bounded under churn, like its siblings).
+                                audit_timeout_strikes.write().await.remove(&peer_id);
                                 // The sticky `commitment_capable` flag is
                                 // preserved orthogonally via
                                 // `ever_capable_peers` — even after this
@@ -3584,11 +3589,22 @@ async fn rebuild_and_rotate_commitment(
         );
     }
 
-    // For content-addressed chunks, bytes_hash == key. Saves a full
-    // chunk-store rescan per rotation. The audit-verify path still
-    // checks `bytes_hash == BLAKE3(local_bytes)` (which for
-    // content-addressed equals key) and the digest (which is bound to
-    // the actual bytes), so a lying responder is still caught.
+    // INVARIANT: this module is only used with CONTENT-ADDRESSED chunks,
+    // where `key == BLAKE3(content)`, so `bytes_hash := key` and we skip a
+    // full chunk re-read per rotation.
+    //
+    // Consequence to be precise about: because the leaf is `(key, key)`,
+    // the Merkle root commits to the SET OF KEYS, not to the bytes. The
+    // commitment therefore binds "which keys I claim to hold"; it does NOT
+    // by itself prove byte possession. Byte possession is enforced by the
+    // audit-verify path, which recomputes `bytes_hash == BLAKE3(local_bytes)`
+    // and the per-key digest against the AUDITOR'S OWN local copy of the
+    // bytes — so a responder that holds the key list but dropped the bytes
+    // still fails (`missing bytes for committed key` / digest mismatch).
+    // This is sound ONLY while keys are content addresses. If this module
+    // is ever reused for non-content-addressed records (`bytes_hash != key`),
+    // the `(k, k)` shortcut would let a byte-less node forge a valid root and
+    // MUST be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
     let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
 
     // No-op-rotation guard: compute just the Merkle root from `entries`
