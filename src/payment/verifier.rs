@@ -162,6 +162,12 @@ pub struct PaymentVerifier {
     /// [`Self::set_records_stored_for_tests`] so unit tests that don't wire a
     /// real `LmdbStorage` can still drive the freshness logic.
     test_records_override: RwLock<Option<u64>>,
+    /// Test-only override for this node's own peer ID, used by
+    /// `validate_quote_freshness` to pick out the node's own quote from the
+    /// payment bundle. Production code derives it from the attached
+    /// [`P2PNode`]; set via [`Self::set_peer_id_for_tests`] so unit tests can
+    /// drive the freshness logic without wiring a real `P2PNode`.
+    test_peer_id_override: RwLock<Option<[u8; 32]>>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -280,6 +286,7 @@ impl PaymentVerifier {
             p2p_node: RwLock::new(None),
             storage: RwLock::new(None),
             test_records_override: RwLock::new(None),
+            test_peer_id_override: RwLock::new(None),
             config,
         }
     }
@@ -316,6 +323,30 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_records_stored_for_tests(&self, count: u64) {
         *self.test_records_override.write() = Some(count);
+    }
+
+    /// Test-only setter for the node's own peer ID used by the quote
+    /// freshness check. Lets unit tests mark which quote in a payment bundle
+    /// is "ours" without wiring a real `P2PNode`. Has no effect in production
+    /// code because production code is expected to call
+    /// [`Self::attach_p2p_node`] instead.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_peer_id_for_tests(&self, peer_id_bytes: [u8; 32]) {
+        *self.test_peer_id_override.write() = Some(peer_id_bytes);
+    }
+
+    /// Snapshot this node's own peer ID for the quote freshness check.
+    ///
+    /// Prefers the attached [`P2PNode`] (authoritative). Falls back to a test
+    /// override if one was set. Returns `None` only when no source is
+    /// available (mis-configured production startup); the caller treats that
+    /// as "unknown" and skips the freshness gate rather than rejecting — the
+    /// same fail-open posture as a missing record-count source.
+    fn self_peer_id_bytes(&self) -> Option<[u8; 32]> {
+        if let Some(node) = self.p2p_node.read().as_ref() {
+            return Some(*node.peer_id().as_bytes());
+        }
+        *self.test_peer_id_override.read()
     }
 
     /// Snapshot the current record count for freshness comparisons.
@@ -647,10 +678,38 @@ impl PaymentVerifier {
     /// is available (mis-configured production startup, or a unit test that
     /// didn't set a test override), the gate is skipped entirely rather than
     /// rejecting every quote — see [`Self::current_records_stored`].
+    ///
+    /// **Only this node's own quote is gated.** A bundle contains one quote
+    /// per close-group peer, and fullness across a close group is wildly
+    /// heterogeneous on a real network (a freshly joined node holds tens of
+    /// records while an established neighbour holds thousands). Comparing a
+    /// *neighbour's* quote price against *this node's* record count therefore
+    /// rejects honest payments whenever the group spans more than the
+    /// tolerance — on ant-prod-01 a close group spanning 47..=1788 records
+    /// made the three fullest nodes reject every bundle containing the
+    /// emptiest node's (perfectly fresh, 10-second-old) quote, failing the
+    /// PUT after the client had already paid on-chain. The node can only
+    /// re-derive *its own* price from its own record count, so its own quote
+    /// is the only one it can legitimately call stale. Replay of another
+    /// node's old cheap quote is that node's gate to enforce when the PUT
+    /// reaches it; the on-chain median payment binding is unaffected either
+    /// way.
+    ///
+    /// A bundle holds at most one quote per peer — [`Self::validate_quote_structure`]
+    /// rejects duplicate peer IDs and runs before this gate on every path —
+    /// so the loop below matches at most one own quote.
     fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
         let Some(current_records) = self.current_records_stored() else {
             debug!(
                 "PaymentVerifier: no record-count source attached; skipping \
+                 quote price-staleness check"
+            );
+            return Ok(());
+        };
+
+        let Some(self_peer_id) = self.self_peer_id_bytes() else {
+            debug!(
+                "PaymentVerifier: no self peer-id source attached; skipping \
                  quote price-staleness check"
             );
             return Ok(());
@@ -664,16 +723,44 @@ impl PaymentVerifier {
             100u64.saturating_sub(QUOTE_PRICE_STALENESS_PCT_TOLERANCE),
         )) / Amount::from(100u64);
 
+        let mut own_quote_seen = false;
         for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if encoded_peer_id.as_bytes() != &self_peer_id {
+                // A neighbour's quote prices the *neighbour's* fullness; this
+                // node has no basis to judge it against its own record count.
+                continue;
+            }
+            own_quote_seen = true;
             if quote.price < min_acceptable_price {
                 let quoted_records = derive_records_stored_from_price(quote.price);
                 return Err(Error::Payment(format!(
-                    "Quote from peer {encoded_peer_id:?} stale: paid price encodes \
+                    "Own quote {encoded_peer_id:?} stale: quoted price encodes \
                      {quoted_records} records but node currently holds {current_records} \
-                     (paid {}, minimum acceptable {min_acceptable_price} at \
+                     (quoted {}, minimum acceptable {min_acceptable_price} at \
                      {QUOTE_PRICE_STALENESS_PCT_TOLERANCE}% under-payment tolerance)",
                     quote.price
                 )));
+            }
+        }
+
+        // Two self-identity notions coexist in this verifier and are expected
+        // to refer to the same node: `validate_local_recipient` matches "us"
+        // by rewards address, this gate by peer ID. They legitimately diverge
+        // when a PUT reaches a node whose own quote isn't in the bundle but
+        // whose rewards address is shared with a quoted sibling (common in
+        // fleet deployments). The gate fail-opens in that case — leave a
+        // breadcrumb, because a silent no-op is exactly what makes a
+        // production incident hard to reconstruct from node logs.
+        if !own_quote_seen {
+            let our_rewards_address_quoted = payment
+                .peer_quotes
+                .iter()
+                .any(|(_, quote)| quote.rewards_address == self.config.local_rewards_address);
+            if our_rewards_address_quoted {
+                debug!(
+                    "PaymentVerifier: bundle contains our rewards address but no quote \
+                     under our peer ID; skipping quote price-staleness check"
+                );
             }
         }
         Ok(())
@@ -1814,6 +1901,8 @@ mod tests {
         let verifier = create_test_verifier();
         // Node gained 10 records since quoting (100 -> 110).
         verifier.set_records_stored_for_tests(110);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
         let quote = make_fake_quote_at_records(
             [0xE0u8; 32],
             SystemTime::now(),
@@ -1821,7 +1910,7 @@ mod tests {
             100,
         );
         let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
+            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
         };
 
         verifier
@@ -1840,6 +1929,8 @@ mod tests {
         let verifier = create_test_verifier();
         // Quote priced at 6000 records, but node now holds only 100.
         verifier.set_records_stored_for_tests(100);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
         let quote = make_fake_quote_at_records(
             [0xE2u8; 32],
             SystemTime::now(),
@@ -1847,7 +1938,7 @@ mod tests {
             6000,
         );
         let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
+            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
         };
 
         verifier
@@ -1865,8 +1956,103 @@ mod tests {
 
         let verifier = create_test_verifier();
         verifier.set_records_stored_for_tests(6000);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
         let quote = make_fake_quote_at_records(
             [0xE1u8; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+            100,
+        );
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
+        };
+
+        let err = verifier
+            .validate_quote_freshness(&payment)
+            .expect_err("a quote underpricing by >25% should fail");
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    /// Regression test for the PROD-UL-01 `DataMap` failure (2026-06-04): a
+    /// close group whose fullness spans 47..=1788 records produces a bundle
+    /// where the emptiest node's honest quote prices far below a full node's
+    /// 75% floor. The verifying node must gate only its OWN quote — a
+    /// neighbour's cheap-but-honest quote is not evidence of staleness.
+    #[test]
+    fn test_neighbour_cheap_quote_not_rejected() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        // This node holds 1788 records (the fullest rejector in the incident).
+        verifier.set_records_stored_for_tests(1788);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
+
+        let xorname = [0xE3u8; 32];
+        let rewards = RewardsAddress::new([1u8; 20]);
+        // Own quote is fresh: priced at our own current fullness.
+        let own_quote = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 1788);
+        // Neighbour quotes from a heterogeneous close group, including a
+        // nearly-empty node at 47 records (price far below our 75% floor).
+        let neighbour_47 = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 47);
+        let neighbour_978 = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 978);
+
+        let payment = ProofOfPayment {
+            peer_quotes: vec![
+                (EncodedPeerId::new(rand::random()), neighbour_47),
+                (EncodedPeerId::new(self_id), own_quote),
+                (EncodedPeerId::new(rand::random()), neighbour_978),
+            ],
+        };
+
+        verifier
+            .validate_quote_freshness(&payment)
+            .expect("neighbours' cheaper quotes must not trip this node's own staleness gate");
+    }
+
+    /// The own-quote gate still bites: if THIS node's own quote in the bundle
+    /// underprices its current fullness beyond tolerance, the payment is
+    /// rejected even when every neighbour quote looks expensive.
+    #[test]
+    fn test_own_stale_quote_still_rejected_among_neighbours() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
+
+        let xorname = [0xE4u8; 32];
+        let rewards = RewardsAddress::new([1u8; 20]);
+        let own_stale = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 100);
+        let neighbour = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 7000);
+
+        let payment = ProofOfPayment {
+            peer_quotes: vec![
+                (EncodedPeerId::new(rand::random()), neighbour),
+                (EncodedPeerId::new(self_id), own_stale),
+            ],
+        };
+
+        let err = verifier
+            .validate_quote_freshness(&payment)
+            .expect_err("own underpriced quote must still be rejected");
+        assert!(format!("{err}").contains("stale"));
+    }
+
+    /// Without a self peer-id source (no `P2PNode` attached, no test override)
+    /// the gate skips rather than rejecting — mirroring the missing
+    /// record-count-source behaviour.
+    #[test]
+    fn test_freshness_skipped_without_self_peer_id() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        // NOTE: no set_peer_id_for_tests call.
+        let quote = make_fake_quote_at_records(
+            [0xE5u8; 32],
             SystemTime::now(),
             RewardsAddress::new([1u8; 20]),
             100,
@@ -1875,10 +2061,9 @@ mod tests {
             peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
         };
 
-        let err = verifier
+        verifier
             .validate_quote_freshness(&payment)
-            .expect_err("a quote underpricing by >25% should fail");
-        assert!(format!("{err}").contains("stale"));
+            .expect("gate must fail open when self identity is unknown");
     }
 
     /// Helper: wrap quotes into a tagged serialized `PaymentProof`.
