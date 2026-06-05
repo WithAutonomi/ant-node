@@ -18,9 +18,19 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 ///
 /// This cache stores `XorName` values that have been verified to exist on the
 /// autonomi network, avoiding repeated network queries for the same data.
+///
+/// Each entry carries a flag recording whether the verification that inserted
+/// it ran the full client-PUT check set (`true`) or only the
+/// receipt-authenticity subset used for replication (`false`). A
+/// replication-verified entry must not satisfy a later client-PUT fast-path —
+/// the context-gated checks (own-quote freshness, local recipient, merkle
+/// candidate closeness) were never run for it — while either kind of entry
+/// satisfies a later replication check.
 #[derive(Clone)]
 pub struct VerifiedCache {
-    inner: Arc<Mutex<LruCache<XorName, ()>>>,
+    /// Value: `true` if the entry was verified under the full client-PUT
+    /// check set, `false` if only under the replication subset.
+    inner: Arc<Mutex<LruCache<XorName, bool>>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
     additions: Arc<AtomicU64>,
@@ -76,9 +86,11 @@ impl VerifiedCache {
         }
     }
 
-    /// Check if a `XorName` is in the cache.
+    /// Check if a `XorName` is in the cache (verified under either check set).
     ///
     /// Returns `true` if the `XorName` is cached (verified to exist on autonomi).
+    /// Sufficient for replication-context lookups; client-PUT lookups must use
+    /// [`Self::contains_client_put_verified`].
     #[must_use]
     pub fn contains(&self, xorname: &XorName) -> bool {
         let found = self.inner.lock().get(xorname).is_some();
@@ -92,12 +104,53 @@ impl VerifiedCache {
         found
     }
 
-    /// Add a `XorName` to the cache.
+    /// Check if a `XorName` is cached AND its verification ran the full
+    /// client-PUT check set.
+    ///
+    /// A replication-verified entry returns `false` here: it never passed the
+    /// client-PUT-only checks, so it must not let a later client PUT skip them.
+    #[must_use]
+    pub fn contains_client_put_verified(&self, xorname: &XorName) -> bool {
+        let found = self.inner.lock().get(xorname).copied() == Some(true);
+
+        if found {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        found
+    }
+
+    /// Add a `XorName` verified under the full client-PUT check set.
     ///
     /// This should be called after verifying that data exists on the autonomi network.
+    /// Also upgrades an existing replication-verified entry.
     pub fn insert(&self, xorname: XorName) {
-        self.inner.lock().put(xorname, ());
+        self.inner.lock().put(xorname, true);
         self.additions.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Add a `XorName` verified under the replication (receipt-authenticity)
+    /// subset only.
+    ///
+    /// Never downgrades an existing client-PUT-verified entry — the stronger
+    /// verification already happened, and replication re-offers of the same
+    /// key are routine.
+    pub fn insert_replication_verified(&self, xorname: XorName) {
+        let added = {
+            let mut inner = self.inner.lock();
+            // `get_mut` refreshes LRU recency for existing entries of either kind.
+            if inner.get_mut(&xorname).is_none() {
+                inner.put(xorname, false);
+                true
+            } else {
+                false
+            }
+        };
+        if added {
+            self.additions.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Get current cache statistics.

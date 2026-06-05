@@ -37,7 +37,7 @@ use crate::ant_protocol::{
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
-use crate::payment::{PaymentVerifier, QuoteGenerator};
+use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
@@ -243,10 +243,16 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Verify payment
+        // 4. Verify payment. This node is the storer being paid right now, so
+        // the full ClientPut check set applies (own-quote price freshness,
+        // local recipient, merkle candidate closeness).
         let payment_result = self
             .payment_verifier
-            .verify_payment(&address, request.payment_proof.as_deref())
+            .verify_payment(
+                &address,
+                request.payment_proof.as_deref(),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         match payment_result {

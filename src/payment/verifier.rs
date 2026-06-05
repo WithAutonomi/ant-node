@@ -95,6 +95,64 @@ pub struct PaymentVerifierConfig {
     pub local_rewards_address: RewardsAddress,
 }
 
+/// The situation a payment proof is being verified in.
+///
+/// A proof-of-payment is a *receipt*: it records a sale that closed at some
+/// earlier moment, at that moment's prices, between the client and the close
+/// group of that moment. Two very different callers present receipts:
+///
+/// - **`ClientPut`** — the node is the storer being paid *right now*. Every
+///   check applies, including the ones that interrogate the present: "is the
+///   price on this receipt still fair for my current fullness?" (own-quote
+///   freshness) and "am I actually one of the paid recipients?" (local
+///   recipient / merkle candidate closeness).
+/// - **`Replication`** — a neighbour is handing over an already-paid record
+///   (fresh-write fan-out, paid-notify, repair). The sale closed long ago; the
+///   network's job now is to keep the record at target redundancy for the rest
+///   of its life. Re-asking the present-tense questions of a receipt is a
+///   category error with a guaranteed failure mode: record counts only grow,
+///   so every receipt's quoted price eventually drops below the verifier's
+///   live floor, and close groups churn, so the receiving node eventually
+///   isn't a quoted recipient at all. On DEV-01 (2026-06-05) this rejected
+///   nearly 100% of replication proof-of-payment transfers within an hour of
+///   launch (4M+
+///   rejections at ~300k/hour), pinned records below target redundancy, and
+///   drove a permanent ~500 MB/s fleet-wide re-offer storm.
+///
+/// Under `Replication` the verifier therefore skips only the
+/// storer-being-paid-now checks. Everything that makes the receipt a receipt
+/// still runs: quote structure, content binding to this exact address,
+/// peer-ID/pub-key bindings, ML-DSA signatures, and the on-chain settlement
+/// lookup. A record cannot be admitted via replication without an authentic,
+/// settled payment for that record.
+///
+/// The verified-`XorName` cache is context-aware to match: an entry inserted
+/// by a `Replication` verification satisfies later replication lookups but
+/// NOT a later `ClientPut` fast-path, so a replication receipt can never let
+/// a client PUT bypass the checks this enum gates.
+///
+/// Trade-off (deliberate, documented): skipping the recipient/closeness
+/// checks for replication means a payer who self-deals — minting a quote pool
+/// from peers they control and settling the median payment to their own
+/// wallet on-chain — can present that receipt to honest nodes via the
+/// replication protocol, paying only gas plus a recycled self-payment instead
+/// of paying real storers. The client-PUT path still rejects such pools, and
+/// replication admission still requires the receiving node to be responsible
+/// for the key, so the abuse costs a settled on-chain payment per chunk and
+/// buys only what storage already costs; closing it properly belongs in quote
+/// issuance / payment policy, not in the replication hot path, where the
+/// equivalent defence provably destroys the network's ability to heal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationContext {
+    /// The node is the storer being paid right now: all checks apply.
+    ClientPut,
+    /// An already-settled receipt presented during replication/repair: skip
+    /// the storer-being-paid-now checks (own-quote price freshness, local
+    /// recipient, merkle candidate closeness); keep all receipt-authenticity
+    /// checks.
+    Replication,
+}
+
 /// Status returned by payment verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaymentStatus {
@@ -378,17 +436,32 @@ impl PaymentVerifier {
     /// 1. Check LRU cache (fast path)
     /// 2. If not cached, payment is required
     ///
+    /// The fast path is context-aware: a `ClientPut` lookup is satisfied only
+    /// by an entry whose verification ran the full client-PUT check set. An
+    /// entry inserted by a `Replication` verification (which skips the
+    /// storer-being-paid-now checks) must not let a later client PUT bypass
+    /// those checks. A `Replication` lookup accepts either kind of entry.
+    ///
     /// # Arguments
     ///
     /// * `xorname` - The content-addressed name of the data
+    /// * `context` - The verification context of the caller
     ///
     /// # Returns
     ///
     /// * `PaymentStatus::CachedAsVerified` - Found in local cache (previously paid)
     /// * `PaymentStatus::PaymentRequired` - Not cached (payment required)
-    pub fn check_payment_required(&self, xorname: &XorName) -> PaymentStatus {
+    pub fn check_payment_required(
+        &self,
+        xorname: &XorName,
+        context: VerificationContext,
+    ) -> PaymentStatus {
         // Check LRU cache (fast path)
-        if self.cache.contains(xorname) {
+        let cached = match context {
+            VerificationContext::ClientPut => self.cache.contains_client_put_verified(xorname),
+            VerificationContext::Replication => self.cache.contains(xorname),
+        };
+        if cached {
             if crate::logging::enabled!(crate::logging::Level::DEBUG) {
                 debug!("Data {} found in verified cache", hex::encode(xorname));
             }
@@ -415,6 +488,9 @@ impl PaymentVerifier {
     ///
     /// * `xorname` - The content-addressed name of the data
     /// * `payment_proof` - Optional payment proof (required if not in cache)
+    /// * `context` - Whether the proof backs a live client PUT or an
+    ///   already-settled receipt presented during replication — see
+    ///   [`VerificationContext`] for which checks each context runs
     ///
     /// # Returns
     ///
@@ -428,9 +504,10 @@ impl PaymentVerifier {
         &self,
         xorname: &XorName,
         payment_proof: Option<&[u8]>,
+        context: VerificationContext,
     ) -> Result<PaymentStatus> {
         // First check if payment is required
-        let status = self.check_payment_required(xorname);
+        let status = self.check_payment_required(xorname, context);
 
         match status {
             PaymentStatus::CachedAsVerified => {
@@ -455,7 +532,7 @@ impl PaymentVerifier {
                     // Detect proof type from version tag byte
                     match detect_proof_type(proof) {
                         Some(ProofType::Merkle) => {
-                            self.verify_merkle_payment(xorname, proof).await?;
+                            self.verify_merkle_payment(xorname, proof, context).await?;
                         }
                         Some(ProofType::SingleNode) => {
                             let (payment, tx_hashes) = deserialize_proof(proof).map_err(|e| {
@@ -466,7 +543,7 @@ impl PaymentVerifier {
                                 debug!("Proof includes {} transaction hash(es)", tx_hashes.len());
                             }
 
-                            self.verify_evm_payment(xorname, &payment).await?;
+                            self.verify_evm_payment(xorname, &payment, context).await?;
                         }
                         None => {
                             let tag = proof.first().copied().unwrap_or(0);
@@ -485,8 +562,17 @@ impl PaymentVerifier {
                         }
                     }
 
-                    // Cache the verified xorname
-                    self.cache.insert(*xorname);
+                    // Cache the verified xorname, recording which check set
+                    // ran. A Replication-verified entry satisfies later
+                    // replication lookups (re-offers of the same key are
+                    // routine) but not a later ClientPut fast-path — the
+                    // context-gated checks were never run for it.
+                    match context {
+                        VerificationContext::ClientPut => self.cache.insert(*xorname),
+                        VerificationContext::Replication => {
+                            self.cache.insert_replication_verified(*xorname);
+                        }
+                    }
 
                     Ok(PaymentStatus::PaymentVerified)
                 } else {
@@ -540,28 +626,45 @@ impl PaymentVerifier {
     /// Verification steps:
     /// 1. Exactly `CLOSE_GROUP_SIZE` quotes are present
     /// 2. All quotes target the correct content address (xorname binding)
-    /// 3. Quote timestamps are fresh (not expired or future-dated)
+    /// 3. This node's own quote price is fresh (`ClientPut` only — a
+    ///    replication receipt's price was fixed at the original sale and the
+    ///    node's record count has legitimately grown since)
     /// 4. Peer ID bindings match the ML-DSA-65 public keys
-    /// 5. This node is among the quoted recipients
+    /// 5. This node is among the quoted recipients (`ClientPut` only — a
+    ///    post-churn close-group member receiving a record via replication
+    ///    was never a payee on the original receipt)
     /// 6. All ML-DSA-65 signatures are valid (offloaded to `spawn_blocking`)
     /// 7. The median-priced quote was paid at least 3x its price on-chain
     ///    (looked up via `completedPayments(quoteHash)` on the payment vault)
     ///
+    /// See [`VerificationContext`] for why steps 3 and 5 are context-gated.
+    ///
     /// For unit tests that don't need on-chain verification, pre-populate
     /// the cache so `verify_payment` returns `CachedAsVerified` before
     /// reaching this method.
-    async fn verify_evm_payment(&self, xorname: &XorName, payment: &ProofOfPayment) -> Result<()> {
+    async fn verify_evm_payment(
+        &self,
+        xorname: &XorName,
+        payment: &ProofOfPayment,
+        context: VerificationContext,
+    ) -> Result<()> {
         if crate::logging::enabled!(crate::logging::Level::DEBUG) {
             let xorname_hex = hex::encode(xorname);
             let quote_count = payment.peer_quotes.len();
-            debug!("Verifying EVM payment for {xorname_hex} with {quote_count} quotes");
+            debug!(
+                "Verifying EVM payment for {xorname_hex} with {quote_count} quotes ({context:?})"
+            );
         }
 
         Self::validate_quote_structure(payment)?;
         Self::validate_quote_content(payment, xorname)?;
-        self.validate_quote_freshness(payment)?;
+        if context == VerificationContext::ClientPut {
+            self.validate_quote_freshness(payment)?;
+        }
         Self::validate_peer_bindings(payment)?;
-        self.validate_local_recipient(payment)?;
+        if context == VerificationContext::ClientPut {
+            self.validate_local_recipient(payment)?;
+        }
 
         // Verify quote signatures (CPU-bound, run off async runtime)
         let peer_quotes = payment.peer_quotes.clone();
@@ -1274,9 +1377,17 @@ impl PaymentVerifier {
     /// 4. Validate the proof against on-chain data
     /// 5. Cache the pool hash for subsequent chunk verifications in the same batch
     #[allow(clippy::too_many_lines)]
-    async fn verify_merkle_payment(&self, xorname: &XorName, proof_bytes: &[u8]) -> Result<()> {
+    async fn verify_merkle_payment(
+        &self,
+        xorname: &XorName,
+        proof_bytes: &[u8],
+        context: VerificationContext,
+    ) -> Result<()> {
         if crate::logging::enabled!(crate::logging::Level::DEBUG) {
-            debug!("Verifying merkle payment for {}", hex::encode(xorname));
+            debug!(
+                "Verifying merkle payment for {} ({context:?})",
+                hex::encode(xorname)
+            );
         }
 
         // Deserialize the merkle proof
@@ -1313,8 +1424,17 @@ impl PaymentVerifier {
         // forged pool is rejected everywhere it lands. The pass cache and
         // single-flight keyed on pool_hash collapse the Kademlia lookup cost
         // within a batch and across concurrent PUTs for the same pool.
-        self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool, pool_hash)
-            .await?;
+        //
+        // ClientPut only: the check interrogates the *live* DHT, but a
+        // replication receipt's winner pool was sampled from the DHT of the
+        // original sale. Churn guarantees old pools eventually stop matching
+        // the current top-K, which would make old records unreplicatable —
+        // the same failure mode the single-node freshness gate caused on
+        // DEV-01. See `VerificationContext` for the trade-off discussion.
+        if context == VerificationContext::ClientPut {
+            self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool, pool_hash)
+                .await?;
+        }
 
         // Check pool cache first
         let cached_info = {
@@ -1525,7 +1645,7 @@ mod tests {
         let xorname = [1u8; 32];
 
         // All uncached data requires payment
-        let status = verifier.check_payment_required(&xorname);
+        let status = verifier.check_payment_required(&xorname, VerificationContext::ClientPut);
         assert_eq!(status, PaymentStatus::PaymentRequired);
     }
 
@@ -1538,7 +1658,7 @@ mod tests {
         verifier.cache.insert(xorname);
 
         // Should return CachedAsVerified
-        let status = verifier.check_payment_required(&xorname);
+        let status = verifier.check_payment_required(&xorname, VerificationContext::ClientPut);
         assert_eq!(status, PaymentStatus::CachedAsVerified);
     }
 
@@ -1548,7 +1668,9 @@ mod tests {
         let xorname = [1u8; 32];
 
         // No proof provided => should return an error (EVM is always on)
-        let result = verifier.verify_payment(&xorname, None).await;
+        let result = verifier
+            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .await;
         assert!(
             result.is_err(),
             "Expected Err without proof, got: {result:?}"
@@ -1564,7 +1686,9 @@ mod tests {
         verifier.cache.insert(xorname);
 
         // Should succeed without payment (cached)
-        let result = verifier.verify_payment(&xorname, None).await;
+        let result = verifier
+            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("cached"), PaymentStatus::CachedAsVerified);
     }
@@ -1590,7 +1714,7 @@ mod tests {
 
         // Not yet cached — should require payment
         assert_eq!(
-            verifier.check_payment_required(&xorname),
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
             PaymentStatus::PaymentRequired
         );
 
@@ -1599,7 +1723,7 @@ mod tests {
 
         // Now the xorname should be cached
         assert_eq!(
-            verifier.check_payment_required(&xorname),
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
             PaymentStatus::CachedAsVerified
         );
     }
@@ -1611,7 +1735,9 @@ mod tests {
 
         // Proof smaller than MIN_PAYMENT_PROOF_SIZE_BYTES
         let small_proof = vec![0u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
-        let result = verifier.verify_payment(&xorname, Some(&small_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&small_proof), VerificationContext::ClientPut)
+            .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -1627,7 +1753,9 @@ mod tests {
 
         // Proof larger than MAX_PAYMENT_PROOF_SIZE_BYTES
         let large_proof = vec![0u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
-        let result = verifier.verify_payment(&xorname, Some(&large_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&large_proof), VerificationContext::ClientPut)
+            .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -1644,7 +1772,11 @@ mod tests {
         // Exactly MIN_PAYMENT_PROOF_SIZE_BYTES with unknown tag — rejected
         let boundary_proof = vec![0xFFu8; MIN_PAYMENT_PROOF_SIZE_BYTES];
         let result = verifier
-            .verify_payment(&xorname, Some(&boundary_proof))
+            .verify_payment(
+                &xorname,
+                Some(&boundary_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1662,7 +1794,11 @@ mod tests {
         // Exactly MAX_PAYMENT_PROOF_SIZE_BYTES with unknown tag — rejected
         let boundary_proof = vec![0xFFu8; MAX_PAYMENT_PROOF_SIZE_BYTES];
         let result = verifier
-            .verify_payment(&xorname, Some(&boundary_proof))
+            .verify_payment(
+                &xorname,
+                Some(&boundary_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -1680,7 +1816,9 @@ mod tests {
         // Valid tag (0x01) but garbage payload — should fail deserialization
         let mut garbage = vec![crate::ant_protocol::PROOF_TAG_SINGLE_NODE];
         garbage.extend_from_slice(&[0xAB; 63]);
-        let result = verifier.verify_payment(&xorname, Some(&garbage)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&garbage), VerificationContext::ClientPut)
+            .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
@@ -1707,14 +1845,14 @@ mod tests {
         let xorname = [7u8; 32];
 
         // Miss
-        verifier.check_payment_required(&xorname);
+        verifier.check_payment_required(&xorname, VerificationContext::ClientPut);
         let stats = verifier.cache_stats();
         assert_eq!(stats.misses, 1);
         assert_eq!(stats.hits, 0);
 
         // Insert and hit
         verifier.cache.insert(xorname);
-        verifier.check_payment_required(&xorname);
+        verifier.check_payment_required(&xorname, VerificationContext::ClientPut);
         let stats = verifier.cache_stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 1);
@@ -1735,7 +1873,8 @@ mod tests {
             let v = verifier.clone();
             handles.push(tokio::spawn(async move {
                 let xorname = [i; 32];
-                v.verify_payment(&xorname, None).await
+                v.verify_payment(&xorname, None, VerificationContext::ClientPut)
+                    .await
             }));
         }
 
@@ -1848,7 +1987,11 @@ mod tests {
         let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
 
         let result = verifier
-            .verify_payment(&target_xorname, Some(&proof_bytes))
+            .verify_payment(
+                &target_xorname,
+                Some(&proof_bytes),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert!(result.is_err(), "Should reject mismatched content address");
@@ -2096,7 +2239,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
         assert!(
@@ -2124,7 +2269,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
         assert!(
@@ -2152,7 +2299,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -2181,7 +2330,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
         assert!(
@@ -2209,7 +2360,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         // Should NOT fail at timestamp check (will fail later at pub_key binding)
         let err_msg = format!("{}", result.expect_err("should fail at later check"));
@@ -2261,7 +2414,9 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         assert!(result.is_err(), "Should reject payment not addressed to us");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -2298,13 +2453,301 @@ mod tests {
         }
 
         let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier.verify_payment(&xorname, Some(&proof_bytes)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
 
         assert!(result.is_err(), "Should reject wrong peer binding");
         let err_msg = format!("{}", result.expect_err("should fail"));
         assert!(
             err_msg.contains("pub_key does not belong to claimed peer"),
             "Error should mention binding mismatch: {err_msg}"
+        );
+    }
+
+    // =========================================================================
+    // VerificationContext tests — Replication must skip the
+    // storer-being-paid-now checks (own-quote freshness, local recipient,
+    // merkle candidate closeness) while keeping every receipt-authenticity
+    // check. Each test runs the same proof under both contexts and asserts
+    // the context-gated check fires only under ClientPut. Where a proof
+    // can't reach Ok(()) without on-chain access, "skipped" is proven by the
+    // error moving PAST the gated check to a later stage.
+    // =========================================================================
+
+    /// A bundle whose own quote is stale (quoted 100 records, node now holds
+    /// 6000) is rejected by the freshness gate under `ClientPut`, but under
+    /// `Replication` the gate is skipped: verification proceeds to the next
+    /// stage (peer bindings, which fail on the fake `pub_keys`).
+    #[tokio::test]
+    async fn test_replication_context_skips_own_quote_freshness() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        let self_id: [u8; 32] = rand::random();
+        verifier.set_peer_id_for_tests(self_id);
+
+        let xorname = [0xD0u8; 32];
+        let rewards = RewardsAddress::new([1u8; 20]);
+        let own_stale = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 100);
+        let mut peer_quotes = vec![(EncodedPeerId::new(self_id), own_stale)];
+        for _ in 1..CLOSE_GROUP_SIZE {
+            let neighbour = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 6000);
+            peer_quotes.push((EncodedPeerId::new(rand::random()), neighbour));
+        }
+        let proof_bytes = serialize_proof(peer_quotes);
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("own stale quote must be rejected on a client PUT");
+        assert!(
+            format!("{err}").contains("stale"),
+            "ClientPut must fail at the freshness gate: {err}"
+        );
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::Replication,
+            )
+            .await
+            .expect_err("fake pub_keys still fail peer bindings");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("stale"),
+            "Replication must skip the freshness gate: {msg}"
+        );
+        assert!(
+            msg.contains("Invalid ML-DSA public key"),
+            "Replication should fail at the LATER peer-binding stage: {msg}"
+        );
+    }
+
+    /// A receipt that pays a different node's rewards address is rejected by
+    /// the local-recipient check under `ClientPut`, but under `Replication`
+    /// (a post-churn close-group member was never a payee) the check is
+    /// skipped: verification proceeds to quote-signature verification.
+    #[tokio::test]
+    async fn test_replication_context_skips_local_recipient() {
+        use evmlib::RewardsAddress;
+        use saorsa_core::MlDsa65;
+        use saorsa_pqc::pqc::MlDsaOperations;
+
+        let local_addr = RewardsAddress::new([0xAAu8; 20]);
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig {
+                network: EvmNetwork::ArbitrumOne,
+            },
+            cache_capacity: 100,
+            local_rewards_address: local_addr,
+        };
+        let verifier = PaymentVerifier::new(config);
+
+        let xorname = [0xD1u8; 32];
+        // Quotes pay a DIFFERENT rewards address.
+        let other_addr = RewardsAddress::new([0xBBu8; 20]);
+
+        // Real ML-DSA keys so the pub_key→peer_id binding check passes and
+        // the first divergence between contexts is the recipient check.
+        let ml_dsa = MlDsa65::new();
+        let mut peer_quotes = Vec::new();
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
+            let pub_key_bytes = public_key.as_bytes().to_vec();
+            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
+            let mut quote = make_fake_quote(xorname, SystemTime::now(), other_addr);
+            quote.pub_key = pub_key_bytes;
+            peer_quotes.push((encoded, quote));
+        }
+        let proof_bytes = serialize_proof(peer_quotes);
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("payment not addressed to us must fail on a client PUT");
+        assert!(
+            format!("{err}").contains("does not include this node as a recipient"),
+            "ClientPut must fail at the recipient check: {err}"
+        );
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::Replication,
+            )
+            .await
+            .expect_err("fake quote signatures still fail signature verification");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("recipient"),
+            "Replication must skip the recipient check: {msg}"
+        );
+        assert!(
+            msg.contains("signature verification failed"),
+            "Replication should fail at the LATER signature stage: {msg}"
+        );
+    }
+
+    /// A `Replication`-verified cache entry must not satisfy a later
+    /// `ClientPut` fast-path: the context-gated checks were never run for it,
+    /// so letting it short-circuit a client PUT would bypass them via the
+    /// cache. It must still satisfy later `Replication` lookups (re-offers of
+    /// the same key are routine), and a subsequent full `ClientPut`
+    /// verification upgrades the entry without ever being downgraded back.
+    #[tokio::test]
+    async fn test_replication_verified_cache_entry_does_not_satisfy_client_put() {
+        let verifier = create_test_verifier();
+        let xorname = [0xD4u8; 32];
+
+        // Simulate a successful Replication-context verification.
+        verifier.cache.insert_replication_verified(xorname);
+
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::Replication),
+            PaymentStatus::CachedAsVerified,
+            "replication lookups must hit a replication-verified entry"
+        );
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
+            PaymentStatus::PaymentRequired,
+            "a client PUT must not fast-path on a replication-verified entry"
+        );
+
+        // End-to-end: a proof-less client PUT is still rejected, while a
+        // proof-less replication re-check passes via the cache.
+        let result = verifier
+            .verify_payment(&xorname, None, VerificationContext::Replication)
+            .await;
+        assert_eq!(
+            result.expect("replication re-check should hit the cache"),
+            PaymentStatus::CachedAsVerified
+        );
+        let err = verifier
+            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .await
+            .expect_err("proof-less client PUT must not ride the replication entry");
+        assert!(
+            format!("{err}").contains("Payment required"),
+            "client PUT must still demand payment: {err}"
+        );
+
+        // A full ClientPut verification upgrades the entry...
+        verifier.cache.insert(xorname);
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
+            PaymentStatus::CachedAsVerified,
+            "a full client-PUT verification must upgrade the entry"
+        );
+
+        // ...and a later replication re-verification never downgrades it.
+        verifier.cache.insert_replication_verified(xorname);
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
+            PaymentStatus::CachedAsVerified,
+            "replication re-verification must not downgrade a client-PUT entry"
+        );
+    }
+
+    /// Receipt authenticity is NOT relaxed under `Replication`: a bundle whose
+    /// quotes are bound to a different content address is rejected in both
+    /// contexts. A neighbour cannot replay a receipt for chunk A to get
+    /// chunk B admitted.
+    #[tokio::test]
+    async fn test_replication_context_still_rejects_content_mismatch() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        let stored_xorname = [0xD2u8; 32];
+        let quoted_xorname = [0xD3u8; 32];
+        let rewards = RewardsAddress::new([1u8; 20]);
+
+        let mut peer_quotes = Vec::new();
+        for _ in 0..CLOSE_GROUP_SIZE {
+            let quote = make_fake_quote(quoted_xorname, SystemTime::now(), rewards);
+            peer_quotes.push((EncodedPeerId::new(rand::random()), quote));
+        }
+        let proof_bytes = serialize_proof(peer_quotes);
+
+        for context in [
+            VerificationContext::ClientPut,
+            VerificationContext::Replication,
+        ] {
+            let err = verifier
+                .verify_payment(&stored_xorname, Some(&proof_bytes), context)
+                .await
+                .expect_err("content binding must hold in every context");
+            assert!(
+                format!("{err}").contains("content address mismatch"),
+                "{context:?} must reject a receipt for a different address: {err}"
+            );
+        }
+    }
+
+    /// The merkle pay-yourself closeness defence (including its duplicate-
+    /// candidate pre-check, which runs without a `P2PNode`) applies to client
+    /// PUTs only. Under `Replication` the pool was sampled from the DHT of
+    /// the original sale, so the live-DHT check is skipped and verification
+    /// proceeds to the on-chain stages.
+    #[tokio::test]
+    async fn test_replication_context_skips_merkle_closeness() {
+        let verifier = create_test_verifier();
+
+        let (mut merkle_proof, _pool_hash, xorname, timestamp) = make_valid_merkle_proof();
+
+        // 16 copies of one real candidate: every self-signature is valid, but
+        // the candidate PeerIds are duplicates — the closeness pre-check
+        // rejects this pool on a client PUT.
+        let shared = merkle_proof
+            .winner_pool
+            .candidate_nodes
+            .first()
+            .expect("candidates")
+            .clone();
+        for c in &mut merkle_proof.winner_pool.candidate_nodes {
+            *c = shared.clone();
+        }
+        let pool_hash = merkle_proof.winner_pool_hash();
+
+        // Seed the pool cache with a deliberately mismatched timestamp so the
+        // Replication path fails deterministically AFTER the (skipped)
+        // closeness check, without needing on-chain access.
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 4,
+                merkle_payment_timestamp: timestamp + 1,
+                paid_node_addresses: vec![],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let tagged =
+            crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+            .await
+            .expect_err("duplicate candidate PeerIds must fail the client-PUT closeness check");
+        assert!(
+            format!("{err}").contains("duplicate candidate PeerId"),
+            "ClientPut must fail at the closeness pre-check: {err}"
+        );
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&tagged), VerificationContext::Replication)
+            .await
+            .expect_err("seeded timestamp mismatch still fails after the skipped check");
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("duplicate candidate PeerId"),
+            "Replication must skip the closeness check: {msg}"
+        );
+        assert!(
+            msg.contains("timestamp mismatch"),
+            "Replication should fail at the LATER timestamp stage: {msg}"
         );
     }
 
@@ -2326,7 +2769,11 @@ mod tests {
         merkle_garbage.extend_from_slice(&[0xAB; 63]);
 
         let result = verifier
-            .verify_payment(&xorname, Some(&merkle_garbage))
+            .verify_payment(
+                &xorname,
+                Some(&merkle_garbage),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert!(
@@ -2374,7 +2821,13 @@ mod tests {
         // verify_payment should process it through the single-node path.
         // It will fail at quote validation (fake pub_key), but we verify
         // it passes the deserialization stage by checking the error type.
-        let result = verifier.verify_payment(&xorname, Some(&tagged_bytes)).await;
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_bytes),
+                VerificationContext::ClientPut,
+            )
+            .await;
 
         assert!(result.is_err(), "Should fail at quote validation stage");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -2708,7 +3161,11 @@ mod tests {
         let wrong_xorname = [0xFFu8; 32];
 
         let result = verifier
-            .verify_payment(&wrong_xorname, Some(&tagged_proof))
+            .verify_payment(
+                &wrong_xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
             .await;
 
         assert!(
@@ -2736,7 +3193,9 @@ mod tests {
             bad_proof.push(0x00);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&bad_proof)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&bad_proof), VerificationContext::ClientPut)
+            .await;
 
         assert!(result.is_err(), "Should reject malformed merkle body");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -2903,7 +3362,9 @@ mod tests {
         let tagged =
             crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+            .await;
 
         assert!(
             result.is_err(),
@@ -2933,7 +3394,9 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged)).await;
+        let result = verifier
+            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+            .await;
 
         assert!(
             result.is_err(),
@@ -2969,7 +3432,13 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
 
         assert!(
             result.is_err(),
@@ -3004,7 +3473,13 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
 
         assert!(result.is_err(), "Should reject paid node address mismatch");
         let err_msg = format!("{}", result.expect_err("should fail"));
@@ -3034,7 +3509,13 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
 
         assert!(
             result.is_err(),
@@ -3068,7 +3549,13 @@ mod tests {
             verifier.pool_cache.lock().put(pool_hash, info);
         }
 
-        let result = verifier.verify_payment(&xorname, Some(&tagged_proof)).await;
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
 
         assert!(
             result.is_err(),

@@ -44,7 +44,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::payment::PaymentVerifier;
+use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::config::{
     max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
@@ -1151,9 +1151,18 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier.
+    // Gap 1: Validate PoP via PaymentVerifier. This is an already-settled
+    // receipt handed over by a neighbour, not a live sale — Replication
+    // context skips the storer-being-paid-now checks (own-quote price
+    // freshness, local recipient, merkle candidate closeness) that would
+    // otherwise reject every honest hand-over once counts grow, the close
+    // group churns, or the live DHT drifts from the pool's original sample.
     match payment_verifier
-        .verify_payment(&offer.key, Some(&offer.proof_of_payment))
+        .verify_payment(
+            &offer.key,
+            Some(&offer.proof_of_payment),
+            VerificationContext::Replication,
+        )
         .await
     {
         Ok(status) if status.can_store() => {
@@ -1266,9 +1275,14 @@ async fn handle_paid_notify(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier.
+    // Gap 1: Validate PoP via PaymentVerifier. Same as the fresh-offer path:
+    // a settled receipt, so Replication context (see VerificationContext).
     match payment_verifier
-        .verify_payment(&notify.key, Some(&notify.proof_of_payment))
+        .verify_payment(
+            &notify.key,
+            Some(&notify.proof_of_payment),
+            VerificationContext::Replication,
+        )
         .await
     {
         Ok(status) if status.can_store() => {
