@@ -2538,6 +2538,24 @@ async fn execute_single_fetch(
 // Audit result handler
 // ---------------------------------------------------------------------------
 
+/// Format the first confirmed-failed key as a 16-hex-char label.
+///
+/// Pairs with `challenged_peer` to form a stable cross-host correlation
+/// handle in the audit-failure log line, e.g.
+///
+/// ```text
+/// Audit failure for <peer>: …, `first_failed_key=0x18878f1d2d9e0612`
+/// ```
+///
+/// Falls back to `"0x"` when the list is empty so the log line never
+/// contains a misleading default.
+fn first_failed_key_label(confirmed_failed_keys: &[XorName]) -> String {
+    confirmed_failed_keys.first().map_or_else(
+        || "0x".to_string(),
+        |k| format!("0x{}", hex::encode(&k[..8])),
+    )
+}
+
 /// Handle audit result: log findings and emit trust events.
 async fn handle_audit_result(
     result: &AuditTickResult,
@@ -2573,8 +2591,9 @@ async fn handle_audit_result(
                 ..
             } = evidence
             {
+                let first_failed_key = first_failed_key_label(confirmed_failed_keys);
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}",
+                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
@@ -2650,7 +2669,7 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::audit_failure_clears_bootstrap_claim;
+    use super::{audit_failure_clears_bootstrap_claim, first_failed_key_label};
     use crate::replication::types::AuditFailureReason;
 
     #[test]
@@ -2673,5 +2692,41 @@ mod tests {
                 "decoded non-bootstrap failure {reason:?} should clear active claim"
             );
         }
+    }
+
+    #[test]
+    fn first_failed_key_label_truncates_to_16_hex_chars() {
+        // The high-order 8 bytes of the XorName determine the label so an
+        // operator can group audit-failures on the same chunk prefix.
+        let mut key = [0u8; 32];
+        key[0] = 0x18;
+        key[7] = 0xff;
+        // Low-order bytes (positions 8..32) are deliberately set to 0xAA
+        // to verify they are NOT included in the label.
+        for byte in &mut key[8..] {
+            *byte = 0xAA;
+        }
+        let label = first_failed_key_label(&[key]);
+        // Only the first 8 bytes are encoded, low-order bytes are dropped.
+        assert_eq!(label, "0x18000000000000ff");
+        assert_eq!(label.len(), "0x".len() + 16);
+    }
+
+    #[test]
+    fn first_failed_key_label_falls_back_when_empty() {
+        // Should never happen in production (handle_audit_failure rejects
+        // empty sets), but the formatter must still produce a valid label
+        // so the log line doesn't contain a misleading default.
+        assert_eq!(first_failed_key_label(&[]), "0x");
+    }
+
+    #[test]
+    fn first_failed_key_label_uses_first_key_only() {
+        let first = [0x11u8; 32];
+        let second = [0x22u8; 32];
+        assert_eq!(
+            first_failed_key_label(&[first, second]),
+            format!("0x{}", hex::encode(&first[..8]))
+        );
     }
 }
