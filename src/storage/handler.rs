@@ -243,7 +243,24 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Verify payment. This node is the storer being paid right now, so
+        // 4. Cheap disk-space pre-check — runs BEFORE the expensive payment
+        //    verification path (ML-DSA pool checks, a Kademlia closeness
+        //    lookup, and an on-chain Arbitrum RPC). A disk-full node can never
+        //    satisfy this PUT, so reject it here rather than burning that work
+        //    only to fail the reserve check inside `storage.put` (V2-411). The
+        //    check is cached (passing results only), so this is effectively
+        //    free per-PUT and still detects freed space promptly. The store
+        //    path keeps its own check as defence-in-depth.
+        if let Err(e) = self.storage.check_capacity() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                addr = %addr_hex,
+                "Rejecting PUT before payment verification: {e}"
+            );
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
+        }
+
+        // 5. Verify payment. This node is the storer being paid right now, so
         // the full ClientPut check set applies (own-quote price freshness,
         // local recipient, merkle candidate closeness).
         let payment_result = self
@@ -269,7 +286,7 @@ impl AntProtocol {
             }
         }
 
-        // 5. Store chunk
+        // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
                 let content_len = request.content.len();
@@ -281,7 +298,7 @@ impl AntProtocol {
                 // fallback path stays roughly accurate.
                 self.quote_generator.record_store();
 
-                // 6. Notify replication engine for fresh fan-out.
+                // 7. Notify replication engine for fresh fan-out.
                 //    Only emit when a real proof is present — cached-as-verified
                 //    PUTs have no proof to forward, and the chunk would have
                 //    already replicated on the original write that carried one.
@@ -528,10 +545,22 @@ mod tests {
     use tempfile::TempDir;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
+        // `test_default()` sets `disk_reserve: 0`, so the disk pre-check always
+        // passes for the regular tests.
+        create_test_protocol_with_reserve(0).await
+    }
+
+    /// Build a test protocol whose storage enforces the given disk reserve.
+    ///
+    /// A very large reserve (e.g. `u64::MAX`) makes `available < reserve`
+    /// always true, so the disk-space pre-check in `handle_put_inner` fails —
+    /// used to exercise the V2-411 early-return path.
+    async fn create_test_protocol_with_reserve(disk_reserve: u64) -> (AntProtocol, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
 
         let storage_config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
+            disk_reserve,
             ..LmdbStorageConfig::test_default()
         };
         let storage = Arc::new(
@@ -725,6 +754,56 @@ mod tests {
         } else {
             panic!("expected ChunkTooLarge error");
         }
+    }
+
+    /// V2-411: a disk-full node must reject a PUT with the disk-space error
+    /// *before* running payment verification.
+    ///
+    /// The chunk is intentionally **not** cache-inserted, so if the handler
+    /// reached `verify_payment` it would return `PaymentRequired`/`PaymentFailed`
+    /// (an uncached chunk with no proof). Observing the `StorageFailed` disk
+    /// error instead proves the disk pre-check short-circuited ahead of
+    /// verification — there is no on-chain path to reach.
+    #[tokio::test]
+    async fn test_put_rejected_on_insufficient_disk_before_verification() {
+        // u64::MAX reserve guarantees `available < reserve`, so the cached
+        // disk-space check always fails.
+        let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
+
+        let content = b"chunk for a disk-full node";
+        let address = LmdbStorage::compute_address(content);
+
+        let put_request = ChunkPutRequest::new(address, Bytes::copy_from_slice(content));
+        let put_msg = ChunkMessage {
+            request_id: 41,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+
+        let response_bytes = protocol
+            .try_handle_request(&put_bytes)
+            .await
+            .expect("handle put")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert_eq!(response.request_id, 41);
+        match response.body {
+            ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
+                ProtocolError::StorageFailed(msg),
+            )) => {
+                assert!(
+                    msg.contains("Insufficient disk space"),
+                    "expected disk-space error, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected StorageFailed disk error before verification, got: {other:?}")
+            }
+        }
+
+        // And nothing was stored.
+        assert!(!protocol.exists(&address).expect("exists check"));
     }
 
     #[tokio::test]
