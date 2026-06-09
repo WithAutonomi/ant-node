@@ -1,17 +1,55 @@
-//! Threat-model proof-of-concept tests for the v12 storage-bound audit
-//! design (`notes/security-findings-2026-05-22/proposal-gossip-audit-v12.md`).
+//! Threat-model proof-of-concept tests for the gossip-triggered
+//! contiguous-subtree storage audit (ADR-0002,
+//! `docs/adr/ADR-0002-gossip-triggered-contiguous-subtree-audit.md`).
 //!
-//! Each test models a specific attack from the original Finding-1 and
-//! Finding-2 reports (`notes/security-findings-2026-05-22/{01,02}-*.md`)
-//! and asserts that the v12 mechanisms reject it.
+//! Each test models a specific storage-binding attack from the security
+//! review that motivated ADR-0002 and asserts that the subtree-audit
+//! mechanisms reject it. This file is the single canonical place to look for
+//! "does the subtree audit actually close the storage-binding holes?" — each
+//! `#[test]` docstring describes the attack it closes.
 //!
-//! This file is the single canonical place to look for "does the
-//! storage-bound audit actually close Findings 1 and 2?" — each `#[test]`
-//! has a docstring linking the attack back to the original finding.
+//! ## How the auditor is modelled here
 //!
-//! Unit-level coverage of each gate in the verifier lives in
-//! `src/replication/commitment_audit.rs` and `src/replication/
-//! commitment_state.rs`. This file composes those gates end-to-end.
+//! The production auditor's `verify_subtree_response` (in
+//! `src/replication/storage_commitment_audit.rs`) is private, so this file
+//! reproduces the exact ordered gates it runs — pin, peer-id binding,
+//! signature, structural [`verify_subtree_proof`], then the **round-2 byte
+//! challenge**: the auditor demands the ORIGINAL chunk bytes for a
+//! nonce-selected sample of the just-proven leaves FROM THE RESPONDER and
+//! verifies the served content against each leaf's committed `bytes_hash`
+//! (content address) and `nonced_hash` (freshness). Possession is
+//! non-delegable: the auditor needs to hold NONE of the responder's chunks,
+//! and a committed key the responder cannot serve is a deterministic,
+//! confirmed failure (`DigestMismatch` in production — never inconclusive,
+//! never graced). The helper [`auditor_accepts`] runs these gates in the same
+//! order with the same failure semantics, so a reviewer can see each attack
+//! is caught at the same gate the network code would catch it.
+//!
+//! ## What changed from the old per-key audit (and why)
+//!
+//! The OLD audit named individual keys and sampled a per-key Merkle inclusion
+//! proof + digest. The subtree audit names NO keys: the nonce alone selects one
+//! contiguous subtree, the responder must expand it in full, and a few leaves
+//! are byte-checked. Consequently these per-key-only attacks were DROPPED — they
+//! have no analogue under subtree sampling:
+//!
+//!   * "key not in commitment" / overclaim-via-partial-commitment — the auditor
+//!     never names a key, so a responder can't be asked to prove an uncommitted
+//!     key; it proves whatever the nonce selects from its own committed tree.
+//!   * per-key digest order / per-key path tamper — replaced by the subtree
+//!     structural checks (leaf count, ascending order, cut-hash count, root
+//!     rebuild) and the per-leaf real-bytes spot-check.
+//!   * `RecentProvers` holder-credit revocation/rotation tests — those exercised
+//!     the cache binding, not the audit proof, and now live with the cache; the
+//!     subtree auditor credits per proven leaf (`AuditCredit`) but the credit
+//!     binding itself is unchanged and tested elsewhere.
+//!
+//! Attacks PRESERVED in spirit, ported to the subtree model: fresh-commitment
+//! substitution, cross-peer commitment substitution, throwaway-key
+//! substitution, wrong-signer, replay-under-fresh-nonce, repudiation of a
+//! recently gossiped pin, and the lazy/relay "holds addresses not bytes"
+//! fabricated-possession attack. Plus subtree-native structural attacks:
+//! tampered cut-hash, wrong leaf count, reordered leaves.
 
 #![allow(
     clippy::unwrap_used,
@@ -25,19 +63,17 @@
 )]
 
 use ant_node::replication::commitment::{
-    commitment_hash, leaf_hash, sign_commitment, verify_commitment_signature,
-    CommitmentBoundResult, MerkleTree, StorageCommitment,
+    commitment_hash, leaf_hash, sign_commitment, verify_commitment_signature, MerkleTree,
+    StorageCommitment,
 };
-use ant_node::replication::commitment_audit::{verify_commitment_bound_response, AuditVerifyError};
-use ant_node::replication::commitment_state::{
-    build_commitment_bound_audit_response, BuiltCommitment, CommitmentBoundOutcome,
-    ResponderCommitmentState,
+use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
+use ant_node::replication::config::AUDIT_SPOTCHECK_COUNT;
+use ant_node::replication::subtree::{
+    build_subtree_proof, nonced_leaf_hash, select_spotcheck_indices, select_subtree_path,
+    verify_subtree_proof, StructureVerdict, SubtreeProof,
 };
-use ant_node::replication::protocol::compute_audit_digest;
-use ant_node::replication::recent_provers::RecentProvers;
-use saorsa_core::identity::PeerId;
+use rand::Rng;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
-use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -47,26 +83,31 @@ fn keypair() -> (MlDsaPublicKey, MlDsaSecretKey) {
     ml_dsa_65().generate_keypair().unwrap()
 }
 
-fn content(byte: u8) -> Vec<u8> {
-    (0..256u32).map(|i| (i as u8) ^ byte).collect()
+/// Deterministic chunk bytes for key index `i`. The committed tree is built
+/// from `BLAKE3(content(i))`, so an honest proof — which hashes the same bytes —
+/// reconstructs the committed root and passes the real-bytes spot-check.
+fn content(i: u32) -> Vec<u8> {
+    let mut v = key(i).to_vec();
+    v.extend_from_slice(b"subtree-audit-chunk-body");
+    v.extend_from_slice(&i.to_le_bytes());
+    v
 }
 
-fn content_hash(byte: u8) -> [u8; 32] {
-    *blake3::hash(&content(byte)).as_bytes()
+fn content_hash(i: u32) -> [u8; 32] {
+    *blake3::hash(&content(i)).as_bytes()
 }
 
-fn key(byte: u8) -> [u8; 32] {
+/// Big-endian key so numeric order matches the MerkleTree sort order; this lets
+/// us reason about leaf positions when we tamper with them.
+fn key(i: u32) -> [u8; 32] {
     let mut k = [0u8; 32];
-    k[0] = byte;
+    k[..4].copy_from_slice(&i.to_be_bytes());
     k
 }
 
-fn peer_id(byte: u8) -> PeerId {
-    let mut bytes = [0u8; 32];
-    bytes[0] = byte;
-    PeerId::from_bytes(bytes)
-}
-
+/// A responder identity (real ML-DSA keypair) plus its retention state. Peer
+/// identity is derived from the public key exactly as in production
+/// (saorsa-core `peer_id_from_public_key` = `BLAKE3(pubkey_bytes)`).
 struct Responder {
     state: ResponderCommitmentState,
     public_key: MlDsaPublicKey,
@@ -75,13 +116,8 @@ struct Responder {
 }
 
 impl Responder {
-    fn new(_peer_byte: u8) -> Self {
+    fn new() -> Self {
         let (public_key, secret_key) = keypair();
-        // Gate 2c requires peer_id == BLAKE3(public_key_bytes). The
-        // _peer_byte parameter is kept for source-compat with existing
-        // tests but is no longer respected — peer identity is derived
-        // from the actual pubkey, as in production (saorsa-core
-        // `peer_id_from_public_key`).
         let peer_id_bytes = *blake3::hash(&public_key.to_bytes()).as_bytes();
         Self {
             state: ResponderCommitmentState::new(),
@@ -91,13 +127,10 @@ impl Responder {
         }
     }
 
-    /// Commit to the given set of (key, bytes_hash) entries and rotate
-    /// into `state.current`.
-    fn commit_to(&self, key_indices: &[u8]) {
-        let entries: Vec<_> = key_indices
-            .iter()
-            .map(|&i| (key(i), content_hash(i)))
-            .collect();
+    /// Commit to keys `[0, n)` and rotate that commitment into `current`.
+    /// Returns the new commitment hash.
+    fn commit_to_range(&self, n: u32) -> [u8; 32] {
+        let entries: Vec<_> = (0..n).map(|i| (key(i), content_hash(i))).collect();
         let built = BuiltCommitment::build(
             entries,
             &self.peer_id_bytes,
@@ -105,673 +138,519 @@ impl Responder {
             &self.public_key.to_bytes(),
         )
         .unwrap();
+        let h = built.hash();
         self.state.rotate(built);
-    }
-
-    fn current_hash(&self) -> [u8; 32] {
-        self.state.current().unwrap().hash()
-    }
-
-    fn build_response(
-        &self,
-        pinned_hash: &[u8; 32],
-        challenge_keys: &[[u8; 32]],
-        nonce: &[u8; 32],
-    ) -> CommitmentBoundOutcome {
-        build_commitment_bound_audit_response(
-            &self.state,
-            pinned_hash,
-            challenge_keys,
-            nonce,
-            &self.peer_id_bytes,
-            |k| {
-                // Responder serves whatever bytes it actually has,
-                // matched by key.
-                for byte in 0..=255u8 {
-                    if &key(byte) == k {
-                        return Some(content(byte));
-                    }
-                }
-                None
-            },
-        )
+        h
     }
 }
 
-/// Auditor verification — takes everything from the responder via the
-/// `CommitmentBoundOutcome::Built` arm and runs the real auditor's
-/// `verify_commitment_bound_response`. The responder's public key is now
-/// embedded in the commitment itself, so no external `responder_public_key`
-/// argument is needed.
-fn auditor_verifies(
-    responder_peer_id_bytes: &[u8; 32],
-    pinned_hash: &[u8; 32],
-    challenge_keys: &[[u8; 32]],
-    nonce: &[u8; 32],
-    response_commitment: &StorageCommitment,
-    response_per_key: &[CommitmentBoundResult],
-    auditor_local_bytes: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
-) -> Result<(), AuditVerifyError> {
-    verify_commitment_bound_response(
-        challenge_keys,
-        nonce,
-        responder_peer_id_bytes,
-        pinned_hash,
-        response_commitment,
-        response_per_key,
-        auditor_local_bytes,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Finding 1: Audit not storage-bound (lazy-node attacks)
-// ---------------------------------------------------------------------------
-
-/// Attack 1a (Finding 1, Path A): lazy node gossips a real commitment,
-/// drops the bytes, fetches them on demand at audit time, and computes
-/// the digest with its own peer ID + the fetched bytes. The PoC test
-/// in commitment_audit.rs proves the auditor's pin closes the variant
-/// where the lazy node tries to substitute a fresh commitment; this
-/// test composes the full flow.
-///
-/// Property: honest responder produces a response that the auditor
-/// accepts. Then a lazy responder with a *different* commitment tries
-/// to answer the same pin — auditor rejects.
-#[test]
-fn honest_responder_passes_audit_lazy_responder_fails() {
-    let nonce = [0xCD; 32];
-
-    // Honest: the responder gossiped this commitment, the auditor pinned
-    // its hash, and the responder still has all the bytes.
-    let honest = Responder::new(0xAB);
-    honest.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let pinned_hash = honest.current_hash();
-    let challenge_keys = vec![key(1), key(4), key(7)];
-
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = honest.build_response(&pinned_hash, &challenge_keys, &nonce)
-    else {
-        panic!("honest responder should produce Built");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        for byte in 1..=8u8 {
-            if &key(byte) == k {
-                return Some(content(byte));
-            }
+/// Bytes source for an HONEST responder: it really holds every chunk it
+/// committed to, so it can always produce a correct `nonced_hash`.
+fn honest_bytes(k: &[u8; 32]) -> Option<Vec<u8>> {
+    for i in 0..4096u32 {
+        if &key(i) == k {
+            return Some(content(i));
         }
-        None
-    };
+    }
+    None
+}
 
-    let result = auditor_verifies(
+/// The auditor's full ordered verification, mirroring the production
+/// `verify_subtree_response` gates. Returns `Ok(byte_checked_count)` on accept.
+///
+/// `responder_serves(k)` models round 2 (`SubtreeByteChallenge`): what the
+/// RESPONDER returns when the auditor demands the original bytes of sampled
+/// leaf `k`. `Some(bytes)` is a `SubtreeByteItem::Present`; `None` is an
+/// explicit `Absent` or an omitted key — a committed key the responder will
+/// not serve, which production `verify_byte_response` counts as a confirmed
+/// `DigestMismatch`. The auditor verifies the SERVED content, so it needs to
+/// hold none of the responder's chunks and no inconclusive lane exists.
+fn auditor_accepts(
+    challenged_peer_id: &[u8; 32],
+    expected_commitment_hash: &[u8; 32],
+    nonce: &[u8; 32],
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
+    responder_serves: impl Fn(&[u8; 32]) -> Option<Vec<u8>>,
+) -> Result<usize, AuditError> {
+    // -- Gate: pin + peer-id binding + signature ----------------------------
+    if commitment.sender_peer_id != *challenged_peer_id {
+        return Err(AuditError::SenderPeerIdMismatch);
+    }
+    let derived = *blake3::hash(&commitment.sender_public_key).as_bytes();
+    if derived != commitment.sender_peer_id {
+        return Err(AuditError::PeerIdKeyMismatch);
+    }
+    match commitment_hash(commitment) {
+        Some(h) if &h == expected_commitment_hash => {}
+        _ => return Err(AuditError::CommitmentHashMismatch),
+    }
+    if !verify_commitment_signature(commitment) {
+        return Err(AuditError::SignatureInvalid);
+    }
+
+    // -- Gate: structure ----------------------------------------------------
+    if let StructureVerdict::Invalid(why) = verify_subtree_proof(proof, nonce, commitment) {
+        return Err(AuditError::StructureInvalid(why));
+    }
+
+    // -- Gate: round-2 byte challenge (responder-served possession) ----------
+    // Mirrors `verify_subtree_response` round 2: the sample is chosen with FRESH
+    // randomness over the RECEIVED proof leaves (NOT nonce-derived), AFTER round
+    // 1, so the responder cannot predict which leaves will be opened (§1
+    // cut-and-choose soundness). EVERY sampled leaf must verify from the bytes
+    // the responder serves. There is no skip and no inconclusive lane: a
+    // committed key the responder cannot serve is a provable lie.
+    let spot = random_sample_indices(
+        proof.leaves.len(),
+        AUDIT_SPOTCHECK_COUNT.clamp(3, 5) as usize,
+    );
+    if spot.is_empty() {
+        // Cannot happen after a valid structure (the subtree is never empty),
+        // but mirror the production guard: never credit an unproven peer.
+        return Err(AuditError::StructureInvalid("empty spot-check sample"));
+    }
+    let mut checked = 0usize;
+    for idx in spot {
+        let leaf = proof
+            .leaves
+            .get(idx)
+            .ok_or(AuditError::StructureInvalid("spot index out of range"))?;
+        let Some(bytes) = responder_serves(&leaf.key) else {
+            // Absent/omitted committed key → confirmed failure (production
+            // maps this to `DigestMismatch`), NOT a skip.
+            return Err(AuditError::CommittedKeyUnserved);
+        };
+        let plain = *blake3::hash(&bytes).as_bytes();
+        let nonced = nonced_leaf_hash(nonce, &commitment.sender_peer_id, &leaf.key, &bytes);
+        if leaf.bytes_hash != plain || leaf.nonced_hash != nonced {
+            return Err(AuditError::RealBytesMismatch);
+        }
+        checked += 1;
+    }
+    Ok(checked)
+}
+
+/// `count` distinct random indices in `0..n` — the auditor's FRESH round-2
+/// sample, chosen after the proof is in hand (mirrors production
+/// `random_spotcheck_leaves`). Not nonce-derived: that is the whole point of
+/// the §1 fix.
+fn random_sample_indices(n: usize, count: usize) -> Vec<usize> {
+    if n == 0 {
+        return Vec::new();
+    }
+    let want = count.min(n);
+    let mut rng = rand::thread_rng();
+    let mut picked = std::collections::BTreeSet::new();
+    while picked.len() < want {
+        picked.insert(rng.gen_range(0..n));
+    }
+    picked.into_iter().collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuditError {
+    SenderPeerIdMismatch,
+    PeerIdKeyMismatch,
+    CommitmentHashMismatch,
+    SignatureInvalid,
+    StructureInvalid(&'static str),
+    /// Round 2: the responder served content that does not hash to the
+    /// committed address / freshness hash (production: `DigestMismatch`).
+    RealBytesMismatch,
+    /// Round 2: the responder would not serve a committed, sampled key
+    /// (production: `DigestMismatch` — a deterministic, confirmed failure).
+    CommittedKeyUnserved,
+}
+
+/// Build an honest subtree proof for `nonce` against the responder's current
+/// committed tree, returning `(proof, commitment)` as the auditor would receive
+/// them in a `SubtreeAuditResponse::Proof`.
+fn honest_proof_and_commitment(
+    r: &Responder,
+    nonce: &[u8; 32],
+) -> (SubtreeProof, StorageCommitment) {
+    let built = r.state.current().unwrap();
+    let proof = build_subtree_proof(built.tree(), nonce, &r.peer_id_bytes, honest_bytes).unwrap();
+    (proof, built.commitment().clone())
+}
+
+// ---------------------------------------------------------------------------
+// Sanity: the honest path the attack tests are measured against actually passes
+// ---------------------------------------------------------------------------
+
+/// Anchor: an honest responder that committed to its keys and still holds the
+/// bytes produces a proof the (modelled) auditor accepts. Without this, the
+/// rejection assertions below could pass vacuously.
+#[test]
+fn honest_responder_passes_audit() {
+    let nonce = [0xCD; 32];
+    let honest = Responder::new();
+    let pin = honest.commit_to_range(64);
+    let (proof, commitment) = honest_proof_and_commitment(&honest, &nonce);
+
+    let res = auditor_accepts(
         &honest.peer_id_bytes,
-        &pinned_hash,
-        &challenge_keys,
+        &pin,
         &nonce,
         &commitment,
-        &per_key,
-        auditor_local,
+        &proof,
+        honest_bytes,
     );
-    assert!(result.is_ok(), "honest path must pass: {result:?}");
+    assert!(res.is_ok(), "honest path must pass, got {res:?}");
+    assert!(res.unwrap() >= 1, "must byte-check at least one leaf");
+}
 
-    // Lazy: a different responder (different key set) tries to answer
-    // the same pin. The pin won't match their commitment — the responder
-    // helper returns UnknownCommitmentHash before it even tries to
-    // build proofs. (Models the "lazy node has no commitment for this
-    // pinned hash" case.)
-    let lazy = Responder::new(0xAB); // same peer_id_bytes, different key (different commitment).
-    lazy.commit_to(&[9, 10, 11]); // covers different keys.
+// ---------------------------------------------------------------------------
+// Storage-binding path A: lazy/relay node holds chunk ADDRESSES, not bytes
+// ---------------------------------------------------------------------------
 
-    let outcome = lazy.build_response(&pinned_hash, &challenge_keys, &nonce);
-    assert!(
-        matches!(outcome, CommitmentBoundOutcome::UnknownCommitmentHash),
-        "lazy responder with no matching commitment must return UnknownCommitmentHash, got {outcome:?}",
+/// Attack 1a (path A) — the storage-binding heart of the subtree
+/// audit. A lazy/relay node retained the gossiped commitment and knows every
+/// leaf's `bytes_hash` (that value IS the chunk's network address, which is
+/// public), but it DROPPED the actual bytes. It fabricates a proof: correct
+/// `key` and correct `bytes_hash` for every selected leaf (so the structural
+/// root rebuild passes), but it cannot compute the `nonced_hash`, which requires
+/// the real bytes under a fresh nonce. It fills in a forged `nonced_hash`.
+///
+/// The structural gate PASSES (addresses alone rebuild the root), proving that
+/// structure is NOT sufficient — exactly the storage-binding hole. Round 2 is what
+/// catches it: the auditor demands the original bytes FROM THE RELAY, and the
+/// relay has nothing to serve. Refusing/omitting a sampled committed key is a
+/// confirmed failure, and serving fabricated bytes cannot hash to the
+/// committed content address (a preimage break) — both lanes are asserted.
+#[test]
+fn relay_holding_only_addresses_caught_by_real_bytes_check() {
+    let nonce = [0x77; 32];
+    let honest_keyset = Responder::new();
+    let pin = honest_keyset.commit_to_range(100);
+    let built = honest_keyset.state.current().unwrap();
+
+    // The lazy node fabricates the proof from PUBLIC data only: it knows each
+    // leaf key and its bytes_hash (== address), but NOT the bytes, so it forges
+    // every nonced_hash.
+    let path = select_subtree_path(&nonce, built.commitment().key_count).unwrap();
+    let mut leaves = Vec::new();
+    for idx in path.leaf_start..path.leaf_end {
+        let k = built.tree().key_at(idx as usize).unwrap();
+        // bytes_hash is public (== the chunk address); the responder fakes the
+        // possession hash because it lacks the bytes.
+        let forged_nonced = *blake3::hash(b"i-do-not-have-the-bytes").as_bytes();
+        leaves.push(ant_node::replication::subtree::SubtreeLeaf {
+            key: k,
+            bytes_hash: content_hash(idx),
+            nonced_hash: forged_nonced,
+        });
+    }
+    // Real sibling cut-hashes from the committed tree (public, derivable).
+    let plan = ant_node::replication::subtree::subtree_plan(built.tree(), &nonce).unwrap();
+    let forged = SubtreeProof {
+        leaves,
+        sibling_cut_hashes: plan.sibling_cut_hashes,
+    };
+
+    // Structure alone PASSES — addresses are enough to rebuild the root. This
+    // is the precise reason structure is insufficient on its own.
+    assert_eq!(
+        verify_subtree_proof(&forged, &nonce, built.commitment()),
+        StructureVerdict::Valid,
+        "address-only proof rebuilds the root (structure cannot bind possession)"
+    );
+
+    // Lane 1: the relay cannot serve the sampled bytes (it holds none). An
+    // unserved committed key is a deterministic, confirmed failure.
+    let res = auditor_accepts(
+        &honest_keyset.peer_id_bytes,
+        &pin,
+        &nonce,
+        built.commitment(),
+        &forged,
+        |_k| None, // the relay has no bytes to serve
+    );
+    assert_eq!(
+        res,
+        Err(AuditError::CommittedKeyUnserved),
+        "a relay that cannot serve sampled bytes must fail round 2, got {res:?}"
+    );
+
+    // Lane 2: the relay serves fabricated bytes instead. They cannot hash to
+    // the committed content address, so the served-content check catches it.
+    let res = auditor_accepts(
+        &honest_keyset.peer_id_bytes,
+        &pin,
+        &nonce,
+        built.commitment(),
+        &forged,
+        |_k| Some(b"fabricated-not-the-chunk".to_vec()),
+    );
+    assert_eq!(
+        res,
+        Err(AuditError::RealBytesMismatch),
+        "fabricated served bytes must fail the content-address check, got {res:?}"
     );
 }
 
-/// Attack 1b (Finding 1, Path B): lazy node fabricates a fresh
-/// commitment and tries to substitute it into the response while the
-/// auditor's pin is for an older commitment. The auditor's gate-2
-/// commitment-hash pin closes this directly.
+/// Attack 1a' (§1 fix — the predict-and-fetch relay). The sharpest version of
+/// the relay attack, and the one the §1 review found: a relay holds only public
+/// addresses, but it knows the round-1 nonce, so under the OLD nonce-derived
+/// sampling it could compute EXACTLY which 3..=5 leaves round 2 would open,
+/// fetch only those few chunks from neighbours, fill in correct `nonced_hash`
+/// for them, and fabricate `nonced_hash` for every other leaf — passing the
+/// audit while holding almost nothing.
 ///
-/// This is the core property: forging a commitment AFTER the auditor
-/// pinned a different one cannot satisfy gate 2.
+/// With the fix, the auditor draws the sample with fresh randomness AFTER the
+/// proof is committed, so the relay's bet on the nonce-derived indices is
+/// uncorrelated with what actually gets opened. We model the relay holding the
+/// nonce-derived prediction set and nothing else: the random sample lands on a
+/// leaf the relay did NOT fetch with overwhelming probability, and the audit
+/// fails. Repeated across many nonces to make the probabilistic catch a
+/// near-certainty in aggregate.
+#[test]
+fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
+    let r = Responder::new();
+    let n: u32 = 400;
+    let pin = r.commit_to_range(n);
+    let built = r.state.current().unwrap();
+
+    let mut escaped = 0u32;
+    let trials = 200u32;
+    for t in 0..trials {
+        let mut nonce = [0u8; 32];
+        nonce[..4].copy_from_slice(&t.to_le_bytes());
+
+        // The relay builds a structurally-valid proof from PUBLIC data, forging
+        // every leaf's nonced_hash (it holds no bytes).
+        let plan = ant_node::replication::subtree::subtree_plan(built.tree(), &nonce).unwrap();
+        let path = select_subtree_path(&nonce, n).unwrap();
+        let mut leaves = Vec::new();
+        for idx in path.leaf_start..path.leaf_end {
+            let k = built.tree().key_at(idx as usize).unwrap();
+            leaves.push(ant_node::replication::subtree::SubtreeLeaf {
+                key: k,
+                bytes_hash: content_hash(idx),
+                nonced_hash: *blake3::hash(b"forged").as_bytes(),
+            });
+        }
+        let forged = SubtreeProof {
+            leaves,
+            sibling_cut_hashes: plan.sibling_cut_hashes,
+        };
+
+        // The relay PREDICTS the old nonce-derived sample and fetches exactly
+        // those chunks (correct bytes for them only).
+        let predicted: std::collections::HashSet<[u8; 32]> =
+            select_spotcheck_indices(&nonce, &path, AUDIT_SPOTCHECK_COUNT.clamp(3, 5))
+                .into_iter()
+                .filter_map(|i| forged.leaves.get(i as usize).map(|l| l.key))
+                .collect();
+
+        // Responder serves real bytes ONLY for the predicted set; everything
+        // else it cannot serve (it holds no other bytes).
+        let res = auditor_accepts(
+            &r.peer_id_bytes,
+            &pin,
+            &nonce,
+            built.commitment(),
+            &forged,
+            |k| {
+                // The relay can only serve bytes for the chunks it fetched (the
+                // predicted set); for those it returns the real content.
+                if predicted.contains(k) {
+                    (0..n).find(|&i| &key(i) == k).map(content)
+                } else {
+                    None
+                }
+            },
+        );
+        if res.is_ok() {
+            escaped += 1;
+        }
+    }
+    // The fresh-random sample must catch the predict-and-fetch relay in the
+    // overwhelming majority of audits (it only slips when the random sample
+    // happens to fall entirely inside the small predicted set — vanishingly
+    // rare and never sustained, since each audit redraws).
+    assert!(
+        escaped <= trials / 20,
+        "fresh-random sampling let the predict-and-fetch relay pass too often: \
+         {escaped}/{trials} (the §1 fix should make this ~0)"
+    );
+}
+
+/// Attack 1a, detection-probability framing: a responder that fabricates a
+/// FRACTION of leaves (holds some bytes, forged the rest) survives one audit
+/// only with probability `(1 - x)^k` over `k` byte-challenged leaves. Because
+/// the auditor now picks the sample with FRESH randomness after the proof is in
+/// hand (§1), the attacker cannot aim its forgeries away from the sample. We
+/// model the worst case for the attacker — every leaf's freshness forged — so
+/// any random sample is fatal; round 2 re-derives the freshness hash from the
+/// served bytes and exposes it.
+#[test]
+fn fabricated_fraction_is_caught_when_a_forged_leaf_is_sampled() {
+    let nonce = [0x31; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(400);
+    let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+
+    // Forge every leaf's nonced hash. Under fresh-random sampling the auditor
+    // is guaranteed to open a forged leaf, so the audit must fail.
+    for leaf in &mut proof.leaves {
+        leaf.nonced_hash[0] ^= 0xFF;
+    }
+
+    // Even if the responder serves the REAL bytes in round 2, the freshness
+    // hash recomputed from that served content exposes the forgery.
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        honest_bytes,
+    );
+    assert_eq!(
+        res,
+        Err(AuditError::RealBytesMismatch),
+        "a forged leaf landing under the byte challenge must fail, got {res:?}"
+    );
+}
+
+/// Attack 1a, non-delegable possession (the lane that replaced "inconclusive"):
+/// a relay returns a structurally-valid, address-only proof and the AUDITOR
+/// holds none of the chunks — the pre-ADR-0002 design had to call this
+/// inconclusive because it byte-checked against the auditor's own copies.
+/// Under the shipped two-round audit there is no such lane: round 2 demands
+/// the bytes from the RESPONDER, so auditor overlap is irrelevant and a relay
+/// that cannot serve its committed bytes fails DETERMINISTICALLY (a confirmed
+/// failure in production, not idle/inconclusive, and never a free pass).
+#[test]
+fn relay_unable_to_serve_bytes_fails_deterministically_regardless_of_auditor_overlap() {
+    let nonce = [0x19; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(100);
+    // Honest structure (real bytes existed at commit time), so round 1 passes;
+    // the point is the responder dropped the bytes and cannot serve them.
+    let (proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+
+    let relay_serves_nothing = |_k: &[u8; 32]| -> Option<Vec<u8>> { None };
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        relay_serves_nothing,
+    );
+    assert_eq!(
+        res,
+        Err(AuditError::CommittedKeyUnserved),
+        "an unserved sampled key ⇒ deterministic confirmed failure, got {res:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Storage-binding path B: fresh-commitment substitution
+// ---------------------------------------------------------------------------
+
+/// Attack 1b (path B): a responder builds a FRESH commitment over a
+/// different key set and answers with a valid proof against THAT commitment,
+/// while the auditor pinned the hash of the commitment the peer actually
+/// gossiped. The auditor's pin (`commitment_hash == expected_commitment_hash`)
+/// rejects the substitution before any structural work.
 #[test]
 fn fresh_commitment_substitution_rejected_by_pin() {
     let nonce = [0xCD; 32];
 
-    let original = Responder::new(0xAB);
-    original.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let pinned_hash = original.current_hash();
+    let original = Responder::new();
+    let pinned_hash = original.commit_to_range(64);
 
-    // Lazy node forges a NEW commitment over only the challenged keys
-    // (using all real bytes — they fetched on demand). The lazy node
-    // even uses the same peer_id_bytes as the original; the only
-    // difference is the key set, hence the new root, hence a different
-    // commitment_hash that won't match `pinned_hash`.
-    let lazy = Responder::new(0xAB);
-    lazy.commit_to(&[1]);
-    let lazy_hash = lazy.current_hash();
-    assert_ne!(pinned_hash, lazy_hash);
+    // Same peer rotates to a fresh commitment over a different range; it can
+    // build a perfectly valid proof against the NEW commitment.
+    let fresh_hash = original.commit_to_range(32);
+    assert_ne!(pinned_hash, fresh_hash);
+    let (proof, fresh_commitment) = honest_proof_and_commitment(&original, &nonce);
 
-    // Responder builds a response that *would* be valid against
-    // `lazy_hash`, then we feed it to the auditor pinned to
-    // `pinned_hash`.
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = lazy.build_response(&lazy_hash, &[key(1)], &nonce)
-    else {
-        panic!("lazy responder builds OK against its own hash");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        if k == &key(1) {
-            Some(content(1))
-        } else {
-            None
-        }
-    };
-
-    let result = auditor_verifies(
-        &lazy.peer_id_bytes,
-        &pinned_hash, // <-- ORIGINAL pin, not the fresh hash
-        &[key(1)],
+    // Auditor still pins the ORIGINAL hash.
+    let res = auditor_accepts(
+        &original.peer_id_bytes,
+        &pinned_hash, // <- original pin, not fresh_hash
         &nonce,
-        &commitment,
-        &per_key,
-        auditor_local,
+        &fresh_commitment,
+        &proof,
+        honest_bytes,
     );
-    assert!(
-        matches!(result, Err(AuditVerifyError::CommitmentHashMismatch)),
-        "auditor pin must reject fresh-commitment substitution, got {result:?}",
-    );
-}
-
-/// Attack 1c (Finding 1, Path C): lazy node gossips a real commitment
-/// over a *small* subset of keys, then claims it holds more via other
-/// channels (e.g. replica hints) and earns rewards for keys it never
-/// committed to.
-///
-/// The §6 holder cache binds credit to (peer, current_commitment_hash,
-/// key). A peer that didn't include K in its committed set cannot
-/// successfully prove K — gate "key not in commitment" rejects. With
-/// no proof, the cache never credits the peer for K.
-#[test]
-fn overclaim_via_partial_commitment_yields_no_holder_credit() {
-    let nonce = [0xCD; 32];
-
-    let lazy = Responder::new(0xAB);
-    // Lazy node only commits to key 1, but it really wanted credit for
-    // keys 1..=8.
-    lazy.commit_to(&[1]);
-    let pinned_hash = lazy.current_hash();
-
-    // The auditor challenges on a key the lazy node DIDN'T commit to.
-    let challenge_keys = [key(5)];
-    let outcome = lazy.build_response(&pinned_hash, &challenge_keys, &nonce);
-    assert!(
-        matches!(outcome, CommitmentBoundOutcome::KeyNotInCommitment { .. }),
-        "lazy responder cannot prove a key it didn't commit to, got {outcome:?}",
-    );
-
-    // The auditor maps `KeyNotInCommitment` to a Rejected response —
-    // no successful proof, no `recent_provers` insertion, so the
-    // holder-cache predicate denies credit.
-    let cache = RecentProvers::new();
-    // The auditor never calls record_proof for key 5 because the
-    // verification never succeeded.
-    assert!(!cache.is_credited_holder(&key(5), &peer_id(0xAB), &pinned_hash));
-}
-
-/// Attack 1d (Finding 1, Path D): lazy node tries to ROTATE its
-/// commitment between the auditor's challenge issue and the response.
-/// v6/v12 §4 retention guarantees the responder can answer audits
-/// pinned to either current or previous, so a single rotation is
-/// answerable. But after two rotations the original commitment is
-/// gone — and the responder correctly returns UnknownCommitmentHash,
-/// which under v12 §5 is conditionally interpreted by the auditor.
-///
-/// This test pins the retention invariant: pin to commitment-N, then
-/// rotate twice. The responder must NOT be able to answer (the old
-/// commitment is contractually allowed to be dropped) AND the auditor
-/// can detect this via the structural response.
-#[test]
-fn responder_drops_old_commitment_past_retention_window() {
-    let nonce = [0xCD; 32];
-
-    let responder = Responder::new(0xAB);
-
-    // Commitment 1.
-    responder.commit_to(&[1, 2, 3]);
-    let h1 = responder.current_hash();
-
-    // Round-11 widened retention to 4 slots (covers ~4h with the 1h
-    // rotation cadence). Rotate 4 more times → h1 ages out.
-    for batch_size in 4..=8u8 {
-        let keys: Vec<u8> = (1..=batch_size).collect();
-        responder.commit_to(&keys);
-    }
-
-    let outcome = responder.build_response(&h1, &[key(1)], &nonce);
-    assert!(
-        matches!(outcome, CommitmentBoundOutcome::UnknownCommitmentHash),
-        "h1 must be unreachable after RETAINED_COMMITMENT_SLOTS rotations, got {outcome:?}",
-    );
-}
-
-/// Attack 1e (Finding 1): replay an old audit response. Since the
-/// digest binds the per-challenge nonce, a fresh challenge with a new
-/// nonce makes a stale response invalid.
-#[test]
-fn audit_response_replay_blocked_by_fresh_nonce() {
-    let original_nonce = [0xCD; 32];
-    let fresh_nonce = [0xEF; 32];
-
-    let responder = Responder::new(0xAB);
-    responder.commit_to(&[1, 2, 3]);
-    let pinned_hash = responder.current_hash();
-
-    // Responder produces a valid response under the ORIGINAL nonce.
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = responder.build_response(&pinned_hash, &[key(1)], &original_nonce)
-    else {
-        panic!("build OK");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        if k == &key(1) {
-            Some(content(1))
-        } else {
-            None
-        }
-    };
-
-    // Auditor's FRESH challenge has `fresh_nonce`. Replaying the OLD
-    // response (with `original_nonce`-derived digest) must fail.
-    let result = auditor_verifies(
-        &responder.peer_id_bytes,
-        &pinned_hash,
-        &[key(1)],
-        &fresh_nonce, // <-- different nonce
-        &commitment,
-        &per_key,
-        auditor_local,
-    );
-    assert!(
-        matches!(result, Err(AuditVerifyError::DigestMismatch { .. })),
-        "replay must fail digest check under fresh nonce, got {result:?}",
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Finding 2 ingredients: bootstrap-claim shield foundation
-// ---------------------------------------------------------------------------
-//
-// Finding 2 (bootstrap-claim audit shield) is closed in v12 §3+§6 by:
-//   - A peer that never gossipped a commitment has commitment_capable
-//     = false; auditor refuses to credit it as a holder.
-//   - The cache binds credit to (peer, current_commitment_hash, key),
-//     so a peer with no commitment has no current hash and credit is
-//     impossible.
-//
-// Full integration (the gossip emit + audit cadence trigger) lands in
-// phase 3. Here we prove the *cache-side* property: no commitment hash
-// ⇒ no credit.
-
-/// A confirmed audit FAILURE revokes the peer's holder credit
-/// immediately, rather than letting it linger for the proof TTL.
-///
-/// This is the cache-side property the auditor's `Failed`-result
-/// handler relies on (`handle_audit_result` → `forget_peer` on any
-/// non-`Timeout` `AuditFailureReason`): a peer that dropped bytes and
-/// got caught (DigestMismatch / "missing bytes for committed key")
-/// loses §6 credit at once. Records a genuine credit, then applies the
-/// exact revocation the handler performs, and asserts credit is gone —
-/// the assertion flips if the revocation is removed (it is NOT a
-/// vacuous empty-cache check).
-#[test]
-fn confirmed_audit_failure_revokes_holder_credit() {
-    let mut cache = RecentProvers::new();
-    let now = Instant::now();
-    let p = peer_id(0xAB);
-    let h = [0xAB; 32];
-    // Peer earned credit for two keys under commitment hash h.
-    cache.record_proof(key(1), p, h, now);
-    cache.record_proof(key(2), p, h, now);
-    assert!(
-        cache.is_credited_holder(&key(1), &p, &h) && cache.is_credited_holder(&key(2), &p, &h),
-        "precondition: peer is credited before the failed audit"
-    );
-
-    // The auditor confirms an audit failure (DigestMismatch / missing
-    // bytes). `handle_audit_result` drops the peer's credit via
-    // `forget_peer`.
-    cache.forget_peer(&p);
-
-    assert!(
-        !cache.is_credited_holder(&key(1), &p, &h) && !cache.is_credited_holder(&key(2), &p, &h),
-        "a confirmed audit failure must strip the peer's holder credit immediately"
-    );
-}
-
-/// A peer with no recent commitment (never gossipped) is not credited.
-/// Baseline empty-cache property — kept distinct from the revocation
-/// test above so each asserts one thing.
-#[test]
-fn silent_peer_earns_no_credit() {
-    let cache = RecentProvers::new();
-    assert!(!cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0; 32]));
-}
-
-/// A peer that rotated their commitment between proof and credit-check
-/// loses credit (the v12 §6 hash-binding lever). The lazy-node "drop
-/// bytes, gossip new commitment, hope auditor doesn't notice" attack
-/// is closed here.
-#[test]
-fn rotated_commitment_drops_holder_credit() {
-    let mut cache = RecentProvers::new();
-    let now = Instant::now();
-    cache.record_proof(key(1), peer_id(7), [0xAB; 32], now);
-    assert!(cache.is_credited_holder(&key(1), &peer_id(7), &[0xAB; 32]));
-    // The auditor's view of "P's current commitment" has now changed
-    // (e.g. P gossipped a new commitment that the auditor stored).
-    // The old cache entry no longer matches; credit is denied.
-    assert!(!cache.is_credited_holder(&key(1), &peer_id(7), &[0xCD; 32]));
-}
-
-// ---------------------------------------------------------------------------
-// Wire-substitution / signature-forgery sanity
-// ---------------------------------------------------------------------------
-
-/// A response carrying a commitment signed by the WRONG key (somebody
-/// else's keypair) is rejected at the signature gate.
-///
-/// Since the public key is now embedded in the commitment AND must hash
-/// to sender_peer_id (gate 2c), isolating the signature gate is fiddly.
-/// The construction here: swap the embedded pubkey to one whose
-/// signature would NOT verify under the actual signed payload, AND
-/// update peer_id to BLAKE3(swapped pubkey) so gate 2c passes, AND
-/// re-pin the auditor + the challenged peer to the new identity. Then
-/// gate 3 (signature) is the only remaining gate that can fail.
-#[test]
-fn wrong_signer_rejected_at_signature_gate() {
-    let nonce = [0xCD; 32];
-    let (wrong_public_key, _) = keypair();
-    let wrong_pk_bytes = wrong_public_key.to_bytes();
-    let wrong_peer_id = *blake3::hash(&wrong_pk_bytes).as_bytes();
-
-    let responder = Responder::new(0xAB);
-    responder.commit_to(&[1, 2, 3]);
-    let pinned_hash = responder.current_hash();
-
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = responder.build_response(&pinned_hash, &[key(1)], &nonce)
-    else {
-        panic!("build OK");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        if k == &key(1) {
-            Some(content(1))
-        } else {
-            None
-        }
-    };
-
-    // Swap both the embedded pubkey AND sender_peer_id so gate 2c
-    // passes; pin to the new commitment hash so gate 2b passes; then
-    // gate 3 is the only failure path because the signature was signed
-    // under responder.secret_key, not the wrong key.
-    let mut bad_commit = commitment.clone();
-    bad_commit.sender_public_key = wrong_pk_bytes;
-    bad_commit.sender_peer_id = wrong_peer_id;
-    let new_pin = commitment_hash(&bad_commit).unwrap();
-
-    // Per-key digest also bound the original challenged_peer_id; rebuild
-    // it under the new wrong_peer_id so gate 4 (digest) wouldn't trip
-    // first.
-    let mut bad_per_key = per_key.clone();
-    bad_per_key[0].digest = compute_audit_digest(&nonce, &wrong_peer_id, &key(1), &content(1));
-
-    let result = auditor_verifies(
-        &wrong_peer_id, // challenged peer == new (wrong) peer_id
-        &new_pin,
-        &[key(1)],
-        &nonce,
-        &bad_commit,
-        &bad_per_key,
-        auditor_local,
-    );
-    assert!(
-        matches!(result, Err(AuditVerifyError::SignatureInvalid)),
-        "swapped embedded key must trip signature gate, got {result:?}",
-    );
-}
-
-/// Attack 1a' (Finding 1, Path A — the ACTUAL on-demand fetch under
-/// the original pin): the lazy node retains its gossiped commitment
-/// but dropped the bytes. At audit time the lazy node fetches the
-/// bytes from honest neighbours and answers with a VALID proof against
-/// its OWN original commitment (same pin, same root). The auditor
-/// accepts.
-///
-/// This is the "lazy node strictly dominated by economic cost"
-/// property v12 admits: the pin defeats cross-commitment substitution
-/// (covered by `fresh_commitment_substitution_rejected_by_pin` above)
-/// but does NOT prevent a node that gossiped a real commitment from
-/// answering audits via on-demand fetch. Closing this is bandwidth
-/// economics (cost-per-audit > cost-of-storing), not cryptography.
-///
-/// **Setup to make the attack structurally distinct from the honest
-/// path**: the lazy responder's commitment is built from a fixed key
-/// set at gossip time (it HAD bytes then, per the v12 protocol
-/// invariant — you cannot compute leaf hashes without bytes). After
-/// that, we build the audit response **bypassing the responder's own
-/// `ResponderCommitmentState`** and instead **manually constructing
-/// the per-key proof entries from an alternate bytes source** that
-/// represents fetched-on-demand bytes from a neighbour. This is
-/// observationally indistinguishable from honest storage from the
-/// auditor's perspective — which is exactly the point.
-///
-/// Pinning this test means: any future "we somehow close Path A
-/// without bandwidth economics" claim must update this test to assert
-/// the new defence (i.e. this test must FAIL after such a fix).
-#[test]
-fn on_demand_fetch_under_original_pin_succeeds_documenting_v12_limit() {
-    use ant_node::replication::commitment::leaf_hash;
-    let nonce = [0xCD; 32];
-
-    // Lazy node gossipped a commitment over its full claimed set at
-    // gossip time. The protocol invariant guarantees it had the bytes
-    // then (leaf_hash requires bytes_hash).
-    let lazy = Responder::new(0xAB);
-    lazy.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let pinned_hash = lazy.current_hash();
-    let challenge_keys = vec![key(3)];
-
-    // ATTACK MODEL: lazy node has DROPPED its local bytes for key 3.
-    // To audit, it must fetch from a "neighbour" — modeled as an
-    // alternate bytes source that the lazy node didn't have at
-    // challenge-receive time but obtains during the audit window.
-    //
-    // We construct the audit response by hand using the alternate
-    // bytes source. This bypasses Responder::build_response (which
-    // would use the lazy node's own bytes via the closure that always
-    // returns content(byte)) — making the fetched-vs-stored
-    // distinction observable in the test setup even though it's
-    // unobservable to the auditor on the wire.
-    let neighbour_fetched_bytes_for_key_3 = content(3);
-
-    // Pull the lazy node's original commitment + proof structure for
-    // key 3 from its retained state.
-    let built = lazy.state.lookup_by_hash(&pinned_hash).expect("retained");
-    let (path, leaf_index) = built.proof_for(&key(3)).expect("key in commitment");
-    let bytes_hash = *blake3::hash(&neighbour_fetched_bytes_for_key_3).as_bytes();
-
-    // Confirm the bytes_hash from "fetched" bytes equals what the
-    // commitment leaf expects (since the commitment was honest at
-    // gossip time, the bytes_hash field is the SAME regardless of
-    // whether the bytes are local or fetched — that's the auditor's
-    // blind spot).
-    let expected_leaf = leaf_hash(&key(3), &bytes_hash);
-    let from_commitment = leaf_hash(&key(3), &content_hash(3));
     assert_eq!(
-        expected_leaf, from_commitment,
-        "fetched bytes produce the same leaf hash as locally-stored bytes (the v12 blind spot)"
-    );
-
-    let digest = ant_node::replication::protocol::compute_audit_digest(
-        &nonce,
-        &lazy.peer_id_bytes,
-        &key(3),
-        &neighbour_fetched_bytes_for_key_3,
-    );
-    let per_key = vec![CommitmentBoundResult {
-        key: key(3),
-        digest,
-        bytes_hash,
-        leaf_index,
-        path,
-    }];
-
-    // Auditor verifies. It has its own copy of the bytes (only
-    // commitment-audits keys it holds, per v12).
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        if k == &key(3) {
-            Some(content(3))
-        } else {
-            None
-        }
-    };
-    let result = auditor_verifies(
-        &lazy.peer_id_bytes,
-        &pinned_hash,
-        &challenge_keys,
-        &nonce,
-        built.commitment(),
-        &per_key,
-        auditor_local,
-    );
-
-    // VERDICT: the audit PASSES. The lazy node sourced bytes from a
-    // neighbour (modeled by `neighbour_fetched_bytes_for_key_3` being
-    // a separate local that is then THROWN AWAY — the actual lazy node
-    // doesn't have those bytes after the audit ends). The verifier
-    // has no way to distinguish this from honest storage. Mick's
-    // design note in #02_network on 2026-05-21 explicitly anchors
-    // this: "harder to fight against when there are few chunks per
-    // node... the more chunks in an audit, the harder it will become
-    // to fetch them all on-demand within the time frame." Bandwidth
-    // economics is the lever, not the audit cryptography.
-    assert!(
-        result.is_ok(),
-        "on-demand-fetch attack with valid original commitment + alternate bytes source \
-         passes the v12 verifier — this is by design. v12 is an economic, not \
-         cryptographic, defence against Path A. result: {result:?}",
+        res,
+        Err(AuditError::CommitmentHashMismatch),
+        "fresh-commitment substitution must trip the pin, got {res:?}"
     );
 }
 
-/// Attack 1f (Finding 1 — peer impersonation via cross-peer
-/// commitment substitution): the lazy node lifts a signed commitment
-/// from another peer P' (e.g. observed in gossip) and embeds it in
-/// its own audit response, hoping the auditor verifies the signature
-/// against P''s public key by mistake. Gate 2a (sender_peer_id ==
-/// challenged_peer_id) rejects this before any signature work.
+// ---------------------------------------------------------------------------
+// Storage-binding path C: cross-peer commitment substitution
+// ---------------------------------------------------------------------------
+
+/// Attack 1c (peer impersonation): peer Q lifts peer P's signed
+/// commitment from gossip and embeds it in its own response, hoping the auditor
+/// verifies P's signature by mistake. The auditor binds the commitment's
+/// `sender_peer_id` to the challenged peer; the stolen commitment names P, not
+/// Q, so it is rejected before any signature/structure work.
 #[test]
 fn cross_peer_commitment_substitution_rejected_by_sender_id() {
     let nonce = [0xCD; 32];
 
-    // Peer P with a real signed commitment.
-    let real_p = Responder::new(0xAA);
-    real_p.commit_to(&[1, 2, 3]);
-    let p_hash = real_p.current_hash();
+    let real_p = Responder::new();
+    let p_hash = real_p.commit_to_range(64);
+    let (p_proof, p_commitment) = honest_proof_and_commitment(&real_p, &nonce);
 
-    // Auditor is challenging peer Q (different peer_id_bytes) but
-    // somehow has p_hash in its pin (modelling a mis-binding bug).
-    // Q's public key, P's signed commitment.
-    let q_peer_id_bytes = [0xCC; 32];
-
-    // Q builds a response that contains P's commitment (lifted from
-    // gossip). The path/digests/bytes happen to be valid for P's
-    // commitment over P's key 1.
-    let CommitmentBoundOutcome::Built {
-        commitment: stolen_commitment,
-        per_key,
-    } = real_p.build_response(&p_hash, &[key(1)], &nonce)
-    else {
-        panic!("real_p builds OK against its own pin");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        if k == &key(1) {
-            Some(content(1))
-        } else {
-            None
-        }
-    };
-
-    // Auditor challenged Q but the response carries P's commitment.
-    // sender_peer_id in the commitment is P's (0xAA), not Q's (0xCC).
-    // Gate 2a rejects.
-    let result = auditor_verifies(
-        &q_peer_id_bytes, // challenged peer
+    // Auditor is challenging Q (a different peer id) but somehow holds p_hash in
+    // its pin (modelling a mis-binding); Q replays P's commitment + proof.
+    let q_peer_id = [0xCC; 32];
+    let res = auditor_accepts(
+        &q_peer_id, // challenged peer is Q
         &p_hash,
-        &[key(1)],
         &nonce,
-        &stolen_commitment, // sender_peer_id = 0xAA, not 0xCC
-        &per_key,
-        auditor_local,
+        &p_commitment, // sender_peer_id == P, not Q
+        &p_proof,
+        honest_bytes,
     );
-    assert!(
-        matches!(result, Err(AuditVerifyError::SenderPeerIdMismatch)),
-        "cross-peer substitution must trip gate 2a, got {result:?}",
+    assert_eq!(
+        res,
+        Err(AuditError::SenderPeerIdMismatch),
+        "cross-peer substitution must trip the sender-id binding, got {res:?}"
     );
 }
 
-/// Attack 1f': throwaway-key substitution. An adversary controls the
-/// peer at peer_id P. They build a commitment, fill in P's peer_id, but
-/// embed a *different* (throwaway) public key whose secret they hold.
-/// The signature verifies under the throwaway key (gate 3). Without
-/// gate 2c, the audit would accept this as a valid claim from P even
-/// though the throwaway key has no relationship to P's identity.
-///
-/// Gate 2c (peer_id == BLAKE3(embedded_pubkey)) rejects this. saorsa-
-/// core derives PeerId from the public key bytes; any commitment whose
-/// embedded pubkey doesn't match the claimed peer_id is malformed.
+/// Attack 1c': throwaway-key substitution. An adversary wants to answer as peer
+/// P (whose pubkey it does NOT control). It builds a commitment naming P's
+/// peer_id but embedding a throwaway pubkey it can sign with — the signature
+/// verifies under the embedded key. The peer-id↔key binding
+/// (`peer_id == BLAKE3(embedded_pubkey)`) rejects it: the embedded throwaway key
+/// does not hash to P's peer_id.
 #[test]
 #[allow(clippy::similar_names)]
 fn throwaway_key_substitution_rejected_by_pubkey_binding() {
     let nonce = [0xCD; 32];
 
-    // Adversary wants to impersonate peer P. Compute P's peer_id from a
-    // legitimate pubkey (which the adversary does NOT control).
-    let (p_pubkey, _) = keypair();
+    // P's real identity (adversary does not hold P's secret key).
+    let (p_pubkey, _p_secret) = keypair();
     let p_peer_id = *blake3::hash(&p_pubkey.to_bytes()).as_bytes();
 
-    // They build a fresh throwaway keypair and sign with it.
+    // Adversary's throwaway keypair.
     let (throwaway_pk, throwaway_sk) = keypair();
     let throwaway_pk_bytes = throwaway_pk.to_bytes();
 
-    // Build a commitment claiming P's peer_id but embedding the throwaway
-    // pubkey. Sign under the throwaway secret. The signature verifies
-    // under the embedded throwaway key.
-    let entries = vec![(key(1), content_hash(1))];
+    // Build a commitment naming P's peer_id but embedding+signing with the
+    // throwaway key.
+    let entries: Vec<_> = (0..8u32).map(|i| (key(i), content_hash(i))).collect();
     let tree = MerkleTree::build(entries).unwrap();
     let root = tree.root();
-    let path = tree.path_for(&key(1)).unwrap();
     let key_count = tree.key_count();
     let sig = sign_commitment(
         &throwaway_sk,
         &root,
         key_count,
-        &p_peer_id, // P's peer_id (LIE)
+        &p_peer_id, // claims P (the lie)
         &throwaway_pk_bytes,
     )
     .unwrap();
@@ -779,202 +658,274 @@ fn throwaway_key_substitution_rejected_by_pubkey_binding() {
         root,
         key_count,
         sender_peer_id: p_peer_id,
-        sender_public_key: throwaway_pk_bytes.clone(),
+        sender_public_key: throwaway_pk_bytes,
         signature: sig,
     };
-
     let pin = commitment_hash(&bad_commit).unwrap();
-    let per_key = vec![CommitmentBoundResult {
-        key: key(1),
-        digest: compute_audit_digest(&nonce, &p_peer_id, &key(1), &content(1)),
-        bytes_hash: content_hash(1),
-        leaf_index: 0,
-        path,
-    }];
 
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> { (k == &key(1)).then(|| content(1)) };
+    // A perfectly valid proof against the bad commitment's own tree.
+    let proof = build_subtree_proof(&tree, &nonce, &p_peer_id, honest_bytes).unwrap();
 
-    let result = auditor_verifies(
-        &p_peer_id, // challenged peer is P
-        &pin,
-        &[key(1)],
+    let res = auditor_accepts(&p_peer_id, &pin, &nonce, &bad_commit, &proof, honest_bytes);
+    assert_eq!(
+        res,
+        Err(AuditError::PeerIdKeyMismatch),
+        "throwaway-key attack must trip the peer-id↔key binding, got {res:?}"
+    );
+}
+
+/// Attack 1c'' — wrong signer at the signature gate. To isolate the signature
+/// gate from the bindings above, the adversary swaps BOTH the embedded pubkey
+/// and the sender_peer_id to a consistent (wrong) identity, and re-pins the
+/// auditor to the mutated commitment. Now the peer-id binding and pin pass, but
+/// the signature was produced under the ORIGINAL secret key over the ORIGINAL
+/// payload — it cannot verify under the swapped key.
+#[test]
+fn wrong_signer_rejected_at_signature_gate() {
+    let nonce = [0xCD; 32];
+
+    let responder = Responder::new();
+    responder.commit_to_range(16);
+    let (proof, commitment) = honest_proof_and_commitment(&responder, &nonce);
+
+    let (wrong_pk, _wrong_sk) = keypair();
+    let wrong_pk_bytes = wrong_pk.to_bytes();
+    let wrong_peer_id = *blake3::hash(&wrong_pk_bytes).as_bytes();
+
+    let mut bad_commit = commitment.clone();
+    bad_commit.sender_public_key = wrong_pk_bytes;
+    bad_commit.sender_peer_id = wrong_peer_id;
+    let new_pin = commitment_hash(&bad_commit).unwrap();
+
+    // The proof's leaves bind the ORIGINAL peer_id in their nonced hashes, but
+    // the signature gate fires BEFORE the structural/real-bytes gates, so it is
+    // the first (and asserted) failure.
+    let res = auditor_accepts(
+        &wrong_peer_id,
+        &new_pin,
         &nonce,
         &bad_commit,
-        &per_key,
-        auditor_local,
+        &proof,
+        honest_bytes,
     );
-    assert!(
-        matches!(result, Err(AuditVerifyError::SenderPeerIdMismatch)),
-        "throwaway-key attack must trip gate 2c, got {result:?}",
+    assert_eq!(
+        res,
+        Err(AuditError::SignatureInvalid),
+        "swapped embedded key must trip the signature gate, got {res:?}"
     );
-}
-
-/// Attack 1g (overclaim, end-to-end via real audit flow): the lazy
-/// node gossips a commitment over a small key set (just key 1), but
-/// in a real network might claim more via replication hints. The
-/// auditor's challenge on key 5 — which is NOT in the lazy node's
-/// commitment — is correctly handled: the responder returns
-/// `KeyNotInCommitment` (caller maps to `Rejected`), and the
-/// auditor's holder cache predicate correctly denies credit because
-/// no `record_proof` is ever issued for (peer, key 5, hash).
-///
-/// This is stronger than the earlier vacuous version because it
-/// composes the full responder helper + cache predicate.
-#[test]
-fn overclaim_via_partial_commitment_end_to_end_no_credit() {
-    let nonce = [0xCD; 32];
-
-    let lazy = Responder::new(0xAB);
-    lazy.commit_to(&[1]); // claims only key 1
-    let pinned_hash = lazy.current_hash();
-
-    // Auditor challenges key 5 — not committed.
-    let outcome = lazy.build_response(&pinned_hash, &[key(5)], &nonce);
-    assert!(
-        matches!(outcome, CommitmentBoundOutcome::KeyNotInCommitment { .. }),
-        "responder must reject key not in commitment, got {outcome:?}",
-    );
-
-    // Simulate the auditor's flow: it receives Rejected
-    // (KeyNotInCommitment); does NOT record_proof; cache stays empty
-    // for (peer, key 5). The credit predicate correctly denies.
-    let mut cache = RecentProvers::new();
-    // No record_proof call — that's the auditor's flow when it sees
-    // any non-successful outcome.
-
-    // For contrast, prove the cache DOES credit when a successful
-    // proof IS recorded — so the predicate is meaningful, not
-    // trivially false.
-    cache.record_proof(key(1), peer_id(0xAB), pinned_hash, Instant::now());
-    assert!(
-        cache.is_credited_holder(&key(1), &peer_id(0xAB), &pinned_hash),
-        "cache predicate is meaningful: successful proof yields credit"
-    );
-
-    // And the lazy node STILL has no credit for key 5 (because no
-    // proof was ever recorded for it).
-    assert!(
-        !cache.is_credited_holder(&key(5), &peer_id(0xAB), &pinned_hash),
-        "key 5 was never proved → no credit, despite a successful proof for key 1"
-    );
-}
-
-/// `forget_commitment` semantics primitive: the v12 §5 conditional
-/// invalidation handler will live at a higher layer (phase 3:
-/// auditor coordinator that owns `last_commitment` per peer). The
-/// underlying primitive — drop cache entries pinned to a specific
-/// hash without touching entries for other hashes — is the building
-/// block. This test pins that primitive's contract.
-#[test]
-fn forget_commitment_only_drops_matching_hash() {
-    let mut cache = RecentProvers::new();
-    let now = Instant::now();
-
-    // P proves K1 under C1, then K1 under C2 (modelling rotation),
-    // then K2 under C1. (Last is unusual but exercises the
-    // "different key same hash" case.)
-    cache.record_proof(key(1), peer_id(0xAB), [0xAA; 32], now);
-    cache.record_proof(key(1), peer_id(0xAB), [0xBB; 32], now);
-    cache.record_proof(key(2), peer_id(0xAB), [0xAA; 32], now);
-
-    // Auditor invalidates C1 (e.g. received UnknownCommitmentHash
-    // for C1 from this peer).
-    cache.forget_commitment(&[0xAA; 32]);
-
-    // C1 entries for both keys are gone.
-    assert!(!cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0xAA; 32]));
-    assert!(!cache.is_credited_holder(&key(2), &peer_id(0xAB), &[0xAA; 32]));
-    // C2 entry survives.
-    assert!(cache.is_credited_holder(&key(1), &peer_id(0xAB), &[0xBB; 32]));
-}
-
-/// Sanity: the four foundational hashes (leaf, node, commitment_hash,
-/// signature) are independent — none of them alone is sufficient.
-#[test]
-fn each_gate_fires_independently() {
-    let nonce = [0xCD; 32];
-    let responder = Responder::new(0xAB);
-    responder.commit_to(&[1, 2, 3, 4, 5, 6, 7, 8]);
-    let pinned_hash = responder.current_hash();
-
-    let CommitmentBoundOutcome::Built {
-        commitment,
-        per_key,
-    } = responder.build_response(&pinned_hash, &[key(1)], &nonce)
-    else {
-        panic!("build OK");
-    };
-
-    let auditor_local = |k: &[u8; 32]| -> Option<Vec<u8>> {
-        for byte in 1..=8u8 {
-            if &key(byte) == k {
-                return Some(content(byte));
-            }
-        }
-        None
-    };
-
-    // Baseline: valid.
-    let ok = auditor_verifies(
-        &responder.peer_id_bytes,
-        &pinned_hash,
-        &[key(1)],
-        &nonce,
-        &commitment,
-        &per_key,
-        &auditor_local,
-    );
-    assert!(ok.is_ok());
-
-    // Tamper bytes_hash → BytesHashMismatch.
-    let mut bad = per_key.clone();
-    bad[0].bytes_hash[0] ^= 1;
-    let r = auditor_verifies(
-        &responder.peer_id_bytes,
-        &pinned_hash,
-        &[key(1)],
-        &nonce,
-        &commitment,
-        &bad,
-        &auditor_local,
-    );
-    assert!(matches!(r, Err(AuditVerifyError::BytesHashMismatch { .. })));
-
-    // Tamper path → PathInvalid.
-    let mut bad = per_key.clone();
-    bad[0].path[0][0] ^= 1;
-    let r = auditor_verifies(
-        &responder.peer_id_bytes,
-        &pinned_hash,
-        &[key(1)],
-        &nonce,
-        &commitment,
-        &bad,
-        &auditor_local,
-    );
-    assert!(matches!(r, Err(AuditVerifyError::PathInvalid { .. })));
-
-    // Tamper digest → DigestMismatch.
-    let mut bad = per_key.clone();
-    bad[0].digest[0] ^= 1;
-    let r = auditor_verifies(
-        &responder.peer_id_bytes,
-        &pinned_hash,
-        &[key(1)],
-        &nonce,
-        &commitment,
-        &bad,
-        &auditor_local,
-    );
-    assert!(matches!(r, Err(AuditVerifyError::DigestMismatch { .. })));
 }
 
 // ---------------------------------------------------------------------------
-// Cross-check: documented v12 invariants
+// Storage-binding path D: replay an old response under a fresh nonce
 // ---------------------------------------------------------------------------
 
-/// The commitment-hash function is sensitive to every field. This
-/// lemma underwrites every "pin doesn't match" test above.
+/// Attack 1d (replay): the auditor issues a fresh nonce each audit.
+/// The nonce both selects the subtree AND freshens every leaf's possession hash,
+/// so a response captured under an old nonce cannot be replayed: the new nonce
+/// selects a different subtree (wrong leaf set / cut-hash count) and the stale
+/// nonced hashes no longer match. Asserts the structural gate alone already
+/// rejects the stale proof under the new nonce.
+#[test]
+fn audit_response_replay_blocked_by_fresh_nonce() {
+    let old_nonce = [0xCD; 32];
+    let fresh_nonce = [0xEF; 32];
+
+    let r = Responder::new();
+    let pin = r.commit_to_range(256);
+    let (stale_proof, commitment) = honest_proof_and_commitment(&r, &old_nonce);
+
+    // Sanity: the stale proof was valid under its own (old) nonce.
+    assert_eq!(
+        verify_subtree_proof(&stale_proof, &old_nonce, &commitment),
+        StructureVerdict::Valid
+    );
+
+    // Replayed verbatim under the fresh nonce, it fails — the new nonce selects
+    // a different subtree, so even the structure no longer reconstructs.
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &fresh_nonce, // <- different nonce
+        &commitment,
+        &stale_proof,
+        honest_bytes,
+    );
+    assert!(
+        matches!(res, Err(AuditError::StructureInvalid(_))),
+        "replay under a fresh nonce must fail the structural gate, got {res:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subtree-native structural attacks (replace the old per-key path/order tamper)
+// ---------------------------------------------------------------------------
+
+/// Tampering a sibling cut-hash breaks the root rebuild. (Subtree analogue of
+/// the old per-key "tamper the inclusion path" attack.)
+#[test]
+fn tampered_cut_hash_rejected() {
+    let nonce = [0x0B; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(256);
+    let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+    assert!(
+        !proof.sibling_cut_hashes.is_empty(),
+        "a 256-leaf tree selects a deep subtree with cut-hashes"
+    );
+    if let Some(c) = proof.sibling_cut_hashes.first_mut() {
+        c[0] ^= 0x01;
+    }
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        honest_bytes,
+    );
+    assert!(
+        matches!(res, Err(AuditError::StructureInvalid(_))),
+        "tampered cut-hash must fail structure, got {res:?}"
+    );
+}
+
+/// Dropping a leaf yields the wrong leaf count for the agreed subtree. The
+/// auditor re-derives the exact expected count from `(nonce, key_count)` and
+/// rejects.
+#[test]
+fn wrong_leaf_count_rejected() {
+    let nonce = [0x0C; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(100);
+    let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+    proof.leaves.pop();
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        honest_bytes,
+    );
+    assert_eq!(
+        res,
+        Err(AuditError::StructureInvalid("wrong leaf count")),
+        "dropped leaf must fail the leaf-count check, got {res:?}"
+    );
+}
+
+/// Reordering leaves violates the strict ascending-key order the committed tree
+/// enforces (and would otherwise let a responder shuffle leaves to dodge the
+/// spot-check). Rejected structurally.
+#[test]
+fn reordered_leaves_rejected() {
+    let nonce = [0x0D; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(100);
+    let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+    assert!(proof.leaves.len() >= 2);
+    proof.leaves.swap(0, 1);
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        honest_bytes,
+    );
+    assert!(
+        matches!(res, Err(AuditError::StructureInvalid(_))),
+        "reordered leaves must fail structure, got {res:?}"
+    );
+}
+
+/// Tampering a leaf's `bytes_hash` (claiming a different chunk at a committed
+/// position) breaks the root rebuild — the leaf hash binds (key, bytes_hash).
+#[test]
+fn tampered_leaf_bytes_hash_rejected() {
+    let nonce = [0x0E; 32];
+    let r = Responder::new();
+    let pin = r.commit_to_range(100);
+    let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
+    proof.leaves[0].bytes_hash[0] ^= 0x01;
+    let res = auditor_accepts(
+        &r.peer_id_bytes,
+        &pin,
+        &nonce,
+        &commitment,
+        &proof,
+        honest_bytes,
+    );
+    assert!(
+        matches!(res, Err(AuditError::StructureInvalid(_))),
+        "tampered bytes_hash must fail structure, got {res:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Repudiation: rejecting a recently-gossiped pinned commitment
+// ---------------------------------------------------------------------------
+
+/// Attack: a responder repudiates a commitment it just gossiped — it answers a
+/// pin for a commitment it no longer retains. Because the auditor only ever pins
+/// a commitment the peer JUST gossiped, and an honest responder retains its last
+/// two GOSSIPED commitments, a `lookup_by_hash` miss for a gossiped pin is a
+/// confirmed failure. This test pins the retention contract: a gossiped pin
+/// stays answerable across the next rotation, but a NEVER-gossiped commitment is
+/// dropped on the next rotation (so the responder rightly cannot answer a pin it
+/// never put on the wire).
+#[test]
+fn repudiating_a_gossiped_pin_is_detectable_via_lookup_miss() {
+    let r = Responder::new();
+    let state = &r.state;
+
+    // c1 is gossiped → must stay answerable across one rotation.
+    let h1 = r.commit_to_range(8);
+    state.mark_gossiped(h1);
+    assert!(
+        state.lookup_by_hash(&h1).is_some(),
+        "gossiped pin must be answerable immediately"
+    );
+
+    // Rotate + gossip c2. c1 is within the last-2-gossiped window → still here.
+    let h2 = r.commit_to_range(16);
+    state.mark_gossiped(h2);
+    assert!(
+        state.lookup_by_hash(&h1).is_some(),
+        "a gossiped commitment must survive one rotation (no false repudiation)"
+    );
+
+    // Rotate + gossip c3. Now the last-2-gossiped are {h3, h2}; h1 has aged out
+    // and is legitimately dropped (the auditor would no longer pin it).
+    let h3 = r.commit_to_range(24);
+    state.mark_gossiped(h3);
+    assert!(
+        state.lookup_by_hash(&h1).is_none(),
+        "h1 aged out of the gossip window"
+    );
+    assert!(state.lookup_by_hash(&h2).is_some());
+    assert!(state.lookup_by_hash(&h3).is_some());
+
+    // The detection edge: a commitment that was NEVER gossiped is dropped on the
+    // very next rotation, so a responder asked to answer a pin for an
+    // ungossiped-then-rotated commitment returns a lookup MISS — which the
+    // auditor (since it only pins gossiped roots) reads as repudiation.
+    let r2 = Responder::new();
+    let ungossiped = r2.commit_to_range(8);
+    assert!(r2.state.lookup_by_hash(&ungossiped).is_some());
+    let _next = r2.commit_to_range(16); // rotate without gossiping `ungossiped`
+    assert!(
+        r2.state.lookup_by_hash(&ungossiped).is_none(),
+        "an ungossiped commitment is dropped on the next rotation"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-check lemmas: the primitives the rejection tests rest on
+// ---------------------------------------------------------------------------
+
+/// The commitment-hash pin is sensitive to every field. This underwrites every
+/// "pin doesn't match" assertion above.
 #[test]
 fn commitment_hash_is_field_sensitive() {
     let (pk, sk) = keypair();
@@ -1004,8 +955,8 @@ fn commitment_hash_is_field_sensitive() {
     }
 }
 
-/// The leaf hash binds (key, bytes_hash). Same key + different bytes →
-/// different leaf → different root.
+/// The leaf hash binds (key, bytes_hash): same key + different bytes → different
+/// leaf → different root. Underwrites the structural rejections.
 #[test]
 fn leaf_hash_binds_key_and_bytes() {
     let h1 = leaf_hash(&key(1), &content_hash(1));
@@ -1016,21 +967,7 @@ fn leaf_hash_binds_key_and_bytes() {
     assert_ne!(h2, h3);
 }
 
-/// The Merkle tree is deterministic per key set.
-#[test]
-fn merkle_tree_root_is_deterministic_per_key_set() {
-    let entries = vec![
-        (key(1), content_hash(1)),
-        (key(2), content_hash(2)),
-        (key(3), content_hash(3)),
-    ];
-    let r1 = MerkleTree::build(entries.clone()).unwrap().root();
-    let r2 = MerkleTree::build(entries).unwrap().root();
-    assert_eq!(r1, r2);
-}
-
-/// The signature verifies under the right public key and only under
-/// that key.
+/// The signature verifies under the embedded key and only that key.
 #[test]
 fn signature_round_trips_correctly() {
     let (pk1, sk1) = keypair();
@@ -1045,58 +982,32 @@ fn signature_round_trips_correctly() {
         sender_public_key: pk1_bytes,
         signature: sig,
     };
-    // Verifies via the embedded pk1 key.
     assert!(verify_commitment_signature(&c));
-    // If we swap the embedded key to pk2 (keeping the signature signed by
-    // sk1), verification must fail because pk2 didn't sign this payload.
     let mut c2 = c.clone();
     c2.sender_public_key = pk2_bytes;
     assert!(!verify_commitment_signature(&c2));
 }
 
-// ---------------------------------------------------------------------------
-// PeerCommitmentRecord: §2 step 5 sticky commitment_capable
-// ---------------------------------------------------------------------------
-
-use ant_node::replication::commitment_state::PeerCommitmentRecord;
-
-/// §2 step 5: `commitment_capable` is set on the first verified gossip
-/// ingest and never flips back to false. A peer that later evicts the
-/// cached commitment (TTL / sybil cap / restart) retains capability
-/// status so §6 + §3 still refuse credit and refuse legacy-fallback.
+/// The per-leaf possession hash binds nonce, peer, key, and bytes — the
+/// foundation of the real-bytes spot-check. Changing any input changes it, so a
+/// responder cannot reuse a possession hash across nonces/peers/keys/chunks.
 #[test]
-fn commitment_capable_flag_is_sticky_across_eviction() {
-    let (pk, sk) = keypair();
-    let pk_bytes = pk.to_bytes();
-    let sig = sign_commitment(&sk, &[0; 32], 1, &[0; 32], &pk_bytes).unwrap();
-    let commitment = StorageCommitment {
-        root: [0; 32],
-        key_count: 1,
-        sender_peer_id: [0; 32],
-        sender_public_key: pk_bytes,
-        signature: sig,
-    };
-
-    let mut rec = PeerCommitmentRecord::from_verified(commitment, Instant::now());
-    assert!(rec.commitment_capable);
-    assert!(rec.last_commitment.is_some());
-
-    // Simulate TTL eviction / restart dropping the cached commitment.
-    // NOTE: on a `commitment: None` gossip the engine deliberately does
-    // NOT clear `last_commitment` (that would let a capable peer evade
-    // audit via the §3 shield); this manual mutation models genuine
-    // TTL/restart loss, not the downgrade path.
-    rec.last_commitment = None;
-    // Sticky: capable flag stays true regardless of how the cached
-    // commitment was lost.
-    assert!(rec.commitment_capable);
-}
-
-/// `capable_but_no_commitment` constructor: used when we evict the
-/// cached commitment but want to remember the peer has spoken v12.
-#[test]
-fn capable_but_no_commitment_starts_capable() {
-    let rec = PeerCommitmentRecord::capable_but_no_commitment(Instant::now());
-    assert!(rec.commitment_capable);
-    assert!(rec.last_commitment.is_none());
+fn nonced_leaf_hash_binds_all_inputs() {
+    let base = nonced_leaf_hash(&[1; 32], &[2; 32], &key(3), b"chunk");
+    assert_ne!(
+        base,
+        nonced_leaf_hash(&[9; 32], &[2; 32], &key(3), b"chunk")
+    );
+    assert_ne!(
+        base,
+        nonced_leaf_hash(&[1; 32], &[9; 32], &key(3), b"chunk")
+    );
+    assert_ne!(
+        base,
+        nonced_leaf_hash(&[1; 32], &[2; 32], &key(9), b"chunk")
+    );
+    assert_ne!(
+        base,
+        nonced_leaf_hash(&[1; 32], &[2; 32], &key(3), b"other")
+    );
 }

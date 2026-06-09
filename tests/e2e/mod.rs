@@ -63,6 +63,9 @@ mod replication;
 #[cfg(test)]
 mod security_attacks;
 
+#[cfg(test)]
+mod subtree_audit_testnet;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};

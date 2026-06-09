@@ -1,7 +1,8 @@
 //! Storage-bound audit via piggybacked commitments.
 //!
-//! Implements the v12 design (`notes/security-findings-2026-05-22/
-//! proposal-gossip-audit-v12.md`) for closing audit Findings 1 and 2.
+//! Implements the v12 storage-bound audit design: it closes the
+//! storage-binding holes where a node could pass audits while holding chunk
+//! addresses (not bytes), or answer against a commitment it never gossiped.
 //!
 //! ## What this module provides
 //!
@@ -14,7 +15,6 @@
 //! - [`commitment_hash`] — the auditor's pin: a `BLAKE3` digest over the
 //!   full signed commitment blob. Audit challenges carry this; audit
 //!   responses must include a commitment that hashes to the same value.
-//! - [`CommitmentBoundResult`] — per-key entry in the audit response.
 //! - [`verify_path`] — auditor's per-key check: rebuilds the leaf from
 //!   `(key, bytes_hash)` and verifies the inclusion path against the
 //!   committed root.
@@ -76,7 +76,7 @@ pub const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
 ///   - signature: 3293 B (ML-DSA-65 signature)
 ///
 /// Piggybacked on every `NeighborSyncRequest`/`Response` (~1 h interval
-/// per close-group peer with the round-11 rotation cadence). At a
+/// per close-group peer at the neighbour-sync cooldown cadence). At a
 /// realistic close-group size of 8 with bidirectional sync, that's
 /// roughly 8 × 2 × 5.3 KiB / hour = ~85 KiB/h of additional gossip
 /// per node. Negligible against typical chunk-transfer bandwidth.
@@ -94,35 +94,6 @@ pub struct StorageCommitment {
     pub sender_public_key: Vec<u8>,
     /// ML-DSA-65 signature over canonical commitment fields. 3293 bytes.
     pub signature: Vec<u8>,
-}
-
-/// Per-key result in a commitment-bound audit response.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CommitmentBoundResult {
-    /// The challenged key.
-    pub key: XorName,
-    /// `BLAKE3(nonce || challenged_peer_id || key || record_bytes)`. Same
-    /// digest the existing [`compute_audit_digest`] produces; the auditor
-    /// recomputes and compares.
-    ///
-    /// [`compute_audit_digest`]: crate::replication::protocol::compute_audit_digest
-    pub digest: [u8; 32],
-    /// `BLAKE3(record_bytes)`. The auditor uses this to rebuild the Merkle
-    /// leaf and checks it matches its own local bytes hash.
-    pub bytes_hash: [u8; 32],
-    /// Position of the leaf for `key` in the responder's sorted leaf set.
-    ///
-    /// The auditor uses this to know, at each level of the path, whether
-    /// the current hash is the left or right child (even index = left,
-    /// odd = right). Without it the auditor cannot reconstruct the root
-    /// because the same set of sibling hashes admits two different
-    /// orderings.
-    ///
-    /// `leaf_index < commitment.key_count` is enforced in the verifier.
-    pub leaf_index: u32,
-    /// Inclusion path from `leaf = BLAKE3(DOMAIN_LEAF || key || bytes_hash)`
-    /// up to the root. One sibling hash per tree level.
-    pub path: Vec<[u8; 32]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -346,13 +317,63 @@ impl MerkleTree {
     pub fn sorted_keys(&self) -> Vec<XorName> {
         self.leaves.iter().map(|(k, _)| *k).collect()
     }
+
+    /// The key at sorted leaf index `idx`, if in range.
+    ///
+    /// Used by the subtree-proof builder to enumerate the keys of a
+    /// contiguous leaf range without cloning the whole key list.
+    #[must_use]
+    pub fn key_at(&self, idx: usize) -> Option<XorName> {
+        self.leaves.get(idx).map(|(k, _)| *k)
+    }
+
+    /// The sorted leaf index of `key`, if committed. `O(log n)` binary search
+    /// over the (key-sorted) leaves — no separate key list needed, so callers
+    /// don't have to keep a duplicate `sorted_keys` Vec alongside the tree.
+    #[must_use]
+    pub fn key_index(&self, key: &XorName) -> Option<usize> {
+        self.leaves.binary_search_by(|(k, _)| k.cmp(key)).ok()
+    }
+
+    /// Whether `key` is committed. Allocation-free membership check via the same
+    /// binary search as [`Self::key_index`].
+    #[must_use]
+    pub fn contains_key(&self, key: &XorName) -> bool {
+        self.key_index(key).is_some()
+    }
+
+    /// The node hash at `(level, index)`, where `level` counts up from the
+    /// leaves (`level == 0` is the leaf level, the last level is the root).
+    ///
+    /// Returns `None` if out of range. Used by the subtree-proof builder to
+    /// read sibling cut-hashes along the path from the root to the selected
+    /// subtree; honours the same left-packed self-pair construction as the
+    /// rest of the tree (a caller asking for an out-of-range sibling on an
+    /// odd-length level should substitute the node itself).
+    #[must_use]
+    pub fn node_at(&self, level: usize, index: u64) -> Option<[u8; 32]> {
+        let index = usize::try_from(index).ok()?;
+        self.levels.get(level).and_then(|l| l.get(index)).copied()
+    }
+
+    /// The number of levels in the tree (`1` for a single-leaf tree; the
+    /// last index is the root level). `depth == levels_count() - 1`.
+    #[must_use]
+    pub fn levels_count(&self) -> usize {
+        self.levels.len()
+    }
 }
 
 /// Build the next level up from `cur`. Odd-length levels pair the last
 /// node with itself (`node_hash(x, x)`) so the level above has
 /// `ceil(n/2)` nodes. Keeps the tree balanced without needing a dummy
 /// leaf domain.
-fn build_next_level(cur: &[[u8; 32]]) -> Vec<[u8; 32]> {
+///
+/// `pub(crate)` so the subtree-proof verifier folds a contiguous leaf block to
+/// its subtree root with the EXACT same self-pair rule (§10 — previously
+/// duplicated as `fold_levels`'s inner loop), guaranteeing the rebuilt node
+/// matches the committed tree bit-for-bit.
+pub(crate) fn build_next_level(cur: &[[u8; 32]]) -> Vec<[u8; 32]> {
     let mut next = Vec::with_capacity(cur.len().div_ceil(2));
     let mut i = 0;
     while i < cur.len() {
@@ -367,8 +388,8 @@ fn build_next_level(cur: &[[u8; 32]]) -> Vec<[u8; 32]> {
 /// Verify an inclusion path against a commitment of size `key_count`.
 ///
 /// `leaf_index` is the responder's position of this leaf in the sorted
-/// leaf set; the auditor reads it from `CommitmentBoundResult.leaf_index`
-/// and the commitment's `key_count` from `StorageCommitment.key_count`.
+/// leaf set; the commitment's `key_count` comes from
+/// `StorageCommitment.key_count`.
 /// At each level of the path, if the current index is even, the current
 /// hash is the left child and we compute `node_hash(self, sibling)`;
 /// otherwise it is the right child and we compute `node_hash(sibling, self)`.
@@ -461,9 +482,9 @@ pub fn sign_commitment(
 /// errors so the caller can simply drop the gossip.
 ///
 /// Verifying against the embedded key removes the need for an external
-/// `PeerId → MlDsaPublicKey` lookup. The peer-id binding (gate 2a in
-/// `commitment_audit::verify_commitment_bound_response`) still ensures the
-/// embedded key belongs to the claimed peer.
+/// `PeerId → MlDsaPublicKey` lookup. The peer-id binding gate in
+/// `ingest_peer_commitment` (and the auditor's `evaluate_subtree_structure`)
+/// still ensures the embedded key belongs to the claimed peer.
 #[must_use]
 pub fn verify_commitment_signature(c: &StorageCommitment) -> bool {
     let Ok(public_key) = MlDsaPublicKey::from_bytes(MlDsaVariant::MlDsa65, &c.sender_public_key)
@@ -709,7 +730,7 @@ mod tests {
     #[test]
     fn out_of_protocol_key_count_rejected() {
         // Wire-supplied key_count exceeding MAX_COMMITMENT_KEY_COUNT is
-        // refused before any hashing. Defends against the round-3 BLOCKER:
+        // refused before any hashing. Guards an overflow found in review:
         // `next_power_of_two()` would otherwise panic in debug and wrap in
         // release on key_count > 1 << 31.
         let lh = [0u8; 32];
@@ -872,8 +893,8 @@ mod tests {
     fn commitment_hash_signature_length_change_changes_hash() {
         // Postcard's varint length prefix means hashing a 1-byte signature
         // and a 2-byte signature whose first byte is the same produces
-        // different commitment hashes — defends against the codex round-1
-        // BLOCKER "omits the serialized length prefix."
+        // different commitment hashes — a hash that omitted the serialized
+        // length prefix would let boundary-shifted fields collide.
         let c1 = StorageCommitment {
             root: [0; 32],
             key_count: 1,

@@ -10,17 +10,11 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
-use crate::replication::commitment::{commitment_hash, CommitmentBoundResult, StorageCommitment};
-use crate::replication::commitment_audit::{
-    verify_commitment_bound_metadata, verify_commitment_bound_per_key,
-};
-use crate::replication::commitment_state::PeerCommitmentRecord;
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
     ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
-use crate::replication::recent_provers::RecentProvers;
 use crate::replication::types::{
     AuditFailureReason, AuditFailureSummary, FailureEvidence, PeerSyncRecord, RepairProofs,
 };
@@ -63,36 +57,6 @@ pub enum AuditTickResult {
 // Main audit tick
 // ---------------------------------------------------------------------------
 
-/// Read-only context the auditor uses to issue commitment-bound audits.
-///
-/// Bundled into one struct so [`audit_tick_with_repair_proofs`] stays
-/// readable when v12 enforcement is enabled. Passing `None` falls back
-/// to today's plain-digest audit; passing `Some` opts in on a per-peer
-/// basis (a peer with no entry in `last_commitment_by_peer` still gets
-/// the legacy path).
-///
-/// `last_commitment_by_peer` and `recent_provers` are owned by
-/// [`crate::replication::ReplicationEngine`]; this struct borrows them.
-pub struct CommitmentAuditCtx<'a> {
-    /// Per-peer record: last-known commitment + sticky `commitment_capable`
-    /// flag (populated from gossip ingest). The auditor pins
-    /// `commitment_hash(record.last_commitment)` into the challenge for
-    /// any peer whose record carries a commitment.
-    pub last_commitment_by_peer: &'a Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
-    /// Sticky "ever v12-capable" set, independent of
-    /// `last_commitment_by_peer` (whose entries can be evicted by
-    /// `PeerRemoved` and the sybil cap). The §3 audit shield consults
-    /// this so a previously-v12 peer whose LRU record was evicted
-    /// still gets the no-legacy-fallback treatment until they
-    /// re-gossip a fresh commitment.
-    pub ever_capable_peers: &'a Arc<RwLock<HashSet<PeerId>>>,
-    /// Holder-eligibility cache. On a successful commitment-bound audit
-    /// the auditor records `(challenged_peer, key, commitment_hash)` so
-    /// downstream code (quorum, paid lists) can credit the peer as a
-    /// real holder.
-    pub recent_provers: &'a Arc<RwLock<RecentProvers>>,
-}
-
 /// Execute one audit tick (Section 15 steps 2-9).
 ///
 /// Returns the audit result. Caller is responsible for emitting trust events.
@@ -117,7 +81,6 @@ pub async fn audit_tick(
         &repair_proofs,
         0,
         is_bootstrapping,
-        None,
     )
     .await
 }
@@ -128,11 +91,7 @@ pub async fn audit_tick(
 /// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
 /// callers that have not adopted repair proofs remain conservative and do not
 /// audit peers for unproven keys.
-#[allow(
-    clippy::implicit_hasher,
-    clippy::too_many_lines,
-    clippy::too_many_arguments
-)]
+#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
@@ -141,7 +100,6 @@ pub async fn audit_tick_with_repair_proofs(
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     current_sync_epoch: u64,
     is_bootstrapping: bool,
-    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
 ) -> AuditTickResult {
     // Invariant 19: never audit while still bootstrapping.
     if is_bootstrapping {
@@ -225,82 +183,12 @@ pub async fn audit_tick_with_repair_proofs(
     // so no explicit truncation needed.
 
     // Step 6: Send challenge.
-    //
-    // Phase 3: if we have a commitment audit context AND we have a last
-    // known commitment from this peer (received via gossip), pin its
-    // hash into the challenge so the responder must answer against the
-    // exact commitment whose hash we pinned. Defeats fresh-commitment
-    // substitution by lazy nodes (v12 §5 gate 2b).
-    //
-    // We snapshot the pinned commitment alongside the hash so the
-    // response-handling code can verify against the SAME commitment we
-    // pinned (avoids a race where the peer's last_commitment_by_peer
-    // entry rotates between issue and response handling).
-    // Snapshot the peer record once; we use it both for pinning the
-    // challenge and (below) for the §3 commitment_capable downgrade
-    // check. Record carries last_commitment + sticky `commitment_capable`.
-    let peer_record = match commitment_ctx {
-        Some(ctx) => ctx
-            .last_commitment_by_peer
-            .read()
-            .await
-            .get(&challenged_peer)
-            .cloned(),
-        None => None,
-    };
-    // Only the pin (hash) is needed to issue the challenge; the
-    // responder answers against its own retained commitment, so we
-    // never need to clone the full StorageCommitment here.
-    let expected_commitment_hash = peer_record
-        .as_ref()
-        .and_then(|r| r.last_commitment.as_ref())
-        .and_then(commitment_hash);
-
-    // §3 + §6 bootstrap-claim shield: if this peer has EVER gossiped a
-    // commitment we MUST NOT fall back to legacy plain-digest audits
-    // when we currently lack their cached commitment. The peer is
-    // expected to speak v12; falling back would let them downgrade to
-    // the weaker path. Return Idle until they re-gossip a fresh
-    // commitment.
-    //
-    // We consult two sources for the sticky-capable signal: the per-
-    // record `commitment_capable` bit (still set on the active LRU
-    // entry) AND the `ever_capable_peers` set (preserved across
-    // PeerRemoved cleanup and sybil-cap eviction of the LRU). Either
-    // one being true engages the shield.
-    let is_capable = peer_record.as_ref().is_some_and(|r| r.commitment_capable)
-        || match commitment_ctx {
-            Some(ctx) => ctx
-                .ever_capable_peers
-                .read()
-                .await
-                .contains(&challenged_peer),
-            None => false,
-        };
-    let has_current_commitment = peer_record
-        .as_ref()
-        .is_some_and(|r| r.last_commitment.is_some());
-    if is_capable && !has_current_commitment {
-        // BY DESIGN this is a no-penalty path: a capable-but-silent peer is
-        // never strike-penalised here (Idle records no strike). It gains
-        // nothing by going silent — its §6 holder credit independently
-        // expires (PROVER_ENTRY_TTL), so it stops being counted as a holder
-        // for quorum/paid-list. We skip rather than penalise because the
-        // missing commitment is indistinguishable from honest TTL/restart
-        // churn; the next fresh gossip re-enables auditing.
-        info!(
-            "Audit: peer {challenged_peer} is commitment-capable but we have no \
-             cached commitment (TTL/restart/silence); skipping audit until fresh gossip"
-        );
-        return AuditTickResult::Idle;
-    }
 
     let challenge = AuditChallenge {
         challenge_id,
         nonce,
         challenged_peer_id: *challenged_peer.as_bytes(),
         keys: peer_keys.clone(),
-        expected_commitment_hash,
     };
 
     let msg = ReplicationMessage {
@@ -394,28 +282,6 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
-            // Wire-contract enforcement (codex round-9 MAJOR): when we
-            // pinned a commitment hash into the challenge, the responder
-            // MUST answer with CommitmentBound or Rejected/Bootstrapping.
-            // Falling back to plain Digests would let a peer that has
-            // already gossiped a commitment ignore the storage-bound
-            // path and pass via on-demand fetch under the weaker legacy
-            // verifier. Treat as malformed.
-            if expected_commitment_hash.is_some() {
-                warn!(
-                    "Audit: peer {challenged_peer} answered Digests to a pinned challenge \
-                     (commitment-bound contract violation) — treating as malformed"
-                );
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
             verify_digests(
                 &challenged_peer,
                 challenge_id,
@@ -444,89 +310,6 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
-            // v12 paragraph 5 conditional invalidation, refined:
-            //
-            // When we issued a pinned challenge and the peer responds
-            // "unknown commitment hash", DO NOT drop the pin and DO NOT
-            // give a free pass. Two reasons:
-            //
-            //   1. If the peer genuinely rotated past our pin (honest
-            //      case), their two-slot retention (current+previous)
-            //      means they could still answer one rotation back —
-            //      so "unknown" here means we are at least two
-            //      rotations behind their gossip. The next gossip round
-            //      (a few minutes) will bring us a fresh commitment to
-            //      pin, and the cache entry will be replaced naturally
-            //      via the gossip ingest path. We don't need to drop
-            //      anything ourselves.
-            //
-            //   2. If we drop the pin on "unknown", a malicious peer
-            //      can claim "unknown" to shed every pinned audit they
-            //      receive — the next tick has no pin → legacy plain-
-            //      digest path → on-demand fetch attack reopens
-            //      (codex round-8 MAJOR).
-            //
-            // So: when the responder says "unknown" AND we pinned, log
-            // and return Idle without penalty (one tick wasted) but
-            // KEEP the pin. The honest case self-resolves via gossip;
-            // the malicious case keeps re-failing pinned audits until
-            // their trust drops naturally through other mechanisms or
-            // we receive a fresh gossiped commitment. Strict gating on
-            // exact reason + pinned challenge prevents the round-6
-            // bypass (a peer cannot trigger this path on a legacy
-            // unpinned audit because expected_commitment_hash is None).
-            if expected_commitment_hash.is_some() && reason == "unknown commitment hash" {
-                // v12 §5 conditional invalidation:
-                // - Case 1 (lazy rotation): peer dropped bytes, no fresh
-                //   gossip, still pinned to H. Stored hash == H. Clear
-                //   the pin → recent_provers entries lose their match
-                //   basis → credit dropped via is_credited_holder. This
-                //   is now safe because §3 above causes the next audit
-                //   to return Idle (commitment_capable but no
-                //   last_commitment) instead of falling back to legacy.
-                // - Case 2 (honest rotation): peer gossiped C2 between
-                //   our challenge and processing. Stored hash != H.
-                //   Keep the new C2 entry, drop credits anchored to H.
-                // - Case 3 (stale auditor): same as case 1; clear pin,
-                //   wait for next gossip.
-                if let (Some(ctx), Some(pin)) = (commitment_ctx, expected_commitment_hash) {
-                    let mut last = ctx.last_commitment_by_peer.write().await;
-                    if let Some(rec) = last.get_mut(&challenged_peer) {
-                        let stored_h = rec.last_commitment.as_ref().and_then(commitment_hash);
-                        if stored_h == Some(pin) {
-                            // Still the rejected commitment — clear it
-                            // but keep `commitment_capable` sticky.
-                            rec.last_commitment = None;
-                        }
-                        // else: a fresh commitment arrived in the meantime;
-                        // leave it untouched (don't clobber).
-                    }
-                    drop(last);
-                    // Drop credit anchored to the now-stale pin so the
-                    // peer must re-prove every key under the new
-                    // commitment to keep holder status (v12 §6).
-                    ctx.recent_provers.write().await.forget_commitment(&pin);
-                }
-                info!(
-                    "Audit: peer {challenged_peer} rotated past pinned commitment; \
-                     dropped stale pin and credits (no trust penalty)"
-                );
-                return AuditTickResult::Idle;
-            }
-            // v12 paragraph 5: "key not in commitment" is also a benign
-            // staleness signal, NOT a failure. The auditor sampled a key
-            // it holds and that the peer SHOULD hold (close-group), but
-            // which the peer hasn't yet committed to (e.g. just-replicated
-            // after their last rotation). Penalising this would punish
-            // honest peers who have the bytes but haven't rebuilt their
-            // Merkle tree yet (codex round-11 MAJOR #2).
-            if expected_commitment_hash.is_some() && reason.starts_with("key not in commitment") {
-                info!(
-                    "Audit: peer {challenged_peer} reports key-not-in-commitment; \
-                     skipping (responder commitment is stale relative to its key set)"
-                );
-                return AuditTickResult::Idle;
-            }
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
                 &challenged_peer,
@@ -535,38 +318,6 @@ pub async fn audit_tick_with_repair_proofs(
                 AuditFailureReason::Rejected,
                 p2p_node,
                 config,
-            )
-            .await
-        }
-        ReplicationMessageBody::AuditResponse(AuditResponse::CommitmentBound {
-            challenge_id: resp_id,
-            commitment,
-            per_key,
-        }) => {
-            if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on CommitmentBound from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            verify_commitment_bound(
-                &challenged_peer,
-                challenge_id,
-                &nonce,
-                &peer_keys,
-                expected_commitment_hash.as_ref(),
-                &commitment,
-                &per_key,
-                storage,
-                p2p_node,
-                config,
-                commitment_ctx,
             )
             .await
         }
@@ -771,176 +522,6 @@ async fn verify_digests(
 }
 
 // ---------------------------------------------------------------------------
-// Commitment-bound verification (v12)
-// ---------------------------------------------------------------------------
-
-/// Verify a `CommitmentBound` audit response (Step 8, v12 path).
-///
-/// Runs the pure verifier `verify_commitment_bound_response` against the
-/// commitment we pinned (NOT the one in the response — the response's
-/// commitment must hash-match the pin), then on success records the
-/// challenged peer as a recent prover for each verified key.
-///
-/// The verifier checks five gates: structural, peer-id binding, pin,
-/// signature (using the pubkey embedded in the commitment), and per-key
-/// (`bytes_hash` + Merkle path + audit digest). Any failure path → standard
-/// `AUDIT_FAILURE_TRUST_WEIGHT × keys` penalty.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn verify_commitment_bound(
-    challenged_peer: &PeerId,
-    challenge_id: u64,
-    nonce: &[u8; 32],
-    keys: &[XorName],
-    expected_commitment_hash: Option<&[u8; 32]>,
-    response_commitment: &StorageCommitment,
-    response_per_key: &[CommitmentBoundResult],
-    storage: &Arc<LmdbStorage>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    commitment_ctx: Option<&CommitmentAuditCtx<'_>>,
-) -> AuditTickResult {
-    // Sanity: a CommitmentBound response must have been answered to a
-    // pinned challenge. If we didn't pin (or have no ctx), this is a
-    // protocol violation by the peer.
-    let Some(pin) = expected_commitment_hash else {
-        warn!(
-            "Audit: peer {challenged_peer} sent CommitmentBound for an unpinned challenge — \
-             treating as malformed"
-        );
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            keys,
-            AuditFailureReason::MalformedResponse,
-            p2p_node,
-            config,
-        )
-        .await;
-    };
-
-    // Metadata gates (structural / peer-id / pin / sig). One-shot, cheap.
-    if let Err(e) = verify_commitment_bound_metadata(
-        keys,
-        challenged_peer.as_bytes(),
-        pin,
-        response_commitment,
-        response_per_key,
-    ) {
-        warn!(
-            "Audit: peer {challenged_peer} failed commitment-bound metadata: {e} (pin={})",
-            hex::encode(pin),
-        );
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            keys,
-            AuditFailureReason::DigestMismatch,
-            p2p_node,
-            config,
-        )
-        .await;
-    }
-
-    // Per-key gates streamed one chunk at a time. Avoids the
-    // sqrt(n)*MAX_CHUNK_SIZE worst case of preloading every challenged
-    // chunk (~4 GiB at 1M stored chunks).
-    //
-    // Verified keys are collected for holder-credit attribution at the
-    // end of the loop. A key that disappears locally between sampling
-    // and verification is skipped without penalising the responder
-    // (matches the legacy `verify_digests` `continue` semantics; the
-    // responder is not at fault for the auditor's storage churn).
-    let mut verified_keys: Vec<XorName> = Vec::with_capacity(response_per_key.len());
-    let mut failed_keys: Vec<XorName> = Vec::new();
-    for (i, result) in response_per_key.iter().enumerate() {
-        let local_bytes = match storage.get_raw(&result.key).await {
-            Ok(Some(b)) => b,
-            Ok(None) => {
-                debug!(
-                    "Audit: local key {} disappeared between sampling and verification; skipping",
-                    hex::encode(result.key)
-                );
-                continue;
-            }
-            Err(e) => {
-                warn!(
-                    "Audit: failed to read local key {}: {e}",
-                    hex::encode(result.key)
-                );
-                continue;
-            }
-        };
-
-        if let Err(e) = verify_commitment_bound_per_key(
-            i,
-            nonce,
-            challenged_peer.as_bytes(),
-            response_commitment,
-            result,
-            &local_bytes,
-        ) {
-            warn!(
-                "Audit: peer {challenged_peer} failed commitment-bound per-key #{i}: {e} \
-                 (pin={})",
-                hex::encode(pin),
-            );
-            // Track only the failing key. Match the legacy
-            // `verify_digests` semantics: continue verifying other keys
-            // and penalise only the ones that actually failed, rather
-            // than escalating a single per-key failure to the whole
-            // challenge batch. `local_bytes` drops here, bounding peak
-            // memory at one chunk.
-            failed_keys.push(result.key);
-            continue;
-        }
-        verified_keys.push(result.key);
-    }
-
-    if !failed_keys.is_empty() {
-        return handle_audit_failure(
-            challenged_peer,
-            challenge_id,
-            &failed_keys,
-            AuditFailureReason::DigestMismatch,
-            p2p_node,
-            config,
-        )
-        .await;
-    }
-
-    if verified_keys.is_empty() {
-        // Every challenged key was locally unavailable. We have no
-        // evidence either way — return Idle without trust events.
-        debug!(
-            "Audit: peer {challenged_peer} commitment-bound audit had no locally-verifiable keys"
-        );
-        return AuditTickResult::Idle;
-    }
-
-    info!(
-        "Audit: peer {challenged_peer} passed commitment-bound audit ({}/{} keys verified, pin={})",
-        verified_keys.len(),
-        keys.len(),
-        hex::encode(pin),
-    );
-    // Credit the peer as a holder for each VERIFIED key under this
-    // exact commitment hash (skipped keys are not credited — we never
-    // confirmed them). Downstream (quorum, paid lists) can read
-    // `recent_provers.is_credited_holder(...)`.
-    if let Some(ctx) = commitment_ctx {
-        let now = std::time::Instant::now();
-        let mut guard = ctx.recent_provers.write().await;
-        for key in &verified_keys {
-            guard.record_proof(*key, *challenged_peer, *pin, now);
-        }
-    }
-    AuditTickResult::Passed {
-        challenged_peer: *challenged_peer,
-        keys_checked: verified_keys.len(),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Failure handling with responsibility confirmation
 // ---------------------------------------------------------------------------
 
@@ -1065,38 +646,6 @@ pub async fn handle_audit_challenge(
     is_bootstrapping: bool,
     stored_chunks: usize,
 ) -> AuditResponse {
-    handle_audit_challenge_with_commitment(
-        challenge,
-        storage,
-        self_peer_id,
-        is_bootstrapping,
-        stored_chunks,
-        None,
-    )
-    .await
-}
-
-/// Like [`handle_audit_challenge`] but also accepts a responder's
-/// `ResponderCommitmentState`. If the challenge carries
-/// `expected_commitment_hash: Some(h)`, dispatches to the v12
-/// commitment-bound response path (gates: structural / pin / signature
-/// / per-key path+digest); otherwise falls through to the legacy
-/// plain-digest path.
-///
-/// Backwards-compatible: existing callers that don't have a
-/// `ResponderCommitmentState` keep calling `handle_audit_challenge`,
-/// which forwards here with `commitment_state = None`.
-#[allow(clippy::too_long_first_doc_paragraph, clippy::too_many_lines)]
-pub async fn handle_audit_challenge_with_commitment(
-    challenge: &AuditChallenge,
-    storage: &LmdbStorage,
-    self_peer_id: &PeerId,
-    is_bootstrapping: bool,
-    stored_chunks: usize,
-    commitment_state: Option<
-        &std::sync::Arc<crate::replication::commitment_state::ResponderCommitmentState>,
-    >,
-) -> AuditResponse {
     if is_bootstrapping {
         return AuditResponse::Bootstrapping {
             challenge_id: challenge.challenge_id,
@@ -1131,99 +680,6 @@ pub async fn handle_audit_challenge_with_commitment(
         };
     }
 
-    // v12 commitment-bound path: when the auditor pinned a specific
-    // commitment, look it up in our state and produce a CommitmentBound
-    // response. If we don't have that commitment (rotated away, never
-    // gossiped, etc.) reject with reason="unknown commitment hash" —
-    // the auditor's v12 paragraph 5 handler keeps the pin (no penalty)
-    // and waits for fresh gossip to replace it.
-    if let (Some(expected_hash), Some(state)) = (
-        challenge.expected_commitment_hash.as_ref(),
-        commitment_state,
-    ) {
-        // Precheck WITHOUT reading any chunk bytes (codex round-9 MAJOR:
-        // the prior preload-into-HashMap pattern hit O(sample×4MiB)
-        // peak memory). Cheap: hash-map lookup + per-key proof_for.
-        let built = match crate::replication::commitment_state::precheck_commitment_bound_challenge(
-            state,
-            expected_hash,
-            &challenge.keys,
-        ) {
-            Ok(b) => b,
-            Err(
-                crate::replication::commitment_state::CommitmentBoundOutcome::UnknownCommitmentHash,
-            ) => {
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: "unknown commitment hash".to_string(),
-                };
-            }
-            Err(
-                crate::replication::commitment_state::CommitmentBoundOutcome::KeyNotInCommitment {
-                    key,
-                },
-            ) => {
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("key not in commitment: {}", hex::encode(key)),
-                };
-            }
-            Err(_) => {
-                // precheck only returns UnknownCommitmentHash /
-                // KeyNotInCommitment today. Reject gracefully rather
-                // than panic if a future variant is added — the
-                // project bans panics on production paths.
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: "unrecognized commitment precheck outcome".to_string(),
-                };
-            }
-        };
-
-        // Stream per-key: read one chunk, build its proof entry, drop
-        // the bytes, move to the next. Peak memory is bounded at
-        // MAX_CHUNK_SIZE (4 MiB) regardless of sample size.
-        let mut per_key = Vec::with_capacity(challenge.keys.len());
-        for key in &challenge.keys {
-            let Ok(Some(bytes)) = storage.get_raw(key).await else {
-                // Key IS in the commitment (precheck above ensured
-                // it) but we cannot read the bytes anymore. That's
-                // real storage loss / deliberate non-response, not
-                // benign staleness. Use a distinct reason string so
-                // the auditor penalises (codex round-12 MAJOR #1).
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("missing bytes for committed key: {}", hex::encode(key)),
-                };
-            };
-            let Some(entry) =
-                crate::replication::commitment_state::build_commitment_bound_result_for_key(
-                    &built,
-                    key,
-                    &challenge.nonce,
-                    &challenge.challenged_peer_id,
-                    &bytes,
-                )
-            else {
-                // Precheck guaranteed proof_for(key) returns Some, so
-                // this is unreachable. Defensive only.
-                return AuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    reason: format!("key not in commitment: {}", hex::encode(key)),
-                };
-            };
-            per_key.push(entry);
-            // bytes drops here.
-        }
-
-        return AuditResponse::CommitmentBound {
-            challenge_id: challenge.challenge_id,
-            commitment: built.commitment().clone(),
-            per_key,
-        };
-    }
-
-    // Legacy plain-digest path (unchanged from pre-v12).
     let mut digests = Vec::with_capacity(challenge.keys.len());
 
     for key in &challenge.keys {
@@ -1299,7 +755,6 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys,
-            expected_commitment_hash: None,
         }
     }
 
@@ -1350,9 +805,6 @@ mod tests {
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
             }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
         }
     }
 
@@ -1388,9 +840,6 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -1432,9 +881,6 @@ mod tests {
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
             }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
         }
     }
 
@@ -1459,9 +905,6 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -1494,9 +937,6 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response");
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         }
     }
@@ -1644,7 +1084,6 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys: vec![addr_k1, addr_k2, addr_k3],
-            expected_commitment_hash: None,
         };
         let self_id = peer_id_from_bytes(peer_id);
 
@@ -1668,9 +1107,6 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests response"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
         }
     }
 
@@ -1699,7 +1135,6 @@ mod tests {
             nonce,
             challenged_peer_id: peer_id,
             keys: vec![a1, a2, a3],
-            expected_commitment_hash: None,
         };
         let self_id = peer_id_from_bytes(peer_id);
 
@@ -1718,9 +1153,6 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
         }
     }
 
@@ -2035,9 +1467,6 @@ mod tests {
             }
             AuditResponse::Bootstrapping { .. } => panic!("Expected Digests"),
             AuditResponse::Rejected { .. } => panic!("Unexpected Rejected response"),
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
-            }
         }
     }
 
@@ -2238,9 +1667,6 @@ mod tests {
             }
             AuditResponse::Rejected { .. } => {
                 panic!("Unexpected Rejected response")
-            }
-            AuditResponse::CommitmentBound { .. } => {
-                panic!("Unexpected CommitmentBound response in legacy-digest test")
             }
         };
         assert_eq!(challenge_id, 4700);

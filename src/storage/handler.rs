@@ -375,14 +375,23 @@ impl AntProtocol {
     /// [`LmdbStorage::delete`] or by the replication prune pass is reflected
     /// immediately, with no risk of missing a delete path.
     ///
-    /// On a storage read error the previous metric value is left untouched so a
-    /// transient LMDB error never disrupts quote generation.
+    /// On a storage read error — or a count that does not fit `usize` — the
+    /// previous metric value is left untouched so a transient LMDB error never
+    /// disrupts quote generation.
     fn resync_quote_metric(&self) {
         match self.storage.current_chunks() {
-            Ok(count) => {
-                self.quote_generator
-                    .resync_records(usize::try_from(count).unwrap_or(usize::MAX));
-            }
+            // Saturating an overflowing count to usize::MAX would jump the
+            // metric to the maximum possible price driver; keep the previous
+            // value instead, as for a read error.
+            Ok(count) => usize::try_from(count).map_or_else(
+                |_| {
+                    warn!(
+                        "current_chunks() count {count} overflows usize; keeping previous quote \
+                         metric"
+                    );
+                },
+                |records| self.quote_generator.resync_records(records),
+            ),
             Err(e) => {
                 warn!("Failed to read current_chunks() for quote metric resync: {e}");
             }

@@ -125,7 +125,7 @@ pub async fn check_bootstrap_drained(
     // Hints capacity-rejected at the pending_verify bounds during bootstrap
     // must be re-delivered by the originating source before drain can be
     // claimed; otherwise we'd silently mark ourselves complete with
-    // outstanding work the source still owes us (codex round-2 BLOCKER).
+    // outstanding work the source still owes us.
     // The set retires per-source as each source's next admission cycle
     // completes with zero rejections — see `clear_capacity_rejected`.
     if !state.capacity_rejected_sources.is_empty() {

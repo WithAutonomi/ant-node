@@ -230,8 +230,9 @@ async fn poc_bootstrap_stall_via_persistent_per_peer_overflow() {
 /// Honest peers are unaffected: the per-source quota means a flood from
 /// the attacker cannot starve an honest peer's hints. The honest peer's
 /// "clean" cycle correctly clears its bootstrap entry. This test
-/// confirms the per-source isolation that D1 already established —
-/// included so a future fix doesn't accidentally break it.
+/// confirms the per-source isolation that the bounded-queues defence
+/// (`poc_d1_bounded_queues`) already established — included so a future
+/// fix doesn't accidentally break it.
 #[tokio::test]
 async fn honest_peer_drains_normally_alongside_attacker() {
     let queues = Arc::new(RwLock::new(ReplicationQueues::new()));

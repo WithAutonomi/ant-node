@@ -150,6 +150,14 @@ name = "poc_audit_handler_live"
 path = "tests/poc_audit_handler_live.rs"
 required-features = ["test-utils"]
 
+# Bootstrap-stall DoS regression marker (documents the unfixed attack; the
+# eventual fix must land with a follow-up test asserting bounded drain).
+# Declared like the other PoC suites so CI invokes it explicitly.
+[[test]]
+name = "poc_bootstrap_stall"
+path = "tests/poc_bootstrap_stall.rs"
+required-features = ["test-utils"]
+
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.

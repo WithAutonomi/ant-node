@@ -56,6 +56,8 @@ jobs:
         run: cargo test --test poc_commitment_audit_attacks --features test-utils
       - name: Run v12 live audit-handler tests
         run: cargo test --test poc_audit_handler_live --features test-utils
+      - name: Run bootstrap-stall PoC regression marker
+        run: cargo test --test poc_bootstrap_stall --features test-utils
 
   doc:
     name: Documentation
