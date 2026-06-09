@@ -182,11 +182,23 @@ pub async fn sync_with_peer(
     config: &ReplicationConfig,
     is_bootstrapping: bool,
 ) -> Option<NeighborSyncResponse> {
-    sync_with_peer_with_outcome(peer, p2p_node, storage, paid_list, config, is_bootstrapping)
-        .await
-        .map(|outcome| outcome.response)
+    sync_with_peer_with_outcome(
+        peer,
+        p2p_node,
+        storage,
+        paid_list,
+        config,
+        is_bootstrapping,
+        None,
+    )
+    .await
+    .map(|outcome| outcome.response)
 }
 
+/// `commitment`: sender's current commitment to piggyback on the request.
+/// `None` if the responder hasn't rotated one yet (e.g. fresh boot,
+/// empty storage) — receiver falls back to legacy path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_with_peer_with_outcome(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
@@ -194,6 +206,7 @@ pub(crate) async fn sync_with_peer_with_outcome(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
+    commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> Option<NeighborSyncOutcome> {
     // Build peer-targeted hint sets (Rule 7).
     let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
@@ -215,6 +228,7 @@ pub(crate) async fn sync_with_peer_with_outcome(
         replica_hints,
         paid_hints,
         bootstrapping: is_bootstrapping,
+        commitment,
     };
     let request_id = rand::thread_rng().gen::<u64>();
     let msg = ReplicationMessage {
@@ -335,11 +349,13 @@ pub async fn handle_sync_request(
         paid_list,
         config,
         is_bootstrapping,
+        None,
     )
     .await;
     (response, sender_in_rt)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_sync_request_with_proofs(
     sender: &PeerId,
     _request: &NeighborSyncRequest,
@@ -348,6 +364,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
+    my_commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> (NeighborSyncResponse, Vec<SentReplicaHint>, bool) {
     let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(sender).await;
 
@@ -376,6 +393,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
         paid_hints,
         bootstrapping: is_bootstrapping,
         rejected_keys: Vec::new(),
+        commitment: my_commitment,
     };
 
     // Rule 4-6: accept inbound hints only if sender is in LocalRT.
@@ -977,6 +995,7 @@ mod tests {
             paid_hints: outbound_paid_hints.clone(),
             bootstrapping: false,
             rejected_keys: Vec::new(),
+            commitment: None,
         };
 
         // Inbound hints from the sender (would be in the request).

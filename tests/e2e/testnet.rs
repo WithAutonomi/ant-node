@@ -1244,11 +1244,21 @@ impl TestNetwork {
             let shutdown = CancellationToken::new();
             let repl_config = ReplicationConfig::default();
             let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
+            let node_identity = if let Some(ref id) = node.node_identity {
+                Arc::clone(id)
+            } else {
+                warn!(
+                    "Node {} has no identity; skipping replication engine",
+                    node.index
+                );
+                return Ok(());
+            };
             match ReplicationEngine::new(
                 repl_config,
                 Arc::clone(p2p),
                 protocol.storage(),
                 protocol.payment_verifier_arc(),
+                node_identity,
                 &node.data_dir,
                 fresh_rx,
                 shutdown.clone(),

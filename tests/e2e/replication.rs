@@ -394,6 +394,7 @@ async fn test_audit_challenge_returns_correct_digest() {
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![address],
+        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 1234,
@@ -444,6 +445,7 @@ async fn test_audit_absent_key_returns_sentinel() {
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![missing_key],
+        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 5678,
@@ -805,6 +807,7 @@ async fn test_neighbor_sync_request_returns_hints() {
         replica_hints: vec![],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 2000,
@@ -866,6 +869,7 @@ async fn test_audit_challenge_multi_key() {
         nonce,
         challenged_peer_id: *peer_a.as_bytes(),
         keys: vec![a1, absent_key, a2],
+        expected_commitment_hash: None,
     };
     let msg = ReplicationMessage {
         request_id: 3000,
@@ -1254,6 +1258,7 @@ async fn scenario_14_sync_hints_cover_all_local_keys() {
         replica_hints: vec![],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 1400,
@@ -1401,6 +1406,7 @@ async fn scenario_17_bidirectional_sync_when_sender_in_rt() {
         replica_hints: vec![inbound_hint],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 1700,

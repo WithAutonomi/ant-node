@@ -33,6 +33,18 @@ impl QuotingMetricsTracker {
         self.close_records_stored.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Overwrite the counter with an authoritative count of held records.
+    ///
+    /// This is the deletion-aware path and the SINGLE source of truth for the
+    /// priced record count: the handler calls it at quote time with the live
+    /// LMDB entry count (`current_chunks()`), so any record removed from
+    /// storage — by delete, prune, or otherwise — is reflected on the next
+    /// quote with no per-delete bookkeeping to keep in sync. `record_store`
+    /// remains only an optimistic between-quote hint; the resync overwrites it.
+    pub fn set_records(&self, count: usize) {
+        self.close_records_stored.store(count, Ordering::SeqCst);
+    }
+
     /// Get the number of records stored.
     #[must_use]
     pub fn records_stored(&self) -> usize {
@@ -61,5 +73,23 @@ mod tests {
         tracker.record_store();
         tracker.record_store();
         assert_eq!(tracker.records_stored(), 3);
+    }
+
+    #[test]
+    fn test_set_records_resyncs_to_authoritative_count() {
+        let tracker = QuotingMetricsTracker::new(100);
+        assert_eq!(tracker.records_stored(), 100);
+
+        // Resync down (e.g. after deletions/pruning the store now holds fewer).
+        tracker.set_records(42);
+        assert_eq!(tracker.records_stored(), 42);
+
+        // Resync up (e.g. after new stores).
+        tracker.set_records(57);
+        assert_eq!(tracker.records_stored(), 57);
+
+        // Resync to zero (empty store).
+        tracker.set_records(0);
+        assert_eq!(tracker.records_stored(), 0);
     }
 }

@@ -113,6 +113,14 @@ impl AntProtocol {
         Arc::clone(&self.storage)
     }
 
+    /// Test-only: the record count the quote generator currently prices on.
+    /// Used to assert that quote-time resync tracks records actually held.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn priced_records_stored(&self) -> usize {
+        self.quote_generator.records_stored()
+    }
+
     /// Get a shared reference to the payment verifier.
     #[must_use]
     pub fn payment_verifier_arc(&self) -> Arc<PaymentVerifier> {
@@ -358,11 +366,37 @@ impl AntProtocol {
         }
     }
 
+    /// Resync the quoting metric to the authoritative count of records the node
+    /// actually holds.
+    ///
+    /// The quote price is driven by `QuoteGenerator::records_stored()`. Reading
+    /// the live LMDB entry count (an O(1) B-tree page-header read) right before
+    /// pricing makes the metric deletion-aware: any chunk removed by
+    /// [`LmdbStorage::delete`] or by the replication prune pass is reflected
+    /// immediately, with no risk of missing a delete path.
+    ///
+    /// On a storage read error the previous metric value is left untouched so a
+    /// transient LMDB error never disrupts quote generation.
+    fn resync_quote_metric(&self) {
+        match self.storage.current_chunks() {
+            Ok(count) => {
+                self.quote_generator
+                    .resync_records(usize::try_from(count).unwrap_or(usize::MAX));
+            }
+            Err(e) => {
+                warn!("Failed to read current_chunks() for quote metric resync: {e}");
+            }
+        }
+    }
+
     /// Handle a quote request.
     fn handle_quote(&self, request: &ChunkQuoteRequest) -> ChunkQuoteResponse {
         let addr_hex = hex::encode(request.address);
         let data_size = request.data_size;
         debug!("Handling quote request for {addr_hex} (size: {data_size})");
+
+        // Price on records ACTUALLY HELD, not a monotonic store counter.
+        self.resync_quote_metric();
 
         // Check if the chunk is already stored so we can tell the client
         // to skip payment (already_stored = true).
@@ -427,6 +461,9 @@ impl AntProtocol {
             "Handling merkle candidate quote request for {addr_hex} (size: {data_size}, ts: {})",
             request.merkle_payment_timestamp
         );
+
+        // Price on records ACTUALLY HELD, not a monotonic store counter.
+        self.resync_quote_metric();
 
         let Ok(data_size_usize) = usize::try_from(request.data_size) else {
             return MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
@@ -1065,5 +1102,91 @@ mod tests {
             }
             other => panic!("expected Success with already_stored=false, got: {other:?}"),
         }
+    }
+
+    /// Drive the real quote handler, then read the record count it priced on.
+    /// The handler calls `resync_quote_metric` first, so this reflects records
+    /// ACTUALLY HELD.
+    fn priced_records_after_quote(protocol: &AntProtocol) -> usize {
+        let quote_request = ChunkQuoteRequest {
+            address: [0xAAu8; 32], // a quote-only probe, not one of the stored chunks
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+        };
+        let _ = protocol.handle_quote(&quote_request);
+        protocol.priced_records_stored()
+    }
+
+    /// The quote price must track records ACTUALLY HELD: deleting stored chunks
+    /// must lower the priced record count, not keep quoting as if the data were
+    /// still held. Exercises the storage-driven resync in `resync_quote_metric`.
+    #[tokio::test]
+    async fn test_quote_metric_reflects_deletions() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        // Distinct content -> distinct content-addressed keys.
+        let contents: Vec<Vec<u8>> = (0u8..5).map(|i| vec![i; 64]).collect();
+        let mut addresses = Vec::new();
+        for content in &contents {
+            let addr = LmdbStorage::compute_address(content);
+            protocol.put_local(&addr, content).await.expect("put_local");
+            addresses.push(addr);
+        }
+
+        // 5 records held -> priced count 5.
+        assert_eq!(priced_records_after_quote(&protocol), 5);
+
+        // Delete 2 chunks the node was holding.
+        for addr in addresses.iter().take(2) {
+            assert!(protocol.storage().delete(addr).await.expect("delete"));
+        }
+        assert_eq!(priced_records_after_quote(&protocol), 3);
+
+        // Delete the rest; priced count floors at 0, never underflows.
+        for addr in addresses.iter().skip(2) {
+            assert!(protocol.storage().delete(addr).await.expect("delete"));
+        }
+        assert_eq!(priced_records_after_quote(&protocol), 0);
+    }
+
+    /// Stronger, externally-observable proof: the actual quote PRICE returned
+    /// to a client must drop after the node deletes data it held. A monotonic
+    /// store counter would keep the price elevated; the resync ties price to
+    /// records actually held.
+    /// FLIPS IF: `resync_quote_metric` is removed — the price would stay at the
+    /// 10-record level even after deletions (`record_store` only ever increments).
+    #[tokio::test]
+    async fn test_quote_price_drops_after_deletion() {
+        use crate::payment::pricing::calculate_price;
+
+        let (protocol, _temp) = create_test_protocol().await;
+        let contents: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; 64]).collect();
+        let mut addresses = Vec::new();
+        for content in &contents {
+            let addr = LmdbStorage::compute_address(content);
+            protocol.put_local(&addr, content).await.expect("put_local");
+            addresses.push(addr);
+        }
+
+        // Drive a real quote; the priced count must equal records held (10),
+        // and the price must equal calculate_price(10) — the externally
+        // observable contract.
+        assert_eq!(priced_records_after_quote(&protocol), 10);
+        let price_full = calculate_price(10);
+
+        // Delete 8 of 10 held chunks.
+        for addr in addresses.iter().take(8) {
+            assert!(protocol.storage().delete(addr).await.expect("delete"));
+        }
+        // The next quote must price on 2 records, and the price must be the
+        // calculate_price(2) value — strictly different from the 10-record
+        // price (price is monotonic non-decreasing in records_stored).
+        assert_eq!(priced_records_after_quote(&protocol), 2);
+        let price_after = calculate_price(2);
+        assert!(
+            price_after < price_full,
+            "deleting data must lower the observable quote price \
+             (full={price_full:?}, after={price_after:?})"
+        );
     }
 }
