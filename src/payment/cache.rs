@@ -19,21 +19,31 @@ const DEFAULT_CACHE_CAPACITY: usize = 100_000;
 /// This cache stores `XorName` values that have been verified to exist on the
 /// autonomi network, avoiding repeated network queries for the same data.
 ///
-/// Each entry carries a flag recording whether the verification that inserted
-/// it ran the full client-PUT check set (`true`) or only the
-/// receipt-authenticity subset used for replication (`false`). A
-/// replication-verified entry must not satisfy a later client-PUT fast-path —
-/// the context-gated checks (own-quote freshness, local recipient, merkle
-/// candidate closeness) were never run for it — while either kind of entry
-/// satisfies a later replication check.
+/// Each entry records which fresh proof verification level inserted it. A
+/// paid-list entry must not satisfy a later client-PUT fast-path because
+/// paid-list membership checks K closest peers while client PUTs require the
+/// close group. Stronger entries satisfy weaker lookups.
 #[derive(Clone)]
 pub struct VerifiedCache {
-    /// Value: `true` if the entry was verified under the full client-PUT
-    /// check set, `false` if only under the replication subset.
-    inner: Arc<Mutex<LruCache<XorName, bool>>>,
+    inner: Arc<Mutex<LruCache<XorName, VerificationLevel>>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
     additions: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerificationLevel {
+    PaidList,
+    ClientPut,
+}
+
+impl VerificationLevel {
+    fn satisfies(self, required: Self) -> bool {
+        matches!(
+            (self, required),
+            (Self::PaidList, Self::PaidList) | (Self::ClientPut, Self::PaidList | Self::ClientPut)
+        )
+    }
 }
 
 /// Cache statistics for monitoring.
@@ -86,11 +96,10 @@ impl VerifiedCache {
         }
     }
 
-    /// Check if a `XorName` is in the cache (verified under either check set).
+    /// Check if a `XorName` is in the cache (verified under any fresh check set).
     ///
     /// Returns `true` if the `XorName` is cached (verified to exist on autonomi).
-    /// Sufficient for replication-context lookups; client-PUT lookups must use
-    /// [`Self::contains_client_put_verified`].
+    /// Paid-list and client-PUT lookups must use their stricter helpers.
     #[must_use]
     pub fn contains(&self, xorname: &XorName) -> bool {
         let found = self.inner.lock().get(xorname).is_some();
@@ -104,14 +113,42 @@ impl VerifiedCache {
         found
     }
 
-    /// Check if a `XorName` is cached AND its verification ran the full
-    /// client-PUT check set.
+    /// Check if a `XorName` is cached AND its verification ran at least the
+    /// paid-list admission check set.
     ///
-    /// A replication-verified entry returns `false` here: it never passed the
-    /// client-PUT-only checks, so it must not let a later client PUT skip them.
+    /// A client-PUT entry returns `true` here because it passed the stricter
+    /// closest-7 receiver membership check.
+    #[must_use]
+    pub fn contains_paid_list_verified(&self, xorname: &XorName) -> bool {
+        let found = self
+            .inner
+            .lock()
+            .get(xorname)
+            .copied()
+            .is_some_and(|level| level.satisfies(VerificationLevel::PaidList));
+
+        if found {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+        }
+
+        found
+    }
+
+    /// Check if a `XorName` is cached AND its verification ran the full
+    /// client-PUT close-group check set.
+    ///
+    /// Paid-list entries return `false` here because they did not pass the
+    /// client-PUT close-group membership check.
     #[must_use]
     pub fn contains_client_put_verified(&self, xorname: &XorName) -> bool {
-        let found = self.inner.lock().get(xorname).copied() == Some(true);
+        let found = self
+            .inner
+            .lock()
+            .get(xorname)
+            .copied()
+            .is_some_and(|level| level.satisfies(VerificationLevel::ClientPut));
 
         if found {
             self.hits.fetch_add(1, Ordering::Relaxed);
@@ -125,27 +162,32 @@ impl VerifiedCache {
     /// Add a `XorName` verified under the full client-PUT check set.
     ///
     /// This should be called after verifying that data exists on the autonomi network.
-    /// Also upgrades an existing replication-verified entry.
+    /// Also upgrades an existing paid-list-verified entry.
     pub fn insert(&self, xorname: XorName) {
-        self.inner.lock().put(xorname, true);
-        self.additions.fetch_add(1, Ordering::Relaxed);
+        self.insert_with_level(xorname, VerificationLevel::ClientPut);
     }
 
-    /// Add a `XorName` verified under the replication (receipt-authenticity)
-    /// subset only.
+    /// Add a `XorName` verified under paid-list admission checks.
     ///
-    /// Never downgrades an existing client-PUT-verified entry — the stronger
-    /// verification already happened, and replication re-offers of the same
-    /// key are routine.
-    pub fn insert_replication_verified(&self, xorname: XorName) {
+    /// Never downgrades an existing client-PUT-verified entry.
+    pub fn insert_paid_list_verified(&self, xorname: XorName) {
+        self.insert_with_level(xorname, VerificationLevel::PaidList);
+    }
+
+    fn insert_with_level(&self, xorname: XorName, level: VerificationLevel) {
         let added = {
             let mut inner = self.inner.lock();
             // `get_mut` refreshes LRU recency for existing entries of either kind.
-            if inner.get_mut(&xorname).is_none() {
-                inner.put(xorname, false);
-                true
-            } else {
+            if inner.get(&xorname).is_some() {
+                if let Some(existing) = inner.get_mut(&xorname) {
+                    if !existing.satisfies(level) {
+                        *existing = level;
+                    }
+                }
                 false
+            } else {
+                inner.put(xorname, level);
+                true
             }
         };
         if added {
@@ -214,6 +256,29 @@ mod tests {
         assert!(cache.contains(&xorname1));
         assert!(cache.contains(&xorname2));
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_cache_verification_levels_do_not_downgrade_or_over_authorize() {
+        let cache = VerifiedCache::new();
+        let paid_list = [2u8; 32];
+        let client_put = [3u8; 32];
+
+        cache.insert_paid_list_verified(paid_list);
+        assert!(cache.contains(&paid_list));
+        assert!(cache.contains_paid_list_verified(&paid_list));
+        assert!(!cache.contains_client_put_verified(&paid_list));
+
+        cache.insert(paid_list);
+        assert!(cache.contains_client_put_verified(&paid_list));
+
+        cache.insert(client_put);
+        assert!(cache.contains(&client_put));
+        assert!(cache.contains_paid_list_verified(&client_put));
+        assert!(cache.contains_client_put_verified(&client_put));
+
+        cache.insert_paid_list_verified(client_put);
+        assert!(cache.contains_client_put_verified(&client_put));
     }
 
     #[test]

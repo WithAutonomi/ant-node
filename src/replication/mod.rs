@@ -72,6 +72,14 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
 
+fn fresh_offer_payment_context() -> VerificationContext {
+    VerificationContext::ClientPut
+}
+
+fn paid_notify_payment_context() -> VerificationContext {
+    VerificationContext::PaidListAdmission
+}
+
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
 
@@ -1135,6 +1143,39 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
+    // Mirror the normal PUT path: the advertised key must be the content
+    // address of the supplied bytes before any expensive payment verification.
+    let computed_key = crate::client::compute_address(&offer.data);
+    if computed_key != offer.key {
+        warn!(
+            "Rejecting fresh offer for key {}: content address mismatch, computed {}",
+            hex::encode(offer.key),
+            hex::encode(computed_key),
+        );
+        p2p_node
+            .report_trust_event(
+                source,
+                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+            )
+            .await;
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: format!(
+                    "Content address mismatch: expected {}, computed {}",
+                    hex::encode(offer.key),
+                    hex::encode(computed_key),
+                ),
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Rule 7: check responsibility.
     if !admission::is_responsible(&self_id, &offer.key, p2p_node, config.close_group_size).await {
         send_replication_response(
@@ -1177,17 +1218,17 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier. This is an already-settled
-    // receipt handed over by a neighbour, not a live sale — Replication
-    // context skips the storer-being-paid-now checks (own-quote price
-    // freshness, local recipient, merkle candidate closeness) that would
-    // otherwise reject every honest hand-over once counts grow, the close
-    // group churns, or the live DHT drifts from the pool's original sample.
+    // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
+    // part of the immediate write fan-out: this receiver is about to store the
+    // record as if the client had PUT it here directly, so it must run the same
+    // ClientPut checks as the storage handler (receiver membership,
+    // paid-quote known-peer and local price floor for single-node proofs,
+    // merkle candidate closeness for merkle proofs).
     match payment_verifier
         .verify_payment(
             &offer.key,
             Some(&offer.proof_of_payment),
-            VerificationContext::Replication,
+            fresh_offer_payment_context(),
         )
         .await
     {
@@ -1301,13 +1342,16 @@ async fn handle_paid_notify(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier. Same as the fresh-offer path:
-    // a settled receipt, so Replication context (see VerificationContext).
+    // Gap 1: Validate PoP via PaymentVerifier. PaidNotify admits fresh
+    // paid-list metadata, so it runs the same payment checks as ClientPut.
+    // The receiver-membership difference is intentional: paid-list metadata
+    // uses the local K closest peers, while direct/fresh chunk stores use the
+    // close group.
     match payment_verifier
         .verify_payment(
             &notify.key,
             Some(&notify.proof_of_payment),
-            VerificationContext::Replication,
+            paid_notify_payment_context(),
         )
         .await
     {
@@ -2695,8 +2739,28 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{audit_failure_clears_bootstrap_claim, first_failed_key_label};
+    use super::{
+        audit_failure_clears_bootstrap_claim, first_failed_key_label, fresh_offer_payment_context,
+        paid_notify_payment_context,
+    };
+    use crate::payment::VerificationContext;
     use crate::replication::types::AuditFailureReason;
+
+    #[test]
+    fn fresh_offer_runs_client_put_payment_checks() {
+        assert_eq!(
+            fresh_offer_payment_context(),
+            VerificationContext::ClientPut
+        );
+    }
+
+    #[test]
+    fn paid_notify_uses_paid_list_admission_payment_checks() {
+        assert_eq!(
+            paid_notify_payment_context(),
+            VerificationContext::PaidListAdmission
+        );
+    }
 
     #[test]
     fn audit_timeout_preserves_active_bootstrap_claim() {

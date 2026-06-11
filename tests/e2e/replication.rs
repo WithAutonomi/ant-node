@@ -775,6 +775,64 @@ async fn test_fresh_offer_with_empty_pop_rejected() {
     harness.teardown().await.expect("teardown");
 }
 
+/// Fresh write with a key that does not match the supplied bytes is rejected
+/// before payment verification, matching the direct PUT handler.
+#[tokio::test]
+#[serial]
+async fn test_fresh_offer_with_mismatched_content_address_rejected() {
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let node_a = harness.test_node(3).expect("node_a");
+    let node_b = harness.test_node(4).expect("node_b");
+    let p2p_b = node_b.p2p_node.as_ref().expect("p2p_b");
+    let peer_a = *node_a.p2p_node.as_ref().expect("p2p_a").peer_id();
+
+    let content = b"mismatched fresh offer content";
+    let actual_address = compute_address(content);
+    let mut wrong_address = actual_address;
+    wrong_address[0] ^= 0xFF;
+
+    let offer = FreshReplicationOffer {
+        key: wrong_address,
+        data: content.to_vec(),
+        proof_of_payment: vec![0x01; 64],
+    };
+    let msg = ReplicationMessage {
+        request_id: 1001,
+        body: ReplicationMessageBody::FreshReplicationOffer(offer),
+    };
+
+    let resp_msg = send_replication_request(p2p_b, &peer_a, msg, Duration::from_secs(10)).await;
+    match resp_msg.body {
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            reason,
+            ..
+        }) => {
+            assert!(
+                reason.contains("Content address mismatch"),
+                "Should mention content address mismatch, got: {reason}"
+            );
+        }
+        other => panic!("Expected Rejected, got: {other:?}"),
+    }
+
+    let protocol_a = node_a.ant_protocol.as_ref().expect("protocol");
+    assert!(
+        !protocol_a.storage().exists(&wrong_address).unwrap_or(false),
+        "Chunk should not be stored under the wrong address"
+    );
+    assert!(
+        !protocol_a
+            .storage()
+            .exists(&actual_address)
+            .unwrap_or(false),
+        "Chunk should not be stored under the actual address after rejected offer"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// Neighbor sync request returns a sync response (Section 18 #5/#37).
 ///
 /// Send a `NeighborSyncRequest` from one node to another and verify we

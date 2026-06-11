@@ -23,6 +23,7 @@ use ant_node::compute_address;
 use ant_node::payment::{
     serialize_merkle_proof, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
 };
+use ant_node::CLOSE_GROUP_SIZE;
 use bytes::Bytes;
 use evmlib::common::Amount;
 use evmlib::merkle_payments::{
@@ -85,6 +86,35 @@ async fn send_put_to_node(
         .map_err(|e| format!("Handle failed: {e}"))?
         .ok_or("No response returned (unexpected None)")?;
     ChunkMessage::decode(&response_bytes).map_err(|e| format!("Decode failed: {e}"))
+}
+
+async fn responsible_receiver_index(
+    harness: &TestHarness,
+    address: &[u8; 32],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    for node in harness.network().nodes() {
+        let Some(p2p_node) = node.p2p_node.as_ref() else {
+            continue;
+        };
+
+        let self_peer_id = *p2p_node.peer_id();
+        let closest = p2p_node
+            .dht_manager()
+            .find_closest_nodes_local_with_self(address, CLOSE_GROUP_SIZE)
+            .await;
+        if closest
+            .iter()
+            .any(|closest_node| closest_node.peer_id == self_peer_id)
+        {
+            return Ok(node.index);
+        }
+    }
+
+    Err(format!(
+        "no running node's local view included itself in the closest {CLOSE_GROUP_SIZE} peers for {}",
+        hex::encode(address)
+    )
+    .into())
 }
 
 /// Create a lightweight test harness with payment enforcement and Anvil wiring.
@@ -555,7 +585,14 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         paid_node_addresses,
     };
 
-    let node = harness.test_node(0).ok_or("no test node 0")?;
+    let receiver_index = responsible_receiver_index(&harness, &proof.target.address.0).await?;
+    info!(
+        "Sending fabricated-pool attack to responsible node {receiver_index} for {}",
+        hex::encode(proof.target.address.0)
+    );
+    let node = harness
+        .test_node(receiver_index)
+        .ok_or_else(|| format!("no test node {receiver_index}"))?;
     let protocol = node
         .ant_protocol
         .as_ref()
@@ -570,7 +607,7 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         proof.tagged_proof,
     );
 
-    let response = send_put_to_node(&harness, 0, request)
+    let response = send_put_to_node(&harness, receiver_index, request)
         .await
         .map_err(|e| format!("Send failed: {e}"))?;
 
@@ -602,7 +639,8 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
                 "Pay-yourself attack was rejected for the WRONG reason — expected the \
                  matched-count rejection (\"candidate pub_keys do not match...\"), got: \
                  {other:?}. Either the testnet was too sparse (<13 peers returned) and the \
-                 sparse-network short-circuit fired instead, or some other check failed first."
+                 sparse-network short-circuit fired instead, or a verifier check other than \
+                 fabricated-pool closeness failed first."
             );
         }
     }

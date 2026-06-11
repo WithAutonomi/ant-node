@@ -74,14 +74,13 @@ impl AntProtocol {
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
-        // Keep the PaymentVerifier's freshness gate AND the QuoteGenerator's
-        // pricing wired to the same authoritative store used by this protocol
-        // handler. Pricing and the freshness gate MUST read the same record
-        // count: the generator prices a quote from current_chunks() and the
-        // verifier later checks the quote against current_chunks(), so the only
-        // difference they see is genuine in-flight growth. Attaching both here
-        // makes the invariant automatic for every AntProtocol construction
-        // path, including tests and future startup variants.
+        // Keep the PaymentVerifier's paid-quote price floor and the
+        // QuoteGenerator's pricing wired to the same authoritative store used
+        // by this protocol handler. Both must read the same record count: the
+        // generator prices quotes from current_chunks(), and the verifier later
+        // checks the paid median quote against current_chunks(). Attaching both
+        // here makes the invariant automatic for every AntProtocol
+        // construction path, including tests and future startup variants.
         payment_verifier.attach_storage(Arc::clone(&storage));
         quote_generator.attach_storage(Arc::clone(&storage));
 
@@ -263,8 +262,9 @@ impl AntProtocol {
         }
 
         // 5. Verify payment. This node is the storer being paid right now, so
-        // the full ClientPut check set applies (own-quote price freshness,
-        // local recipient, merkle candidate closeness).
+        // the full ClientPut check set applies (receiver membership,
+        // paid-quote known-peer and local price floor for single-node proofs,
+        // merkle candidate closeness).
         let payment_result = self
             .payment_verifier
             .verify_payment(
@@ -294,7 +294,7 @@ impl AntProtocol {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
                 // Bump the in-memory fallback counter. Both pricing and the
-                // freshness gate now read LmdbStorage::current_chunks() directly,
+                // paid-quote floor now read LmdbStorage::current_chunks() directly,
                 // so this counter only matters when no storage is attached
                 // (unit tests / mis-configured startup). Kept warm so that
                 // fallback path stays roughly accurate.
