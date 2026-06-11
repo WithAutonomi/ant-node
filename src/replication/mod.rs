@@ -1675,8 +1675,9 @@ async fn run_neighbor_sync_round(
     // prune pass and DHT snapshot so other tasks are not starved.
     let cycle_complete = sync_state.read().await.is_cycle_complete();
     if cycle_complete {
-        // A completed local neighbor-sync cycle matures key-specific repair
-        // proofs recorded in earlier epochs.
+        // A completed local neighbor-sync cycle advances the epoch component
+        // of repair-proof maturity. The per-key wall-clock minimum age is
+        // checked when audits are selected.
         {
             let mut history = sync_history.write().await;
             for record in history.values_mut() {

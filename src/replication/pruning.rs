@@ -70,7 +70,7 @@ pub struct PrunePassContext<'a> {
     pub sync_state: &'a Arc<RwLock<NeighborSyncState>>,
     /// Key-specific repair proofs used to gate prune-confirmation audits.
     pub repair_proofs: &'a Arc<RwLock<RepairProofs>>,
-    /// Current local neighbor-sync cycle epoch.
+    /// Current local neighbor-sync cycle epoch for repair-proof maturity.
     pub current_sync_epoch: u64,
     /// Whether remote prune-confirmation audits are allowed this pass.
     pub allow_remote_prune_audits: bool,
@@ -353,6 +353,7 @@ async fn evaluate_record_prune_key(
         &current_close_peers,
         ctx.repair_proofs,
         ctx.current_sync_epoch,
+        now,
     )
     .await
     {
@@ -452,10 +453,11 @@ async fn target_peers_have_mature_repair_proofs(
     current_close_peers: &HashSet<PeerId>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     current_sync_epoch: u64,
+    now: Instant,
 ) -> bool {
     let mut proofs = repair_proofs.write().await;
     target_peers.iter().all(|peer| {
-        proofs.has_mature_replica_hint(peer, key, current_close_peers, current_sync_epoch)
+        proofs.has_mature_replica_hint(peer, key, current_close_peers, current_sync_epoch, now)
     })
 }
 

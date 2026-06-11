@@ -58,6 +58,13 @@ const NEIGHBOR_SYNC_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
 /// Per-peer minimum spacing between successive syncs with the same peer.
 pub const NEIGHBOR_SYNC_COOLDOWN: Duration = Duration::from_secs(NEIGHBOR_SYNC_COOLDOWN_SECS);
 
+/// Minimum age for a replica repair hint before the hinted peer can be audited
+/// for that key.
+const REPAIR_HINT_MIN_AGE_SECS: u64 = 60 * 60; // 1 hour
+/// Minimum age for a replica repair hint before the hinted peer can be audited
+/// for that key.
+pub const REPAIR_HINT_MIN_AGE: Duration = Duration::from_secs(REPAIR_HINT_MIN_AGE_SECS);
+
 /// Minimum self-lookup cadence.
 const SELF_LOOKUP_INTERVAL_MIN_SECS: u64 = 5 * 60;
 /// Maximum self-lookup cadence.

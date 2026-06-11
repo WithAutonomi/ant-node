@@ -7,7 +7,7 @@
 
 use super::TestHarness;
 use ant_node::client::compute_address;
-use ant_node::replication::config::REPLICATION_PROTOCOL_ID;
+use ant_node::replication::config::{REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID};
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
     FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
@@ -22,7 +22,7 @@ use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Maximum time to wait for replication propagation in tests.
@@ -148,9 +148,18 @@ async fn record_repair_proofs_for_peers(
         .map(|node| node.peer_id)
         .collect();
     let mut proofs = repair_proofs.write().await;
+    let hinted_at = Instant::now()
+        .checked_sub(REPAIR_HINT_MIN_AGE)
+        .unwrap_or_else(Instant::now);
     for peer in peers {
         assert!(
-            proofs.record_replica_hint_sent(*peer, *key, &close_peers, hinted_at_epoch),
+            proofs.record_replica_hint_sent_at(
+                *peer,
+                *key,
+                &close_peers,
+                hinted_at_epoch,
+                hinted_at
+            ),
             "test target should be in close group for repair-proof recording"
         );
     }
