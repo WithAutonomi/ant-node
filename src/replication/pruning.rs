@@ -471,9 +471,7 @@ async fn prune_paid_entries(
     let mut last_selected_offset = None;
 
     for offset in 0..paid_keys.len() {
-        let Some(key) = paid_keys.get((scan_start + offset) % paid_keys.len()) else {
-            continue;
-        };
+        let key = &paid_keys[(scan_start + offset) % paid_keys.len()];
         let closest: Vec<DHTNode> = dht
             .find_closest_nodes_local_with_self(key, config.paid_list_close_group_size)
             .await;
@@ -1017,7 +1015,7 @@ fn prune_proofs_needed(group_size: usize) -> usize {
     }
 }
 
-/// Whether enough target peers proved possession to allow deletion.
+/// Whether enough target peers supplied positive evidence to allow deletion.
 ///
 /// `proofs_needed == 0` means confirmation is impossible (no targets), not
 /// trivially met.
