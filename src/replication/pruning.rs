@@ -193,15 +193,8 @@ pub async fn run_prune_pass(
 pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResult {
     let (stored_count, record_stats) = prune_stored_records(&ctx).await;
     let now = Instant::now();
-    let (paid_count, paid_stats) = prune_paid_entries(
-        ctx.self_id,
-        ctx.paid_list,
-        ctx.p2p_node,
-        ctx.config,
-        ctx.sync_state,
-        now,
-    )
-    .await;
+    let (paid_count, paid_stats) =
+        prune_paid_entries(ctx.self_id, ctx.paid_list, ctx.p2p_node, ctx.config, now).await;
 
     let result = PruneResult {
         records_pruned: record_stats.pruned,
@@ -404,7 +397,6 @@ async fn prune_paid_entries(
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
     now: Instant,
 ) -> (usize, PaidPruneStats) {
     let paid_keys = match paid_list.all_keys() {
@@ -421,7 +413,7 @@ async fn prune_paid_entries(
     let mut verification_deferred = 0usize;
     // Rotate the scan start so expired entries beyond the per-pass cap are
     // not starved by the same head-of-list entries every pass.
-    let scan_start = paid_prune_scan_start(sync_state, paid_keys.len()).await;
+    let scan_start = paid_list.paid_prune_scan_start(paid_keys.len());
     let mut last_selected_offset = None;
 
     for offset in 0..paid_keys.len() {
@@ -461,13 +453,7 @@ async fn prune_paid_entries(
         }
     }
 
-    advance_paid_prune_cursor(
-        sync_state,
-        paid_keys.len(),
-        scan_start,
-        last_selected_offset,
-    )
-    .await;
+    paid_list.advance_paid_prune_cursor(paid_keys.len(), scan_start, last_selected_offset);
 
     if verification_deferred > 0 {
         debug!(
@@ -502,31 +488,6 @@ async fn prune_paid_entries(
     }
 
     (paid_keys.len(), stats)
-}
-
-async fn paid_prune_scan_start(
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    paid_key_count: usize,
-) -> usize {
-    if paid_key_count == 0 {
-        return 0;
-    }
-    sync_state.read().await.paid_prune_cursor % paid_key_count
-}
-
-async fn advance_paid_prune_cursor(
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    paid_key_count: usize,
-    scan_start: usize,
-    last_selected_offset: Option<usize>,
-) {
-    if paid_key_count == 0 {
-        sync_state.write().await.paid_prune_cursor = 0;
-        return;
-    }
-
-    let advance_by = last_selected_offset.map_or(1, |offset| offset.saturating_add(1));
-    sync_state.write().await.paid_prune_cursor = (scan_start + advance_by) % paid_key_count;
 }
 
 /// Re-check each confirmed candidate against current local state before
@@ -1445,28 +1406,6 @@ mod tests {
         let confirmed_by_key = paid_confirmations_by_key(&candidates, &HashMap::new());
 
         assert!(confirmed_by_key.is_empty());
-    }
-
-    #[tokio::test]
-    async fn paid_prune_cursor_advances_past_selected_window() {
-        let state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
-        state.write().await.paid_prune_cursor = 2;
-
-        let start = paid_prune_scan_start(&state, 10).await;
-        advance_paid_prune_cursor(&state, 10, start, Some(3)).await;
-
-        assert_eq!(state.read().await.paid_prune_cursor, 6);
-    }
-
-    #[tokio::test]
-    async fn paid_prune_cursor_advances_even_when_nothing_selected() {
-        let state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
-        state.write().await.paid_prune_cursor = 9;
-
-        let start = paid_prune_scan_start(&state, 10).await;
-        advance_paid_prune_cursor(&state, 10, start, None).await;
-
-        assert_eq!(state.read().await.paid_prune_cursor, 0);
     }
 
     #[test]

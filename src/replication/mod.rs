@@ -1695,13 +1695,11 @@ async fn run_neighbor_sync_round(
             let old_bootstrap_claims = std::mem::take(&mut state.bootstrap_claims);
             let old_bootstrap_claim_history = std::mem::take(&mut state.bootstrap_claim_history);
             let old_prune_cursor = state.prune_cursor;
-            let old_paid_prune_cursor = state.paid_prune_cursor;
             *state = NeighborSyncState::new_cycle(neighbors);
             state.last_sync_times = old_sync_times;
             state.bootstrap_claims = old_bootstrap_claims;
             state.bootstrap_claim_history = old_bootstrap_claim_history;
             state.prune_cursor = old_prune_cursor;
-            state.paid_prune_cursor = old_paid_prune_cursor;
         }
     }
 

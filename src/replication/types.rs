@@ -455,9 +455,6 @@ pub struct NeighborSyncState {
     /// Cursor used by post-cycle pruning to rotate through stored records when
     /// the per-pass prune-confirmation budget is exhausted.
     pub prune_cursor: usize,
-    /// Cursor used by post-cycle pruning to rotate through `PaidForList`
-    /// entries when the per-pass paid-verification cap is exhausted.
-    pub paid_prune_cursor: usize,
 }
 
 impl NeighborSyncState {
@@ -471,7 +468,6 @@ impl NeighborSyncState {
             bootstrap_claims: HashMap::new(),
             bootstrap_claim_history: HashMap::new(),
             prune_cursor: 0,
-            paid_prune_cursor: 0,
         }
     }
 
