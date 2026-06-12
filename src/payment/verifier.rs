@@ -11,6 +11,7 @@ use crate::payment::pricing::{calculate_price, derive_records_stored_from_price}
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
+use crate::replication::config::storage_admission_width;
 use crate::storage::lmdb::LmdbStorage;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::{Amount, QuoteHash};
@@ -919,17 +920,27 @@ impl PaymentVerifier {
             }
         };
 
-        let close_group_size = self.config.close_group_size;
+        // Verify against the close group PLUS the storage-admission margin
+        // rather than the bare configured close-group width. The check compares
+        // the client's network-derived quote set against this node's *local*
+        // routing-table view, which on a real (young / large / NAT-heavy)
+        // network does not perfectly reflect the global K-closest: a peer the
+        // client legitimately quoted routinely ranks just outside this node's
+        // local close-group window. Bare `close_group_size` (no margin) falsely
+        // rejects those honest payments — the same divergence the sibling
+        // receiver admission check absorbs via `storage_admission_width`
+        // (PR #137); apply the same margin here for symmetry.
+        let admission_width = storage_admission_width(self.config.close_group_size);
         let closest = p2p_node
             .dht_manager()
-            .find_closest_nodes_local_with_self(xorname, close_group_size)
+            .find_closest_nodes_local_with_self(xorname, admission_width)
             .await;
         if closest.iter().any(|node| node.peer_id == *issuer_peer_id) {
             return Ok(());
         }
 
         Err(Error::Payment(format!(
-            "Paid quote issuer {} is not among this node's local {close_group_size} closest peers for {}",
+            "Paid quote issuer {} is not among this node's local {admission_width} closest peers for {}",
             issuer_peer_id.to_hex(),
             hex::encode(xorname)
         )))
