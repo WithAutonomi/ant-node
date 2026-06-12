@@ -7,7 +7,9 @@
 
 use super::TestHarness;
 use ant_node::client::compute_address;
-use ant_node::replication::config::{REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID};
+use ant_node::replication::config::{
+    storage_admission_width, REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID,
+};
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
     FreshReplicationOffer, FreshReplicationResponse, NeighborSyncRequest, ReplicationMessage,
@@ -78,6 +80,7 @@ async fn find_remote_prune_candidate(
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = pruner.p2p_node.as_ref().expect("pruner p2p");
     let pruner_peer = *pruner_p2p.peer_id();
+    let admission_width = storage_admission_width(close_group_size);
 
     for attempt in 0..10_000usize {
         let content = format!("prune-confirmation-{label}-{attempt}").into_bytes();
@@ -94,6 +97,16 @@ async fn find_remote_prune_candidate(
         if target_peers.contains(&pruner_peer) {
             continue;
         }
+        let storage_admission_group = pruner_p2p
+            .dht_manager()
+            .find_closest_nodes_local_with_self(&address, admission_width)
+            .await;
+        if storage_admission_group
+            .iter()
+            .any(|node| node.peer_id == pruner_peer)
+        {
+            continue;
+        }
         if target_peers
             .iter()
             .all(|peer| node_index_for_peer(harness, peer).is_some())
@@ -102,7 +115,10 @@ async fn find_remote_prune_candidate(
         }
     }
 
-    panic!("failed to find a {close_group_size}-peer prune candidate outside pruner {pruner_idx}");
+    panic!(
+        "failed to find a {close_group_size}-peer prune candidate outside pruner {pruner_idx}'s \
+         storage-admission range"
+    );
 }
 
 async fn store_record_on_peer(

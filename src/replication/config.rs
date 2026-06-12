@@ -23,6 +23,14 @@ use crate::ant_protocol::CLOSE_GROUP_SIZE;
 /// Maximum number of peers per k-bucket in the Kademlia routing table.
 pub const K_BUCKET_SIZE: usize = 20;
 
+/// Extra local-routing-table positions accepted for local chunk storage
+/// admission and stored-record pruning.
+///
+/// This margin absorbs small local RT disagreement between peers. It does not
+/// widen audit, quorum, or paid-list target sets; those remain strict
+/// `close_group_size` / paid-list group checks.
+pub const STORAGE_ADMISSION_MARGIN: usize = 2;
+
 /// Full-network target for required positive presence votes.
 ///
 /// Effective per-key threshold is
@@ -38,6 +46,13 @@ pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 /// Number of close-neighbor peers synced concurrently per round-robin repair
 /// round.
 pub const NEIGHBOR_SYNC_PEER_COUNT: usize = 4;
+
+/// Width used when deciding whether this node may locally store or retain a
+/// chunk.
+#[must_use]
+pub const fn storage_admission_width(close_group_size: usize) -> usize {
+    close_group_size.saturating_add(STORAGE_ADMISSION_MARGIN)
+}
 
 /// Minimum neighbor-sync cadence. Actual interval is randomized within
 /// `[min, max]`.
@@ -409,6 +424,17 @@ mod tests {
             config.prune_hysteresis_duration,
             Duration::from_secs(3 * 24 * 60 * 60)
         );
+    }
+
+    #[test]
+    fn storage_admission_width_adds_margin() {
+        const TEST_CLOSE_GROUP_SIZE: usize = 7;
+
+        assert_eq!(
+            storage_admission_width(TEST_CLOSE_GROUP_SIZE),
+            TEST_CLOSE_GROUP_SIZE + STORAGE_ADMISSION_MARGIN
+        );
+        assert_eq!(storage_admission_width(usize::MAX), usize::MAX);
     }
 
     #[test]

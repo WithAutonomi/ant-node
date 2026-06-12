@@ -18,8 +18,8 @@ use tokio::sync::RwLock;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
-    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
-    REPLICATION_PROTOCOL_ID,
+    storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
+    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -195,10 +195,12 @@ struct PruneAuditReportState {
 /// Execute post-cycle responsibility pruning.
 ///
 /// For each stored record K:
-/// - If `IsResponsible(self, K)`: clear `RecordOutOfRangeFirstSeen`.
-/// - If not responsible: set timestamp if not already set; delete if the
+/// - If `self` is within the storage-admission group
+///   (`close_group_size + STORAGE_ADMISSION_MARGIN`): clear
+///   `RecordOutOfRangeFirstSeen`.
+/// - If not in that group: set timestamp if not already set; delete if the
 ///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old and all but one
-///   of the current close group prove they store the record.
+///   of the strict current close group prove they store the record.
 ///
 /// For each `PaidForList` entry K:
 /// - If self is in `PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen`.
@@ -280,7 +282,6 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     };
 
     let now = Instant::now();
-    let dht = ctx.p2p_node.dht_manager();
     let mut stats = RecordPruneStats::default();
     let mut candidates = Vec::new();
     let mut audit_challenge_budget = MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS;
@@ -291,12 +292,18 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 
     for offset in 0..stored_keys.len() {
         let key = &stored_keys[(scan_start + offset) % stored_keys.len()];
-        let closest: Vec<DHTNode> = dht
-            .find_closest_nodes_local_with_self(key, ctx.config.close_group_size)
-            .await;
+        let (storage_admission_group, strict_close_group) =
+            record_prune_lookup_groups(key, ctx.p2p_node, ctx.config).await;
 
-        let outcome =
-            evaluate_record_prune_key(ctx, key, &closest, now, &mut audit_challenge_budget).await;
+        let outcome = evaluate_record_prune_key(
+            ctx,
+            key,
+            &storage_admission_group,
+            &strict_close_group,
+            now,
+            &mut audit_challenge_budget,
+        )
+        .await;
         if outcome.marked {
             stats.marked += 1;
         }
@@ -367,15 +374,33 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     (stored_keys.len(), stats)
 }
 
+async fn record_prune_lookup_groups(
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> (Vec<DHTNode>, Vec<DHTNode>) {
+    let dht = p2p_node.dht_manager();
+    let storage_admission_group = dht
+        .find_closest_nodes_local_with_self(key, storage_admission_width(config.close_group_size))
+        .await;
+    let strict_close_group = dht
+        .find_closest_nodes_local_with_self(key, config.close_group_size)
+        .await;
+    (storage_admission_group, strict_close_group)
+}
+
 async fn evaluate_record_prune_key(
     ctx: &PrunePassContext<'_>,
     key: &XorName,
-    closest: &[DHTNode],
+    storage_admission_group: &[DHTNode],
+    strict_close_group: &[DHTNode],
     now: Instant,
     audit_challenge_budget: &mut usize,
 ) -> RecordPruneKeyOutcome {
     let mut outcome = RecordPruneKeyOutcome::default();
-    let is_responsible = closest.iter().any(|node| node.peer_id == *ctx.self_id);
+    let is_responsible = storage_admission_group
+        .iter()
+        .any(|node| node.peer_id == *ctx.self_id);
 
     if is_responsible {
         if ctx.paid_list.record_out_of_range_since(key).is_some() {
@@ -405,7 +430,7 @@ async fn evaluate_record_prune_key(
         return outcome;
     }
 
-    let target_peers = remote_close_group_peers(closest, ctx.self_id);
+    let target_peers = remote_close_group_peers(strict_close_group, ctx.self_id);
     if target_peers.is_empty() {
         warn!(
             "Cannot prune {}: current close group has no remote peers",
@@ -417,7 +442,8 @@ async fn evaluate_record_prune_key(
     // Only peers we have hinted (mature repair proof) may be audited; the
     // proof threshold must be reachable among them. A never-synced peer in
     // the close group reduces the audit pool instead of vetoing the prune.
-    let current_close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
+    let current_close_peers: HashSet<PeerId> =
+        strict_close_group.iter().map(|node| node.peer_id).collect();
     #[cfg(any(test, feature = "test-utils"))]
     let repair_proof_now = ctx.repair_proof_now.unwrap_or(now);
     #[cfg(not(any(test, feature = "test-utils")))]
@@ -918,17 +944,18 @@ async fn revalidated_record_prune_keys(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> (Vec<XorName>, usize) {
-    let dht = p2p_node.dht_manager();
     let mut keys_to_delete = Vec::new();
     let mut cleared = 0;
     let now = Instant::now();
 
     for candidate in candidates {
-        let closest: Vec<DHTNode> = dht
-            .find_closest_nodes_local_with_self(&candidate.key, config.close_group_size)
-            .await;
+        let (storage_admission_group, strict_close_group) =
+            record_prune_lookup_groups(&candidate.key, p2p_node, config).await;
 
-        if closest.iter().any(|n| n.peer_id == *self_id) {
+        if storage_admission_group
+            .iter()
+            .any(|n| n.peer_id == *self_id)
+        {
             if paid_list
                 .record_out_of_range_since(&candidate.key)
                 .is_some()
@@ -949,7 +976,7 @@ async fn revalidated_record_prune_keys(
             continue;
         }
 
-        let current_target_peers = remote_close_group_peers(&closest, self_id);
+        let current_target_peers = remote_close_group_peers(&strict_close_group, self_id);
         if current_target_peers.is_empty() {
             warn!(
                 "Cannot prune {}: current close group has no remote peers",
