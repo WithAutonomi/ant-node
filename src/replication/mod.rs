@@ -47,8 +47,8 @@ use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::config::{
-    max_parallel_fetch, ReplicationConfig, MAX_CONCURRENT_REPLICATION_SENDS,
-    REPLICATION_PROTOCOL_ID,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig,
+    MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1176,15 +1176,23 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Rule 7: check responsibility.
-    if !admission::is_responsible(&self_id, &offer.key, p2p_node, config.close_group_size).await {
+    // Rule 7: check storage admission. Fresh chunk receivers accept the close
+    // group plus a small margin to absorb local routing-table disagreement.
+    if !admission::is_responsible(
+        &self_id,
+        &offer.key,
+        p2p_node,
+        storage_admission_width(config.close_group_size),
+    )
+    .await
+    {
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
                 key: offer.key,
-                reason: "Not responsible for this key".to_string(),
+                reason: "Not in storage-admission range for this key".to_string(),
             }),
             rr_message_id,
         )
@@ -1220,7 +1228,7 @@ async fn handle_fresh_offer(
 
     // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
     // part of the immediate write fan-out: this receiver is about to store the
-    // record as if the client had PUT it here directly. Receiver responsibility
+    // record as if the client had PUT it here directly. Storage admission
     // was checked above before proof work. ClientPut verification applies
     // store-strength cache semantics, paid-quote issuer close-group and local
     // price floor checks for single-node proofs, and merkle candidate
@@ -2141,9 +2149,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     match pipeline {
                         HintPipeline::PaidOnly => {
                             // Paid-only + local paid state needs one more
-                            // responsibility check outside this lock: if we
-                            // are also in the storage close group, the hint
-                            // can repair a missing replica.
+                            // storage-admission check outside this lock: if we
+                            // are also in the close group plus storage margin,
+                            // the hint can repair a missing replica.
                             local_paid_paid_only_keys.push(*key);
                         }
                         HintPipeline::Replica => {
@@ -2166,8 +2174,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         for key in local_paid_paid_only_keys {
             if storage.exists(&key).unwrap_or(false) {
                 terminal_paid_only.push(key);
-            } else if admission::is_responsible(&self_id, &key, p2p_node, config.close_group_size)
-                .await
+            } else if admission::is_responsible(
+                &self_id,
+                &key,
+                p2p_node,
+                storage_admission_width(config.close_group_size),
+            )
+            .await
             {
                 local_paid_presence_probe_keys.push(key);
             } else {
@@ -2276,9 +2289,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Paid-only hints normally update PaidForList only. If this node is
-        // also storage-responsible for the key, a verified paid-only hint can
-        // safely repair a missing replica using sources from the same
-        // verification round.
+        // also within the storage-admission group for the key, a verified
+        // paid-only hint can safely repair a missing replica using sources
+        // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
         for (key, outcome, pipeline) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
@@ -2288,7 +2301,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         | KeyVerificationOutcome::PaidListVerified { .. }
                 )
                 && !storage.exists(key).unwrap_or(false)
-                && admission::is_responsible(&self_id, key, p2p_node, config.close_group_size).await
+                && admission::is_responsible(
+                    &self_id,
+                    key,
+                    p2p_node,
+                    storage_admission_width(config.close_group_size),
+                )
+                .await
             {
                 paid_only_fetch_keys.insert(*key);
             }
@@ -2313,7 +2332,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // retained as pending until queue drains.
                     } else if fetch_eligible && sources.is_empty() {
                         warn!(
-                            "Verified responsible key {} has no holders (possible data loss)",
+                            "Verified storage-admitted key {} has no holders (possible data loss)",
                             hex::encode(key)
                         );
                         q.remove_pending(&key);

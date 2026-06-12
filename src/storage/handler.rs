@@ -38,6 +38,7 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::replication::config::storage_admission_width;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
@@ -58,7 +59,7 @@ pub struct AntProtocol {
     /// Quote generator for creating storage quotes.
     /// Also handles merkle candidate quote signing via ML-DSA-65.
     quote_generator: Arc<QuoteGenerator>,
-    /// P2P node handle used for direct PUT receiver responsibility checks.
+    /// P2P node handle used for direct PUT storage-admission checks.
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
     /// Channel for notifying the replication engine about newly-stored chunks.
     fresh_write_tx: Option<mpsc::UnboundedSender<FreshWriteEvent>>,
@@ -270,9 +271,10 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Check storage responsibility before payment verification. A node
+        // 4. Check storage admission before payment verification. A node
         //    should only accept the actual chunk when its local routing table
-        //    places it in the configured close group for the chunk address.
+        //    places it in the configured close group plus storage margin for
+        //    the chunk address.
         if let Err(e) = self.validate_store_membership(&address).await {
             return ChunkPutResponse::Error(e);
         }
@@ -375,8 +377,9 @@ impl AntProtocol {
                     return Ok(());
                 }
                 return Err(ProtocolError::PaymentFailed(format!(
-                    "ClientPut receiver is not among this node's local {} closest peers for {}",
-                    self.payment_verifier.close_group_size(),
+                    "ClientPut receiver is not among this node's local {} closest peers for {} \
+                     (close group plus storage margin)",
+                    storage_admission_width(self.payment_verifier.close_group_size()),
                     hex::encode(address)
                 )));
             }
@@ -409,17 +412,18 @@ impl AntProtocol {
         };
 
         let self_id = *p2p_node.peer_id();
-        let close_group_size = self.payment_verifier.close_group_size();
+        let admission_width = storage_admission_width(self.payment_verifier.close_group_size());
         let closest = p2p_node
             .dht_manager()
-            .find_closest_nodes_local_with_self(address, close_group_size)
+            .find_closest_nodes_local_with_self(address, admission_width)
             .await;
         if closest.iter().any(|node| node.peer_id == self_id) {
             return Ok(());
         }
 
         Err(ProtocolError::PaymentFailed(format!(
-            "ClientPut receiver {} is not among this node's local {close_group_size} closest peers for {}",
+            "ClientPut receiver {} is not among this node's local {admission_width} closest peers for {} \
+             (close group plus storage margin)",
             self_id.to_hex(),
             hex::encode(address)
         )))

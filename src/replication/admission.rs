@@ -15,7 +15,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::ReplicationConfig;
+use crate::replication::config::{storage_admission_width, ReplicationConfig};
 use crate::replication::paid_list::PaidList;
 use crate::storage::LmdbStorage;
 
@@ -31,19 +31,20 @@ pub struct AdmissionResult {
     pub rejected_keys: Vec<XorName>,
 }
 
-/// Check if this node is responsible for key `K`.
+/// Check if this node is within a caller-supplied closest-peer width for key
+/// `K`.
 ///
-/// Returns `true` if `self_id` is among the `close_group_size` nearest peers
-/// to `K` in `SelfInclusiveRT`.
+/// Returns `true` if `self_id` is among the `responsibility_width` nearest
+/// peers to `K` in `SelfInclusiveRT`.
 pub async fn is_responsible(
     self_id: &PeerId,
     key: &XorName,
     p2p_node: &Arc<P2PNode>,
-    close_group_size: usize,
+    responsibility_width: usize,
 ) -> bool {
     let closest = p2p_node
         .dht_manager()
-        .find_closest_nodes_local_with_self(key, close_group_size)
+        .find_closest_nodes_local_with_self(key, responsibility_width)
         .await;
     closest.iter().any(|n| n.peer_id == *self_id)
 }
@@ -70,8 +71,9 @@ pub async fn is_in_paid_close_group(
 /// For each key in `replica_hints` and `paid_hints`:
 /// - **Cross-set precedence**: if a key appears in both sets, keep only the
 ///   replica-hint entry.
-/// - **Replica hints**: admitted if `IsResponsible(self, K)` or key already
-///   exists in local store / pending set.
+/// - **Replica hints**: admitted if `self` is in the storage-admission group
+///   (`close_group_size + STORAGE_ADMISSION_MARGIN`) or key already exists in
+///   local store / pending set.
 /// - **Paid hints**: admitted if `self` is in `PaidCloseGroup(K)` or key is
 ///   already in `PaidForList`.
 ///
@@ -111,7 +113,14 @@ pub async fn admit_hints(
             continue;
         }
 
-        if is_responsible(self_id, &key, p2p_node, config.close_group_size).await {
+        if is_responsible(
+            self_id,
+            &key,
+            p2p_node,
+            storage_admission_width(config.close_group_size),
+        )
+        .await
+        {
             result.replica_keys.push(key);
         } else {
             result.rejected_keys.push(key);
@@ -323,8 +332,9 @@ mod tests {
     ///     gate tested at the e2e level (scenario 17 tests the positive
     ///     case).
     /// (b) Even if a sender IS in `LocalRT`, the per-key relevance check
-    ///     (`is_responsible` / `is_in_paid_close_group`) in `admit_hints`
-    ///     still applies. Sender identity does not grant key admission.
+    ///     (`is_responsible` with storage-admission width /
+    ///     `is_in_paid_close_group`) in `admit_hints` still applies. Sender
+    ///     identity does not grant key admission.
     ///
     /// This test exercises layer (b): the admission pipeline's dedup,
     /// cross-set precedence, and relevance filtering using the same logic
@@ -358,8 +368,8 @@ mod tests {
                 admitted_replica.push(key);
                 continue;
             }
-            // key_not_pending: not pending, not local -> needs is_responsible.
-            // Simulate is_responsible returning false (out of range).
+            // key_not_pending: not pending, not local -> needs the
+            // storage-admission check. Simulate it returning false.
             let is_responsible = false;
             if is_responsible {
                 admitted_replica.push(key);
@@ -416,7 +426,7 @@ mod tests {
     /// Scenario 7: Out-of-range key hint rejected regardless of quorum.
     ///
     /// A key whose XOR distance from self is much larger than the distance
-    /// of the close-group members fails the `is_responsible` check in
+    /// of the storage-admission members fails the `is_responsible` check in
     /// `admit_hints`. The key never enters the verification pipeline, so
     /// quorum is irrelevant.
     ///
@@ -441,7 +451,7 @@ mod tests {
 
         // -- Simulate admit_hints for these keys --
         //
-        // When `close_group_size` peers are all closer to far_key than
+        // When the storage-admission peers are all closer to far_key than
         // self, `is_responsible(self, far_key)` returns false. The key is
         // rejected without entering verification or quorum.
 
@@ -460,8 +470,8 @@ mod tests {
                 admitted.push(key);
                 continue;
             }
-            // Simulate is_responsible: self (0x00) has close_group_size
-            // peers closer to far_key (0xFF) than itself -> not responsible.
+            // Simulate is_responsible: self (0x00) has the full
+            // storage-admission group closer to far_key (0xFF) than itself.
             // For close_key (0x01), self is very close -> responsible.
             let distance = xor_distance(&self_xor, &key);
             let simulated_responsible = distance[0] < 0x80;
