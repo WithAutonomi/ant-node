@@ -954,24 +954,24 @@ impl PaymentVerifier {
         let network_lookup = p2p_node
             .dht_manager()
             .find_closest_nodes_network(xorname, lookup_width);
-        let network = match tokio::time::timeout(Self::CLOSENESS_LOOKUP_TIMEOUT, network_lookup).await
-        {
-            Ok(Ok(peers)) => peers,
-            Ok(Err(e)) => {
-                return Err(Error::Payment(format!(
-                    "Paid quote issuer closeness could not be verified against the \
+        let network =
+            match tokio::time::timeout(Self::CLOSENESS_LOOKUP_TIMEOUT, network_lookup).await {
+                Ok(Ok(peers)) => peers,
+                Ok(Err(e)) => {
+                    return Err(Error::Payment(format!(
+                        "Paid quote issuer closeness could not be verified against the \
                      authoritative network view for {}: {e}",
-                    hex::encode(xorname)
-                )));
-            }
-            Err(_) => {
-                return Err(Error::Payment(format!(
-                    "Paid quote issuer closeness network lookup timed out after {:?} for {}",
-                    Self::CLOSENESS_LOOKUP_TIMEOUT,
-                    hex::encode(xorname)
-                )));
-            }
-        };
+                        hex::encode(xorname)
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::Payment(format!(
+                        "Paid quote issuer closeness network lookup timed out after {:?} for {}",
+                        Self::CLOSENESS_LOOKUP_TIMEOUT,
+                        hex::encode(xorname)
+                    )));
+                }
+            };
         if network.iter().any(|node| node.peer_id == *issuer_peer_id) {
             return Ok(());
         }
