@@ -1062,7 +1062,8 @@ impl PaymentVerifier {
     /// at which point a second leader can race for the same pool (see
     /// [`InflightGuard::drop`]). At steady state the pool cache and pool
     /// signature verification gate keep this rare in practice.
-    const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
+    pub(crate) const CLOSENESS_LOOKUP_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(240);
 
     /// Width of the storer's authoritative network lookup, in peers.
     ///

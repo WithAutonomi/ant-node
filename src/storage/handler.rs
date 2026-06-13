@@ -38,6 +38,10 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+// `storage_admission_width` is now only referenced by the test-only membership
+// override below; the production path mirrors the uploader's over-query window
+// (see `validate_store_membership`).
+#[cfg(any(test, feature = "test-utils"))]
 use crate::replication::config::storage_admission_width;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
@@ -412,26 +416,64 @@ impl AntProtocol {
         };
 
         let self_id = *p2p_node.peer_id();
-        let admission_width = storage_admission_width(self.payment_verifier.close_group_size());
-        // Storage-responsibility *verification* must mirror the uploader's pure
-        // XOR-distance peer selection. `find_closest_nodes_local_with_self`
-        // reranks the local routing table by reachability (preferring
-        // directly-reachable peers, XOR only as a tiebreaker), which demotes
-        // this node out of the compared window when it is an XOR-close
-        // relay-only / NAT'd peer and falsely rejects an honest PUT it is
-        // legitimately responsible for. Use the XOR-only sibling so the local
-        // admission check matches how the client chose the close group.
-        let closest = p2p_node
+        // The uploader selects storers by querying `2 * CLOSE_GROUP_SIZE` peers
+        // and keeping the `CLOSE_GROUP_SIZE` closest *successful responders*
+        // (ant-client `get_store_quotes`), then PUTs each chunk to that set.
+        // When closer peers are slow or NAT-stuck the storer it legitimately
+        // PUT to can sit anywhere in the top `2 * close_group_size` by XOR
+        // distance, so a bare close-group + margin window rejects honest PUTs
+        // with no security benefit. Mirror the uploader's over-query window —
+        // the same width and rationale as the paid-quote issuer check
+        // (`PaymentVerifier::validate_paid_quote_issuer_close_group`).
+        let lookup_width = self.payment_verifier.close_group_size().saturating_mul(2);
+
+        // Use the XOR-only lookup, not `find_closest_nodes_local_with_self`
+        // (which reranks by reachability and would demote this node when it is
+        // an XOR-close relay-only / NAT'd storer). Try the cheap local
+        // routing-table view first — it covers the common case with no network
+        // I/O — and only when this node is absent locally (our table may simply
+        // not know the closer peers yet) fall back to an authoritative network
+        // lookup, the same view the uploader used to choose the storers, before
+        // rejecting a PUT this node may legitimately be responsible for.
+        let local = p2p_node
             .dht_manager()
-            .find_closest_nodes_local_by_distance_with_self(address, admission_width)
+            .find_closest_nodes_local_by_distance_with_self(address, lookup_width)
             .await;
-        if closest.iter().any(|node| node.peer_id == self_id) {
+        if local.iter().any(|node| node.peer_id == self_id) {
+            return Ok(());
+        }
+
+        let network_lookup = p2p_node
+            .dht_manager()
+            .find_closest_nodes_network(address, lookup_width);
+        let network =
+            match tokio::time::timeout(PaymentVerifier::CLOSENESS_LOOKUP_TIMEOUT, network_lookup)
+                .await
+            {
+                Ok(Ok(peers)) => peers,
+                Ok(Err(e)) => {
+                    return Err(ProtocolError::PaymentFailed(format!(
+                        "ClientPut storage responsibility could not be verified against \
+                         the authoritative network view for {}: {e}",
+                        hex::encode(address)
+                    )));
+                }
+                Err(_) => {
+                    return Err(ProtocolError::PaymentFailed(format!(
+                        "ClientPut storage responsibility network lookup timed out after \
+                         {:?} for {}",
+                        PaymentVerifier::CLOSENESS_LOOKUP_TIMEOUT,
+                        hex::encode(address)
+                    )));
+                }
+            };
+        if network.iter().any(|node| node.peer_id == self_id) {
             return Ok(());
         }
 
         Err(ProtocolError::PaymentFailed(format!(
-            "ClientPut receiver {} is not among this node's local {admission_width} closest peers for {} \
-             (close group plus storage margin)",
+            "ClientPut receiver {} is not among the {lookup_width} closest peers for {} \
+             (checked the local routing table and the authoritative network view)",
             self_id.to_hex(),
             hex::encode(address)
         )))
