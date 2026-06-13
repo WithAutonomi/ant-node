@@ -919,24 +919,66 @@ impl PaymentVerifier {
             }
         };
 
-        // Closeness *verification* must mirror the uploader's pure XOR-distance
-        // peer selection. `find_closest_nodes_local_with_self` reranks the local
-        // routing table by reachability (preferring directly-reachable peers,
-        // XOR only as a tiebreaker), which demotes an XOR-close relay-only /
-        // NAT'd peer out of the compared window and falsely rejects an honest
-        // payment that legitimately quoted that peer. Use the XOR-only sibling
-        // so this check matches how the client chose the quoted close group.
-        let close_group_size = self.config.close_group_size;
-        let closest = p2p_node
+        // Verify the paid quote issuer is a legitimate close-group peer for the
+        // chunk. Two properties govern the width and the lookup source:
+        //
+        // 1. WIDTH. The uploader selects single-node quotes by querying
+        //    `2 * CLOSE_GROUP_SIZE` peers and keeping the `CLOSE_GROUP_SIZE`
+        //    closest *successful responders* (ant-client `get_store_quotes`).
+        //    When closer peers are slow or NAT-stuck the honestly-paid issuer
+        //    can therefore sit anywhere in the top `2 * close_group_size` by XOR
+        //    distance, so verifying against the bare `close_group_size` rejects
+        //    honest payments with no security benefit. Mirror the uploader's
+        //    over-query window (same rationale as the merkle path's
+        //    `2 * CANDIDATES_PER_POOL`).
+        //
+        // 2. ORDERING / SOURCE. Use the XOR-only lookup, not
+        //    `find_closest_nodes_local_with_self` (which reranks by reachability
+        //    and would demote XOR-close relay-only / NAT'd peers the uploader
+        //    legitimately quoted). Try the cheap local routing-table view first
+        //    — it covers the common case with no network I/O — and only when the
+        //    issuer is absent locally (our table may simply not know it yet) fall
+        //    back to an authoritative network lookup, which is the same view the
+        //    uploader used to choose the quote set. This mirrors the merkle
+        //    path's authoritative-view check while keeping the hot path local.
+        let lookup_width = self.config.close_group_size.saturating_mul(2);
+
+        let local = p2p_node
             .dht_manager()
-            .find_closest_nodes_local_by_distance_with_self(xorname, close_group_size)
+            .find_closest_nodes_local_by_distance_with_self(xorname, lookup_width)
             .await;
-        if closest.iter().any(|node| node.peer_id == *issuer_peer_id) {
+        if local.iter().any(|node| node.peer_id == *issuer_peer_id) {
+            return Ok(());
+        }
+
+        let network_lookup = p2p_node
+            .dht_manager()
+            .find_closest_nodes_network(xorname, lookup_width);
+        let network =
+            match tokio::time::timeout(Self::CLOSENESS_LOOKUP_TIMEOUT, network_lookup).await {
+                Ok(Ok(peers)) => peers,
+                Ok(Err(e)) => {
+                    return Err(Error::Payment(format!(
+                        "Paid quote issuer closeness could not be verified against the \
+                     authoritative network view for {}: {e}",
+                        hex::encode(xorname)
+                    )));
+                }
+                Err(_) => {
+                    return Err(Error::Payment(format!(
+                        "Paid quote issuer closeness network lookup timed out after {:?} for {}",
+                        Self::CLOSENESS_LOOKUP_TIMEOUT,
+                        hex::encode(xorname)
+                    )));
+                }
+            };
+        if network.iter().any(|node| node.peer_id == *issuer_peer_id) {
             return Ok(());
         }
 
         Err(Error::Payment(format!(
-            "Paid quote issuer {} is not among this node's local {close_group_size} closest peers for {}",
+            "Paid quote issuer {} is not among the {lookup_width} closest peers for {} \
+             (checked the local routing table and the authoritative network view)",
             issuer_peer_id.to_hex(),
             hex::encode(xorname)
         )))
