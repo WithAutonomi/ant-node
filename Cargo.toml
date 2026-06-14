@@ -35,14 +35,13 @@ mimalloc = "0.1"
 # node-only DHT internals (DHTNode, TrustEvent, DhtNetworkEvent), which
 # Cargo unifies with ant-protocol's version constraint.
 #
-# TODO: swap to `ant-protocol = "2.0.0"` once 2.0.0 is on crates.io.
-# Until then, the git pin tracks the matching saorsa-core lineage
-# (the rc-2026.4.2 branch) so Cargo can unify the wire types here
-# with ant-protocol's re-exports.
-ant-protocol = "2.1.3"
+# The git pins below track the stacked witnessed-close-group dependency line so
+# Cargo can unify the wire types here with ant-protocol's re-exports while the
+# upstream PRs are open.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "snp-witnessed-close-group" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.25.0"
+saorsa-core = { git = "https://github.com/mickvandijke/saorsa-core.git", branch = "snp-witnessed-close-group" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
