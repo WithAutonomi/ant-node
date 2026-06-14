@@ -862,7 +862,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.1.3"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=snp-witnessed-close-group#0cb92b50d980cff3547ba49706a03ff2d3ac8217"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=snp-witnessed-close-group#b1b0067946d304008113a30eec6d4021b88fb405"
 dependencies = [
  "blake3",
  "bytes",
@@ -4866,7 +4866,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.25.0"
-source = "git+https://github.com/mickvandijke/saorsa-core.git?branch=snp-witnessed-close-group#354a9d7d4d4f44edaa61a6fbf2393535df607019"
+source = "git+https://github.com/mickvandijke/saorsa-core.git?branch=snp-witnessed-close-group#348c47595fe5290db7b918a98470b268bfd7c071"
 dependencies = [
  "anyhow",
  "async-trait",
