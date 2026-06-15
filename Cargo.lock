@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.12.1-rc.6"
+version = "0.12.1-rc.7"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -861,8 +861,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.1.4-rc.2"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#af8fadc828266c52169bccd106f3ebfd9e409b36"
+version = "2.2.0-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#72f1f53dcaf17beb5b1bc476513390570325c949"
 dependencies = [
  "blake3",
  "bytes",
@@ -4865,8 +4865,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.25.1-rc.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#f2dab914367b687342cc758b0cc8c2b10d824f31"
+version = "0.26.0-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#68862e790f981e73b6d8b4bc30d1c76b6c807a51"
 dependencies = [
  "anyhow",
  "async-trait",
