@@ -132,38 +132,40 @@ Rules:
 Triggers:
 
 - Periodic randomized timer (`NEIGHBOR_SYNC_INTERVAL`).
+- `KClosestPeersChanged(old, new)`: peers in `new - old` are queued for priority neighbor sync and the sync loop is triggered immediately.
 
 Rules:
 
-1. At the start of each round-robin cycle, node computes `CloseNeighbors(self)` as the `NEIGHBOR_SYNC_SCOPE` nearest peers to self in `LocalRT(self)`, then snapshots `NeighborSyncOrder(self)` as a deterministic ordering of those peers and resets `NeighborSyncCursor(self)` to `0`. The snapshot is fixed for the entire cycle; peers joining `CloseNeighbors(self)` mid-cycle are not added to the current snapshot (they enter the next cycle's snapshot).
-2. Node selects `NeighborSyncSet(self)` by scanning `NeighborSyncOrder(self)` forward from `NeighborSyncCursor(self)`:
+1. At the start of each round-robin cycle, node computes `CloseNeighbors(self)` as the `NEIGHBOR_SYNC_SCOPE` nearest peers to self in `LocalRT(self)`, then snapshots `NeighborSyncOrder(self)` as a deterministic ordering of those peers and resets `NeighborSyncCursor(self)` to `0`. The snapshot is fixed for the normal round-robin walk.
+2. When a `KClosestPeersChanged(old, new)` event reports peers that entered the close-neighbor set (`new - old`), node appends those peers to `PriorityNeighborSyncOrder(self)` unless already queued. Priority peers remain outside `NeighborSyncOrder(self)` but are selected before the normal cursor. If a priority peer is also present in the current snapshot, selecting it removes it from the snapshot so the same peer is not synced twice in one round.
+3. Node selects `NeighborSyncSet(self)` by first draining `PriorityNeighborSyncOrder(self)` and then scanning `NeighborSyncOrder(self)` forward from `NeighborSyncCursor(self)`:
    a. If a candidate peer is on per-peer cooldown (`NEIGHBOR_SYNC_COOLDOWN` not elapsed since last successful sync with that peer), remove the peer from `NeighborSyncOrder(self)` and continue scanning.
    b. Otherwise, add the peer to `NeighborSyncSet(self)`.
    c. Stop when `|NeighborSyncSet(self)| = NEIGHBOR_SYNC_PEER_COUNT` or no unscanned peers remain in the snapshot.
-3. Node initiates sync with each peer in `NeighborSyncSet(self)`. If a peer cannot be synced, remove it from `NeighborSyncOrder(self)` and attempt to fill the vacated slot by resuming the scan from where rule 2 left off. A peer cannot be synced if:
+4. Node initiates sync with each peer in `NeighborSyncSet(self)`. If a peer cannot be synced, remove it from `NeighborSyncOrder(self)` and `PriorityNeighborSyncOrder(self)`, then attempt to fill the vacated slot by resuming the scan from where rule 3 left off. A peer cannot be synced if:
    a. Unreachable (connection failure/timeout).
    b. Peer responds with a bootstrapping claim. On first observation, record `BootstrapClaimFirstSeen(self, peer)`. If `now - BootstrapClaimFirstSeen(self, peer) <= BOOTSTRAP_CLAIM_GRACE_PERIOD`, accept the claim and skip without penalty. If the grace period has elapsed, emit `BootstrapClaimAbuse` evidence to `TrustEngine` (via `report_trust_event` with `ApplicationFailure(weight)`) and skip. If the peer had previously stopped claiming bootstrap, emit `BootstrapClaimAbuse` immediately for the repeated claim and skip.
-4. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
-5. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
-6. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
-7. In each session, sender-side hint construction uses peer-targeted sets:
+5. On any sync session open (outbound or inbound), receiver validates peer authentication and checks current local route membership (`peer ∈ LocalRT(self)`).
+6. If `peer ∈ LocalRT(self)`, sync is bidirectional: both sides send and receive peer-targeted hint sets.
+7. If `peer ∉ LocalRT(self)`, sync is outbound-only from receiver perspective: receiver MAY send hints to that peer, but MUST NOT accept replica or paid-list hints from that peer.
+8. In each session, sender-side hint construction uses peer-targeted sets:
     - `ReplicaHintsForPeer`: keys the sender believes the receiver should hold (receiver is among the `CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
     - `PaidHintsForPeer`: keys the sender believes the receiver should track in `PaidForList` (receiver is among the `PAID_LIST_CLOSE_GROUP_SIZE` nearest to `K` in sender's `SelfInclusiveRT`).
-8. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
-9. Receiver treats hint sets as unordered collections and deduplicates repeated keys. If a key appears in both `ReplicaHintsForPeer` and `PaidHintsForPeer` in the same session, receiver MUST keep only the replica-hint entry and drop the paid-hint duplicate (single-pipeline processing).
-10. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
-11. Receiver launches quorum checks exactly once per admitted unknown replica key.
-12. Only admitted unknown replica keys that pass presence quorum or paid-list authorization are queued for fetch.
-13. Receiver processes unknown paid hints via Section 7.2 majority checks in a paid-list pipeline: successful checks may update `PaidForList(self)`. If the receiver is also storage-responsible for `K`, successful verification may queue record fetch using verified `Present` sources from the same round. If the same key is also present in replica hints, rule 9 drops the paid-hint duplicate and fetch behavior is governed by the replica-hint pipeline.
-14. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
-15. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
-16. After each round, node sets `NeighborSyncCursor(self)` to the position after the last scanned peer in the (possibly shrunk) snapshot. Peers removed during scanning (cooldown or unreachable) do not occupy cursor positions — the cursor reflects the snapshot's state after removals.
-17. When `NeighborSyncCursor(self) >= |NeighborSyncOrder(self)|`, the cycle is complete (`NeighborSyncCycleComplete(self)`). Node MUST execute post-cycle responsibility pruning (Section 11), then recompute `CloseNeighbors(self)` from current `LocalRT(self)`, take a fresh snapshot, and reset the cursor to `0` to begin the next cycle.
+9. Transport-level chunking/fragmentation is implementation detail and out of scope for replication logic.
+10. Receiver treats hint sets as unordered collections and deduplicates repeated keys. If a key appears in both `ReplicaHintsForPeer` and `PaidHintsForPeer` in the same session, receiver MUST keep only the replica-hint entry and drop the paid-hint duplicate (single-pipeline processing).
+11. Receiver diffs replica hints against local store and pending sets, then runs per-key admission rules before quorum logic.
+12. Receiver launches quorum checks exactly once per admitted unknown replica key.
+13. Only admitted unknown replica keys that pass presence quorum or paid-list authorization are queued for fetch.
+14. Receiver processes unknown paid hints via Section 7.2 majority checks in a paid-list pipeline: successful checks may update `PaidForList(self)`. If the receiver is also storage-responsible for `K`, successful verification may queue record fetch using verified `Present` sources from the same round. If the same key is also present in replica hints, rule 10 drops the paid-hint duplicate and fetch behavior is governed by the replica-hint pipeline.
+15. Sync payloads MUST NOT include PoP material; PoP remains fresh-replication-only.
+16. Nodes SHOULD use ongoing neighbor sync rounds to re-announce paid hints for locally paid keys to improve paid-list convergence.
+17. After each round, node sets `NeighborSyncCursor(self)` to the position after the last scanned peer in the (possibly shrunk) snapshot. Peers removed during scanning (cooldown or unreachable) do not occupy cursor positions — the cursor reflects the snapshot's state after removals. Priority syncs do not advance the cursor unless the peer was also removed from the snapshot.
+18. When `PriorityNeighborSyncOrder(self)` is empty and `NeighborSyncCursor(self) >= |NeighborSyncOrder(self)|`, the cycle is complete (`NeighborSyncCycleComplete(self)`). Node MUST execute post-cycle responsibility pruning (Section 11), then recompute `CloseNeighbors(self)` from current `LocalRT(self)`, take a fresh snapshot, and reset the cursor to `0` to begin the next cycle.
 
 Rate control:
 
 - `NEIGHBOR_SYNC_INTERVAL` governs the global sync timer cadence (how often batch selection runs).
-- `NEIGHBOR_SYNC_COOLDOWN` is per-peer: a peer is skipped and removed from the snapshot if it was last successfully synced within `NEIGHBOR_SYNC_COOLDOWN`.
+- `NEIGHBOR_SYNC_COOLDOWN` is per-peer: a peer is skipped and removed from priority and/or snapshot state if it was last successfully synced within `NEIGHBOR_SYNC_COOLDOWN`.
 
 ## 7. Authorization and Admission Rules
 
@@ -402,7 +404,8 @@ Capacity-managed mode (finite store):
 
 Maintain tracker for neighbor-sync eligibility/order and classify topology events:
 
-- `Trigger`: genuine change, run neighbor sync.
+- `Trigger`: genuine close-neighborhood change, run neighbor sync.
+- `Prioritize`: peers in `KClosestPeersChanged.new - KClosestPeersChanged.old` are queued ahead of the normal neighbor-sync cursor.
 - `Skip`: probable restart churn, suppress.
 - `Ignore`: far peers, no action.
 
@@ -414,7 +417,7 @@ Nodes MUST periodically perform self-lookups (network closest-peer lookup for th
 
 1. Self-lookup runs on a randomized timer (`SELF_LOOKUP_INTERVAL`).
 2. Discovered peers are added to `LocalRT(self)` through normal routing-table maintenance.
-3. `CloseNeighbors(self)` is recomputed from `LocalRT(self)` at the start of each neighbor-sync cycle (Section 6.2 rule 1).
+3. `KClosestPeersChanged(old, new)` queues newly-entered close peers for priority neighbor sync, and `CloseNeighbors(self)` is recomputed from `LocalRT(self)` at the start of each neighbor-sync cycle (Section 6.2 rules 1-2).
 4. Without regular self-lookups, a node's close neighborhood becomes stale under churn: new close peers go undetected and departed peers remain in `CloseNeighbors` until routing-table eviction. This delays repair and may cause responsibility misjudgments.
 
 ## 14. Failure Evidence and TrustEngine Integration
@@ -611,8 +614,8 @@ Each scenario should assert exact expected outcomes and state transitions.
 - When a full neighbor-sync round-robin cycle completes, node runs one prune pass using current `SelfInclusiveRT(self)` (`LocalRT(self) ∪ {self}`): stored keys with `IsResponsible(self, K)=false` have `RecordOutOfRangeFirstSeen` recorded (if not already set) but are deleted only when `now - RecordOutOfRangeFirstSeen >= PRUNE_HYSTERESIS_DURATION`, every current close-group peer has mature repair proof for the current close-group snapshot, and every current close-group peer returns a positive nonce-bound audit proof for the key. Missing or failed proofs defer pruning and emit trust penalties after fresh responsibility confirmation; first-time bootstrap claims are penalized only after the bootstrap grace period, while repeated bootstrap claims are penalized immediately. Prune-confirmation work is bounded per pass. Keys that are in range have their `RecordOutOfRangeFirstSeen` cleared. Same hysteresis timing applies independently to `PaidForList` entries where `self ∉ PaidCloseGroup(K)` using `PaidOutOfRangeFirstSeen`, but paid-list pruning does not require remote storage confirmation.
 37. Non-`LocalRT` inbound sync behavior:
 - If a peer opens sync while not in receiver `LocalRT(self)`, receiver may still send hints to that peer, but receiver drops all inbound replica/paid hints from that peer.
-38. Neighbor-sync snapshot stability under peer join:
-- Peer `P` joins `CloseNeighbors(self)` mid-cycle. `P` does not appear in the current `NeighborSyncOrder(self)` snapshot. After cycle completes and a new snapshot is taken from recomputed `CloseNeighbors(self)`, `P` is included in the next cycle's ordering.
+38. Neighbor-sync priority under peer join:
+- Peer `P` joins `CloseNeighbors(self)` mid-cycle. `P` does not appear in the current `NeighborSyncOrder(self)` snapshot, but `KClosestPeersChanged(old, new)` queues `P` in `PriorityNeighborSyncOrder(self)`. The next sync round selects `P` before the normal cursor, removes `P` from the snapshot if already present, and does not sync `P` twice in the same round.
 39. Neighbor-sync unreachable peer removal and slot fill:
 - Peer `P` is in the snapshot. Sync attempt with `P` fails (unreachable). `P` is removed from `NeighborSyncOrder(self)`. Node resumes scanning from where batch selection left off and picks the next available peer `Q` to fill the slot. `P` is not in the next cycle's snapshot (unless it has rejoined `CloseNeighbors`).
 40. Neighbor-sync per-peer cooldown skip:

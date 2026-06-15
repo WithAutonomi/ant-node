@@ -5,7 +5,7 @@
 //! `docs/REPLICATION_DESIGN.md`).
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -479,6 +479,13 @@ pub enum BootstrapClaimObservation {
 /// used their one bootstrap-claim window.
 #[derive(Debug)]
 pub struct NeighborSyncState {
+    /// Newly-entered close peers to sync before the normal cycle cursor.
+    ///
+    /// This queue is populated from `KClosestPeersChanged` routing-table
+    /// events and is intentionally separate from `order`: priority syncs do
+    /// not restart the current round-robin cycle or discard already-scanned
+    /// peers.
+    pub priority_order: VecDeque<PeerId>,
     /// Deterministic ordering of peers for the current cycle (snapshot).
     pub order: Vec<PeerId>,
     /// Current cursor position into `order`.
@@ -509,6 +516,7 @@ impl NeighborSyncState {
     #[must_use]
     pub fn new_cycle(close_neighbors: Vec<PeerId>) -> Self {
         Self {
+            priority_order: VecDeque::new(),
             order: close_neighbors,
             cursor: 0,
             last_sync_times: HashMap::new(),
@@ -551,10 +559,51 @@ impl NeighborSyncState {
         self.bootstrap_claims.remove(peer).is_some()
     }
 
+    /// Queue newly-entered close peers for priority sync.
+    ///
+    /// Existing queued peers are retained in their original position and
+    /// duplicates from the same routing-table churn burst are ignored.
+    pub fn queue_priority_peers<I>(&mut self, peers: I) -> usize
+    where
+        I: IntoIterator<Item = PeerId>,
+    {
+        let mut queued = 0;
+        for peer in peers {
+            if self.priority_order.contains(&peer) {
+                continue;
+            }
+            self.priority_order.push_back(peer);
+            queued += 1;
+        }
+        queued
+    }
+
+    /// Drop queued priority peers that are no longer in the close-peer set.
+    pub fn retain_priority_peers(&mut self, close_peers: &HashSet<PeerId>) {
+        self.priority_order
+            .retain(|peer| close_peers.contains(peer));
+    }
+
+    /// Remove a peer from any pending neighbor-sync state.
+    pub fn remove_peer(&mut self, peer: &PeerId) -> bool {
+        let old_priority_len = self.priority_order.len();
+        self.priority_order.retain(|queued| queued != peer);
+
+        let old_order_len = self.order.len();
+        if let Some(pos) = self.order.iter().position(|queued| queued == peer) {
+            self.order.remove(pos);
+            if pos < self.cursor {
+                self.cursor = self.cursor.saturating_sub(1);
+            }
+        }
+
+        old_priority_len != self.priority_order.len() || old_order_len != self.order.len()
+    }
+
     /// Whether the current cycle is complete.
     #[must_use]
     pub fn is_cycle_complete(&self) -> bool {
-        self.cursor >= self.order.len()
+        self.priority_order.is_empty() && self.cursor >= self.order.len()
     }
 }
 
@@ -1126,6 +1175,44 @@ mod tests {
             state.is_cycle_complete(),
             "cursor past end should still report complete"
         );
+    }
+
+    #[test]
+    fn neighbor_sync_priority_queue_blocks_cycle_completion() {
+        let peer = peer_id_from_byte(2);
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+
+        assert!(state.is_cycle_complete());
+        assert_eq!(state.queue_priority_peers([peer]), 1);
+        assert!(
+            !state.is_cycle_complete(),
+            "pending priority peers must sync before the cycle completes"
+        );
+    }
+
+    #[test]
+    fn neighbor_sync_priority_queue_deduplicates_peers() {
+        let peer = peer_id_from_byte(3);
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+
+        assert_eq!(state.queue_priority_peers([peer, peer]), 1);
+        assert_eq!(state.priority_order.len(), 1);
+    }
+
+    #[test]
+    fn neighbor_sync_remove_peer_clears_order_and_priority_queue() {
+        let peer = peer_id_from_byte(4);
+        let retained = peer_id_from_byte(5);
+        let mut state = NeighborSyncState::new_cycle(vec![peer, retained]);
+        assert_eq!(state.queue_priority_peers([peer]), 1);
+        state.cursor = 1;
+
+        assert!(state.remove_peer(&peer));
+
+        assert!(!state.order.contains(&peer));
+        assert!(!state.priority_order.contains(&peer));
+        assert_eq!(state.order, vec![retained]);
+        assert_eq!(state.cursor, 0);
     }
 
     #[test]
