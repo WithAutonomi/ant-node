@@ -36,13 +36,12 @@ mimalloc = "0.1"
 # Cargo unifies with ant-protocol's version constraint.
 #
 # TODO: swap to `ant-protocol = "2.0.0"` once 2.0.0 is on crates.io.
-# Until then, the git pin tracks the matching saorsa-core lineage
-# (the rc-2026.4.2 branch) so Cargo can unify the wire types here
-# with ant-protocol's re-exports.
-ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "rc-2026.6.2" }
+# Until then, the git pin tracks the matching saorsa-core lineage so Cargo can
+# unify the wire types here with ant-protocol's re-exports.
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "feat/witnessed-transcript-policy" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "rc-2026.6.2" }
+saorsa-core = { git = "https://github.com/saorsa-labs/saorsa-core", branch = "feat/witnessed-transcript-policy" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment

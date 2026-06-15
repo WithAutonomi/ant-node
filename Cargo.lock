@@ -862,7 +862,7 @@ dependencies = [
 [[package]]
 name = "ant-protocol"
 version = "2.1.4-rc.2"
-source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.2#af8fadc828266c52169bccd106f3ebfd9e409b36"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=feat/witnessed-transcript-policy#d73d7656b4fcc7f96d06dfb98c7b9155edd50e08"
 dependencies = [
  "blake3",
  "bytes",
@@ -4866,7 +4866,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.25.1-rc.2"
-source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.2#f2dab914367b687342cc758b0cc8c2b10d824f31"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=feat/witnessed-transcript-policy#d6877658b3b8248aeaeb7f422effd7d8b5499f98"
 dependencies = [
  "anyhow",
  "async-trait",
