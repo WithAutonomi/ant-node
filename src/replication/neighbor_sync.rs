@@ -140,8 +140,9 @@ pub async fn snapshot_close_neighbors(
 
 /// Select the next batch of peers for sync from the current cycle.
 ///
-/// Rules 2-3: Scan forward from cursor, skip peers still under cooldown,
-/// fill up to `peer_count` slots.
+/// Priority peers from routing-table churn are drained before the round-robin
+/// cursor. Rules 2-3 then scan forward from cursor, skip peers still under
+/// cooldown, and fill up to `peer_count` slots.
 pub fn select_sync_batch(
     state: &mut NeighborSyncState,
     peer_count: usize,
@@ -150,24 +151,59 @@ pub fn select_sync_batch(
     let mut batch = Vec::new();
     let now = Instant::now();
 
-    while batch.len() < peer_count && state.cursor < state.order.len() {
+    while batch.len() < peer_count {
+        let Some(peer) = select_next_sync_peer(state, now, cooldown) else {
+            break;
+        };
+        batch.push(peer);
+    }
+
+    batch
+}
+
+fn select_next_sync_peer(
+    state: &mut NeighborSyncState,
+    now: Instant,
+    cooldown: Duration,
+) -> Option<PeerId> {
+    while let Some(peer) = state.priority_order.pop_front() {
+        if peer_on_cooldown(state, &peer, now, cooldown) {
+            state.remove_peer(&peer);
+            continue;
+        }
+
+        state.remove_peer(&peer);
+        return Some(peer);
+    }
+
+    while state.cursor < state.order.len() {
         let peer = state.order[state.cursor];
 
         // Check cooldown (Rule 2a): if the peer was synced recently, remove
         // from the snapshot and continue without advancing the cursor (the
         // next element slides into the current cursor position).
-        if let Some(last_sync) = state.last_sync_times.get(&peer) {
-            if now.duration_since(*last_sync) < cooldown {
-                state.order.remove(state.cursor);
-                continue;
-            }
+        if peer_on_cooldown(state, &peer, now, cooldown) {
+            state.order.remove(state.cursor);
+            continue;
         }
 
-        batch.push(peer);
         state.cursor += 1;
+        return Some(peer);
     }
 
-    batch
+    None
+}
+
+fn peer_on_cooldown(
+    state: &NeighborSyncState,
+    peer: &PeerId,
+    now: Instant,
+    cooldown: Duration,
+) -> bool {
+    state
+        .last_sync_times
+        .get(peer)
+        .is_some_and(|last_sync| now.duration_since(*last_sync) < cooldown)
 }
 
 /// Execute a sync session with a single peer.
@@ -268,42 +304,21 @@ pub(crate) async fn sync_with_peer_with_outcome(
 /// Handle a failed sync attempt: remove peer from snapshot and try to fill
 /// the vacated slot.
 ///
-/// Rule 3: Remove unreachable peer from `NeighborSyncOrder`, attempt to fill
-/// by resuming scan from where rule 2 left off. Applies the same cooldown
-/// filtering as [`select_sync_batch`] to avoid selecting a peer that was
-/// recently synced.
+/// Rule 3: Remove unreachable peer from pending sync state, attempt to fill
+/// by using the same priority-first scan as [`select_sync_batch`]. Applies the
+/// same cooldown filtering to avoid selecting a peer that was recently synced.
 pub fn handle_sync_failure(
     state: &mut NeighborSyncState,
     failed_peer: &PeerId,
     cooldown: Duration,
 ) -> Option<PeerId> {
     // Find and remove the failed peer from the ordering.
-    if let Some(pos) = state.order.iter().position(|p| p == failed_peer) {
-        state.order.remove(pos);
-        // Adjust cursor if removal was before the current cursor position.
-        if pos < state.cursor {
-            state.cursor = state.cursor.saturating_sub(1);
-        }
-    }
+    state.remove_peer(failed_peer);
 
-    // Try to fill the vacated slot, applying cooldown filtering (same as
-    // select_sync_batch Rule 2a).
+    // Try to fill the vacated slot, applying the same priority and cooldown
+    // filtering used by select_sync_batch.
     let now = Instant::now();
-    while state.cursor < state.order.len() {
-        let candidate = state.order[state.cursor];
-
-        if let Some(last_sync) = state.last_sync_times.get(&candidate) {
-            if now.duration_since(*last_sync) < cooldown {
-                state.order.remove(state.cursor);
-                continue;
-            }
-        }
-
-        state.cursor += 1;
-        return Some(candidate);
-    }
-
-    None
+    select_next_sync_peer(state, now, cooldown)
 }
 
 /// Record a successful sync with a peer.
@@ -778,10 +793,9 @@ mod tests {
     }
 
     #[test]
-    fn scenario_38_mid_cycle_peer_join_excluded() {
-        // Peer D joins CloseNeighbors mid-cycle.
-        // D should NOT appear in the current NeighborSyncOrder snapshot.
-        // After cycle completes and a new snapshot is taken, D can be included.
+    fn scenario_38_mid_cycle_peer_join_prioritized() {
+        // Peer D joins CloseNeighbors mid-cycle. It is queued for priority
+        // sync without being inserted into the current round-robin snapshot.
         let peers = vec![
             peer_id_from_byte(0xA),
             peer_id_from_byte(0xB),
@@ -793,29 +807,18 @@ mod tests {
         let _ = select_sync_batch(&mut state, 1, Duration::from_secs(0));
         assert_eq!(state.cursor, 1);
 
-        // Peer D "joins" the network. It should NOT be in the current snapshot.
+        // Peer D "joins" the close-neighbor set. It remains outside the
+        // stable snapshot but is queued ahead of the cursor.
         let peer_d = peer_id_from_byte(0xD);
+        assert_eq!(state.queue_priority_peers([peer_d]), 1);
+        assert!(!state.order.contains(&peer_d));
         assert!(
-            !state.order.contains(&peer_d),
-            "mid-cycle joiner must not appear in the current snapshot"
+            !state.is_cycle_complete(),
+            "pending priority sync keeps the cycle active"
         );
 
-        // Complete the current cycle.
-        let _ = select_sync_batch(&mut state, 2, Duration::from_secs(0));
-        assert!(state.is_cycle_complete());
-
-        // New cycle: now D can be included in the fresh snapshot.
-        let new_peers = vec![
-            peer_id_from_byte(0xA),
-            peer_id_from_byte(0xB),
-            peer_id_from_byte(0xC),
-            peer_d,
-        ];
-        let new_state = NeighborSyncState::new_cycle(new_peers);
-        assert!(
-            new_state.order.contains(&peer_d),
-            "after new snapshot, joiner D should be present"
-        );
+        let batch = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        assert_eq!(batch, vec![peer_d, peer_id_from_byte(0xB)]);
     }
 
     #[test]
@@ -882,6 +885,64 @@ mod tests {
 
         // Cycle is complete since all remaining peers were selected.
         assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn priority_peer_in_snapshot_is_not_selected_twice() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        assert_eq!(state.queue_priority_peers([peer_id_from_byte(2)]), 1);
+
+        let batch = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+
+        assert_eq!(batch, vec![peer_id_from_byte(2), peer_id_from_byte(1)]);
+        assert_eq!(
+            state.order,
+            vec![peer_id_from_byte(1), peer_id_from_byte(3)]
+        );
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn priority_peer_on_cooldown_is_skipped_and_removed_from_snapshot() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let cooldown = Duration::from_secs(1);
+        let priority_peer = peer_id_from_byte(2);
+        state.last_sync_times.insert(priority_peer, Instant::now());
+        assert_eq!(state.queue_priority_peers([priority_peer]), 1);
+
+        let batch = select_sync_batch(&mut state, 2, cooldown);
+
+        assert_eq!(batch, vec![peer_id_from_byte(1)]);
+        assert!(state.priority_order.is_empty());
+        assert!(!state.order.contains(&priority_peer));
+    }
+
+    #[test]
+    fn failure_replacement_prefers_remaining_priority_peer() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let first_priority_peer = peer_id_from_byte(3);
+        let second_priority_peer = peer_id_from_byte(4);
+        assert_eq!(
+            state.queue_priority_peers([first_priority_peer, second_priority_peer]),
+            2
+        );
+
+        let batch = select_sync_batch(&mut state, 1, Duration::from_secs(0));
+        assert_eq!(batch, vec![first_priority_peer]);
+
+        let replacement =
+            handle_sync_failure(&mut state, &first_priority_peer, Duration::from_secs(0));
+
+        assert_eq!(replacement, Some(second_priority_peer));
+        assert!(state.priority_order.is_empty());
+        assert_eq!(state.cursor, 0);
     }
 
     #[test]

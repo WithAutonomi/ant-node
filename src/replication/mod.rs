@@ -375,6 +375,7 @@ impl ReplicationEngine {
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        let sync_state = Arc::clone(&self.sync_state);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -439,13 +440,44 @@ impl ReplicationEngine {
                     dht_event = dht_events.recv() => {
                         let Ok(dht_event) = dht_event else { continue };
                         match dht_event {
-                            DhtNetworkEvent::KClosestPeersChanged { .. } => {
-                                debug!(
-                                    "K-closest peers changed, triggering early neighbor sync"
-                                );
+                            DhtNetworkEvent::KClosestPeersChanged { old, new } => {
+                                let old_peers = old
+                                    .iter()
+                                    .take(config.neighbor_sync_scope)
+                                    .copied()
+                                    .collect::<HashSet<_>>();
+                                let new_scoped = new
+                                    .iter()
+                                    .take(config.neighbor_sync_scope)
+                                    .copied()
+                                    .collect::<Vec<_>>();
+                                let new_peers =
+                                    new_scoped.iter().copied().collect::<HashSet<_>>();
+                                let entrants = new_scoped
+                                    .iter()
+                                    .copied()
+                                    .filter(|peer| !old_peers.contains(peer))
+                                    .collect::<Vec<_>>();
+                                let entrant_count = entrants.len();
+                                let (priority_insertions, sync_removals) = {
+                                    let mut state = sync_state.write().await;
+                                    let sync_removals = state.retain_sync_peers(&new_peers);
+                                    let priority_insertions = state.queue_priority_peers(entrants);
+                                    (priority_insertions, sync_removals)
+                                };
+                                if priority_insertions > 0 {
+                                    debug!(
+                                        "K-closest peers changed, queued {priority_insertions}/{entrant_count} new close peers for priority neighbor sync and pruned {sync_removals} departed pending sync entries"
+                                    );
+                                } else {
+                                    debug!(
+                                        "K-closest peers changed, no additional close peers queued, pruned {sync_removals} departed pending sync entries, triggering early neighbor sync"
+                                    );
+                                }
                                 sync_trigger.notify_one();
                             }
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
+                                sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
                             }
                             _ => {}

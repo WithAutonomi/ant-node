@@ -303,6 +303,12 @@ impl ReplicationConfig {
         if self.neighbor_sync_scope == 0 {
             return Err("neighbor_sync_scope must be >= 1".to_string());
         }
+        if self.neighbor_sync_scope > K_BUCKET_SIZE {
+            return Err(format!(
+                "neighbor_sync_scope ({}) must be <= K_BUCKET_SIZE ({})",
+                self.neighbor_sync_scope, K_BUCKET_SIZE,
+            ));
+        }
         Ok(())
     }
 
@@ -529,6 +535,15 @@ mod tests {
     fn neighbor_sync_peer_count_zero_rejected() {
         let config = ReplicationConfig {
             neighbor_sync_peer_count: 0,
+            ..ReplicationConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_sync_scope_exceeding_k_bucket_size_rejected() {
+        let config = ReplicationConfig {
+            neighbor_sync_scope: K_BUCKET_SIZE + 1,
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());
