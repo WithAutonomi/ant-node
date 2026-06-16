@@ -23,13 +23,26 @@ use crate::ant_protocol::CLOSE_GROUP_SIZE;
 /// Maximum number of peers per k-bucket in the Kademlia routing table.
 pub const K_BUCKET_SIZE: usize = 20;
 
-/// Extra local-routing-table positions accepted for local chunk storage
-/// admission and stored-record pruning.
+/// Multiplier applied to `close_group_size` to size the local chunk
+/// storage-admission / stored-record-retention window.
 ///
-/// This margin absorbs small local RT disagreement between peers. It does not
-/// widen audit, quorum, or paid-list target sets; those remain strict
+/// Mirrors the uploader's quote over-query window
+/// (`CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER` in the ant-client
+/// `get_store_quotes` path): the client picks a chunk's close group from its
+/// `close_group_size * N` XOR-closest *reachable* peers. On a network with
+/// unreachable (NAT'd, relay-only) nodes, the peer it legitimately pays can sit
+/// several positions beyond `close_group_size` in a storer's *full* local
+/// routing-table view, because that view also contains the closer peers the
+/// client could not reach. A `close_group_size + small-margin` window rejects
+/// those honest payments (the receiver decides it is "not responsible" for a
+/// chunk it is genuinely XOR-close to); sizing admission to the same over-query
+/// width the uploader selected from removes that false rejection while keeping
+/// the check XOR-only (see `validate_store_membership`).
+///
+/// This widens only local storage admission and stored-record retention. It
+/// does NOT widen audit, quorum, or paid-list target sets; those remain strict
 /// `close_group_size` / paid-list group checks.
-pub const STORAGE_ADMISSION_MARGIN: usize = 2;
+pub const STORAGE_ADMISSION_OVERQUERY_MULTIPLIER: usize = 2;
 
 /// Full-network target for required positive presence votes.
 ///
@@ -49,9 +62,15 @@ pub const NEIGHBOR_SYNC_PEER_COUNT: usize = 4;
 
 /// Width used when deciding whether this node may locally store or retain a
 /// chunk.
+///
+/// Sized to the uploader's quote over-query window
+/// (`close_group_size * STORAGE_ADMISSION_OVERQUERY_MULTIPLIER`) so a storer
+/// does not reject an honestly-paid chunk it is XOR-close to merely because the
+/// uploader, on a NAT'd network, had to pay a peer that ranks just outside the
+/// strict close group in the storer's full local view.
 #[must_use]
 pub const fn storage_admission_width(close_group_size: usize) -> usize {
-    close_group_size.saturating_add(STORAGE_ADMISSION_MARGIN)
+    close_group_size.saturating_mul(STORAGE_ADMISSION_OVERQUERY_MULTIPLIER)
 }
 
 /// Minimum neighbor-sync cadence. Actual interval is randomized within
@@ -433,13 +452,23 @@ mod tests {
     }
 
     #[test]
-    fn storage_admission_width_adds_margin() {
+    fn storage_admission_width_is_overquery_window() {
         const TEST_CLOSE_GROUP_SIZE: usize = 7;
 
+        // Admission mirrors the uploader's quote over-query window
+        // (`CLOSE_GROUP_SIZE * FAULT_TOLERANT_QUOTE_QUERY_MULTIPLIER`, where the
+        // ant-client multiplier is 2), so an honestly-paid receiver ranking just
+        // outside the strict close group is still admitted.
         assert_eq!(
             storage_admission_width(TEST_CLOSE_GROUP_SIZE),
-            TEST_CLOSE_GROUP_SIZE + STORAGE_ADMISSION_MARGIN
+            TEST_CLOSE_GROUP_SIZE * STORAGE_ADMISSION_OVERQUERY_MULTIPLIER
         );
+        // Concretely: the production close group of 7 admits the 14 closest.
+        assert_eq!(storage_admission_width(7), 14);
+        // The widened window must still be strictly wider than the strict close
+        // group (otherwise the recalibration is a no-op).
+        assert!(storage_admission_width(TEST_CLOSE_GROUP_SIZE) > TEST_CLOSE_GROUP_SIZE);
+        // Saturates rather than overflowing on a degenerate config.
         assert_eq!(storage_admission_width(usize::MAX), usize::MAX);
     }
 

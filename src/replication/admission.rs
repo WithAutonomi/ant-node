@@ -72,8 +72,9 @@ pub async fn is_in_paid_close_group(
 /// - **Cross-set precedence**: if a key appears in both sets, keep only the
 ///   replica-hint entry.
 /// - **Replica hints**: admitted if `self` is in the storage-admission group
-///   (`close_group_size + STORAGE_ADMISSION_MARGIN`) or key already exists in
-///   local store / pending set.
+///   (`storage_admission_width` = `close_group_size *
+///   STORAGE_ADMISSION_OVERQUERY_MULTIPLIER`) or key already exists in local
+///   store / pending set.
 /// - **Paid hints**: admitted if `self` is in `PaidCloseGroup(K)` or key is
 ///   already in `PaidForList`.
 ///

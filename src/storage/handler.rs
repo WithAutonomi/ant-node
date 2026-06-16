@@ -412,6 +412,19 @@ impl AntProtocol {
         };
 
         let self_id = *p2p_node.peer_id();
+        // `admission_width` is the uploader's quote over-query window
+        // (`close_group_size * STORAGE_ADMISSION_OVERQUERY_MULTIPLIER`), not the
+        // strict close group. On a network with unreachable (NAT'd, relay-only)
+        // peers the client cannot quote the genuinely-closest nodes, so the peer
+        // it legitimately pays can rank several positions beyond
+        // `close_group_size` in this node's *full* local routing-table view
+        // (which still contains those unreachable closer peers). Verifying
+        // against the same over-query width the uploader selected from prevents
+        // this node from rejecting an honest PUT for a chunk it is XOR-close to;
+        // narrower windows produced multiplicative per-file upload failures on
+        // NAT-simulated testnets. Steady-state responsibility stays strict — the
+        // record is pruned back to the close group once replication heals it
+        // (see `replication::pruning`).
         let admission_width = storage_admission_width(self.payment_verifier.close_group_size());
         // Storage-responsibility *verification* must mirror the uploader's pure
         // XOR-distance peer selection. `find_closest_nodes_local_with_self`

@@ -196,7 +196,8 @@ struct PruneAuditReportState {
 ///
 /// For each stored record K:
 /// - If `self` is within the storage-admission group
-///   (`close_group_size + STORAGE_ADMISSION_MARGIN`): clear
+///   (`storage_admission_width` = `close_group_size *
+///   STORAGE_ADMISSION_OVERQUERY_MULTIPLIER`): clear
 ///   `RecordOutOfRangeFirstSeen`.
 /// - If not in that group: set timestamp if not already set; delete if the
 ///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old and all but one
