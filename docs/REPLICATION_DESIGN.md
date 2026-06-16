@@ -29,10 +29,11 @@ Primary goal: validate correctness, safety, and liveness of replication logic be
 - `LocalRT(N)`: node `N`'s current authenticated local routing-table peer set (does not include `N` itself).
 - `SelfInclusiveRT(N)`: derived local view `LocalRT(N) ∪ {N}` used for responsibility-range and local membership evaluations that must treat `N` as a candidate.
 - `CloseNeighbors(N)`: the `NEIGHBOR_SYNC_SCOPE` nearest peers to `N`'s own address in `LocalRT(N)`, ordered by distance to `N`. This is the set of peers eligible for neighbor-sync repair. Recomputed from `LocalRT(N)` at each cycle snapshot.
-- `NeighborSyncOrder(N)`: deterministic ordering of peers, snapshotted from `CloseNeighbors(N)` at the start of each round-robin cycle. Peers joining `CloseNeighbors(N)` mid-cycle are not added (they enter the next cycle's snapshot). Peers may be removed from the snapshot mid-cycle if they are on per-peer cooldown or unreachable during sync.
+- `NeighborSyncOrder(N)`: deterministic ordering of peers, snapshotted from `CloseNeighbors(N)` at the start of each round-robin cycle. Peers joining `CloseNeighbors(N)` mid-cycle are not inserted into this snapshot; they may be queued in `PriorityNeighborSyncOrder(N)` and appear in the next cycle's snapshot. Peers may be removed from the snapshot mid-cycle if they leave the scoped close-neighbor set, are on per-peer cooldown, are unreachable during sync, or are selected from the priority queue while also present in the snapshot.
+- `PriorityNeighborSyncOrder(N)`: FIFO queue of peers that newly entered `CloseNeighbors(N)` according to `KClosestPeersChanged(old, new)`. Priority peers are selected before the normal `NeighborSyncOrder(N)` cursor and are pruned if they leave the scoped close-neighbor set before being selected.
 - `NeighborSyncCursor(N)`: index into the current `NeighborSyncOrder(N)` snapshot indicating the next peer position to schedule. Valid for the lifetime of the snapshot.
-- `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)`; periodic repair sync partners for `N`.
-- `NeighborSyncCycleComplete(N)`: event that fires when node `N`'s cursor reaches or exceeds the end of the current `NeighborSyncOrder(N)` snapshot (all remaining peers synced, on cooldown, or unreachable). Triggers post-cycle pruning (Section 11) and a fresh snapshot from current `CloseNeighbors(N)` for the next cycle.
+- `NeighborSyncSet(N)`: current round's up-to-`NEIGHBOR_SYNC_PEER_COUNT` peers selected first from `PriorityNeighborSyncOrder(N)` and then from `NeighborSyncOrder(N)` starting at `NeighborSyncCursor(N)`; periodic repair sync partners for `N`.
+- `NeighborSyncCycleComplete(N)`: event that fires when `PriorityNeighborSyncOrder(N)` is empty and node `N`'s cursor reaches or exceeds the end of the current `NeighborSyncOrder(N)` snapshot (all pending peers synced, on cooldown, unreachable, or removed). Triggers post-cycle pruning (Section 11) and a fresh snapshot from current `CloseNeighbors(N)` for the next cycle.
 - `Record`: immutable, content-addressed data unit with key `K`.
 - `Distance(K, N)`: deterministic distance metric between key and node identity.
 - `CloseGroup(K)`: the `CLOSE_GROUP_SIZE` nearest nodes to key `K`.
@@ -298,7 +299,7 @@ For each unknown key:
 
 1. Deduplicate key in pending-verification table.
 2. Determine fetch eligibility from admission context:
-    - Apply cross-set precedence first (Section 6.2 rule 9): a key present in both hint sets is treated as replica-hint pipeline only.
+    - Apply cross-set precedence first (Section 6.2 rule 10): a key present in both hint sets is treated as replica-hint pipeline only.
     - `FetchEligible = true` if `K` is in the admitted replica-hint pipeline.
     - `FetchEligible = true` for a paid-hint-only key only if `IsResponsible(self, K)` is true.
     - `FetchEligible = false` for paid-hint-only keys where `IsResponsible(self, K)` is false.
@@ -452,7 +453,7 @@ Challenge-response for claimed holders:
 6. Challenger sends `challenged_peer_id` an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
 7. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
     a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = H(nonce || challenged_peer_id || K_i || record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
-    b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 3b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within the one-time `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period or if this is a repeated claim after the peer previously stopped claiming bootstrap. Audit tick ends (no digest verification).
+    b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 4b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within the one-time `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period or if this is a repeated claim after the peer previously stopped claiming bootstrap. Audit tick ends (no digest verification).
 8. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
 9. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
     a. For each failed key `K` in `PeerKeySet(challenged_peer_id)`, perform a fresh local RT closest-peer lookup for `K`.
@@ -621,7 +622,7 @@ Each scenario should assert exact expected outcomes and state transitions.
 40. Neighbor-sync per-peer cooldown skip:
 - Peer `P` was successfully synced in a prior round and is still within `NEIGHBOR_SYNC_COOLDOWN`. When batch selection reaches `P`, it is removed from `NeighborSyncOrder(self)` and scanning continues to the next peer. `P` does not consume a batch slot.
 41. Neighbor-sync cycle completion is guaranteed:
-- Under arbitrary churn, cooldowns, and unreachable peers, the cycle always terminates because the snapshot can only shrink (removals) and the cursor advances monotonically. Cycle completes when `NeighborSyncCursor >= |NeighborSyncOrder|`.
+- Under arbitrary churn, cooldowns, and unreachable peers, the cycle always terminates because the priority queue can only drain or be pruned, the snapshot can only shrink, and the cursor advances monotonically. Cycle completes when `PriorityNeighborSyncOrder` is empty and `NeighborSyncCursor >= |NeighborSyncOrder|`.
 42. Quorum-derived paid-list authorization:
 - Unknown key `K` passes presence quorum (`>= QuorumNeeded(K)` positives from `QuorumTargets`). Key is stored AND added to local `PaidForList(self)`. Node subsequently answers paid-list queries for `K` as "paid."
 43. Paid-list persistence across restart:
