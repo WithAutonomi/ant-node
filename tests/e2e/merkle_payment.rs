@@ -213,7 +213,8 @@ fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDA
         let price = Amount::from(1024u64);
         #[allow(clippy::cast_possible_truncation)]
         let reward_address = RewardsAddress::new([i as u8; 20]);
-        let msg = MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp);
+        let msg =
+            MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp, 0, &None);
         let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
         let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
@@ -222,6 +223,8 @@ fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDA
             price,
             reward_address,
             merkle_payment_timestamp: timestamp,
+            committed_key_count: 0,
+            commitment_pin: None,
             signature,
         }
     })

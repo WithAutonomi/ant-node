@@ -125,6 +125,19 @@ pub enum ReplicationMessageBody {
     SubtreeByteChallenge(SubtreeByteChallenge),
     /// Response carrying the requested chunks' original bytes (round 2).
     SubtreeByteResponse(SubtreeByteResponse),
+
+    // === Commitment fetch by pin (ADR-0003) ===
+    // APPENDED at the end so postcard variant discriminants of all the
+    // pre-existing variants are unchanged — old nodes keep decoding every
+    // message they already understood; only these two new indices are unknown
+    // to them (and they never receive them, since old nodes never send the
+    // matching request).
+    /// Fetch a retained commitment by its pin (ADR-0003): used to resolve a
+    /// quote's `commitment_pin` when the sidecar is absent and the gossip cache
+    /// has no fresh copy.
+    GetCommitmentByPin(GetCommitmentByPin),
+    /// Response to [`Self::GetCommitmentByPin`].
+    GetCommitmentByPinResponse(GetCommitmentByPinResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +300,41 @@ pub enum FetchResponse {
         key: XorName,
         /// Human-readable error description.
         reason: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// Commitment fetch by pin (ADR-0003)
+// ---------------------------------------------------------------------------
+
+/// Request a retained commitment by its pin (commitment hash).
+///
+/// ADR-0003: a storer cross-checking a quote whose `commitment_pin` it does not
+/// already hold (no sidecar, no fresh gossip copy) fetches the signed
+/// commitment so it can verify the binding and route the commitment into audit.
+/// The responder answers only from its retained set, so this never forces a
+/// node to reconstruct or re-sign anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetCommitmentByPin {
+    /// The commitment hash (pin) being resolved.
+    pub pin: [u8; 32],
+}
+
+/// Response to [`GetCommitmentByPin`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GetCommitmentByPinResponse {
+    /// The pin resolved to a retained, signed commitment.
+    Found {
+        /// The signed commitment matching the requested pin. The fetcher
+        /// re-verifies its signature and peer binding before trusting it.
+        commitment: crate::replication::commitment::StorageCommitment,
+    },
+    /// The pin is not among the responder's retained commitments (rotated/aged
+    /// out, or never held). ADR-0003 treats this as graced, never confirmed:
+    /// an unanswerable pin is indistinguishable from an honest crash-restart.
+    NotRetained {
+        /// Echo of the requested pin, for matching.
+        pin: [u8; 32],
     },
 }
 

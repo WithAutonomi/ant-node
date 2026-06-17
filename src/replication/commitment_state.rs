@@ -422,6 +422,34 @@ impl ResponderCommitmentState {
         Some(current)
     }
 
+    /// Atomically snapshot the current commitment to PIN IN A QUOTE and refresh
+    /// its answerability, under a single lock. Returns the live current
+    /// commitment, or `None` if there is no live current (never rotated, or
+    /// retired) — in which case the caller must quote the baseline with no pin.
+    ///
+    /// ADR-0003 ("quoting is advertising"): issuing a quote that prices against
+    /// the current commitment must extend that commitment's answerability
+    /// exactly as gossiping it does, so a recently-quoted pin stays resolvable
+    /// for its TTL and a peer auditing it cannot false-fail an honest node.
+    /// This deliberately mirrors [`Self::current_for_gossip`]: same atomic
+    /// snapshot-and-stamp, same TOCTOU-free guarantee that anything a quote can
+    /// pin is simultaneously retained. It refreshes the CURRENT commitment only
+    /// — a retired or merely-retained-but-not-current commitment is never
+    /// returned here, so quote traffic can never keep a stale fat commitment
+    /// alive (it can only be answered, via `lookup_by_hash`, until its own
+    /// gossip/quote stamp lapses).
+    #[must_use]
+    pub fn current_for_quote(&self) -> Option<Arc<BuiltCommitment>> {
+        let now = Instant::now();
+        let mut guard = self.inner.write();
+        if !guard.has_current {
+            return None;
+        }
+        let current = guard.slots.first().map(Arc::clone)?;
+        mark_gossiped_locked(&mut guard, current.cached_hash, now);
+        Some(current)
+    }
+
     /// Expire retention purely by the wall clock, without building, signing, or
     /// rotating anything. Call once per rotation tick so a gossiped commitment's
     /// answerability deadline advances even when the rotation no-op guard
@@ -509,6 +537,31 @@ impl ResponderCommitmentState {
         guard.slots.clear();
         guard.has_current = false;
         guard.recently_gossiped.clear();
+    }
+}
+
+/// ADR-0003: the responder commitment state is the quote generator's commitment
+/// source. `current_binding_for_quote` snapshots the live current commitment's
+/// `(key_count, pin)` and refreshes its answerability in one atomic step (via
+/// [`ResponderCommitmentState::current_for_quote`]), so a quote that prices
+/// against the current commitment keeps it answerable for its TTL.
+impl crate::payment::quote::CommitmentSource for ResponderCommitmentState {
+    fn current_binding_for_quote(&self) -> Option<crate::payment::quote::QuoteBinding> {
+        self.current_for_quote()
+            .map(|built| crate::payment::quote::QuoteBinding {
+                key_count: built.commitment().key_count,
+                pin: built.hash(),
+            })
+    }
+
+    fn commitment_blob_for_pin(&self, pin: [u8; 32]) -> Option<Vec<u8>> {
+        // rmp-encode the `StorageCommitment` itself — the EXACT form the storer's
+        // `index_valid_sidecars` deserializes (`rmp_serde::from_slice::<StorageCommitment>`),
+        // so a sidecar shipped here resolves identically to one fetched via
+        // `GetCommitmentByPin`. Only retained pins resolve; a rotated-out pin
+        // yields `None` and the response simply carries no commitment.
+        let built = self.lookup_by_hash(&pin)?;
+        rmp_serde::to_vec(built.commitment()).ok()
     }
 }
 
@@ -1138,5 +1191,95 @@ mod tests {
             state.lookup_by_hash(&h1).is_some(),
             "gossiped commitment must survive ungossiped rebuilds"
         );
+    }
+
+    // === ADR-0003: current_for_quote (quote-issuance answerability) ===
+
+    use crate::payment::quote::CommitmentSource;
+
+    #[test]
+    fn current_for_quote_returns_current_binding_and_is_current_only() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        // No current yet -> baseline (None).
+        assert!(state.current_binding_for_quote().is_none());
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        state.mark_gossiped(h1);
+        let c2 = BuiltCommitment::build(
+            vec![(key(2), bh(2)), (key(3), bh(3))],
+            &peer_id,
+            &sk,
+            &pk_bytes,
+        )
+        .unwrap();
+        let h2 = c2.hash();
+        state.rotate(c2);
+
+        // current_for_quote returns the CURRENT (c2) binding, never the
+        // previous (c1) — a quote may pin only the live current commitment.
+        let binding = state
+            .current_binding_for_quote()
+            .expect("current binding present");
+        assert_eq!(
+            binding.pin, h2,
+            "must bind the current commitment, not previous"
+        );
+        assert_eq!(binding.key_count, 2, "current commitment's key count");
+        assert_ne!(
+            binding.pin, h1,
+            "must never pin the retired/previous commitment"
+        );
+    }
+
+    #[test]
+    fn current_for_quote_refreshes_answerability() {
+        // Issuing a quote must refresh the current commitment's answerability,
+        // exactly like gossiping it (ADR-0003 "quoting is advertising").
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        // NOT gossiped; instead "quote" it. The quote-issuance refresh must make
+        // it answerable just as a gossip emission would.
+        let binding = state.current_binding_for_quote().expect("binding");
+        assert_eq!(binding.pin, h1);
+        assert!(
+            state.lookup_by_hash(&h1).is_some(),
+            "a quoted current pin must be answerable (issuance refreshed retention)"
+        );
+    }
+
+    #[test]
+    fn retired_current_cannot_be_quoted() {
+        // After retire_current (node has no responsible keys), there is no live
+        // current commitment, so current_for_quote yields baseline — a retired
+        // commitment can never be newly quoted.
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        state.mark_gossiped(h1);
+        state.retire_current();
+
+        assert!(
+            state.current_binding_for_quote().is_none(),
+            "a retired current commitment must not be quotable"
+        );
+        // ...but it stays answerable for any in-flight pin until its TTL lapses.
+        assert!(state.lookup_by_hash(&h1).is_some());
     }
 }

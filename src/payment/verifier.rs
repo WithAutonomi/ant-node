@@ -9,7 +9,7 @@ use crate::logging::{debug, info, warn};
 use crate::payment::cache::{CacheStats, VerifiedCache, XorName};
 use crate::payment::pricing::{calculate_price, derive_records_stored_from_price};
 use crate::payment::proof::{
-    deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
+    deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
 };
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::lmdb::LmdbStorage;
@@ -26,7 +26,6 @@ use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
-#[cfg(any(test, feature = "test-utils"))]
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -176,6 +175,25 @@ pub enum PaymentStatus {
     PaymentVerified,
 }
 
+/// Outcome of the ADR-0003 quote-vs-commitment cross-check (see
+/// [`PaymentVerifier::cross_check_binding`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossCheck {
+    /// Pin resolves to the commitment and the counts agree: nothing to report.
+    Match,
+    /// Pin resolves to the commitment but the claimed and committed counts
+    /// disagree: deterministic, first-occurrence contradiction (evidence).
+    Mismatch {
+        /// The key count the quote claimed.
+        quoted_key_count: u32,
+        /// The key count the pinned commitment actually attests.
+        committed_key_count: u32,
+    },
+    /// The supplied commitment does not hash to the quote's pin: the pin is
+    /// unresolved (treat as fetch/skip), never evidence.
+    PinDoesNotResolve,
+}
+
 impl PaymentStatus {
     /// Returns true if the data can be stored (cached or payment verified).
     #[must_use]
@@ -192,6 +210,29 @@ impl PaymentStatus {
 
 /// Default capacity for the merkle pool cache (number of pool hashes to cache).
 const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
+
+/// ADR-0003: max commitment sidecars processed per bundle. A legitimate bundle
+/// carries at most one commitment per quote/candidate — `CANDIDATES_PER_POOL`
+/// (16) is the larger of the single-node (`CLOSE_GROUP_SIZE` = 7) and merkle
+/// cases, so it covers both. Excess sidecars from a malicious client are
+/// ignored before any deserialize/verify work (bounds the hot-path cost).
+const MAX_SIDECARS_PER_BUNDLE: usize = evmlib::merkle_batch_payment::CANDIDATES_PER_POOL;
+
+/// Shared handle to the replication engine's gossip commitment cache
+/// (`last_commitment_by_peer`), used by the ADR-0003 cross-check to resolve a
+/// quote's pin against a neighbour's recently gossiped commitment. A `tokio`
+/// `RwLock` to match the engine's; read with `.await` on the async path.
+type CommitmentCache = Arc<
+    tokio::sync::RwLock<
+        HashMap<PeerId, crate::replication::commitment_state::PeerCommitmentRecord>,
+    >,
+>;
+
+/// Per-`(peer, pin)` negative cache for unresolved ADR-0003 pin fetches: a pin a
+/// peer answered `NotRetained` (or that timed out) is remembered so repeated
+/// bundles don't re-fetch it. Behind an `Arc` so the detached fetch task owns a
+/// handle without borrowing the verifier.
+type PinFetchNegativeCache = Arc<Mutex<LruCache<(PeerId, [u8; 32]), ()>>>;
 
 /// Main payment verifier for ant-node.
 ///
@@ -244,6 +285,34 @@ pub struct PaymentVerifier {
     /// exercise the full verifier path without starting an EVM chain.
     #[cfg(any(test, feature = "test-utils"))]
     test_completed_payments_override: RwLock<HashMap<QuoteHash, Amount>>,
+    /// Test-only override for this node's own peer ID, used by
+    /// `validate_quote_freshness` to pick out the node's own quote from the
+    /// payment bundle. Production code derives it from the attached
+    /// [`P2PNode`]; set via [`Self::set_peer_id_for_tests`] so unit tests can
+    /// drive the freshness logic without wiring a real `P2PNode`.
+    test_peer_id_override: RwLock<Option<[u8; 32]>>,
+    /// ADR-0003 gossip commitment cache, shared with the replication engine
+    /// (`last_commitment_by_peer`). The cross-check resolves a quote's
+    /// `commitment_pin` against the neighbour's most recently gossiped
+    /// commitment held here, *only if seen within the answerability TTL*;
+    /// otherwise the pin is treated as unknown (fetch/skip), never a penalty.
+    /// A `tokio` `RwLock` to match the engine's; read with `.await` on the
+    /// async verification path. `None` until [`Self::attach_commitment_cache`]
+    /// (unit tests, or pre-replication startup).
+    commitment_cache: RwLock<Option<CommitmentCache>>,
+    /// ADR-0003 negative cache for unresolved pin fetches: a `(peer, pin)` that
+    /// resolved to `NotRetained` or timed out is remembered here so repeated
+    /// bundles citing the same unknown pin don't re-fetch (bounding the
+    /// amplification an attacker can drive). Keyed by `(PeerId, pin)`. Behind an
+    /// `Arc` so the detached background fetch task (which runs off the payment
+    /// hot path) can read and update it without borrowing the verifier.
+    pin_fetch_negative_cache: PinFetchNegativeCache,
+    /// ADR-0003: sender to surface monetized pins (commitments that backed a
+    /// payment) to the replication engine's deterministic first-audit drainer.
+    /// `None` until [`Self::attach_monetized_pin_sender`] (unit tests, or
+    /// pre-replication startup), in which case no first audit is scheduled.
+    monetized_pin_tx:
+        RwLock<Option<tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>>>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -366,8 +435,40 @@ impl PaymentVerifier {
             test_paid_quote_k_closest_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             test_completed_payments_override: RwLock::new(HashMap::new()),
+            test_peer_id_override: RwLock::new(None),
+            commitment_cache: RwLock::new(None),
+            pin_fetch_negative_cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(crate::replication::config::PIN_FETCH_NEGATIVE_CACHE_CAPACITY)
+                    .unwrap_or(NonZeroUsize::MIN),
+            ))),
+            monetized_pin_tx: RwLock::new(None),
             config,
         }
+    }
+
+    /// Attach the ADR-0003 monetized-pin sender (the replication engine's
+    /// first-audit drainer channel) so the cross-check can route commitments
+    /// that backed a payment into a deterministic first audit. Idempotent;
+    /// absent (unit tests / pre-replication) no first audit is scheduled.
+    pub fn attach_monetized_pin_sender(
+        &self,
+        tx: tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>,
+    ) {
+        *self.monetized_pin_tx.write() = Some(tx);
+        debug!("PaymentVerifier: ADR-0003 monetized-pin sender attached");
+    }
+
+    /// Attach the ADR-0003 gossip commitment cache (the replication engine's
+    /// `last_commitment_by_peer`) so the cross-check can resolve a quote's
+    /// `commitment_pin` against the neighbour's recently gossiped commitment.
+    ///
+    /// Wired by the node once the replication engine exists, alongside the
+    /// quote generator's commitment source. Idempotent. Absent (unit tests,
+    /// pre-replication startup), the cross-check resolves no pins from gossip
+    /// and falls back to fetch/skip — never a penalty.
+    pub fn attach_commitment_cache(&self, cache: CommitmentCache) {
+        *self.commitment_cache.write() = Some(cache);
+        debug!("PaymentVerifier: ADR-0003 commitment cache attached");
     }
 
     /// Attach the node's [`P2PNode`] handle so paid-quote verification can
@@ -450,7 +551,10 @@ impl PaymentVerifier {
     /// paid-quote floor rejects client PUTs because the local floor is
     /// the economic security gate for this proof policy.
     fn current_records_stored(&self) -> Option<u64> {
-        if let Some(storage) = self.storage.read().as_ref() {
+        // Clone the Arc out and drop the guard before the storage read, so the
+        // `RwLock<Option<Arc<LmdbStorage>>>` is never held across `current_chunks()`.
+        let storage = self.storage.read().as_ref().map(Arc::clone);
+        if let Some(storage) = storage {
             match storage.current_chunks() {
                 Ok(n) => return Some(n),
                 Err(e) => {
@@ -612,15 +716,24 @@ impl PaymentVerifier {
                             self.verify_merkle_payment(xorname, proof, context).await?;
                         }
                         Some(ProofType::SingleNode) => {
-                            let (payment, tx_hashes) = deserialize_proof(proof).map_err(|e| {
+                            let parsed = deserialize_single_node_proof(proof).map_err(|e| {
                                 Error::Payment(format!("Failed to deserialize payment proof: {e}"))
                             })?;
 
-                            if !tx_hashes.is_empty() {
-                                debug!("Proof includes {} transaction hash(es)", tx_hashes.len());
+                            if !parsed.tx_hashes.is_empty() {
+                                debug!(
+                                    "Proof includes {} transaction hash(es)",
+                                    parsed.tx_hashes.len()
+                                );
                             }
 
-                            self.verify_evm_payment(xorname, &payment, context).await?;
+                            self.verify_evm_payment(
+                                xorname,
+                                &parsed.proof_of_payment,
+                                &parsed.commitment_sidecars,
+                                context,
+                            )
+                            .await?;
                         }
                         None => {
                             let tag = proof.first().copied().unwrap_or(0);
@@ -718,6 +831,7 @@ impl PaymentVerifier {
         &self,
         xorname: &XorName,
         payment: &ProofOfPayment,
+        commitment_sidecars: &[Vec<u8>],
         context: VerificationContext,
     ) -> Result<()> {
         if crate::logging::enabled!(crate::logging::Level::DEBUG) {
@@ -729,6 +843,18 @@ impl PaymentVerifier {
         }
 
         Self::validate_quote_structure(payment)?;
+        // ADR-0003: re-run the `price == calculate_price(committed_key_count)`
+        // arithmetic/binding check on EVERY quote in the bundle (all single-node
+        // quotes), per the ADR's "every storer re-runs the
+        // price-equals-formula-of-count check on every quote in the bundle"
+        // rule — bundle-level, before median selection (the candidate loop below
+        // only sees median-priced quotes). This hard cutover also RETIRES the
+        // percentage-based own-quote price-staleness gate: a quote's price is
+        // now exactly bound to its committed count here (both the `(n>0, Some)`
+        // and baseline `(0, None)` shapes), and the committed responsible count
+        // legitimately differs from the on-disk count, so the old gate would
+        // FALSE-REJECT healthy ADR quotes. The binding gate supersedes it.
+        Self::validate_quote_arithmetic(payment)?;
         let candidates = Self::legacy_median_candidates(payment)?;
         let mut failures = Vec::with_capacity(candidates.len());
         let mut verified_paid_quote = false;
@@ -756,6 +882,20 @@ impl PaymentVerifier {
             return Err(Error::Payment(format!(
                 "Median quote payment verification failed for {xorname_hex}: {details}"
             )));
+        }
+
+        // ADR-0003 observe-only telemetry: log off-curve quotes only AFTER the
+        // paid (median) quote's ML-DSA-65 signature has verified above, so
+        // unauthenticated senders cannot poison rollout logs. In enforce mode
+        // `validate_quote_arithmetic` already rejected; this is a no-op there.
+        Self::log_off_curve_single_node(payment);
+
+        // ADR-0003 cross-check + first-audit enqueue (ClientPut only) runs ONLY
+        // after on-chain payment verification has SUCCEEDED above, so an unpaid
+        // (but signed) bundle can never enqueue audits or drive pin fetches —
+        // closing the free-amplification path. Fresh client-put bundles only.
+        if context == VerificationContext::ClientPut {
+            self.cross_check_quotes(payment, commitment_sidecars).await;
         }
 
         if crate::logging::enabled!(crate::logging::Level::INFO) {
@@ -1033,6 +1173,816 @@ impl PaymentVerifier {
             seen.push(encoded_peer_id);
         }
 
+        Ok(())
+    }
+
+    /// Verify all quotes target the correct content address.
+    fn validate_quote_content(payment: &ProofOfPayment, xorname: &XorName) -> Result<()> {
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if !verify_quote_content(quote, xorname) {
+                let expected_hex = hex::encode(xorname);
+                let actual_hex = hex::encode(quote.content.0);
+                return Err(Error::Payment(format!(
+                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {expected_hex}, got {actual_hex}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// ADR-0003: enforce that every quoted price lies exactly on the public
+    /// pricing curve.
+    ///
+    /// **Scope** (this slice): canonicality only. The gate proves the price is
+    /// some `calculate_price(n)` for a non-negative integer `n`; it does NOT
+    /// yet prove `n` matches a signed commitment, because `PaymentQuote` lives
+    /// in evmlib (crates.io) and has no `claimed_key_count` / `commitment_pin`
+    /// fields yet. A future slice will bind `n` to a signed commitment once
+    /// the evmlib quote payload is extended. Until then, an attacker can still
+    /// quote `calculate_price(fake_n)` for any fake count and pass this gate;
+    /// what dies here is the strictly weaker attack of picking a price *off*
+    /// the curve altogether.
+    ///
+    /// **Check**: exact recomputation, never price-inversion. We derive the
+    /// candidate `n` for which `quote.price` would be the curve value (using
+    /// the existing inverse `derive_records_stored_from_price`, which floors),
+    /// then recompute `calculate_price(n)` and require strict equality.
+    /// On-curve prices round-trip exactly; off-curve prices floor to a smaller
+    /// `n` whose recomputed value is strictly less than `quote.price` and so
+    /// are rejected. Floor-then-equality is the canonicality test the ADR
+    /// specifies; price inversion alone would silently accept any value
+    /// between two curve points.
+    ///
+    /// **Where it runs**: in every [`VerificationContext`] over **every**
+    /// quote in **both** quote types — all 7 single-node quotes
+    /// ([`Self::validate_quote_arithmetic`]) and all 16 merkle candidates
+    /// ([`Self::validate_merkle_candidate_arithmetic`]) — because the rule
+    /// "every storer re-runs the price-equals-formula-of-count check on every
+    /// quote in the bundle" (ADR-0003) needs no peer-specific state and depends
+    /// only on the bundle itself, so every honest storer reaches the same
+    /// verdict with no split-brain risk.
+    ///
+    /// **Reject-only**, per ADR-0003: no trust evidence is emitted, no audit
+    /// is scheduled. The rejection is the consequence. The gate is
+    /// rollout-gated by
+    /// [`crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED`]; when
+    /// `false`, off-curve quotes are accepted and only telemetered
+    /// ([`Self::log_off_curve_single_node`] /
+    /// [`Self::log_off_curve_merkle`]), matching ADR-0003's observe-only
+    /// rollout. Telemetry is invoked **after** ML-DSA-65 signature
+    /// verification so unauthenticated senders cannot poison the rollout
+    /// logs.
+    fn validate_quote_arithmetic(payment: &ProofOfPayment) -> Result<()> {
+        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            return Ok(());
+        }
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if let Some(detail) = Self::quote_arithmetic_violation(quote) {
+                return Err(Error::Payment(format!(
+                    "ADR-0003 off-curve quote rejected for peer {encoded_peer_id:?}: {detail}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The ADR-0003 forced-price rule for a single quote, returning a human
+    /// diagnostic iff the quote violates it. Shared by single-node quotes and
+    /// merkle candidates via [`Self::binding_violation`].
+    ///
+    /// The rule is the ADR's exact one — `price == calculate_price(
+    /// committed_key_count)`, recomputed, never inverted from the price (which
+    /// rounds) — PLUS a binding-shape check. There is no "legacy degradation"
+    /// that infers an old quote from its field values: a `(0, None)` quote is
+    /// rejected unless its price is exactly `calculate_price(0)`, closing the
+    /// bypass where a modified node strips the pin yet prices above baseline.
+    /// Old-format quotes (which never carried these fields) are tolerated only
+    /// at the *wire-decode* layer, where they decode as `(0, None)` and are then
+    /// held to the same baseline rule; an explicit version negotiation, not
+    /// field inference, is the sanctioned path if non-baseline legacy quotes
+    /// must ever be accepted.
+    fn quote_arithmetic_violation(quote: &evmlib::PaymentQuote) -> Option<String> {
+        Self::binding_violation(
+            quote.committed_key_count,
+            quote.commitment_pin,
+            &quote.price,
+        )
+    }
+
+    /// The shared ADR-0003 binding rule over a `(committed_key_count,
+    /// commitment_pin, price)` triple, used for both quote types.
+    ///
+    /// Enforces, in order:
+    /// 1. **Shape.** `(0, None)` baseline or `(n>0, Some(pin))` bound; the mixed
+    ///    shapes `(n>0, None)` and `(0, Some(_))` are always rejected — a count
+    ///    without a pin is unauditable, and a pin without a count is incoherent.
+    /// 2. **Cap.** `committed_key_count <= MAX_COMMITMENT_KEY_COUNT`; a count a
+    ///    commitment could never legitimately attest is rejected before pricing.
+    /// 3. **Forced price.** `price == calculate_price(committed_key_count)`, by
+    ///    exact recomputation.
+    fn binding_violation(
+        committed_key_count: u32,
+        commitment_pin: Option<[u8; 32]>,
+        price: &Amount,
+    ) -> Option<String> {
+        match (committed_key_count, commitment_pin.is_some()) {
+            (0, false) | (1.., true) => {}
+            (1.., false) => {
+                return Some(format!(
+                    "binding shape invalid: committed_key_count={committed_key_count} > 0 \
+                     but commitment_pin is None (unauditable count)"
+                ));
+            }
+            (0, true) => {
+                return Some(
+                    "binding shape invalid: committed_key_count=0 with a commitment_pin \
+                     (incoherent baseline)"
+                        .to_string(),
+                );
+            }
+        }
+        if committed_key_count > crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT {
+            return Some(format!(
+                "committed_key_count={committed_key_count} exceeds MAX_COMMITMENT_KEY_COUNT={}",
+                crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT
+            ));
+        }
+        let expected = calculate_price(Self::candidate_count_to_usize(u64::from(
+            committed_key_count,
+        )));
+        if &expected == price {
+            None
+        } else {
+            Some(format!(
+                "price {price} does not equal calculate_price(committed_key_count={committed_key_count}) = {expected}"
+            ))
+        }
+    }
+
+    /// Pure ADR-0003 cross-check: compare a quote's claimed `(key_count, pin)`
+    /// against a resolved signed commitment.
+    ///
+    /// This is the decision core of "peers cross-check the original": given a
+    /// quote's binding and the actual `StorageCommitment` the pin was resolved
+    /// to (from the sidecar, the gossip cache, or a fetch), decide whether the
+    /// quote contradicts the commitment. It is deliberately a pure function over
+    /// the two artifacts so it is exhaustively unit-testable without any cache,
+    /// network, or trust wiring; the caller owns resolution and emission.
+    ///
+    /// Outcomes:
+    /// - [`CrossCheck::Match`] — the pin matches the commitment's hash and the
+    ///   counts agree: nothing to report.
+    /// - [`CrossCheck::Mismatch`] — the pin matches the commitment's hash but
+    ///   the quote's `committed_key_count` differs from the commitment's
+    ///   `key_count`. Two artifacts signed by the same key contradict each
+    ///   other: this is the deterministic, first-occurrence evidence.
+    /// - [`CrossCheck::PinDoesNotResolve`] — the supplied commitment's hash does
+    ///   not equal the quote's pin (wrong/garbled resolution). NOT evidence: the
+    ///   caller must treat it as an unresolved pin (fetch/skip), never a
+    ///   penalty, exactly like an unanswerable pin.
+    ///
+    /// A baseline quote `(0, None)` is never cross-checked (it pins nothing);
+    /// callers skip it before reaching here.
+    fn cross_check_binding(
+        quoted_key_count: u32,
+        quoted_pin: [u8; 32],
+        commitment: &crate::replication::commitment::StorageCommitment,
+    ) -> CrossCheck {
+        // The pin IS the commitment hash; if the resolved commitment hashes to
+        // something else, this is not the artifact the quote pinned.
+        match crate::replication::commitment::commitment_hash(commitment) {
+            Some(h) if h == quoted_pin => {
+                if commitment.key_count == quoted_key_count {
+                    CrossCheck::Match
+                } else {
+                    CrossCheck::Mismatch {
+                        quoted_key_count,
+                        committed_key_count: commitment.key_count,
+                    }
+                }
+            }
+            _ => CrossCheck::PinDoesNotResolve,
+        }
+    }
+
+    /// ADR-0003 "peers cross-check the original": for each non-baseline quote in
+    /// a client-put bundle, resolve its `commitment_pin` against the gossip
+    /// commitment cache and report a count/pin contradiction.
+    ///
+    /// Resolution today is the gossip cache only, and only if the neighbour's
+    /// commitment was seen within `GOSSIP_ANSWERABILITY_TTL` — a staler cache
+    /// entry is treated as unknown (the ADR's "cached commitment older than the
+    /// answerability TTL is treated as unknown"). An unresolved pin is never a
+    /// penalty: it is skipped here (the sidecar and `GetCommitmentByPin` fetch
+    /// fallbacks resolve more pins and are layered on next, but a pin that
+    /// resolves nowhere stays graced, exactly like an unanswerable audit pin).
+    ///
+    /// A genuine [`CrossCheck::Mismatch`] is a deterministic, first-occurrence
+    /// contradiction between two same-key-signed artifacts: when enforcing, it
+    /// emits [`FailureEvidence::QuoteCommitmentMismatch`] to the trust engine
+    /// (same lane as a confirmed deterministic audit failure — NOT the timeout
+    /// silence lane); when observe-only, it only logs. Always best-effort: a
+    /// missing cache or absent `P2PNode` degrades to "resolve nothing", never an
+    /// error on the payment path — the synchronous arithmetic gate and the
+    /// later audit remain the load-bearing checks.
+    /// Resolve a cached peer commitment record to its commitment *only if* it
+    /// was seen within the answerability TTL; a staler entry is treated as
+    /// unknown (ADR-0003: "a cached commitment older than the answerability TTL
+    /// is treated as unknown"). Pure over `(record, now, ttl)` so the TTL
+    /// boundary is unit-testable without the async cache/network path.
+    fn fresh_cached_commitment(
+        rec: &crate::replication::commitment_state::PeerCommitmentRecord,
+        pin: [u8; 32],
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> Option<crate::replication::commitment::StorageCommitment> {
+        if now.saturating_duration_since(rec.received_at) >= ttl {
+            return None; // stale cache entry -> treat as unknown
+        }
+        // Only resolve when the cached commitment is actually the one the quote
+        // pinned. The auditor cache holds a peer's LATEST gossiped commitment,
+        // which may be a DIFFERENT pin than this quote's; returning it would make
+        // `cross_check_binding` yield `PinDoesNotResolve` and wrongly suppress
+        // the fetch fallback for the quoted pin. A pin mismatch here means "not
+        // cached" -> fall through to fetch.
+        if rec.commitment_hash() != Some(pin) {
+            return None;
+        }
+        rec.last_commitment().cloned()
+    }
+
+    /// Resolve a `(peer, pin)` from the gossip commitment cache, if the cache is
+    /// wired and holds a fresh entry whose hash matches the pin. Shared by the
+    /// single-node and merkle cross-check paths.
+    async fn cache_resolve(
+        cache: Option<&CommitmentCache>,
+        peer_id: PeerId,
+        pin: [u8; 32],
+        now: std::time::Instant,
+        ttl: std::time::Duration,
+    ) -> Option<crate::replication::commitment::StorageCommitment> {
+        let cache = cache?;
+        let guard = cache.read().await;
+        guard
+            .get(&peer_id)
+            .and_then(|rec| Self::fresh_cached_commitment(rec, pin, now, ttl))
+    }
+
+    /// Parse and validate ADR-0003 commitment sidecars into a `(peer, pin) ->
+    /// commitment` map. Each blob is deserialized and held to the SAME gates as
+    /// a gossip-ingested or fetched commitment (peer id derived from its own
+    /// `sender_peer_id`, `BLAKE3(pubkey) == sender_peer_id`, valid signature),
+    /// keyed by `(its own peer, its own hash)`. Resolution then matches a quote
+    /// only when both the quote's peer AND pin equal the sidecar's, so a sidecar
+    /// can never satisfy a different peer's or a different pin's quote. An
+    /// unparseable or invalid sidecar is silently skipped (resolution falls back
+    /// to gossip/fetch), never a hard error on the payment path.
+    fn index_valid_sidecars(
+        sidecars: &[Vec<u8>],
+    ) -> HashMap<(PeerId, [u8; 32]), crate::replication::commitment::StorageCommitment> {
+        use crate::replication::commitment::MAX_COMMITMENT_SIDECAR_BYTES;
+        let mut map = HashMap::new();
+        // Bound the number of sidecars we even look at: a legitimate bundle has
+        // at most one commitment per quote/candidate. `MAX_SIDECARS_PER_BUNDLE`
+        // (= CANDIDATES_PER_POOL, the larger of the two) caps the deserialize/
+        // verify work a malicious client can force on the hot path.
+        for blob in sidecars.iter().take(MAX_SIDECARS_PER_BUNDLE) {
+            // Cap blob size before parsing: never attempt to deserialize an
+            // oversized commitment.
+            if blob.len() > MAX_COMMITMENT_SIDECAR_BYTES {
+                continue;
+            }
+            let Ok(commitment) =
+                rmp_serde::from_slice::<crate::replication::commitment::StorageCommitment>(blob)
+            else {
+                continue; // unparseable -> skip
+            };
+            let peer_id = PeerId::from_bytes(commitment.sender_peer_id);
+            let Some(pin) = crate::replication::commitment::commitment_hash(&commitment) else {
+                continue;
+            };
+            // Validate against its own (peer, pin): peer binding + pubkey
+            // derivation + signature + hash==pin.
+            if Self::fetched_commitment_is_valid(&commitment, &peer_id, pin) {
+                map.insert((peer_id, pin), commitment);
+            }
+        }
+        map
+    }
+
+    async fn cross_check_quotes(&self, payment: &ProofOfPayment, commitment_sidecars: &[Vec<u8>]) {
+        let now = std::time::Instant::now();
+        let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
+        let p2p = self.p2p_node.read().as_ref().map(Arc::clone);
+        let monetized_pin_tx = self.monetized_pin_tx.read().as_ref().cloned();
+        let cache = self.commitment_cache.read().as_ref().map(Arc::clone);
+
+        // ADR-0003 "the commitment arrived with the quote": parse and FULLY
+        // validate the sidecars (peer/pubkey/signature/hash gates, keyed by
+        // `(peer, pin)`), so the cross-check resolves synchronously without a
+        // gossip-cache hit or a post-payment fetch. An invalid sidecar is simply
+        // dropped (resolution falls back to gossip/fetch), never a hard error.
+        let sidecar_map = Self::index_valid_sidecars(commitment_sidecars);
+
+        // Inline pass: resolve from the sidecar first, then the gossip cache
+        // (cheap, no network). Pins that don't resolve here are collected for
+        // the off-hot-path fetch.
+        let mut unresolved: Vec<(PeerId, [u8; 32], u32, Vec<u8>)> = Vec::new();
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            let Some(pin) = quote.commitment_pin else {
+                continue; // baseline quote pins nothing
+            };
+            let peer_id = PeerId::from_bytes(*encoded_peer_id.as_bytes());
+
+            // ADR-0003: this commitment backed a payment — route it for a
+            // deterministic first audit (the drainer dedups by pin and respects
+            // the cooldown). Best-effort: a closed channel just means no first
+            // audit is scheduled, never an error on the payment path.
+            if let Some(ref tx) = monetized_pin_tx {
+                let _ = tx.send(crate::replication::MonetizedPinEvent {
+                    peer: peer_id,
+                    pin,
+                    key_count: quote.committed_key_count,
+                });
+            }
+            // Resolution order: sidecar (synchronous, no state) -> gossip cache
+            // (fresh within TTL) -> fetch fallback (collected as unresolved).
+            let resolved = match sidecar_map.get(&(peer_id, pin)) {
+                Some(c) => Some(c.clone()),
+                None => Self::cache_resolve(cache.as_ref(), peer_id, pin, now, ttl).await,
+            };
+            match resolved {
+                Some(commitment) => {
+                    let artifact = rmp_serde::to_vec(quote).unwrap_or_default();
+                    Self::handle_cross_check(
+                        &peer_id,
+                        pin,
+                        quote.committed_key_count,
+                        artifact,
+                        &commitment,
+                        p2p.as_ref(),
+                    )
+                    .await;
+                }
+                None => unresolved.push((
+                    peer_id,
+                    pin,
+                    quote.committed_key_count,
+                    rmp_serde::to_vec(quote).unwrap_or_default(),
+                )),
+            }
+        }
+
+        // Off-hot-path fallback: fetch the unresolved pins via
+        // `GetCommitmentByPin` and cross-check the results in a detached task,
+        // so `verify_payment` does not block on the network.
+        if unresolved.is_empty() {
+            return;
+        }
+        let Some(p2p) = p2p else {
+            return; // no P2P handle: cannot fetch, leave graced
+        };
+        let neg_cache = Arc::clone(&self.pin_fetch_negative_cache);
+        tokio::spawn(async move {
+            Self::drain_unresolved_pin_fetches(&p2p, &neg_cache, unresolved).await;
+        });
+    }
+
+    /// Fetch each unresolved pin via `GetCommitmentByPin` and cross-check the
+    /// result. Bounded at [`MAX_PIN_FETCHES_PER_BUNDLE`] per call, negatively
+    /// cached per `(peer, pin)`, and graced on any miss/timeout. Shared by the
+    /// single-node and merkle cross-check paths; meant to run in a detached task
+    /// off the payment hot path.
+    async fn drain_unresolved_pin_fetches(
+        p2p: &Arc<P2PNode>,
+        neg_cache: &PinFetchNegativeCache,
+        unresolved: Vec<(PeerId, [u8; 32], u32, Vec<u8>)>,
+    ) {
+        let mut fetched = 0usize;
+        for (peer_id, pin, quoted_key_count, artifact) in unresolved {
+            if fetched >= crate::replication::config::MAX_PIN_FETCHES_PER_BUNDLE {
+                debug!("ADR-0003 pin-fetch cap reached for this bundle; leaving rest graced");
+                break;
+            }
+            // Skip pins already known-unresolvable for this peer.
+            if neg_cache.lock().get(&(peer_id, pin)).is_some() {
+                continue;
+            }
+            fetched += 1;
+            match Self::fetch_commitment_by_pin(p2p, &peer_id, pin).await {
+                Some(commitment) => {
+                    Self::handle_cross_check(
+                        &peer_id,
+                        pin,
+                        quoted_key_count,
+                        artifact,
+                        &commitment,
+                        Some(p2p),
+                    )
+                    .await;
+                }
+                None => {
+                    // NotRetained / timeout / malformed: graced (never a
+                    // penalty), but remembered so we don't re-fetch.
+                    neg_cache.lock().put((peer_id, pin), ());
+                }
+            }
+        }
+    }
+
+    /// Apply the ADR-0003 cross-check verdict for one resolved `(peer, pin,
+    /// quoted_count)` against `commitment`, emitting a trust failure on a
+    /// genuine mismatch (when enforcing) or logging it (observe-only). Shared by
+    /// the inline cache pass and the background fetch path so both reach the
+    /// same verdict and emission.
+    async fn handle_cross_check(
+        peer_id: &PeerId,
+        pin: [u8; 32],
+        quoted_key_count: u32,
+        quote_artifact: Vec<u8>,
+        commitment: &crate::replication::commitment::StorageCommitment,
+        p2p: Option<&Arc<P2PNode>>,
+    ) {
+        let CrossCheck::Mismatch {
+            quoted_key_count,
+            committed_key_count,
+        } = Self::cross_check_binding(quoted_key_count, pin, commitment)
+        else {
+            return; // Match or PinDoesNotResolve: nothing to report
+        };
+        // The evidence is only meaningful if it carries the signed quote
+        // artifact (one of the two contradicting same-key signatures). An empty
+        // artifact — a re-serialization failure upstream — would produce
+        // non-portable, unverifiable evidence, so grace it (log) instead of
+        // emitting it: the deterministic first audit still convicts a genuine
+        // inflater on the disk bytes.
+        if quote_artifact.is_empty() {
+            warn!(
+                "ADR-0003 quote/commitment mismatch for {peer_id}: dropping evidence, \
+                 quote artifact failed to serialize (graced; the audit still runs)"
+            );
+            return;
+        }
+        // Build the portable evidence variant — the two same-key-signed
+        // artifacts that contradict each other, carried in full so any third
+        // party can re-verify both signatures and recompute the contradiction.
+        // This value IS the record; `emit_mismatch_evidence` turns it into the
+        // trust action (or an observe-only log).
+        let evidence = crate::replication::types::FailureEvidence::QuoteCommitmentMismatch {
+            peer: *peer_id,
+            pinned_commitment: pin,
+            quoted_key_count,
+            committed_key_count,
+            quote_artifact,
+            commitment: Box::new(commitment.clone()),
+        };
+        Self::emit_mismatch_evidence(&evidence, p2p).await;
+    }
+
+    /// Route a `QuoteCommitmentMismatch` evidence record: when enforcing, report
+    /// it to the trust engine as a confirmed deterministic failure (an
+    /// `ApplicationFailure` — same lane as a confirmed audit failure, NOT the
+    /// timeout silence lane); when observe-only, only log it. Separated so the
+    /// evidence→action mapping is unit-testable independent of resolution.
+    async fn emit_mismatch_evidence(
+        evidence: &crate::replication::types::FailureEvidence,
+        p2p: Option<&Arc<P2PNode>>,
+    ) {
+        let crate::replication::types::FailureEvidence::QuoteCommitmentMismatch {
+            peer,
+            quoted_key_count,
+            committed_key_count,
+            ..
+        } = evidence
+        else {
+            return; // only this variant is handled here
+        };
+        let enforce = crate::replication::config::QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED;
+        if enforce {
+            warn!(
+                "ADR-0003 quote/commitment mismatch (enforcing) for {peer}: quote claims \
+                 {quoted_key_count} keys but pinned commitment attests {committed_key_count}"
+            );
+            if let Some(p2p) = p2p {
+                p2p.report_trust_event(
+                    peer,
+                    saorsa_core::TrustEvent::ApplicationFailure(
+                        crate::replication::config::AUDIT_FAILURE_TRUST_WEIGHT,
+                    ),
+                )
+                .await;
+            }
+        } else {
+            warn!(
+                "ADR-0003 quote/commitment mismatch observed (not enforcing) for {peer}: quote \
+                 claims {quoted_key_count} keys but pinned commitment attests {committed_key_count}"
+            );
+        }
+    }
+
+    /// Fetch a peer's commitment by pin via `GetCommitmentByPin`, returning it
+    /// only if the peer answered `Found` with a commitment that (a) is validly
+    /// signed and peer-bound and (b) actually hashes to the requested pin.
+    /// `None` on `NotRetained`, timeout, malformed, or any verification failure
+    /// — all graced (the caller never penalises an unresolved pin).
+    async fn fetch_commitment_by_pin(
+        p2p: &Arc<P2PNode>,
+        peer_id: &PeerId,
+        pin: [u8; 32],
+    ) -> Option<crate::replication::commitment::StorageCommitment> {
+        use crate::replication::config::{PIN_FETCH_TIMEOUT, REPLICATION_PROTOCOL_ID};
+        use crate::replication::protocol::{
+            GetCommitmentByPin, GetCommitmentByPinResponse, ReplicationMessage,
+            ReplicationMessageBody,
+        };
+        let msg = ReplicationMessage {
+            request_id: 0,
+            body: ReplicationMessageBody::GetCommitmentByPin(GetCommitmentByPin { pin }),
+        };
+        let encoded = msg.encode().ok()?;
+        let resp = p2p
+            .send_request(peer_id, REPLICATION_PROTOCOL_ID, encoded, PIN_FETCH_TIMEOUT)
+            .await
+            .ok()?;
+        let decoded = ReplicationMessage::decode(&resp.data).ok()?;
+        let ReplicationMessageBody::GetCommitmentByPinResponse(GetCommitmentByPinResponse::Found {
+            commitment,
+        }) = decoded.body
+        else {
+            return None; // NotRetained / unexpected -> graced
+        };
+        Self::fetched_commitment_is_valid(&commitment, peer_id, pin).then_some(commitment)
+    }
+
+    /// The untrusted-fetched-commitment validation gates, pure over
+    /// `(commitment, peer_id, pin)` so they are unit-testable. A fetched
+    /// commitment is accepted only if it passes the SAME gates as a gossip
+    /// ingest, so a peer cannot answer with another peer's (validly signed)
+    /// commitment and have it pass as its own:
+    ///   (a) it is bound to THIS peer (`sender_peer_id == peer_id`),
+    ///   (b) the embedded pubkey derives that peer id (`BLAKE3(pk) == id`),
+    ///   (c) its signature is valid (binds the pubkey),
+    ///   (d) it actually hashes to the pin we asked for.
+    fn fetched_commitment_is_valid(
+        commitment: &crate::replication::commitment::StorageCommitment,
+        peer_id: &PeerId,
+        pin: [u8; 32],
+    ) -> bool {
+        commitment.sender_peer_id == *peer_id.as_bytes()
+            && *blake3::hash(&commitment.sender_public_key).as_bytes() == commitment.sender_peer_id
+            && crate::replication::commitment::verify_commitment_signature(commitment)
+            && crate::replication::commitment::commitment_hash(commitment) == Some(pin)
+    }
+
+    /// Single-node telemetry for off-curve quotes. Always returns; never
+    /// errors. MUST be called only after ML-DSA-65 signature verification has
+    /// passed, so unauthenticated peers cannot drive log volume.
+    fn log_off_curve_single_node(payment: &ProofOfPayment) {
+        if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            return; // enforce mode already rejected; no separate telemetry.
+        }
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if let Some(detail) = Self::quote_arithmetic_violation(quote) {
+                warn!(
+                    "ADR-0003 off-curve single-node quote observed (not enforcing): \
+                     peer {encoded_peer_id:?} {detail}"
+                );
+            }
+        }
+    }
+
+    /// ADR-0003 sister gate for the merkle batch path: every candidate's
+    /// `price` field must lie on the pricing curve, by exact recomputation.
+    /// See [`Self::validate_quote_arithmetic`] for the rationale; semantics
+    /// (reject-only, rollout-gated, no trust evidence) are identical.
+    fn validate_merkle_candidate_arithmetic(
+        pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
+    ) -> Result<()> {
+        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            return Ok(());
+        }
+        for candidate in &pool.candidate_nodes {
+            if let Some(detail) = Self::binding_violation(
+                candidate.committed_key_count,
+                candidate.commitment_pin,
+                &candidate.price,
+            ) {
+                return Err(Error::Payment(format!(
+                    "ADR-0003 merkle candidate rejected (reward {}): {detail}",
+                    candidate.reward_address
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Merkle batch telemetry for off-curve candidates. Always returns; never
+    /// errors. MUST be called only after ML-DSA-65 signature verification has
+    /// passed.
+    fn log_off_curve_merkle(pool: &evmlib::merkle_payments::MerklePaymentCandidatePool) {
+        if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            return; // enforce mode already rejected; no separate telemetry.
+        }
+        for candidate in &pool.candidate_nodes {
+            if let Some(detail) = Self::binding_violation(
+                candidate.committed_key_count,
+                candidate.commitment_pin,
+                &candidate.price,
+            ) {
+                warn!(
+                    "ADR-0003 merkle candidate violation observed (not enforcing): \
+                     reward {} {detail}",
+                    candidate.reward_address
+                );
+            }
+        }
+    }
+
+    /// Pure curve-canonicality predicate: does `price` lie exactly on the
+    /// pricing curve? Equivalent to "there exists some non-negative integer
+    /// `n` such that `calculate_price(n) == price`".
+    ///
+    /// Separated from the rollout-gated outer gates so the canonicality rule
+    /// itself is unit-testable independent of the gate. Callers MUST use this
+    /// and not `derive_records_stored_from_price` directly: the latter floors
+    /// and is not a canonicality test.
+    ///
+    /// Saturation: `derive_records_stored_from_price` saturates to `u64::MAX`
+    /// for prices beyond `calculate_price(u64::MAX)`, and
+    /// [`Self::candidate_count_to_usize`] saturates to `usize::MAX` on 32-bit
+    /// targets. Both saturation regimes converge on `calculate_price`'s own
+    /// saturation ceiling; an honest in-range price (which can never approach
+    /// these regions — `MAX_COMMITMENT_KEY_COUNT` is `1_000_000`) round-trips
+    /// exactly.
+    #[allow(dead_code)] // boolean convenience for tests + follow-up slices
+    fn quote_price_is_on_curve(price: &Amount) -> bool {
+        Self::price_off_curve_diagnostics(price).is_none()
+    }
+
+    /// Returns `Some((candidate_count, recomputed))` iff `price` is off-curve;
+    /// `None` iff `price` is on-curve. The tuple is the diagnostic detail used
+    /// by both the rejection error message and the telemetry warning.
+    fn price_off_curve_diagnostics(price: &Amount) -> Option<(u64, Amount)> {
+        let candidate_count = derive_records_stored_from_price(*price);
+        let recomputed = calculate_price(Self::candidate_count_to_usize(candidate_count));
+        if recomputed == *price {
+            None
+        } else {
+            Some((candidate_count, recomputed))
+        }
+    }
+
+    /// Narrow the canonicality predicate's `u64` candidate into `usize` for
+    /// [`calculate_price`]. On every 64-bit target (the only supported
+    /// production target) this is the identity; on 32-bit targets we saturate
+    /// to `usize::MAX`, which matches `calculate_price`'s own
+    /// `Amount::saturating_mul` behaviour so the round-trip still terminates
+    /// in the same saturation regime rather than panicking.
+    fn candidate_count_to_usize(candidate_count: u64) -> usize {
+        usize::try_from(candidate_count).unwrap_or(usize::MAX)
+    }
+
+    /// Verify quote freshness by price staleness, not wall-clock time and not a
+    /// symmetric record-count delta.
+    ///
+    /// The quote price encodes the quoting node's record count via the quadratic
+    /// pricing formula. We compute the price the node would charge *now* for its
+    /// current fullness and reject the quote only if the client under-paid that
+    /// current price by more than [`QUOTE_PRICE_STALENESS_PCT_TOLERANCE`]. This:
+    ///
+    /// - removes the platform clock dependency that caused Windows/UTC false
+    ///   rejections (timestamps are deliberately unused);
+    /// - never rejects an over-payment (the previous symmetric `abs_diff` check
+    ///   rejected quotes where the node had *fewer* records than when it quoted,
+    ///   i.e. the client paid for a fuller, pricier node — nonsensical to
+    ///   reject); and
+    /// - self-scales with the pricing curve, so benign in-flight churn (a node
+    ///   storing a few replicated records between quoting and verifying) — a
+    ///   negligible price move where the curve is flat — no longer rejects an
+    ///   otherwise-valid payment. On a fresh, rapidly-filling testnet that churn
+    ///   routinely exceeded the old fixed 5-record tolerance and rejected ~100%
+    ///   of uploads via the multiplicative per-chunk effect.
+    ///
+    /// The current record count comes from the attached [`LmdbStorage`] via
+    /// `current_chunks()` — an O(1) B-tree page-header read, authoritative
+    /// regardless of which path stored the record (client PUT, replication
+    /// store, repair fetch) or removed it (prune delete). If no storage source
+    /// is available (mis-configured production startup, or a unit test that
+    /// didn't set a test override), the gate is skipped entirely rather than
+    /// rejecting every quote — see [`Self::current_records_stored`].
+    ///
+    /// **Only this node's own quote is gated.** A bundle contains one quote
+    /// per close-group peer, and fullness across a close group is wildly
+    /// heterogeneous on a real network (a freshly joined node holds tens of
+    /// records while an established neighbour holds thousands). Comparing a
+    /// *neighbour's* quote price against *this node's* record count therefore
+    /// rejects honest payments whenever the group spans more than the
+    /// tolerance — on ant-prod-01 a close group spanning 47..=1788 records
+    /// made the three fullest nodes reject every bundle containing the
+    /// emptiest node's (perfectly fresh, 10-second-old) quote, failing the
+    /// PUT after the client had already paid on-chain. The node can only
+    /// re-derive *its own* price from its own record count, so its own quote
+    /// is the only one it can legitimately call stale. Replay of another
+    /// node's old cheap quote is that node's gate to enforce when the PUT
+    /// reaches it; the on-chain median payment binding is unaffected either
+    /// way.
+    ///
+    /// A bundle holds at most one quote per peer — [`Self::validate_quote_structure`]
+    /// rejects duplicate peer IDs and runs before this gate on every path —
+    /// so the loop below matches at most one own quote.
+    ///
+    /// RETIRED (ADR-0003 hard cutover): no longer called on the verification
+    /// path. Forced pricing binds a quote's price exactly to its committed count
+    /// via `validate_quote_arithmetic`, so a valid quote can never be "stale";
+    /// and the committed *responsible* count legitimately differs from the live
+    /// on-disk `current_chunks()` this gate reads, so running it would
+    /// false-reject healthy ADR quotes (notably baseline quotes from a node that
+    /// holds records but has no live commitment yet). Kept, with its unit tests,
+    /// only to document the legacy gate's exact semantics.
+    #[allow(dead_code)]
+    fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
+        let Some(current_records) = self.current_records_stored() else {
+            debug!(
+                "PaymentVerifier: no record-count source attached; skipping \
+                 quote price-staleness check"
+            );
+            return Ok(());
+        };
+
+        let Some(self_peer_id) = self.self_peer_id_bytes() else {
+            debug!(
+                "PaymentVerifier: no self peer-id source attached; skipping \
+                 quote price-staleness check"
+            );
+            return Ok(());
+        };
+
+        // The price the node would charge right now for its current fullness,
+        // and the floor a quote may not drop below (one-directional: paying at
+        // or above `current_price` is always accepted).
+        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
+        let min_acceptable_price = current_price.saturating_mul(Amount::from(
+            100u64.saturating_sub(QUOTE_PRICE_STALENESS_PCT_TOLERANCE),
+        )) / Amount::from(100u64);
+
+        let mut own_quote_seen = false;
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            if encoded_peer_id.as_bytes() != &self_peer_id {
+                // A neighbour's quote prices the *neighbour's* fullness; this
+                // node has no basis to judge it against its own record count.
+                continue;
+            }
+            own_quote_seen = true;
+            if quote.price < min_acceptable_price {
+                let quoted_records = derive_records_stored_from_price(quote.price);
+                return Err(Error::Payment(format!(
+                    "Own quote {encoded_peer_id:?} stale: quoted price encodes \
+                     {quoted_records} records but node currently holds {current_records} \
+                     (quoted {}, minimum acceptable {min_acceptable_price} at \
+                     {QUOTE_PRICE_STALENESS_PCT_TOLERANCE}% under-payment tolerance)",
+                    quote.price
+                )));
+            }
+        }
+
+        // Two self-identity notions coexist in this verifier and are expected
+        // to refer to the same node: `validate_local_recipient` matches "us"
+        // by rewards address, this gate by peer ID. They legitimately diverge
+        // when a PUT reaches a node whose own quote isn't in the bundle but
+        // whose rewards address is shared with a quoted sibling (common in
+        // fleet deployments). The gate fail-opens in that case — leave a
+        // breadcrumb, because a silent no-op is exactly what makes a
+        // production incident hard to reconstruct from node logs.
+        if !own_quote_seen {
+            let our_rewards_address_quoted = payment
+                .peer_quotes
+                .iter()
+                .any(|(_, quote)| quote.rewards_address == self.config.local_rewards_address);
+            if our_rewards_address_quoted {
+                debug!(
+                    "PaymentVerifier: bundle contains our rewards address but no quote \
+                     under our peer ID; skipping quote price-staleness check"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
+    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
+        for (encoded_peer_id, quote) in &payment.peer_quotes {
+            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
+                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
+
+            if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
+                let expected_hex = expected_peer_id.to_hex();
+                let actual_hex = hex::encode(encoded_peer_id.as_bytes());
+                return Err(Error::Payment(format!(
+                    "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
+                     BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -1565,6 +2515,15 @@ impl PaymentVerifier {
             }
         }
 
+        // ADR-0003: every storer re-runs the price-equals-formula-of-count
+        // check on every merkle candidate, in every context, before median
+        // reconstruction. Runs AFTER signature verification so observe-only
+        // telemetry cannot be spoofed by unauthenticated senders. Reject-only
+        // when enforcement is enabled; no trust evidence emitted in either
+        // mode.
+        Self::validate_merkle_candidate_arithmetic(&merkle_proof.winner_pool)?;
+        Self::log_off_curve_merkle(&merkle_proof.winner_pool);
+
         // Pay-yourself defence: the candidate pub_keys must map to peers the
         // live DHT actually considers closest to the pool midpoint. Without
         // this, an attacker can point all 16 reward_address fields at a
@@ -1743,6 +2702,107 @@ impl PaymentVerifier {
             );
         }
 
+        // ADR-0003: route the merkle-batch candidates through the SAME
+        // cross-check + first-audit funnel as single-node quotes, AFTER on-chain
+        // verification has succeeded (so an unpaid pool cannot drive audits or
+        // fetches). ClientPut only — a replication receipt's pins have aged out.
+        if context == VerificationContext::ClientPut {
+            self.cross_check_merkle_candidates(
+                &merkle_proof.winner_pool,
+                &merkle_proof.commitment_sidecars,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// ADR-0003 cross-check for the merkle-batch path: every candidate carries
+    /// the same signed `(committed_key_count, commitment_pin)` binding as a
+    /// single-node quote, so each non-baseline candidate is resolved against the
+    /// gossip cache (or fetched) and routed into the deterministic first audit,
+    /// exactly like [`Self::cross_check_quotes`]. The candidate's peer id is
+    /// derived from its `pub_key` (`PeerId = BLAKE3(pub_key)`), matching how the
+    /// network binds identities.
+    async fn cross_check_merkle_candidates(
+        &self,
+        pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
+        commitment_sidecars: &[Vec<u8>],
+    ) {
+        let now = std::time::Instant::now();
+        let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
+        let p2p = self.p2p_node.read().as_ref().map(Arc::clone);
+        let monetized_pin_tx = self.monetized_pin_tx.read().as_ref().cloned();
+        let cache = self.commitment_cache.read().as_ref().map(Arc::clone);
+        // ADR-0003 "the commitment arrived with the quote" for the merkle path:
+        // validate sidecars exactly as the single-node path does.
+        let sidecar_map = Self::index_valid_sidecars(commitment_sidecars);
+
+        let mut unresolved: Vec<(PeerId, [u8; 32], u32, Vec<u8>)> = Vec::new();
+        for candidate in &pool.candidate_nodes {
+            let Some(pin) = candidate.commitment_pin else {
+                continue; // baseline candidate pins nothing
+            };
+            let peer_id = PeerId::from_bytes(*blake3::hash(&candidate.pub_key).as_bytes());
+
+            if let Some(ref tx) = monetized_pin_tx {
+                let _ = tx.send(crate::replication::MonetizedPinEvent {
+                    peer: peer_id,
+                    pin,
+                    key_count: candidate.committed_key_count,
+                });
+            }
+
+            let resolved = match sidecar_map.get(&(peer_id, pin)) {
+                Some(c) => Some(c.clone()),
+                None => Self::cache_resolve(cache.as_ref(), peer_id, pin, now, ttl).await,
+            };
+            match resolved {
+                Some(commitment) => {
+                    let artifact = rmp_serde::to_vec(candidate).unwrap_or_default();
+                    Self::handle_cross_check(
+                        &peer_id,
+                        pin,
+                        candidate.committed_key_count,
+                        artifact,
+                        &commitment,
+                        p2p.as_ref(),
+                    )
+                    .await;
+                }
+                None => unresolved.push((
+                    peer_id,
+                    pin,
+                    candidate.committed_key_count,
+                    rmp_serde::to_vec(candidate).unwrap_or_default(),
+                )),
+            }
+        }
+
+        if unresolved.is_empty() {
+            return;
+        }
+        let Some(p2p) = p2p else {
+            return;
+        };
+        let neg_cache = Arc::clone(&self.pin_fetch_negative_cache);
+        tokio::spawn(async move {
+            Self::drain_unresolved_pin_fetches(&p2p, &neg_cache, unresolved).await;
+        });
+    }
+
+    /// Verify this node is among the paid recipients.
+    fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
+        let local_addr = &self.config.local_rewards_address;
+        let is_recipient = payment
+            .peer_quotes
+            .iter()
+            .any(|(_, quote)| quote.rewards_address == *local_addr);
+        if !is_recipient {
+            return Err(Error::Payment(
+                "Payment proof does not include this node as a recipient".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -2710,6 +3770,7 @@ mod tests {
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
             tx_hashes: vec![FixedBytes::from([0xABu8; 32])],
+            commitment_sidecars: vec![],
         };
 
         let proof_bytes =
@@ -2748,6 +3809,8 @@ mod tests {
             timestamp: SystemTime::now(),
             price: Amount::from(1u64),
             rewards_address: RewardsAddress::new([1u8; 20]),
+            committed_key_count: 0,
+            commitment_pin: None,
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
         };
@@ -2761,6 +3824,7 @@ mod tests {
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
             tx_hashes: vec![],
+            commitment_sidecars: vec![],
         };
 
         let proof_bytes = serialize_single_node_proof(&proof).expect("serialize proof");
@@ -2794,6 +3858,8 @@ mod tests {
             timestamp,
             price: Amount::from(1u64),
             rewards_address,
+            committed_key_count: 0,
+            commitment_pin: None,
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
         }
@@ -2806,6 +3872,7 @@ mod tests {
         let proof = PaymentProof {
             proof_of_payment: ProofOfPayment { peer_quotes },
             tx_hashes: vec![],
+            commitment_sidecars: vec![],
         };
         serialize_single_node_proof(&proof).expect("serialize proof")
     }
@@ -3141,6 +4208,7 @@ mod tests {
                 peer_quotes: peer_quotes.clone(),
             },
             tx_hashes: vec![],
+            commitment_sidecars: vec![],
         };
 
         let tagged_bytes = serialize_single_node_proof(&proof).expect("serialize tagged proof");
@@ -3410,7 +4478,13 @@ mod tests {
             let price = evmlib::common::Amount::from(1024u64);
             #[allow(clippy::cast_possible_truncation)]
             let reward_address = RewardsAddress::new([i as u8; 20]);
-            let msg = MerklePaymentCandidateNode::bytes_to_sign(&price, &reward_address, timestamp);
+            let msg = MerklePaymentCandidateNode::bytes_to_sign(
+                &price,
+                &reward_address,
+                timestamp,
+                0,
+                &None,
+            );
             let sk = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("sk");
             let signature = ml_dsa.sign(&sk, &msg).expect("sign").as_bytes().to_vec();
 
@@ -3419,6 +4493,8 @@ mod tests {
                 price,
                 reward_address,
                 merkle_payment_timestamp: timestamp,
+                committed_key_count: 0,
+                commitment_pin: None,
                 signature,
             }
         })
@@ -4160,5 +5236,456 @@ mod tests {
             }
             other => panic!("expected sparse-DHT rejection, got: {other:?}"),
         }
+    }
+
+    // ---------- ADR-0003: quote arithmetic re-check ----------
+
+    /// Curve canonicality: any price produced by `calculate_price(n)` is
+    /// on-curve by construction. We exercise a spread of `n` covering the
+    /// baseline floor (n=0), small counts, the pricing-curve knee
+    /// (`n=PRICING_DIVISOR=6000`), and a saturating-arithmetic regime.
+    #[test]
+    fn adr0003_on_curve_prices_round_trip() {
+        for &n in &[0usize, 1, 2, 100, 5999, 6000, 6001, 50_000, 1_000_000] {
+            let price = crate::payment::pricing::calculate_price(n);
+            assert!(
+                PaymentVerifier::quote_price_is_on_curve(&price),
+                "calculate_price({n}) = {price} must be on-curve"
+            );
+        }
+    }
+
+    /// Off-curve canonicality: a price one wei above or below an on-curve
+    /// point is between two adjacent curve values and must fail the
+    /// canonicality predicate. The check IS exact equality, not a tolerance.
+    #[test]
+    fn adr0003_off_curve_prices_rejected_by_predicate() {
+        // n=100 is well above baseline so price ± 1 is non-saturating.
+        let on = crate::payment::pricing::calculate_price(100);
+        let just_above = on + Amount::from(1u64);
+        let just_below = on - Amount::from(1u64);
+        assert!(
+            !PaymentVerifier::quote_price_is_on_curve(&just_above),
+            "price one wei above an on-curve point must be off-curve"
+        );
+        assert!(
+            !PaymentVerifier::quote_price_is_on_curve(&just_below),
+            "price one wei below an on-curve point must be off-curve"
+        );
+    }
+
+    /// A price strictly below the baseline floor is off-curve: the formula's
+    /// minimum value is `calculate_price(0) = BASELINE`, so any smaller value
+    /// has no corresponding `n`.
+    #[test]
+    fn adr0003_sub_baseline_price_is_off_curve() {
+        let baseline = crate::payment::pricing::calculate_price(0);
+        let sub_baseline = baseline - Amount::from(1u64);
+        assert!(
+            !PaymentVerifier::quote_price_is_on_curve(&sub_baseline),
+            "price strictly below baseline must be off-curve"
+        );
+    }
+
+    /// ADR-0003 storer-side gate: a bundle in which every quote is on-curve
+    /// passes the gate **and** the per-quote canonicality predicate. Runs in
+    /// every context (no `ClientPut` split): the rule depends only on the
+    /// bundle, not on per-peer state. The outer `validate_quote_arithmetic`
+    /// short-circuits to `Ok` under the observe-only rollout const, so the
+    /// per-quote diagnostics assertion is what proves the bundle is genuinely
+    /// on-curve regardless of how the const ships.
+    #[test]
+    fn adr0003_validate_quote_arithmetic_passes_for_honest_bundle() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let payment = ProofOfPayment {
+            peer_quotes: (0..crate::ant_protocol::CLOSE_GROUP_SIZE)
+                .map(|i| {
+                    let id: [u8; 32] = rand::random();
+                    let byte = u8::try_from(i & 0xFF).unwrap_or(0);
+                    let quote = make_fake_quote_at_records(
+                        [0xC0u8; 32],
+                        SystemTime::now(),
+                        RewardsAddress::new([byte; 20]),
+                        100 * (i + 1),
+                    );
+                    (EncodedPeerId::new(id), quote)
+                })
+                .collect(),
+        };
+        PaymentVerifier::validate_quote_arithmetic(&payment)
+            .expect("honest on-curve bundle must pass the gate (any const value)");
+        for (_, quote) in &payment.peer_quotes {
+            assert!(
+                PaymentVerifier::price_off_curve_diagnostics(&quote.price).is_none(),
+                "every quote in honest bundle must be canonically on-curve"
+            );
+        }
+    }
+
+    /// Off-curve quote behaviour follows the rollout gate
+    /// [`QUOTE_ARITHMETIC_RECHECK_ENABLED`]. We assert the gate's current
+    /// observe-only stance: an off-curve quote is accepted with no error.
+    /// The enforcement-branch behaviour is exercised separately by
+    /// `adr0003_off_curve_diagnostics_yields_reject_payload` so both branches
+    /// of the const-gated split are covered in CI.
+    #[test]
+    fn adr0003_observe_only_does_not_reject_off_curve_quote() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let mut quote = make_fake_quote_at_records(
+            [0xC1u8; 32],
+            SystemTime::now(),
+            RewardsAddress::new([1u8; 20]),
+            100,
+        );
+        // Bump one wei off the curve.
+        quote.price += Amount::from(1u64);
+
+        let id: [u8; 32] = rand::random();
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new(id), quote)],
+        };
+
+        // This test is only meaningful in the observe-only configuration
+        // (which is the default at slice ship). If a future change flips the
+        // const, the assertion documents the regression instead of silently
+        // changing semantics.
+        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            assert!(
+                PaymentVerifier::validate_quote_arithmetic(&payment).is_ok(),
+                "observe-only rollout must not reject off-curve quotes"
+            );
+        }
+    }
+
+    /// Enforcement-branch coverage: the rejection payload (peer id, candidate
+    /// `n`, recomputed price) is produced for off-curve prices independently
+    /// of the rollout const, so CI exercises the rejection code path even
+    /// while [`QUOTE_ARITHMETIC_RECHECK_ENABLED`] ships as `false`. Flipping
+    /// the const to `true` then merely wires this diagnostic into the outer
+    /// `Err` return, which is what `validate_quote_arithmetic` does.
+    #[test]
+    fn adr0003_off_curve_diagnostics_yields_reject_payload() {
+        let on = crate::payment::pricing::calculate_price(100);
+        let off = on + Amount::from(1u64);
+
+        let diag = PaymentVerifier::price_off_curve_diagnostics(&off)
+            .expect("off-curve price must produce diagnostics");
+        let (candidate_count, recomputed) = diag;
+        assert_eq!(candidate_count, 100, "floor candidate must be n=100");
+        assert_eq!(
+            recomputed, on,
+            "recomputed price must equal the floor curve point"
+        );
+        assert!(
+            recomputed < off,
+            "off-curve diagnostics' recomputed price must be strictly below the off-curve input"
+        );
+
+        // And an on-curve price must produce no diagnostics.
+        assert!(
+            PaymentVerifier::price_off_curve_diagnostics(&on).is_none(),
+            "on-curve price must yield no off-curve diagnostics"
+        );
+    }
+
+    /// Saturation regime: a price strictly above
+    /// `calculate_price(u64::MAX-equivalent saturating ceiling)` is rejected.
+    /// We do not have direct access to that ceiling, but `Amount::MAX` is
+    /// guaranteed above it (since `calculate_price(usize::MAX)` saturates to
+    /// some value strictly less than `Amount::MAX` due to the additive
+    /// baseline). The gate must reject it.
+    #[test]
+    fn adr0003_amount_max_price_is_off_curve() {
+        let price = Amount::MAX;
+        assert!(
+            !PaymentVerifier::quote_price_is_on_curve(&price),
+            "Amount::MAX must not be a valid on-curve price"
+        );
+    }
+
+    /// Merkle gate, predicate-level: the same canonicality rule applies to
+    /// `MerklePaymentCandidateNode.price`. We don't construct a full merkle
+    /// proof here (the test fixtures for that live elsewhere); we prove the
+    /// underlying decision matches the single-node side, so the Merkle gate
+    /// inherits the same correctness as `validate_quote_arithmetic`.
+    #[test]
+    fn adr0003_merkle_candidate_canonicality_matches_single_node() {
+        // Every on-curve `n` produces a price the predicate accepts; one wei
+        // off produces a price the predicate rejects. This is the entire
+        // contract; the Merkle gate's outer wrapper enforces the same const
+        // as the single-node gate, so the wrappers are mechanically
+        // equivalent.
+        for &n in &[0usize, 1, 100, 6000, 1_000_000] {
+            let on = crate::payment::pricing::calculate_price(n);
+            assert!(
+                PaymentVerifier::quote_price_is_on_curve(&on),
+                "merkle candidate price for n={n} must be on-curve"
+            );
+            if n > 0 {
+                let off = on + Amount::from(1u64);
+                assert!(
+                    !PaymentVerifier::quote_price_is_on_curve(&off),
+                    "merkle candidate price one wei above n={n} must be off-curve"
+                );
+            }
+        }
+    }
+
+    /// Merkle gate, pool-level: build a real signed candidate pool, set every
+    /// candidate's price to the same on-curve value, and assert the gate
+    /// passes. Then bump one candidate's price one wei off-curve and assert
+    /// the per-candidate diagnostics correctly identify it. We use the
+    /// diagnostics predicate rather than the outer `validate_merkle_candidate_arithmetic`
+    /// because the outer wrapper short-circuits to `Ok` under the observe-only
+    /// rollout const; the diagnostics path is what carries the rejection
+    /// information when enforcement flips on.
+    #[test]
+    fn adr0003_merkle_pool_off_curve_candidate_caught_by_diagnostics() {
+        use evmlib::merkle_payments::MerklePaymentCandidatePool;
+
+        let timestamp = 1_700_000_000u64;
+        let mut candidates = make_candidate_nodes(timestamp);
+
+        // Set every candidate price to calculate_price(500) so the pool is
+        // honestly on-curve to start.
+        let on_curve = crate::payment::pricing::calculate_price(500);
+        for c in &mut candidates {
+            c.price = on_curve;
+        }
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof: fake_midpoint_proof(),
+            candidate_nodes: candidates,
+        };
+        // The outer wrapper is rollout-gated, but a fully on-curve pool must
+        // pass it under any const value because the loop finds no off-curve
+        // candidate to reject.
+        PaymentVerifier::validate_merkle_candidate_arithmetic(&pool)
+            .expect("honest on-curve pool must pass merkle gate (any const value)");
+        for c in &pool.candidate_nodes {
+            assert!(
+                PaymentVerifier::price_off_curve_diagnostics(&c.price).is_none(),
+                "every honest candidate must be canonically on-curve"
+            );
+        }
+
+        // Now bump exactly one candidate off-curve and check that the
+        // diagnostics path catches it. (The outer wrapper still short-circuits
+        // under observe-only; this proves the underlying detection works
+        // independently of the rollout const, exercising the rejection-payload
+        // path in CI.)
+        let mut tampered = pool;
+        tampered.candidate_nodes[3].price += Amount::from(1u64);
+        let mut off_curve_seen = 0;
+        for c in &tampered.candidate_nodes {
+            if PaymentVerifier::price_off_curve_diagnostics(&c.price).is_some() {
+                off_curve_seen += 1;
+            }
+        }
+        assert_eq!(
+            off_curve_seen, 1,
+            "exactly one tampered candidate must register as off-curve"
+        );
+    }
+
+    // === ADR-0003 binding-shape + cross-check unit tests ===
+
+    use crate::payment::pricing::calculate_price as cp;
+
+    /// Build a real signed commitment over `n` synthetic keys for tests.
+    fn test_built_commitment(n: u32) -> crate::replication::commitment_state::BuiltCommitment {
+        use saorsa_pqc::api::sig::ml_dsa_65;
+        let (pk, sk) = ml_dsa_65().generate_keypair().expect("keypair");
+        let pk_bytes = pk.to_bytes();
+        let peer_id = blake3::hash(&pk_bytes);
+        let entries: Vec<([u8; 32], [u8; 32])> = (0..n)
+            .map(|i| {
+                let mut k = [0u8; 32];
+                k[..4].copy_from_slice(&i.to_le_bytes());
+                let mut b = [1u8; 32];
+                b[..4].copy_from_slice(&i.to_le_bytes());
+                (k, b)
+            })
+            .collect();
+        crate::replication::commitment_state::BuiltCommitment::build(
+            entries,
+            peer_id.as_bytes(),
+            &sk,
+            &pk_bytes,
+        )
+        .expect("build commitment")
+    }
+
+    #[test]
+    fn binding_baseline_ok_only_at_baseline_price() {
+        // (0, None) with calculate_price(0) is the valid baseline.
+        assert!(PaymentVerifier::binding_violation(0, None, &cp(0)).is_none());
+        // (0, None) with a non-baseline price is REJECTED — this is the BLOCKER
+        // bypass the round-1 review found (unpinned quote priced above baseline).
+        assert!(PaymentVerifier::binding_violation(0, None, &cp(500)).is_some());
+    }
+
+    #[test]
+    fn binding_bound_ok_only_with_pin_and_exact_price() {
+        let pin = [9u8; 32];
+        // (n>0, Some(pin)) priced exactly is valid.
+        assert!(PaymentVerifier::binding_violation(500, Some(pin), &cp(500)).is_none());
+        // (n>0, Some(pin)) priced for a DIFFERENT count is rejected (on-curve
+        // but wrong count — stronger than canonicality).
+        assert!(PaymentVerifier::binding_violation(500, Some(pin), &cp(499)).is_some());
+    }
+
+    #[test]
+    fn binding_rejects_incoherent_shapes() {
+        let pin = [9u8; 32];
+        // count > 0 but no pin: unauditable.
+        assert!(PaymentVerifier::binding_violation(500, None, &cp(500)).is_some());
+        // count 0 but a pin: incoherent baseline.
+        assert!(PaymentVerifier::binding_violation(0, Some(pin), &cp(0)).is_some());
+    }
+
+    #[test]
+    fn binding_rejects_count_above_cap() {
+        let pin = [9u8; 32];
+        let over = crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT + 1;
+        assert!(PaymentVerifier::binding_violation(over, Some(pin), &cp(over as usize)).is_some());
+    }
+
+    #[test]
+    fn cross_check_match_when_pin_and_count_agree() {
+        let built = test_built_commitment(12);
+        let outcome = PaymentVerifier::cross_check_binding(12, built.hash(), built.commitment());
+        assert_eq!(outcome, CrossCheck::Match);
+    }
+
+    #[test]
+    fn cross_check_mismatch_when_count_inflated() {
+        let built = test_built_commitment(12);
+        // Quote claims 999 but the pinned commitment attests 12.
+        let outcome = PaymentVerifier::cross_check_binding(999, built.hash(), built.commitment());
+        assert_eq!(
+            outcome,
+            CrossCheck::Mismatch {
+                quoted_key_count: 999,
+                committed_key_count: 12,
+            }
+        );
+    }
+
+    #[test]
+    fn cross_check_unresolved_when_pin_wrong() {
+        let built = test_built_commitment(12);
+        // Pin does not match the supplied commitment's hash: not evidence.
+        let outcome = PaymentVerifier::cross_check_binding(12, [0xFFu8; 32], built.commitment());
+        assert_eq!(outcome, CrossCheck::PinDoesNotResolve);
+    }
+
+    #[test]
+    fn fresh_cached_commitment_honours_ttl_boundary() {
+        use crate::replication::commitment_state::PeerCommitmentRecord;
+        let built = test_built_commitment(5);
+        let commitment = built.commitment().clone();
+        let pin = built.hash();
+        let ttl = std::time::Duration::from_secs(3 * 3600);
+        let now = std::time::Instant::now();
+
+        // Fresh AND matching pin -> resolves to the commitment.
+        let fresh = PeerCommitmentRecord::from_verified(commitment.clone(), now);
+        assert!(
+            PaymentVerifier::fresh_cached_commitment(&fresh, pin, now, ttl).is_some(),
+            "a fresh cache entry whose hash matches the pin must resolve"
+        );
+
+        // Fresh but a DIFFERENT pin -> treated as not-cached (None), so the
+        // caller falls through to fetch the actually-quoted pin instead of
+        // mis-resolving against the peer's latest (different) commitment.
+        assert!(
+            PaymentVerifier::fresh_cached_commitment(&fresh, [0xEEu8; 32], now, ttl).is_none(),
+            "a fresh cache entry for a DIFFERENT pin must not resolve (fetch fallback runs)"
+        );
+
+        // Stale: received older than the TTL -> treated as unknown (None), the
+        // ADR-0003 false-positive guard against an aged cache entry.
+        let stale_at = now
+            .checked_sub(ttl + std::time::Duration::from_secs(1))
+            .expect("instant in range");
+        let stale = PeerCommitmentRecord::from_verified(commitment, stale_at);
+        assert!(
+            PaymentVerifier::fresh_cached_commitment(&stale, pin, now, ttl).is_none(),
+            "a cache entry older than the answerability TTL must be treated as unknown"
+        );
+    }
+
+    #[test]
+    fn fetched_commitment_must_be_bound_to_the_queried_peer() {
+        // A fetched commitment is accepted only when it is bound to the peer we
+        // asked (sender_peer_id == peer_id) and hashes to the requested pin.
+        let built = test_built_commitment(8);
+        let commitment = built.commitment().clone();
+        let pin = built.hash();
+        let owner = PeerId::from_bytes(commitment.sender_peer_id);
+
+        // Correct owner + correct pin -> accepted.
+        assert!(
+            PaymentVerifier::fetched_commitment_is_valid(&commitment, &owner, pin),
+            "a peer's own validly-signed commitment, hashing to the pin, must be accepted"
+        );
+
+        // Same (validly signed) commitment but attributed to a DIFFERENT peer ->
+        // rejected. This is the MAJOR fix: a peer must not be able to answer with
+        // someone else's commitment and have it pass as its own.
+        let other = PeerId::from_bytes([0xABu8; 32]);
+        assert!(
+            !PaymentVerifier::fetched_commitment_is_valid(&commitment, &other, pin),
+            "another peer's commitment must be rejected for the queried peer"
+        );
+
+        // Correct owner but wrong pin -> rejected.
+        assert!(
+            !PaymentVerifier::fetched_commitment_is_valid(&commitment, &owner, [0u8; 32]),
+            "a commitment that does not hash to the requested pin must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_mismatch_evidence_is_observe_only_safe_without_p2p() {
+        // The evidence variant is constructed and routed; in observe-only mode
+        // (and with no P2P handle) it must log without panicking and take no
+        // trust action. This exercises the evidence->action mapping directly.
+        let built = test_built_commitment(12);
+        let evidence = crate::replication::types::FailureEvidence::QuoteCommitmentMismatch {
+            peer: PeerId::from_bytes([1u8; 32]),
+            pinned_commitment: [2u8; 32],
+            quoted_key_count: 999,
+            committed_key_count: 12,
+            quote_artifact: vec![0xAA; 16],
+            commitment: Box::new(built.commitment().clone()),
+        };
+        // No P2P -> no trust event even if enforce were on; must not panic.
+        PaymentVerifier::emit_mismatch_evidence(&evidence, None).await;
+    }
+
+    #[test]
+    fn valid_sidecar_is_indexed_and_resolves_synchronously() {
+        // A valid sidecar blob is indexed under its own (peer, pin) so the
+        // cross-check resolves it synchronously — "the commitment arrived with
+        // the quote", no gossip-cache hit or fetch needed.
+        let built = test_built_commitment(9);
+        let commitment = built.commitment().clone();
+        let pin = built.hash();
+        let owner = PeerId::from_bytes(commitment.sender_peer_id);
+        let blob = rmp_serde::to_vec(&commitment).expect("serialize sidecar");
+
+        let map = PaymentVerifier::index_valid_sidecars(std::slice::from_ref(&blob));
+        assert!(
+            map.contains_key(&(owner, pin)),
+            "a valid sidecar must be indexed under its own (peer, pin)"
+        );
+
+        // A garbage blob is silently skipped (resolution falls back), never a
+        // hard error.
+        let map2 = PaymentVerifier::index_valid_sidecars(&[vec![0xFF; 8]]);
+        assert!(map2.is_empty(), "an unparseable sidecar must be skipped");
     }
 }

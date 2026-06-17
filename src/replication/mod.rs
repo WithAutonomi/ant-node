@@ -34,10 +34,12 @@ pub mod subtree;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lru::LruCache;
 use std::pin::Pin;
 
 use crate::logging::{debug, error, info, warn};
@@ -306,6 +308,13 @@ pub struct ReplicationEngine {
     possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
     /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
+    /// ADR-0003: sender the payment verifier clones to surface monetized pins
+    /// for a deterministic first audit. The matching receiver is drained by
+    /// `start_first_audit_drainer`.
+    monetized_pin_tx: mpsc::UnboundedSender<MonetizedPinEvent>,
+    /// ADR-0003: receiver half of the monetized-pin channel, taken by
+    /// `start_first_audit_drainer`.
+    monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -342,6 +351,9 @@ impl ReplicationEngine {
         let config = Arc::new(config);
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
+        // ADR-0003: monetized-pin channel (verifier -> first-audit drainer).
+        let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
+
         Ok(Self {
             config: Arc::clone(&config),
             p2p_node,
@@ -370,9 +382,19 @@ impl ReplicationEngine {
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
+            monetized_pin_tx,
+            monetized_pin_rx: Some(monetized_pin_rx),
             shutdown,
             task_handles: Vec::new(),
         })
+    }
+
+    /// ADR-0003: a sender the payment verifier uses to surface monetized pins
+    /// (commitments that backed a payment) for a deterministic first audit.
+    /// Cloneable; the engine drains the matching receiver.
+    #[must_use]
+    pub fn monetized_pin_sender(&self) -> mpsc::UnboundedSender<MonetizedPinEvent> {
+        self.monetized_pin_tx.clone()
     }
 
     /// Get a reference to the `PaidList`.
@@ -518,6 +540,9 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
+        // ADR-0003: deterministic first audit of commitments that backed a
+        // payment (surfaced by the verifier cross-check).
+        self.start_first_audit_drainer();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -712,6 +737,156 @@ impl ReplicationEngine {
                 }
             }
             debug!("Possession-check scheduler shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// ADR-0003: drain monetized pins surfaced by the verifier cross-check and
+    /// run a **deterministic first audit** of each — the same `run_subtree_audit`
+    /// as the gossip path, under the same per-peer cooldown and concurrency
+    /// caps, but with the probability lottery BYPASSED (the lottery governs
+    /// re-audits only). Deduped by pin via a bounded set so a pin gets one
+    /// deterministic first audit; a peer minting fresh pins faster than the
+    /// cooldown forfeits the older ones' coverage, never the newest's (the
+    /// channel surfaces newest pins as they are monetized).
+    fn start_first_audit_drainer(&mut self) {
+        let Some(mut rx) = self.monetized_pin_rx.take() else {
+            return;
+        };
+        let gossip_audit = GossipAuditTrigger {
+            p2p_node: Arc::clone(&self.p2p_node),
+            config: Arc::clone(&self.config),
+            recent_provers: Arc::clone(&self.recent_provers),
+            sync_state: Arc::clone(&self.sync_state),
+            cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+        };
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            // Bounded dedup of pins that have ALREADY been given their
+            // deterministic first audit. A pin is inserted ONLY when an audit is
+            // actually launched (never on a cooldown skip), so a pin skipped now
+            // can still be first-audited later.
+            let mut first_audited: LruCache<[u8; 32], ()> = LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            );
+            // PERSISTENT pending queue: the most-recently-monetized pin per peer
+            // that has NOT yet been first-audited. A pin stays here until it is
+            // ACTUALLY first-audited (enters `first_audited`) — never removed for
+            // any weaker reason (e.g. a cooldown stamp), so an unaudited monetized
+            // pin is never silently forgotten. Newest-per-peer: a fresher pin for
+            // the same peer replaces the older one. Memory is bounded by an LRU:
+            // each entry needs a SETTLED on-chain payment, so the realistic count
+            // is tiny; the LRU is a pure DoS backstop that, only under an absurd
+            // flood, evicts the LEAST-RECENTLY-MONETIZED peer (the one most likely
+            // already superseded) — never the newest.
+            let mut pending: LruCache<PeerId, MonetizedPinEvent> = LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            );
+            // Periodic retry tick for pending (cooldown-blocked) pins. Created
+            // once; `Skip` so a backlog of missed ticks collapses to one.
+            let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                // Wake on: shutdown, a new monetized pin, OR a periodic tick so
+                // pending (cooldown-blocked) pins get retried once their window
+                // reopens even if no new pin arrives.
+                let drained_new = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => match event {
+                        Some(e) => {
+                            // Newest-per-peer: a fresher pin replaces the older one,
+                            // BUT only if it is not already first-audited — an
+                            // already-audited duplicate must never overwrite an
+                            // unaudited pending pin for the same peer (it would then
+                            // be dropped as "done" and the unaudited pin lost). Cap
+                            // the per-wake batch drain (FIRST_AUDIT_DRAIN_BATCH) so a
+                            // sustained flood can't starve the audit-launch phase.
+                            if !first_audited.contains(&e.pin) {
+                                pending.put(e.peer, e);
+                            }
+                            let mut drained = 1usize;
+                            while drained < config::FIRST_AUDIT_DRAIN_BATCH {
+                                match rx.try_recv() {
+                                    Ok(e) => {
+                                        if !first_audited.contains(&e.pin) {
+                                            pending.put(e.peer, e);
+                                        }
+                                        drained += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            true
+                        }
+                        None => break,
+                    },
+                    _ = tick.tick() => false,
+                };
+                let _ = drained_new;
+
+                if pending.is_empty() {
+                    continue;
+                }
+
+                // Try to launch an audit for each pending peer; keep the ones
+                // still blocked by cooldown for the next tick. Drain into a vec
+                // first so we can re-insert the still-blocked ones afterwards
+                // (LruCache has no drain). `iter()` yields most- to least-recently-
+                // used; we reverse so re-inserting blocked entries below restores
+                // their relative recency (oldest re-put first → stays the eviction
+                // victim, newest stays most-recently-used).
+                let snapshot: Vec<(PeerId, MonetizedPinEvent)> =
+                    pending.iter().rev().map(|(p, e)| (*p, *e)).collect();
+                pending.clear();
+                for (peer, event) in snapshot {
+                    // Dedup: a pin already first-audited is dropped (done).
+                    if first_audited.contains(&event.pin) {
+                        continue;
+                    }
+                    // Cooldown: if the peer's per-peer audit window is closed, keep
+                    // this pin pending and retry on a later tick once it reopens.
+                    // We do NOT treat "cooldown closed" as "already audited" (a
+                    // losing gossip lottery can stamp the window without auditing),
+                    // so the pin stays pending until it gets a REAL first audit; it
+                    // is only ever evicted by the LRU memory backstop above, which
+                    // drops the least-recently-monetized peer, not this newest one.
+                    {
+                        let now = Instant::now();
+                        let mut map = gossip_audit.cooldown.write().await;
+                        if !cooldown_allows_audit(&mut map, &peer, now) {
+                            pending.put(peer, event);
+                            continue;
+                        }
+                    }
+                    // Audit is launching: now mark the pin first-audited.
+                    first_audited.put(event.pin, ());
+                    let trigger = gossip_audit.clone();
+                    tokio::spawn(async move {
+                        let credit = storage_commitment_audit::AuditCredit {
+                            recent_provers: &trigger.recent_provers,
+                        };
+                        let result = storage_commitment_audit::run_subtree_audit(
+                            &trigger.p2p_node,
+                            &trigger.config,
+                            &event.peer,
+                            event.pin,
+                            event.key_count,
+                            Some(&credit),
+                        )
+                        .await;
+                        handle_subtree_audit_result(
+                            &result,
+                            &trigger.p2p_node,
+                            &trigger.sync_state,
+                            &trigger.recent_provers,
+                            &trigger.config,
+                        )
+                        .await;
+                    });
+                }
+            }
+            debug!("First-audit drainer shut down");
         });
         self.task_handles.push(handle);
     }
@@ -1938,6 +2113,41 @@ async fn handle_replication_message(
             });
             Ok(())
         }
+        ReplicationMessageBody::GetCommitmentByPin(ref request) => {
+            // ADR-0003: answer a commitment-by-pin fetch from the retained set
+            // only. `lookup_by_hash` is an allocation-light read over the
+            // bounded slot set; it returns the live current commitment or any
+            // still-answerable recently-gossiped/quoted one. A miss is reported
+            // as `NotRetained` (graced, never confirmed) rather than an error,
+            // so an aged-out pin can never brand an honest node.
+            //
+            // Reuse the audit-responder admission guard (global ceiling + per-peer
+            // cap) so a flood of fetches cannot drive unbounded commitment
+            // clone/encode/send work; over-limit is dropped, which the fetching
+            // peer graces exactly like a missed audit response.
+            let Some(_guard) =
+                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
+                    .await
+            else {
+                debug!("GetCommitmentByPin from {source} dropped: responder capacity reached");
+                return Ok(());
+            };
+            let response = my_commitment_state.lookup_by_hash(&request.pin).map_or(
+                protocol::GetCommitmentByPinResponse::NotRetained { pin: request.pin },
+                |built| protocol::GetCommitmentByPinResponse::Found {
+                    commitment: built.commitment().clone(),
+                },
+            );
+            send_replication_response(
+                source,
+                p2p_node,
+                msg.request_id,
+                ReplicationMessageBody::GetCommitmentByPinResponse(response),
+                rr_message_id,
+            )
+            .await;
+            Ok(())
+        }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
@@ -1945,7 +2155,8 @@ async fn handle_replication_message(
         | ReplicationMessageBody::FetchResponse(_)
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
-        | ReplicationMessageBody::SubtreeByteResponse(_) => Ok(()),
+        | ReplicationMessageBody::SubtreeByteResponse(_)
+        | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
     }
 }
 
@@ -4075,6 +4286,24 @@ struct GossipAuditTrigger {
 struct AuditTarget {
     pin_hash: [u8; 32],
     key_count: u32,
+}
+
+/// ADR-0003: a commitment that backed a payment, surfaced by the payment
+/// verifier's cross-check so it can receive a **deterministic first audit**.
+///
+/// Sent from the verifier to the replication engine's first-audit drainer. The
+/// drainer dedups by `pin` (a pin gets one deterministic first audit; later
+/// audits of the same peer revert to the gossip lottery), orders most-recently-
+/// monetized first, and runs the same `run_subtree_audit` under the same
+/// per-peer cooldown and concurrency caps — only the lottery is bypassed.
+#[derive(Debug, Clone, Copy)]
+pub struct MonetizedPinEvent {
+    /// The peer whose commitment backed the payment.
+    pub peer: PeerId,
+    /// The pinned commitment hash.
+    pub pin: [u8; 32],
+    /// The committed key count (sizes the audit deadline).
+    pub key_count: u32,
 }
 
 /// Per-peer audit cooldown check-and-stamp (ADR-0002 "occasional surprise

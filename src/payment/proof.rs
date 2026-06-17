@@ -5,6 +5,6 @@
 //! callers using `crate::payment::proof::…` keep working unchanged.
 
 pub use ant_protocol::payment::proof::{
-    deserialize_merkle_proof, deserialize_proof, detect_proof_type, serialize_merkle_proof,
-    serialize_single_node_proof, PaymentProof, ProofType,
+    deserialize_merkle_proof, deserialize_proof, deserialize_single_node_proof, detect_proof_type,
+    serialize_merkle_proof, serialize_single_node_proof, PaymentProof, ProofType,
 };
