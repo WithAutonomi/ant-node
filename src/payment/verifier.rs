@@ -141,11 +141,12 @@ pub struct PaymentVerifierConfig {
 ///   cache entry that does not authorize future chunk stores.
 ///
 /// The caller must check local receiver/admission membership before invoking
-/// the verifier: direct client PUTs and fresh chunk replication require local
-/// close-group responsibility; fresh paid-list replication requires local
-/// paid-list close-group membership. The verifier itself only checks payment
-/// proof validity and that the paid quote's issuer is in the K closest peers
-/// for the quoted chunk address.
+/// the verifier for replication admission: fresh chunk replication requires
+/// local close-group responsibility, and fresh paid-list replication requires
+/// local paid-list close-group membership. Direct client PUT deliberately does
+/// not perform a receiver-responsibility gate. The verifier itself only checks
+/// payment proof validity and that the paid quote's issuer is in the K closest
+/// peers for the quoted chunk address.
 ///
 /// Immediate fresh chunk replication is different: the receiver is about to
 /// store the newly written chunk as if the client PUT it there directly, so
