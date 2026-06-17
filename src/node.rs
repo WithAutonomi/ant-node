@@ -125,9 +125,8 @@ impl NodeBuilder {
 
         let p2p_arc = Arc::new(p2p_node);
 
-        // Wire the P2PNode handle into AntProtocol so direct PUTs can verify
-        // close-group responsibility and payment proofs can query live-DHT
-        // closeness.
+        // Wire the P2PNode handle into AntProtocol so payment proofs can query
+        // live-DHT closeness.
         if let Some(ref protocol) = ant_protocol {
             protocol.attach_p2p_node(Arc::clone(&p2p_arc));
         }

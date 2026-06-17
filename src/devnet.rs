@@ -614,8 +614,7 @@ impl Devnet {
         *node.state.write().await = NodeState::Running;
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
-            // Wire P2P into AntProtocol for direct PUT responsibility and
-            // payment-proof closeness checks.
+            // Wire P2P into AntProtocol for payment-proof closeness checks.
             protocol.attach_p2p_node(Arc::clone(p2p));
 
             let mut events = p2p.subscribe_events();

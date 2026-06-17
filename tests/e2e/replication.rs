@@ -1064,7 +1064,7 @@ async fn test_fresh_offer_with_empty_pop_rejected() {
 }
 
 /// Fresh write with a key that does not match the supplied bytes is rejected
-/// before payment verification, matching the direct PUT handler.
+/// before payment verification.
 #[tokio::test]
 #[serial]
 async fn test_fresh_offer_with_mismatched_content_address_rejected() {
