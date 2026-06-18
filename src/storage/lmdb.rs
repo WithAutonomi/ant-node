@@ -583,6 +583,23 @@ impl LmdbStorage {
         value
     }
 
+    /// Cheap capacity pre-check for callers that want to reject work *before*
+    /// doing expensive setup (e.g. the PUT handler skipping payment
+    /// verification on a disk-full node — see `V2-411`).
+    ///
+    /// Delegates to the private `check_disk_space_cached`, so it shares the same
+    /// TTL cache and only ever performs an `fs2::available_space` syscall on a
+    /// cache miss. Returns the same `Insufficient disk space …` error the
+    /// store path raises, keeping caller behaviour identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] when available space is below the configured
+    /// reserve, or when the disk-space query itself fails.
+    pub(crate) fn check_capacity(&self) -> Result<()> {
+        self.check_disk_space_cached()
+    }
+
     /// Check available disk space, skipping the syscall if a recent check passed.
     ///
     /// Only caches *passing* results — a low-space condition is always

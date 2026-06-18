@@ -5,8 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
@@ -17,12 +18,15 @@ use crate::replication::protocol::{
 };
 use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, PresenceEvidence};
 
+/// Verification round duration that is worth surfacing at info level.
+const VERIFICATION_ROUND_SLOW_LOG_MS: u128 = 500;
+
 // ---------------------------------------------------------------------------
 // Verification targets
 // ---------------------------------------------------------------------------
 
 /// Targets for verifying a set of keys.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct VerificationTargets {
     /// Per-key: closest `CLOSE_GROUP_SIZE` peers (excluding self) for presence
     /// quorum.
@@ -328,6 +332,10 @@ pub async fn run_verification_round(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> HashMap<XorName, KeyVerificationEvidence> {
+    let started = Instant::now();
+    let peer_count = targets.peer_to_keys.len();
+    let requested_key_refs = targets.peer_to_keys.values().map(Vec::len).sum::<usize>();
+
     // Initialize empty evidence for all keys.
     let mut evidence: HashMap<XorName, KeyVerificationEvidence> = keys
         .iter()
@@ -422,6 +430,21 @@ pub async fn run_verification_round(
         if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
             process_verification_response(&peer, &resp, targets, &mut evidence);
         }
+    }
+
+    let elapsed_ms = started.elapsed().as_millis();
+    if elapsed_ms >= VERIFICATION_ROUND_SLOW_LOG_MS {
+        info!(
+            target: "ant_node::replication::verification",
+            "Slow quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            keys.len(),
+        );
+    } else {
+        debug!(
+            target: "ant_node::replication::verification",
+            "Quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            keys.len(),
+        );
     }
 
     evidence

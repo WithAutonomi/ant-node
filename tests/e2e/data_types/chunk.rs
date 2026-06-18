@@ -68,6 +68,7 @@ mod tests {
         QuotingMetricsTracker,
     };
     use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+    use ant_node::ReplicationConfig;
     use evmlib::testnet::Testnet;
     use evmlib::RewardsAddress;
     use rand::seq::SliceRandom;
@@ -442,6 +443,7 @@ mod tests {
         let payment_verifier = PaymentVerifier::new(PaymentVerifierConfig {
             evm: EvmVerifierConfig { network },
             cache_capacity: 100,
+            close_group_size: ReplicationConfig::default().close_group_size,
             local_rewards_address: rewards_address,
         });
         let metrics_tracker = QuotingMetricsTracker::new(100);

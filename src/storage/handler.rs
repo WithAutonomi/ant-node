@@ -41,6 +41,7 @@ use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
+use saorsa_core::P2PNode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -74,14 +75,13 @@ impl AntProtocol {
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
-        // Keep the PaymentVerifier's freshness gate AND the QuoteGenerator's
-        // pricing wired to the same authoritative store used by this protocol
-        // handler. Pricing and the freshness gate MUST read the same record
-        // count: the generator prices a quote from current_chunks() and the
-        // verifier later checks the quote against current_chunks(), so the only
-        // difference they see is genuine in-flight growth. Attaching both here
-        // makes the invariant automatic for every AntProtocol construction
-        // path, including tests and future startup variants.
+        // Keep the PaymentVerifier's paid-quote price floor and the
+        // QuoteGenerator's pricing wired to the same authoritative store used
+        // by this protocol handler. Both must read the same record count: the
+        // generator prices quotes from current_chunks(), and the verifier later
+        // checks the paid median quote against current_chunks(). Attaching both
+        // here makes the invariant automatic for every AntProtocol
+        // construction path, including tests and future startup variants.
         payment_verifier.attach_storage(Arc::clone(&storage));
         quote_generator.attach_storage(Arc::clone(&storage));
 
@@ -91,6 +91,16 @@ impl AntProtocol {
             quote_generator,
             fresh_write_tx: None,
         }
+    }
+
+    /// Attach the node's P2P handle for payment live-DHT checks.
+    ///
+    /// Wires the handle into the payment verifier so payment-proof closeness
+    /// checks can use the live routing view. Idempotent: calling twice
+    /// replaces the verifier handle.
+    pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
+        self.payment_verifier.attach_p2p_node(node);
+        debug!("AntProtocol: P2PNode attached for payment live-DHT checks");
     }
 
     /// Set the channel sender for fresh-write replication events.
@@ -243,9 +253,28 @@ impl AntProtocol {
             Ok(false) => {}
         }
 
-        // 4. Verify payment. This node is the storer being paid right now, so
-        // the full ClientPut check set applies (own-quote price freshness,
-        // local recipient, merkle candidate closeness).
+        // 4. Cheap disk-space pre-check — runs BEFORE the expensive payment
+        //    verification path (ML-DSA pool checks, a Kademlia closeness
+        //    lookup, and an on-chain Arbitrum RPC). A disk-full node can never
+        //    satisfy this PUT, so reject it here rather than burning that work
+        //    only to fail the reserve check inside `storage.put` (V2-411). The
+        //    check caches passing results, so it is free per-PUT on a healthy
+        //    node; a disk-full node re-runs a cheap `available_space` syscall
+        //    each PUT (still negligible next to the verification it avoids) and
+        //    so detects freed space promptly. The store path keeps its own
+        //    check as defence-in-depth.
+        if let Err(e) = self.storage.check_capacity() {
+            info!(
+                target: "ant_node::storage::disk_precheck",
+                addr = %addr_hex,
+                "Rejecting PUT before payment verification: {e}"
+            );
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
+        }
+
+        // 5. Verify payment. The ClientPut context applies the store-strength
+        // payment cache and verifies live proofs. Direct client PUT does not
+        // reject based on this node's local storage-responsibility view.
         let payment_result = self
             .payment_verifier
             .verify_payment(
@@ -269,19 +298,19 @@ impl AntProtocol {
             }
         }
 
-        // 5. Store chunk
+        // 6. Store chunk
         match self.storage.put(&address, &request.content).await {
             Ok(_) => {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
                 // Bump the in-memory fallback counter. Both pricing and the
-                // freshness gate now read LmdbStorage::current_chunks() directly,
+                // paid-quote floor now read LmdbStorage::current_chunks() directly,
                 // so this counter only matters when no storage is attached
                 // (unit tests / mis-configured startup). Kept warm so that
                 // fallback path stays roughly accurate.
                 self.quote_generator.record_store();
 
-                // 6. Notify replication engine for fresh fan-out.
+                // 7. Notify replication engine for fresh fan-out.
                 //    Only emit when a real proof is present — cached-as-verified
                 //    PUTs have no proof to forward, and the chunk would have
                 //    already replicated on the original write that carried one.
@@ -528,10 +557,22 @@ mod tests {
     use tempfile::TempDir;
 
     async fn create_test_protocol() -> (AntProtocol, TempDir) {
+        // `test_default()` sets `disk_reserve: 0`, so the disk pre-check always
+        // passes for the regular tests.
+        create_test_protocol_with_reserve(0).await
+    }
+
+    /// Build a test protocol whose storage enforces the given disk reserve.
+    ///
+    /// A very large reserve (e.g. `u64::MAX`) makes `available < reserve`
+    /// always true, so the disk-space pre-check in `handle_put_inner` fails —
+    /// used to exercise the V2-411 early-return path.
+    async fn create_test_protocol_with_reserve(disk_reserve: u64) -> (AntProtocol, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
 
         let storage_config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
+            disk_reserve,
             ..LmdbStorageConfig::test_default()
         };
         let storage = Arc::new(
@@ -544,6 +585,7 @@ mod tests {
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100_000,
+            close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
@@ -727,6 +769,56 @@ mod tests {
         }
     }
 
+    /// V2-411: a disk-full node must reject a PUT with the disk-space error
+    /// *before* running payment verification.
+    ///
+    /// The chunk is intentionally **not** cache-inserted, so if the handler
+    /// reached `verify_payment` it would return `PaymentRequired`/`PaymentFailed`
+    /// (an uncached chunk with no proof). Observing the `StorageFailed` disk
+    /// error instead proves the disk pre-check short-circuited ahead of
+    /// verification — there is no on-chain path to reach.
+    #[tokio::test]
+    async fn test_put_rejected_on_insufficient_disk_before_verification() {
+        // u64::MAX reserve guarantees `available < reserve`, so the cached
+        // disk-space check always fails.
+        let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
+
+        let content = b"chunk for a disk-full node";
+        let address = LmdbStorage::compute_address(content);
+
+        let put_request = ChunkPutRequest::new(address, Bytes::copy_from_slice(content));
+        let put_msg = ChunkMessage {
+            request_id: 41,
+            body: ChunkMessageBody::PutRequest(put_request),
+        };
+        let put_bytes = put_msg.encode().expect("encode put");
+
+        let response_bytes = protocol
+            .try_handle_request(&put_bytes)
+            .await
+            .expect("handle put")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert_eq!(response.request_id, 41);
+        match response.body {
+            ChunkMessageBody::PutResponse(ChunkPutResponse::Error(
+                ProtocolError::StorageFailed(msg),
+            )) => {
+                assert!(
+                    msg.contains("Insufficient disk space"),
+                    "expected disk-space error, got: {msg}"
+                );
+            }
+            other => {
+                panic!("expected StorageFailed disk error before verification, got: {other:?}")
+            }
+        }
+
+        // And nothing was stored.
+        assert!(!protocol.exists(&address).expect("exists check"));
+    }
+
     #[tokio::test]
     async fn test_put_already_exists() {
         let (protocol, _temp) = create_test_protocol().await;
@@ -854,7 +946,7 @@ mod tests {
             .await
             .expect("handle put 1");
 
-        // Second PUT — should return AlreadyExists (checked in storage before payment)
+        // Second PUT should return AlreadyExists from the storage idempotency check.
         let response_bytes = protocol
             .try_handle_request(&put_bytes)
             .await
@@ -864,7 +956,7 @@ mod tests {
 
         if let ChunkMessageBody::PutResponse(ChunkPutResponse::AlreadyExists { .. }) = response.body
         {
-            // expected — storage check comes before payment check
+            // expected
         } else {
             panic!("expected AlreadyExists, got: {response:?}");
         }

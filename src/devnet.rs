@@ -10,6 +10,7 @@ use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, QuoteGenerator,
     QuotingMetricsTracker,
 };
+use crate::replication::config::ReplicationConfig;
 use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
 use evmlib::Network as EvmNetwork;
 use evmlib::RewardsAddress;
@@ -550,9 +551,11 @@ impl Devnet {
         };
 
         let rewards_address = RewardsAddress::new(DEVNET_REWARDS_ADDRESS);
+        let replication_config = ReplicationConfig::default();
         let payment_config = PaymentVerifierConfig {
             evm: evm_config,
             cache_capacity: DEVNET_PAYMENT_CACHE_CAPACITY,
+            close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
@@ -611,10 +614,8 @@ impl Devnet {
         *node.state.write().await = NodeState::Running;
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
-            // Wire the P2PNode into the payment verifier for merkle-closeness checks.
-            protocol
-                .payment_verifier_arc()
-                .attach_p2p_node(Arc::clone(p2p));
+            // Wire P2P into AntProtocol for payment-proof closeness checks.
+            protocol.attach_p2p_node(Arc::clone(p2p));
 
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);

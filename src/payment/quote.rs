@@ -45,12 +45,11 @@ pub struct QuoteGenerator {
     ///
     /// When attached, quote prices are computed from
     /// [`LmdbStorage::current_chunks()`] — the **same** count the
-    /// [`PaymentVerifier`](crate::payment::PaymentVerifier) freshness gate
-    /// compares the quote against. Keeping pricing and freshness on one source
-    /// means a quote priced at record count `N` is later checked against a
-    /// current count that differs only by genuine in-flight growth, instead of
-    /// by the standing client-PUT-vs-replication gap that rejected every
-    /// payment when pricing read the side counter and freshness read the store.
+    /// [`PaymentVerifier`](crate::payment::PaymentVerifier) price-floor check
+    /// compares the paid quote against. Keeping pricing and verification on one
+    /// source means a quote priced at record count `N` is later checked against
+    /// a current count that differs only by genuine in-flight growth, instead of
+    /// by a side-counter-vs-store gap.
     /// `None` until [`Self::attach_storage`] is called.
     storage: RwLock<Option<Arc<LmdbStorage>>>,
     /// Signing function provided by the node.
@@ -84,10 +83,10 @@ impl QuoteGenerator {
     /// authoritative on-disk record count.
     ///
     /// This MUST be wired to the same `LmdbStorage` the
-    /// [`PaymentVerifier`](crate::payment::PaymentVerifier) freshness gate reads
-    /// via `current_chunks()`; otherwise pricing and freshness diverge and the
-    /// gate rejects healthy payments. Idempotent: calling twice replaces the
-    /// handle. Uses interior mutability so it can be called on an `Arc`.
+    /// [`PaymentVerifier`](crate::payment::PaymentVerifier) price-floor check
+    /// reads via `current_chunks()`; otherwise pricing and verification diverge
+    /// and healthy payments can be rejected. Idempotent: calling twice replaces
+    /// the handle. Uses interior mutability so it can be called on an `Arc`.
     pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
         *self.storage.write() = Some(storage);
         debug!("QuoteGenerator: LmdbStorage attached for current-records pricing");
@@ -97,7 +96,7 @@ impl QuoteGenerator {
     ///
     /// Prefers the attached `LmdbStorage` count (authoritative — counts client
     /// PUTs, replication stores, and repair fetches alike, exactly matching the
-    /// verifier's freshness source). Falls back to the in-memory
+    /// verifier's price-floor source). Falls back to the in-memory
     /// `metrics_tracker` when no storage is attached or the read fails, so
     /// pricing never panics or stalls.
     fn pricing_records_stored(&self) -> usize {
@@ -184,7 +183,7 @@ impl QuoteGenerator {
         let timestamp = SystemTime::now();
 
         // Calculate price from the authoritative current record count (the same
-        // count the verifier's freshness gate reads), falling back to the
+        // count the verifier's price-floor check reads), falling back to the
         // in-memory counter only when no storage is attached.
         let price = calculate_price(self.pricing_records_stored());
 
@@ -370,13 +369,13 @@ mod tests {
         generator
     }
 
-    /// Regression test for the STG-01 quote-freshness rejection: pricing must
-    /// read the attached store's `current_chunks()`, NOT the side counter.
+    /// Regression test for the STG-01 quote-pricing mismatch: pricing must read
+    /// the attached store's `current_chunks()`, NOT the side counter.
     ///
     /// Before the fix, the price came from `metrics_tracker` (client-PUT count
-    /// only) while the verifier's freshness gate read `current_chunks()` (all
-    /// records, including replicated ones). On a replicating network the store
-    /// count ran far ahead of the side counter, so every quote looked "stale".
+    /// only) while verifier checks read `current_chunks()` (all records,
+    /// including replicated ones). On a replicating network the store count ran
+    /// far ahead of the side counter, so every quote looked underpriced.
     /// Here we attach a store, write records WITHOUT touching the side counter
     /// (mimicking replication stores), and assert the quote prices off the
     /// store count — i.e. the two sources now agree.
@@ -441,7 +440,7 @@ mod tests {
             derive_records_stored_from_price(quote.price),
             25,
             "verifier's price-inverse must recover the store count, keeping the \
-             freshness delta at ~0 for a freshly issued quote"
+             local price comparison aligned for a freshly issued quote"
         );
     }
 

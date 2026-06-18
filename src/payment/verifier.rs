@@ -11,13 +11,14 @@ use crate::payment::pricing::{calculate_price, derive_records_stored_from_price}
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_proof, detect_proof_type, ProofType,
 };
-use crate::payment::single_node::SingleNodePayment;
+use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::lmdb::LmdbStorage;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
-use evmlib::common::Amount;
+use evmlib::common::{Amount, QuoteHash};
 use evmlib::contract::payment_vault;
 use evmlib::merkle_batch_payment::{OnChainPaymentInfo, PoolHash};
 use evmlib::Network as EvmNetwork;
+use evmlib::PaymentQuote;
 use evmlib::ProofOfPayment;
 use evmlib::RewardsAddress;
 use lru::LruCache;
@@ -25,8 +26,11 @@ use parking_lot::{Mutex, RwLock};
 use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+#[cfg(any(test, feature = "test-utils"))]
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Minimum allowed size for a payment proof in bytes.
 ///
@@ -42,25 +46,54 @@ pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 /// 256 KB provides headroom while still capping memory during verification.
 pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
 
-/// Maximum percentage by which a quote's paid price may fall *below* the node's
-/// current price before the quote is rejected as stale.
+/// Maximum percentage by which the median-paid quote may fall below this
+/// verifier's current local price before a client PUT is rejected.
 ///
-/// The freshness gate is one-directional and price-based, not a symmetric
-/// record-count delta:
+/// A 20% floor means a paid quote must be at least `0.8 * P_v`, so an
+/// attacker who controls a real K-close issuer still pays at least
+/// `0.8 * P_v * 3` for an honest verifier. Honest median-paid bundles have
+/// a structural majority guarantee: the four nodes at or below the median
+/// accept unless their own price grows more than `1 / 0.8 = 1.25x` between
+/// quote and PUT. Above-median nodes may reject when `P_v > 1.25 * median`;
+/// those records are backfilled by replication, which deliberately skips
+/// this present-tense floor.
+const PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT: u64 = 20;
+
+const PERCENT_DENOMINATOR: u64 = 100;
+const PAID_QUOTE_PAYMENT_MULTIPLIER: u64 = 3;
+const PAYMENT_VERIFY_SLOW_LOG_MS: u128 = 500;
+
+/// Number of nearest DHT peers accepted for paid-quote issuer locality.
 ///
-/// - **Over-payment is always accepted.** If the client paid at least the
-///   node's current price (e.g. the node pruned records and is now cheaper),
-///   the quote is fine — a node has no reason to reject money.
-/// - **Only meaningful under-payment is rejected.** A quote priced below the
-///   current price by more than this percentage is rejected as stale.
-///
-/// Comparing prices instead of raw record counts makes the tolerance
-/// self-scaling against the quadratic pricing curve: at low/moderate fill the
-/// curve is nearly flat, so normal in-flight churn (the node storing a handful
-/// of replicated records between quoting and verifying) is a negligible price
-/// change and passes; at high fill the curve is steep, so the same percentage
-/// still catches genuinely stale, underpriced quotes.
-const QUOTE_PRICE_STALENESS_PCT_TOLERANCE: u64 = 25;
+/// This is the Kademlia K width, intentionally wider than `CLOSE_GROUP_SIZE`.
+const PAID_QUOTE_ISSUER_CLOSENESS_WIDTH: usize = K_BUCKET_SIZE;
+
+#[derive(Clone, Copy)]
+struct LegacyMedianCandidate<'a> {
+    encoded_peer_id: &'a evmlib::EncodedPeerId,
+    quote: &'a PaymentQuote,
+    expected_amount: Amount,
+}
+
+fn price_floor(current_price: Amount, tolerance_pct: u64) -> Amount {
+    current_price.saturating_mul(Amount::from(
+        PERCENT_DENOMINATOR.saturating_sub(tolerance_pct),
+    )) / Amount::from(PERCENT_DENOMINATOR)
+}
+
+fn median_quote_index(quote_count: usize) -> usize {
+    quote_count / 2
+}
+
+fn payment_proof_type_label(payment_proof: Option<&[u8]>) -> &'static str {
+    match payment_proof.and_then(detect_proof_type) {
+        Some(ProofType::Merkle) => "merkle",
+        Some(ProofType::SingleNode) => "single_node",
+        Some(_) => "unsupported",
+        None if payment_proof.is_some() => "unknown",
+        None => "none",
+    }
+}
 
 /// Configuration for EVM payment verification.
 ///
@@ -90,67 +123,46 @@ pub struct PaymentVerifierConfig {
     pub evm: EvmVerifierConfig,
     /// Cache capacity (number of `XorName` values to cache).
     pub cache_capacity: usize,
+    /// Close-group width exposed to storage and replication admission callers.
+    pub close_group_size: usize,
     /// Local node's rewards address.
-    /// The verifier rejects payments that don't include this node as a recipient.
+    ///
+    /// Kept in the verifier config for payment policies that bind receipts to
+    /// this node's payout address.
     pub local_rewards_address: RewardsAddress,
 }
 
-/// The situation a payment proof is being verified in.
+/// The fresh admission path a payment proof is being verified for.
 ///
-/// A proof-of-payment is a *receipt*: it records a sale that closed at some
-/// earlier moment, at that moment's prices, between the client and the close
-/// group of that moment. Two very different callers present receipts:
+/// - **`ClientPut`** — the node is admitting a chunk store. The verifier
+///   applies store-strength cache semantics and live payment checks.
+/// - **`PaidListAdmission`** — the node is admitting fresh paid-list metadata.
+///   It runs the same live payment checks as `ClientPut`, but writes a weaker
+///   cache entry that does not authorize future chunk stores.
 ///
-/// - **`ClientPut`** — the node is the storer being paid *right now*. Every
-///   check applies, including the ones that interrogate the present: "is the
-///   price on this receipt still fair for my current fullness?" (own-quote
-///   freshness) and "am I actually one of the paid recipients?" (local
-///   recipient / merkle candidate closeness).
-/// - **`Replication`** — a neighbour is handing over an already-paid record
-///   (fresh-write fan-out, paid-notify, repair). The sale closed long ago; the
-///   network's job now is to keep the record at target redundancy for the rest
-///   of its life. Re-asking the present-tense questions of a receipt is a
-///   category error with a guaranteed failure mode: record counts only grow,
-///   so every receipt's quoted price eventually drops below the verifier's
-///   live floor, and close groups churn, so the receiving node eventually
-///   isn't a quoted recipient at all. On DEV-01 (2026-06-05) this rejected
-///   nearly 100% of replication proof-of-payment transfers within an hour of
-///   launch (4M+
-///   rejections at ~300k/hour), pinned records below target redundancy, and
-///   drove a permanent ~500 MB/s fleet-wide re-offer storm.
+/// The caller must check local receiver/admission membership before invoking
+/// the verifier for replication admission: fresh chunk replication requires
+/// local close-group responsibility, and fresh paid-list replication requires
+/// local paid-list close-group membership. Direct client PUT deliberately does
+/// not perform a receiver-responsibility gate. The verifier itself only checks
+/// payment proof validity and that the paid quote's issuer is in the K closest
+/// peers for the quoted chunk address.
 ///
-/// Under `Replication` the verifier therefore skips only the
-/// storer-being-paid-now checks. Everything that makes the receipt a receipt
-/// still runs: quote structure, content binding to this exact address,
-/// peer-ID/pub-key bindings, ML-DSA signatures, and the on-chain settlement
-/// lookup. A record cannot be admitted via replication without an authentic,
-/// settled payment for that record.
+/// Immediate fresh chunk replication is different: the receiver is about to
+/// store the newly written chunk as if the client PUT it there directly, so
+/// that call site deliberately uses `ClientPut`.
 ///
-/// The verified-`XorName` cache is context-aware to match: an entry inserted
-/// by a `Replication` verification satisfies later replication lookups but
-/// NOT a later `ClientPut` fast-path, so a replication receipt can never let
-/// a client PUT bypass the checks this enum gates.
-///
-/// Trade-off (deliberate, documented): skipping the recipient/closeness
-/// checks for replication means a payer who self-deals — minting a quote pool
-/// from peers they control and settling the median payment to their own
-/// wallet on-chain — can present that receipt to honest nodes via the
-/// replication protocol, paying only gas plus a recycled self-payment instead
-/// of paying real storers. The client-PUT path still rejects such pools, and
-/// replication admission still requires the receiving node to be responsible
-/// for the key, so the abuse costs a settled on-chain payment per chunk and
-/// buys only what storage already costs; closing it properly belongs in quote
-/// issuance / payment policy, not in the replication hot path, where the
-/// equivalent defence provably destroys the network's ability to heal.
+/// Later neighbour-sync repair does not include proof-of-payment bytes and
+/// does not call this verifier. It authorizes repair from network evidence:
+/// majority storage among the configured close group, or majority paid-list
+/// membership among the closest K.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationContext {
-    /// The node is the storer being paid right now: all checks apply.
+    /// The node is admitting a chunk store with store-strength cache semantics.
     ClientPut,
-    /// An already-settled receipt presented during replication/repair: skip
-    /// the storer-being-paid-now checks (own-quote price freshness, local
-    /// recipient, merkle candidate closeness); keep all receipt-authenticity
-    /// checks.
-    Replication,
+    /// The node is admitting fresh paid-list metadata with paid-list-strength
+    /// cache semantics.
+    PaidListAdmission,
 }
 
 /// Status returned by payment verification.
@@ -202,30 +214,36 @@ pub struct PaymentVerifier {
     /// amplification to one lookup per unique `pool_hash` regardless of
     /// concurrency.
     inflight_closeness: Mutex<LruCache<PoolHash, Arc<ClosenessSlot>>>,
-    /// P2P node handle, attached post-construction so merkle verification can
+    /// P2P node handle, attached post-construction so paid-quote verification
+    /// can check paid-quote issuer K-closeness, and merkle verification can
     /// check that candidate `pub_keys` map to peers actually close to the pool
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
-    /// merkle verification; production startup MUST call [`attach_p2p_node`].
+    /// live-DHT checks; production startup MUST call [`attach_p2p_node`].
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
-    /// LMDB storage handle, attached post-construction so the storage-delta
-    /// freshness check can read the authoritative on-disk record count without
+    /// LMDB storage handle, attached post-construction so the paid-quote
+    /// price-floor check can read the authoritative on-disk record count without
     /// depending on a side counter that may drift from replication/repair/prune
     /// paths. `None` in unit tests that pre-set [`Self::test_records_override`];
     /// production startup MUST call [`attach_storage`].
     storage: RwLock<Option<Arc<LmdbStorage>>>,
-    /// Test-only override for the storage-delta freshness check.
+    /// Test-only override for the paid-quote local price floor.
     ///
-    /// When `Some(n)`, `validate_quote_freshness` uses `n` as the current
-    /// record count instead of querying `storage.current_chunks()`. Set via
+    /// When `Some(n)`, `validate_paid_quote_price_floor` uses `n` as the
+    /// current record count instead of querying `storage.current_chunks()`. Set via
     /// [`Self::set_records_stored_for_tests`] so unit tests that don't wire a
-    /// real `LmdbStorage` can still drive the freshness logic.
+    /// real `LmdbStorage` can still drive the price-floor logic.
     test_records_override: RwLock<Option<u64>>,
-    /// Test-only override for this node's own peer ID, used by
-    /// `validate_quote_freshness` to pick out the node's own quote from the
-    /// payment bundle. Production code derives it from the attached
-    /// [`P2PNode`]; set via [`Self::set_peer_id_for_tests`] so unit tests can
-    /// drive the freshness logic without wiring a real `P2PNode`.
-    test_peer_id_override: RwLock<Option<[u8; 32]>>,
+    /// Test-only override for the paid-quote issuer K-closest check.
+    ///
+    /// Production code derives closest peers from the attached [`P2PNode`].
+    #[cfg(any(test, feature = "test-utils"))]
+    test_paid_quote_k_closest_override: RwLock<Option<Vec<[u8; 32]>>>,
+    /// Test-only override for `completedPayments(quote_hash)`.
+    ///
+    /// Production always queries the payment vault; unit tests use this to
+    /// exercise the full verifier path without starting an EVM chain.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_completed_payments_override: RwLock<HashMap<QuoteHash, Amount>>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -325,13 +343,13 @@ impl PaymentVerifier {
         info!("Payment verifier initialized (cache_capacity={cache_capacity}, evm=always-on, pool_cache={DEFAULT_POOL_CACHE_CAPACITY})");
 
         // Loud warning if a production binary was accidentally built with
-        // `test-utils`: that feature flips the closeness-check fail-open
-        // switch, disabling the pay-yourself defence when P2PNode isn't
-        // attached. Safe in tests, never intended for prod.
+        // `test-utils`: that feature flips the live-DHT payment-check
+        // fail-open switches when P2PNode isn't attached. Safe in tests, never
+        // intended for prod.
         #[cfg(feature = "test-utils")]
         crate::logging::error!(
-            "PaymentVerifier: built with `test-utils` feature — merkle closeness \
-             defence falls back to fail-open when no P2PNode is attached. This \
+            "PaymentVerifier: built with `test-utils` feature — payment live-DHT \
+             checks fall back to fail-open when no P2PNode is attached. This \
              feature is for test binaries only; production nodes must be built \
              without it."
         );
@@ -344,38 +362,48 @@ impl PaymentVerifier {
             p2p_node: RwLock::new(None),
             storage: RwLock::new(None),
             test_records_override: RwLock::new(None),
-            test_peer_id_override: RwLock::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_paid_quote_k_closest_override: RwLock::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_completed_payments_override: RwLock::new(HashMap::new()),
             config,
         }
     }
 
-    /// Attach the node's [`P2PNode`] handle so merkle-payment verification can
-    /// check candidate `pub_keys` against the DHT's actual closest peers to the
-    /// pool midpoint.
+    /// Attach the node's [`P2PNode`] handle so paid-quote verification can
+    /// check issuer closeness, and merkle-payment verification can check
+    /// candidate `pub_keys` against the DHT's actual closest peers to the pool
+    /// midpoint.
     ///
     /// Production startup MUST call this once the `P2PNode` exists. Without
-    /// it, the closeness check fails CLOSED in release builds (rejects the
-    /// PUT with a visible error) and fails open in test builds. Idempotent:
-    /// calling twice replaces the handle.
+    /// it, live-DHT payment checks fail CLOSED in release builds with a visible
+    /// error and fail open in test builds. Idempotent: calling twice replaces
+    /// the handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
         *self.p2p_node.write() = Some(node);
-        debug!("PaymentVerifier: P2PNode attached for merkle closeness checks");
+        debug!("PaymentVerifier: P2PNode attached for payment live-DHT checks");
     }
 
-    /// Attach the node's [`LmdbStorage`] handle so storage-delta freshness
+    /// Configured close-group width used by storage admission callers.
+    #[must_use]
+    pub fn close_group_size(&self) -> usize {
+        self.config.close_group_size
+    }
+
+    /// Attach the node's [`LmdbStorage`] handle so paid-quote price-floor
     /// checks can query the authoritative on-disk record count.
     ///
     /// Production startup MUST call this once the storage exists; otherwise
-    /// `validate_quote_freshness` falls back to treating the current count as
-    /// zero, which will reject all non-trivial quotes. Idempotent: calling
-    /// twice replaces the handle.
+    /// client PUTs using paid-quote verification are rejected because
+    /// the local economic floor cannot be checked. Idempotent: calling twice
+    /// replaces the handle.
     pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
         *self.storage.write() = Some(storage);
-        debug!("PaymentVerifier: LmdbStorage attached for storage-delta freshness checks");
+        debug!("PaymentVerifier: LmdbStorage attached for paid-quote price-floor checks");
     }
 
-    /// Test-only setter for the current record count used by storage-delta
-    /// freshness checks. Lets unit tests drive the freshness logic without
+    /// Test-only setter for the current record count used by paid-quote
+    /// price-floor checks. Lets unit tests drive the floor logic without
     /// wiring a real `LmdbStorage`. Has no effect in production code because
     /// production code is expected to call [`Self::attach_storage`] instead.
     #[cfg(any(test, feature = "test-utils"))]
@@ -383,45 +411,51 @@ impl PaymentVerifier {
         *self.test_records_override.write() = Some(count);
     }
 
-    /// Test-only setter for the node's own peer ID used by the quote
-    /// freshness check. Lets unit tests mark which quote in a payment bundle
-    /// is "ours" without wiring a real `P2PNode`. Has no effect in production
-    /// code because production code is expected to call
-    /// [`Self::attach_p2p_node`] instead.
+    /// Test-only setter for local closest peers used by the paid-quote
+    /// issuer K-closest check.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn set_peer_id_for_tests(&self, peer_id_bytes: [u8; 32]) {
-        *self.test_peer_id_override.write() = Some(peer_id_bytes);
+    pub fn set_paid_quote_k_closest_for_tests(&self, peer_ids: Vec<[u8; 32]>) {
+        *self.test_paid_quote_k_closest_override.write() = Some(peer_ids);
     }
 
-    /// Snapshot this node's own peer ID for the quote freshness check.
-    ///
-    /// Prefers the attached [`P2PNode`] (authoritative). Falls back to a test
-    /// override if one was set. Returns `None` only when no source is
-    /// available (mis-configured production startup); the caller treats that
-    /// as "unknown" and skips the freshness gate rather than rejecting — the
-    /// same fail-open posture as a missing record-count source.
-    fn self_peer_id_bytes(&self) -> Option<[u8; 32]> {
-        if let Some(node) = self.p2p_node.read().as_ref() {
-            return Some(*node.peer_id().as_bytes());
-        }
-        *self.test_peer_id_override.read()
+    /// Compatibility alias for older tests that called this the close group.
+    /// The check now accepts the K closest peers for the quoted chunk address.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_paid_quote_close_group_for_tests(&self, peer_ids: Vec<[u8; 32]>) {
+        self.set_paid_quote_k_closest_for_tests(peer_ids);
     }
 
-    /// Snapshot the current record count for freshness comparisons.
+    /// Compatibility alias for older tests that called this the known-peer
+    /// set. The check now accepts the K closest peers for the quoted chunk
+    /// address.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_paid_quote_known_peers_for_tests(&self, peer_ids: Vec<[u8; 32]>) {
+        self.set_paid_quote_k_closest_for_tests(peer_ids);
+    }
+
+    /// Test-only setter for an on-chain completed payment amount.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_completed_payment_for_tests(&self, quote_hash: QuoteHash, amount: Amount) {
+        self.test_completed_payments_override
+            .write()
+            .insert(quote_hash, amount);
+    }
+
+    /// Snapshot the current record count for paid-quote price-floor checks.
     ///
     /// Prefers the attached `LmdbStorage` (authoritative — covers client PUTs,
     /// replication stores, repair fetches, and prune deletes by definition).
     /// Falls back to a test override if one was set. Returns `None` only when
-    /// no source is available (mis-configured production startup); the caller
-    /// treats that as "unknown" and skips storage-delta gating rather than
-    /// rejecting all quotes outright.
+    /// no source is available (mis-configured production startup). The
+    /// paid-quote floor rejects client PUTs because the local floor is
+    /// the economic security gate for this proof policy.
     fn current_records_stored(&self) -> Option<u64> {
         if let Some(storage) = self.storage.read().as_ref() {
             match storage.current_chunks() {
                 Ok(n) => return Some(n),
                 Err(e) => {
                     warn!(
-                        "PaymentVerifier: failed to read current_chunks() for freshness check: {e}"
+                        "PaymentVerifier: failed to read current_chunks() for price-floor check: {e}"
                     );
                     return None;
                 }
@@ -436,11 +470,9 @@ impl PaymentVerifier {
     /// 1. Check LRU cache (fast path)
     /// 2. If not cached, payment is required
     ///
-    /// The fast path is context-aware: a `ClientPut` lookup is satisfied only
-    /// by an entry whose verification ran the full client-PUT check set. An
-    /// entry inserted by a `Replication` verification (which skips the
-    /// storer-being-paid-now checks) must not let a later client PUT bypass
-    /// those checks. A `Replication` lookup accepts either kind of entry.
+    /// The fast path is context-aware. A `ClientPut` lookup is satisfied only
+    /// by a close-group store verification. A `PaidListAdmission` lookup is
+    /// satisfied by either a paid-list or client-PUT verification.
     ///
     /// # Arguments
     ///
@@ -459,7 +491,9 @@ impl PaymentVerifier {
         // Check LRU cache (fast path)
         let cached = match context {
             VerificationContext::ClientPut => self.cache.contains_client_put_verified(xorname),
-            VerificationContext::Replication => self.cache.contains(xorname),
+            VerificationContext::PaidListAdmission => {
+                self.cache.contains_paid_list_verified(xorname)
+            }
         };
         if cached {
             if crate::logging::enabled!(crate::logging::Level::DEBUG) {
@@ -488,9 +522,8 @@ impl PaymentVerifier {
     ///
     /// * `xorname` - The content-addressed name of the data
     /// * `payment_proof` - Optional payment proof (required if not in cache)
-    /// * `context` - Whether the proof backs a live client PUT or an
-    ///   already-settled receipt presented during replication — see
-    ///   [`VerificationContext`] for which checks each context runs
+    /// * `context` - Which fresh admission path is verifying the proof — see
+    ///   [`VerificationContext`] for cache-strength semantics
     ///
     /// # Returns
     ///
@@ -501,6 +534,50 @@ impl PaymentVerifier {
     ///
     /// Returns an error if payment is required but not provided, or if payment is invalid.
     pub async fn verify_payment(
+        &self,
+        xorname: &XorName,
+        payment_proof: Option<&[u8]>,
+        context: VerificationContext,
+    ) -> Result<PaymentStatus> {
+        let started = Instant::now();
+        let proof_type = payment_proof_type_label(payment_proof);
+        let proof_bytes = payment_proof.map_or(0, <[u8]>::len);
+        let result = self
+            .verify_payment_inner(xorname, payment_proof, context)
+            .await;
+        let elapsed_ms = started.elapsed().as_millis();
+
+        match &result {
+            Ok(status) if elapsed_ms >= PAYMENT_VERIFY_SLOW_LOG_MS => {
+                info!(
+                    target: "ant_node::payment::verify",
+                    "Slow payment verification: context={context:?}, proof_type={proof_type}, proof_bytes={proof_bytes}, status={status:?}, elapsed_ms={elapsed_ms}",
+                );
+            }
+            Ok(status) => {
+                debug!(
+                    target: "ant_node::payment::verify",
+                    "Payment verification: context={context:?}, proof_type={proof_type}, proof_bytes={proof_bytes}, status={status:?}, elapsed_ms={elapsed_ms}",
+                );
+            }
+            Err(e) if elapsed_ms >= PAYMENT_VERIFY_SLOW_LOG_MS => {
+                warn!(
+                    target: "ant_node::payment::verify",
+                    "Slow payment verification failed: context={context:?}, proof_type={proof_type}, proof_bytes={proof_bytes}, elapsed_ms={elapsed_ms}: {e}",
+                );
+            }
+            Err(e) => {
+                debug!(
+                    target: "ant_node::payment::verify",
+                    "Payment verification failed: context={context:?}, proof_type={proof_type}, proof_bytes={proof_bytes}, elapsed_ms={elapsed_ms}: {e}",
+                );
+            }
+        }
+
+        result
+    }
+
+    async fn verify_payment_inner(
         &self,
         xorname: &XorName,
         payment_proof: Option<&[u8]>,
@@ -562,15 +639,13 @@ impl PaymentVerifier {
                         }
                     }
 
-                    // Cache the verified xorname, recording which check set
-                    // ran. A Replication-verified entry satisfies later
-                    // replication lookups (re-offers of the same key are
-                    // routine) but not a later ClientPut fast-path — the
-                    // context-gated checks were never run for it.
+                    // Cache the verified xorname at the context's verification
+                    // strength. Stronger entries satisfy weaker future lookups,
+                    // but not the reverse.
                     match context {
                         VerificationContext::ClientPut => self.cache.insert(*xorname),
-                        VerificationContext::Replication => {
-                            self.cache.insert_replication_verified(*xorname);
+                        VerificationContext::PaidListAdmission => {
+                            self.cache.insert_paid_list_verified(*xorname);
                         }
                     }
 
@@ -624,24 +699,21 @@ impl PaymentVerifier {
     /// Verify a single-node EVM payment proof.
     ///
     /// Verification steps:
-    /// 1. Exactly `CLOSE_GROUP_SIZE` quotes are present
-    /// 2. All quotes target the correct content address (xorname binding)
-    /// 3. This node's own quote price is fresh (`ClientPut` only — a
-    ///    replication receipt's price was fixed at the original sale and the
-    ///    node's record count has legitimately grown since)
-    /// 4. Peer ID bindings match the ML-DSA-65 public keys
-    /// 5. This node is among the quoted recipients (`ClientPut` only — a
-    ///    post-churn close-group member receiving a record via replication
-    ///    was never a payee on the original receipt)
-    /// 6. All ML-DSA-65 signatures are valid (offloaded to `spawn_blocking`)
-    /// 7. The median-priced quote was paid at least 3x its price on-chain
-    ///    (looked up via `completedPayments(quoteHash)` on the payment vault)
+    /// 1. Between 1 and `CLOSE_GROUP_SIZE` quotes are present
+    /// 2. Median-priced candidate quotes are derived from the supplied bundle
+    /// 3. Each candidate is checked for content binding, peer binding, and a
+    ///    valid ML-DSA-65 signature
+    /// 4. Each candidate must also come from a local K-close peer and
+    ///    satisfy the paid-quote price floor
+    /// 5. A candidate is accepted only if `completedPayments(quoteHash)` is at
+    ///    least 3x the median price
     ///
-    /// See [`VerificationContext`] for why steps 3 and 5 are context-gated.
-    ///
-    /// For unit tests that don't need on-chain verification, pre-populate
-    /// the cache so `verify_payment` returns `CachedAsVerified` before
-    /// reaching this method.
+    /// Non-median quotes are parsed only to locate the median. Their content,
+    /// peer bindings, and signatures are deliberately ignored: the paid
+    /// quote's content hash, quote hash, signature, local floor, issuer
+    /// K-closeness check, and on-chain settlement are the authority. A
+    /// one-quote proof is valid when that single quote passes these checks and
+    /// was paid 3x.
     async fn verify_evm_payment(
         &self,
         xorname: &XorName,
@@ -657,60 +729,285 @@ impl PaymentVerifier {
         }
 
         Self::validate_quote_structure(payment)?;
-        Self::validate_quote_content(payment, xorname)?;
-        if context == VerificationContext::ClientPut {
-            self.validate_quote_freshness(payment)?;
-        }
-        Self::validate_peer_bindings(payment)?;
-        if context == VerificationContext::ClientPut {
-            self.validate_local_recipient(payment)?;
+        let candidates = Self::legacy_median_candidates(payment)?;
+        let mut failures = Vec::with_capacity(candidates.len());
+        let mut verified_paid_quote = false;
+
+        for candidate in candidates {
+            match self
+                .verify_legacy_median_candidate(xorname, candidate)
+                .await
+            {
+                Ok(()) => {
+                    verified_paid_quote = true;
+                    break;
+                }
+                Err(err) => failures.push(err.to_string()),
+            }
         }
 
-        // Verify quote signatures (CPU-bound, run off async runtime)
-        let peer_quotes = payment.peer_quotes.clone();
+        if !verified_paid_quote {
+            let xorname_hex = hex::encode(xorname);
+            let details = if failures.is_empty() {
+                "no median-priced candidates were available".to_string()
+            } else {
+                failures.join("; ")
+            };
+            return Err(Error::Payment(format!(
+                "Median quote payment verification failed for {xorname_hex}: {details}"
+            )));
+        }
+
+        if crate::logging::enabled!(crate::logging::Level::INFO) {
+            let xorname_hex = hex::encode(xorname);
+            info!("EVM payment verified for {xorname_hex}");
+        }
+        Ok(())
+    }
+
+    fn legacy_median_candidates(
+        payment: &ProofOfPayment,
+    ) -> Result<Vec<LegacyMedianCandidate<'_>>> {
+        let mut sorted_quotes: Vec<(&evmlib::EncodedPeerId, &PaymentQuote)> = payment
+            .peer_quotes
+            .iter()
+            .map(|(encoded_peer_id, quote)| (encoded_peer_id, quote))
+            .collect();
+        sorted_quotes.sort_by_key(|(_, quote)| quote.price);
+        let quote_count = sorted_quotes.len();
+        let median_index = median_quote_index(quote_count);
+        let median_price = sorted_quotes
+            .get(median_index)
+            .ok_or_else(|| {
+                Error::Payment(format!("Missing paid quote at median index {median_index}"))
+            })?
+            .1
+            .price;
+        let expected_amount = median_price
+            .checked_mul(Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER))
+            .ok_or_else(|| {
+                Error::Payment(format!(
+                    "Median quote payment amount overflow for price {median_price}"
+                ))
+            })?;
+
+        if expected_amount == Amount::ZERO || median_price == Amount::ZERO {
+            return Err(Error::Payment(format!(
+                "Median quote has zero price/amount (price={median_price}, amount={expected_amount}); refusing to verify as paid"
+            )));
+        }
+
+        Ok(sorted_quotes
+            .into_iter()
+            .filter(|(_, quote)| quote.price == median_price)
+            .map(|(encoded_peer_id, quote)| LegacyMedianCandidate {
+                encoded_peer_id,
+                quote,
+                expected_amount,
+            })
+            .collect())
+    }
+
+    async fn verify_legacy_median_candidate(
+        &self,
+        xorname: &XorName,
+        candidate: LegacyMedianCandidate<'_>,
+    ) -> Result<()> {
+        Self::validate_paid_quote_content(xorname, candidate)?;
+        let issuer_peer_id =
+            Self::validate_paid_quote_peer_binding(candidate.encoded_peer_id, candidate.quote)?;
+
+        self.validate_paid_quote_issuer_k_closest(xorname, &issuer_peer_id)
+            .await?;
+        self.validate_paid_quote_price_floor(candidate.quote)?;
+
+        Self::validate_paid_quote_signature(candidate).await?;
+
+        let on_chain_amount = self
+            .completed_payment_amount(candidate.quote.hash())
+            .await?;
+        if on_chain_amount >= candidate.expected_amount {
+            return Ok(());
+        }
+
+        Err(Error::Payment(format!(
+            "Median-priced quote for peer {:?} was not paid enough: expected at least {}, got {on_chain_amount}",
+            candidate.encoded_peer_id, candidate.expected_amount
+        )))
+    }
+
+    fn validate_paid_quote_content(
+        xorname: &XorName,
+        candidate: LegacyMedianCandidate<'_>,
+    ) -> Result<()> {
+        if verify_quote_content(candidate.quote, xorname) {
+            return Ok(());
+        }
+
+        let expected_hex = hex::encode(xorname);
+        let actual_hex = hex::encode(candidate.quote.content.0);
+        Err(Error::Payment(format!(
+            "Paid quote content address mismatch for peer {:?}: expected {expected_hex}, got {actual_hex}",
+            candidate.encoded_peer_id
+        )))
+    }
+
+    async fn validate_paid_quote_signature(candidate: LegacyMedianCandidate<'_>) -> Result<()> {
+        let quote_for_signature = candidate.quote.clone();
+        let peer_id_for_error = candidate.encoded_peer_id.clone();
         tokio::task::spawn_blocking(move || {
-            for (encoded_peer_id, quote) in &peer_quotes {
-                if !verify_quote_signature(quote) {
-                    return Err(Error::Payment(
-                        format!("Quote ML-DSA-65 signature verification failed for peer {encoded_peer_id:?}"),
-                    ));
-                }
+            if !verify_quote_signature(&quote_for_signature) {
+                return Err(Error::Payment(format!(
+                    "Paid quote ML-DSA-65 signature verification failed for peer {peer_id_for_error:?}"
+                )));
             }
             Ok(())
         })
         .await
-        .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))??;
+        .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
+    }
 
-        // Reconstruct the SingleNodePayment to identify the median quote.
-        // from_quotes() sorts by price and marks the median for 3x payment.
-        let quotes_with_prices: Vec<_> = payment
-            .peer_quotes
-            .iter()
-            .map(|(_, quote)| (quote.clone(), quote.price))
-            .collect();
-        let single_payment = SingleNodePayment::from_quotes(quotes_with_prices).map_err(|e| {
-            Error::Payment(format!(
-                "Failed to reconstruct payment for verification: {e}"
-            ))
-        })?;
-
-        // Verify the median quote was paid at least 3x its price on-chain
-        // via completedPayments(quoteHash) on the payment vault contract.
-        let verified_amount = single_payment
-            .verify(&self.config.evm.network)
-            .await
-            .map_err(|e| {
-                let xorname_hex = hex::encode(xorname);
-                Error::Payment(format!(
-                    "Median quote payment verification failed for {xorname_hex}: {e}"
-                ))
-            })?;
-
-        if crate::logging::enabled!(crate::logging::Level::INFO) {
-            let xorname_hex = hex::encode(xorname);
-            info!("EVM payment verified for {xorname_hex} (median paid {verified_amount} atto)");
+    async fn completed_payment_amount(&self, quote_hash: QuoteHash) -> Result<Amount> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            let completed_payment_override = {
+                self.test_completed_payments_override
+                    .read()
+                    .get(&quote_hash)
+                    .copied()
+            };
+            if let Some(amount) = completed_payment_override {
+                return Ok(amount);
+            }
         }
+
+        let provider = evmlib::utils::http_provider(self.config.evm.network.rpc_url().clone());
+        let vault_address = *self.config.evm.network.payment_vault_address();
+        let contract = payment_vault::interface::IPaymentVault::new(vault_address, provider);
+
+        let result = contract
+            .completedPayments(quote_hash)
+            .call()
+            .await
+            .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
+
+        Ok(Amount::from(result.amount))
+    }
+
+    fn validate_paid_quote_peer_binding(
+        encoded_peer_id: &evmlib::EncodedPeerId,
+        quote: &PaymentQuote,
+    ) -> Result<PeerId> {
+        let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
+            .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
+
+        if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
+            let expected_hex = expected_peer_id.to_hex();
+            let actual_hex = hex::encode(encoded_peer_id.as_bytes());
+            return Err(Error::Payment(format!(
+                "Paid quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
+                 BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
+            )));
+        }
+
+        Ok(expected_peer_id)
+    }
+
+    fn validate_paid_quote_price_floor(&self, quote: &PaymentQuote) -> Result<()> {
+        let Some(current_records) = self.current_records_stored() else {
+            return Err(Error::Payment(
+                "PaymentVerifier: no record-count source attached; cannot verify \
+                 paid-quote local price floor"
+                    .to_string(),
+            ));
+        };
+
+        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
+        let min_acceptable_price = price_floor(current_price, PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT);
+
+        if quote.price < min_acceptable_price {
+            let quoted_records = derive_records_stored_from_price(quote.price);
+            return Err(Error::Payment(format!(
+                "Paid quote price below local floor: quoted price encodes \
+                 {quoted_records} records but node currently holds {current_records} \
+                 (quoted {}, minimum acceptable {min_acceptable_price} at \
+                 {PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT}% under-payment tolerance)",
+                quote.price
+            )));
+        }
+
         Ok(())
+    }
+
+    async fn validate_paid_quote_issuer_k_closest(
+        &self,
+        xorname: &XorName,
+        issuer_peer_id: &PeerId,
+    ) -> Result<()> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(k_closest_peer_ids) = self.test_paid_quote_k_closest_override.read().as_ref() {
+            if k_closest_peer_ids
+                .iter()
+                .any(|peer_id| peer_id == issuer_peer_id.as_bytes())
+            {
+                return Ok(());
+            }
+            let issuer_closeness_width = PAID_QUOTE_ISSUER_CLOSENESS_WIDTH;
+            return Err(Error::Payment(format!(
+                "Paid quote issuer {} is not among this node's local K={issuer_closeness_width} closest peers for {}",
+                issuer_peer_id.to_hex(),
+                hex::encode(xorname)
+            )));
+        }
+
+        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
+        let Some(p2p_node) = attached else {
+            #[cfg(any(test, feature = "test-utils"))]
+            {
+                crate::logging::warn!(
+                    "PaymentVerifier: no P2PNode attached; paid-quote issuer \
+                     K-closest check SKIPPED (test build). Production startup MUST call \
+                     PaymentVerifier::attach_p2p_node."
+                );
+                return Ok(());
+            }
+            #[cfg(not(any(test, feature = "test-utils")))]
+            {
+                crate::logging::error!(
+                    "PaymentVerifier: no P2PNode attached; rejecting paid-quote \
+                     payment. This is a node-startup bug — \
+                     PaymentVerifier::attach_p2p_node must be called before \
+                     any PUT handler runs."
+                );
+                return Err(Error::Payment(
+                    "Paid quote rejected: verifier is not wired to the P2P \
+                     layer; cannot verify issuer closeness."
+                        .into(),
+                ));
+            }
+        };
+
+        // Closeness *verification* must mirror the uploader's pure XOR-distance
+        // peer selection. `find_closest_nodes_local_with_self` reranks the local
+        // routing table by reachability (preferring directly-reachable peers,
+        // XOR only as a tiebreaker), which demotes an XOR-close relay-only /
+        // NAT'd peer out of the compared window and falsely rejects an honest
+        // payment that legitimately quoted that peer. Use the XOR-only sibling
+        // so this check matches how the client chose the quoted K-closest set.
+        let issuer_closeness_width = PAID_QUOTE_ISSUER_CLOSENESS_WIDTH;
+        let closest = p2p_node
+            .dht_manager()
+            .find_closest_nodes_local_by_distance_with_self(xorname, issuer_closeness_width)
+            .await;
+        if closest.iter().any(|node| node.peer_id == *issuer_peer_id) {
+            return Ok(());
+        }
+
+        Err(Error::Payment(format!(
+            "Paid quote issuer {} is not among this node's local K={issuer_closeness_width} closest peers for {}",
+            issuer_peer_id.to_hex(),
+            hex::encode(xorname)
+        )))
     }
 
     /// Validate quote count, uniqueness, and basic structure.
@@ -720,9 +1017,9 @@ impl PaymentVerifier {
         }
 
         let quote_count = payment.peer_quotes.len();
-        if quote_count != CLOSE_GROUP_SIZE {
+        if quote_count > CLOSE_GROUP_SIZE {
             return Err(Error::Payment(format!(
-                "Payment must have exactly {CLOSE_GROUP_SIZE} quotes, got {quote_count}"
+                "Payment must have at most {CLOSE_GROUP_SIZE} quotes, got {quote_count}"
             )));
         }
 
@@ -736,154 +1033,6 @@ impl PaymentVerifier {
             seen.push(encoded_peer_id);
         }
 
-        Ok(())
-    }
-
-    /// Verify all quotes target the correct content address.
-    fn validate_quote_content(payment: &ProofOfPayment, xorname: &XorName) -> Result<()> {
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            if !verify_quote_content(quote, xorname) {
-                let expected_hex = hex::encode(xorname);
-                let actual_hex = hex::encode(quote.content.0);
-                return Err(Error::Payment(format!(
-                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {expected_hex}, got {actual_hex}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Verify quote freshness by price staleness, not wall-clock time and not a
-    /// symmetric record-count delta.
-    ///
-    /// The quote price encodes the quoting node's record count via the quadratic
-    /// pricing formula. We compute the price the node would charge *now* for its
-    /// current fullness and reject the quote only if the client under-paid that
-    /// current price by more than [`QUOTE_PRICE_STALENESS_PCT_TOLERANCE`]. This:
-    ///
-    /// - removes the platform clock dependency that caused Windows/UTC false
-    ///   rejections (timestamps are deliberately unused);
-    /// - never rejects an over-payment (the previous symmetric `abs_diff` check
-    ///   rejected quotes where the node had *fewer* records than when it quoted,
-    ///   i.e. the client paid for a fuller, pricier node — nonsensical to
-    ///   reject); and
-    /// - self-scales with the pricing curve, so benign in-flight churn (a node
-    ///   storing a few replicated records between quoting and verifying) — a
-    ///   negligible price move where the curve is flat — no longer rejects an
-    ///   otherwise-valid payment. On a fresh, rapidly-filling testnet that churn
-    ///   routinely exceeded the old fixed 5-record tolerance and rejected ~100%
-    ///   of uploads via the multiplicative per-chunk effect.
-    ///
-    /// The current record count comes from the attached [`LmdbStorage`] via
-    /// `current_chunks()` — an O(1) B-tree page-header read, authoritative
-    /// regardless of which path stored the record (client PUT, replication
-    /// store, repair fetch) or removed it (prune delete). If no storage source
-    /// is available (mis-configured production startup, or a unit test that
-    /// didn't set a test override), the gate is skipped entirely rather than
-    /// rejecting every quote — see [`Self::current_records_stored`].
-    ///
-    /// **Only this node's own quote is gated.** A bundle contains one quote
-    /// per close-group peer, and fullness across a close group is wildly
-    /// heterogeneous on a real network (a freshly joined node holds tens of
-    /// records while an established neighbour holds thousands). Comparing a
-    /// *neighbour's* quote price against *this node's* record count therefore
-    /// rejects honest payments whenever the group spans more than the
-    /// tolerance — on ant-prod-01 a close group spanning 47..=1788 records
-    /// made the three fullest nodes reject every bundle containing the
-    /// emptiest node's (perfectly fresh, 10-second-old) quote, failing the
-    /// PUT after the client had already paid on-chain. The node can only
-    /// re-derive *its own* price from its own record count, so its own quote
-    /// is the only one it can legitimately call stale. Replay of another
-    /// node's old cheap quote is that node's gate to enforce when the PUT
-    /// reaches it; the on-chain median payment binding is unaffected either
-    /// way.
-    ///
-    /// A bundle holds at most one quote per peer — [`Self::validate_quote_structure`]
-    /// rejects duplicate peer IDs and runs before this gate on every path —
-    /// so the loop below matches at most one own quote.
-    fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
-        let Some(current_records) = self.current_records_stored() else {
-            debug!(
-                "PaymentVerifier: no record-count source attached; skipping \
-                 quote price-staleness check"
-            );
-            return Ok(());
-        };
-
-        let Some(self_peer_id) = self.self_peer_id_bytes() else {
-            debug!(
-                "PaymentVerifier: no self peer-id source attached; skipping \
-                 quote price-staleness check"
-            );
-            return Ok(());
-        };
-
-        // The price the node would charge right now for its current fullness,
-        // and the floor a quote may not drop below (one-directional: paying at
-        // or above `current_price` is always accepted).
-        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
-        let min_acceptable_price = current_price.saturating_mul(Amount::from(
-            100u64.saturating_sub(QUOTE_PRICE_STALENESS_PCT_TOLERANCE),
-        )) / Amount::from(100u64);
-
-        let mut own_quote_seen = false;
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            if encoded_peer_id.as_bytes() != &self_peer_id {
-                // A neighbour's quote prices the *neighbour's* fullness; this
-                // node has no basis to judge it against its own record count.
-                continue;
-            }
-            own_quote_seen = true;
-            if quote.price < min_acceptable_price {
-                let quoted_records = derive_records_stored_from_price(quote.price);
-                return Err(Error::Payment(format!(
-                    "Own quote {encoded_peer_id:?} stale: quoted price encodes \
-                     {quoted_records} records but node currently holds {current_records} \
-                     (quoted {}, minimum acceptable {min_acceptable_price} at \
-                     {QUOTE_PRICE_STALENESS_PCT_TOLERANCE}% under-payment tolerance)",
-                    quote.price
-                )));
-            }
-        }
-
-        // Two self-identity notions coexist in this verifier and are expected
-        // to refer to the same node: `validate_local_recipient` matches "us"
-        // by rewards address, this gate by peer ID. They legitimately diverge
-        // when a PUT reaches a node whose own quote isn't in the bundle but
-        // whose rewards address is shared with a quoted sibling (common in
-        // fleet deployments). The gate fail-opens in that case — leave a
-        // breadcrumb, because a silent no-op is exactly what makes a
-        // production incident hard to reconstruct from node logs.
-        if !own_quote_seen {
-            let our_rewards_address_quoted = payment
-                .peer_quotes
-                .iter()
-                .any(|(_, quote)| quote.rewards_address == self.config.local_rewards_address);
-            if our_rewards_address_quoted {
-                debug!(
-                    "PaymentVerifier: bundle contains our rewards address but no quote \
-                     under our peer ID; skipping quote price-staleness check"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
-    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
-                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
-
-            if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
-                let expected_hex = expected_peer_id.to_hex();
-                let actual_hex = hex::encode(encoded_peer_id.as_bytes());
-                return Err(Error::Payment(format!(
-                    "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
-                     BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
-                )));
-            }
-        }
         Ok(())
     }
 
@@ -1425,16 +1574,8 @@ impl PaymentVerifier {
         // single-flight keyed on pool_hash collapse the Kademlia lookup cost
         // within a batch and across concurrent PUTs for the same pool.
         //
-        // ClientPut only: the check interrogates the *live* DHT, but a
-        // replication receipt's winner pool was sampled from the DHT of the
-        // original sale. Churn guarantees old pools eventually stop matching
-        // the current top-K, which would make old records unreplicatable —
-        // the same failure mode the single-node freshness gate caused on
-        // DEV-01. See `VerificationContext` for the trade-off discussion.
-        if context == VerificationContext::ClientPut {
-            self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool, pool_hash)
-                .await?;
-        }
+        self.verify_merkle_candidate_closeness(&merkle_proof.winner_pool, pool_hash)
+            .await?;
 
         // Check pool cache first
         let cached_info = {
@@ -1604,21 +1745,6 @@ impl PaymentVerifier {
 
         Ok(())
     }
-
-    /// Verify this node is among the paid recipients.
-    fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
-        let local_addr = &self.config.local_rewards_address;
-        let is_recipient = payment
-            .peer_quotes
-            .iter()
-            .any(|(_, quote)| quote.rewards_address == *local_addr);
-        if !is_recipient {
-            return Err(Error::Payment(
-                "Payment proof does not include this node as a recipient".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1626,6 +1752,10 @@ impl PaymentVerifier {
 mod tests {
     use super::*;
     use evmlib::merkle_payments::MerklePaymentCandidatePool;
+    use evmlib::PaymentQuote;
+    use saorsa_core::MlDsa65;
+    use saorsa_pqc::pqc::types::MlDsaSecretKey;
+    use saorsa_pqc::pqc::MlDsaOperations;
     use std::time::SystemTime;
 
     /// Create a verifier for unit tests. EVM is always on, but tests can
@@ -1634,9 +1764,140 @@ mod tests {
         let config = PaymentVerifierConfig {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
+            close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
         };
         PaymentVerifier::new(config)
+    }
+
+    #[test]
+    fn paid_quote_issuer_closeness_width_uses_k() {
+        let issuer_closeness_width = PAID_QUOTE_ISSUER_CLOSENESS_WIDTH;
+        let k_bucket_size = K_BUCKET_SIZE;
+        let close_group_size = CLOSE_GROUP_SIZE;
+
+        assert_eq!(issuer_closeness_width, k_bucket_size);
+        assert!(issuer_closeness_width > close_group_size);
+    }
+
+    fn make_signed_quote(
+        xorname: XorName,
+        price: Amount,
+        rewards_seed: u8,
+    ) -> (evmlib::EncodedPeerId, PaymentQuote) {
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        let peer_id = encoded_peer_id_for_pub_key(&pub_key_bytes);
+        let mut quote = PaymentQuote {
+            content: xor_name::XorName(xorname),
+            timestamp: SystemTime::now(),
+            price,
+            rewards_address: RewardsAddress::new([rewards_seed; 20]),
+            pub_key: pub_key_bytes,
+            signature: Vec::new(),
+        };
+        let secret_key = MlDsaSecretKey::from_bytes(secret_key.as_bytes()).expect("secret key");
+        quote.signature = ml_dsa
+            .sign(&secret_key, &quote.bytes_for_sig())
+            .expect("sign quote")
+            .as_bytes()
+            .to_vec();
+        (peer_id, quote)
+    }
+
+    fn make_signed_legacy_bundle(
+        xorname: XorName,
+        prices: [Amount; CLOSE_GROUP_SIZE],
+    ) -> Vec<(evmlib::EncodedPeerId, PaymentQuote)> {
+        prices
+            .into_iter()
+            .enumerate()
+            .map(|(index, price)| {
+                let rewards_seed = u8::try_from(index + 1).expect("small test index");
+                make_signed_quote(xorname, price, rewards_seed)
+            })
+            .collect()
+    }
+
+    fn price_at_records(records: usize) -> Amount {
+        crate::payment::pricing::calculate_price(records)
+    }
+
+    fn unique_test_prices() -> [Amount; CLOSE_GROUP_SIZE] {
+        [
+            price_at_records(0),
+            price_at_records(1),
+            price_at_records(2),
+            price_at_records(3),
+            price_at_records(4),
+            price_at_records(5),
+            price_at_records(6),
+        ]
+    }
+
+    fn tied_median_test_prices() -> [Amount; CLOSE_GROUP_SIZE] {
+        [
+            price_at_records(0),
+            price_at_records(1),
+            price_at_records(2),
+            price_at_records(3),
+            price_at_records(3),
+            price_at_records(4),
+            price_at_records(5),
+        ]
+    }
+
+    fn median_test_candidates(
+        peer_quotes: &[(evmlib::EncodedPeerId, PaymentQuote)],
+    ) -> Vec<(evmlib::EncodedPeerId, PaymentQuote)> {
+        let mut sorted_quotes: Vec<_> = peer_quotes.iter().collect();
+        sorted_quotes.sort_by_key(|(_, quote)| quote.price);
+        let median_index = median_quote_index(sorted_quotes.len());
+        let median_price = sorted_quotes
+            .get(median_index)
+            .expect("median quote")
+            .1
+            .price;
+
+        sorted_quotes
+            .into_iter()
+            .filter(|(_, quote)| quote.price == median_price)
+            .map(|(peer_id, quote)| (peer_id.clone(), quote.clone()))
+            .collect()
+    }
+
+    fn expected_median_payment(peer_quotes: &[(evmlib::EncodedPeerId, PaymentQuote)]) -> Amount {
+        let median_price = median_test_candidates(peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .price;
+        median_price * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER)
+    }
+
+    fn mark_k_closest_paid_candidates(
+        verifier: &PaymentVerifier,
+        peer_quotes: &[(evmlib::EncodedPeerId, PaymentQuote)],
+    ) {
+        let k_closest_peers = median_test_candidates(peer_quotes)
+            .iter()
+            .map(|(peer_id, _)| *peer_id.as_bytes())
+            .collect();
+        verifier.set_paid_quote_k_closest_for_tests(k_closest_peers);
+    }
+
+    fn mark_candidate_paid(verifier: &PaymentVerifier, quote: &PaymentQuote, amount: Amount) {
+        verifier.set_completed_payment_for_tests(quote.hash(), amount);
+    }
+
+    fn mark_all_median_candidates_unpaid(
+        verifier: &PaymentVerifier,
+        peer_quotes: &[(evmlib::EncodedPeerId, PaymentQuote)],
+    ) {
+        for (_, quote) in median_test_candidates(peer_quotes) {
+            mark_candidate_paid(verifier, &quote, Amount::ZERO);
+        }
     }
 
     #[test]
@@ -1691,6 +1952,33 @@ mod tests {
             .await;
         assert!(result.is_ok());
         assert_eq!(result.expect("cached"), PaymentStatus::CachedAsVerified);
+    }
+
+    #[tokio::test]
+    async fn test_paid_list_cache_entry_does_not_satisfy_client_put() {
+        let verifier = create_test_verifier();
+        let xorname = [0xB8u8; 32];
+        verifier.cache.insert_paid_list_verified(xorname);
+
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::PaidListAdmission),
+            PaymentStatus::CachedAsVerified,
+            "paid-list lookups must hit a paid-list-verified entry"
+        );
+        assert_eq!(
+            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
+            PaymentStatus::PaymentRequired,
+            "client PUT must not fast-path on a paid-list-verified entry"
+        );
+
+        let err = verifier
+            .verify_payment(&xorname, None, VerificationContext::ClientPut)
+            .await
+            .expect_err("proof-less client PUT must not ride the paid-list entry");
+        assert!(
+            format!("{err}").contains("Payment required"),
+            "client PUT must still demand payment: {err}"
+        );
     }
 
     #[test]
@@ -1824,6 +2112,497 @@ mod tests {
         assert!(
             err_msg.contains("deserialize") || err_msg.contains("Failed"),
             "Error should mention deserialization failure: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_median_full_path_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xA1u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("paid median should verify"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_single_quote_proof_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xB1u8; 32];
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
+        let peer_quotes = vec![(peer_id, quote.clone())];
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        mark_candidate_paid(&verifier, &quote, expected_median_payment(&peer_quotes));
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("single paid quote should verify"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_single_quote_proof_requires_three_x_payment() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xB2u8; 32];
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
+        let peer_quotes = vec![(peer_id, quote.clone())];
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        mark_candidate_paid(&verifier, &quote, quote.price);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("single quote paid less than 3x should be rejected");
+
+        assert!(
+            format!("{err}").contains("not paid enough"),
+            "Error should mention underpayment: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_too_many_quotes_rejected() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xB3u8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        peer_quotes.push(make_signed_quote(xorname, price_at_records(7), 8));
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("proof with more than close-group quotes should be rejected");
+
+        assert!(
+            format!("{err}").contains("at most"),
+            "Error should mention max quote count: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_structural_majority_price_at_median_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(1000);
+        let xorname = [0xA2u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(
+            xorname,
+            [
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(100),
+                crate::payment::pricing::calculate_price(500),
+                crate::payment::pricing::calculate_price(1000),
+                crate::payment::pricing::calculate_price(2000),
+                crate::payment::pricing::calculate_price(4000),
+                crate::payment::pricing::calculate_price(6000),
+            ],
+        );
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("median-priced verifier should accept"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_above_median_verifier_rejected_by_floor() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(2000);
+        let xorname = [0xA3u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(
+            xorname,
+            [
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(100),
+                crate::payment::pricing::calculate_price(500),
+                crate::payment::pricing::calculate_price(1000),
+                crate::payment::pricing::calculate_price(2000),
+                crate::payment::pricing::calculate_price(4000),
+                crate::payment::pricing::calculate_price(6000),
+            ],
+        );
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("above-median verifier should reject the client PUT");
+
+        assert!(
+            format!("{err}").contains("below local floor"),
+            "Error should mention paid-quote floor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_median_issuer_k_closest_rejection() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        verifier.set_paid_quote_k_closest_for_tests(vec![rand::random()]);
+        let xorname = [0xA4u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("out-of-K paid issuer should be rejected");
+
+        assert!(
+            format!("{err}").contains("not among this node's local"),
+            "Error should mention local K-closest peers: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_median_floor_rejection() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        let xorname = [0xA5u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(
+            xorname,
+            [
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+            ],
+        );
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("cheap paid median should be rejected");
+
+        assert!(
+            format!("{err}").contains("below local floor"),
+            "Error should mention local floor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_zero_price_median_rejected() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xA6u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(
+            xorname,
+            [
+                Amount::ZERO,
+                Amount::ZERO,
+                Amount::ZERO,
+                Amount::ZERO,
+                Amount::from(1u64),
+                Amount::from(2u64),
+                Amount::from(3u64),
+            ],
+        );
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("zero median must be rejected");
+
+        assert!(
+            format!("{err}").contains("zero price"),
+            "Error should mention zero price: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_quote_content_mismatch_rejected() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xA7u8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        let median_index = median_quote_index(peer_quotes.len());
+        peer_quotes[median_index].1.content = xor_name::XorName([0xE7u8; 32]);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("paid quote content mismatch should be rejected");
+
+        assert!(
+            format!("{err}").contains("content address mismatch"),
+            "Error should mention content mismatch: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_unpaid_quote_content_mismatch_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xA8u8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        peer_quotes[0].1.content = xor_name::XorName([0xE8u8; 32]);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("unpaid content mismatch should be ignored"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_quote_bad_signature_rejected() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xA9u8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        let median_index = median_quote_index(peer_quotes.len());
+        peer_quotes[median_index].1.signature.push(0xFF);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("paid bad signature should be rejected");
+
+        assert!(
+            format!("{err}").contains("signature verification failed"),
+            "Error should mention signature failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_unpaid_quote_bad_signature_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xAAu8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        peer_quotes[0].1.signature.push(0xFF);
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("unpaid bad signature should be ignored"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_unpaid_peer_binding_mismatch_accepted() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xABu8; 32];
+        let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        peer_quotes[0].0 = evmlib::EncodedPeerId::new(rand::random());
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("unpaid peer binding mismatch should be ignored"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_median_tie_accepts_paid_candidate() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        let xorname = [0xACu8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, tied_median_test_prices());
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        mark_all_median_candidates_unpaid(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .get(1)
+            .expect("second tied median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("one paid tied median candidate should verify"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_list_admission_enforces_issuer_k_closest() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(0);
+        verifier.set_paid_quote_k_closest_for_tests(Vec::new());
+        let xorname = [0xB5u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("paid-list admission must enforce the paid issuer K-closest check");
+
+        assert!(
+            format!("{err}").contains("not among this node's local"),
+            "Error should mention local K-closest peers: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_paid_list_admission_enforces_full_bundle_floor() {
+        let verifier = create_test_verifier();
+        verifier.set_records_stored_for_tests(6000);
+        let xorname = [0xB6u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(
+            xorname,
+            [
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+                crate::payment::pricing::calculate_price(0),
+            ],
+        );
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await
+            .expect_err("paid-list admission must enforce the floor for full bundles");
+
+        assert!(
+            format!("{err}").contains("below local floor"),
+            "Error should mention the local price floor: {err}"
         );
     }
 
@@ -2020,195 +2799,6 @@ mod tests {
         }
     }
 
-    /// Helper: create a fake quote whose price encodes the supplied record count.
-    fn make_fake_quote_at_records(
-        xorname: [u8; 32],
-        timestamp: SystemTime,
-        rewards_address: RewardsAddress,
-        records: usize,
-    ) -> evmlib::PaymentQuote {
-        let mut quote = make_fake_quote(xorname, timestamp, rewards_address);
-        quote.price = crate::payment::pricing::calculate_price(records);
-        quote
-    }
-
-    /// A small upward record drift between quoting and verifying — the normal
-    /// in-flight churn on a busy network — must pass. The old fixed 5-record
-    /// tolerance rejected a drift of 10 as "stale by 10 records"; the
-    /// price-based gate sees a negligible price move on the near-flat curve and
-    /// accepts it.
-    #[test]
-    fn test_small_record_drift_accepted() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        // Node gained 10 records since quoting (100 -> 110).
-        verifier.set_records_stored_for_tests(110);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-        let quote = make_fake_quote_at_records(
-            [0xE0u8; 32],
-            SystemTime::now(),
-            RewardsAddress::new([1u8; 20]),
-            100,
-        );
-        let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
-        };
-
-        verifier
-            .validate_quote_freshness(&payment)
-            .expect("benign in-flight drift should pass");
-    }
-
-    /// Over-payment must always be accepted: the node had MORE records when it
-    /// quoted than it does now (e.g. it pruned), so the client paid for a
-    /// fuller, pricier node. The old symmetric `abs_diff` gate wrongly rejected
-    /// this; ~36% of STG-01 rejections were exactly this case.
-    #[test]
-    fn test_overpayment_accepted() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        // Quote priced at 6000 records, but node now holds only 100.
-        verifier.set_records_stored_for_tests(100);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-        let quote = make_fake_quote_at_records(
-            [0xE2u8; 32],
-            SystemTime::now(),
-            RewardsAddress::new([1u8; 20]),
-            6000,
-        );
-        let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
-        };
-
-        verifier
-            .validate_quote_freshness(&payment)
-            .expect("over-payment must never be rejected");
-    }
-
-    /// Genuine staleness — a quote that under-prices the node's current fullness
-    /// by far more than the tolerance — is still rejected. Quote encodes 100
-    /// records but the node now holds 6000, so the quadratic curve makes the
-    /// paid price a small fraction of the current price.
-    #[test]
-    fn test_underpriced_quote_rejected() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-        let quote = make_fake_quote_at_records(
-            [0xE1u8; 32],
-            SystemTime::now(),
-            RewardsAddress::new([1u8; 20]),
-            100,
-        );
-        let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(self_id), quote)],
-        };
-
-        let err = verifier
-            .validate_quote_freshness(&payment)
-            .expect_err("a quote underpricing by >25% should fail");
-        assert!(format!("{err}").contains("stale"));
-    }
-
-    /// Regression test for the PROD-UL-01 `DataMap` failure (2026-06-04): a
-    /// close group whose fullness spans 47..=1788 records produces a bundle
-    /// where the emptiest node's honest quote prices far below a full node's
-    /// 75% floor. The verifying node must gate only its OWN quote — a
-    /// neighbour's cheap-but-honest quote is not evidence of staleness.
-    #[test]
-    fn test_neighbour_cheap_quote_not_rejected() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        // This node holds 1788 records (the fullest rejector in the incident).
-        verifier.set_records_stored_for_tests(1788);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-
-        let xorname = [0xE3u8; 32];
-        let rewards = RewardsAddress::new([1u8; 20]);
-        // Own quote is fresh: priced at our own current fullness.
-        let own_quote = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 1788);
-        // Neighbour quotes from a heterogeneous close group, including a
-        // nearly-empty node at 47 records (price far below our 75% floor).
-        let neighbour_47 = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 47);
-        let neighbour_978 = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 978);
-
-        let payment = ProofOfPayment {
-            peer_quotes: vec![
-                (EncodedPeerId::new(rand::random()), neighbour_47),
-                (EncodedPeerId::new(self_id), own_quote),
-                (EncodedPeerId::new(rand::random()), neighbour_978),
-            ],
-        };
-
-        verifier
-            .validate_quote_freshness(&payment)
-            .expect("neighbours' cheaper quotes must not trip this node's own staleness gate");
-    }
-
-    /// The own-quote gate still bites: if THIS node's own quote in the bundle
-    /// underprices its current fullness beyond tolerance, the payment is
-    /// rejected even when every neighbour quote looks expensive.
-    #[test]
-    fn test_own_stale_quote_still_rejected_among_neighbours() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-
-        let xorname = [0xE4u8; 32];
-        let rewards = RewardsAddress::new([1u8; 20]);
-        let own_stale = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 100);
-        let neighbour = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 7000);
-
-        let payment = ProofOfPayment {
-            peer_quotes: vec![
-                (EncodedPeerId::new(rand::random()), neighbour),
-                (EncodedPeerId::new(self_id), own_stale),
-            ],
-        };
-
-        let err = verifier
-            .validate_quote_freshness(&payment)
-            .expect_err("own underpriced quote must still be rejected");
-        assert!(format!("{err}").contains("stale"));
-    }
-
-    /// Without a self peer-id source (no `P2PNode` attached, no test override)
-    /// the gate skips rather than rejecting — mirroring the missing
-    /// record-count-source behaviour.
-    #[test]
-    fn test_freshness_skipped_without_self_peer_id() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        // NOTE: no set_peer_id_for_tests call.
-        let quote = make_fake_quote_at_records(
-            [0xE5u8; 32],
-            SystemTime::now(),
-            RewardsAddress::new([1u8; 20]),
-            100,
-        );
-        let payment = ProofOfPayment {
-            peer_quotes: vec![(EncodedPeerId::new(rand::random()), quote)],
-        };
-
-        verifier
-            .validate_quote_freshness(&payment)
-            .expect("gate must fail open when self identity is unknown");
-    }
-
     /// Helper: wrap quotes into a tagged serialized `PaymentProof`.
     fn serialize_proof(peer_quotes: Vec<(evmlib::EncodedPeerId, evmlib::PaymentQuote)>) -> Vec<u8> {
         use crate::payment::proof::{serialize_single_node_proof, PaymentProof};
@@ -2379,54 +2969,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_local_not_in_paid_set_rejected() {
-        use evmlib::RewardsAddress;
-        use saorsa_core::MlDsa65;
-        use saorsa_pqc::pqc::MlDsaOperations;
-
-        // Verifier with a local rewards address set
-        let local_addr = RewardsAddress::new([0xAAu8; 20]);
-        let config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                network: EvmNetwork::ArbitrumOne,
-            },
-            cache_capacity: 100,
-            local_rewards_address: local_addr,
-        };
-        let verifier = PaymentVerifier::new(config);
-
-        let xorname = [0xEEu8; 32];
-        // Quotes pay a DIFFERENT rewards address
-        let other_addr = RewardsAddress::new([0xBBu8; 20]);
-
-        // Use real ML-DSA keys so the pub_key→peer_id binding check passes
-        let ml_dsa = MlDsa65::new();
-        let mut peer_quotes = Vec::new();
-        for _ in 0..CLOSE_GROUP_SIZE {
-            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let pub_key_bytes = public_key.as_bytes().to_vec();
-            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
-
-            let mut quote = make_fake_quote(xorname, SystemTime::now(), other_addr);
-            quote.pub_key = pub_key_bytes;
-
-            peer_quotes.push((encoded, quote));
-        }
-
-        let proof_bytes = serialize_proof(peer_quotes);
-        let result = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await;
-
-        assert!(result.is_err(), "Should reject payment not addressed to us");
-        let err_msg = format!("{}", result.expect_err("should fail"));
-        assert!(
-            err_msg.contains("does not include this node as a recipient"),
-            "Error should mention recipient rejection: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_wrong_peer_binding_rejected() {
         use evmlib::{EncodedPeerId, RewardsAddress};
         use saorsa_core::MlDsa65;
@@ -2466,200 +3008,16 @@ mod tests {
     }
 
     // =========================================================================
-    // VerificationContext tests — Replication must skip the
-    // storer-being-paid-now checks (own-quote freshness, local recipient,
-    // merkle candidate closeness) while keeping every receipt-authenticity
-    // check. Each test runs the same proof under both contexts and asserts
-    // the context-gated check fires only under ClientPut. Where a proof
-    // can't reach Ok(()) without on-chain access, "skipped" is proven by the
-    // error moving PAST the gated check to a later stage.
+    // VerificationContext tests — both contexts verify fresh proof admissions.
+    // Later neighbour-sync repair has no proof-of-payment and is authorized by
+    // closest-7 storage quorum or closest-K paid-list quorum instead.
     // =========================================================================
 
-    /// A bundle whose own quote is stale (quoted 100 records, node now holds
-    /// 6000) is rejected by the freshness gate under `ClientPut`, but under
-    /// `Replication` the gate is skipped: verification proceeds to the next
-    /// stage (peer bindings, which fail on the fake `pub_keys`).
+    /// Content binding is required for every fresh proof context. A receipt for
+    /// chunk A cannot admit chunk B as either a direct/fresh store or a fresh
+    /// paid-list update.
     #[tokio::test]
-    async fn test_replication_context_skips_own_quote_freshness() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        let self_id: [u8; 32] = rand::random();
-        verifier.set_peer_id_for_tests(self_id);
-
-        let xorname = [0xD0u8; 32];
-        let rewards = RewardsAddress::new([1u8; 20]);
-        let own_stale = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 100);
-        let mut peer_quotes = vec![(EncodedPeerId::new(self_id), own_stale)];
-        for _ in 1..CLOSE_GROUP_SIZE {
-            let neighbour = make_fake_quote_at_records(xorname, SystemTime::now(), rewards, 6000);
-            peer_quotes.push((EncodedPeerId::new(rand::random()), neighbour));
-        }
-        let proof_bytes = serialize_proof(peer_quotes);
-
-        let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await
-            .expect_err("own stale quote must be rejected on a client PUT");
-        assert!(
-            format!("{err}").contains("stale"),
-            "ClientPut must fail at the freshness gate: {err}"
-        );
-
-        let err = verifier
-            .verify_payment(
-                &xorname,
-                Some(&proof_bytes),
-                VerificationContext::Replication,
-            )
-            .await
-            .expect_err("fake pub_keys still fail peer bindings");
-        let msg = format!("{err}");
-        assert!(
-            !msg.contains("stale"),
-            "Replication must skip the freshness gate: {msg}"
-        );
-        assert!(
-            msg.contains("Invalid ML-DSA public key"),
-            "Replication should fail at the LATER peer-binding stage: {msg}"
-        );
-    }
-
-    /// A receipt that pays a different node's rewards address is rejected by
-    /// the local-recipient check under `ClientPut`, but under `Replication`
-    /// (a post-churn close-group member was never a payee) the check is
-    /// skipped: verification proceeds to quote-signature verification.
-    #[tokio::test]
-    async fn test_replication_context_skips_local_recipient() {
-        use evmlib::RewardsAddress;
-        use saorsa_core::MlDsa65;
-        use saorsa_pqc::pqc::MlDsaOperations;
-
-        let local_addr = RewardsAddress::new([0xAAu8; 20]);
-        let config = PaymentVerifierConfig {
-            evm: EvmVerifierConfig {
-                network: EvmNetwork::ArbitrumOne,
-            },
-            cache_capacity: 100,
-            local_rewards_address: local_addr,
-        };
-        let verifier = PaymentVerifier::new(config);
-
-        let xorname = [0xD1u8; 32];
-        // Quotes pay a DIFFERENT rewards address.
-        let other_addr = RewardsAddress::new([0xBBu8; 20]);
-
-        // Real ML-DSA keys so the pub_key→peer_id binding check passes and
-        // the first divergence between contexts is the recipient check.
-        let ml_dsa = MlDsa65::new();
-        let mut peer_quotes = Vec::new();
-        for _ in 0..CLOSE_GROUP_SIZE {
-            let (public_key, _secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let pub_key_bytes = public_key.as_bytes().to_vec();
-            let encoded = encoded_peer_id_for_pub_key(&pub_key_bytes);
-            let mut quote = make_fake_quote(xorname, SystemTime::now(), other_addr);
-            quote.pub_key = pub_key_bytes;
-            peer_quotes.push((encoded, quote));
-        }
-        let proof_bytes = serialize_proof(peer_quotes);
-
-        let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await
-            .expect_err("payment not addressed to us must fail on a client PUT");
-        assert!(
-            format!("{err}").contains("does not include this node as a recipient"),
-            "ClientPut must fail at the recipient check: {err}"
-        );
-
-        let err = verifier
-            .verify_payment(
-                &xorname,
-                Some(&proof_bytes),
-                VerificationContext::Replication,
-            )
-            .await
-            .expect_err("fake quote signatures still fail signature verification");
-        let msg = format!("{err}");
-        assert!(
-            !msg.contains("recipient"),
-            "Replication must skip the recipient check: {msg}"
-        );
-        assert!(
-            msg.contains("signature verification failed"),
-            "Replication should fail at the LATER signature stage: {msg}"
-        );
-    }
-
-    /// A `Replication`-verified cache entry must not satisfy a later
-    /// `ClientPut` fast-path: the context-gated checks were never run for it,
-    /// so letting it short-circuit a client PUT would bypass them via the
-    /// cache. It must still satisfy later `Replication` lookups (re-offers of
-    /// the same key are routine), and a subsequent full `ClientPut`
-    /// verification upgrades the entry without ever being downgraded back.
-    #[tokio::test]
-    async fn test_replication_verified_cache_entry_does_not_satisfy_client_put() {
-        let verifier = create_test_verifier();
-        let xorname = [0xD4u8; 32];
-
-        // Simulate a successful Replication-context verification.
-        verifier.cache.insert_replication_verified(xorname);
-
-        assert_eq!(
-            verifier.check_payment_required(&xorname, VerificationContext::Replication),
-            PaymentStatus::CachedAsVerified,
-            "replication lookups must hit a replication-verified entry"
-        );
-        assert_eq!(
-            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
-            PaymentStatus::PaymentRequired,
-            "a client PUT must not fast-path on a replication-verified entry"
-        );
-
-        // End-to-end: a proof-less client PUT is still rejected, while a
-        // proof-less replication re-check passes via the cache.
-        let result = verifier
-            .verify_payment(&xorname, None, VerificationContext::Replication)
-            .await;
-        assert_eq!(
-            result.expect("replication re-check should hit the cache"),
-            PaymentStatus::CachedAsVerified
-        );
-        let err = verifier
-            .verify_payment(&xorname, None, VerificationContext::ClientPut)
-            .await
-            .expect_err("proof-less client PUT must not ride the replication entry");
-        assert!(
-            format!("{err}").contains("Payment required"),
-            "client PUT must still demand payment: {err}"
-        );
-
-        // A full ClientPut verification upgrades the entry...
-        verifier.cache.insert(xorname);
-        assert_eq!(
-            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
-            PaymentStatus::CachedAsVerified,
-            "a full client-PUT verification must upgrade the entry"
-        );
-
-        // ...and a later replication re-verification never downgrades it.
-        verifier.cache.insert_replication_verified(xorname);
-        assert_eq!(
-            verifier.check_payment_required(&xorname, VerificationContext::ClientPut),
-            PaymentStatus::CachedAsVerified,
-            "replication re-verification must not downgrade a client-PUT entry"
-        );
-    }
-
-    /// Receipt authenticity is NOT relaxed under `Replication`: a bundle whose
-    /// quotes are bound to a different content address is rejected in both
-    /// contexts. A neighbour cannot replay a receipt for chunk A to get
-    /// chunk B admitted.
-    #[tokio::test]
-    async fn test_replication_context_still_rejects_content_mismatch() {
-        use evmlib::{EncodedPeerId, RewardsAddress};
-
+    async fn test_fresh_contexts_reject_content_mismatch() {
         let verifier = create_test_verifier();
         let stored_xorname = [0xD2u8; 32];
         let quoted_xorname = [0xD3u8; 32];
@@ -2668,13 +3026,13 @@ mod tests {
         let mut peer_quotes = Vec::new();
         for _ in 0..CLOSE_GROUP_SIZE {
             let quote = make_fake_quote(quoted_xorname, SystemTime::now(), rewards);
-            peer_quotes.push((EncodedPeerId::new(rand::random()), quote));
+            peer_quotes.push((evmlib::EncodedPeerId::new(rand::random()), quote));
         }
         let proof_bytes = serialize_proof(peer_quotes);
 
         for context in [
             VerificationContext::ClientPut,
-            VerificationContext::Replication,
+            VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
                 .verify_payment(&stored_xorname, Some(&proof_bytes), context)
@@ -2688,15 +3046,13 @@ mod tests {
     }
 
     /// The merkle pay-yourself closeness defence (including its duplicate-
-    /// candidate pre-check, which runs without a `P2PNode`) applies to client
-    /// PUTs only. Under `Replication` the pool was sampled from the DHT of
-    /// the original sale, so the live-DHT check is skipped and verification
-    /// proceeds to the on-chain stages.
+    /// candidate pre-check, which runs without a `P2PNode`) applies to every
+    /// proof verification context because every context is a fresh admission.
     #[tokio::test]
-    async fn test_replication_context_skips_merkle_closeness() {
+    async fn test_fresh_contexts_enforce_merkle_closeness() {
         let verifier = create_test_verifier();
 
-        let (mut merkle_proof, _pool_hash, xorname, timestamp) = make_valid_merkle_proof();
+        let (mut merkle_proof, _pool_hash, xorname, _timestamp) = make_valid_merkle_proof();
 
         // 16 copies of one real candidate: every self-signature is valid, but
         // the candidate PeerIds are duplicates — the closeness pre-check
@@ -2710,45 +3066,22 @@ mod tests {
         for c in &mut merkle_proof.winner_pool.candidate_nodes {
             *c = shared.clone();
         }
-        let pool_hash = merkle_proof.winner_pool_hash();
-
-        // Seed the pool cache with a deliberately mismatched timestamp so the
-        // Replication path fails deterministically AFTER the (skipped)
-        // closeness check, without needing on-chain access.
-        {
-            let info = evmlib::merkle_payments::OnChainPaymentInfo {
-                depth: 4,
-                merkle_payment_timestamp: timestamp + 1,
-                paid_node_addresses: vec![],
-            };
-            verifier.pool_cache.lock().put(pool_hash, info);
-        }
-
         let tagged =
             crate::payment::proof::serialize_merkle_proof(&merkle_proof).expect("serialize");
 
-        let err = verifier
-            .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
-            .await
-            .expect_err("duplicate candidate PeerIds must fail the client-PUT closeness check");
-        assert!(
-            format!("{err}").contains("duplicate candidate PeerId"),
-            "ClientPut must fail at the closeness pre-check: {err}"
-        );
-
-        let err = verifier
-            .verify_payment(&xorname, Some(&tagged), VerificationContext::Replication)
-            .await
-            .expect_err("seeded timestamp mismatch still fails after the skipped check");
-        let msg = format!("{err}");
-        assert!(
-            !msg.contains("duplicate candidate PeerId"),
-            "Replication must skip the closeness check: {msg}"
-        );
-        assert!(
-            msg.contains("timestamp mismatch"),
-            "Replication should fail at the LATER timestamp stage: {msg}"
-        );
+        for context in [
+            VerificationContext::ClientPut,
+            VerificationContext::PaidListAdmission,
+        ] {
+            let err = verifier
+                .verify_payment(&xorname, Some(&tagged), context)
+                .await
+                .expect_err("duplicate candidate PeerIds must fail fresh admission closeness");
+            assert!(
+                format!("{err}").contains("duplicate candidate PeerId"),
+                "{context:?} must fail at the closeness pre-check: {err}"
+            );
+        }
     }
 
     // =========================================================================
@@ -3246,6 +3579,7 @@ mod tests {
         let config = PaymentVerifierConfig {
             evm: EvmVerifierConfig::default(),
             cache_capacity: 100,
+            close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
         };
         let verifier = PaymentVerifier::new(config);

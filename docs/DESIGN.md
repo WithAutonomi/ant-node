@@ -185,7 +185,6 @@ use saorsa_core::{
     P2PNode, NodeConfig, NodeMode,
     adaptive::trust::TrustEngine,
     adaptive::dht::AdaptiveDhtConfig,
-    BootstrapConfig, BootstrapManager,
     IPDiversityConfig,
     identity::peer_id::PeerId,
 };
@@ -194,7 +193,6 @@ pub struct RunningNode {
     shutdown_sender: watch::Sender<bool>,
     // USE ANT-CORE DIRECTLY - NO REIMPLEMENTATION!
     node: Arc<P2PNode>,                     // Integrates ALL components
-    bootstrap: Arc<BootstrapManager>,       // 30,000 peer cache
     // Events
     node_events_channel: NodeEventsChannel,
     root_dir_path: PathBuf,

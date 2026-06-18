@@ -1094,11 +1094,13 @@ impl TestNetwork {
         // When an EVM network is provided (e.g. Anvil), use it for on-chain verification.
         // Otherwise default to ArbitrumSepoliaTest for test nodes.
         let rewards_address = RewardsAddress::new(TEST_REWARDS_ADDRESS);
+        let replication_config = ReplicationConfig::default();
         let payment_config = PaymentVerifierConfig {
             evm: EvmVerifierConfig {
                 network: evm_network.unwrap_or(EvmNetwork::ArbitrumSepoliaTest),
             },
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
+            close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
@@ -1182,10 +1184,8 @@ impl TestNetwork {
 
         // Start protocol handler that routes incoming P2P messages to AntProtocol
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
-            // Wire the P2PNode into the payment verifier so merkle-payment
-            // verification can run the pay-yourself closeness check against
-            // the live DHT.
-            protocol.payment_verifier().attach_p2p_node(Arc::clone(p2p));
+            // Wire P2P into AntProtocol for payment-proof closeness checks.
+            protocol.attach_p2p_node(Arc::clone(p2p));
 
             let mut events = p2p.subscribe_events();
             let p2p_clone = Arc::clone(p2p);

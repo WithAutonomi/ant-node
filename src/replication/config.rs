@@ -23,6 +23,14 @@ use crate::ant_protocol::CLOSE_GROUP_SIZE;
 /// Maximum number of peers per k-bucket in the Kademlia routing table.
 pub const K_BUCKET_SIZE: usize = 20;
 
+/// Extra local-routing-table positions accepted for local chunk storage
+/// admission and stored-record pruning.
+///
+/// This margin absorbs small local RT disagreement between peers. It does not
+/// widen audit, quorum, or paid-list target sets; those remain strict
+/// `close_group_size` / paid-list group checks.
+pub const STORAGE_ADMISSION_MARGIN: usize = 2;
+
 /// Full-network target for required positive presence votes.
 ///
 /// Effective per-key threshold is
@@ -38,6 +46,13 @@ pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 /// Number of close-neighbor peers synced concurrently per round-robin repair
 /// round.
 pub const NEIGHBOR_SYNC_PEER_COUNT: usize = 4;
+
+/// Width used when deciding whether this node may locally store or retain a
+/// chunk.
+#[must_use]
+pub const fn storage_admission_width(close_group_size: usize) -> usize {
+    close_group_size.saturating_add(STORAGE_ADMISSION_MARGIN)
+}
 
 /// Minimum neighbor-sync cadence. Actual interval is randomized within
 /// `[min, max]`.
@@ -57,6 +72,13 @@ pub const NEIGHBOR_SYNC_INTERVAL_MAX: Duration =
 const NEIGHBOR_SYNC_COOLDOWN_SECS: u64 = 60 * 60; // 1 hour
 /// Per-peer minimum spacing between successive syncs with the same peer.
 pub const NEIGHBOR_SYNC_COOLDOWN: Duration = Duration::from_secs(NEIGHBOR_SYNC_COOLDOWN_SECS);
+
+/// Minimum age for a replica repair hint before the hinted peer can be audited
+/// for that key.
+const REPAIR_HINT_MIN_AGE_SECS: u64 = 60 * 60; // 1 hour
+/// Minimum age for a replica repair hint before the hinted peer can be audited
+/// for that key.
+pub const REPAIR_HINT_MIN_AGE: Duration = Duration::from_secs(REPAIR_HINT_MIN_AGE_SECS);
 
 /// Minimum self-lookup cadence.
 const SELF_LOOKUP_INTERVAL_MIN_SECS: u64 = 5 * 60;
@@ -281,6 +303,12 @@ impl ReplicationConfig {
         if self.neighbor_sync_scope == 0 {
             return Err("neighbor_sync_scope must be >= 1".to_string());
         }
+        if self.neighbor_sync_scope > K_BUCKET_SIZE {
+            return Err(format!(
+                "neighbor_sync_scope ({}) must be <= K_BUCKET_SIZE ({})",
+                self.neighbor_sync_scope, K_BUCKET_SIZE,
+            ));
+        }
         Ok(())
     }
 
@@ -405,6 +433,17 @@ mod tests {
     }
 
     #[test]
+    fn storage_admission_width_adds_margin() {
+        const TEST_CLOSE_GROUP_SIZE: usize = 7;
+
+        assert_eq!(
+            storage_admission_width(TEST_CLOSE_GROUP_SIZE),
+            TEST_CLOSE_GROUP_SIZE + STORAGE_ADMISSION_MARGIN
+        );
+        assert_eq!(storage_admission_width(usize::MAX), usize::MAX);
+    }
+
+    #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
     }
@@ -496,6 +535,15 @@ mod tests {
     fn neighbor_sync_peer_count_zero_rejected() {
         let config = ReplicationConfig {
             neighbor_sync_peer_count: 0,
+            ..ReplicationConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn neighbor_sync_scope_exceeding_k_bucket_size_rejected() {
+        let config = ReplicationConfig {
+            neighbor_sync_scope: K_BUCKET_SIZE + 1,
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());

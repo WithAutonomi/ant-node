@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::logging::{debug, info, warn};
 use rand::seq::SliceRandom;
@@ -167,11 +168,13 @@ pub async fn audit_tick_with_repair_proofs(
 
     let peer_keys = {
         let mut proofs = repair_proofs.write().await;
+        let now = Instant::now();
         mature_audit_keys_for_peer(
             &challenged_peer,
             sampled_key_groups,
             &mut proofs,
             current_sync_epoch,
+            now,
         )
     };
 
@@ -349,12 +352,19 @@ fn mature_audit_keys_for_peer(
     sampled_key_groups: Vec<(XorName, HashSet<PeerId>)>,
     repair_proofs: &mut RepairProofs,
     current_sync_epoch: u64,
+    now: Instant,
 ) -> Vec<XorName> {
     sampled_key_groups
         .into_iter()
         .filter_map(|(key, close_peers)| {
             repair_proofs
-                .has_mature_replica_hint(challenged_peer, &key, &close_peers, current_sync_epoch)
+                .has_mature_replica_hint(
+                    challenged_peer,
+                    &key,
+                    &close_peers,
+                    current_sync_epoch,
+                    now,
+                )
                 .then_some(key)
         })
         .collect()
@@ -720,6 +730,7 @@ pub async fn handle_audit_challenge(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::config::REPAIR_HINT_MIN_AGE;
     use crate::replication::protocol::compute_audit_digest;
     use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
     use crate::storage::LmdbStorageConfig;
@@ -1367,6 +1378,7 @@ mod tests {
         const MISSING_PROOF_KEY_BYTE: u8 = 0xB3;
         const STABLE_CHURN_KEY_BYTE: u8 = 0xB4;
         const EVICTED_KEY_BYTE: u8 = 0xB5;
+        const FRESH_HINT_KEY_BYTE: u8 = 0xB6;
         const XOR_NAME_LEN: usize = 32;
 
         let challenged_peer = peer_id_from_bytes([CHALLENGED_PEER_BYTE; XOR_NAME_LEN]);
@@ -1377,34 +1389,50 @@ mod tests {
         let missing_proof_key = [MISSING_PROOF_KEY_BYTE; XOR_NAME_LEN];
         let stable_churn_key = [STABLE_CHURN_KEY_BYTE; XOR_NAME_LEN];
         let evicted_key = [EVICTED_KEY_BYTE; XOR_NAME_LEN];
+        let fresh_hint_key = [FRESH_HINT_KEY_BYTE; XOR_NAME_LEN];
         let close_group = HashSet::from([challenged_peer, other_peer]);
         let changed_close_group = HashSet::from([challenged_peer, new_peer]);
         let evicted_close_group = HashSet::from([other_peer, new_peer]);
         let mut repair_proofs = RepairProofs::new();
+        let mature_hinted_at = Instant::now();
+        let now = mature_hinted_at
+            .checked_add(REPAIR_HINT_MIN_AGE)
+            .unwrap_or(mature_hinted_at);
 
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             mature_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             same_epoch_key,
             &close_group,
             CURRENT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             stable_churn_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             evicted_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
+        ));
+        assert!(repair_proofs.record_replica_hint_sent_at(
+            challenged_peer,
+            fresh_hint_key,
+            &close_group,
+            HINT_EPOCH,
+            now,
         ));
 
         let sampled_key_groups = vec![
@@ -1413,18 +1441,20 @@ mod tests {
             (missing_proof_key, close_group.clone()),
             (stable_churn_key, changed_close_group),
             (evicted_key, evicted_close_group),
+            (fresh_hint_key, close_group.clone()),
         ];
         let peer_keys = mature_audit_keys_for_peer(
             &challenged_peer,
             sampled_key_groups,
             &mut repair_proofs,
             CURRENT_EPOCH,
+            now,
         );
 
         assert_eq!(
             peer_keys,
             vec![mature_key, stable_churn_key],
-            "mature proofs for stable close-group peers should become audit keys, while same-epoch, missing, and evicted-peer proofs should not"
+            "mature proofs for stable close-group peers should become audit keys, while same-epoch, fresh, missing, and evicted-peer proofs should not"
         );
     }
 
