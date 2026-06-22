@@ -28,6 +28,7 @@ pub mod scheduling;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,9 +38,11 @@ use std::pin::Pin;
 use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
+use lru::LruCache;
+use parking_lot::Mutex;
 use rand::Rng;
-use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
-use tokio::task::JoinHandle;
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore, TryAcquireError};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
@@ -52,8 +55,8 @@ use crate::replication::config::{
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
-    FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
-    VerificationResponse,
+    FreshReplicationResponse, NeighborSyncResponse, OverloadedNotice, ReplicationMessage,
+    ReplicationMessageBody, VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::scheduling::ReplicationQueues;
@@ -71,6 +74,122 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
+
+/// Maximum inbound replication request handlers allowed to run in parallel.
+///
+/// Handlers can perform LMDB scans, full-chunk reads, payment verification, and
+/// audit digest generation. Running them behind the receive loop creates
+/// head-of-line blocking where one slow request can make unrelated
+/// request-response callers time out.
+const MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS: usize = 16;
+
+/// Maximum inbound replication request handlers allowed from one peer.
+///
+/// A single peer can issue several offers for the same key concurrently within
+/// this budget. That is safe and cheap: chunk storage is idempotent, and the
+/// expensive part of payment verification (the on-chain pool closeness/payment
+/// lookup) is single-flighted per pool inside [`PaymentVerifier`], so duplicate
+/// concurrent offers do not duplicate on-chain work.
+///
+/// Kept strictly below half of [`MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS`]
+/// so no single peer can occupy the majority of global handler capacity:
+/// saturating the receiver now takes at least three distinct peers, preserving
+/// fairness for the close group under a one-peer burst.
+const MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS_PER_PEER: usize = 6;
+
+// Enforce the fairness invariant documented above at compile time so a future
+// tuning change cannot silently let one peer monopolize global capacity.
+const _: () = assert!(
+    MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS_PER_PEER * 2
+        < MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS,
+    "per-peer inbound cap must stay below half the global cap"
+);
+
+/// Maximum overload response tasks tracked separately from accepted handlers.
+const MAX_CONCURRENT_INBOUND_OVERLOAD_RESPONSES: usize = 32;
+
+/// Reason sent to request-response callers when the global inbound cap is hit.
+const INBOUND_REPLICATION_OVERLOADED_REASON: &str = "inbound replication handler capacity exceeded";
+
+/// Reason sent to request-response callers when their peer-specific cap is hit.
+const INBOUND_REPLICATION_PEER_OVERLOADED_REASON: &str =
+    "inbound replication per-peer handler capacity exceeded";
+
+fn is_inbound_replication_overloaded_reason(reason: &str) -> bool {
+    reason == INBOUND_REPLICATION_OVERLOADED_REASON
+        || reason == INBOUND_REPLICATION_PEER_OVERLOADED_REASON
+}
+
+/// Maximum consecutive "overloaded" responses honored from a single peer before
+/// the claim is treated as a normal failure.
+///
+/// The overload reason is an unauthenticated string in a peer's response, so a
+/// misbehaving peer could otherwise return it indefinitely to dodge audit
+/// failures and fetch trust penalties. Honoring a short run of consecutive
+/// claims still exempts a peer under a brief genuine load spike; beyond that the
+/// peer is held accountable. The counter resets on any non-overload response on
+/// the same path.
+///
+/// The audit and fetch paths each keep their own [`OverloadClaimTracker`], so
+/// this budget is enforced independently per path. The trackers are
+/// deliberately *not* shared: `record_normal_response` clears a peer's entire
+/// streak, so a shared tracker would let a peer keep its audit-overload streak
+/// permanently fresh simply by returning ordinary (non-overload) responses on
+/// the fetch path — defeating the audit-dodge bound this constant exists to
+/// enforce.
+const MAX_CONSECUTIVE_OVERLOAD_CLAIMS: u32 = 5;
+
+/// Capacity of the per-peer overload-claim tracker. Bounds memory under peer
+/// churn; evicting a stale peer at worst restarts its (already near-exhausted)
+/// budget, which is harmless.
+const OVERLOAD_CLAIM_TRACKER_CAPACITY: usize = 1024;
+
+/// Per-peer budget that bounds how often a peer's "overloaded" response is
+/// honored before it is treated as a normal failure.
+///
+/// The audit and fetch paths each own a separate instance (behind an `Arc`):
+/// they are the request initiators that would otherwise grant an
+/// unauthenticated, indefinite accountability exemption to any peer that simply
+/// echoes the overload reason. They are kept separate rather than shared so a
+/// non-overload response on one path cannot reset the streak that bounds claims
+/// on the other (see [`MAX_CONSECUTIVE_OVERLOAD_CLAIMS`]). The prune-audit path
+/// does not use this tracker: an overload there only makes us keep our own
+/// replica, which has no evasion value.
+pub(crate) struct OverloadClaimTracker {
+    /// Consecutive overload claims per peer (reset on any normal response).
+    consecutive: Mutex<LruCache<PeerId, u32>>,
+}
+
+impl OverloadClaimTracker {
+    pub(crate) fn new() -> Self {
+        let capacity =
+            NonZeroUsize::new(OVERLOAD_CLAIM_TRACKER_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            consecutive: Mutex::new(LruCache::new(capacity)),
+        }
+    }
+
+    /// Record an overload claim from `peer` and report whether to honor it.
+    ///
+    /// Returns `true` while the peer is within its consecutive-claim budget
+    /// (treat the overload as a neutral deferral), `false` once the budget is
+    /// exceeded (treat it as a normal failure).
+    pub(crate) fn honor_overload_claim(&self, peer: &PeerId) -> bool {
+        let mut map = self.consecutive.lock();
+        // `get` promotes the peer's recency so active claimers are not evicted
+        // mid-streak; an absent peer starts a fresh streak at 1.
+        let count = map.get(peer).copied().unwrap_or(0).saturating_add(1);
+        map.put(*peer, count);
+        count <= MAX_CONSECUTIVE_OVERLOAD_CLAIMS
+    }
+
+    /// Reset a peer's consecutive-overload counter after any non-overload
+    /// response, so an occasional genuine overload never accumulates toward the
+    /// budget.
+    pub(crate) fn record_normal_response(&self, peer: &PeerId) {
+        self.consecutive.lock().pop(peer);
+    }
+}
 
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::ClientPut
@@ -95,8 +214,189 @@ struct VerificationCycleContext<'a> {
     bootstrap_complete_notify: &'a Arc<Notify>,
 }
 
+#[derive(Clone)]
+struct InboundReplicationHandlerContext {
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<LmdbStorage>,
+    paid_list: Arc<PaidList>,
+    payment_verifier: Arc<PaymentVerifier>,
+    queues: Arc<RwLock<ReplicationQueues>>,
+    config: Arc<ReplicationConfig>,
+    is_bootstrapping: Arc<RwLock<bool>>,
+    bootstrap_state: Arc<RwLock<BootstrapState>>,
+    sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    sync_cycle_epoch: Arc<RwLock<u64>>,
+    repair_proofs: Arc<RwLock<RepairProofs>>,
+}
+
+impl InboundReplicationHandlerContext {
+    async fn handle(&self, source: PeerId, payload: Vec<u8>, rr_message_id: Option<String>) {
+        if let Err(e) = handle_replication_message(
+            &source,
+            &payload,
+            &self.p2p_node,
+            &self.storage,
+            &self.paid_list,
+            &self.payment_verifier,
+            &self.queues,
+            &self.config,
+            &self.is_bootstrapping,
+            &self.bootstrap_state,
+            &self.sync_history,
+            &self.sync_cycle_epoch,
+            &self.repair_proofs,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!("Replication message from {source} error: {e}");
+        }
+    }
+
+    async fn send_overloaded_response(
+        &self,
+        source: PeerId,
+        payload: Vec<u8>,
+        rr_message_id: String,
+        reason: &'static str,
+    ) {
+        let msg = match ReplicationMessage::decode(&payload) {
+            Ok(msg) => msg,
+            Err(e) => {
+                debug!("Failed to decode overloaded replication request from {source}: {e}");
+                return;
+            }
+        };
+        let Some(body) = overloaded_response_body(&msg.body, reason) else {
+            return;
+        };
+        send_replication_response(
+            &source,
+            &self.p2p_node,
+            msg.request_id,
+            body,
+            Some(&rr_message_id),
+        )
+        .await;
+    }
+}
+
+fn overloaded_response_body(
+    request: &ReplicationMessageBody,
+    reason: &str,
+) -> Option<ReplicationMessageBody> {
+    match request {
+        // Defensive: fresh offers are normally sent fire-and-forget over the
+        // gossip topic (no `rr_message_id`), so `spawn_inbound_overloaded_response`
+        // drops them before reaching here and this arm is not exercised in
+        // practice. It is kept so that an offer arriving over request-response
+        // would still receive a typed rejection rather than time out.
+        ReplicationMessageBody::FreshReplicationOffer(offer) => Some(
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: reason.to_string(),
+            }),
+        ),
+        ReplicationMessageBody::FetchRequest(request) => Some(
+            ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Error {
+                key: request.key,
+                reason: reason.to_string(),
+            }),
+        ),
+        ReplicationMessageBody::AuditChallenge(challenge) => Some(
+            ReplicationMessageBody::AuditResponse(protocol::AuditResponse::Rejected {
+                challenge_id: challenge.challenge_id,
+                reason: reason.to_string(),
+            }),
+        ),
+        // Verification and neighbor sync have no typed neutral rejection that
+        // carries overload. Empty success-shaped responses would be misread as
+        // real work, while no response would be charged as a timeout. A
+        // dedicated notice lets callers classify overload as a neutral deferral.
+        ReplicationMessageBody::VerificationRequest(_)
+        | ReplicationMessageBody::NeighborSyncRequest(_) => {
+            Some(ReplicationMessageBody::Overloaded(OverloadedNotice {
+                reason: reason.to_string(),
+            }))
+        }
+        ReplicationMessageBody::PaidNotify(_)
+        | ReplicationMessageBody::FreshReplicationResponse(_)
+        | ReplicationMessageBody::NeighborSyncResponse(_)
+        | ReplicationMessageBody::VerificationResponse(_)
+        | ReplicationMessageBody::FetchResponse(_)
+        | ReplicationMessageBody::AuditResponse(_)
+        | ReplicationMessageBody::Overloaded(_) => None,
+    }
+}
+
+fn spawn_inbound_overloaded_response(
+    overload_responses: &mut JoinSet<()>,
+    overload_semaphore: &Arc<Semaphore>,
+    context: &InboundReplicationHandlerContext,
+    source: PeerId,
+    payload: Vec<u8>,
+    rr_message_id: Option<String>,
+    reason: &'static str,
+) {
+    let Some(rr_message_id) = rr_message_id else {
+        // Gossip-topic requests (fresh offers, paid notifies) are
+        // fire-and-forget: there is no reply channel to carry an overload
+        // rejection, so the request is simply dropped under load. Log it so the
+        // drop is observable rather than silent; the sender re-offers later.
+        debug!(
+            "Dropping fire-and-forget replication request from {source} under overload ({reason})"
+        );
+        return;
+    };
+    // A semaphore (not `JoinSet::len()`) bounds the *in-flight* responses:
+    // `len()` also counts finished-but-unjoined tasks, which would otherwise
+    // refuse new responses while the actual in-flight count is low.
+    let Ok(permit) = Arc::clone(overload_semaphore).try_acquire_owned() else {
+        debug!("Dropping overload response to {source}: overload response task limit reached");
+        return;
+    };
+
+    let context = context.clone();
+    overload_responses.spawn(async move {
+        let _permit = permit;
+        context
+            .send_overloaded_response(source, payload, rr_message_id, reason)
+            .await;
+    });
+}
+
+fn prune_idle_inbound_peer_limiters(peer_limiters: &mut HashMap<PeerId, Arc<Semaphore>>) {
+    // An outstanding owned permit holds an `Arc` clone of its limiter, so
+    // `strong_count > 1` exactly means "this peer still has a handler in
+    // flight". Removing only when the count is back to 1 is therefore safe: an
+    // entry is never dropped while a permit is checked out.
+    peer_limiters.retain(|_, limiter| Arc::strong_count(limiter) > 1);
+}
+
+fn has_priority_sync_work(state: &NeighborSyncState) -> bool {
+    !state.priority_order.is_empty()
+}
+
+fn log_inbound_task_result(result: std::result::Result<(), JoinError>, task_label: &str) {
+    match result {
+        Ok(()) => {}
+        Err(e) if e.is_cancelled() => {}
+        Err(e) => warn!("{task_label} panicked: {e}"),
+    }
+}
+
+async fn abort_and_drain_inbound_tasks(tasks: &mut JoinSet<()>, task_label: &str) {
+    tasks.abort_all();
+    while let Some(result) = tasks.join_next().await {
+        log_inbound_task_result(result, task_label);
+    }
+}
+
 /// Fetch worker polling interval in milliseconds.
 const FETCH_WORKER_POLL_MS: u64 = 100;
+
+/// Delay before retrying a fetch source that explicitly reported overload.
+const FETCH_OVERLOAD_RETRY_DELAY_MS: u64 = 250;
 
 /// Verification worker polling interval in milliseconds.
 const VERIFICATION_WORKER_POLL_MS: u64 = 250;
@@ -155,6 +455,15 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
+    /// Bounds repeated "overloaded" responses from a peer on the audit path so
+    /// the unauthenticated overload reason cannot be used to indefinitely dodge
+    /// audit accountability. Kept separate from [`Self::fetch_overload_tracker`]
+    /// so an ordinary fetch response cannot reset an audit-overload streak.
+    audit_overload_tracker: Arc<OverloadClaimTracker>,
+    /// Bounds repeated "overloaded" responses from a peer on the fetch path so a
+    /// source cannot defer a fetch indefinitely. Separate from the audit tracker
+    /// (see [`OverloadClaimTracker`]).
+    fetch_overload_tracker: Arc<OverloadClaimTracker>,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -209,6 +518,8 @@ impl ReplicationEngine {
             sync_trigger: Arc::new(Notify::new()),
             bootstrap_complete_notify: Arc::new(Notify::new()),
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
+            audit_overload_tracker: Arc::new(OverloadClaimTracker::new()),
+            fetch_overload_tracker: Arc::new(OverloadClaimTracker::new()),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
             task_handles: Vec::new(),
@@ -365,25 +676,49 @@ impl ReplicationEngine {
     fn start_message_handler(&mut self) {
         let mut p2p_events = self.p2p_node.subscribe_events();
         let mut dht_events = self.p2p_node.dht_manager().subscribe_events();
-        let p2p = Arc::clone(&self.p2p_node);
-        let storage = Arc::clone(&self.storage);
-        let paid_list = Arc::clone(&self.paid_list);
-        let payment_verifier = Arc::clone(&self.payment_verifier);
-        let queues = Arc::clone(&self.queues);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
-        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
-        let bootstrap_state = Arc::clone(&self.bootstrap_state);
-        let sync_history = Arc::clone(&self.sync_history);
-        let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_trigger = Arc::clone(&self.sync_trigger);
         let sync_state = Arc::clone(&self.sync_state);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let inbound_context = InboundReplicationHandlerContext {
+            p2p_node: Arc::clone(&self.p2p_node),
+            storage: Arc::clone(&self.storage),
+            paid_list: Arc::clone(&self.paid_list),
+            payment_verifier: Arc::clone(&self.payment_verifier),
+            queues: Arc::clone(&self.queues),
+            config: Arc::clone(&self.config),
+            is_bootstrapping: Arc::clone(&self.is_bootstrapping),
+            bootstrap_state: Arc::clone(&self.bootstrap_state),
+            sync_history: Arc::clone(&self.sync_history),
+            sync_cycle_epoch: Arc::clone(&self.sync_cycle_epoch),
+            repair_proofs: Arc::clone(&self.repair_proofs),
+        };
+        let inbound_request_semaphore =
+            Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS));
+        let inbound_overload_semaphore =
+            Arc::new(Semaphore::new(MAX_CONCURRENT_INBOUND_OVERLOAD_RESPONSES));
 
         let handle = tokio::spawn(async move {
+            let mut inbound_handlers = JoinSet::new();
+            let mut overload_responses = JoinSet::new();
+            let mut inbound_peer_limiters: HashMap<PeerId, Arc<Semaphore>> = HashMap::new();
+
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
+                    result = inbound_handlers.join_next(), if !inbound_handlers.is_empty() => {
+                        if let Some(result) = result {
+                            log_inbound_task_result(result, "Inbound replication handler");
+                            prune_idle_inbound_peer_limiters(&mut inbound_peer_limiters);
+                        }
+                    }
+                    result = overload_responses.join_next(), if !overload_responses.is_empty() => {
+                        if let Some(result) = result {
+                            log_inbound_task_result(result, "Inbound replication overload response");
+                        }
+                    }
                     event = p2p_events.recv() => {
                         let Ok(event) = event else { continue };
                         if let P2PEvent::Message {
@@ -396,7 +731,12 @@ impl ReplicationEngine {
                             // and whether it arrived via the /rr/ request-response
                             // path (which wraps payloads in RequestResponseEnvelope).
                             let rr_info = if topic == REPLICATION_PROTOCOL_ID {
-                                Some((data.clone(), None))
+                                // Move the payload — direct (gossip-topic)
+                                // replication messages can carry full chunk
+                                // bytes in a fresh offer, so cloning before
+                                // admission control would copy data we may
+                                // immediately drop when overloaded.
+                                Some((data, None))
                             } else if topic.starts_with(RR_PREFIX)
                                 && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
                             {
@@ -407,29 +747,67 @@ impl ReplicationEngine {
                                 None
                             };
                             if let Some((payload, rr_message_id)) = rr_info {
-                                match handle_replication_message(
-                                    &source,
-                                    &payload,
-                                    &p2p,
-                                    &storage,
-                                    &paid_list,
-                                    &payment_verifier,
-                                    &queues,
-                                    &config,
-                                    &is_bootstrapping,
-                                    &bootstrap_state,
-                                    &sync_history,
-                                    &sync_cycle_epoch,
-                                    &repair_proofs,
-                                    rr_message_id.as_deref(),
-                                ).await {
-                                    Ok(()) => {}
-                                    Err(e) => {
+                                let global_permit =
+                                    match Arc::clone(&inbound_request_semaphore).try_acquire_owned()
+                                    {
+                                        Ok(permit) => permit,
+                                        Err(TryAcquireError::NoPermits) => {
+                                            debug!(
+                                                "Rejecting inbound replication request from {source}: global handler capacity reached"
+                                            );
+                                            spawn_inbound_overloaded_response(
+                                                &mut overload_responses,
+                                                &inbound_overload_semaphore,
+                                                &inbound_context,
+                                                source,
+                                                payload,
+                                                rr_message_id,
+                                                INBOUND_REPLICATION_OVERLOADED_REASON,
+                                            );
+                                            continue;
+                                        }
+                                        Err(TryAcquireError::Closed) => break,
+                                    };
+
+                                let peer_limiter = Arc::clone(
+                                    inbound_peer_limiters
+                                        .entry(source)
+                                        .or_insert_with(|| {
+                                            Arc::new(Semaphore::new(
+                                                MAX_CONCURRENT_INBOUND_REPLICATION_REQUESTS_PER_PEER,
+                                            ))
+                                        }),
+                                );
+                                let peer_permit = match Arc::clone(&peer_limiter).try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(TryAcquireError::NoPermits) => {
                                         debug!(
-                                            "Replication message from {source} error: {e}"
+                                            "Rejecting inbound replication request from {source}: per-peer handler capacity reached"
                                         );
+                                        drop(global_permit);
+                                        spawn_inbound_overloaded_response(
+                                            &mut overload_responses,
+                                            &inbound_overload_semaphore,
+                                            &inbound_context,
+                                            source,
+                                            payload,
+                                            rr_message_id,
+                                            INBOUND_REPLICATION_PEER_OVERLOADED_REASON,
+                                        );
+                                        continue;
                                     }
-                                }
+                                    Err(TryAcquireError::Closed) => break,
+                                };
+                                let context = inbound_context.clone();
+                                let handler_shutdown = shutdown.clone();
+                                inbound_handlers.spawn(async move {
+                                    let _global_permit = global_permit;
+                                    let _peer_permit = peer_permit;
+                                    tokio::select! {
+                                        () = handler_shutdown.cancelled() => {}
+                                        () = context.handle(source, payload, rr_message_id) => {}
+                                    }
+                                });
                             }
                         }
                     }
@@ -456,6 +834,10 @@ impl ReplicationEngine {
                                     .collect::<Vec<_>>();
                                 let new_peers =
                                     new_scoped.iter().copied().collect::<HashSet<_>>();
+                                let removed_peers = old_peers
+                                    .difference(&new_peers)
+                                    .copied()
+                                    .collect::<Vec<_>>();
                                 let entrants = new_scoped
                                     .iter()
                                     .copied()
@@ -477,17 +859,64 @@ impl ReplicationEngine {
                                         "K-closest peers changed, no additional close peers queued, pruned {sync_removals} departed pending sync entries, triggering early neighbor sync"
                                     );
                                 }
+                                for peer in &removed_peers {
+                                    let cleared_capacity = bootstrap::clear_capacity_rejected(
+                                        &inbound_context.bootstrap_state,
+                                        peer,
+                                    )
+                                    .await;
+                                    let cleared_deferred = bootstrap::clear_overload_deferred_sync(
+                                        &inbound_context.bootstrap_state,
+                                        peer,
+                                    )
+                                    .await;
+                                    if cleared_capacity || cleared_deferred {
+                                        check_and_complete_bootstrap(
+                                            &inbound_context.bootstrap_state,
+                                            &inbound_context.queues,
+                                            &inbound_context.is_bootstrapping,
+                                            &bootstrap_complete_notify,
+                                        )
+                                        .await;
+                                    }
+                                }
                                 sync_trigger.notify_one();
                             }
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                let cleared_capacity = bootstrap::clear_capacity_rejected(
+                                    &inbound_context.bootstrap_state,
+                                    &peer_id,
+                                )
+                                .await;
+                                let cleared_deferred = bootstrap::clear_overload_deferred_sync(
+                                    &inbound_context.bootstrap_state,
+                                    &peer_id,
+                                )
+                                .await;
+                                if cleared_capacity || cleared_deferred {
+                                    check_and_complete_bootstrap(
+                                        &inbound_context.bootstrap_state,
+                                        &inbound_context.queues,
+                                        &inbound_context.is_bootstrapping,
+                                        &bootstrap_complete_notify,
+                                    )
+                                    .await;
+                                }
                             }
                             _ => {}
                         }
                     }
                 }
             }
+            abort_and_drain_inbound_tasks(&mut inbound_handlers, "Inbound replication handler")
+                .await;
+            abort_and_drain_inbound_tasks(
+                &mut overload_responses,
+                "Inbound replication overload response",
+            )
+            .await;
             debug!("Replication message handler shut down");
         });
         self.task_handles.push(handle);
@@ -506,16 +935,25 @@ impl ReplicationEngine {
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
             loop {
-                let interval = config.random_neighbor_sync_interval();
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(interval) => {}
-                    () = sync_trigger.notified() => {
-                        debug!("Neighbor sync triggered by topology change");
+                let has_priority_backlog = {
+                    let state = sync_state.read().await;
+                    has_priority_sync_work(&state)
+                };
+                if has_priority_backlog {
+                    debug!("Neighbor sync continuing queued priority sync backlog");
+                } else {
+                    let interval = config.random_neighbor_sync_interval();
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(interval) => {}
+                        () = sync_trigger.notified() => {
+                            debug!("Neighbor sync triggered by topology change");
+                        }
                     }
                 }
                 // Wrap the sync round in a select so shutdown cancels
@@ -535,6 +973,7 @@ impl ReplicationEngine {
                         &repair_proofs,
                         &is_bootstrapping,
                         &bootstrap_state,
+                        &bootstrap_complete_notify,
                     ) => {}
                 }
             }
@@ -576,6 +1015,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
+        let overload_tracker = Arc::clone(&self.audit_overload_tracker);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -598,13 +1038,14 @@ impl ReplicationEngine {
                 let result = {
                     let history = sync_history.read().await;
                     let current_sync_epoch = *sync_cycle_epoch.read().await;
-                    audit::audit_tick_with_repair_proofs(
+                    audit::audit_tick_with_repair_proofs_and_overload_tracker(
                         &p2p,
                         &storage,
                         &config,
                         &history,
                         &repair_proofs,
                         current_sync_epoch,
+                        &overload_tracker,
                         bootstrapping,
                     )
                     .await
@@ -622,13 +1063,14 @@ impl ReplicationEngine {
                         let result = {
                             let history = sync_history.read().await;
                             let current_sync_epoch = *sync_cycle_epoch.read().await;
-                            audit::audit_tick_with_repair_proofs(
+                            audit::audit_tick_with_repair_proofs_and_overload_tracker(
                                 &p2p,
                                 &storage,
                                 &config,
                                 &history,
                                 &repair_proofs,
                                 current_sync_epoch,
+                                &overload_tracker,
                                 bootstrapping,
                             )
                             .await
@@ -652,6 +1094,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let overload_tracker = Arc::clone(&self.fetch_overload_tracker);
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -660,6 +1103,13 @@ impl ReplicationEngine {
             // Each in-flight future yields (key, Option<FetchOutcome>) so we
             // always recover the key — even if the inner task panics.
             let mut in_flight = FuturesUnordered::<FetchFuture>::new();
+            let fetch_context = FetchAttemptContext {
+                p2p_node: Arc::clone(&p2p),
+                storage: Arc::clone(&storage),
+                config: Arc::clone(&config),
+                overload_tracker: Arc::clone(&overload_tracker),
+                shutdown: shutdown.clone(),
+            };
 
             loop {
                 // Fill up to `concurrency` slots from the queue.
@@ -678,35 +1128,12 @@ impl ReplicationEngine {
                         };
                         q.start_fetch(candidate.key, source, candidate.sources.clone());
 
-                        let p2p = Arc::clone(&p2p);
-                        let storage = Arc::clone(&storage);
-                        let config = Arc::clone(&config);
-                        let token = shutdown.clone();
-                        let fetch_key = candidate.key;
-                        in_flight.push(Box::pin(async move {
-                            let handle = tokio::spawn(async move {
-                                // Cancel-aware: abort when the engine shuts down.
-                                tokio::select! {
-                                    () = token.cancelled() => FetchOutcome {
-                                        key: fetch_key,
-                                        result: FetchResult::SourceFailed,
-                                    },
-                                    outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
-                                    ) => outcome,
-                                }
-                            });
-                            match handle.await {
-                                Ok(outcome) => (outcome.key, Some(outcome)),
-                                Err(e) => {
-                                    error!(
-                                        "Fetch task for {} panicked: {e}",
-                                        hex::encode(fetch_key)
-                                    );
-                                    (fetch_key, None)
-                                }
-                            }
-                        }));
+                        in_flight.push(spawn_fetch_attempt(
+                            fetch_context.clone(),
+                            candidate.key,
+                            source,
+                            None,
+                        ));
                     }
                 } // release queues write lock
 
@@ -731,37 +1158,31 @@ impl ReplicationEngine {
                                     q.complete_fetch(&key);
                                     true
                                 }
+                                FetchResult::Deferred => {
+                                    if let Some(source) = q.current_fetch_source(&key) {
+                                        in_flight.push(spawn_fetch_attempt(
+                                            fetch_context.clone(),
+                                            key,
+                                            source,
+                                            Some(Duration::from_millis(
+                                                FETCH_OVERLOAD_RETRY_DELAY_MS,
+                                            )),
+                                        ));
+                                        false
+                                    } else {
+                                        q.complete_fetch(&key);
+                                        true
+                                    }
+                                }
                                 FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
                                     if let Some(next_peer) = q.retry_fetch(&key) {
                                         // Spawn a new fetch task for the next source.
-                                        let p2p = Arc::clone(&p2p);
-                                        let storage = Arc::clone(&storage);
-                                        let config = Arc::clone(&config);
-                                        let token = shutdown.clone();
-                                        let fetch_key = key;
-                                        in_flight.push(Box::pin(async move {
-                                            let handle = tokio::spawn(async move {
-                                                tokio::select! {
-                                                    () = token.cancelled() => FetchOutcome {
-                                                        key: fetch_key,
-                                                        result: FetchResult::SourceFailed,
-                                                    },
-                                                    outcome = execute_single_fetch(
-                                                        p2p, storage, config, fetch_key, next_peer,
-                                                    ) => outcome,
-                                                }
-                                            });
-                                            match handle.await {
-                                                Ok(outcome) => (outcome.key, Some(outcome)),
-                                                Err(e) => {
-                                                    error!(
-                                                        "Fetch task for {} panicked: {e}",
-                                                        hex::encode(fetch_key)
-                                                    );
-                                                    (fetch_key, None)
-                                                }
-                                            }
-                                        }));
+                                        in_flight.push(spawn_fetch_attempt(
+                                            fetch_context.clone(),
+                                            key,
+                                            next_peer,
+                                            None,
+                                        ));
                                         false
                                     } else {
                                         q.complete_fetch(&key);
@@ -871,6 +1292,8 @@ impl ReplicationEngine {
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
+        let sync_state = Arc::clone(&self.sync_state);
+        let sync_trigger = Arc::clone(&self.sync_trigger);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -938,51 +1361,75 @@ impl ReplicationEngine {
                     )
                     .await;
 
-                    bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
-
-                    if let Some(outcome) = outcome {
-                        if !outcome.response.bootstrapping {
-                            record_sent_replica_hints(
-                                peer,
-                                &outcome.sent_replica_hints,
-                                &repair_proofs,
-                                &sync_cycle_epoch,
-                            )
-                            .await;
-                            // Admit hints into verification pipeline.
-                            let outcome = admit_and_queue_hints(
-                                &self_id,
-                                peer,
-                                &outcome.response.replica_hints,
-                                &outcome.response.paid_hints,
-                                &p2p,
-                                &config,
-                                &storage,
-                                &paid_list,
-                                &queues,
-                            )
-                            .await;
-
-                            // Track discovered keys for drain detection.
-                            if !outcome.discovered.is_empty() {
-                                bootstrap::track_discovered_keys(
-                                    &bootstrap_state,
-                                    &outcome.discovered,
+                    match outcome {
+                        neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                            if !outcome.response.bootstrapping {
+                                record_sent_replica_hints(
+                                    peer,
+                                    &outcome.sent_replica_hints,
+                                    &repair_proofs,
+                                    &sync_cycle_epoch,
                                 )
                                 .await;
-                            }
+                                // Admit hints into verification pipeline.
+                                let outcome = admit_and_queue_hints(
+                                    &self_id,
+                                    peer,
+                                    &outcome.response.replica_hints,
+                                    &outcome.response.paid_hints,
+                                    &p2p,
+                                    &config,
+                                    &storage,
+                                    &paid_list,
+                                    &queues,
+                                )
+                                .await;
 
-                            // Record / retire capacity rejections so the
-                            // drain check correctly reflects whether each
-                            // source still owes us re-hinted work after
-                            // queue overflow.
-                            if outcome.capacity_rejected_count > 0 {
-                                bootstrap::note_capacity_rejected(&bootstrap_state, *peer).await;
-                            } else {
-                                bootstrap::clear_capacity_rejected(&bootstrap_state, peer).await;
+                                // Track discovered keys for drain detection.
+                                if !outcome.discovered.is_empty() {
+                                    bootstrap::track_discovered_keys(
+                                        &bootstrap_state,
+                                        &outcome.discovered,
+                                    )
+                                    .await;
+                                }
+
+                                // Record / retire capacity rejections so the
+                                // drain check correctly reflects whether each
+                                // source still owes us re-hinted work after
+                                // queue overflow.
+                                if outcome.capacity_rejected_count > 0 {
+                                    bootstrap::note_capacity_rejected(&bootstrap_state, *peer)
+                                        .await;
+                                } else {
+                                    bootstrap::clear_capacity_rejected(&bootstrap_state, peer)
+                                        .await;
+                                }
                             }
                         }
+                        neighbor_sync::NeighborSyncAttempt::Overloaded => {
+                            debug!(
+                                "Bootstrap sync with {peer} deferred because peer is overloaded"
+                            );
+                            bootstrap::note_overload_deferred_sync(&bootstrap_state, *peer).await;
+                            {
+                                let mut state = sync_state.write().await;
+                                let _ = state.queue_priority_peers(std::iter::once(*peer));
+                            }
+                            sync_trigger.notify_one();
+                        }
+                        neighbor_sync::NeighborSyncAttempt::Failed => {}
                     }
+
+                    // Decrement only after the outcome is fully applied —
+                    // hints admitted, discovered keys tracked, capacity
+                    // rejections / overload deferrals recorded. Decrementing
+                    // earlier opens a window where a concurrent drain check
+                    // (verification cycle, sync round, or DHT-churn handler)
+                    // sees zero pending requests while this peer's just-
+                    // discovered work has not yet been registered, and could
+                    // declare bootstrap drained prematurely.
+                    bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
                 }
             }
 
@@ -1116,7 +1563,8 @@ async fn handle_replication_message(
         | ReplicationMessageBody::NeighborSyncResponse(_)
         | ReplicationMessageBody::VerificationResponse(_)
         | ReplicationMessageBody::FetchResponse(_)
-        | ReplicationMessageBody::AuditResponse(_) => Ok(()),
+        | ReplicationMessageBody::AuditResponse(_)
+        | ReplicationMessageBody::Overloaded(_) => Ok(()),
     }
 }
 
@@ -1745,6 +2193,40 @@ async fn record_sent_replica_hints(
     }
 }
 
+async fn check_and_complete_bootstrap(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+) {
+    let drained = bootstrap_state.read().await.is_drained();
+    if drained {
+        return;
+    }
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
+    }
+}
+
+async fn clear_overload_deferred_sync_and_check_drain(
+    peer: &PeerId,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+) {
+    if bootstrap::clear_overload_deferred_sync(bootstrap_state, peer).await {
+        check_and_complete_bootstrap(
+            bootstrap_state,
+            queues,
+            is_bootstrapping,
+            bootstrap_complete_notify,
+        )
+        .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Neighbor sync round
 // ---------------------------------------------------------------------------
@@ -1763,6 +2245,7 @@ async fn run_neighbor_sync_round(
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    bootstrap_complete_notify: &Arc<Notify>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -1862,75 +2345,150 @@ async fn run_neighbor_sync_round(
             neighbor_sync::sync_with_peer_with_hints(peer, p2p_node, config, bootstrapping, hints)
                 .await;
 
-        if let Some(outcome) = outcome {
-            handle_sync_response(
-                &self_id,
-                peer,
-                &outcome.response,
-                &outcome.sent_replica_hints,
-                p2p_node,
-                config,
-                bootstrapping,
-                bootstrap_state,
-                storage,
-                paid_list,
-                queues,
-                sync_state,
-                sync_history,
-                sync_cycle_epoch,
-                repair_proofs,
-            )
-            .await;
-        } else {
-            // Sync failed -- remove peer and try to fill slot.
-            let replacement = {
-                let mut state = sync_state.write().await;
-                neighbor_sync::handle_sync_failure(&mut state, peer, config.neighbor_sync_cooldown)
-            };
-
-            // Attempt sync with the replacement peer (if one was found).
-            if let Some(replacement_peer) = replacement {
-                let mut replacement_hints = neighbor_sync::build_sync_hints_for_peers(
-                    std::slice::from_ref(&replacement_peer),
-                    storage,
-                    paid_list,
-                    p2p_node,
-                    config.close_group_size,
-                    config.paid_list_close_group_size,
-                )
-                .await;
-                let hints = replacement_hints
-                    .remove(&replacement_peer)
-                    .unwrap_or_default();
-                let replacement_outcome = neighbor_sync::sync_with_peer_with_hints(
-                    &replacement_peer,
+        match outcome {
+            neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                handle_sync_response(
+                    &self_id,
+                    peer,
+                    &outcome.response,
+                    &outcome.sent_replica_hints,
                     p2p_node,
                     config,
                     bootstrapping,
-                    hints,
+                    bootstrap_state,
+                    storage,
+                    paid_list,
+                    queues,
+                    sync_state,
+                    sync_history,
+                    sync_cycle_epoch,
+                    repair_proofs,
                 )
                 .await;
+                clear_overload_deferred_sync_and_check_drain(
+                    peer,
+                    bootstrap_state,
+                    queues,
+                    is_bootstrapping,
+                    bootstrap_complete_notify,
+                )
+                .await;
+            }
+            neighbor_sync::NeighborSyncAttempt::Overloaded => {
+                // The peer answered the deferred bootstrap retry but is still
+                // overloaded. Stop blocking bootstrap drain on it rather than
+                // re-deferring: the neighbor-sync path has no overload-claim
+                // budget, so a reachable peer that always reports overload would
+                // otherwise suspend bootstrap (and therefore audits)
+                // indefinitely. This matches the documented contract on
+                // `note_overload_deferred_sync` ("until that retry completes,
+                // fails, or the peer leaves"). Regular periodic sync still
+                // retries this peer later and will pick up any repair work.
+                clear_overload_deferred_sync_and_check_drain(
+                    peer,
+                    bootstrap_state,
+                    queues,
+                    is_bootstrapping,
+                    bootstrap_complete_notify,
+                )
+                .await;
+            }
+            neighbor_sync::NeighborSyncAttempt::Failed => {
+                // Sync failed -- remove peer and try to fill slot.
+                let replacement = {
+                    let mut state = sync_state.write().await;
+                    neighbor_sync::handle_sync_failure(
+                        &mut state,
+                        peer,
+                        config.neighbor_sync_cooldown,
+                    )
+                };
 
-                if let Some(outcome) = replacement_outcome {
-                    handle_sync_response(
-                        &self_id,
+                // Attempt sync with the replacement peer (if one was found).
+                if let Some(replacement_peer) = replacement {
+                    let mut replacement_hints = neighbor_sync::build_sync_hints_for_peers(
+                        std::slice::from_ref(&replacement_peer),
+                        storage,
+                        paid_list,
+                        p2p_node,
+                        config.close_group_size,
+                        config.paid_list_close_group_size,
+                    )
+                    .await;
+                    let hints = replacement_hints
+                        .remove(&replacement_peer)
+                        .unwrap_or_default();
+                    let replacement_outcome = neighbor_sync::sync_with_peer_with_hints(
                         &replacement_peer,
-                        &outcome.response,
-                        &outcome.sent_replica_hints,
                         p2p_node,
                         config,
                         bootstrapping,
-                        bootstrap_state,
-                        storage,
-                        paid_list,
-                        queues,
-                        sync_state,
-                        sync_history,
-                        sync_cycle_epoch,
-                        repair_proofs,
+                        hints,
                     )
                     .await;
+
+                    match replacement_outcome {
+                        neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                            handle_sync_response(
+                                &self_id,
+                                &replacement_peer,
+                                &outcome.response,
+                                &outcome.sent_replica_hints,
+                                p2p_node,
+                                config,
+                                bootstrapping,
+                                bootstrap_state,
+                                storage,
+                                paid_list,
+                                queues,
+                                sync_state,
+                                sync_history,
+                                sync_cycle_epoch,
+                                repair_proofs,
+                            )
+                            .await;
+                            clear_overload_deferred_sync_and_check_drain(
+                                &replacement_peer,
+                                bootstrap_state,
+                                queues,
+                                is_bootstrapping,
+                                bootstrap_complete_notify,
+                            )
+                            .await;
+                        }
+                        neighbor_sync::NeighborSyncAttempt::Overloaded => {
+                            // See the primary-peer arm above: give up rather
+                            // than re-deferring indefinitely on a replacement
+                            // peer that keeps reporting overload.
+                            clear_overload_deferred_sync_and_check_drain(
+                                &replacement_peer,
+                                bootstrap_state,
+                                queues,
+                                is_bootstrapping,
+                                bootstrap_complete_notify,
+                            )
+                            .await;
+                        }
+                        neighbor_sync::NeighborSyncAttempt::Failed => {
+                            clear_overload_deferred_sync_and_check_drain(
+                                &replacement_peer,
+                                bootstrap_state,
+                                queues,
+                                is_bootstrapping,
+                                bootstrap_complete_notify,
+                            )
+                            .await;
+                        }
+                    }
                 }
+                clear_overload_deferred_sync_and_check_drain(
+                    peer,
+                    bootstrap_state,
+                    queues,
+                    is_bootstrapping,
+                    bootstrap_complete_notify,
+                )
+                .await;
             }
         }
     }
@@ -2108,6 +2666,7 @@ async fn admit_and_queue_hints(
                     tried_sources: HashSet::new(),
                     created_at: now,
                     hint_sender: *source_peer,
+                    inconclusive_rounds: 0,
                 },
             );
             match result {
@@ -2132,6 +2691,7 @@ async fn admit_and_queue_hints(
                 tried_sources: HashSet::new(),
                 created_at: now,
                 hint_sender: *source_peer,
+                inconclusive_rounds: 0,
             },
         );
         match result {
@@ -2179,9 +2739,19 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
     // Evict stale entries that have been pending too long (e.g. unreachable
     // verification targets during a network partition).
-    {
+    let evicted_keys = {
         let mut q = queues.write().await;
-        q.evict_stale(config::PENDING_VERIFY_MAX_AGE);
+        q.evict_stale(config::PENDING_VERIFY_MAX_AGE)
+    };
+    if !evicted_keys.is_empty() {
+        update_bootstrap_after_verification(
+            &evicted_keys,
+            bootstrap_state,
+            queues,
+            is_bootstrapping,
+            bootstrap_complete_notify,
+        )
+        .await;
     }
 
     let pending_keys = {
@@ -2322,7 +2892,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
         // Step 3: Evaluate results — collect outcomes without holding the write
         // lock across paid-list I/O.
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
+        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline, Vec<PeerId>)> =
+            Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
@@ -2333,13 +2904,23 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     continue;
                 };
                 let outcome = quorum::evaluate_key_evidence(key, ev, &targets, config);
-                evaluated.push((*key, outcome, entry.pipeline));
+                // `present_sources` is only consumed by the bootstrap
+                // `QuorumFailed` + replica-pipeline repair branch below, so only
+                // pay for the per-key allocation when that branch can fire.
+                let present_sources = if matches!(outcome, KeyVerificationOutcome::QuorumFailed)
+                    && entry.pipeline == HintPipeline::Replica
+                {
+                    quorum::present_sources_for_key(key, ev, &targets)
+                } else {
+                    Vec::new()
+                };
+                evaluated.push((*key, outcome, entry.pipeline, present_sources));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _) in &evaluated {
+        for (key, outcome, _, _) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -2359,7 +2940,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // paid-only hint can safely repair a missing replica using sources
         // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline) in &evaluated {
+        for (key, outcome, pipeline, _) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
                 && matches!(
                     outcome,
@@ -2380,8 +2961,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Step 5: Update queues with the evaluated outcomes.
+        let bootstrapping = *is_bootstrapping.read().await;
         let mut q = queues.write().await;
-        for (key, outcome, pipeline) in evaluated {
+        for (key, outcome, pipeline, present_sources) in evaluated {
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
@@ -2408,10 +2990,38 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         terminal_keys.push(key);
                     }
                 }
-                KeyVerificationOutcome::QuorumFailed
-                | KeyVerificationOutcome::QuorumInconclusive => {
-                    q.remove_pending(&key);
-                    terminal_keys.push(key);
+                KeyVerificationOutcome::QuorumFailed => {
+                    if bootstrapping
+                        && pipeline == HintPipeline::Replica
+                        && !present_sources.is_empty()
+                    {
+                        // Bootstrap repair must converge even when the
+                        // network is temporarily under-replicated. A present
+                        // holder still has to serve content-address-valid
+                        // bytes before the key leaves the pipeline.
+                        let distance =
+                            crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
+                        let _ = q.promote_pending_to_fetch(key, distance, present_sources);
+                    } else {
+                        q.remove_pending(&key);
+                        terminal_keys.push(key);
+                    }
+                }
+                KeyVerificationOutcome::QuorumInconclusive => {
+                    let rounds = q.record_inconclusive(&key);
+                    if rounds >= config::MAX_INCONCLUSIVE_VERIFY_ROUNDS {
+                        debug!(
+                            "Verification for key {} still inconclusive after {rounds} rounds; abandoning",
+                            hex::encode(key)
+                        );
+                        q.remove_pending(&key);
+                        terminal_keys.push(key);
+                    } else {
+                        debug!(
+                            "Verification for key {} is inconclusive (round {rounds}); leaving pending for retry",
+                            hex::encode(key)
+                        );
+                    }
                 }
             }
         }
@@ -2491,9 +3101,14 @@ async fn complete_bootstrap(
 // ---------------------------------------------------------------------------
 
 /// Result classification for a single fetch attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FetchResult {
     /// Data fetched, integrity-checked, and stored successfully.
     Stored,
+    /// Source is temporarily overloaded within its overload-claim budget; keep
+    /// the fetch in flight and retry without exhausting sources or completing
+    /// bootstrap work.
+    Deferred,
     /// Content-address integrity check failed — do not retry.
     IntegrityFailed,
     /// Source failed (network error or non-success response) — retryable.
@@ -2507,6 +3122,81 @@ struct FetchOutcome {
     result: FetchResult,
 }
 
+#[derive(Clone)]
+struct FetchAttemptContext {
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<LmdbStorage>,
+    config: Arc<ReplicationConfig>,
+    overload_tracker: Arc<OverloadClaimTracker>,
+    shutdown: CancellationToken,
+}
+
+fn classify_fetch_overload_response(
+    source: &PeerId,
+    key: &XorName,
+    reason: &str,
+    overload_tracker: &OverloadClaimTracker,
+) -> FetchResult {
+    if overload_tracker.honor_overload_claim(source) {
+        debug!(
+            "Fetch: peer {source} is overloaded for {} (deferred): {reason}",
+            hex::encode(key)
+        );
+        FetchResult::Deferred
+    } else {
+        warn!(
+            "Fetch: peer {source} exceeded overload-claim budget for {}; trying alternate source",
+            hex::encode(key)
+        );
+        FetchResult::SourceFailed
+    }
+}
+
+fn spawn_fetch_attempt(
+    context: FetchAttemptContext,
+    key: XorName,
+    source: PeerId,
+    retry_delay: Option<Duration>,
+) -> FetchFuture {
+    Box::pin(async move {
+        let fetch_key = key;
+        let handle = tokio::spawn(async move {
+            if let Some(delay) = retry_delay {
+                tokio::select! {
+                    () = context.shutdown.cancelled() => {
+                        return FetchOutcome {
+                            key: fetch_key,
+                            result: FetchResult::SourceFailed,
+                        };
+                    }
+                    () = tokio::time::sleep(delay) => {}
+                }
+            }
+            tokio::select! {
+                () = context.shutdown.cancelled() => FetchOutcome {
+                    key: fetch_key,
+                    result: FetchResult::SourceFailed,
+                },
+                outcome = execute_single_fetch(
+                    context.p2p_node,
+                    context.storage,
+                    context.config,
+                    context.overload_tracker,
+                    fetch_key,
+                    source,
+                ) => outcome,
+            }
+        });
+        match handle.await {
+            Ok(outcome) => (outcome.key, Some(outcome)),
+            Err(e) => {
+                error!("Fetch task for {} panicked: {e}", hex::encode(fetch_key));
+                (fetch_key, None)
+            }
+        }
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 /// Execute a single fetch request against `source` for `key`.
 ///
@@ -2517,6 +3207,7 @@ async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<LmdbStorage>,
     config: Arc<ReplicationConfig>,
+    overload_tracker: Arc<OverloadClaimTracker>,
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
@@ -2560,6 +3251,28 @@ async fn execute_single_fetch(
                     result: FetchResult::SourceFailed,
                 };
             };
+
+            if let ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Error {
+                reason,
+                ..
+            }) = &resp_msg.body
+            {
+                if is_inbound_replication_overloaded_reason(reason) {
+                    let result =
+                        classify_fetch_overload_response(&source, &key, reason, &overload_tracker);
+                    if result == FetchResult::SourceFailed {
+                        p2p_node
+                            .report_trust_event(
+                                &source,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                    }
+                    return FetchOutcome { key, result };
+                }
+            }
+
+            overload_tracker.record_normal_response(&source);
 
             match resp_msg.body {
                 ReplicationMessageBody::FetchResponse(protocol::FetchResponse::Success {
@@ -2673,6 +3386,8 @@ async fn execute_single_fetch(
                     reason,
                     ..
                 }) => {
+                    // Overload errors were already classified and returned
+                    // before this match, so this is a genuine error response.
                     warn!(
                         "Fetch: peer {source} returned error for {}: {reason}",
                         hex::encode(key)
@@ -2851,11 +3566,37 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        audit_failure_clears_bootstrap_claim, first_failed_key_label, fresh_offer_payment_context,
-        paid_notify_payment_context,
+        audit_failure_clears_bootstrap_claim, classify_fetch_overload_response,
+        first_failed_key_label, fresh_offer_payment_context, has_priority_sync_work,
+        is_inbound_replication_overloaded_reason, overloaded_response_body,
+        paid_notify_payment_context, FetchResult, OverloadClaimTracker,
+        INBOUND_REPLICATION_OVERLOADED_REASON, INBOUND_REPLICATION_PEER_OVERLOADED_REASON,
+        MAX_CONSECUTIVE_OVERLOAD_CLAIMS,
     };
     use crate::payment::VerificationContext;
-    use crate::replication::types::AuditFailureReason;
+    use crate::replication::protocol::{
+        AuditChallenge, AuditResponse, FetchRequest, FetchResponse, FreshReplicationOffer,
+        FreshReplicationResponse, NeighborSyncRequest, OverloadedNotice, PaidNotify,
+        ReplicationMessageBody, VerificationRequest,
+    };
+    use crate::replication::types::{AuditFailureReason, NeighborSyncState};
+    use saorsa_core::identity::PeerId;
+
+    const TEST_KEY: [u8; 32] = [0x42; 32];
+    const TEST_NONCE: [u8; 32] = [0; 32];
+    const TEST_CHALLENGED_PEER_ID: [u8; 32] = [1; 32];
+    const TEST_CHALLENGE_ID: u64 = 7;
+
+    #[test]
+    fn priority_sync_backlog_detects_queued_peers() {
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+        assert!(!has_priority_sync_work(&state));
+
+        let peer = PeerId::from_bytes(TEST_CHALLENGED_PEER_ID);
+        assert_eq!(state.queue_priority_peers(std::iter::once(peer)), 1);
+
+        assert!(has_priority_sync_work(&state));
+    }
 
     #[test]
     fn fresh_offer_runs_client_put_payment_checks() {
@@ -2870,6 +3611,199 @@ mod tests {
         assert_eq!(
             paid_notify_payment_context(),
             VerificationContext::PaidListAdmission
+        );
+    }
+
+    #[test]
+    fn inbound_overload_reason_classifier_matches_admission_reasons() {
+        assert!(is_inbound_replication_overloaded_reason(
+            INBOUND_REPLICATION_OVERLOADED_REASON
+        ));
+        assert!(is_inbound_replication_overloaded_reason(
+            INBOUND_REPLICATION_PEER_OVERLOADED_REASON
+        ));
+        assert!(!is_inbound_replication_overloaded_reason(
+            "ordinary replication failure"
+        ));
+    }
+
+    #[test]
+    fn overloaded_response_body_rejects_fresh_offers() {
+        let request = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+            key: TEST_KEY,
+            data: Vec::new(),
+            proof_of_payment: Vec::new(),
+        });
+
+        let response = overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON)
+            .expect("fresh offer should have a rejection response");
+
+        match response {
+            ReplicationMessageBody::FreshReplicationResponse(
+                FreshReplicationResponse::Rejected { key, reason },
+            ) => {
+                assert_eq!(key, TEST_KEY);
+                assert_eq!(reason, INBOUND_REPLICATION_OVERLOADED_REASON);
+            }
+            other => panic!("unexpected overload response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_response_body_returns_fetch_error() {
+        let request = ReplicationMessageBody::FetchRequest(FetchRequest { key: TEST_KEY });
+
+        let response = overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON)
+            .expect("fetch request should have an error response");
+
+        match response {
+            ReplicationMessageBody::FetchResponse(FetchResponse::Error { key, reason }) => {
+                assert_eq!(key, TEST_KEY);
+                assert_eq!(reason, INBOUND_REPLICATION_OVERLOADED_REASON);
+            }
+            other => panic!("unexpected overload response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_response_body_returns_audit_rejection() {
+        let request = ReplicationMessageBody::AuditChallenge(AuditChallenge {
+            challenge_id: TEST_CHALLENGE_ID,
+            nonce: TEST_NONCE,
+            challenged_peer_id: TEST_CHALLENGED_PEER_ID,
+            keys: vec![TEST_KEY],
+        });
+
+        let response = overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON)
+            .expect("audit challenge should have a rejection response");
+
+        match response {
+            ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
+                challenge_id,
+                reason,
+            }) => {
+                assert_eq!(challenge_id, TEST_CHALLENGE_ID);
+                assert_eq!(reason, INBOUND_REPLICATION_OVERLOADED_REASON);
+            }
+            other => panic!("unexpected overload response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_response_body_returns_overloaded_notice_for_verification() {
+        let request = ReplicationMessageBody::VerificationRequest(VerificationRequest {
+            keys: vec![TEST_KEY],
+            paid_list_check_indices: Vec::new(),
+        });
+
+        let response = overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON)
+            .expect("verification request should get an overloaded notice");
+
+        match response {
+            ReplicationMessageBody::Overloaded(OverloadedNotice { reason }) => {
+                assert_eq!(reason, INBOUND_REPLICATION_OVERLOADED_REASON);
+            }
+            other => panic!("unexpected overload response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_response_body_returns_overloaded_notice_for_neighbor_sync() {
+        let request = ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+            replica_hints: vec![TEST_KEY],
+            paid_hints: Vec::new(),
+            bootstrapping: false,
+        });
+
+        let response = overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON)
+            .expect("neighbor sync should get an overloaded notice, not a timeout");
+
+        match response {
+            ReplicationMessageBody::Overloaded(OverloadedNotice { reason }) => {
+                assert_eq!(reason, INBOUND_REPLICATION_OVERLOADED_REASON);
+            }
+            other => panic!("unexpected overload response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overloaded_response_body_ignores_one_way_paid_notify() {
+        let request = ReplicationMessageBody::PaidNotify(PaidNotify {
+            key: TEST_KEY,
+            proof_of_payment: Vec::new(),
+        });
+
+        assert!(
+            overloaded_response_body(&request, INBOUND_REPLICATION_OVERLOADED_REASON).is_none()
+        );
+    }
+
+    #[test]
+    fn overload_tracker_honors_budget_then_penalizes() {
+        let tracker = OverloadClaimTracker::new();
+        let peer = PeerId::from_bytes(TEST_CHALLENGED_PEER_ID);
+
+        // A bounded run of consecutive claims is honored as a neutral deferral.
+        for _ in 0..MAX_CONSECUTIVE_OVERLOAD_CLAIMS {
+            assert!(tracker.honor_overload_claim(&peer));
+        }
+        // The next claim exceeds the budget and must not be honored.
+        assert!(!tracker.honor_overload_claim(&peer));
+    }
+
+    #[test]
+    fn overload_tracker_resets_on_normal_response() {
+        let tracker = OverloadClaimTracker::new();
+        let peer = PeerId::from_bytes(TEST_CHALLENGED_PEER_ID);
+
+        for _ in 0..MAX_CONSECUTIVE_OVERLOAD_CLAIMS {
+            assert!(tracker.honor_overload_claim(&peer));
+        }
+        // A genuine response clears the streak, restoring the full budget.
+        tracker.record_normal_response(&peer);
+        assert!(tracker.honor_overload_claim(&peer));
+    }
+
+    #[test]
+    fn overload_tracker_budget_is_per_peer() {
+        let tracker = OverloadClaimTracker::new();
+        let peer_a = PeerId::from_bytes([1; 32]);
+        let peer_b = PeerId::from_bytes([2; 32]);
+
+        // Exhaust peer_a's budget.
+        for _ in 0..=MAX_CONSECUTIVE_OVERLOAD_CLAIMS {
+            let _ = tracker.honor_overload_claim(&peer_a);
+        }
+        assert!(!tracker.honor_overload_claim(&peer_a));
+        // peer_b is unaffected and keeps its own budget.
+        assert!(tracker.honor_overload_claim(&peer_b));
+    }
+
+    #[test]
+    fn fetch_overload_uses_tracker_budget_then_source_failed() {
+        let tracker = OverloadClaimTracker::new();
+        let peer = PeerId::from_bytes(TEST_CHALLENGED_PEER_ID);
+
+        for _ in 0..MAX_CONSECUTIVE_OVERLOAD_CLAIMS {
+            assert_eq!(
+                classify_fetch_overload_response(
+                    &peer,
+                    &TEST_KEY,
+                    INBOUND_REPLICATION_OVERLOADED_REASON,
+                    &tracker,
+                ),
+                FetchResult::Deferred
+            );
+        }
+
+        assert_eq!(
+            classify_fetch_overload_response(
+                &peer,
+                &TEST_KEY,
+                INBOUND_REPLICATION_OVERLOADED_REASON,
+                &tracker,
+            ),
+            FetchResult::SourceFailed
         );
     }
 

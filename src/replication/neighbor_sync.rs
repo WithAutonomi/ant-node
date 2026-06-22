@@ -43,6 +43,19 @@ pub(crate) struct NeighborSyncOutcome {
     pub(crate) sent_replica_hints: Vec<SentReplicaHint>,
 }
 
+/// Result of attempting one outbound neighbor-sync request.
+#[derive(Debug)]
+pub(crate) enum NeighborSyncAttempt {
+    /// Peer processed the sync and returned a typed response.
+    Completed(NeighborSyncOutcome),
+    /// Request failed, timed out, decoded incorrectly, or returned an
+    /// unexpected response type.
+    Failed,
+    /// Peer explicitly reported inbound replication overload before processing
+    /// the sync request.
+    Overloaded,
+}
+
 /// Prebuilt hint sets for one outbound neighbor-sync exchange.
 #[derive(Debug, Default)]
 pub(crate) struct PeerSyncHints {
@@ -283,12 +296,14 @@ fn select_next_sync_peer(
     now: Instant,
     cooldown: Duration,
 ) -> Option<PeerId> {
-    while let Some(peer) = state.priority_order.pop_front() {
-        if peer_on_cooldown(state, &peer, now, cooldown) {
-            state.remove_peer(&peer);
-            continue;
-        }
-
+    // Priority peers are explicitly queued for prompt attention — newly entered
+    // close-set members, or peers whose bootstrap sync was deferred because they
+    // reported overload. They bypass the periodic-sync cooldown: an
+    // overload-deferred peer blocks bootstrap drain (and hence audits) until it
+    // is re-synced, so skipping it on cooldown could strand drain until the next
+    // cycle. They are still de-duplicated, so a peer is synced at most once per
+    // queueing.
+    if let Some(peer) = state.priority_order.pop_front() {
         state.remove_peer(&peer);
         return Some(peer);
     }
@@ -335,9 +350,12 @@ pub async fn sync_with_peer(
     config: &ReplicationConfig,
     is_bootstrapping: bool,
 ) -> Option<NeighborSyncResponse> {
-    sync_with_peer_with_outcome(peer, p2p_node, storage, paid_list, config, is_bootstrapping)
+    match sync_with_peer_with_outcome(peer, p2p_node, storage, paid_list, config, is_bootstrapping)
         .await
-        .map(|outcome| outcome.response)
+    {
+        NeighborSyncAttempt::Completed(outcome) => Some(outcome.response),
+        NeighborSyncAttempt::Failed | NeighborSyncAttempt::Overloaded => None,
+    }
 }
 
 pub(crate) async fn sync_with_peer_with_outcome(
@@ -347,7 +365,7 @@ pub(crate) async fn sync_with_peer_with_outcome(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
-) -> Option<NeighborSyncOutcome> {
+) -> NeighborSyncAttempt {
     // Build peer-targeted hint sets (Rule 7).
     let mut hints_by_peer = build_sync_hints_for_peers(
         std::slice::from_ref(peer),
@@ -368,7 +386,7 @@ pub(crate) async fn sync_with_peer_with_hints(
     config: &ReplicationConfig,
     is_bootstrapping: bool,
     hints: PeerSyncHints,
-) -> Option<NeighborSyncOutcome> {
+) -> NeighborSyncAttempt {
     let replica_hints = hints
         .sent_replica_hints
         .iter()
@@ -391,7 +409,7 @@ pub(crate) async fn sync_with_peer_with_hints(
         Ok(data) => data,
         Err(e) => {
             warn!("Failed to encode sync request for {peer}: {e}");
-            return None;
+            return NeighborSyncAttempt::Failed;
         }
     };
 
@@ -407,25 +425,38 @@ pub(crate) async fn sync_with_peer_with_hints(
         Ok(resp) => resp,
         Err(e) => {
             debug!("Sync with {peer} failed: {e}");
-            return None;
+            return NeighborSyncAttempt::Failed;
         }
     };
 
     match ReplicationMessage::decode(&response.data) {
-        Ok(decoded) => {
-            if let ReplicationMessageBody::NeighborSyncResponse(resp) = decoded.body {
-                Some(NeighborSyncOutcome {
+        Ok(decoded) => match decoded.body {
+            ReplicationMessageBody::NeighborSyncResponse(resp) => {
+                NeighborSyncAttempt::Completed(NeighborSyncOutcome {
                     response: resp,
                     sent_replica_hints,
                 })
-            } else {
-                warn!("Unexpected response type from {peer} during sync");
-                None
             }
-        }
+            // The peer was too overloaded to process this sync. Treat it as a
+            // neutral non-result: the request-response call already succeeded,
+            // so there is no timeout trust penalty, and the explicit
+            // `Overloaded` outcome avoids recording a false successful sync.
+            // The peer is retried on a later cycle.
+            ReplicationMessageBody::Overloaded(notice) => {
+                debug!(
+                    "Sync with {peer} deferred — peer overloaded: {}",
+                    notice.reason
+                );
+                NeighborSyncAttempt::Overloaded
+            }
+            _ => {
+                warn!("Unexpected response type from {peer} during sync");
+                NeighborSyncAttempt::Failed
+            }
+        },
         Err(e) => {
             warn!("Failed to decode sync response from {peer}: {e}");
-            None
+            NeighborSyncAttempt::Failed
         }
     }
 }
@@ -1037,7 +1068,12 @@ mod tests {
     }
 
     #[test]
-    fn priority_peer_on_cooldown_is_skipped_and_removed_from_snapshot() {
+    fn priority_peer_on_cooldown_is_still_selected_and_removed_from_snapshot() {
+        // Priority peers bypass the periodic-sync cooldown: a peer queued for
+        // priority sync (e.g. an overload-deferred bootstrap retry) is selected
+        // even within its cooldown window so it cannot strand bootstrap drain
+        // until a later cycle. It is still removed from the snapshot once
+        // selected, exactly like any synced peer.
         let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
         let mut state = NeighborSyncState::new_cycle(peers);
         let cooldown = Duration::from_secs(1);
@@ -1047,7 +1083,9 @@ mod tests {
 
         let batch = select_sync_batch(&mut state, 2, cooldown);
 
-        assert_eq!(batch, vec![peer_id_from_byte(1)]);
+        // Priority peer comes first despite cooldown, then the regular-order
+        // peer; the priority peer is consumed from both queues.
+        assert_eq!(batch, vec![priority_peer, peer_id_from_byte(1)]);
         assert!(state.priority_order.is_empty());
         assert!(!state.order.contains(&priority_peer));
     }

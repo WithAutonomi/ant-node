@@ -266,6 +266,22 @@ impl ReplicationQueues {
         Some(entry.pipeline)
     }
 
+    /// Record that `key` resolved as `QuorumInconclusive` this round and return
+    /// the running count of consecutive inconclusive rounds.
+    ///
+    /// Returns `0` if the key is no longer pending (already terminal). The
+    /// caller abandons the key once the count reaches its bound so a key whose
+    /// targets never produce a conclusive answer cannot be re-verified forever.
+    pub fn record_inconclusive(&mut self, key: &XorName) -> u32 {
+        match self.pending_verify.get_mut(key) {
+            Some(entry) => {
+                entry.inconclusive_rounds = entry.inconclusive_rounds.saturating_add(1);
+                entry.inconclusive_rounds
+            }
+            None => 0,
+        }
+    }
+
     /// Remove a key from pending verification.
     pub fn remove_pending(&mut self, key: &XorName) -> Option<VerificationEntry> {
         let removed = self.pending_verify.remove(key);
@@ -348,6 +364,15 @@ impl ReplicationQueues {
                  for retry next cycle",
                 hex::encode(key)
             );
+            // This key reached a conclusive verification outcome (every caller
+            // promotes only verified/failed keys) but cannot move to fetch yet.
+            // Clear any inconclusive streak so a prior run of inconclusive rounds
+            // does not count toward inconclusive abandonment once the entry is
+            // retained — the streak only ever reflects *unbroken* inconclusive
+            // rounds.
+            if let Some(entry) = self.pending_verify.get_mut(&key) {
+                entry.inconclusive_rounds = 0;
+            }
             return false;
         }
         // Capacity confirmed; safe to release the pending slot and enqueue.
@@ -405,6 +430,12 @@ impl ReplicationQueues {
         self.in_flight_fetch.remove(key)
     }
 
+    /// Return the peer currently serving an in-flight fetch.
+    #[must_use]
+    pub fn current_fetch_source(&self, key: &XorName) -> Option<PeerId> {
+        self.in_flight_fetch.get(key).map(|entry| entry.source)
+    }
+
     /// Mark the current fetch attempt as failed and try the next untried source.
     ///
     /// Returns the next source peer if one is available, or `None` if all
@@ -455,21 +486,27 @@ impl ReplicationQueues {
     }
 
     /// Evict stale pending-verification entries older than `max_age`.
-    pub fn evict_stale(&mut self, max_age: Duration) {
+    ///
+    /// Returns the evicted keys so callers that maintain external bookkeeping
+    /// (for example bootstrap drain tracking) can remove those keys from their
+    /// own pending sets.
+    pub fn evict_stale(&mut self, max_age: Duration) -> Vec<XorName> {
         let now = Instant::now();
-        let before = self.pending_verify.len();
+        let mut evicted_keys = Vec::new();
         let pending_per_sender = &mut self.pending_per_sender;
-        self.pending_verify.retain(|_, entry| {
+        self.pending_verify.retain(|key, entry| {
             let fresh = now.duration_since(entry.created_at) < max_age;
             if !fresh {
                 Self::release_sender_slot(pending_per_sender, &entry.hint_sender);
+                evicted_keys.push(*key);
             }
             fresh
         });
-        let evicted = before.saturating_sub(self.pending_verify.len());
+        let evicted = evicted_keys.len();
         if evicted > 0 {
             debug!("Evicted {evicted} stale pending-verification entries");
         }
+        evicted_keys
     }
 
     /// Number of `pending_verify` entries currently attributed to `sender`.
@@ -513,6 +550,7 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             hint_sender: peer_id_from_byte(sender_byte),
+            inconclusive_rounds: 0,
         }
     }
 
@@ -533,6 +571,22 @@ mod tests {
         assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
         assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
         assert_eq!(queues.pending_count(), 1);
+    }
+
+    #[test]
+    fn record_inconclusive_counts_streak_and_reports_zero_when_absent() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x55);
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+
+        assert_eq!(queues.record_inconclusive(&key), 1);
+        assert_eq!(queues.record_inconclusive(&key), 2);
+        assert_eq!(queues.record_inconclusive(&key), 3);
+
+        // Once the key leaves pending, further calls report 0 (no entry to
+        // count) rather than resurrecting state.
+        queues.remove_pending(&key);
+        assert_eq!(queues.record_inconclusive(&key), 0);
     }
 
     #[test]
@@ -856,6 +910,7 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             hint_sender: peer_id_from_byte(1),
+            inconclusive_rounds: 0,
         };
 
         assert!(queues.add_pending_verify(key, entry).admitted());
@@ -875,6 +930,7 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             hint_sender: peer_id_from_byte(2),
+            inconclusive_rounds: 0,
         };
 
         assert!(
@@ -915,6 +971,7 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             hint_sender,
+            inconclusive_rounds: 0,
         };
         assert!(
             queues.add_pending_verify(key, entry).admitted(),

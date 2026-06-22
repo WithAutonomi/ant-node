@@ -427,9 +427,7 @@ pub async fn run_verification_round(
             continue;
         };
 
-        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
-            process_verification_response(&peer, &resp, targets, &mut evidence);
-        }
+        process_peer_verification_message(&peer, msg, targets, &mut evidence);
     }
 
     let elapsed_ms = started.elapsed().as_millis();
@@ -448,6 +446,30 @@ pub async fn run_verification_round(
     }
 
     evidence
+}
+
+fn process_peer_verification_message(
+    peer: &PeerId,
+    msg: ReplicationMessage,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    match msg.body {
+        ReplicationMessageBody::VerificationResponse(resp) => {
+            process_verification_response(peer, &resp, targets, evidence);
+        }
+        ReplicationMessageBody::Overloaded(notice) => {
+            debug!(
+                "Verification request to {peer} deferred because peer is overloaded: {}",
+                notice.reason
+            );
+            mark_peer_unresolved(peer, targets, evidence);
+        }
+        other => {
+            debug!("Unexpected verification response from {peer}: {other:?}");
+            mark_peer_unresolved(peer, targets, evidence);
+        }
+    }
 }
 
 /// Mark all keys for a peer as unresolved (timeout / decode failure).

@@ -114,6 +114,26 @@ pub enum ReplicationMessageBody {
     AuditChallenge(AuditChallenge),
     /// Response to audit challenge.
     AuditResponse(AuditResponse),
+
+    // === Admission control ===
+    /// Sent in place of a typed response when the receiver's inbound handler
+    /// capacity is exhausted and a request type has no natural rejection
+    /// response to carry the overload reason (currently `NeighborSyncRequest`).
+    ///
+    /// Added as the final variant so postcard keeps the discriminants of all
+    /// existing variants byte-identical: a node that predates this variant
+    /// simply fails to decode it and falls back to its neutral
+    /// no-response-received path, rather than misreading another message.
+    Overloaded(OverloadedNotice),
+}
+
+/// Notice that the receiver dropped a request because its inbound replication
+/// handler capacity was exhausted. Carries the human-readable reason for
+/// logging parity with the typed overload rejections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverloadedNotice {
+    /// Human-readable overload reason (for logging only).
+    pub reason: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +618,28 @@ mod tests {
             assert_eq!(resp.results[2].paid, Some(false));
         } else {
             panic!("expected VerificationResponse");
+        }
+    }
+
+    #[test]
+    fn overloaded_notice_roundtrip() {
+        let msg = ReplicationMessage {
+            request_id: 42,
+            body: ReplicationMessageBody::Overloaded(OverloadedNotice {
+                reason: "inbound replication handler capacity exceeded".to_string(),
+            }),
+        };
+        let encoded = msg.encode().expect("encode should succeed");
+        let decoded = ReplicationMessage::decode(&encoded).expect("decode should succeed");
+
+        assert_eq!(decoded.request_id, 42);
+        if let ReplicationMessageBody::Overloaded(notice) = decoded.body {
+            assert_eq!(
+                notice.reason,
+                "inbound replication handler capacity exceeded"
+            );
+        } else {
+            panic!("expected Overloaded");
         }
     }
 

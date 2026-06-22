@@ -19,6 +19,7 @@ use crate::replication::protocol::{
 use crate::replication::types::{
     AuditFailureReason, AuditFailureSummary, FailureEvidence, PeerSyncRecord, RepairProofs,
 };
+use crate::replication::{is_inbound_replication_overloaded_reason, OverloadClaimTracker};
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -86,12 +87,12 @@ pub async fn audit_tick(
     .await
 }
 
-/// Execute one repair-proof-gated audit tick.
+/// Execute one repair-proof-gated audit tick with a fresh overload-claim
+/// tracker.
 ///
-/// This is the production path used by the replication engine. The
-/// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
-/// callers that have not adopted repair proofs remain conservative and do not
-/// audit peers for unproven keys.
+/// This preserves the public helper signature that existed before inbound
+/// overload accounting was added. The replication engine uses the crate-private
+/// tracker-aware helper so overload claim budgets persist across audit ticks.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
@@ -100,6 +101,41 @@ pub async fn audit_tick_with_repair_proofs(
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
     current_sync_epoch: u64,
+    is_bootstrapping: bool,
+) -> AuditTickResult {
+    let overload_tracker = Arc::new(OverloadClaimTracker::new());
+    audit_tick_with_repair_proofs_and_overload_tracker(
+        p2p_node,
+        storage,
+        config,
+        sync_history,
+        repair_proofs,
+        current_sync_epoch,
+        &overload_tracker,
+        is_bootstrapping,
+    )
+    .await
+}
+
+/// Execute one repair-proof-gated audit tick.
+///
+/// This is the production path used by the replication engine. The
+/// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
+/// callers that have not adopted repair proofs remain conservative and do not
+/// audit peers for unproven keys.
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_lines,
+    clippy::too_many_arguments
+)]
+pub(crate) async fn audit_tick_with_repair_proofs_and_overload_tracker(
+    p2p_node: &Arc<P2PNode>,
+    storage: &Arc<LmdbStorage>,
+    config: &ReplicationConfig,
+    sync_history: &HashMap<PeerId, PeerSyncRecord>,
+    repair_proofs: &Arc<RwLock<RepairProofs>>,
+    current_sync_epoch: u64,
+    overload_tracker: &Arc<OverloadClaimTracker>,
     is_bootstrapping: bool,
 ) -> AuditTickResult {
     // Invariant 19: never audit while still bootstrapping.
@@ -264,6 +300,8 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
+            // A cooperative response clears any prior overload streak.
+            overload_tracker.record_normal_response(&challenged_peer);
             // Step 7b: Bootstrapping claim.
             AuditTickResult::BootstrapClaim {
                 peer: challenged_peer,
@@ -285,6 +323,8 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
+            // A cooperative response clears any prior overload streak.
+            overload_tracker.record_normal_response(&challenged_peer);
             verify_digests(
                 &challenged_peer,
                 challenge_id,
@@ -313,6 +353,30 @@ pub async fn audit_tick_with_repair_proofs(
                 )
                 .await;
             }
+            if is_inbound_replication_overloaded_reason(&reason) {
+                // Honor a brief genuine overload, but do not let a peer dodge
+                // the audit indefinitely by always claiming to be overloaded.
+                if overload_tracker.honor_overload_claim(&challenged_peer) {
+                    debug!(
+                        "Audit: challenge deferred by overloaded peer {challenged_peer}: {reason}"
+                    );
+                    return AuditTickResult::Idle;
+                }
+                warn!(
+                    "Audit: peer {challenged_peer} exceeded overload-claim budget; treating challenge rejection as a failure"
+                );
+                return handle_audit_failure(
+                    &challenged_peer,
+                    challenge_id,
+                    &peer_keys,
+                    AuditFailureReason::Rejected,
+                    p2p_node,
+                    config,
+                )
+                .await;
+            }
+            // A genuine (non-overload) rejection clears any prior overload streak.
+            overload_tracker.record_normal_response(&challenged_peer);
             warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
             handle_audit_failure(
                 &challenged_peer,

@@ -21,6 +21,7 @@ use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
 };
+use crate::replication::is_inbound_replication_overloaded_reason;
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -95,6 +96,7 @@ enum PruneAuditStatus {
     Proven,
     Failed,
     Bootstrapping,
+    Overloaded,
 }
 
 #[derive(Debug, Default)]
@@ -1122,6 +1124,7 @@ async fn peer_proves_record(
             report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
             None
         }
+        PruneAuditStatus::Overloaded => None,
     }
 }
 
@@ -1255,6 +1258,13 @@ fn prune_audit_response_status(
             reason,
         }) => {
             if resp_id == challenge_id {
+                if is_inbound_replication_overloaded_reason(&reason) {
+                    debug!(
+                        "Prune audit proof for {} deferred by overloaded peer {peer}: {reason}",
+                        hex::encode(key)
+                    );
+                    return PruneAuditStatus::Overloaded;
+                }
                 warn!(
                     "Prune audit proof for {} rejected by {peer}: {reason}",
                     hex::encode(key)
@@ -1764,6 +1774,31 @@ mod tests {
         assert!(!prune_audit_response_clears_bootstrap_claim(
             PruneAuditStatus::Bootstrapping
         ));
+        assert!(!prune_audit_response_clears_bootstrap_claim(
+            PruneAuditStatus::Overloaded
+        ));
+    }
+
+    #[test]
+    fn prune_audit_overload_rejection_is_neutral() {
+        const TEST_CHALLENGE_ID: u64 = 99;
+        const TEST_KEY_BYTE: u8 = 0xab;
+        const TEST_NONCE: [u8; 32] = [0; 32];
+
+        let peer = peer_id_from_byte(1);
+        let key = key_from_byte(TEST_KEY_BYTE);
+        let decoded = ReplicationMessage {
+            request_id: TEST_CHALLENGE_ID,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
+                challenge_id: TEST_CHALLENGE_ID,
+                reason: crate::replication::INBOUND_REPLICATION_OVERLOADED_REASON.to_string(),
+            }),
+        };
+
+        let status =
+            prune_audit_response_status(decoded, TEST_CHALLENGE_ID, &peer, &key, &TEST_NONCE, &[]);
+
+        assert_eq!(status, PruneAuditStatus::Overloaded);
     }
 
     #[tokio::test]

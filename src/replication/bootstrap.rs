@@ -11,6 +11,7 @@ use crate::logging::{debug, info, warn};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use saorsa_core::identity::PeerId;
 use saorsa_core::DhtNetworkEvent;
 
 use crate::ant_protocol::XorName;
@@ -134,6 +135,12 @@ pub async fn check_bootstrap_drained(
         return false;
     }
 
+    if !state.overload_deferred_sync_peers.is_empty() {
+        let n = state.overload_deferred_sync_peers.len();
+        debug!("Bootstrap NOT drained: {n} peer(s) have overload-deferred sync retries");
+        return false;
+    }
+
     if queues.is_bootstrap_work_empty(&state.pending_keys) {
         state.drained = true;
         info!("Bootstrap drained: all peer requests completed and work queues empty");
@@ -150,10 +157,7 @@ pub async fn check_bootstrap_drained(
 /// [`clear_capacity_rejected`] when the same source's next admission cycle
 /// completes with zero rejections (i.e. the source successfully
 /// re-delivered everything that previously overflowed).
-pub async fn note_capacity_rejected(
-    bootstrap_state: &Arc<RwLock<BootstrapState>>,
-    source: saorsa_core::identity::PeerId,
-) {
+pub async fn note_capacity_rejected(bootstrap_state: &Arc<RwLock<BootstrapState>>, source: PeerId) {
     let mut state = bootstrap_state.write().await;
     if state.capacity_rejected_sources.insert(source) {
         let n = state.capacity_rejected_sources.len();
@@ -172,8 +176,8 @@ pub async fn note_capacity_rejected(
 /// drained" is retired. No-op if the source had no outstanding rejections.
 pub async fn clear_capacity_rejected(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
-    source: &saorsa_core::identity::PeerId,
-) {
+    source: &PeerId,
+) -> bool {
     let mut state = bootstrap_state.write().await;
     if state.capacity_rejected_sources.remove(source) {
         let n = state.capacity_rejected_sources.len();
@@ -181,7 +185,48 @@ pub async fn clear_capacity_rejected(
             "Bootstrap: cleared outstanding capacity rejections for {source} \
              ({n} sources still outstanding)"
         );
+        return true;
     }
+    false
+}
+
+/// Record that `peer` reported overload during the initial bootstrap sync.
+///
+/// The peer has been queued for a later priority neighbor-sync retry. Bootstrap
+/// cannot drain until that retry completes, fails, or the peer leaves the local
+/// close-neighbor set.
+pub async fn note_overload_deferred_sync(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    peer: PeerId,
+) {
+    let mut state = bootstrap_state.write().await;
+    if state.overload_deferred_sync_peers.insert(peer) {
+        let n = state.overload_deferred_sync_peers.len();
+        debug!(
+            "Bootstrap: peer {peer} has an overload-deferred sync retry \
+             ({n} peers outstanding)"
+        );
+    }
+}
+
+/// Clear an outstanding overload-deferred bootstrap sync for `peer`.
+///
+/// Returns `true` when this call removed a blocker and the caller should re-run
+/// the bootstrap drain check.
+pub async fn clear_overload_deferred_sync(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    peer: &PeerId,
+) -> bool {
+    let mut state = bootstrap_state.write().await;
+    if state.overload_deferred_sync_peers.remove(peer) {
+        let n = state.overload_deferred_sync_peers.len();
+        debug!(
+            "Bootstrap: cleared overload-deferred sync retry for {peer} \
+             ({n} peers still outstanding)"
+        );
+        return true;
+    }
+    false
 }
 
 /// Record a set of discovered keys into the bootstrap state for drain tracking.
@@ -247,6 +292,7 @@ mod tests {
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashSet::new(),
+            overload_deferred_sync_peers: HashSet::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -263,6 +309,7 @@ mod tests {
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashSet::new(),
+            overload_deferred_sync_peers: HashSet::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -279,6 +326,7 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
             capacity_rejected_sources: HashSet::new(),
+            overload_deferred_sync_peers: HashSet::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -294,6 +342,7 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
             capacity_rejected_sources: HashSet::new(),
+            overload_deferred_sync_peers: HashSet::new(),
         }));
         let mut queues = ReplicationQueues::new();
 
@@ -305,6 +354,7 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             hint_sender: saorsa_core::identity::PeerId::from_bytes([0u8; 32]),
+            inconclusive_rounds: 0,
         };
         queues.add_pending_verify(xor_name_from_byte(0x01), entry);
 
@@ -405,5 +455,26 @@ mod tests {
 
         clear_capacity_rejected(&state, &source_b).await;
         assert!(check_bootstrap_drained(&state, &queues).await);
+    }
+
+    #[tokio::test]
+    async fn overload_deferred_sync_blocks_until_cleared() {
+        const TEST_PEER_BYTE: u8 = 0xCC;
+
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let peer = PeerId::from_bytes([TEST_PEER_BYTE; 32]);
+
+        note_overload_deferred_sync(&state, peer).await;
+        assert!(
+            !check_bootstrap_drained(&state, &queues).await,
+            "overload-deferred sync must block bootstrap drain"
+        );
+
+        assert!(clear_overload_deferred_sync(&state, &peer).await);
+        assert!(
+            check_bootstrap_drained(&state, &queues).await,
+            "bootstrap should drain once the overload-deferred retry is cleared"
+        );
     }
 }

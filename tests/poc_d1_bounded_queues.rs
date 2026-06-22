@@ -66,6 +66,7 @@ fn entry_from(sender: PeerId) -> VerificationEntry {
         tried_sources: HashSet::new(),
         created_at: Instant::now(),
         hint_sender: sender,
+        inconclusive_rounds: 0,
     }
 }
 

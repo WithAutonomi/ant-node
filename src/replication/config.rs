@@ -166,6 +166,16 @@ const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
 /// Maximum age for pending-verification entries before stale eviction.
 pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
 
+/// Maximum consecutive `QuorumInconclusive` rounds a pending key is retried
+/// before it is abandoned.
+///
+/// A backstop complementing the age-based [`PENDING_VERIFY_MAX_AGE`] eviction:
+/// it bounds wasted re-verification (and per-source pending-slot occupancy) for
+/// keys whose targets never converge — persistently unreachable peers, or peers
+/// that keep replying `Overloaded`, which the network-verify path treats as
+/// neutral and otherwise has no per-peer overload-claim budget to bound.
+pub const MAX_INCONCLUSIVE_VERIFY_ROUNDS: u32 = 10;
+
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 

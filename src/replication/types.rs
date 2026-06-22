@@ -94,6 +94,18 @@ pub struct VerificationEntry {
     pub created_at: Instant,
     /// The peer that originally hinted this key (for source tracking).
     pub hint_sender: PeerId,
+    /// Consecutive verification rounds this key has resolved as
+    /// `QuorumInconclusive`.
+    ///
+    /// Bounds re-verification of keys that never converge — e.g. targets that
+    /// are persistently unreachable or that keep replying `Overloaded` (the
+    /// network-verify path has no per-peer overload-claim budget). The counter
+    /// only ever reflects an *unbroken* inconclusive streak: a conclusive
+    /// outcome normally removes the entry, and on the one path where a verified
+    /// key is retained instead of removed (fetch queue at capacity)
+    /// [`promote_pending_to_fetch`](crate::replication::scheduling::ReplicationQueues::promote_pending_to_fetch)
+    /// resets this field to zero.
+    pub inconclusive_rounds: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -654,6 +666,14 @@ pub struct BootstrapState {
     /// of a global counter prevents one peer's rejection from being
     /// "cleared" by an unrelated peer's clean cycle.
     pub capacity_rejected_sources: HashSet<PeerId>,
+    /// Bootstrap neighbors whose initial sync was explicitly deferred because
+    /// the peer reported inbound overload.
+    ///
+    /// These peers have been queued for a later priority neighbor-sync retry.
+    /// Bootstrap must not drain while this set is non-empty, because otherwise
+    /// an overload response can make the initial bootstrap sync appear complete
+    /// before the retry has a chance to discover repair work.
+    pub overload_deferred_sync_peers: HashSet<PeerId>,
 }
 
 impl BootstrapState {
@@ -665,6 +685,7 @@ impl BootstrapState {
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashSet::new(),
+            overload_deferred_sync_peers: HashSet::new(),
         }
     }
 
@@ -1388,6 +1409,14 @@ mod tests {
             from_default.pending_peer_requests
         );
         assert_eq!(from_new.pending_keys, from_default.pending_keys);
+        assert_eq!(
+            from_new.capacity_rejected_sources,
+            from_default.capacity_rejected_sources
+        );
+        assert_eq!(
+            from_new.overload_deferred_sync_peers,
+            from_default.overload_deferred_sync_peers
+        );
     }
 
     // -- Scenario tests -------------------------------------------------------
