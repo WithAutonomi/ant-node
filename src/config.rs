@@ -116,10 +116,6 @@ pub struct NodeConfig {
     #[serde(default)]
     pub payment: PaymentConfig,
 
-    /// Bootstrap cache configuration for persistent peer storage.
-    #[serde(default)]
-    pub bootstrap_cache: BootstrapCacheConfig,
-
     /// Storage configuration for chunk persistence.
     #[serde(default)]
     pub storage: StorageConfig,
@@ -282,7 +278,6 @@ impl Default for NodeConfig {
             testnet: TestnetConfig::default(),
             upgrade: UpgradeConfig::default(),
             payment: PaymentConfig::default(),
-            bootstrap_cache: BootstrapCacheConfig::default(),
             storage: StorageConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
@@ -406,63 +401,6 @@ const fn default_staged_rollout_hours() -> u64 {
 }
 
 // ============================================================================
-// Bootstrap Cache Configuration
-// ============================================================================
-
-/// Bootstrap cache configuration for persistent peer storage.
-///
-/// The bootstrap cache stores discovered peers across node restarts,
-/// ranking them by quality metrics (success rate, latency, recency).
-/// This reduces dependency on hardcoded bootstrap nodes and enables
-/// faster network reconnection after restarts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BootstrapCacheConfig {
-    /// Enable persistent bootstrap cache.
-    /// Default: true
-    #[serde(default = "default_bootstrap_cache_enabled")]
-    pub enabled: bool,
-
-    /// Directory for cache files.
-    /// Default: `{root_dir}/bootstrap_cache/`
-    #[serde(default)]
-    pub cache_dir: Option<PathBuf>,
-
-    /// Maximum contacts to store in the cache.
-    /// Default: 10,000
-    #[serde(default = "default_bootstrap_max_contacts")]
-    pub max_contacts: usize,
-
-    /// Stale contact threshold in days.
-    /// Contacts older than this are removed during cleanup.
-    /// Default: 7 days
-    #[serde(default = "default_bootstrap_stale_days")]
-    pub stale_threshold_days: u64,
-}
-
-impl Default for BootstrapCacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: default_bootstrap_cache_enabled(),
-            cache_dir: None,
-            max_contacts: default_bootstrap_max_contacts(),
-            stale_threshold_days: default_bootstrap_stale_days(),
-        }
-    }
-}
-
-const fn default_bootstrap_cache_enabled() -> bool {
-    true
-}
-
-const fn default_bootstrap_max_contacts() -> usize {
-    10_000
-}
-
-const fn default_bootstrap_stale_days() -> u64 {
-    7
-}
-
-// ============================================================================
 // Storage Configuration
 // ============================================================================
 
@@ -537,8 +475,6 @@ pub const BOOTSTRAP_PEERS_ENV: &str = "ANT_BOOTSTRAP_PEERS_PATH";
 /// Bootstrap peers loaded from a shipped configuration file.
 ///
 /// This file provides initial peers for first-time network joins.
-/// It is separate from the bootstrap *cache* (which stores quality-ranked
-/// peers discovered at runtime).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BootstrapPeersConfig {
     /// The bootstrap peer socket addresses.
@@ -583,22 +519,35 @@ impl BootstrapPeersConfig {
     /// Returns `None` if no file is found in any location.
     #[must_use]
     pub fn discover() -> Option<(Self, PathBuf)> {
-        let candidates = Self::search_paths();
-        for path in candidates {
-            if path.is_file() {
-                match Self::from_file(&path) {
-                    Ok(config) if !config.peers.is_empty() => return Some((config, path)),
-                    Ok(_) => {}
-                    Err(err) => {
-                        crate::logging::warn!(
-                            "Failed to load bootstrap peers from {}: {err}",
-                            path.display(),
-                        );
-                    }
-                }
+        if let Ok(env_path) = std::env::var(BOOTSTRAP_PEERS_ENV) {
+            return Self::load_non_empty_candidate(PathBuf::from(env_path));
+        }
+
+        for path in Self::search_paths() {
+            if let Some(discovered) = Self::load_non_empty_candidate(path) {
+                return Some(discovered);
             }
         }
+
         None
+    }
+
+    fn load_non_empty_candidate(path: PathBuf) -> Option<(Self, PathBuf)> {
+        if !path.is_file() {
+            return None;
+        }
+
+        match Self::from_file(&path) {
+            Ok(config) if !config.peers.is_empty() => Some((config, path)),
+            Ok(_) => None,
+            Err(err) => {
+                crate::logging::warn!(
+                    "Failed to load bootstrap peers from {}: {err}",
+                    path.display(),
+                );
+                None
+            }
+        }
     }
 
     /// Build the ordered list of candidate paths to search.

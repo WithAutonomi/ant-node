@@ -3,11 +3,11 @@
 //! Round-robin cycle management: snapshot close neighbors, iterate through
 //! them in batches of `NEIGHBOR_SYNC_PEER_COUNT`, exchanging hint sets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
 use rand::Rng;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -20,6 +20,9 @@ use crate::replication::protocol::{
 };
 use crate::replication::types::NeighborSyncState;
 use crate::storage::LmdbStorage;
+
+/// Hint-build duration that is worth surfacing at info level.
+const HINT_BUILD_SLOW_LOG_MS: u128 = 250;
 
 /// Replica hint sent to a peer, with the close-group snapshot used to decide
 /// that hint.
@@ -38,6 +41,16 @@ pub(crate) struct NeighborSyncOutcome {
     pub(crate) response: NeighborSyncResponse,
     /// Replica hints sent to the peer in our request.
     pub(crate) sent_replica_hints: Vec<SentReplicaHint>,
+}
+
+/// Prebuilt hint sets for one outbound neighbor-sync exchange.
+#[derive(Debug, Default)]
+pub(crate) struct PeerSyncHints {
+    /// Replica hints, including the close-group snapshot needed for repair
+    /// proof recording after the request is successfully sent.
+    pub(crate) sent_replica_hints: Vec<SentReplicaHint>,
+    /// Paid-list-only hints for this peer.
+    paid_hints: Vec<XorName>,
 }
 
 /// Build replica hints for a specific peer.
@@ -90,6 +103,110 @@ pub(crate) async fn build_replica_hints_for_peer_with_close_groups(
     hints
 }
 
+/// Build outbound hint sets for a batch of peers with one scan over local
+/// storage and one scan over the paid list.
+pub(crate) async fn build_sync_hints_for_peers(
+    peers: &[PeerId],
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    p2p_node: &Arc<P2PNode>,
+    close_group_size: usize,
+    paid_list_close_group_size: usize,
+) -> HashMap<PeerId, PeerSyncHints> {
+    let started = Instant::now();
+    let target_peers = peers.iter().copied().collect::<HashSet<_>>();
+    let mut hints_by_peer = peers
+        .iter()
+        .copied()
+        .map(|peer| (peer, PeerSyncHints::default()))
+        .collect::<HashMap<_, _>>();
+
+    if peers.is_empty() {
+        return hints_by_peer;
+    }
+
+    let all_keys = match storage.all_keys().await {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read stored keys for batch hint construction: {e}");
+            Vec::new()
+        }
+    };
+    let stored_key_count = all_keys.len();
+
+    let dht = p2p_node.dht_manager();
+    for key in all_keys {
+        let closest = dht
+            .find_closest_nodes_local_with_self(&key, close_group_size)
+            .await;
+        let close_peers = closest.iter().map(|n| n.peer_id).collect::<HashSet<_>>();
+        for peer in close_peers.intersection(&target_peers) {
+            if let Some(peer_hints) = hints_by_peer.get_mut(peer) {
+                peer_hints.sent_replica_hints.push(SentReplicaHint {
+                    key,
+                    close_peers: close_peers.clone(),
+                });
+            }
+        }
+    }
+
+    let all_paid_keys = match paid_list.all_keys() {
+        Ok(keys) => keys,
+        Err(e) => {
+            warn!("Failed to read PaidForList for batch hint construction: {e}");
+            Vec::new()
+        }
+    };
+    let paid_key_count = all_paid_keys.len();
+
+    for key in all_paid_keys {
+        let closest = dht
+            .find_closest_nodes_local_with_self(&key, paid_list_close_group_size)
+            .await;
+        for node in closest {
+            if target_peers.contains(&node.peer_id) {
+                if let Some(peer_hints) = hints_by_peer.get_mut(&node.peer_id) {
+                    peer_hints.paid_hints.push(key);
+                }
+            }
+        }
+    }
+
+    let replica_hint_count = hints_by_peer
+        .values()
+        .map(|hints| hints.sent_replica_hints.len())
+        .sum::<usize>();
+    let paid_hint_count = hints_by_peer
+        .values()
+        .map(|hints| hints.paid_hints.len())
+        .sum::<usize>();
+    let elapsed_ms = started.elapsed().as_millis();
+
+    if elapsed_ms >= HINT_BUILD_SLOW_LOG_MS {
+        info!(
+            target: "ant_node::replication::neighbor_sync",
+            "Slow neighbor-sync hint build: peers={}, stored_keys={}, paid_keys={}, replica_hints={}, paid_hints={}, elapsed_ms={elapsed_ms}",
+            peers.len(),
+            stored_key_count,
+            paid_key_count,
+            replica_hint_count,
+            paid_hint_count,
+        );
+    } else {
+        debug!(
+            target: "ant_node::replication::neighbor_sync",
+            "Neighbor-sync hint build: peers={}, stored_keys={}, paid_keys={}, replica_hints={}, paid_hints={}, elapsed_ms={elapsed_ms}",
+            peers.len(),
+            stored_key_count,
+            paid_key_count,
+            replica_hint_count,
+            paid_hint_count,
+        );
+    }
+
+    hints_by_peer
+}
+
 /// Build paid hints for a specific peer.
 ///
 /// Returns keys from our `PaidForList` that we believe the peer should
@@ -140,8 +257,9 @@ pub async fn snapshot_close_neighbors(
 
 /// Select the next batch of peers for sync from the current cycle.
 ///
-/// Rules 2-3: Scan forward from cursor, skip peers still under cooldown,
-/// fill up to `peer_count` slots.
+/// Priority peers from routing-table churn are drained before the round-robin
+/// cursor. Rules 2-3 then scan forward from cursor, skip peers still under
+/// cooldown, and fill up to `peer_count` slots.
 pub fn select_sync_batch(
     state: &mut NeighborSyncState,
     peer_count: usize,
@@ -150,24 +268,59 @@ pub fn select_sync_batch(
     let mut batch = Vec::new();
     let now = Instant::now();
 
-    while batch.len() < peer_count && state.cursor < state.order.len() {
+    while batch.len() < peer_count {
+        let Some(peer) = select_next_sync_peer(state, now, cooldown) else {
+            break;
+        };
+        batch.push(peer);
+    }
+
+    batch
+}
+
+fn select_next_sync_peer(
+    state: &mut NeighborSyncState,
+    now: Instant,
+    cooldown: Duration,
+) -> Option<PeerId> {
+    while let Some(peer) = state.priority_order.pop_front() {
+        if peer_on_cooldown(state, &peer, now, cooldown) {
+            state.remove_peer(&peer);
+            continue;
+        }
+
+        state.remove_peer(&peer);
+        return Some(peer);
+    }
+
+    while state.cursor < state.order.len() {
         let peer = state.order[state.cursor];
 
         // Check cooldown (Rule 2a): if the peer was synced recently, remove
         // from the snapshot and continue without advancing the cursor (the
         // next element slides into the current cursor position).
-        if let Some(last_sync) = state.last_sync_times.get(&peer) {
-            if now.duration_since(*last_sync) < cooldown {
-                state.order.remove(state.cursor);
-                continue;
-            }
+        if peer_on_cooldown(state, &peer, now, cooldown) {
+            state.order.remove(state.cursor);
+            continue;
         }
 
-        batch.push(peer);
         state.cursor += 1;
+        return Some(peer);
     }
 
-    batch
+    None
+}
+
+fn peer_on_cooldown(
+    state: &NeighborSyncState,
+    peer: &PeerId,
+    now: Instant,
+    cooldown: Duration,
+) -> bool {
+    state
+        .last_sync_times
+        .get(peer)
+        .is_some_and(|last_sync| now.duration_since(*last_sync) < cooldown)
 }
 
 /// Execute a sync session with a single peer.
@@ -209,24 +362,41 @@ pub(crate) async fn sync_with_peer_with_outcome(
     commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> Option<NeighborSyncOutcome> {
     // Build peer-targeted hint sets (Rule 7).
-    let sent_replica_hints = build_replica_hints_for_peer_with_close_groups(
-        peer,
+    let mut hints_by_peer = build_sync_hints_for_peers(
+        std::slice::from_ref(peer),
         storage,
+        paid_list,
         p2p_node,
         config.close_group_size,
+        config.paid_list_close_group_size,
     )
     .await;
-    let replica_hints = sent_replica_hints
+    let hints = hints_by_peer.remove(peer).unwrap_or_default();
+    sync_with_peer_with_hints(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn sync_with_peer_with_hints(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    is_bootstrapping: bool,
+    hints: PeerSyncHints,
+    // ADR-0002: sender's current commitment, piggybacked on the sync request so
+    // the receiver can ingest it (commitment gossip travels on neighbor sync) —
+    // see `NeighborSyncRequest::commitment` and `ingest_peer_commitment`.
+    commitment: Option<crate::replication::commitment::StorageCommitment>,
+) -> Option<NeighborSyncOutcome> {
+    let replica_hints = hints
+        .sent_replica_hints
         .iter()
         .map(|hint| hint.key)
         .collect::<Vec<_>>();
-    let paid_hints =
-        build_paid_hints_for_peer(peer, paid_list, p2p_node, config.paid_list_close_group_size)
-            .await;
+    let sent_replica_hints = hints.sent_replica_hints;
 
     let request = NeighborSyncRequest {
         replica_hints,
-        paid_hints,
+        paid_hints: hints.paid_hints,
         bootstrapping: is_bootstrapping,
         commitment,
     };
@@ -282,42 +452,21 @@ pub(crate) async fn sync_with_peer_with_outcome(
 /// Handle a failed sync attempt: remove peer from snapshot and try to fill
 /// the vacated slot.
 ///
-/// Rule 3: Remove unreachable peer from `NeighborSyncOrder`, attempt to fill
-/// by resuming scan from where rule 2 left off. Applies the same cooldown
-/// filtering as [`select_sync_batch`] to avoid selecting a peer that was
-/// recently synced.
+/// Rule 3: Remove unreachable peer from pending sync state, attempt to fill
+/// by using the same priority-first scan as [`select_sync_batch`]. Applies the
+/// same cooldown filtering to avoid selecting a peer that was recently synced.
 pub fn handle_sync_failure(
     state: &mut NeighborSyncState,
     failed_peer: &PeerId,
     cooldown: Duration,
 ) -> Option<PeerId> {
     // Find and remove the failed peer from the ordering.
-    if let Some(pos) = state.order.iter().position(|p| p == failed_peer) {
-        state.order.remove(pos);
-        // Adjust cursor if removal was before the current cursor position.
-        if pos < state.cursor {
-            state.cursor = state.cursor.saturating_sub(1);
-        }
-    }
+    state.remove_peer(failed_peer);
 
-    // Try to fill the vacated slot, applying cooldown filtering (same as
-    // select_sync_batch Rule 2a).
+    // Try to fill the vacated slot, applying the same priority and cooldown
+    // filtering used by select_sync_batch.
     let now = Instant::now();
-    while state.cursor < state.order.len() {
-        let candidate = state.order[state.cursor];
-
-        if let Some(last_sync) = state.last_sync_times.get(&candidate) {
-            if now.duration_since(*last_sync) < cooldown {
-                state.order.remove(state.cursor);
-                continue;
-            }
-        }
-
-        state.cursor += 1;
-        return Some(candidate);
-    }
-
-    None
+    select_next_sync_peer(state, now, cooldown)
 }
 
 /// Record a successful sync with a peer.
@@ -796,10 +945,9 @@ mod tests {
     }
 
     #[test]
-    fn scenario_38_mid_cycle_peer_join_excluded() {
-        // Peer D joins CloseNeighbors mid-cycle.
-        // D should NOT appear in the current NeighborSyncOrder snapshot.
-        // After cycle completes and a new snapshot is taken, D can be included.
+    fn scenario_38_mid_cycle_peer_join_prioritized() {
+        // Peer D joins CloseNeighbors mid-cycle. It is queued for priority
+        // sync without being inserted into the current round-robin snapshot.
         let peers = vec![
             peer_id_from_byte(0xA),
             peer_id_from_byte(0xB),
@@ -811,29 +959,18 @@ mod tests {
         let _ = select_sync_batch(&mut state, 1, Duration::from_secs(0));
         assert_eq!(state.cursor, 1);
 
-        // Peer D "joins" the network. It should NOT be in the current snapshot.
+        // Peer D "joins" the close-neighbor set. It remains outside the
+        // stable snapshot but is queued ahead of the cursor.
         let peer_d = peer_id_from_byte(0xD);
+        assert_eq!(state.queue_priority_peers([peer_d]), 1);
+        assert!(!state.order.contains(&peer_d));
         assert!(
-            !state.order.contains(&peer_d),
-            "mid-cycle joiner must not appear in the current snapshot"
+            !state.is_cycle_complete(),
+            "pending priority sync keeps the cycle active"
         );
 
-        // Complete the current cycle.
-        let _ = select_sync_batch(&mut state, 2, Duration::from_secs(0));
-        assert!(state.is_cycle_complete());
-
-        // New cycle: now D can be included in the fresh snapshot.
-        let new_peers = vec![
-            peer_id_from_byte(0xA),
-            peer_id_from_byte(0xB),
-            peer_id_from_byte(0xC),
-            peer_d,
-        ];
-        let new_state = NeighborSyncState::new_cycle(new_peers);
-        assert!(
-            new_state.order.contains(&peer_d),
-            "after new snapshot, joiner D should be present"
-        );
+        let batch = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+        assert_eq!(batch, vec![peer_d, peer_id_from_byte(0xB)]);
     }
 
     #[test]
@@ -900,6 +1037,64 @@ mod tests {
 
         // Cycle is complete since all remaining peers were selected.
         assert!(state.is_cycle_complete());
+    }
+
+    #[test]
+    fn priority_peer_in_snapshot_is_not_selected_twice() {
+        let peers = vec![
+            peer_id_from_byte(1),
+            peer_id_from_byte(2),
+            peer_id_from_byte(3),
+        ];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        assert_eq!(state.queue_priority_peers([peer_id_from_byte(2)]), 1);
+
+        let batch = select_sync_batch(&mut state, 2, Duration::from_secs(0));
+
+        assert_eq!(batch, vec![peer_id_from_byte(2), peer_id_from_byte(1)]);
+        assert_eq!(
+            state.order,
+            vec![peer_id_from_byte(1), peer_id_from_byte(3)]
+        );
+        assert_eq!(state.cursor, 1);
+    }
+
+    #[test]
+    fn priority_peer_on_cooldown_is_skipped_and_removed_from_snapshot() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let cooldown = Duration::from_secs(1);
+        let priority_peer = peer_id_from_byte(2);
+        state.last_sync_times.insert(priority_peer, Instant::now());
+        assert_eq!(state.queue_priority_peers([priority_peer]), 1);
+
+        let batch = select_sync_batch(&mut state, 2, cooldown);
+
+        assert_eq!(batch, vec![peer_id_from_byte(1)]);
+        assert!(state.priority_order.is_empty());
+        assert!(!state.order.contains(&priority_peer));
+    }
+
+    #[test]
+    fn failure_replacement_prefers_remaining_priority_peer() {
+        let peers = vec![peer_id_from_byte(1), peer_id_from_byte(2)];
+        let mut state = NeighborSyncState::new_cycle(peers);
+        let first_priority_peer = peer_id_from_byte(3);
+        let second_priority_peer = peer_id_from_byte(4);
+        assert_eq!(
+            state.queue_priority_peers([first_priority_peer, second_priority_peer]),
+            2
+        );
+
+        let batch = select_sync_batch(&mut state, 1, Duration::from_secs(0));
+        assert_eq!(batch, vec![first_priority_peer]);
+
+        let replacement =
+            handle_sync_failure(&mut state, &first_priority_peer, Duration::from_secs(0));
+
+        assert_eq!(replacement, Some(second_priority_peer));
+        assert!(state.priority_order.is_empty());
+        assert_eq!(state.cursor, 0);
     }
 
     #[test]

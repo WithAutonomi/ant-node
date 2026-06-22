@@ -54,7 +54,7 @@ use crate::replication::audit::AuditTickResult;
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
 use crate::replication::config::{
-    max_parallel_fetch, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
@@ -79,6 +79,14 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
+
+fn fresh_offer_payment_context() -> VerificationContext {
+    VerificationContext::ClientPut
+}
+
+fn paid_notify_payment_context() -> VerificationContext {
+    VerificationContext::PaidListAdmission
+}
 
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
@@ -107,6 +115,9 @@ const FETCH_WORKER_POLL_MS: u64 = 100;
 
 /// Verification worker polling interval in milliseconds.
 const VERIFICATION_WORKER_POLL_MS: u64 = 250;
+
+/// Verification cycle duration that is worth surfacing at info level.
+const VERIFICATION_CYCLE_SLOW_LOG_MS: u128 = 500;
 
 /// Standard trust event weight for per-operation success/failure signals.
 ///
@@ -718,13 +729,44 @@ impl ReplicationEngine {
                     dht_event = dht_events.recv() => {
                         let Ok(dht_event) = dht_event else { continue };
                         match dht_event {
-                            DhtNetworkEvent::KClosestPeersChanged { .. } => {
-                                debug!(
-                                    "K-closest peers changed, triggering early neighbor sync"
-                                );
+                            DhtNetworkEvent::KClosestPeersChanged { old, new } => {
+                                let old_peers = old
+                                    .iter()
+                                    .take(config.neighbor_sync_scope)
+                                    .copied()
+                                    .collect::<HashSet<_>>();
+                                let new_scoped = new
+                                    .iter()
+                                    .take(config.neighbor_sync_scope)
+                                    .copied()
+                                    .collect::<Vec<_>>();
+                                let new_peers =
+                                    new_scoped.iter().copied().collect::<HashSet<_>>();
+                                let entrants = new_scoped
+                                    .iter()
+                                    .copied()
+                                    .filter(|peer| !old_peers.contains(peer))
+                                    .collect::<Vec<_>>();
+                                let entrant_count = entrants.len();
+                                let (priority_insertions, sync_removals) = {
+                                    let mut state = sync_state.write().await;
+                                    let sync_removals = state.retain_sync_peers(&new_peers);
+                                    let priority_insertions = state.queue_priority_peers(entrants);
+                                    (priority_insertions, sync_removals)
+                                };
+                                if priority_insertions > 0 {
+                                    debug!(
+                                        "K-closest peers changed, queued {priority_insertions}/{entrant_count} new close peers for priority neighbor sync and pruned {sync_removals} departed pending sync entries"
+                                    );
+                                } else {
+                                    debug!(
+                                        "K-closest peers changed, no additional close peers queued, pruned {sync_removals} departed pending sync entries, triggering early neighbor sync"
+                                    );
+                                }
                                 sync_trigger.notify_one();
                             }
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
+                                sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
                                 // v12: drop the commitment bytes and the
                                 // recent-prover credit so a churn / sybil
@@ -1314,6 +1356,16 @@ impl ReplicationEngine {
                     break;
                 }
 
+                let mut hints_by_peer = neighbor_sync::build_sync_hints_for_peers(
+                    batch,
+                    &storage,
+                    &paid_list,
+                    &p2p,
+                    config.close_group_size,
+                    config.paid_list_close_group_size,
+                )
+                .await;
+
                 for peer in batch {
                     if shutdown.is_cancelled() {
                         break;
@@ -1324,13 +1376,13 @@ impl ReplicationEngine {
 
                     bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
 
-                    let outcome = neighbor_sync::sync_with_peer_with_outcome(
+                    let hints = hints_by_peer.remove(peer).unwrap_or_default();
+                    let outcome = neighbor_sync::sync_with_peer_with_hints(
                         peer,
                         &p2p,
-                        &storage,
-                        &paid_list,
                         &config,
                         bootstrapping,
+                        hints,
                         // Atomically snapshot + mark-gossiped: emitted in the
                         // bootstrap-sync request, so we stay answerable for it
                         // (ADR-0002). One critical section avoids a TOCTOU where a
@@ -1669,11 +1721,18 @@ async fn handle_replication_message(
             // timeout, so an honest auditor is unaffected and only a flooder is
             // throttled (and it cannot starve other peers, since its share is
             // capped per-peer).
+            info!(
+                "Audit challenge received: kind=subtree source={source} request_response={}",
+                rr_message_id.is_some(),
+            );
             let Some(guard) =
                 admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
                     .await
             else {
-                debug!("Subtree audit from {source} dropped: audit-responder capacity reached");
+                warn!(
+                    "Audit challenge reply not sent: kind=subtree response=dropped \
+                     source={source} (audit-responder capacity reached)"
+                );
                 return Ok(());
             };
             let bootstrapping = *is_bootstrapping.read().await;
@@ -1693,7 +1752,8 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
-                send_replication_response(
+                let response_kind = subtree_audit_response_kind(&response);
+                let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
                     request_id,
@@ -1701,6 +1761,19 @@ async fn handle_replication_message(
                     rr_message_id.as_deref(),
                 )
                 .await;
+                if sent {
+                    info!(
+                        "Audit challenge reply sent: kind=subtree response={response_kind} \
+                         source={source} request_response={}",
+                        rr_message_id.is_some(),
+                    );
+                } else {
+                    warn!(
+                        "Audit challenge reply not sent: kind=subtree response={response_kind} \
+                         source={source} request_response={}",
+                        rr_message_id.is_some(),
+                    );
+                }
             });
             Ok(())
         }
@@ -1710,11 +1783,18 @@ async fn handle_replication_message(
             // committed key we can no longer produce. Reads chunk bytes from
             // disk, so likewise spawned off the serial loop (§5) under the same
             // flood-fair admission (codex#1 + codex-r2 A).
+            info!(
+                "Audit challenge received: kind=byte source={source} request_response={}",
+                rr_message_id.is_some(),
+            );
             let Some(guard) =
                 admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
                     .await
             else {
-                debug!("Byte audit from {source} dropped: audit-responder capacity reached");
+                warn!(
+                    "Audit challenge reply not sent: kind=byte response=dropped \
+                     source={source} (audit-responder capacity reached)"
+                );
                 return Ok(());
             };
             let bootstrapping = *is_bootstrapping.read().await;
@@ -1734,7 +1814,8 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
-                send_replication_response(
+                let response_kind = subtree_byte_response_kind(&response);
+                let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
                     request_id,
@@ -1742,6 +1823,19 @@ async fn handle_replication_message(
                     rr_message_id.as_deref(),
                 )
                 .await;
+                if sent {
+                    info!(
+                        "Audit challenge reply sent: kind=byte response={response_kind} \
+                         source={source} request_response={}",
+                        rr_message_id.is_some(),
+                    );
+                } else {
+                    warn!(
+                        "Audit challenge reply not sent: kind=byte response={response_kind} \
+                         source={source} request_response={}",
+                        rr_message_id.is_some(),
+                    );
+                }
             });
             Ok(())
         }
@@ -1824,15 +1918,32 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Rule 7: check responsibility.
-    if !admission::is_responsible(&self_id, &offer.key, p2p_node, config.close_group_size).await {
+    // Mirror the normal PUT path: the advertised key must be the content
+    // address of the supplied bytes before any expensive payment verification.
+    let computed_key = crate::client::compute_address(&offer.data);
+    if computed_key != offer.key {
+        warn!(
+            "Rejecting fresh offer for key {}: content address mismatch, computed {}",
+            hex::encode(offer.key),
+            hex::encode(computed_key),
+        );
+        p2p_node
+            .report_trust_event(
+                source,
+                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+            )
+            .await;
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
                 key: offer.key,
-                reason: "Not responsible for this key".to_string(),
+                reason: format!(
+                    "Content address mismatch: expected {}, computed {}",
+                    hex::encode(offer.key),
+                    hex::encode(computed_key),
+                ),
             }),
             rr_message_id,
         )
@@ -1840,17 +1951,68 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier. This is an already-settled
-    // receipt handed over by a neighbour, not a live sale — Replication
-    // context skips the storer-being-paid-now checks (own-quote price
-    // freshness, local recipient, merkle candidate closeness) that would
-    // otherwise reject every honest hand-over once counts grow, the close
-    // group churns, or the live DHT drifts from the pool's original sample.
+    // Rule 7: check storage admission. Fresh chunk receivers accept the close
+    // group plus a small margin to absorb local routing-table disagreement.
+    if !admission::is_responsible(
+        &self_id,
+        &offer.key,
+        p2p_node,
+        storage_admission_width(config.close_group_size),
+    )
+    .await
+    {
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: "Not in storage-admission range for this key".to_string(),
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Disk-space pre-check — mirror the PUT handler (V2-411). A full node can
+    // never store this record, so reject it before the expensive payment
+    // verification (EVM on-chain query / merkle pool work) rather than verifying
+    // and only then failing at `storage.put` below. Reuses the cached capacity
+    // check (passing results only, so freed space is detected promptly), and the
+    // store path keeps its own check as defence-in-depth.
+    if let Err(e) = storage.check_capacity() {
+        info!(
+            target: "ant_node::storage::disk_precheck",
+            key = %hex::encode(offer.key),
+            "Rejecting fresh replication offer before payment verification: {e}"
+        );
+        send_replication_response(
+            source,
+            p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: e.to_string(),
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    }
+
+    // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
+    // part of the immediate write fan-out: this receiver is about to store the
+    // record as if the client had PUT it here directly. Storage admission
+    // was checked above before proof work. ClientPut verification applies
+    // store-strength cache semantics, paid-quote issuer K-closeness and local
+    // price floor checks for single-node proofs, and merkle candidate
+    // closeness for merkle proofs.
     match payment_verifier
         .verify_payment(
             &offer.key,
             Some(&offer.proof_of_payment),
-            VerificationContext::Replication,
+            fresh_offer_payment_context(),
         )
         .await
     {
@@ -1925,7 +2087,7 @@ async fn handle_fresh_offer(
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
                         key: offer.key,
-                        reason: format!("Storage error: {e}"),
+                        reason: e.to_string(),
                     },
                 ),
                 rr_message_id,
@@ -1964,13 +2126,15 @@ async fn handle_paid_notify(
         return Ok(());
     }
 
-    // Gap 1: Validate PoP via PaymentVerifier. Same as the fresh-offer path:
-    // a settled receipt, so Replication context (see VerificationContext).
+    // Gap 1: Validate PoP via PaymentVerifier. PaidNotify admits fresh
+    // paid-list metadata, so local paid-list close-group membership was checked
+    // above before proof work. The verifier then runs the same payment proof
+    // checks as ClientPut while writing a paid-list-strength cache entry.
     match payment_verifier
         .verify_payment(
             &notify.key,
             Some(&notify.proof_of_payment),
-            VerificationContext::Replication,
+            paid_notify_payment_context(),
         )
         .await
     {
@@ -2213,6 +2377,13 @@ async fn handle_audit_challenge_msg(
 ) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
+    info!(
+        "Audit challenge received: kind=responsible keys={} bootstrapping={} request_response={}",
+        challenge.keys.len(),
+        is_bootstrapping,
+        rr_message_id.is_some(),
+    );
+
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
@@ -2221,8 +2392,9 @@ async fn handle_audit_challenge_msg(
         stored_chunks,
     )
     .await;
+    let response_kind = audit_response_kind(&response);
 
-    send_replication_response(
+    let sent = send_replication_response_checked(
         source,
         p2p_node,
         request_id,
@@ -2230,8 +2402,47 @@ async fn handle_audit_challenge_msg(
         rr_message_id,
     )
     .await;
+    if sent {
+        info!(
+            "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
+            response_kind,
+            challenge.keys.len(),
+            rr_message_id.is_some(),
+        );
+    } else {
+        warn!(
+            "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
+            response_kind,
+            challenge.keys.len(),
+            rr_message_id.is_some(),
+        );
+    }
 
     Ok(())
+}
+
+fn audit_response_kind(response: &protocol::AuditResponse) -> &'static str {
+    match response {
+        protocol::AuditResponse::Digests { .. } => "digests",
+        protocol::AuditResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::AuditResponse::Rejected { .. } => "rejected",
+    }
+}
+
+fn subtree_audit_response_kind(response: &protocol::SubtreeAuditResponse) -> &'static str {
+    match response {
+        protocol::SubtreeAuditResponse::Proof { .. } => "proof",
+        protocol::SubtreeAuditResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::SubtreeAuditResponse::Rejected { .. } => "rejected",
+    }
+}
+
+fn subtree_byte_response_kind(response: &protocol::SubtreeByteResponse) -> &'static str {
+    match response {
+        protocol::SubtreeByteResponse::Items { .. } => "items",
+        protocol::SubtreeByteResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::SubtreeByteResponse::Rejected { .. } => "rejected",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2348,8 +2559,9 @@ async fn run_neighbor_sync_round(
     // prune pass and DHT snapshot so other tasks are not starved.
     let cycle_complete = sync_state.read().await.is_cycle_complete();
     if cycle_complete {
-        // A completed local neighbor-sync cycle matures key-specific repair
-        // proofs recorded in earlier epochs.
+        // A completed local neighbor-sync cycle advances the epoch component
+        // of repair-proof maturity. The per-key wall-clock minimum age is
+        // checked when audits are selected.
         {
             let mut history = sync_history.write().await;
             for record in history.values_mut() {
@@ -2375,6 +2587,8 @@ async fn run_neighbor_sync_round(
             sync_state,
             repair_proofs,
             current_sync_epoch,
+            #[cfg(any(test, feature = "test-utils"))]
+            repair_proof_now: None,
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
         })
@@ -2428,15 +2642,25 @@ async fn run_neighbor_sync_round(
         .current_for_gossip()
         .map(|b| b.commitment().clone());
 
+    let mut hints_by_peer = neighbor_sync::build_sync_hints_for_peers(
+        &batch,
+        storage,
+        paid_list,
+        p2p_node,
+        config.close_group_size,
+        config.paid_list_close_group_size,
+    )
+    .await;
+
     // Sync with each peer in the batch.
     for peer in &batch {
-        let outcome = neighbor_sync::sync_with_peer_with_outcome(
+        let hints = hints_by_peer.remove(peer).unwrap_or_default();
+        let outcome = neighbor_sync::sync_with_peer_with_hints(
             peer,
             p2p_node,
-            storage,
-            paid_list,
             config,
             bootstrapping,
+            hints,
             my_commitment.clone(),
         )
         .await;
@@ -2473,13 +2697,24 @@ async fn run_neighbor_sync_round(
 
             // Attempt sync with the replacement peer (if one was found).
             if let Some(replacement_peer) = replacement {
-                let replacement_outcome = neighbor_sync::sync_with_peer_with_outcome(
-                    &replacement_peer,
-                    p2p_node,
+                let mut replacement_hints = neighbor_sync::build_sync_hints_for_peers(
+                    std::slice::from_ref(&replacement_peer),
                     storage,
                     paid_list,
+                    p2p_node,
+                    config.close_group_size,
+                    config.paid_list_close_group_size,
+                )
+                .await;
+                let hints = replacement_hints
+                    .remove(&replacement_peer)
+                    .unwrap_or_default();
+                let replacement_outcome = neighbor_sync::sync_with_peer_with_hints(
+                    &replacement_peer,
+                    p2p_node,
                     config,
                     bootstrapping,
+                    hints,
                     my_commitment.clone(),
                 )
                 .await;
@@ -2764,6 +2999,7 @@ async fn admit_and_queue_hints(
 /// Run one verification cycle: process pending keys through quorum checks.
 #[allow(clippy::too_many_lines)]
 async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
+    let cycle_started = Instant::now();
     let VerificationCycleContext {
         p2p_node,
         paid_list,
@@ -2793,6 +3029,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     if pending_keys.is_empty() {
         return;
     }
+    let initial_pending_count = pending_keys.len();
 
     let self_id = *p2p_node.peer_id();
 
@@ -2812,9 +3049,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     match pipeline {
                         HintPipeline::PaidOnly => {
                             // Paid-only + local paid state needs one more
-                            // responsibility check outside this lock: if we
-                            // are also in the storage close group, the hint
-                            // can repair a missing replica.
+                            // storage-admission check outside this lock: if we
+                            // are also in the close group plus storage margin,
+                            // the hint can repair a missing replica.
                             local_paid_paid_only_keys.push(*key);
                         }
                         HintPipeline::Replica => {
@@ -2837,8 +3074,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         for key in local_paid_paid_only_keys {
             if storage.exists(&key).unwrap_or(false) {
                 terminal_paid_only.push(key);
-            } else if admission::is_responsible(&self_id, &key, p2p_node, config.close_group_size)
-                .await
+            } else if admission::is_responsible(
+                &self_id,
+                &key,
+                p2p_node,
+                storage_admission_width(config.close_group_size),
+            )
+            .await
             {
                 local_paid_presence_probe_keys.push(key);
             } else {
@@ -2854,6 +3096,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         }
     }
+
+    let local_paid_probe_count = local_paid_presence_probe_keys.len();
+    let keys_needing_network_count = keys_needing_network.len();
 
     // Step 1b: Local paid-list hit for fetch-eligible keys. Per Section 9
     // step 4, authorization succeeds immediately; run a presence-only probe
@@ -3028,9 +3273,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Paid-only hints normally update PaidForList only. If this node is
-        // also storage-responsible for the key, a verified paid-only hint can
-        // safely repair a missing replica using sources from the same
-        // verification round.
+        // also within the storage-admission group for the key, a verified
+        // paid-only hint can safely repair a missing replica using sources
+        // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
         for (key, outcome, pipeline) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
@@ -3040,7 +3285,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         | KeyVerificationOutcome::PaidListVerified { .. }
                 )
                 && !storage.exists(key).unwrap_or(false)
-                && admission::is_responsible(&self_id, key, p2p_node, config.close_group_size).await
+                && admission::is_responsible(
+                    &self_id,
+                    key,
+                    p2p_node,
+                    storage_admission_width(config.close_group_size),
+                )
+                .await
             {
                 paid_only_fetch_keys.insert(*key);
             }
@@ -3065,7 +3316,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // retained as pending until queue drains.
                     } else if fetch_eligible && sources.is_empty() {
                         warn!(
-                            "Verified responsible key {} has no holders (possible data loss)",
+                            "Verified storage-admitted key {} has no holders (possible data loss)",
                             hex::encode(key)
                         );
                         q.remove_pending(&key);
@@ -3094,6 +3345,29 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         bootstrap_complete_notify,
     )
     .await;
+
+    let (pending_after, fetch_after, in_flight_after) = {
+        let q = queues.read().await;
+        (
+            q.pending_count(),
+            q.fetch_queue_count(),
+            q.in_flight_count(),
+        )
+    };
+    let terminal_key_count = terminal_keys.len();
+    let elapsed_ms = cycle_started.elapsed().as_millis();
+
+    if elapsed_ms >= VERIFICATION_CYCLE_SLOW_LOG_MS {
+        info!(
+            target: "ant_node::replication::verification",
+            "Slow replication verification cycle: pending_start={initial_pending_count}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+        );
+    } else {
+        debug!(
+            target: "ant_node::replication::verification",
+            "Replication verification cycle: pending_start={initial_pending_count}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+        );
+    }
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -4370,10 +4644,11 @@ mod tests {
         adaptive_timeout_threshold, apply_audit_failure_credit_revocation,
         audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
         audit_launch_decision, config, cooldown_allows_audit, decide_audit_failure_action,
-        first_failed_key_label, median_timeout_strikes_excluding, plan_failed_audit,
-        record_audit_timeout_strike, timeout_strike_reaches_threshold, AuditFailureAction,
-        AUDIT_TIMEOUT_STRIKE_MAX,
+        first_failed_key_label, fresh_offer_payment_context, median_timeout_strikes_excluding,
+        paid_notify_payment_context, plan_failed_audit, record_audit_timeout_strike,
+        timeout_strike_reaches_threshold, AuditFailureAction, AUDIT_TIMEOUT_STRIKE_MAX,
     };
+    use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
     use crate::replication::types::AuditFailureReason;
     use saorsa_core::identity::PeerId;
@@ -4391,6 +4666,22 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    #[test]
+    fn fresh_offer_runs_client_put_payment_checks() {
+        assert_eq!(
+            fresh_offer_payment_context(),
+            VerificationContext::ClientPut
+        );
+    }
+
+    #[test]
+    fn paid_notify_uses_paid_list_admission_payment_checks() {
+        assert_eq!(
+            paid_notify_payment_context(),
+            VerificationContext::PaidListAdmission
+        );
     }
 
     #[test]

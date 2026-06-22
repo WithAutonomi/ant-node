@@ -54,6 +54,9 @@ pub struct PaidList {
     /// In-memory: when each stored record first went out of
     /// storage-responsibility range.
     record_out_of_range: RwLock<HashMap<XorName, Instant>>,
+    /// Cursor used by paid-list pruning to rotate through expired entries when
+    /// the per-pass remote confirmation cap is exhausted.
+    paid_prune_cursor: RwLock<usize>,
 }
 
 impl PaidList {
@@ -107,6 +110,7 @@ impl PaidList {
             db,
             paid_out_of_range: RwLock::new(HashMap::new()),
             record_out_of_range: RwLock::new(HashMap::new()),
+            paid_prune_cursor: RwLock::new(0),
         };
 
         let count = paid_list.count()?;
@@ -323,6 +327,36 @@ impl PaidList {
     /// Returns `None` if the record is currently in range (no timestamp set).
     pub fn record_out_of_range_since(&self, key: &XorName) -> Option<Instant> {
         self.record_out_of_range.read().get(key).copied()
+    }
+
+    /// Starting offset for the next paid-list prune scan.
+    ///
+    /// LMDB iteration order is stable, so a bounded prune pass must rotate its
+    /// verification window or later expired entries can be starved behind
+    /// earlier unconfirmed entries.
+    pub(crate) fn paid_prune_scan_start(&self, paid_key_count: usize) -> usize {
+        if paid_key_count == 0 {
+            return 0;
+        }
+
+        *self.paid_prune_cursor.read() % paid_key_count
+    }
+
+    /// Advance the paid-list prune cursor after one pass.
+    pub(crate) fn advance_paid_prune_cursor(
+        &self,
+        paid_key_count: usize,
+        scan_start: usize,
+        last_selected_offset: Option<usize>,
+    ) {
+        let mut cursor = self.paid_prune_cursor.write();
+        if paid_key_count == 0 {
+            *cursor = 0;
+            return;
+        }
+
+        let advance_by = last_selected_offset.map_or(1, |offset| offset.saturating_add(1));
+        *cursor = (scan_start + advance_by) % paid_key_count;
     }
 
     /// Remove multiple keys in a single write transaction.
@@ -640,6 +674,52 @@ mod tests {
 
         let removed = pl.remove_batch(&[]).await.expect("remove_batch empty");
         assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn paid_prune_cursor_advances_past_selected_window() {
+        const PAID_KEY_COUNT: usize = 10;
+        const START_CURSOR: usize = 2;
+        const LAST_SELECTED_OFFSET: usize = 3;
+        const EXPECTED_CURSOR: usize = 6;
+
+        let (pl, _temp) = create_test_paid_list().await;
+        *pl.paid_prune_cursor.write() = START_CURSOR;
+
+        let scan_start = pl.paid_prune_scan_start(PAID_KEY_COUNT);
+        pl.advance_paid_prune_cursor(PAID_KEY_COUNT, scan_start, Some(LAST_SELECTED_OFFSET));
+
+        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
+    }
+
+    #[tokio::test]
+    async fn paid_prune_cursor_advances_even_without_selected_entry() {
+        const PAID_KEY_COUNT: usize = 10;
+        const START_CURSOR: usize = 9;
+        const EXPECTED_CURSOR: usize = 0;
+
+        let (pl, _temp) = create_test_paid_list().await;
+        *pl.paid_prune_cursor.write() = START_CURSOR;
+
+        let scan_start = pl.paid_prune_scan_start(PAID_KEY_COUNT);
+        pl.advance_paid_prune_cursor(PAID_KEY_COUNT, scan_start, None);
+
+        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
+    }
+
+    #[tokio::test]
+    async fn paid_prune_cursor_resets_for_empty_paid_list() {
+        const STALE_CURSOR: usize = 7;
+        const EMPTY_PAID_KEY_COUNT: usize = 0;
+        const EXPECTED_CURSOR: usize = 0;
+
+        let (pl, _temp) = create_test_paid_list().await;
+        *pl.paid_prune_cursor.write() = STALE_CURSOR;
+
+        let scan_start = pl.paid_prune_scan_start(EMPTY_PAID_KEY_COUNT);
+        pl.advance_paid_prune_cursor(EMPTY_PAID_KEY_COUNT, scan_start, Some(STALE_CURSOR));
+
+        assert_eq!(*pl.paid_prune_cursor.read(), EXPECTED_CURSOR);
     }
 
     // -- Scenario tests -------------------------------------------------------

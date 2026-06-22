@@ -4,8 +4,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::logging::{debug, info, warn};
+use crate::logging::{debug, enabled, info, warn};
 use rand::seq::SliceRandom;
 use rand::Rng;
 
@@ -51,6 +52,37 @@ pub enum AuditTickResult {
     Idle,
     /// Audit skipped (not enough local keys).
     InsufficientKeys,
+}
+
+/// Format the first challenged key as a short stable correlation label.
+fn first_challenged_key_label(keys: &[XorName]) -> String {
+    keys.first().map_or_else(
+        || "0x".to_string(),
+        |k| format!("0x{}", hex::encode(&k[..8])),
+    )
+}
+
+/// Best-effort coarse class for the transport/request error returned by
+/// `P2PNode::send_request`.
+///
+/// The current core networking layer can wrap request deadline timeouts inside
+/// display strings, so this deliberately remains a bounded heuristic for logs
+/// rather than protocol/trust semantics.
+fn classify_audit_send_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("peer not found") || lower.contains("no channel") {
+        "peer_unavailable"
+    } else if lower.contains("connection") || lower.contains("connect") || lower.contains("dial") {
+        "connection_failed"
+    } else if lower.contains("closed") || lower.contains("dropped") {
+        "connection_closed"
+    } else if lower.contains("transport") {
+        "transport_error"
+    } else {
+        "other"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -167,11 +199,13 @@ pub async fn audit_tick_with_repair_proofs(
 
     let peer_keys = {
         let mut proofs = repair_proofs.write().await;
+        let now = Instant::now();
         mature_audit_keys_for_peer(
             &challenged_peer,
             sampled_key_groups,
             &mut proofs,
             current_sync_epoch,
+            now,
         )
     };
 
@@ -204,18 +238,49 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
+    let encoded_len = encoded.len();
+    let audit_timeout = config.audit_response_timeout(peer_keys.len());
+    let audit_started = Instant::now();
     let response = match p2p_node
         .send_request(
             &challenged_peer,
             REPLICATION_PROTOCOL_ID,
             encoded,
-            config.audit_response_timeout(peer_keys.len()),
+            audit_timeout,
         )
         .await
     {
         Ok(resp) => resp,
         Err(e) => {
-            debug!("Audit: challenge to {challenged_peer} failed: {e}");
+            if enabled!(crate::logging::Level::WARN) {
+                let elapsed = audit_started.elapsed();
+                let send_error = e.to_string();
+                let send_error_class = classify_audit_send_error(&send_error);
+                let first_key = first_challenged_key_label(&peer_keys);
+                warn!(
+                    audit_type = "responsible_chunk",
+                    audit_phase = "challenge_send",
+                    audit_outcome = "send_request_failed",
+                    challenged_peer = %challenged_peer,
+                    challenge_id,
+                    key_count = peer_keys.len(),
+                    timeout_ms = audit_timeout.as_millis(),
+                    elapsed_ms = elapsed.as_millis(),
+                    first_key = %first_key,
+                    encoded_len,
+                    send_error_class,
+                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}",
+                    peer_keys.len(),
+                    audit_timeout.as_millis(),
+                    elapsed.as_millis(),
+                );
+            }
+            debug!(
+                challenged_peer = %challenged_peer,
+                challenge_id,
+                send_error = %e,
+                "Audit challenge raw send_request error"
+            );
             // Timeout — need responsibility confirmation before penalty.
             return handle_audit_timeout(
                 &challenged_peer,
@@ -349,12 +414,19 @@ fn mature_audit_keys_for_peer(
     sampled_key_groups: Vec<(XorName, HashSet<PeerId>)>,
     repair_proofs: &mut RepairProofs,
     current_sync_epoch: u64,
+    now: Instant,
 ) -> Vec<XorName> {
     sampled_key_groups
         .into_iter()
         .filter_map(|(key, close_peers)| {
             repair_proofs
-                .has_mature_replica_hint(challenged_peer, &key, &close_peers, current_sync_epoch)
+                .has_mature_replica_hint(
+                    challenged_peer,
+                    &key,
+                    &close_peers,
+                    current_sync_epoch,
+                    now,
+                )
                 .then_some(key)
         })
         .collect()
@@ -720,6 +792,7 @@ pub async fn handle_audit_challenge(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::config::REPAIR_HINT_MIN_AGE;
     use crate::replication::protocol::compute_audit_digest;
     use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
     use crate::storage::LmdbStorageConfig;
@@ -729,6 +802,46 @@ mod tests {
     /// Simulated stored chunk count for tests. Large enough that the dynamic
     /// incoming audit limit (`2 * sqrt(N)`) never rejects small test challenges.
     const TEST_STORED_CHUNKS: usize = 1_000_000;
+
+    #[test]
+    fn first_challenged_key_label_truncates_to_16_hex_chars() {
+        let mut key = [0u8; 32];
+        key[0] = 0xAB;
+        key[7] = 0xCD;
+        key[8] = 0xEF;
+
+        assert_eq!(first_challenged_key_label(&[key]), "0xab000000000000cd");
+    }
+
+    #[test]
+    fn first_challenged_key_label_falls_back_when_empty() {
+        assert_eq!(first_challenged_key_label(&[]), "0x");
+    }
+
+    #[test]
+    fn classify_audit_send_error_uses_bounded_classes() {
+        assert_eq!(
+            classify_audit_send_error("request to peer timed out after 10s"),
+            "timeout"
+        );
+        assert_eq!(
+            classify_audit_send_error("peer not found in active channels"),
+            "peer_unavailable"
+        );
+        assert_eq!(
+            classify_audit_send_error("dial failed for all candidate addresses"),
+            "connection_failed"
+        );
+        assert_eq!(
+            classify_audit_send_error("response receiver dropped before delivery"),
+            "connection_closed"
+        );
+        assert_eq!(
+            classify_audit_send_error("transport stream error"),
+            "transport_error"
+        );
+        assert_eq!(classify_audit_send_error("unexpected error"), "other");
+    }
 
     /// Create a test `LmdbStorage` backed by a temp directory.
     async fn create_test_storage() -> (LmdbStorage, TempDir) {
@@ -1367,6 +1480,7 @@ mod tests {
         const MISSING_PROOF_KEY_BYTE: u8 = 0xB3;
         const STABLE_CHURN_KEY_BYTE: u8 = 0xB4;
         const EVICTED_KEY_BYTE: u8 = 0xB5;
+        const FRESH_HINT_KEY_BYTE: u8 = 0xB6;
         const XOR_NAME_LEN: usize = 32;
 
         let challenged_peer = peer_id_from_bytes([CHALLENGED_PEER_BYTE; XOR_NAME_LEN]);
@@ -1377,34 +1491,50 @@ mod tests {
         let missing_proof_key = [MISSING_PROOF_KEY_BYTE; XOR_NAME_LEN];
         let stable_churn_key = [STABLE_CHURN_KEY_BYTE; XOR_NAME_LEN];
         let evicted_key = [EVICTED_KEY_BYTE; XOR_NAME_LEN];
+        let fresh_hint_key = [FRESH_HINT_KEY_BYTE; XOR_NAME_LEN];
         let close_group = HashSet::from([challenged_peer, other_peer]);
         let changed_close_group = HashSet::from([challenged_peer, new_peer]);
         let evicted_close_group = HashSet::from([other_peer, new_peer]);
         let mut repair_proofs = RepairProofs::new();
+        let mature_hinted_at = Instant::now();
+        let now = mature_hinted_at
+            .checked_add(REPAIR_HINT_MIN_AGE)
+            .unwrap_or(mature_hinted_at);
 
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             mature_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             same_epoch_key,
             &close_group,
             CURRENT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             stable_churn_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
         ));
-        assert!(repair_proofs.record_replica_hint_sent(
+        assert!(repair_proofs.record_replica_hint_sent_at(
             challenged_peer,
             evicted_key,
             &close_group,
             HINT_EPOCH,
+            mature_hinted_at,
+        ));
+        assert!(repair_proofs.record_replica_hint_sent_at(
+            challenged_peer,
+            fresh_hint_key,
+            &close_group,
+            HINT_EPOCH,
+            now,
         ));
 
         let sampled_key_groups = vec![
@@ -1413,18 +1543,20 @@ mod tests {
             (missing_proof_key, close_group.clone()),
             (stable_churn_key, changed_close_group),
             (evicted_key, evicted_close_group),
+            (fresh_hint_key, close_group.clone()),
         ];
         let peer_keys = mature_audit_keys_for_peer(
             &challenged_peer,
             sampled_key_groups,
             &mut repair_proofs,
             CURRENT_EPOCH,
+            now,
         );
 
         assert_eq!(
             peer_keys,
             vec![mature_key, stable_churn_key],
-            "mature proofs for stable close-group peers should become audit keys, while same-epoch, missing, and evicted-peer proofs should not"
+            "mature proofs for stable close-group peers should become audit keys, while same-epoch, fresh, missing, and evicted-peer proofs should not"
         );
     }
 
