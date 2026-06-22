@@ -146,14 +146,14 @@ const OVERLOAD_CLAIM_TRACKER_CAPACITY: usize = 1024;
 /// Per-peer budget that bounds how often a peer's "overloaded" response is
 /// honored before it is treated as a normal failure.
 ///
-/// The audit and fetch paths each own a separate instance (behind an `Arc`):
-/// they are the request initiators that would otherwise grant an
-/// unauthenticated, indefinite accountability exemption to any peer that simply
+/// Long-lived request initiators each own a separate instance (behind an
+/// `Arc`): audit, fetch, verification, and neighbour-sync can all otherwise
+/// grant an unauthenticated accountability exemption to any peer that simply
 /// echoes the overload reason. They are kept separate rather than shared so a
 /// non-overload response on one path cannot reset the streak that bounds claims
-/// on the other (see [`MAX_CONSECUTIVE_OVERLOAD_CLAIMS`]). The prune-audit path
-/// does not use this tracker: an overload there only makes us keep our own
-/// replica, which has no evasion value.
+/// on another (see [`MAX_CONSECUTIVE_OVERLOAD_CLAIMS`]). Short one-shot prune
+/// verification uses a local tracker because overload there only makes us keep
+/// our own replica.
 pub(crate) struct OverloadClaimTracker {
     /// Consecutive overload claims per peer (reset on any normal response).
     consecutive: Mutex<LruCache<PeerId, u32>>,
@@ -2270,6 +2270,19 @@ async fn handle_neighbor_sync_overload(
                 let _ = state.queue_priority_peers(std::iter::once(*peer));
             }
             sync_trigger.notify_one();
+        } else {
+            // A later/priority retry completed with an overload notice. Do not
+            // keep bootstrap drain blocked on this peer; normal sync cycles can
+            // try it again later, while the overload budget still bounds
+            // repeated claims.
+            clear_overload_deferred_sync_and_check_drain(
+                peer,
+                bootstrap_state,
+                queues,
+                is_bootstrapping,
+                bootstrap_complete_notify,
+            )
+            .await;
         }
         return;
     }
@@ -2454,7 +2467,7 @@ async fn run_neighbor_sync_round(
                     bootstrap_complete_notify,
                     sync_trigger,
                     overload_tracker,
-                    bootstrapping,
+                    false,
                 )
                 .await;
             }
@@ -2533,7 +2546,7 @@ async fn run_neighbor_sync_round(
                                 bootstrap_complete_notify,
                                 sync_trigger,
                                 overload_tracker,
-                                bootstrapping,
+                                false,
                             )
                             .await;
                         }
@@ -2932,7 +2945,14 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             let sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
-            if sources.is_empty() {
+            let overload_deferred = evidence.get(&key).is_some_and(|ev| ev.overload_deferred);
+            if sources.is_empty() && overload_deferred {
+                q.reset_inconclusive(&key);
+                debug!(
+                    "Locally paid key {} has no responding holders because verification was overload-deferred; leaving pending",
+                    hex::encode(key)
+                );
+            } else if sources.is_empty() {
                 // Terminal failure: remove pending and report. No fetch path.
                 q.remove_pending(&key);
                 warn!(
@@ -2968,8 +2988,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
         // Step 3: Evaluate results — collect outcomes without holding the write
         // lock across paid-list I/O.
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline, Vec<PeerId>)> =
-            Vec::new();
+        let mut evaluated: Vec<(
+            XorName,
+            KeyVerificationOutcome,
+            HintPipeline,
+            Vec<PeerId>,
+            bool,
+        )> = Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
@@ -2990,13 +3015,20 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 } else {
                     Vec::new()
                 };
-                evaluated.push((*key, outcome, entry.pipeline, present_sources));
+                let overload_deferred = ev.overload_deferred;
+                evaluated.push((
+                    *key,
+                    outcome,
+                    entry.pipeline,
+                    present_sources,
+                    overload_deferred,
+                ));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _, _) in &evaluated {
+        for (key, outcome, _, _, _) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -3016,7 +3048,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // paid-only hint can safely repair a missing replica using sources
         // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline, _) in &evaluated {
+        for (key, outcome, pipeline, _, _) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
                 && matches!(
                     outcome,
@@ -3039,7 +3071,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // Step 5: Update queues with the evaluated outcomes.
         let bootstrapping = *is_bootstrapping.read().await;
         let mut q = queues.write().await;
-        for (key, outcome, pipeline, present_sources) in evaluated {
+        for (key, outcome, pipeline, present_sources, overload_deferred) in evaluated {
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
@@ -3054,6 +3086,12 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         let _ = q.promote_pending_to_fetch(key, distance, sources);
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
+                    } else if fetch_eligible && sources.is_empty() && overload_deferred {
+                        q.reset_inconclusive(&key);
+                        debug!(
+                            "Verified storage-admitted key {} has no holders because verification was overload-deferred; leaving pending",
+                            hex::encode(key)
+                        );
                     } else if fetch_eligible && sources.is_empty() {
                         warn!(
                             "Verified storage-admitted key {} has no holders (possible data loss)",
@@ -3084,6 +3122,14 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     }
                 }
                 KeyVerificationOutcome::QuorumInconclusive => {
+                    if overload_deferred {
+                        q.reset_inconclusive(&key);
+                        debug!(
+                            "Verification for key {} is overload-deferred; leaving pending without burning inconclusive budget",
+                            hex::encode(key)
+                        );
+                        continue;
+                    }
                     let rounds = q.record_inconclusive(&key);
                     if rounds >= config::MAX_INCONCLUSIVE_VERIFY_ROUNDS {
                         debug!(

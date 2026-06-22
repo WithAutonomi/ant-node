@@ -282,6 +282,15 @@ impl ReplicationQueues {
         }
     }
 
+    /// Clear a pending key's inconclusive streak after an explicit overload
+    /// deferral. Overload is a receiver-side backpressure signal, not evidence
+    /// that the key cannot converge.
+    pub fn reset_inconclusive(&mut self, key: &XorName) {
+        if let Some(entry) = self.pending_verify.get_mut(key) {
+            entry.inconclusive_rounds = 0;
+        }
+    }
+
     /// Remove a key from pending verification.
     pub fn remove_pending(&mut self, key: &XorName) -> Option<VerificationEntry> {
         let removed = self.pending_verify.remove(key);
@@ -586,6 +595,22 @@ mod tests {
         // Once the key leaves pending, further calls report 0 (no entry to
         // count) rather than resurrecting state.
         queues.remove_pending(&key);
+        assert_eq!(queues.record_inconclusive(&key), 0);
+    }
+
+    #[test]
+    fn reset_inconclusive_clears_streak_for_pending_key() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x56);
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+
+        assert_eq!(queues.record_inconclusive(&key), 1);
+        assert_eq!(queues.record_inconclusive(&key), 2);
+        queues.reset_inconclusive(&key);
+        assert_eq!(queues.record_inconclusive(&key), 1);
+
+        queues.remove_pending(&key);
+        queues.reset_inconclusive(&key);
         assert_eq!(queues.record_inconclusive(&key), 0);
     }
 

@@ -1607,6 +1607,7 @@ mod tests {
                     // Confirmation from a peer outside the target set.
                     (outsider, PaidListEvidence::Confirmed),
                 ]),
+                overload_deferred: false,
             },
         );
 

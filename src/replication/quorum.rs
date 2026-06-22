@@ -351,6 +351,7 @@ pub(crate) async fn run_verification_round(
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             )
         })
@@ -503,10 +504,27 @@ async fn process_peer_verification_message(
                     .await;
             }
             mark_peer_unresolved(peer, targets, evidence);
+            if honor {
+                mark_peer_overload_deferred(peer, targets, evidence);
+            }
         }
         other => {
             debug!("Unexpected verification response from {peer}: {other:?}");
             mark_peer_unresolved(peer, targets, evidence);
+        }
+    }
+}
+
+fn mark_peer_overload_deferred(
+    peer: &PeerId,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    if let Some(peer_keys) = targets.peer_to_keys.get(peer) {
+        for key in peer_keys {
+            if let Some(ev) = evidence.get_mut(key) {
+                ev.overload_deferred = true;
+            }
         }
     }
 }
@@ -671,6 +689,7 @@ mod tests {
         KeyVerificationEvidence {
             presence: presence.into_iter().collect(),
             paid_list: paid_list.into_iter().collect(),
+            overload_deferred: false,
         }
     }
 
@@ -1045,6 +1064,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                overload_deferred: false,
             },
         ))
         .collect();
@@ -1084,6 +1104,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                overload_deferred: false,
             },
         ))
         .collect();
@@ -1107,6 +1128,33 @@ mod tests {
     }
 
     #[test]
+    fn mark_overload_deferred_sets_flag_without_changing_evidence_values() {
+        let key = xor_name_from_byte(0xA1);
+        let peer = peer_id_from_byte(2);
+
+        let targets = single_key_targets(&key, vec![peer], vec![peer]);
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::from([(peer, PresenceEvidence::Unresolved)]),
+                paid_list: HashMap::from([(peer, PaidListEvidence::Unresolved)]),
+                overload_deferred: false,
+            },
+        ))
+        .collect();
+
+        mark_peer_overload_deferred(&peer, &targets, &mut evidence);
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert!(
+            ev.overload_deferred,
+            "overload should be tracked separately"
+        );
+        assert_eq!(ev.presence.get(&peer), Some(&PresenceEvidence::Unresolved));
+        assert_eq!(ev.paid_list.get(&peer), Some(&PaidListEvidence::Unresolved));
+    }
+
+    #[test]
     fn process_response_ignores_unsolicited_keys() {
         let key = xor_name_from_byte(0xB0);
         let unsolicited_key = xor_name_from_byte(0xB1);
@@ -1119,6 +1167,7 @@ mod tests {
             KeyVerificationEvidence {
                 presence: HashMap::new(),
                 paid_list: HashMap::new(),
+                overload_deferred: false,
             },
         ))
         .collect();
@@ -1181,6 +1230,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
             (
@@ -1188,6 +1238,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
         ]
@@ -1439,6 +1490,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
             (
@@ -1446,6 +1498,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
         ]
@@ -1501,6 +1554,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
             (
@@ -1508,6 +1562,7 @@ mod tests {
                 KeyVerificationEvidence {
                     presence: HashMap::new(),
                     paid_list: HashMap::new(),
+                    overload_deferred: false,
                 },
             ),
         ]

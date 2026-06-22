@@ -186,6 +186,12 @@ pub struct KeyVerificationEvidence {
     pub presence: HashMap<PeerId, PresenceEvidence>,
     /// Paid-list evidence per peer (from `PaidTargets`).
     pub paid_list: HashMap<PeerId, PaidListEvidence>,
+    /// At least one target explicitly reported a valid, in-budget overload.
+    ///
+    /// This is distinct from an ordinary timeout/unresolved peer: the caller
+    /// should defer/retry without burning the normal inconclusive-round budget
+    /// or terminally deciding that no holders exist.
+    pub overload_deferred: bool,
 }
 
 // ---------------------------------------------------------------------------
