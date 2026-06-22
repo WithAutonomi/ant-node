@@ -98,13 +98,12 @@ pub struct VerificationEntry {
     /// `QuorumInconclusive`.
     ///
     /// Bounds re-verification of keys that never converge — e.g. targets that
-    /// are persistently unreachable or that keep replying `Overloaded` (the
-    /// network-verify path has no per-peer overload-claim budget). The counter
-    /// only ever reflects an *unbroken* inconclusive streak: a conclusive
-    /// outcome normally removes the entry, and on the one path where a verified
-    /// key is retained instead of removed (fetch queue at capacity)
-    /// [`promote_pending_to_fetch`](crate::replication::scheduling::ReplicationQueues::promote_pending_to_fetch)
-    /// resets this field to zero.
+    /// are persistently unreachable, or peers whose `Overloaded` replies have
+    /// exceeded the per-peer overload-claim budget. The counter only ever
+    /// reflects an *unbroken* inconclusive streak: a conclusive outcome normally
+    /// removes the entry. When a pending entry is intentionally retained after a
+    /// conclusive/deferred outcome (fetch queue at capacity or honored overload
+    /// deferral), the queue resets this field to zero.
     pub inconclusive_rounds: u32,
 }
 

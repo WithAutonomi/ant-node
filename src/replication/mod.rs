@@ -2271,18 +2271,13 @@ async fn handle_neighbor_sync_overload(
             }
             sync_trigger.notify_one();
         } else {
-            // A later/priority retry completed with an overload notice. Do not
-            // keep bootstrap drain blocked on this peer; normal sync cycles can
-            // try it again later, while the overload budget still bounds
-            // repeated claims.
-            clear_overload_deferred_sync_and_check_drain(
-                peer,
-                bootstrap_state,
-                queues,
-                is_bootstrapping,
-                bootstrap_complete_notify,
-            )
-            .await;
+            // A later/priority retry completed with another in-budget overload
+            // notice. Do not immediately requeue the same peer again — priority
+            // peers bypass cooldown — but also do not clear any existing
+            // bootstrap-drain blocker because this peer still has not processed
+            // the bootstrap sync or returned its hints. Normal neighbour-sync
+            // cycles will retry later; success/failure or over-budget overload
+            // clears the blocker.
         }
         return;
     }
