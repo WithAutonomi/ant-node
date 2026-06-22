@@ -21,7 +21,6 @@ use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
 };
-use crate::replication::is_inbound_replication_overloaded_reason;
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -32,6 +31,7 @@ use crate::replication::types::{
     BootstrapClaimObservation, KeyVerificationEvidence, NeighborSyncState, PaidListEvidence,
     RepairProofs,
 };
+use crate::replication::{is_inbound_replication_overloaded_reason, OverloadClaimTracker};
 use crate::storage::LmdbStorage;
 
 use super::REPLICATION_TRUST_WEIGHT;
@@ -787,7 +787,10 @@ async fn collect_paid_prune_confirmations(
         keys_list.dedup();
     }
 
-    let evidence = quorum::run_verification_round(&keys, &targets, p2p_node, config).await;
+    let overload_tracker = Arc::new(OverloadClaimTracker::new());
+    let evidence =
+        quorum::run_verification_round(&keys, &targets, p2p_node, config, Some(&overload_tracker))
+            .await;
     paid_confirmations_by_key(expired_candidates, &evidence)
 }
 

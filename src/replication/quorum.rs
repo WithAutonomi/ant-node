@@ -17,6 +17,10 @@ use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
 };
 use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, PresenceEvidence};
+use crate::replication::{
+    is_inbound_replication_overloaded_reason, OverloadClaimTracker, REPLICATION_TRUST_WEIGHT,
+};
+use saorsa_core::TrustEvent;
 
 /// Verification round duration that is worth surfacing at info level.
 const VERIFICATION_ROUND_SLOW_LOG_MS: u128 = 500;
@@ -326,11 +330,13 @@ fn collect_present_sources(
 ///
 /// Implements Section 9 requirement: one request per peer carrying many keys.
 /// Returns per-key evidence aggregated from all peer responses.
-pub async fn run_verification_round(
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_verification_round(
     keys: &[XorName],
     targets: &VerificationTargets,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    overload_tracker: Option<&Arc<OverloadClaimTracker>>,
 ) -> HashMap<XorName, KeyVerificationEvidence> {
     let started = Instant::now();
     let peer_count = targets.peer_to_keys.len();
@@ -427,7 +433,15 @@ pub async fn run_verification_round(
             continue;
         };
 
-        process_peer_verification_message(&peer, msg, targets, &mut evidence);
+        process_peer_verification_message(
+            &peer,
+            msg,
+            targets,
+            &mut evidence,
+            p2p_node,
+            overload_tracker,
+        )
+        .await;
     }
 
     let elapsed_ms = started.elapsed().as_millis();
@@ -448,21 +462,46 @@ pub async fn run_verification_round(
     evidence
 }
 
-fn process_peer_verification_message(
+async fn process_peer_verification_message(
     peer: &PeerId,
     msg: ReplicationMessage,
     targets: &VerificationTargets,
     evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+    p2p_node: &Arc<P2PNode>,
+    overload_tracker: Option<&Arc<OverloadClaimTracker>>,
 ) {
     match msg.body {
         ReplicationMessageBody::VerificationResponse(resp) => {
+            if let Some(tracker) = overload_tracker {
+                tracker.record_normal_response(peer);
+            }
             process_verification_response(peer, &resp, targets, evidence);
         }
         ReplicationMessageBody::Overloaded(notice) => {
-            debug!(
-                "Verification request to {peer} deferred because peer is overloaded: {}",
-                notice.reason
-            );
+            let honor = match overload_tracker {
+                Some(tracker) => {
+                    is_inbound_replication_overloaded_reason(&notice.reason)
+                        && tracker.honor_overload_claim(peer)
+                }
+                None => true,
+            };
+            if honor {
+                debug!(
+                    "Verification request to {peer} deferred because peer is overloaded: {}",
+                    notice.reason
+                );
+            } else {
+                warn!(
+                    "Verification peer {peer} sent invalid or over-budget overload notice; treating as non-cooperation: {}",
+                    notice.reason
+                );
+                p2p_node
+                    .report_trust_event(
+                        peer,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
+            }
             mark_peer_unresolved(peer, targets, evidence);
         }
         other => {

@@ -130,13 +130,12 @@ fn is_inbound_replication_overloaded_reason(reason: &str) -> bool {
 /// peer is held accountable. The counter resets on any non-overload response on
 /// the same path.
 ///
-/// The audit and fetch paths each keep their own [`OverloadClaimTracker`], so
-/// this budget is enforced independently per path. The trackers are
-/// deliberately *not* shared: `record_normal_response` clears a peer's entire
-/// streak, so a shared tracker would let a peer keep its audit-overload streak
-/// permanently fresh simply by returning ordinary (non-overload) responses on
-/// the fetch path — defeating the audit-dodge bound this constant exists to
-/// enforce.
+/// Each request/response path keeps its own [`OverloadClaimTracker`], so this
+/// budget is enforced independently per path. The trackers are deliberately
+/// *not* shared: `record_normal_response` clears a peer's entire streak, so a
+/// shared tracker would let a peer keep its audit-overload streak permanently
+/// fresh simply by returning ordinary (non-overload) responses on the fetch path
+/// — defeating the audit-dodge bound this constant exists to enforce.
 const MAX_CONSECUTIVE_OVERLOAD_CLAIMS: u32 = 5;
 
 /// Capacity of the per-peer overload-claim tracker. Bounds memory under peer
@@ -209,6 +208,7 @@ struct VerificationCycleContext<'a> {
     storage: &'a Arc<LmdbStorage>,
     queues: &'a Arc<RwLock<ReplicationQueues>>,
     config: &'a ReplicationConfig,
+    overload_tracker: &'a Arc<OverloadClaimTracker>,
     bootstrap_state: &'a Arc<RwLock<BootstrapState>>,
     is_bootstrapping: &'a Arc<RwLock<bool>>,
     bootstrap_complete_notify: &'a Arc<Notify>,
@@ -464,6 +464,14 @@ pub struct ReplicationEngine {
     /// source cannot defer a fetch indefinitely. Separate from the audit tracker
     /// (see [`OverloadClaimTracker`]).
     fetch_overload_tracker: Arc<OverloadClaimTracker>,
+    /// Bounds repeated `Overloaded` notices from verification targets. Without
+    /// this, a peer could indefinitely avoid producing presence / paid-list
+    /// evidence while each individual key is merely abandoned after its
+    /// inconclusive-round budget.
+    verification_overload_tracker: Arc<OverloadClaimTracker>,
+    /// Bounds repeated `Overloaded` notices from neighbor-sync peers. This keeps
+    /// bootstrap retry deferrals from becoming a silent accountability bypass.
+    neighbor_sync_overload_tracker: Arc<OverloadClaimTracker>,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -520,6 +528,8 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_overload_tracker: Arc::new(OverloadClaimTracker::new()),
             fetch_overload_tracker: Arc::new(OverloadClaimTracker::new()),
+            verification_overload_tracker: Arc::new(OverloadClaimTracker::new()),
+            neighbor_sync_overload_tracker: Arc::new(OverloadClaimTracker::new()),
             fresh_write_rx: Some(fresh_write_rx),
             shutdown,
             task_handles: Vec::new(),
@@ -937,6 +947,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        let overload_tracker = Arc::clone(&self.neighbor_sync_overload_tracker);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -974,6 +985,8 @@ impl ReplicationEngine {
                         &is_bootstrapping,
                         &bootstrap_state,
                         &bootstrap_complete_notify,
+                        &sync_trigger,
+                        &overload_tracker,
                     ) => {}
                 }
             }
@@ -1238,6 +1251,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let overload_tracker = Arc::clone(&self.verification_overload_tracker);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1252,6 +1266,7 @@ impl ReplicationEngine {
                             storage: &storage,
                             queues: &queues,
                             config: &config,
+                            overload_tracker: &overload_tracker,
                             bootstrap_state: &bootstrap_state,
                             is_bootstrapping: &is_bootstrapping,
                             bootstrap_complete_notify: &bootstrap_complete_notify,
@@ -1294,6 +1309,7 @@ impl ReplicationEngine {
         let repair_proofs = Arc::clone(&self.repair_proofs);
         let sync_state = Arc::clone(&self.sync_state);
         let sync_trigger = Arc::clone(&self.sync_trigger);
+        let overload_tracker = Arc::clone(&self.neighbor_sync_overload_tracker);
 
         let handle = tokio::spawn(async move {
             // Wait for DHT bootstrap to complete before snapshotting
@@ -1363,6 +1379,7 @@ impl ReplicationEngine {
 
                     match outcome {
                         neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                            overload_tracker.record_normal_response(peer);
                             if !outcome.response.bootstrapping {
                                 record_sent_replica_hints(
                                     peer,
@@ -1408,15 +1425,19 @@ impl ReplicationEngine {
                             }
                         }
                         neighbor_sync::NeighborSyncAttempt::Overloaded => {
-                            debug!(
-                                "Bootstrap sync with {peer} deferred because peer is overloaded"
-                            );
-                            bootstrap::note_overload_deferred_sync(&bootstrap_state, *peer).await;
-                            {
-                                let mut state = sync_state.write().await;
-                                let _ = state.queue_priority_peers(std::iter::once(*peer));
-                            }
-                            sync_trigger.notify_one();
+                            handle_neighbor_sync_overload(
+                                peer,
+                                &p2p,
+                                &sync_state,
+                                &bootstrap_state,
+                                &queues,
+                                &is_bootstrapping,
+                                &bootstrap_complete_notify,
+                                &sync_trigger,
+                                &overload_tracker,
+                                true,
+                            )
+                            .await;
                         }
                         neighbor_sync::NeighborSyncAttempt::Failed => {}
                     }
@@ -2227,6 +2248,51 @@ async fn clear_overload_deferred_sync_and_check_drain(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_neighbor_sync_overload(
+    peer: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    sync_state: &Arc<RwLock<NeighborSyncState>>,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+    sync_trigger: &Arc<Notify>,
+    overload_tracker: &Arc<OverloadClaimTracker>,
+    block_bootstrap_drain: bool,
+) {
+    if overload_tracker.honor_overload_claim(peer) {
+        debug!("Neighbor sync with {peer} deferred because peer is overloaded");
+        if block_bootstrap_drain {
+            bootstrap::note_overload_deferred_sync(bootstrap_state, *peer).await;
+            {
+                let mut state = sync_state.write().await;
+                let _ = state.queue_priority_peers(std::iter::once(*peer));
+            }
+            sync_trigger.notify_one();
+        }
+        return;
+    }
+
+    warn!(
+        "Neighbor sync peer {peer} exceeded overload-claim budget; treating overload as sync failure"
+    );
+    p2p_node
+        .report_trust_event(
+            peer,
+            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+        )
+        .await;
+    clear_overload_deferred_sync_and_check_drain(
+        peer,
+        bootstrap_state,
+        queues,
+        is_bootstrapping,
+        bootstrap_complete_notify,
+    )
+    .await;
+}
+
 // ---------------------------------------------------------------------------
 // Neighbor sync round
 // ---------------------------------------------------------------------------
@@ -2246,6 +2312,8 @@ async fn run_neighbor_sync_round(
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     bootstrap_complete_notify: &Arc<Notify>,
+    sync_trigger: &Arc<Notify>,
+    overload_tracker: &Arc<OverloadClaimTracker>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -2347,6 +2415,7 @@ async fn run_neighbor_sync_round(
 
         match outcome {
             neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                overload_tracker.record_normal_response(peer);
                 handle_sync_response(
                     &self_id,
                     peer,
@@ -2375,21 +2444,17 @@ async fn run_neighbor_sync_round(
                 .await;
             }
             neighbor_sync::NeighborSyncAttempt::Overloaded => {
-                // The peer answered the deferred bootstrap retry but is still
-                // overloaded. Stop blocking bootstrap drain on it rather than
-                // re-deferring: the neighbor-sync path has no overload-claim
-                // budget, so a reachable peer that always reports overload would
-                // otherwise suspend bootstrap (and therefore audits)
-                // indefinitely. This matches the documented contract on
-                // `note_overload_deferred_sync` ("until that retry completes,
-                // fails, or the peer leaves"). Regular periodic sync still
-                // retries this peer later and will pick up any repair work.
-                clear_overload_deferred_sync_and_check_drain(
+                handle_neighbor_sync_overload(
                     peer,
+                    p2p_node,
+                    sync_state,
                     bootstrap_state,
                     queues,
                     is_bootstrapping,
                     bootstrap_complete_notify,
+                    sync_trigger,
+                    overload_tracker,
+                    bootstrapping,
                 )
                 .await;
             }
@@ -2429,6 +2494,7 @@ async fn run_neighbor_sync_round(
 
                     match replacement_outcome {
                         neighbor_sync::NeighborSyncAttempt::Completed(outcome) => {
+                            overload_tracker.record_normal_response(&replacement_peer);
                             handle_sync_response(
                                 &self_id,
                                 &replacement_peer,
@@ -2457,15 +2523,17 @@ async fn run_neighbor_sync_round(
                             .await;
                         }
                         neighbor_sync::NeighborSyncAttempt::Overloaded => {
-                            // See the primary-peer arm above: give up rather
-                            // than re-deferring indefinitely on a replacement
-                            // peer that keeps reporting overload.
-                            clear_overload_deferred_sync_and_check_drain(
+                            handle_neighbor_sync_overload(
                                 &replacement_peer,
+                                p2p_node,
+                                sync_state,
                                 bootstrap_state,
                                 queues,
                                 is_bootstrapping,
                                 bootstrap_complete_notify,
+                                sync_trigger,
+                                overload_tracker,
+                                bootstrapping,
                             )
                             .await;
                         }
@@ -2732,6 +2800,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         storage,
         queues,
         config,
+        overload_tracker,
         bootstrap_state,
         is_bootstrapping,
         bootstrap_complete_notify,
@@ -2849,6 +2918,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             &targets,
             p2p_node,
             config,
+            Some(overload_tracker),
         )
         .await;
 
@@ -2887,8 +2957,14 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             quorum::compute_verification_targets(&keys_needing_network, p2p_node, config, &self_id)
                 .await;
 
-        let evidence =
-            quorum::run_verification_round(&keys_needing_network, &targets, p2p_node, config).await;
+        let evidence = quorum::run_verification_round(
+            &keys_needing_network,
+            &targets,
+            p2p_node,
+            config,
+            Some(overload_tracker),
+        )
+        .await;
 
         // Step 3: Evaluate results — collect outcomes without holding the write
         // lock across paid-list I/O.
