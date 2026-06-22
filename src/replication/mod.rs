@@ -1642,6 +1642,13 @@ async fn handle_audit_challenge_msg(
 ) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
+    info!(
+        "Audit challenge received: kind=responsible keys={} bootstrapping={} request_response={}",
+        challenge.keys.len(),
+        is_bootstrapping,
+        rr_message_id.is_some(),
+    );
+
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
@@ -1650,8 +1657,9 @@ async fn handle_audit_challenge_msg(
         stored_chunks,
     )
     .await;
+    let response_kind = audit_response_kind(&response);
 
-    send_replication_response(
+    let sent = send_replication_response_checked(
         source,
         p2p_node,
         request_id,
@@ -1659,8 +1667,31 @@ async fn handle_audit_challenge_msg(
         rr_message_id,
     )
     .await;
+    if sent {
+        info!(
+            "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
+            response_kind,
+            challenge.keys.len(),
+            rr_message_id.is_some(),
+        );
+    } else {
+        warn!(
+            "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
+            response_kind,
+            challenge.keys.len(),
+            rr_message_id.is_some(),
+        );
+    }
 
     Ok(())
+}
+
+fn audit_response_kind(response: &protocol::AuditResponse) -> &'static str {
+    match response {
+        protocol::AuditResponse::Digests { .. } => "digests",
+        protocol::AuditResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::AuditResponse::Rejected { .. } => "rejected",
+    }
 }
 
 // ---------------------------------------------------------------------------
