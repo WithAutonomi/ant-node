@@ -4,6 +4,7 @@ use crate::ant_protocol::CHUNK_PROTOCOL_ID;
 use crate::config::{
     default_nodes_dir, default_root_dir, NetworkMode, NodeConfig, NODE_IDENTITY_FILENAME,
 };
+use crate::diagnostics::memory::start_process_memory_diagnostics;
 use crate::error::{Error, Result};
 use crate::event::{create_event_channel, NodeEvent, NodeEventsChannel, NodeEventsSender};
 use crate::logging::{debug, error, info, warn};
@@ -167,6 +168,7 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
+            diagnostic_task: None,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -417,6 +419,8 @@ pub struct RunningNode {
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// Process-level diagnostics background task.
+    diagnostic_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -475,6 +479,12 @@ impl RunningNode {
         info!(
             port = actual_port,
             "Node is running on port: {}", actual_port
+        );
+
+        self.diagnostic_task = start_process_memory_diagnostics(
+            format!("ant-node-port-{actual_port}"),
+            actual_port,
+            self.shutdown.clone(),
         );
 
         // Emit started event
@@ -653,6 +663,11 @@ impl RunningNode {
 
         // Stop protocol routing task
         if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
+
+        // Stop process diagnostics task
+        if let Some(handle) = self.diagnostic_task.take() {
             handle.abort();
         }
 

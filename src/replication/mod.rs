@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use std::pin::Pin;
 
-use crate::logging::{debug, error, info, warn};
+use crate::logging::{debug, enabled, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
@@ -71,6 +71,9 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
+
+/// Runtime-gated diagnostic snapshot cadence for the one-node memory canary.
+const TELEMETRY_INTERVAL_SECS: u64 = 60;
 
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::ClientPut
@@ -241,6 +244,7 @@ impl ReplicationEngine {
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
+        self.start_telemetry_loop();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -358,6 +362,130 @@ impl ReplicationEngine {
             }
             debug!("Fresh-write drainer shut down");
         });
+        self.task_handles.push(handle);
+    }
+
+    /// Spawn a runtime-gated, logging-only telemetry loop for the memory canary.
+    fn start_telemetry_loop(&mut self) {
+        if std::env::var("ANT_REPLICATION_TELEMETRY_ENABLE")
+            .ok()
+            .as_deref()
+            != Some("1")
+        {
+            return;
+        }
+
+        let queues = Arc::clone(&self.queues);
+        let sync_state = Arc::clone(&self.sync_state);
+        let sync_history = Arc::clone(&self.sync_history);
+        let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
+        let repair_proofs = Arc::clone(&self.repair_proofs);
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let storage = Arc::clone(&self.storage);
+        let paid_list = Arc::clone(&self.paid_list);
+        let send_semaphore = Arc::clone(&self.send_semaphore);
+        let shutdown = self.shutdown.clone();
+        let task_count = self.task_handles.len();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(TELEMETRY_INTERVAL_SECS));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            info!(
+                telemetry = "replication_snapshot_started",
+                interval_secs = TELEMETRY_INTERVAL_SECS,
+                "replication telemetry snapshots started"
+            );
+
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        if !enabled!(crate::logging::Level::INFO) {
+                            continue;
+                        }
+
+                        let queue = queues.read().await.snapshot();
+                        let neighbor = sync_state.read().await.snapshot();
+                        let bootstrap = bootstrap_state.read().await.snapshot();
+                        let repair = repair_proofs.read().await.snapshot();
+                        let is_bootstrapping = *is_bootstrapping.read().await;
+                        let sync_cycle_epoch = *sync_cycle_epoch.read().await;
+                        let (sync_history_peers, sync_history_max_cycles_since_sync) = {
+                            let history = sync_history.read().await;
+                            (
+                                history.len(),
+                                history
+                                    .values()
+                                    .map(|record| record.cycles_since_sync)
+                                    .max()
+                                    .unwrap_or(0),
+                            )
+                        };
+                        let storage_stats = storage.stats();
+                        let paid = paid_list.snapshot();
+                        let send_available_permits = send_semaphore.available_permits();
+
+                        match paid {
+                            Ok(paid) => info!(
+                                telemetry = "replication_snapshot",
+                                task_count,
+                                send_available_permits,
+                                is_bootstrapping,
+                                queue_pending_verify = queue.pending_verify,
+                                queue_pending_verify_capacity = queue.pending_verify_capacity,
+                                queue_fetch = queue.fetch_queue,
+                                queue_fetch_capacity = queue.fetch_queue_capacity,
+                                queue_fetch_keys = queue.fetch_queue_keys,
+                                queue_in_flight = queue.in_flight_fetch,
+                                queue_pending_senders = queue.pending_senders,
+                                queue_pending_per_sender_max = queue.pending_per_sender_max,
+                                queue_pending_senders_over_80pct = queue.pending_senders_over_80pct,
+                                neighbor_priority_len = neighbor.priority_len,
+                                neighbor_cycle_len = neighbor.cycle_len,
+                                neighbor_cursor = neighbor.cursor,
+                                neighbor_remaining = neighbor.remaining,
+                                neighbor_last_sync_peers = neighbor.last_sync_peers,
+                                neighbor_active_bootstrap_claims = neighbor.active_bootstrap_claims,
+                                neighbor_bootstrap_claim_history = neighbor.bootstrap_claim_history,
+                                neighbor_prune_cursor = neighbor.prune_cursor,
+                                sync_cycle_epoch,
+                                sync_history_peers,
+                                sync_history_max_cycles_since_sync,
+                                bootstrap_drained = bootstrap.drained,
+                                bootstrap_pending_peer_requests = bootstrap.pending_peer_requests,
+                                bootstrap_pending_keys = bootstrap.pending_keys,
+                                bootstrap_capacity_rejected_sources = bootstrap.capacity_rejected_sources,
+                                repair_proof_keys = repair.keys_with_proofs,
+                                repair_proof_peer_entries = repair.total_peer_proofs,
+                                storage_current_chunks = storage_stats.current_chunks,
+                                storage_chunks_stored_total = storage_stats.chunks_stored,
+                                storage_chunks_retrieved_total = storage_stats.chunks_retrieved,
+                                storage_bytes_stored_total = storage_stats.bytes_stored,
+                                storage_bytes_retrieved_total = storage_stats.bytes_retrieved,
+                                storage_duplicates_total = storage_stats.duplicates,
+                                storage_verification_failures_total = storage_stats.verification_failures,
+                                paid_keys = paid.paid_keys,
+                                paid_out_of_range = paid.paid_out_of_range,
+                                record_out_of_range = paid.record_out_of_range,
+                                paid_prune_cursor = paid.paid_prune_cursor,
+                                "replication telemetry snapshot"
+                            ),
+                            Err(error) => warn!(
+                                telemetry = "replication_snapshot_error",
+                                component = "paid_list",
+                                error = %error,
+                                "failed to collect replication telemetry snapshot"
+                            ),
+                        }
+                    }
+                }
+            }
+
+            debug!("Replication telemetry loop shut down");
+        });
+
         self.task_handles.push(handle);
     }
 

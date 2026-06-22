@@ -308,11 +308,33 @@ pub struct RepairProofs {
     proofs_by_key: HashMap<XorName, RepairProofEntry>,
 }
 
+/// Low-cardinality repair-proof table snapshot for canary diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct RepairProofsSnapshot {
+    /// Number of keys that currently have at least one repair proof entry.
+    pub keys_with_proofs: usize,
+    /// Total `(key, peer)` proof entries retained across all keys.
+    pub total_peer_proofs: usize,
+}
+
 impl RepairProofs {
     /// Create an empty repair-proof table.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Capture aggregate repair-proof table sizes without exposing keys/peers.
+    #[must_use]
+    pub fn snapshot(&self) -> RepairProofsSnapshot {
+        RepairProofsSnapshot {
+            keys_with_proofs: self.proofs_by_key.len(),
+            total_peer_proofs: self
+                .proofs_by_key
+                .values()
+                .map(|entry| entry.peer_proofs.len())
+                .sum(),
+        }
     }
 
     /// Record that `peer` was sent a replica repair hint for `key`.
@@ -511,6 +533,27 @@ pub struct NeighborSyncState {
     pub prune_cursor: usize,
 }
 
+/// Low-cardinality neighbor-sync snapshot for canary diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborSyncSnapshot {
+    /// Newly-entered close peers waiting for priority sync.
+    pub priority_len: usize,
+    /// Number of peers in the current round-robin cycle.
+    pub cycle_len: usize,
+    /// Cursor into the current cycle.
+    pub cursor: usize,
+    /// Peers remaining in the current cycle after the cursor.
+    pub remaining: usize,
+    /// Peers with recorded successful sync timestamps.
+    pub last_sync_peers: usize,
+    /// Peers currently claiming bootstrap status.
+    pub active_bootstrap_claims: usize,
+    /// Peers that have ever claimed bootstrap status.
+    pub bootstrap_claim_history: usize,
+    /// Cursor for bounded prune scans.
+    pub prune_cursor: usize,
+}
+
 impl NeighborSyncState {
     /// Create a new cycle from the given close neighbors.
     #[must_use]
@@ -523,6 +566,21 @@ impl NeighborSyncState {
             bootstrap_claims: HashMap::new(),
             bootstrap_claim_history: HashMap::new(),
             prune_cursor: 0,
+        }
+    }
+
+    /// Capture aggregate neighbor-sync state without exposing peer IDs.
+    #[must_use]
+    pub fn snapshot(&self) -> NeighborSyncSnapshot {
+        NeighborSyncSnapshot {
+            priority_len: self.priority_order.len(),
+            cycle_len: self.order.len(),
+            cursor: self.cursor,
+            remaining: self.order.len().saturating_sub(self.cursor),
+            last_sync_peers: self.last_sync_times.len(),
+            active_bootstrap_claims: self.bootstrap_claims.len(),
+            bootstrap_claim_history: self.bootstrap_claim_history.len(),
+            prune_cursor: self.prune_cursor,
         }
     }
 
@@ -656,6 +714,19 @@ pub struct BootstrapState {
     pub capacity_rejected_sources: HashSet<PeerId>,
 }
 
+/// Low-cardinality bootstrap drain snapshot for canary diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct BootstrapSnapshot {
+    /// Whether bootstrap has been marked drained.
+    pub drained: bool,
+    /// Number of bootstrap peer requests still pending.
+    pub pending_peer_requests: usize,
+    /// Number of keys still tracked as bootstrap-discovered work.
+    pub pending_keys: usize,
+    /// Number of sources with capacity-rejected bootstrap admissions.
+    pub capacity_rejected_sources: usize,
+}
+
 impl BootstrapState {
     /// Create initial bootstrap state.
     #[must_use]
@@ -665,6 +736,17 @@ impl BootstrapState {
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashSet::new(),
+        }
+    }
+
+    /// Capture aggregate bootstrap drain state without exposing keys/peers.
+    #[must_use]
+    pub fn snapshot(&self) -> BootstrapSnapshot {
+        BootstrapSnapshot {
+            drained: self.drained,
+            pending_peer_requests: self.pending_peer_requests,
+            pending_keys: self.pending_keys.len(),
+            capacity_rejected_sources: self.capacity_rejected_sources.len(),
         }
     }
 

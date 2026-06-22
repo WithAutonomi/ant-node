@@ -27,7 +27,9 @@ path = "src/bin/ant-devnet/main.rs"
 # glibc's under concurrent allocation churn, which matches the node's
 # steady-state workload. mimalloc neutralises that regression for the
 # musl Linux builds (and tends to beat glibc's allocator too).
-mimalloc = "0.1"
+mimalloc = { version = "0.1", optional = true }
+tikv-jemallocator = { version = "0.6", optional = true, features = ["profiling", "stats", "override_allocator_on_supported_platforms"] }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["stats"] }
 
 # Wire protocol — the single version-pin shared with ant-client.
 # Bumping ant-protocol's `evmlib`/`saorsa-core`/`saorsa-pqc` pins ripples
@@ -135,7 +137,12 @@ path = "tests/e2e/mod.rs"
 required-features = ["test-utils"]
 
 [features]
-default = ["logging"]
+default = ["logging", "mimalloc-allocator"]
+# Preserve the current production allocator for normal builds.
+mimalloc-allocator = ["dep:mimalloc"]
+# Debug/canary allocator with jemalloc profiling support. Build with
+# `--no-default-features --features logging,jemalloc-heap-profiling`.
+jemalloc-heap-profiling = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 # Enable tracing/logging infrastructure.
 # Included in `default` so dev builds (`cargo build`, `cargo test`) get logging
 # automatically. Release builds strip it:

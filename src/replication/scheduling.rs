@@ -127,6 +127,29 @@ pub struct InFlightEntry {
 // Central queue manager
 // ---------------------------------------------------------------------------
 
+/// Low-cardinality snapshot of the replication queues for canary diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationQueuesSnapshot {
+    /// Keys awaiting quorum verification.
+    pub pending_verify: usize,
+    /// Global capacity for pending verification entries.
+    pub pending_verify_capacity: usize,
+    /// Keys waiting for a fetch slot.
+    pub fetch_queue: usize,
+    /// Global capacity for fetch queue entries.
+    pub fetch_queue_capacity: usize,
+    /// Dedup set size for queued fetch keys.
+    pub fetch_queue_keys: usize,
+    /// Keys currently being fetched.
+    pub in_flight_fetch: usize,
+    /// Distinct senders currently represented in pending verification.
+    pub pending_senders: usize,
+    /// Largest pending verification count attributed to a single sender.
+    pub pending_per_sender_max: usize,
+    /// Number of senders at or above 80% of their per-sender pending cap.
+    pub pending_senders_over_80pct: usize,
+}
+
 /// Central queue manager for the replication pipeline.
 ///
 /// Maintains three stages of the pipeline with global dedup:
@@ -173,6 +196,30 @@ impl ReplicationQueues {
             fetch_queue_keys: HashSet::new(),
             in_flight_fetch: HashMap::new(),
             pending_per_sender: HashMap::new(),
+        }
+    }
+
+    /// Capture queue sizes and high-water pressure without exposing keys/peers.
+    #[must_use]
+    pub fn snapshot(&self) -> ReplicationQueuesSnapshot {
+        let pending_per_sender_max = self.pending_per_sender.values().copied().max().unwrap_or(0);
+        let over_80_threshold = MAX_PENDING_VERIFY_PER_PEER * 8 / 10;
+        let pending_senders_over_80pct = self
+            .pending_per_sender
+            .values()
+            .filter(|&&count| count >= over_80_threshold)
+            .count();
+
+        ReplicationQueuesSnapshot {
+            pending_verify: self.pending_verify.len(),
+            pending_verify_capacity: MAX_PENDING_VERIFY,
+            fetch_queue: self.fetch_queue.len(),
+            fetch_queue_capacity: MAX_FETCH_QUEUE,
+            fetch_queue_keys: self.fetch_queue_keys.len(),
+            in_flight_fetch: self.in_flight_fetch.len(),
+            pending_senders: self.pending_per_sender.len(),
+            pending_per_sender_max,
+            pending_senders_over_80pct,
         }
     }
 

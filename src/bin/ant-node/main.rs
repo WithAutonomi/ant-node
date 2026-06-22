@@ -2,8 +2,16 @@
 
 #![cfg_attr(not(feature = "logging"), allow(unused_variables))]
 
+#[cfg(all(
+    feature = "mimalloc-allocator",
+    not(feature = "jemalloc-heap-profiling")
+))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "jemalloc-heap-profiling")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 mod cli;
 mod platform;

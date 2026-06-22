@@ -39,6 +39,19 @@ use crate::ant_protocol::XORNAME_LEN;
 /// generous even for very large close-group memberships.
 const DEFAULT_MAP_SIZE: usize = 256 * 1_024 * 1_024;
 
+/// Low-cardinality paid-list snapshot for canary diagnostics.
+#[derive(Debug, Clone, Copy)]
+pub struct PaidListSnapshot {
+    /// Number of keys currently persisted in the paid list.
+    pub paid_keys: u64,
+    /// Number of paid keys currently marked out of range in memory.
+    pub paid_out_of_range: usize,
+    /// Number of stored records currently marked out of range in memory.
+    pub record_out_of_range: usize,
+    /// Current cursor for bounded paid-list prune scans.
+    pub paid_prune_cursor: usize,
+}
+
 /// Persistent paid-for-list backed by LMDB.
 ///
 /// Tracks which keys this node believes are paid-authorized.
@@ -243,6 +256,20 @@ impl PaidList {
             .map_err(|e| Error::Storage(format!("Failed to read paid-list stats: {e}")))?
             .entries;
         Ok(entries as u64)
+    }
+
+    /// Capture paid-list sizes without scanning paid keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the LMDB read transaction fails.
+    pub fn snapshot(&self) -> Result<PaidListSnapshot> {
+        Ok(PaidListSnapshot {
+            paid_keys: self.count()?,
+            paid_out_of_range: self.paid_out_of_range.read().len(),
+            record_out_of_range: self.record_out_of_range.read().len(),
+            paid_prune_cursor: *self.paid_prune_cursor.read(),
+        })
     }
 
     /// Return all keys in the paid-for set.
