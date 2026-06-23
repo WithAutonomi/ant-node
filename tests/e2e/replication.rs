@@ -7,6 +7,7 @@
 
 use super::TestHarness;
 use ant_node::client::compute_address;
+use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
     storage_admission_width, REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID,
 };
@@ -416,6 +417,11 @@ async fn test_audit_challenge_returns_correct_digest() {
     let nonce = [0x42u8; 32];
 
     // Send audit challenge from B to A
+    // The on-wire `AuditChallenge` is handled by the responsible-chunk audit
+    // responder (`audit::handle_audit_challenge`), which answers with per-key
+    // `Digests`. The prune-confirmation audit reuses the same message. (The
+    // storage-commitment audit uses the separate
+    // `SubtreeAuditChallenge`/`SubtreeAuditResponse` path.)
     let challenge = AuditChallenge {
         challenge_id: 1234,
         nonce,
@@ -556,6 +562,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         current_sync_epoch: CURRENT_EPOCH,
         repair_proof_now: Some(gate_repair_proof_now),
         allow_remote_prune_audits: false,
+        commitment_state: None,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -575,6 +582,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         current_sync_epoch: CURRENT_EPOCH,
         repair_proof_now: Some(gate_repair_proof_now),
         allow_remote_prune_audits: true,
+        commitment_state: None,
     })
     .await;
     assert_eq!(confirmed.records_pruned, 1);
@@ -619,6 +627,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         current_sync_epoch: CURRENT_EPOCH,
         repair_proof_now: Some(missing_repair_proof_now),
         allow_remote_prune_audits: true,
+        commitment_state: None,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -646,12 +655,143 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         current_sync_epoch: CURRENT_EPOCH,
         repair_proof_now: Some(missing_repair_proof_now),
         allow_remote_prune_audits: true,
+        commitment_state: None,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
     assert!(
         !pruner_storage.exists(&missing_address).expect("exists"),
         "record should prune once every current target peer proves storage"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// Pruner-retention veto (ADR-0002): a chunk the pruner is no longer responsible
+/// for, but which is still committed under a recently-gossiped commitment, must
+/// NOT be deleted — the storage-commitment audit's round-2 byte challenge could
+/// still demand it, and deleting would turn an honest node's reply into an
+/// `Absent` confirmed failure. Once it is no longer committed (e.g. it has aged
+/// out of the retention window, simulated here by passing `None`), the same
+/// out-of-range record becomes prunable. Drives the real `run_prune_pass`
+/// against live nodes.
+#[tokio::test]
+#[serial]
+async fn test_prune_veto_for_committed_out_of_range_key() {
+    const HINT_EPOCH: u64 = 7;
+    const CURRENT_EPOCH: u64 = HINT_EPOCH + 1;
+
+    let harness = TestHarness::setup_minimal().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let pruner_idx = 3;
+    let close_group_size = 2;
+    let config = prune_test_config(close_group_size);
+    let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
+    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+
+    let pruner = harness.test_node(pruner_idx).expect("pruner");
+    let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
+    let pruner_storage = pruner.ant_protocol.as_ref().expect("protocol").storage();
+    let pruner_paid_list = Arc::clone(
+        pruner
+            .replication_engine
+            .as_ref()
+            .expect("engine")
+            .paid_list(),
+    );
+    let pruner_peer = *pruner_p2p.peer_id();
+
+    // An out-of-range record fully confirmed on its remote close group — so the
+    // ONLY thing that can keep it on the pruner is the retention veto.
+    let (content, address, targets) =
+        find_remote_prune_candidate(&harness, pruner_idx, close_group_size, "veto").await;
+    pruner_storage
+        .put(&address, &content)
+        .await
+        .expect("put record on pruner");
+    store_record_on_peers(&harness, &targets, &address, &content).await;
+    // Mature repair proofs (hinted_at + REPAIR_HINT_MIN_AGE) so main's prune-proof
+    // gate treats the record as fully prunable — leaving the retention veto as the
+    // ONLY thing that can keep it. Same pattern as the prune-threshold tests below.
+    let repair_proof_now = record_repair_proofs_for_peers(
+        &repair_proofs,
+        &pruner_p2p,
+        &config,
+        &targets,
+        &address,
+        HINT_EPOCH,
+    )
+    .await;
+
+    // A retained commitment that COMMITS to the out-of-range key (as if we
+    // gossiped it just before the key left our range). A throwaway keypair is
+    // fine: the pruner's veto consults only `is_held` (membership), not the
+    // signature.
+    let committed = ResponderCommitmentState::new();
+    {
+        let (pk, sk) = saorsa_pqc::api::sig::ml_dsa_65()
+            .generate_keypair()
+            .expect("keypair");
+        let bytes_hash = *blake3::hash(&content).as_bytes();
+        let built =
+            BuiltCommitment::build(vec![(address, bytes_hash)], &[0; 32], &sk, &pk.to_bytes())
+                .expect("build commitment");
+        let h = built.hash();
+        committed.rotate(built);
+        committed.mark_gossiped(h);
+    }
+    let committed = Arc::new(committed);
+    assert!(committed.is_held(&address), "test setup: key must be held");
+
+    // With the key still committed, an otherwise-fully-prunable out-of-range
+    // record is VETOED.
+    let vetoed = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        current_sync_epoch: CURRENT_EPOCH,
+        allow_remote_prune_audits: true,
+        repair_proof_now: Some(repair_proof_now),
+        commitment_state: Some(&committed),
+    })
+    .await;
+    assert_eq!(
+        vetoed.records_pruned, 0,
+        "a key still committed under a recent commitment must not be pruned"
+    );
+    assert!(
+        pruner_storage.exists(&address).expect("exists"),
+        "the vetoed record must remain on disk"
+    );
+
+    // Once it is no longer committed (aged out of the retention window — modelled
+    // by `None`), the same out-of-range record is prunable.
+    let pruned = pruning::run_prune_pass_with_context(pruning::PrunePassContext {
+        self_id: &pruner_peer,
+        storage: &pruner_storage,
+        paid_list: &pruner_paid_list,
+        p2p_node: &pruner_p2p,
+        config: &config,
+        sync_state: &sync_state,
+        repair_proofs: &repair_proofs,
+        current_sync_epoch: CURRENT_EPOCH,
+        allow_remote_prune_audits: true,
+        repair_proof_now: Some(repair_proof_now),
+        commitment_state: None,
+    })
+    .await;
+    assert_eq!(
+        pruned.records_pruned, 1,
+        "once no longer committed, the out-of-range record prunes normally"
+    );
+    assert!(
+        !pruner_storage.exists(&address).expect("exists"),
+        "the no-longer-committed record is reclaimed"
     );
 
     harness.teardown().await.expect("teardown");
@@ -757,6 +897,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             current_sync_epoch: CURRENT_EPOCH,
             allow_remote_prune_audits: true,
             repair_proof_now: Some(repair_proof_now),
+            commitment_state: None,
         })
         .await;
         assert_eq!(
@@ -792,6 +933,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         current_sync_epoch: CURRENT_EPOCH,
         allow_remote_prune_audits: true,
         repair_proof_now: Some(repair_proof_now),
+        commitment_state: None,
     })
     .await;
     assert_eq!(
@@ -865,6 +1007,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         current_sync_epoch: 1,
         allow_remote_prune_audits: true,
         repair_proof_now: None,
+        commitment_state: None,
     })
     .await;
     assert_eq!(
@@ -900,6 +1043,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         current_sync_epoch: 1,
         allow_remote_prune_audits: true,
         repair_proof_now: None,
+        commitment_state: None,
     })
     .await;
     assert_eq!(
@@ -1151,6 +1295,7 @@ async fn test_neighbor_sync_request_returns_hints() {
         replica_hints: vec![],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 2000,
@@ -1600,6 +1745,7 @@ async fn scenario_14_sync_hints_cover_all_local_keys() {
         replica_hints: vec![],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 1400,
@@ -1747,6 +1893,7 @@ async fn scenario_17_bidirectional_sync_when_sender_in_rt() {
         replica_hints: vec![inbound_hint],
         paid_hints: vec![],
         bootstrapping: false,
+        commitment: None,
     };
     let msg = ReplicationMessage {
         request_id: 1700,

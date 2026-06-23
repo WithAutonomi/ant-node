@@ -17,6 +17,7 @@ use saorsa_core::{DHTNode, P2PNode};
 use tokio::sync::RwLock;
 
 use crate::ant_protocol::XorName;
+use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
     MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
@@ -88,6 +89,11 @@ pub struct PrunePassContext<'a> {
     pub repair_proof_now: Option<Instant>,
     /// Whether remote prune-confirmation audits are allowed this pass.
     pub allow_remote_prune_audits: bool,
+    /// Responder commitment state, used to veto deleting a chunk still held
+    /// under a recently-gossiped commitment (so the storage-commitment audit's
+    /// round-2 byte challenge cannot false-positive an honest node). `None` on
+    /// the legacy/test-only prune path, which keeps the pre-retention behavior.
+    pub commitment_state: Option<&'a Arc<ResponderCommitmentState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +108,7 @@ struct RecordPruneStats {
     marked: usize,
     cleared: usize,
     pruned: usize,
+    held_by_commitment: usize,
 }
 
 #[derive(Debug, Default)]
@@ -171,6 +178,10 @@ enum RecordPruneKeyState {
     Cleared,
     BootstrapDeferred,
     BudgetDeferred,
+    /// Out of range, but still committed under a recently-gossiped commitment:
+    /// deletion is vetoed (and the out-of-range hysteresis clock is not even
+    /// started) until the key ages out of the last-2-gossiped window.
+    HeldByCommitment,
     Candidate(RecordPruneCandidate),
 }
 
@@ -237,6 +248,7 @@ pub async fn run_prune_pass(
         #[cfg(any(test, feature = "test-utils"))]
         repair_proof_now: None,
         allow_remote_prune_audits,
+        commitment_state: None,
     })
     .await
 }
@@ -272,6 +284,9 @@ pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResu
     result
 }
 
+// Combines main's prune-proof/admission gate with ADR-0002's commitment
+// retention veto in one pass; the merged body runs just over the line budget.
+#[allow(clippy::too_many_lines)]
 async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPruneStats) {
     let stored_keys = match ctx.storage.all_keys().await {
         Ok(keys) => keys,
@@ -316,6 +331,9 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
             RecordPruneKeyState::BudgetDeferred => {
                 budget_deferred = budget_deferred.saturating_add(1);
             }
+            RecordPruneKeyState::HeldByCommitment => {
+                stats.held_by_commitment = stats.held_by_commitment.saturating_add(1);
+            }
             RecordPruneKeyState::Candidate(candidate) => {
                 last_selected_offset = Some(offset);
                 candidates.push(candidate);
@@ -345,6 +363,14 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         );
     }
 
+    if stats.held_by_commitment > 0 {
+        debug!(
+            "Vetoed {} prune candidate(s) still committed under a recently-gossiped \
+             commitment (bounded reprieve until they age out of the retention window)",
+            stats.held_by_commitment
+        );
+    }
+
     let present_by_key = collect_record_prune_proofs(
         &candidates,
         ctx.storage,
@@ -360,6 +386,7 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         ctx.paid_list,
         ctx.p2p_node,
         ctx.config,
+        ctx.commitment_state,
     )
     .await;
     stats.cleared += revalidated_cleared;
@@ -408,6 +435,24 @@ async fn evaluate_record_prune_key(
             outcome.state = RecordPruneKeyState::Cleared;
         }
         return outcome;
+    }
+
+    // Retention veto: the key has left our close group, but if it is still
+    // committed under a recently-gossiped commitment a neighbour can pin that
+    // root and demand its bytes in a round-2 byte challenge. Deleting it now
+    // would turn an honest node's response into `Absent` → a confirmed audit
+    // failure. Veto deletion AND do not even start the out-of-range hysteresis
+    // clock yet: the commitment rebuild only commits to keys we are still
+    // responsible for, so this key drops out of the next rebuilt commitment and
+    // ages out of the last-2-gossiped window within at most
+    // `RETAINED_GOSSIPED_COMMITMENTS` gossip rotations, after which `is_held`
+    // returns false and the key prunes through the normal path. This is a
+    // bounded reprieve, not a permanent pin.
+    if let Some(cs) = ctx.commitment_state {
+        if cs.is_held(key) {
+            outcome.state = RecordPruneKeyState::HeldByCommitment;
+            return outcome;
+        }
     }
 
     if ctx.paid_list.record_out_of_range_since(key).is_none() {
@@ -943,12 +988,23 @@ async fn revalidated_record_prune_keys(
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> (Vec<XorName>, usize) {
     let mut keys_to_delete = Vec::new();
     let mut cleared = 0;
     let now = Instant::now();
 
     for candidate in candidates {
+        // TOCTOU guard: a rotation/gossip may have (re-)committed this key
+        // between candidate selection and now. Re-check retention immediately
+        // before scheduling deletion so we never delete bytes a recently
+        // gossiped commitment still owes in a round-2 byte challenge.
+        if let Some(cs) = commitment_state {
+            if cs.is_held(&candidate.key) {
+                continue;
+            }
+        }
+
         let (storage_admission_group, strict_close_group) =
             record_prune_lookup_groups(&candidate.key, p2p_node, config).await;
 
@@ -1098,10 +1154,23 @@ async fn peer_proves_record(
     let encoded = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
     let Some(decoded) = send_prune_audit_challenge(&peer, &key, encoded, p2p_node, config).await
     else {
-        // No decoded response means we did not observe the peer stop claiming
-        // bootstrap status. Preserve any active claim so a later claim is not
-        // misclassified as repeated abuse.
-        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+        // No decoded response means a timeout or an undecodable reply — the
+        // same "no response" case the main audit path treats as a timeout. The
+        // penalty is gated behind `TIMEOUT_EVICTION_ENABLED` (off this
+        // release — a not-yet-upgraded or briefly-slow peer must not be evicted
+        // by a no-response during the breaking rollout). Mirrors the suppressed
+        // timeout penalty in handle_failed_audit; only a DECODED
+        // PruneAuditStatus::Failed below (a peer that answered with bad/absent
+        // bytes) is penalised regardless of the gate.
+        if crate::replication::config::TIMEOUT_EVICTION_ENABLED {
+            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+        } else {
+            debug!(
+                "Prune audit for {peer} key {} got no decodable response \
+                 (eviction disabled this release — not penalising)",
+                hex::encode(key)
+            );
+        }
         return None;
     };
 
@@ -1128,6 +1197,11 @@ async fn peer_proves_record(
 fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool {
     matches!(status, PruneAuditStatus::Proven | PruneAuditStatus::Failed)
 }
+
+// The responder for an incoming `AuditChallenge` (including prune-confirmation
+// challenges, which reuse the same wire message) lives in
+// `super::handle_audit_challenge_msg` -> `audit::handle_audit_challenge`, the
+// responsible-chunk audit responder. No separate prune-only responder is needed.
 
 fn encode_prune_audit_challenge(
     peer: &PeerId,
@@ -1170,7 +1244,7 @@ async fn send_prune_audit_challenge(
             peer,
             REPLICATION_PROTOCOL_ID,
             encoded,
-            config.audit_response_timeout(1),
+            config.prune_audit_response_timeout,
         )
         .await
     {

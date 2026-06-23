@@ -109,11 +109,22 @@ pub enum ReplicationMessageBody {
     /// Response with the record data.
     FetchResponse(FetchResponse),
 
-    // === Audit (Section 15) ===
-    /// Storage audit challenge.
+    // === Responsible-chunk audit (per-key digests) ===
+    /// Per-key audit challenge: used by the responsible-chunk audit and the
+    /// prune-confirmation path.
     AuditChallenge(AuditChallenge),
-    /// Response to audit challenge.
+    /// Response to a per-key audit challenge.
     AuditResponse(AuditResponse),
+
+    // === Storage-bound subtree audit (ADR-0002) ===
+    /// Gossip-triggered contiguous-subtree storage audit challenge (round 1).
+    SubtreeAuditChallenge(SubtreeAuditChallenge),
+    /// Response to a contiguous-subtree storage audit challenge (round 1).
+    SubtreeAuditResponse(SubtreeAuditResponse),
+    /// Surprise byte challenge for the spot-checked leaves (round 2).
+    SubtreeByteChallenge(SubtreeByteChallenge),
+    /// Response carrying the requested chunks' original bytes (round 2).
+    SubtreeByteResponse(SubtreeByteResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +188,14 @@ pub struct NeighborSyncRequest {
     pub paid_hints: Vec<XorName>,
     /// Whether sender is currently bootstrapping.
     pub bootstrapping: bool,
+    /// Sender's signed storage commitment (optional, see
+    /// [`crate::replication::commitment`]). `None` from old peers; from
+    /// new peers this carries the Merkle-root commitment over the
+    /// sender's claimed keys. Receivers that recognize it store it as
+    /// the per-peer "last known commitment" used to pin commitment-bound
+    /// audits.
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 /// Neighbor sync response carrying own hint sets.
@@ -190,6 +209,10 @@ pub struct NeighborSyncResponse {
     pub bootstrapping: bool,
     /// Keys that receiver rejected (optional feedback to sender).
     pub rejected_keys: Vec<XorName>,
+    /// Receiver's signed storage commitment (optional, see
+    /// [`NeighborSyncRequest::commitment`]).
+    #[serde(default)]
+    pub commitment: Option<crate::replication::commitment::StorageCommitment>,
 }
 
 // ---------------------------------------------------------------------------
@@ -271,11 +294,14 @@ pub enum FetchResponse {
 // Audit Messages
 // ---------------------------------------------------------------------------
 
-/// Storage audit challenge (Section 15).
+/// Per-key audit challenge.
 ///
 /// The challenger picks a random nonce and a set of keys the challenged peer
-/// should hold, then sends this challenge. The challenged peer must prove
-/// storage by returning per-key BLAKE3 digests.
+/// should hold, then sends this challenge. The challenged peer proves storage
+/// by returning per-key BLAKE3 digests. Used by the responsible-chunk audit
+/// (audit #2: a node samples keys a close peer should hold) and by the
+/// prune-confirmation path (a node checks a peer still holds a key before
+/// pruning its own copy).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditChallenge {
     /// Unique challenge identifier.
@@ -288,7 +314,7 @@ pub struct AuditChallenge {
     pub keys: Vec<XorName>,
 }
 
-/// Response to audit challenge.
+/// Response to a per-key audit challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AuditResponse {
     /// Per-key digests proving storage.
@@ -313,6 +339,223 @@ pub enum AuditResponse {
     Rejected {
         /// The challenge this response answers.
         challenge_id: u64,
+        /// Human-readable rejection reason.
+        reason: String,
+    },
+}
+
+/// Gossip-triggered contiguous-subtree storage audit challenge (ADR-0002).
+///
+/// The auditor pins the commitment a peer just gossiped and sends a fresh
+/// random nonce. The nonce alone deterministically selects one contiguous
+/// subtree of the peer's committed Merkle tree (see
+/// [`crate::replication::subtree::select_subtree_path`]); the auditor does
+/// **not** name keys. The responder must reply with a
+/// [`SubtreeAuditResponse::Proof`] for that selected subtree against the pinned
+/// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
+/// (for a recently gossiped pinned commitment a rejection is a confirmed
+/// failure, since the responder retains its last two gossiped commitments).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtreeAuditChallenge {
+    /// Unique challenge identifier.
+    pub challenge_id: u64,
+    /// Random nonce. Selects the subtree AND freshens each leaf's possession
+    /// hash, so a stored answer cannot be replayed.
+    pub nonce: [u8; 32],
+    /// Challenged peer ID. Bound into each leaf's possession hash.
+    pub challenged_peer_id: [u8; 32],
+    /// The auditor's pin: the [`crate::replication::commitment::commitment_hash`]
+    /// of the commitment the peer just gossiped. The response's commitment must
+    /// hash to exactly this value.
+    pub expected_commitment_hash: [u8; 32],
+}
+
+/// Response to a contiguous-subtree storage audit challenge (ADR-0002).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubtreeAuditResponse {
+    /// The single-contiguous-subtree proof.
+    ///
+    /// Carries the responder's signed commitment (so the auditor re-derives
+    /// `key_count` and confirms the pin and signature) and the
+    /// nonce-selected subtree expanded to its leaves plus the sibling
+    /// cut-hashes on the path to the root. This is **round 1** of the
+    /// two-round audit. The auditor:
+    ///   1. confirms `commitment_hash(commitment) == expected_commitment_hash`
+    ///      and the signature is valid;
+    ///   2. re-derives the selected subtree from `(nonce, key_count)`, rebuilds
+    ///      the root from the proof, and requires it to equal the commitment
+    ///      root (structure).
+    ///
+    /// The leaves carry only hashes (`bytes_hash`, `nonced_hash`), so this round
+    /// proves the tree SHAPE is committed — not that the bytes are still held.
+    /// Real possession is proven in **round 2**: the auditor picks a few of the
+    /// just-verified leaves and sends a [`SubtreeByteChallenge`] requesting their
+    /// original chunk bytes FROM the responder (see that type).
+    Proof {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// The signed commitment whose root the proof is against.
+        commitment: crate::replication::commitment::StorageCommitment,
+        /// The nonce-selected contiguous subtree proof.
+        proof: crate::replication::subtree::SubtreeProof,
+    },
+    /// Peer is still bootstrapping (not ready for audit).
+    Bootstrapping {
+        /// The challenge this response answers.
+        challenge_id: u64,
+    },
+    /// Challenge rejected. `kind` drives the auditor's accounting (confirmed vs
+    /// graced); `reason` is the human-readable detail for logs.
+    Rejected {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// Machine-readable rejection class (accounting).
+        kind: RejectKind,
+        /// Human-readable rejection reason.
+        reason: String,
+    },
+}
+
+/// Why a responder rejected an audit challenge, in a form the auditor can act
+/// on without string-matching.
+///
+/// The distinction matters for accounting: a responder that no longer RETAINS
+/// the pinned commitment may simply have rotated past it legitimately — the
+/// auditor can pin a root it gossiped a while ago, or one whose newer
+/// replacements the auditor never observed (retention is capped at the last two
+/// *gossiped* roots, so a peer that rotated several times within the
+/// answerability window can honestly drop an older one). That is NOT provable
+/// misbehaviour, so it is GRACED like a timeout. Every other rejection is a
+/// genuine protocol fault the auditor confirms.
+///
+/// **Self-grace is bounded and does not preserve stale credit.** A Byzantine
+/// peer can deliberately claim `UnknownCommitment`/`Transient` to dodge the
+/// confirmed-failure *trust penalty*. But the auditor still REVOKES the holder
+/// credit for the PINNED commitment on any graced rejection (it answered and
+/// could not prove possession now — see the credit revocation in
+/// `storage_commitment_audit`'s rejection handling). The revocation is scoped to
+/// the pinned commitment hash, so it strips exactly the credit for the root the
+/// peer would not prove without touching credit it legitimately re-earned for a
+/// newer commitment. Lying therefore does not let a deleter keep "proven holder"
+/// status for that root until the credit TTL — the loophole a plain timeout
+/// would leave. It also accumulates a timeout strike, so a peer
+/// that self-graces on every audit still crosses the strike threshold once
+/// timeout-eviction is enabled. An honest peer that genuinely rotated simply
+/// re-earns credit on the next audit of its current commitment, so the grace
+/// strips no peer that is actually holding its responsible data. The grace
+/// removes only the false TRUST PENALTY for the genuinely-ambiguous
+/// rotated/transient case; it does not remove the possession requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectKind {
+    /// The responder does not retain the pinned commitment (rotated past it).
+    /// GRACED — indistinguishable from legitimate rotation the auditor missed.
+    UnknownCommitment,
+    /// A transient, recoverable condition on the responder (e.g. a storage read
+    /// error) that is NOT evidence of missing data. GRACED like a timeout so a
+    /// flaky disk never manufactures a confirmed possession failure.
+    Transient,
+    /// Any other rejection (wrong target peer, no commitment state, malformed
+    /// proof plan, oversized byte challenge, …). CONFIRMED failure.
+    Protocol,
+}
+
+impl RejectKind {
+    /// Whether the auditor should GRACE this rejection (treat like a timeout —
+    /// no confirmed penalty, no holder-credit revocation) rather than confirm
+    /// it. Only genuine protocol faults are confirmed; rotation/transient
+    /// conditions are graced because they are not provable misbehaviour.
+    #[must_use]
+    pub fn is_graced(self) -> bool {
+        matches!(self, Self::UnknownCommitment | Self::Transient)
+    }
+}
+
+/// Round 2 of the storage audit (ADR-0002): the **surprise byte challenge**.
+///
+/// After the auditor has structurally verified a [`SubtreeAuditResponse::Proof`]
+/// it picks a small sample of that subtree's just-proven leaves with FRESH
+/// randomness (chosen now, after the proof is committed — NOT derived from the
+/// round-1 nonce, so the responder could not have predicted it at proof-build
+/// time) and asks the responder to return the ORIGINAL chunk bytes for exactly
+/// those keys. The auditor then checks each returned chunk against the committed
+/// leaf:
+///   - `BLAKE3(bytes) == leaf.bytes_hash` (the chunk's content address), AND
+///   - `compute_audit_digest(nonce, peer, key, bytes) == leaf.nonced_hash`.
+///
+/// This makes possession non-delegable to the auditor: the auditor needs to
+/// hold NONE of the responder's chunks. A responder that committed to a chunk it
+/// no longer holds cannot fabricate bytes that hash to the committed address (a
+/// preimage break), so it is caught regardless of who audits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtreeByteChallenge {
+    /// The same `challenge_id` as the round-1 [`SubtreeAuditChallenge`], so the
+    /// responder/auditor correlate the two rounds.
+    pub challenge_id: u64,
+    /// The same nonce as round 1 — needed for the freshness (`nonced_hash`)
+    /// check and to bind these bytes to this audit.
+    pub nonce: [u8; 32],
+    /// The challenged peer ID (bound into each leaf's possession hash).
+    pub challenged_peer_id: [u8; 32],
+    /// The pinned commitment hash from round 1, so the responder resolves the
+    /// SAME tree it just proved and serves bytes only for keys it committed to.
+    pub expected_commitment_hash: [u8; 32],
+    /// The exact keys whose original bytes the responder must return. These are
+    /// the auditor's freshly-randomised spot-check sample of the round-1 subtree
+    /// (chosen after the proof was received; not nonce-derived).
+    pub keys: Vec<XorName>,
+}
+
+/// One requested chunk in a [`SubtreeByteResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SubtreeByteItem {
+    /// The responder holds this committed key and returns its original bytes.
+    Present {
+        /// The requested key.
+        key: XorName,
+        /// The original chunk bytes (the auditor re-hashes to verify).
+        bytes: Vec<u8>,
+    },
+    /// The responder committed to this key but cannot serve its bytes. This is a
+    /// PROVABLE cheat (it published a commitment over a chunk it does not hold),
+    /// so the auditor counts it as a confirmed failure — NOT a graced timeout.
+    /// Distinguishing this explicit signal from silence is what separates a
+    /// deleter (instant fail) from a dropped packet (timeout).
+    Absent {
+        /// The committed key the responder could not serve.
+        key: XorName,
+    },
+}
+
+/// Response to a [`SubtreeByteChallenge`] (round 2). One item per requested key,
+/// in the requested order.
+///
+/// Sizing rule: a challenge carries at most
+/// [`MAX_BYTE_CHALLENGE_KEYS`](super::config::MAX_BYTE_CHALLENGE_KEYS) keys —
+/// the auditor batches its sample, the responder rejects larger requests — so
+/// the WORST-CASE `Items` response (every chunk at `MAX_CHUNK_SIZE`) always
+/// encodes under [`MAX_REPLICATION_MESSAGE_SIZE`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SubtreeByteResponse {
+    /// The responder's per-key answers (bytes or an explicit absent signal).
+    Items {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// One entry per requested key.
+        items: Vec<SubtreeByteItem>,
+    },
+    /// Peer is still bootstrapping (should not happen mid-audit, but handled).
+    Bootstrapping {
+        /// The challenge this response answers.
+        challenge_id: u64,
+    },
+    /// The responder rejects the byte challenge outright. `kind` drives the
+    /// auditor's accounting: [`RejectKind::UnknownCommitment`] (rotated past the
+    /// pin) is graced; everything else is a confirmed failure, like round 1.
+    Rejected {
+        /// The challenge this response answers.
+        challenge_id: u64,
+        /// Machine-readable rejection class (accounting).
+        kind: RejectKind,
         /// Human-readable rejection reason.
         reason: String,
     },
@@ -391,6 +634,33 @@ impl std::error::Error for ReplicationProtocolError {}
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // === Round-2 byte response sizing ===
+
+    #[test]
+    fn max_batch_worst_case_byte_response_fits_wire_cap() {
+        // The auditor batches its round-2 sample to MAX_BYTE_CHALLENGE_KEYS per
+        // challenge precisely so this worst case — every requested chunk at
+        // MAX_CHUNK_SIZE — still encodes. If this fails, honest responders
+        // would hit encode errors and be penalized as timeouts.
+        let items: Vec<SubtreeByteItem> = (0..crate::replication::config::MAX_BYTE_CHALLENGE_KEYS)
+            .map(|i| SubtreeByteItem::Present {
+                key: [u8::try_from(i).unwrap_or(u8::MAX); 32],
+                bytes: vec![0xAB; crate::ant_protocol::MAX_CHUNK_SIZE],
+            })
+            .collect();
+        let msg = ReplicationMessage {
+            request_id: 7,
+            body: ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Items {
+                challenge_id: 7,
+                items,
+            }),
+        };
+        let encoded = msg
+            .encode()
+            .expect("worst-case max-batch byte response must fit the wire cap");
+        assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
+    }
 
     // === Fresh Replication roundtrip ===
 
@@ -490,6 +760,110 @@ mod tests {
 
     // === Neighbor Sync roundtrips ===
 
+    // -- backwards compat across the wire-type extension --------------------
+
+    /// Backwards-compat: an old peer that has the v0 layout of
+    /// `NeighborSyncRequest` (no `commitment` field) can still decode a
+    /// message encoded by a new peer that emits `commitment: None`. This
+    /// is the realistic mixed-version case during rollout: new peers
+    /// gossip with the field; old peers must not crash.
+    ///
+    /// The check works because postcard's [`from_bytes`] is lenient on
+    /// trailing bytes — the old decoder reads what it knows about and
+    /// stops, the new fields are silently ignored. This test pins that
+    /// invariant so any future codec/library swap that breaks it is
+    /// caught immediately.
+    #[test]
+    fn old_decoder_tolerates_new_neighbor_sync_request() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct OldNeighborSyncRequest {
+            #[allow(dead_code)]
+            pub replica_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub paid_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub bootstrapping: bool,
+        }
+
+        let new_req = NeighborSyncRequest {
+            replica_hints: vec![[0x01; 32], [0x02; 32]],
+            paid_hints: vec![[0x03; 32]],
+            bootstrapping: true,
+            commitment: None,
+        };
+        let encoded = postcard::to_stdvec(&new_req).expect("encode");
+        let old_decoded: OldNeighborSyncRequest =
+            postcard::from_bytes(&encoded).expect("old decoder accepts");
+        // Field-by-field check would fail if old peer misaligned on the
+        // length prefix — passing decode is the structural check.
+        assert_eq!(old_decoded.replica_hints.len(), 2);
+        assert_eq!(old_decoded.paid_hints.len(), 1);
+        assert!(old_decoded.bootstrapping);
+    }
+
+    /// Same property for `NeighborSyncResponse`.
+    #[test]
+    fn old_decoder_tolerates_new_neighbor_sync_response() {
+        use serde::Deserialize;
+        #[derive(Deserialize)]
+        struct OldNeighborSyncResponse {
+            #[allow(dead_code)]
+            pub replica_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub paid_hints: Vec<XorName>,
+            #[allow(dead_code)]
+            pub bootstrapping: bool,
+            #[allow(dead_code)]
+            pub rejected_keys: Vec<XorName>,
+        }
+
+        let new_resp = NeighborSyncResponse {
+            replica_hints: vec![[0x04; 32]],
+            paid_hints: vec![],
+            bootstrapping: false,
+            rejected_keys: vec![[0x05; 32]],
+            commitment: None,
+        };
+        let encoded = postcard::to_stdvec(&new_resp).expect("encode");
+        let old_decoded: OldNeighborSyncResponse =
+            postcard::from_bytes(&encoded).expect("old decoder accepts");
+        assert_eq!(old_decoded.replica_hints.len(), 1);
+        assert_eq!(old_decoded.rejected_keys.len(), 1);
+    }
+
+    /// Roundtrip: a new peer can decode its own message including the
+    /// commitment field. Catches accidental serde annotation breakage
+    /// (e.g. forgetting `#[serde(default)]` on the new field).
+    #[test]
+    fn new_peer_roundtrips_with_commitment_some() {
+        use crate::replication::commitment::{sign_commitment, StorageCommitment};
+        use saorsa_pqc::api::sig::ml_dsa_65;
+
+        let (pk, sk) = ml_dsa_65().generate_keypair().expect("keygen");
+        let root = [0x7Fu8; 32];
+        let sender = [0xCCu8; 32];
+        let pk_bytes = pk.to_bytes();
+        let sig = sign_commitment(&sk, &root, 3, &sender, &pk_bytes).expect("sign");
+        let commitment = StorageCommitment {
+            root,
+            key_count: 3,
+            sender_peer_id: sender,
+            sender_public_key: pk_bytes,
+            signature: sig,
+        };
+
+        let req = NeighborSyncRequest {
+            replica_hints: vec![[0x01; 32]],
+            paid_hints: vec![],
+            bootstrapping: false,
+            commitment: Some(commitment.clone()),
+        };
+        let encoded = postcard::to_stdvec(&req).expect("encode");
+        let decoded: NeighborSyncRequest = postcard::from_bytes(&encoded).expect("new decoder");
+        assert_eq!(decoded.commitment, Some(commitment));
+    }
+
     #[test]
     fn neighbor_sync_request_roundtrip() {
         let msg = ReplicationMessage {
@@ -498,6 +872,7 @@ mod tests {
                 replica_hints: vec![[0x01; 32], [0x02; 32]],
                 paid_hints: vec![[0x03; 32]],
                 bootstrapping: true,
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");
@@ -522,6 +897,7 @@ mod tests {
                 paid_hints: vec![],
                 bootstrapping: false,
                 rejected_keys: vec![[0x05; 32], [0x06; 32]],
+                commitment: None,
             }),
         };
         let encoded = msg.encode().expect("encode should succeed");

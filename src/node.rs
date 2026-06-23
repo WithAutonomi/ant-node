@@ -45,6 +45,36 @@ impl NodeBuilder {
         Self { config }
     }
 
+    /// Reject startup in production mode without a usable rewards address.
+    ///
+    /// A node that cannot receive payment must not silently run on the
+    /// production network. The placeholder address shipped in the example
+    /// config and an empty string both count as "unconfigured".
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Config`] if `network_mode` is `Production` and
+    /// `payment.rewards_address` is unset, empty, or the example placeholder.
+    fn validate_production_rewards_address(config: &NodeConfig) -> Result<()> {
+        if config.network_mode != NetworkMode::Production {
+            return Ok(());
+        }
+        let configured = config
+            .payment
+            .rewards_address
+            .as_deref()
+            .is_some_and(|addr| !addr.is_empty() && addr != "0xYOUR_ARBITRUM_ADDRESS_HERE");
+        if configured {
+            Ok(())
+        } else {
+            Err(Error::Config(
+                "CRITICAL: Rewards address is not configured. \
+                 Set payment.rewards_address in config to your Arbitrum wallet address."
+                    .to_string(),
+            ))
+        }
+    }
+
     /// Build and start the node.
     ///
     /// # Errors
@@ -53,26 +83,7 @@ impl NodeBuilder {
     pub async fn build(mut self) -> Result<RunningNode> {
         info!("Building ant-node with config: {:?}", self.config);
 
-        // Validate rewards address in production
-        if self.config.network_mode == NetworkMode::Production {
-            match self.config.payment.rewards_address {
-                None => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(ref addr) if addr == "0xYOUR_ARBITRUM_ADDRESS_HERE" || addr.is_empty() => {
-                    return Err(Error::Config(
-                        "CRITICAL: Rewards address is not configured. \
-                         Set payment.rewards_address in config to your Arbitrum wallet address."
-                            .to_string(),
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
+        Self::validate_production_rewards_address(&self.config)?;
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
@@ -141,6 +152,7 @@ impl NodeBuilder {
                     Arc::clone(&p2p_arc),
                     storage_arc,
                     payment_verifier_arc,
+                    Arc::clone(&identity),
                     &self.config.root_dir,
                     fresh_rx,
                     shutdown.clone(),

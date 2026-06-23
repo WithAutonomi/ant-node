@@ -1145,34 +1145,71 @@ impl TestNetwork {
         debug!("Starting node {} on port {}", node.index, node.port);
         *node.state.write().await = NodeState::Starting;
 
-        // Build configuration for saorsa-core P2PNode (saorsa-core is an external crate).
+        // Retry budget for a transient transport/port-bind race at node
+        // creation (a `let`, not an item, to avoid clippy's items-after-
+        // statements in this scope). See the loop below for the rationale.
+        let node_create_attempts: u32 = 4;
+
+        // Build the saorsa-core config (a fresh one per creation attempt, since
+        // P2PNode::new consumes it). Factored into a closure so the transient-
+        // error retry below can rebuild it.
         // .local(true) auto-enables allow_loopback for test nodes on 127.0.0.1.
         // .ipv6(false) keeps the bind on 127.0.0.1 only; Windows GitHub
         // Actions runners (and some macOS runners) can't bind a dual-stack
         // v6 socket and the whole testnet startup fails with
         // "Failed to create dual-stack network nodes: Failed to create transport".
         // Loopback-only tests don't need v6.
-        let mut core_config = CoreNodeConfig::builder()
-            .port(node.port)
-            .ipv6(false)
-            .local(true)
-            .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
-            .max_message_size(MAX_REPLICATION_MESSAGE_SIZE.max(MAX_WIRE_MESSAGE_SIZE))
-            .build()
-            .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
+        let build_core_config = || -> Result<CoreNodeConfig> {
+            let mut core_config = CoreNodeConfig::builder()
+                .port(node.port)
+                .ipv6(false)
+                .local(true)
+                .connection_timeout(Duration::from_secs(TEST_CORE_CONNECTION_TIMEOUT_SECS))
+                .max_message_size(MAX_REPLICATION_MESSAGE_SIZE.max(MAX_WIRE_MESSAGE_SIZE))
+                .build()
+                .map_err(|e| TestnetError::Core(format!("Failed to create core config: {e}")))?;
+            core_config
+                .bootstrap_peers
+                .clone_from(&node.bootstrap_addrs);
+            core_config.diversity_config = Some(CoreDiversityConfig::permissive());
+            // Inject the ML-DSA identity so the P2PNode's transport peer ID
+            // matches the pub_key embedded in payment quotes.
+            core_config.node_identity.clone_from(&node.node_identity);
+            Ok(core_config)
+        };
 
-        core_config
-            .bootstrap_peers
-            .clone_from(&node.bootstrap_addrs);
-        core_config.diversity_config = Some(CoreDiversityConfig::permissive());
-
-        // Inject the ML-DSA identity so the P2PNode's transport peer ID
-        // matches the pub_key embedded in payment quotes.
-        core_config.node_identity.clone_from(&node.node_identity);
-
-        // Create and start the P2P node
-        let p2p_node = P2PNode::new(core_config).await.map_err(|e| {
-            TestnetError::Startup(format!("Failed to create node {}: {e}", node.index))
+        // Create the P2P node, retrying a transient transport/port-bind failure.
+        // On Windows (and occasionally macOS) GitHub runners, node creation can
+        // intermittently fail with "Failed to create transport" when the freshly
+        // chosen loopback port is momentarily still held by a just-released
+        // socket — a flaky-setup race, not a logic error. A few retries with a
+        // short backoff (same port; the race clears in milliseconds) makes the
+        // multi-node bring-up deterministic without masking a real transport
+        // misconfiguration (which fails every attempt).
+        let mut p2p_node = None;
+        let mut last_err = String::new();
+        for attempt in 1..=node_create_attempts {
+            match P2PNode::new(build_core_config()?).await {
+                Ok(n) => {
+                    p2p_node = Some(n);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    debug!(
+                        "Node {} creation attempt {attempt}/{node_create_attempts} failed \
+                         (transient transport/port race?): {last_err}",
+                        node.index
+                    );
+                    tokio::time::sleep(Duration::from_millis(250 * u64::from(attempt))).await;
+                }
+            }
+        }
+        let p2p_node = p2p_node.ok_or_else(|| {
+            TestnetError::Startup(format!(
+                "Failed to create node {} after {node_create_attempts} attempts: {last_err}",
+                node.index
+            ))
         })?;
 
         p2p_node.start().await.map_err(|e| {
@@ -1239,16 +1276,23 @@ impl TestNetwork {
             }));
         }
 
-        // Start replication engine for this node
-        if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {
+        // Start replication engine for this node. A node without an identity
+        // skips ONLY the engine (no early return — the node must still be
+        // tracked in `self.nodes` below, or its already-started P2P/protocol
+        // tasks would keep running untracked by the harness).
+        if let (Some(ref p2p), Some(ref protocol), Some(ref id)) =
+            (&node.p2p_node, &node.ant_protocol, &node.node_identity)
+        {
             let shutdown = CancellationToken::new();
             let repl_config = ReplicationConfig::default();
             let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
+            let node_identity = Arc::clone(id);
             match ReplicationEngine::new(
                 repl_config,
                 Arc::clone(p2p),
                 protocol.storage(),
                 protocol.payment_verifier_arc(),
+                node_identity,
                 &node.data_dir,
                 fresh_rx,
                 shutdown.clone(),
@@ -1269,6 +1313,11 @@ impl TestNetwork {
                     );
                 }
             }
+        } else if node.node_identity.is_none() {
+            warn!(
+                "Node {} has no identity; skipping replication engine",
+                node.index
+            );
         }
 
         debug!("Node {} started successfully", node.index);

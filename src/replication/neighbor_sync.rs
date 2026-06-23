@@ -335,11 +335,23 @@ pub async fn sync_with_peer(
     config: &ReplicationConfig,
     is_bootstrapping: bool,
 ) -> Option<NeighborSyncResponse> {
-    sync_with_peer_with_outcome(peer, p2p_node, storage, paid_list, config, is_bootstrapping)
-        .await
-        .map(|outcome| outcome.response)
+    sync_with_peer_with_outcome(
+        peer,
+        p2p_node,
+        storage,
+        paid_list,
+        config,
+        is_bootstrapping,
+        None,
+    )
+    .await
+    .map(|outcome| outcome.response)
 }
 
+/// `commitment`: sender's current commitment to piggyback on the request.
+/// `None` if the responder hasn't rotated one yet (e.g. fresh boot,
+/// empty storage) — receiver falls back to legacy path.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_with_peer_with_outcome(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
@@ -347,6 +359,7 @@ pub(crate) async fn sync_with_peer_with_outcome(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
+    commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> Option<NeighborSyncOutcome> {
     // Build peer-targeted hint sets (Rule 7).
     let mut hints_by_peer = build_sync_hints_for_peers(
@@ -359,15 +372,20 @@ pub(crate) async fn sync_with_peer_with_outcome(
     )
     .await;
     let hints = hints_by_peer.remove(peer).unwrap_or_default();
-    sync_with_peer_with_hints(peer, p2p_node, config, is_bootstrapping, hints).await
+    sync_with_peer_with_hints(peer, p2p_node, config, is_bootstrapping, hints, commitment).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn sync_with_peer_with_hints(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
     hints: PeerSyncHints,
+    // ADR-0002: sender's current commitment, piggybacked on the sync request so
+    // the receiver can ingest it (commitment gossip travels on neighbor sync) —
+    // see `NeighborSyncRequest::commitment` and `ingest_peer_commitment`.
+    commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> Option<NeighborSyncOutcome> {
     let replica_hints = hints
         .sent_replica_hints
@@ -380,6 +398,7 @@ pub(crate) async fn sync_with_peer_with_hints(
         replica_hints,
         paid_hints: hints.paid_hints,
         bootstrapping: is_bootstrapping,
+        commitment,
     };
     let request_id = rand::thread_rng().gen::<u64>();
     let msg = ReplicationMessage {
@@ -479,11 +498,13 @@ pub async fn handle_sync_request(
         paid_list,
         config,
         is_bootstrapping,
+        None,
     )
     .await;
     (response, sender_in_rt)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_sync_request_with_proofs(
     sender: &PeerId,
     _request: &NeighborSyncRequest,
@@ -492,6 +513,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     is_bootstrapping: bool,
+    my_commitment: Option<crate::replication::commitment::StorageCommitment>,
 ) -> (NeighborSyncResponse, Vec<SentReplicaHint>, bool) {
     let sender_in_rt = p2p_node.dht_manager().is_in_routing_table(sender).await;
 
@@ -520,6 +542,7 @@ pub(crate) async fn handle_sync_request_with_proofs(
         paid_hints,
         bootstrapping: is_bootstrapping,
         rejected_keys: Vec::new(),
+        commitment: my_commitment,
     };
 
     // Rule 4-6: accept inbound hints only if sender is in LocalRT.
@@ -1167,6 +1190,7 @@ mod tests {
             paid_hints: outbound_paid_hints.clone(),
             bootstrapping: false,
             rejected_keys: Vec::new(),
+            commitment: None,
         };
 
         // Inbound hints from the sender (would be in the request).

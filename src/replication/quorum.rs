@@ -207,18 +207,51 @@ pub fn evaluate_key_evidence(
     targets: &VerificationTargets,
     config: &ReplicationConfig,
 ) -> KeyVerificationOutcome {
+    evaluate_key_evidence_with_holder_check(key, evidence, targets, config, |_, _| true)
+}
+
+/// Variant of [`evaluate_key_evidence`] that consults a holder-credit
+/// predicate before counting a peer's Present evidence (v12 §6).
+///
+/// `holder_credit` is invoked as `(peer, key) -> bool`. Returning `false`
+/// downgrades a Present claim to Unresolved (we don't trust this peer's
+/// "I have it" without a recent commitment-bound audit proving it).
+/// Returning `true` keeps today's behaviour. Paid-list evidence is
+/// independent of holder credit (the paid-list lookup is a property of
+/// the receiving peer's own data, not a claim about K being present).
+///
+/// The non-`_with_holder_check` form preserves prior behaviour by
+/// passing a predicate that always returns true. New call sites that
+/// have a `RecentProvers` cache + commitment-by-peer table should pass
+/// a real predicate.
+#[must_use]
+pub fn evaluate_key_evidence_with_holder_check(
+    key: &XorName,
+    evidence: &KeyVerificationEvidence,
+    targets: &VerificationTargets,
+    config: &ReplicationConfig,
+    holder_credit: impl Fn(&PeerId, &XorName) -> bool,
+) -> KeyVerificationOutcome {
     let quorum_peers = targets
         .quorum_targets
         .get(key)
         .map_or(&[][..], Vec::as_slice);
 
-    // Count presence evidence from QuorumTargets.
+    // Count presence evidence from QuorumTargets. v12 §6: a peer that
+    // claims Present but is not commitment-credited for K is downgraded
+    // to Unresolved (we may have to retry once they re-prove storage).
     let mut presence_positive = 0usize;
     let mut presence_unresolved = 0usize;
 
     for peer in quorum_peers {
         match evidence.presence.get(peer) {
-            Some(PresenceEvidence::Present) => presence_positive += 1,
+            Some(PresenceEvidence::Present) => {
+                if holder_credit(peer, key) {
+                    presence_positive += 1;
+                } else {
+                    presence_unresolved += 1;
+                }
+            }
             Some(PresenceEvidence::Absent) => {}
             Some(PresenceEvidence::Unresolved) | None => {
                 presence_unresolved += 1;
@@ -682,6 +715,108 @@ mod tests {
         assert!(
             matches!(outcome, KeyVerificationOutcome::QuorumVerified { ref sources } if sources.len() == 4),
             "expected QuorumVerified with 4 sources, got {outcome:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // v12 §6 holder-credit predicate downgrades uncredited peers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quorum_downgrades_uncredited_present_peers() {
+        // 7 quorum peers, threshold 4. 4 say Present, 3 say Absent —
+        // would normally pass. But with a holder-credit predicate that
+        // only credits 2 of them, presence_positive drops to 2 and the
+        // 2 uncredited Presents become Unresolved. Total = 2 positive
+        // + 2 unresolved + 3 absent = 5 valid → still possible →
+        // QuorumInconclusive (not yet failed, but not verified either).
+        let key = xor_name_from_byte(0x33);
+        let config = ReplicationConfig::default();
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), vec![]);
+
+        let evidence = build_evidence(
+            vec![
+                (quorum_peers[0], PresenceEvidence::Present),
+                (quorum_peers[1], PresenceEvidence::Present),
+                (quorum_peers[2], PresenceEvidence::Present),
+                (quorum_peers[3], PresenceEvidence::Present),
+                (quorum_peers[4], PresenceEvidence::Absent),
+                (quorum_peers[5], PresenceEvidence::Absent),
+                (quorum_peers[6], PresenceEvidence::Absent),
+            ],
+            vec![],
+        );
+
+        // Credit only the first two peers (the other two Presents are
+        // uncredited and will be downgraded to Unresolved).
+        let credit = |peer: &PeerId, _: &XorName| -> bool {
+            *peer == quorum_peers[0] || *peer == quorum_peers[1]
+        };
+        let outcome =
+            evaluate_key_evidence_with_holder_check(&key, &evidence, &targets, &config, credit);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumInconclusive),
+            "credit downgrade should drop presence_positive below threshold, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn quorum_passes_when_all_present_peers_are_credited() {
+        let key = xor_name_from_byte(0x34);
+        let config = ReplicationConfig::default();
+        let quorum_peers: Vec<PeerId> = (1..=7).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), vec![]);
+
+        let evidence = build_evidence(
+            (0..4)
+                .map(|i| (quorum_peers[i], PresenceEvidence::Present))
+                .chain((4..7).map(|i| (quorum_peers[i], PresenceEvidence::Absent)))
+                .collect(),
+            vec![],
+        );
+
+        let credit = |_: &PeerId, _: &XorName| -> bool { true };
+        let outcome =
+            evaluate_key_evidence_with_holder_check(&key, &evidence, &targets, &config, credit);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumVerified { .. }),
+            "all-credited Present should pass quorum, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_path_unaffected_by_holder_credit() {
+        // v12 §6: holder-credit gates Present claims, NOT paid-list
+        // evidence (the paid-list lookup is the receiving peer's own
+        // data, not a claim about K). A peer with no credit at all
+        // can still contribute to paid-list majority.
+        let key = xor_name_from_byte(0x35);
+        let config = ReplicationConfig::default();
+        let quorum_peers: Vec<PeerId> = (1..=3).map(peer_id_from_byte).collect();
+        let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        let evidence = build_evidence(
+            quorum_peers
+                .iter()
+                .map(|p| (*p, PresenceEvidence::Absent))
+                .collect(),
+            vec![
+                (paid_peers[0], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[2], PaidListEvidence::Confirmed),
+                (paid_peers[3], PaidListEvidence::NotFound),
+                (paid_peers[4], PaidListEvidence::NotFound),
+            ],
+        );
+
+        let credit = |_: &PeerId, _: &XorName| -> bool { false };
+        let outcome =
+            evaluate_key_evidence_with_holder_check(&key, &evidence, &targets, &config, credit);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "paid-list path must not be gated by holder-credit, got {outcome:?}"
         );
     }
 
