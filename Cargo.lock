@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.14.0"
+version = "0.14.1-rc.1"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -861,9 +861,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f61260c89bbc0039e0643f3e2ec79b1c17aee9d81b58d7edbc52314689489f39"
+version = "2.2.1-rc.1"
+source = "git+https://github.com/WithAutonomi/ant-protocol?branch=rc-2026.6.3#ea5a252856f1eade54e229fb2fb24c3f2ef69fcb"
 dependencies = [
  "blake3",
  "bytes",
@@ -4866,9 +4865,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa8cc1b7f59f97d018760ff150bbb4f217197c41622b83f7085c9cf0424b736e"
+version = "0.26.1-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-core?branch=rc-2026.6.3#fffb96212261e4df9ea47ae81d2a1f88e636ff95"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4981,9 +4979,8 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.35.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "621d0a207914a8fd6453f25e4bcc369914cbfaf59a2857e898c079b95f52f5bb"
+version = "0.35.1-rc.1"
+source = "git+https://github.com/saorsa-labs/saorsa-transport?branch=rc-2026.6.3#a201fac4f38f7839850600fde2eaa306018b6ff7"
 dependencies = [
  "anyhow",
  "async-trait",
