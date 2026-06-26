@@ -485,6 +485,17 @@ impl ReplicationEngine {
         .await
     }
 
+    /// Test-only: run the possession check immediately for `key` against
+    /// `peers`, bypassing the scheduler's randomised 5-15 minute settle delay.
+    ///
+    /// Penalises any peer that does not hold `key` at `AuditChallenge`
+    /// severity (ADR-0003). Lets e2e tests assert the detection+penalty path
+    /// deterministically without waiting for the scheduled check.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn run_possession_check_now(&self, key: XorName, peers: Vec<PeerId>) {
+        possession::run_possession_check(key, peers, &self.p2p_node, &self.shutdown).await;
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that

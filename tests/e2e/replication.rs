@@ -252,6 +252,86 @@ async fn test_fresh_replication_propagates_to_close_group() {
     harness.teardown().await.expect("teardown");
 }
 
+/// ADR-0003: the delayed possession check penalises a responsible peer that
+/// does NOT hold the chunk, and leaves a peer that DOES hold it unpenalised.
+///
+/// Drives the check directly (`run_possession_check_now`, bypassing the 5-15
+/// minute settle delay) so the detection+penalty path is asserted
+/// deterministically over real transport. The penalty is observed as a drop in
+/// the checker's trust score for the absent peer (the same signal saorsa-core
+/// eviction acts on), via `P2PNode::peer_trust`.
+#[tokio::test]
+#[serial]
+async fn possession_check_penalises_absent_peer_only() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // A is the checker; B will be absent, C will hold the chunk. All three are
+    // regular nodes (idx >= 3) with running replication engines and storage.
+    let a = harness.test_node(3).expect("node a");
+    let b = harness.test_node(4).expect("node b");
+    let c = harness.test_node(5).expect("node c");
+
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
+    let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
+
+    let content = b"adr-0003 possession-check payload";
+    let address = compute_address(content);
+
+    // C holds the chunk; B never stores it.
+    c.ant_protocol
+        .as_ref()
+        .expect("proto c")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on c");
+
+    assert!(
+        !b.ant_protocol
+            .as_ref()
+            .expect("proto b")
+            .storage()
+            .exists(&address)
+            .expect("exists b"),
+        "precondition: B must not hold the chunk"
+    );
+    assert!(
+        c.ant_protocol
+            .as_ref()
+            .expect("proto c")
+            .storage()
+            .exists(&address)
+            .expect("exists c"),
+        "precondition: C must hold the chunk"
+    );
+
+    let trust_b_before = p2p_a.peer_trust(&peer_b);
+    let trust_c_before = p2p_a.peer_trust(&peer_c);
+
+    // Probe both peers now (no scheduler delay). B is absent -> penalised; C is
+    // present -> untouched.
+    engine_a
+        .run_possession_check_now(address, vec![peer_b, peer_c])
+        .await;
+
+    let trust_b_after = p2p_a.peer_trust(&peer_b);
+    let trust_c_after = p2p_a.peer_trust(&peer_c);
+
+    assert!(
+        trust_b_after < trust_b_before,
+        "absent peer B must be penalised: {trust_b_before} -> {trust_b_after}"
+    );
+    assert!(
+        trust_c_after >= trust_c_before - f64::EPSILON,
+        "present peer C must not be penalised: {trust_c_before} -> {trust_c_after}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
 /// `PaidForList` persistence (Section 18 #43).
 ///
 /// Insert a key into the `PaidList`, verify it persists by reopening the
