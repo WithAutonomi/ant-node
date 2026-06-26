@@ -38,9 +38,10 @@ pub struct FreshWriteEvent {
 
 /// Execute fresh replication for a newly accepted record.
 ///
-/// Sends fresh offers to close group members and `PaidNotify` to
-/// `PaidCloseGroup`. Both are fire-and-forget (no ack tracking or retry per
-/// Section 6.1, rule 8).
+/// Sends fresh offers to close group members (with bounded delivery retries,
+/// ADR-0003) and `PaidNotify` to `PaidCloseGroup`. Returns the close-group
+/// peers responsible for the key (excluding self) so the caller can schedule
+/// the delayed possession check; `PaidNotify` remains fire-and-forget.
 ///
 /// The `send_semaphore` limits how many outbound chunk transfers can be
 /// in-flight concurrently across the entire replication engine, preventing
@@ -53,7 +54,7 @@ pub async fn replicate_fresh(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     send_semaphore: &Arc<Semaphore>,
-) {
+) -> Vec<PeerId> {
     let self_id = *p2p_node.peer_id();
 
     // Rule 6: Node that validates PoP adds K to PaidForList(self).
@@ -90,7 +91,7 @@ pub async fn replicate_fresh(
             "Failed to encode FreshReplicationOffer for {}",
             hex::encode(key),
         );
-        return;
+        return Vec::new();
     };
     // Share one encoded copy across the per-peer send tasks so a retry only
     // re-materialises the buffer for the (consuming) send call, keeping the
@@ -154,6 +155,8 @@ pub async fn replicate_fresh(
         hex::encode(key),
         target_peers.len()
     );
+
+    target_peers
 }
 
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget).

@@ -23,6 +23,7 @@ pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
+pub mod possession;
 pub mod protocol;
 pub mod pruning;
 pub mod quorum;
@@ -311,6 +312,12 @@ pub struct ReplicationEngine {
     /// When present, `start()` spawns a drainer task that calls
     /// `replicate_fresh` for each event.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Sender for delayed possession-check events (ADR-0003). The fresh-write
+    /// drainer pushes the responsible close-group peers here after each fresh
+    /// replication; the possession-check scheduler drains the paired receiver.
+    possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
+    /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
+    possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -345,6 +352,7 @@ impl ReplicationEngine {
 
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
         let config = Arc::new(config);
+        let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config: Arc::clone(&config),
@@ -373,6 +381,8 @@ impl ReplicationEngine {
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_write_rx: Some(fresh_write_rx),
+            possession_check_tx,
+            possession_check_rx: Some(possession_check_rx),
             shutdown,
             task_handles: Vec::new(),
         })
@@ -500,6 +510,7 @@ impl ReplicationEngine {
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
+        self.start_possession_check_scheduler();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -594,6 +605,7 @@ impl ReplicationEngine {
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let send_semaphore = Arc::clone(&self.send_semaphore);
+        let possession_tx = self.possession_check_tx.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -602,7 +614,7 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
-                        fresh::replicate_fresh(
+                        let peers = fresh::replicate_fresh(
                             &event.key,
                             &event.data,
                             &event.payment_proof,
@@ -612,10 +624,67 @@ impl ReplicationEngine {
                             &send_semaphore,
                         )
                         .await;
+                        // Schedule the delayed possession check (ADR-0003) for
+                        // the responsible close-group peers. A closed receiver
+                        // (engine shutting down) is ignored.
+                        if !peers.is_empty() {
+                            let _ = possession_tx.send(possession::PossessionCheckEvent {
+                                key: event.key,
+                                peers,
+                            });
+                        }
                     }
                 }
             }
             debug!("Fresh-write drainer shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Spawn the possession-check scheduler (ADR-0003).
+    ///
+    /// Drains scheduled possession-check events and, for each, waits a
+    /// randomised 5-15 minute settle delay before probing every responsible
+    /// peer for actual possession. A peer that lacks the chunk is penalised at
+    /// `AuditChallenge` severity; an unreachable peer is re-probed under a
+    /// bounded grace and never penalised.
+    fn start_possession_check_scheduler(&mut self) {
+        let Some(mut rx) = self.possession_check_rx.take() else {
+            return;
+        };
+        let p2p = Arc::clone(&self.p2p_node);
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        // Spawn a per-chunk delayed check so the drain loop
+                        // keeps pace with the write rate. Each check sleeps the
+                        // randomised settle delay, then probes every peer.
+                        let p2p = Arc::clone(&p2p);
+                        let shutdown = shutdown.clone();
+                        tokio::spawn(async move {
+                            let delay = possession::random_delay();
+                            tokio::select! {
+                                () = shutdown.cancelled() => {}
+                                () = tokio::time::sleep(delay) => {
+                                    possession::run_possession_check(
+                                        event.key,
+                                        event.peers,
+                                        &p2p,
+                                        &shutdown,
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            debug!("Possession-check scheduler shut down");
         });
         self.task_handles.push(handle);
     }

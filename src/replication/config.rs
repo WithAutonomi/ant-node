@@ -56,6 +56,38 @@ pub const NEIGHBOR_SYNC_PEER_COUNT: usize = 4;
 /// push never reached it.
 pub const FRESH_REPLICATION_DELIVERY_MAX_RETRIES: u32 = 2;
 
+const POSSESSION_CHECK_DELAY_MIN_SECS: u64 = 5 * 60;
+const POSSESSION_CHECK_DELAY_MAX_SECS: u64 = 15 * 60;
+const POSSESSION_CHECK_TIMEOUT_SECS: u64 = 15;
+const POSSESSION_CHECK_RETRY_BACKOFF_SECS: u64 = 30;
+
+/// Lower bound of the delay before a fresh-replication possession check runs
+/// (ADR-0003).
+///
+/// The delay lets replication settle so an honest peer still mid-store is not
+/// judged prematurely, and makes the check unpredictable to the peer.
+pub const POSSESSION_CHECK_DELAY_MIN: Duration =
+    Duration::from_secs(POSSESSION_CHECK_DELAY_MIN_SECS);
+
+/// Upper bound of the possession-check delay (ADR-0003).
+pub const POSSESSION_CHECK_DELAY_MAX: Duration =
+    Duration::from_secs(POSSESSION_CHECK_DELAY_MAX_SECS);
+
+/// Per-peer request timeout for a single possession probe (ADR-0003).
+pub const POSSESSION_CHECK_TIMEOUT: Duration = Duration::from_secs(POSSESSION_CHECK_TIMEOUT_SECS);
+
+/// Maximum possession-probe attempts per peer before giving up without a
+/// verdict (ADR-0003).
+///
+/// A peer unreachable at check time is re-attempted under this bounded grace
+/// and is never penalised as absent.
+pub const POSSESSION_CHECK_MAX_ATTEMPTS: u32 = 3;
+
+/// Backoff between possession-probe attempts when a peer yields no verdict
+/// (ADR-0003).
+pub const POSSESSION_CHECK_RETRY_BACKOFF: Duration =
+    Duration::from_secs(POSSESSION_CHECK_RETRY_BACKOFF_SECS);
+
 /// Width used when deciding whether this node may locally store or retain a
 /// chunk.
 #[must_use]
