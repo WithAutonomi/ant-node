@@ -222,6 +222,11 @@ pub struct TestNetworkConfig {
     /// this network (e.g. Anvil testnet) for on-chain verification.
     /// When `None`, defaults to `ArbitrumOne`.
     pub evm_network: Option<EvmNetwork>,
+
+    /// Optional replication-config override applied to every node's
+    /// replication engine. `None` uses `ReplicationConfig::default()`. Tests
+    /// use this to shorten timers — e.g. the ADR-0003 possession-check delay.
+    pub replication_config: Option<ReplicationConfig>,
 }
 
 impl Default for TestNetworkConfig {
@@ -255,6 +260,7 @@ impl Default for TestNetworkConfig {
             enable_node_logging: false,
             payment_enforcement: false,
             evm_network: None,
+            replication_config: None,
         }
     }
 }
@@ -1284,7 +1290,7 @@ impl TestNetwork {
             (&node.p2p_node, &node.ant_protocol, &node.node_identity)
         {
             let shutdown = CancellationToken::new();
-            let repl_config = ReplicationConfig::default();
+            let repl_config = self.config.replication_config.clone().unwrap_or_default();
             let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(

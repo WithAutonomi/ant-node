@@ -21,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 use crate::ant_protocol::XorName;
 use crate::logging::{debug, warn};
 use crate::replication::config::{
-    self, POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN, POSSESSION_CHECK_MAX_ATTEMPTS,
-    POSSESSION_CHECK_RETRY_BACKOFF, POSSESSION_CHECK_TIMEOUT, REPLICATION_PROTOCOL_ID,
+    self, POSSESSION_CHECK_MAX_ATTEMPTS, POSSESSION_CHECK_RETRY_BACKOFF, POSSESSION_CHECK_TIMEOUT,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest,
@@ -46,17 +46,18 @@ enum ProbeOutcome {
     NoVerdict,
 }
 
-/// Pick a randomised delay in `[POSSESSION_CHECK_DELAY_MIN,
-/// POSSESSION_CHECK_DELAY_MAX]` to wait before a possession check runs.
+/// Pick a randomised delay in `[min, max]` to wait before a possession check
+/// runs. The bounds come from `ReplicationConfig` (defaulting to
+/// `POSSESSION_CHECK_DELAY_MIN`/`MAX`) so tests can shorten them.
 #[must_use]
-pub fn random_delay() -> Duration {
+pub fn random_delay(min: Duration, max: Duration) -> Duration {
     let to_millis = |d: Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
-    let min = to_millis(POSSESSION_CHECK_DELAY_MIN);
-    let max = to_millis(POSSESSION_CHECK_DELAY_MAX);
-    if min >= max {
-        return POSSESSION_CHECK_DELAY_MIN;
+    let min_ms = to_millis(min);
+    let max_ms = to_millis(max);
+    if min_ms >= max_ms {
+        return min;
     }
-    Duration::from_millis(rand::thread_rng().gen_range(min..=max))
+    Duration::from_millis(rand::thread_rng().gen_range(min_ms..=max_ms))
 }
 
 /// Run the possession check for one chunk against every responsible peer.
@@ -180,11 +181,12 @@ async fn probe_once(key: &XorName, peer: &PeerId, p2p_node: &Arc<P2PNode>) -> Pr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::replication::config::{POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN};
 
     #[test]
     fn random_delay_is_within_bounds() {
         for _ in 0..100 {
-            let d = random_delay();
+            let d = random_delay(POSSESSION_CHECK_DELAY_MIN, POSSESSION_CHECK_DELAY_MAX);
             assert!(d >= POSSESSION_CHECK_DELAY_MIN);
             assert!(d <= POSSESSION_CHECK_DELAY_MAX);
         }

@@ -5,6 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use super::testnet::TestNetworkConfig;
 use super::TestHarness;
 use ant_node::client::compute_address;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
@@ -327,6 +328,79 @@ async fn possession_check_penalises_absent_peer_only() {
     assert!(
         trust_c_after >= trust_c_before - f64::EPSILON,
         "present peer C must not be penalised: {trust_c_before} -> {trust_c_after}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0003: the possession-check *scheduler* (not the direct-drive path)
+/// fires after the configured delay and penalises an absent close peer.
+///
+/// Uses a shortened possession delay so the scheduled check runs in well under
+/// a second. No payment cache is pre-populated, so the close-group peers reject
+/// the fresh offer and are absent when the scheduled check probes them. Proves
+/// the `replicate_fresh` -> enqueue -> delayed scheduler -> penalty wiring.
+#[tokio::test]
+#[serial]
+async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
+    let mut net_config = TestNetworkConfig::small();
+    net_config.replication_config = Some(ReplicationConfig {
+        possession_check_delay_min: Duration::from_millis(200),
+        possession_check_delay_max: Duration::from_millis(500),
+        ..ReplicationConfig::default()
+    });
+    let harness = TestHarness::setup_with_config(net_config)
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let a = harness.test_node(3).expect("node a");
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let self_a = *p2p_a.peer_id();
+
+    let content = b"adr-0003 scheduler-wiring payload";
+    let address = compute_address(content);
+
+    // A's close group for this key = exactly the peers the scheduled possession
+    // check targets. With no payment cache anywhere, they reject the fresh offer
+    // and are absent when probed.
+    let close_group_size = ReplicationConfig::default().close_group_size;
+    let close_group: Vec<PeerId> = p2p_a
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, close_group_size)
+        .await
+        .iter()
+        .filter(|n| n.peer_id != self_a)
+        .map(|n| n.peer_id)
+        .collect();
+    assert!(!close_group.is_empty(), "expected a non-empty close group");
+
+    let trust_before: Vec<f64> = close_group.iter().map(|p| p2p_a.peer_trust(p)).collect();
+
+    // Trigger fresh replication; the engine enqueues the possession check, which
+    // fires ~200-500 ms later and penalises the absent close peers.
+    let dummy_pop = [0x01u8; 64];
+    engine_a
+        .replicate_fresh(&address, content, &dummy_pop)
+        .await;
+
+    // Poll until at least one absent close peer is penalised (trust drops).
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+    let mut penalised = false;
+    while tokio::time::Instant::now() < deadline {
+        penalised = close_group
+            .iter()
+            .zip(trust_before.iter())
+            .any(|(peer, &before)| p2p_a.peer_trust(peer) < before - f64::EPSILON);
+        if penalised {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert!(
+        penalised,
+        "the scheduled possession check should have penalised an absent close peer"
     );
 
     harness.teardown().await.expect("teardown");

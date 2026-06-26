@@ -588,9 +588,13 @@ impl ReplicationEngine {
         self.sync_trigger.notify_one();
     }
 
-    /// Execute fresh replication for a newly stored record.
+    /// Execute fresh replication for a newly stored record, then schedule the
+    /// delayed possession check for the responsible close-group peers
+    /// (ADR-0003). The production PUT path schedules via the fresh-write
+    /// drainer; this direct entry point schedules here so callers (and tests)
+    /// that drive replication directly still get the possession check.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        fresh::replicate_fresh(
+        let peers = fresh::replicate_fresh(
             key,
             data,
             proof_of_payment,
@@ -600,6 +604,11 @@ impl ReplicationEngine {
             &self.send_semaphore,
         )
         .await;
+        if !peers.is_empty() {
+            let _ = self
+                .possession_check_tx
+                .send(possession::PossessionCheckEvent { key: *key, peers });
+        }
     }
 
     // =======================================================================
@@ -664,6 +673,7 @@ impl ReplicationEngine {
             return;
         };
         let p2p = Arc::clone(&self.p2p_node);
+        let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -677,8 +687,10 @@ impl ReplicationEngine {
                         // randomised settle delay, then probes every peer.
                         let p2p = Arc::clone(&p2p);
                         let shutdown = shutdown.clone();
+                        let delay_min = config.possession_check_delay_min;
+                        let delay_max = config.possession_check_delay_max;
                         tokio::spawn(async move {
-                            let delay = possession::random_delay();
+                            let delay = possession::random_delay(delay_min, delay_max);
                             tokio::select! {
                                 () = shutdown.cancelled() => {}
                                 () = tokio::time::sleep(delay) => {

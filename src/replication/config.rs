@@ -469,6 +469,13 @@ pub struct ReplicationConfig {
     /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before
     /// proceeding with bootstrap sync (covers bootstrap nodes with no peers).
     pub bootstrap_complete_timeout_secs: u64,
+    /// Lower bound of the delay before a fresh-replication possession check
+    /// runs (ADR-0003). Defaults to [`POSSESSION_CHECK_DELAY_MIN`]; tests
+    /// shorten it so the scheduled check fires quickly.
+    pub possession_check_delay_min: Duration,
+    /// Upper bound of the possession-check delay window (ADR-0003). Defaults
+    /// to [`POSSESSION_CHECK_DELAY_MAX`].
+    pub possession_check_delay_max: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -495,6 +502,8 @@ impl Default for ReplicationConfig {
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
             fetch_request_timeout: FETCH_REQUEST_TIMEOUT,
             bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
+            possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
+            possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
         }
     }
 }
