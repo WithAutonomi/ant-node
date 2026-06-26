@@ -41,8 +41,11 @@ mimalloc = "0.1"
 # with ant-protocol's re-exports.
 ant-protocol = "2.2.0"
 
-# Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.26.0"
+# Core (provides EVERYTHING: networking, DHT, security, trust, storage).
+# Pinned to WithAutonomi/saorsa-core PR #119 (trust quarantine thresholds);
+# the matching `[patch.crates-io]` below redirects ant-protocol's transitive
+# saorsa-core to the same source so Cargo unifies on one copy.
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "feat/trust-quarantine-thresholds" }
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
@@ -196,3 +199,11 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
+
+[patch.crates-io]
+# Redirect the saorsa-core that ant-protocol (and other crates) pull from
+# crates.io onto the same git source as the node's direct dependency,
+# eliminating the duplicate 0.26.0 copies (crates.io vs git) that otherwise
+# collide on shared types such as `saorsa_core::address::MultiAddr`.
+# Tracks WithAutonomi/saorsa-core PR #119 (trust quarantine thresholds).
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core", branch = "feat/trust-quarantine-thresholds" }
