@@ -35,6 +35,7 @@ use saorsa_core::{
     identity::NodeIdentity, IPDiversityConfig as CoreDiversityConfig, MultiAddr,
     NodeConfig as CoreNodeConfig, P2PEvent, P2PNode,
 };
+use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -222,6 +223,17 @@ pub struct TestNetworkConfig {
     /// this network (e.g. Anvil testnet) for on-chain verification.
     /// When `None`, defaults to `ArbitrumOne`.
     pub evm_network: Option<EvmNetwork>,
+
+    /// Optional replication-config override applied to every node's
+    /// replication engine. `None` uses `ReplicationConfig::default()`. Tests
+    /// use this to shorten timers — e.g. the ADR-0003 possession-check delay.
+    pub replication_config: Option<ReplicationConfig>,
+
+    /// Optional per-node storage disk-reserve overrides.
+    ///
+    /// Tests can set a node's reserve above available disk space to make its
+    /// capacity pre-check fail deterministically without filling the host disk.
+    pub storage_disk_reserve_overrides: HashMap<usize, u64>,
 }
 
 impl Default for TestNetworkConfig {
@@ -255,6 +267,8 @@ impl Default for TestNetworkConfig {
             enable_node_logging: false,
             payment_enforcement: false,
             evm_network: None,
+            replication_config: None,
+            storage_disk_reserve_overrides: HashMap::new(),
         }
     }
 }
@@ -1040,9 +1054,19 @@ impl TestNetwork {
         })?);
 
         // Initialize AntProtocol for this node with payment enforcement setting
-        let ant_protocol =
-            Self::create_ant_protocol(&data_dir, self.config.evm_network.clone(), &identity)
-                .await?;
+        let storage_disk_reserve = self
+            .config
+            .storage_disk_reserve_overrides
+            .get(&index)
+            .copied()
+            .unwrap_or_default();
+        let ant_protocol = Self::create_ant_protocol_with_disk_reserve(
+            &data_dir,
+            self.config.evm_network.clone(),
+            storage_disk_reserve,
+            &identity,
+        )
+        .await?;
 
         Ok(TestNode {
             index,
@@ -1081,9 +1105,24 @@ impl TestNetwork {
         evm_network: Option<EvmNetwork>,
         identity: &saorsa_core::identity::NodeIdentity,
     ) -> Result<AntProtocol> {
+        Self::create_ant_protocol_with_disk_reserve(data_dir, evm_network, 0, identity).await
+    }
+
+    /// Create an `AntProtocol` handler with an explicit storage disk reserve.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if LMDB storage initialisation fails.
+    pub async fn create_ant_protocol_with_disk_reserve(
+        data_dir: &std::path::Path,
+        evm_network: Option<EvmNetwork>,
+        disk_reserve: u64,
+        identity: &saorsa_core::identity::NodeIdentity,
+    ) -> Result<AntProtocol> {
         // Create LMDB storage
         let storage_config = LmdbStorageConfig {
             root_dir: data_dir.to_path_buf(),
+            disk_reserve,
             ..LmdbStorageConfig::test_default()
         };
         let storage = LmdbStorage::new(storage_config)
@@ -1284,7 +1323,7 @@ impl TestNetwork {
             (&node.p2p_node, &node.ant_protocol, &node.node_identity)
         {
             let shutdown = CancellationToken::new();
-            let repl_config = ReplicationConfig::default();
+            let repl_config = self.config.replication_config.clone().unwrap_or_default();
             let (_fresh_tx, fresh_rx) = tokio::sync::mpsc::unbounded_channel();
             let node_identity = Arc::clone(id);
             match ReplicationEngine::new(

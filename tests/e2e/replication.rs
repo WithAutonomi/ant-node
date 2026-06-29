@@ -5,11 +5,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use super::testnet::TestNetworkConfig;
 use super::TestHarness;
 use ant_node::client::compute_address;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
-    storage_admission_width, REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID,
+    storage_admission_width, K_BUCKET_SIZE, REPAIR_HINT_MIN_AGE, REPLICATION_PROTOCOL_ID,
 };
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
@@ -32,6 +33,20 @@ use tokio::sync::RwLock;
 const PROPAGATION_TIMEOUT: Duration = Duration::from_secs(15);
 /// Interval between propagation poll checks.
 const PROPAGATION_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Checker node used by the full-node shunning regression.
+const FULL_NODE_SHUN_CHECKER_INDEX: usize = 3;
+/// Target node made disk-full by the full-node shunning regression.
+const FULL_NODE_SHUN_TARGET_INDEX: usize = 4;
+/// Search budget for finding a key whose close group contains the full node.
+const FULL_NODE_SHUN_KEY_SEARCH_ATTEMPTS: usize = 10_000;
+/// Fast lower bound for the full-node shunning scheduler check.
+const FULL_NODE_SHUN_POSSESSION_DELAY_MIN: Duration = Duration::from_millis(200);
+/// Fast upper bound for the full-node shunning scheduler check.
+const FULL_NODE_SHUN_POSSESSION_DELAY_MAX: Duration = Duration::from_millis(500);
+/// Dummy proof length used when a test only needs to reach pre-payment gates.
+const DUMMY_PAYMENT_PROOF_LEN: usize = 64;
+/// Dummy proof byte used when a test only needs to reach pre-payment gates.
+const DUMMY_PAYMENT_PROOF_BYTE: u8 = 0x01;
 
 /// Send a replication request via saorsa-core's request-response mechanism
 /// and decode the response.
@@ -247,6 +262,428 @@ async fn test_fresh_replication_propagates_to_close_group() {
     assert!(
         found_on_other,
         "Chunk should have replicated to at least one other node"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0003: the delayed possession check penalises a responsible peer that
+/// does NOT hold the chunk, and leaves a peer that DOES hold it unpenalised.
+///
+/// Drives the check directly (`run_possession_check_now`, bypassing the 5-15
+/// minute settle delay) so the detection+penalty path is asserted
+/// deterministically over real transport. The penalty is observed as a drop in
+/// the checker's trust score for the absent peer (the same signal saorsa-core
+/// eviction acts on), via `P2PNode::peer_trust`.
+#[tokio::test]
+#[serial]
+async fn possession_check_penalises_absent_peer_only() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    // A is the checker; B will be absent, C will hold the chunk. All three are
+    // regular nodes (idx >= 3) with running replication engines and storage.
+    let a = harness.test_node(3).expect("node a");
+    let b = harness.test_node(4).expect("node b");
+    let c = harness.test_node(5).expect("node c");
+
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let peer_b = *b.p2p_node.as_ref().expect("p2p b").peer_id();
+    let peer_c = *c.p2p_node.as_ref().expect("p2p c").peer_id();
+
+    let content = b"adr-0003 possession-check payload";
+    let address = compute_address(content);
+
+    // The checker A must hold the chunk it verifies: the possession check
+    // recomputes the audit digest from its own canonical copy. In production the
+    // PUT handler stores K before fresh-replicating; here we store it on the
+    // checker explicitly.
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on a (checker)");
+
+    // C holds the chunk; B never stores it.
+    c.ant_protocol
+        .as_ref()
+        .expect("proto c")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on c");
+
+    assert!(
+        !b.ant_protocol
+            .as_ref()
+            .expect("proto b")
+            .storage()
+            .exists(&address)
+            .expect("exists b"),
+        "precondition: B must not hold the chunk"
+    );
+    assert!(
+        c.ant_protocol
+            .as_ref()
+            .expect("proto c")
+            .storage()
+            .exists(&address)
+            .expect("exists c"),
+        "precondition: C must hold the chunk"
+    );
+
+    let trust_b_before = p2p_a.peer_trust(&peer_b);
+    let trust_c_before = p2p_a.peer_trust(&peer_c);
+
+    // Probe both peers now (no scheduler delay). B is absent -> penalised; C is
+    // present -> untouched.
+    engine_a
+        .run_possession_check_now(address, vec![peer_b, peer_c])
+        .await;
+
+    let trust_b_after = p2p_a.peer_trust(&peer_b);
+    let trust_c_after = p2p_a.peer_trust(&peer_c);
+
+    assert!(
+        trust_b_after < trust_b_before,
+        "absent peer B must be penalised: {trust_b_before} -> {trust_b_after}"
+    );
+    assert!(
+        trust_c_after >= trust_c_before - f64::EPSILON,
+        "present peer C must not be penalised: {trust_c_before} -> {trust_c_after}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0003: the possession-check *scheduler* (not the direct-drive path)
+/// fires after the configured delay and penalises an absent close peer.
+///
+/// Uses a shortened possession delay so the scheduled check runs in well under
+/// a second. No payment cache is pre-populated, so the close-group peers reject
+/// the fresh offer and are absent when the scheduled check probes them. Proves
+/// the `replicate_fresh` -> enqueue -> delayed scheduler -> penalty wiring.
+#[tokio::test]
+#[serial]
+async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
+    let mut net_config = TestNetworkConfig::small();
+    net_config.replication_config = Some(ReplicationConfig {
+        possession_check_delay_min: Duration::from_millis(200),
+        possession_check_delay_max: Duration::from_millis(500),
+        ..ReplicationConfig::default()
+    });
+    let harness = TestHarness::setup_with_config(net_config)
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let a = harness.test_node(3).expect("node a");
+    let p2p_a = a.p2p_node.as_ref().expect("p2p a");
+    let engine_a = a.replication_engine.as_ref().expect("engine a");
+    let self_a = *p2p_a.peer_id();
+
+    let content = b"adr-0003 scheduler-wiring payload";
+    let address = compute_address(content);
+
+    // A's close group for this key = exactly the peers the scheduled possession
+    // check targets. With no payment cache anywhere, they reject the fresh offer
+    // and are absent when probed.
+    let close_group_size = ReplicationConfig::default().close_group_size;
+    let close_group: Vec<PeerId> = p2p_a
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, close_group_size)
+        .await
+        .iter()
+        .filter(|n| n.peer_id != self_a)
+        .map(|n| n.peer_id)
+        .collect();
+    assert!(!close_group.is_empty(), "expected a non-empty close group");
+
+    let trust_before: Vec<f64> = close_group.iter().map(|p| p2p_a.peer_trust(p)).collect();
+
+    // The checker must hold the chunk it later probes for: the possession check
+    // recomputes the audit digest from its own copy. `replicate_fresh` assumes
+    // the PUT handler already stored K locally, so store it on the checker here.
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on a (checker)");
+
+    // Trigger fresh replication; the engine enqueues the possession check, which
+    // fires ~200-500 ms later and penalises the absent close peers.
+    let dummy_pop = [0x01u8; 64];
+    engine_a
+        .replicate_fresh(&address, content, &dummy_pop)
+        .await;
+
+    // Poll until at least one absent close peer is penalised (trust drops).
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+    let mut penalised = false;
+    while tokio::time::Instant::now() < deadline {
+        penalised = close_group
+            .iter()
+            .zip(trust_before.iter())
+            .any(|(peer, &before)| p2p_a.peer_trust(peer) < before - f64::EPSILON);
+        if penalised {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert!(
+        penalised,
+        "the scheduled possession check should have penalised an absent close peer"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0003 full-node shunning: a close-group peer that is disk-full rejects a
+/// fresh-replication offer before payment verification, remains absent for the
+/// key, and is penalised when the checker probes possession.
+///
+/// This bridges the two protections that make a full node get shunned by close
+/// groups: capacity rejection creates a missing replica, and the delayed
+/// possession-check verdict turns that absence into the trust signal that
+/// saorsa-core eviction acts on.
+#[tokio::test]
+#[serial]
+async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
+    let mut net_config = TestNetworkConfig::small();
+    net_config.replication_config = Some(ReplicationConfig {
+        possession_check_delay_min: FULL_NODE_SHUN_POSSESSION_DELAY_MIN,
+        possession_check_delay_max: FULL_NODE_SHUN_POSSESSION_DELAY_MAX,
+        ..ReplicationConfig::default()
+    });
+    net_config
+        .storage_disk_reserve_overrides
+        .insert(FULL_NODE_SHUN_TARGET_INDEX, u64::MAX);
+    let harness = TestHarness::setup_with_config(net_config)
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let checker = harness
+        .test_node(FULL_NODE_SHUN_CHECKER_INDEX)
+        .expect("checker node");
+    let full_node = harness
+        .test_node(FULL_NODE_SHUN_TARGET_INDEX)
+        .expect("full node");
+    let checker_p2p = checker.p2p_node.as_ref().expect("checker p2p");
+    let checker_engine = checker.replication_engine.as_ref().expect("checker engine");
+    let full_p2p = full_node.p2p_node.as_ref().expect("full node p2p");
+    let full_peer = *full_p2p.peer_id();
+
+    let close_group_size = ReplicationConfig::default().close_group_size;
+    let admission_width = storage_admission_width(close_group_size);
+    let mut candidate = None;
+    for attempt in 0..FULL_NODE_SHUN_KEY_SEARCH_ATTEMPTS {
+        let content = format!("adr-0003 full-node shunning payload {attempt}").into_bytes();
+        let address = compute_address(&content);
+        let full_node_in_checker_close_group = checker_p2p
+            .dht_manager()
+            .find_closest_nodes_local_with_self(&address, close_group_size)
+            .await
+            .iter()
+            .any(|node| node.peer_id == full_peer);
+        if !full_node_in_checker_close_group {
+            continue;
+        }
+
+        let full_node_admits_self = full_p2p
+            .dht_manager()
+            .find_closest_nodes_local_with_self(&address, admission_width)
+            .await
+            .iter()
+            .any(|node| node.peer_id == full_peer);
+        if full_node_admits_self {
+            candidate = Some((content, address));
+            break;
+        }
+    }
+    let (content, address) =
+        candidate.expect("find key where full node is a responsible close-group peer");
+
+    for idx in 0..harness.node_count() {
+        if let Some(protocol) = harness
+            .test_node(idx)
+            .and_then(|node| node.ant_protocol.as_ref())
+        {
+            protocol.payment_verifier().cache_insert(address);
+        }
+    }
+
+    let dummy_payment_proof = vec![DUMMY_PAYMENT_PROOF_BYTE; DUMMY_PAYMENT_PROOF_LEN];
+    let offer = FreshReplicationOffer {
+        key: address,
+        data: content.clone(),
+        proof_of_payment: dummy_payment_proof.clone(),
+    };
+    let response = send_replication_request(
+        checker_p2p,
+        &full_peer,
+        ReplicationMessage {
+            request_id: rand::random(),
+            body: ReplicationMessageBody::FreshReplicationOffer(offer),
+        },
+        PROPAGATION_TIMEOUT,
+    )
+    .await;
+
+    match response.body {
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            key,
+            reason,
+        }) => {
+            assert_eq!(key, address);
+            assert!(
+                reason.contains("Insufficient disk space"),
+                "expected disk-full rejection, got: {reason}"
+            );
+        }
+        other => panic!("expected disk-full rejection, got: {other:?}"),
+    }
+
+    let full_storage = full_node
+        .ant_protocol
+        .as_ref()
+        .expect("full node protocol")
+        .storage();
+    assert!(
+        !full_storage.exists(&address).expect("exists on full node"),
+        "full node must not store the rejected replica"
+    );
+
+    // The checker must hold the chunk it probes for: the possession check
+    // recomputes the audit digest from its own copy. `replicate_fresh` assumes
+    // the PUT handler already stored K locally, so store it on the checker here.
+    checker
+        .ant_protocol
+        .as_ref()
+        .expect("checker protocol")
+        .storage()
+        .put(&address, &content)
+        .await
+        .expect("put on checker");
+
+    let trust_before = checker_p2p.peer_trust(&full_peer);
+    checker_engine
+        .replicate_fresh(&address, &content, &dummy_payment_proof)
+        .await;
+
+    let deadline = tokio::time::Instant::now() + PROPAGATION_TIMEOUT;
+    let mut trust_after = trust_before;
+    while tokio::time::Instant::now() < deadline {
+        trust_after = checker_p2p.peer_trust(&full_peer);
+        if trust_after < trust_before - f64::EPSILON {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+    assert!(
+        trust_after < trust_before - f64::EPSILON,
+        "full close-group peer should be shunned by the scheduled possession check: \
+         {trust_before} -> {trust_after}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// ADR-0003 self-closeness gate: a node accepts a client PUT only when it is
+/// within its own local `K_BUCKET_SIZE`-closest to the address.
+///
+/// Needs more than `K_BUCKET_SIZE` nodes so a far node falls outside its own
+/// closest view. The responsible (closest) node accepts and stores; the
+/// non-responsible (farthest) node rejects before payment with a closeness
+/// error. Guards both the regression risk (gate must not reject responsible
+/// puts) and the intended reject behaviour.
+#[tokio::test]
+#[serial]
+async fn self_closeness_gate_accepts_responsible_rejects_far_node() {
+    let harness = TestHarness::setup().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let content = b"adr-0003 self-closeness gate payload";
+    let address = compute_address(content);
+
+    // Rank all peers by XOR distance to the address (identical from any node's
+    // view once routing tables are warm).
+    let ranker_p2p = harness
+        .test_node(3)
+        .expect("ranker")
+        .p2p_node
+        .as_ref()
+        .expect("p2p");
+    let ranked: Vec<PeerId> = ranker_p2p
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, harness.node_count())
+        .await
+        .iter()
+        .map(|n| n.peer_id)
+        .collect();
+    assert!(
+        ranked.len() > K_BUCKET_SIZE,
+        "need > K_BUCKET_SIZE nodes to exercise the reject path; got {}",
+        ranked.len()
+    );
+
+    // Only nodes that actually run a protocol handler can serve a client PUT.
+    let has_protocol = |peer: &PeerId| {
+        node_index_for_peer(&harness, peer)
+            .and_then(|idx| harness.test_node(idx))
+            .is_some_and(|n| n.ant_protocol.is_some())
+    };
+
+    // Closest node with a handler -> within its own K-closest -> gate accepts.
+    let close_peer = ranked
+        .iter()
+        .copied()
+        .find(|p| has_protocol(p))
+        .expect("a close node with a handler");
+    // Farthest node beyond the gate width with a handler -> gate rejects.
+    let far_peer = ranked
+        .iter()
+        .copied()
+        .enumerate()
+        .rev()
+        .find(|(rank, p)| *rank >= K_BUCKET_SIZE && has_protocol(p))
+        .map(|(_, p)| p)
+        .expect("a far node (rank >= K_BUCKET_SIZE) with a handler");
+
+    let close_idx = node_index_for_peer(&harness, &close_peer).expect("close idx");
+    let far_idx = node_index_for_peer(&harness, &far_peer).expect("far idx");
+
+    // Accept path: a responsible node stores the chunk (gate passes).
+    let close_result = harness
+        .test_node(close_idx)
+        .expect("close node")
+        .store_chunk(content)
+        .await;
+    assert!(
+        close_result.is_ok(),
+        "responsible (closest) node must accept the PUT, got {close_result:?}"
+    );
+
+    // Reject path: a non-responsible node rejects before payment with a
+    // closeness error.
+    let far_result = harness
+        .test_node(far_idx)
+        .expect("far node")
+        .store_chunk(content)
+        .await;
+    assert!(
+        far_result.is_err(),
+        "non-responsible (farthest) node must reject the PUT"
+    );
+    let err = format!("{}", far_result.expect_err("far rejection"));
+    assert!(
+        err.contains("closest"),
+        "rejection should cite closeness, got: {err}"
     );
 
     harness.teardown().await.expect("teardown");

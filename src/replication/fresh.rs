@@ -14,7 +14,9 @@ use saorsa_core::P2PNode;
 use tokio::sync::Semaphore;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{
+    ReplicationConfig, FRESH_REPLICATION_DELIVERY_MAX_RETRIES, REPLICATION_PROTOCOL_ID,
+};
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
     FreshReplicationOffer, PaidNotify, ReplicationMessage, ReplicationMessageBody,
@@ -36,9 +38,10 @@ pub struct FreshWriteEvent {
 
 /// Execute fresh replication for a newly accepted record.
 ///
-/// Sends fresh offers to close group members and `PaidNotify` to
-/// `PaidCloseGroup`. Both are fire-and-forget (no ack tracking or retry per
-/// Section 6.1, rule 8).
+/// Sends fresh offers to close group members (with bounded delivery retries,
+/// ADR-0003) and `PaidNotify` to `PaidCloseGroup`. Returns the close-group
+/// peers responsible for the key (excluding self) so the caller can schedule
+/// the delayed possession check; `PaidNotify` remains fire-and-forget.
 ///
 /// The `send_semaphore` limits how many outbound chunk transfers can be
 /// in-flight concurrently across the entire replication engine, preventing
@@ -51,7 +54,7 @@ pub async fn replicate_fresh(
     paid_list: &Arc<PaidList>,
     config: &ReplicationConfig,
     send_semaphore: &Arc<Semaphore>,
-) {
+) -> Vec<PeerId> {
     let self_id = *p2p_node.peer_id();
 
     // Rule 6: Node that validates PoP adds K to PaidForList(self).
@@ -88,11 +91,15 @@ pub async fn replicate_fresh(
             "Failed to encode FreshReplicationOffer for {}",
             hex::encode(key),
         );
-        return;
+        return Vec::new();
     };
+    // Share one encoded copy across the per-peer send tasks so a retry only
+    // re-materialises the buffer for the (consuming) send call, keeping the
+    // common single-attempt path at one clone per peer.
+    let encoded = Arc::new(encoded);
     for peer in &target_peers {
         let p2p = Arc::clone(p2p_node);
-        let data = encoded.clone();
+        let data = Arc::clone(&encoded);
         let peer_id = *peer;
         let sem = Arc::clone(send_semaphore);
         tokio::spawn(async move {
@@ -103,11 +110,37 @@ pub async fn replicate_fresh(
                 "Replication send permit acquired for peer {peer_id} ({} available)",
                 sem.available_permits()
             );
-            if let Err(e) = p2p
-                .send_message(&peer_id, REPLICATION_PROTOCOL_ID, data, &[])
-                .await
-            {
-                debug!("Failed to send fresh offer to {peer_id}: {e}");
+            // ADR-0003: best-effort delivery. Retry the push up to
+            // FRESH_REPLICATION_DELIVERY_MAX_RETRIES times on a transport
+            // failure so a transient hiccup doesn't silently drop the offer.
+            // Possession is judged separately by the delayed possession check.
+            let mut attempt = 0u32;
+            loop {
+                match p2p
+                    .send_message(
+                        &peer_id,
+                        REPLICATION_PROTOCOL_ID,
+                        data.as_ref().clone(),
+                        &[],
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if attempt >= FRESH_REPLICATION_DELIVERY_MAX_RETRIES {
+                            debug!(
+                                "Failed to send fresh offer to {peer_id} after {} attempts: {e}",
+                                attempt + 1
+                            );
+                            break;
+                        }
+                        attempt += 1;
+                        debug!(
+                            "Retrying fresh offer to {peer_id} (attempt {}): {e}",
+                            attempt + 1
+                        );
+                    }
+                }
             }
         });
     }
@@ -122,6 +155,8 @@ pub async fn replicate_fresh(
         hex::encode(key),
         target_peers.len()
     );
+
+    target_peers
 }
 
 /// Send `PaidNotify(K)` to every peer in `PaidCloseGroup(K)` (fire-and-forget).

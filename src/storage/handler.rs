@@ -38,12 +38,26 @@ use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
+use crate::replication::admission;
+use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
 use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use saorsa_core::P2PNode;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+
+/// Width of the self-closeness gate on client PUTs (ADR-0003): a node accepts
+/// a PUT only when it is within its own local `SELF_CLOSENESS_GATE_WIDTH`
+/// closest peers to the address.
+///
+/// Set to the client's PUT fallback ceiling (`K_BUCKET_SIZE`), wider than the
+/// storage-admission width, so a client routing past full close-group members
+/// onto further peers (ADR-0002) is still accepted here, while a genuinely far
+/// node — which could only mis-attribute fresh-replication failures — is
+/// turned away.
+const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
 
 /// ANT protocol handler.
 ///
@@ -59,6 +73,10 @@ pub struct AntProtocol {
     quote_generator: Arc<QuoteGenerator>,
     /// Channel for notifying the replication engine about newly-stored chunks.
     fresh_write_tx: Option<mpsc::UnboundedSender<FreshWriteEvent>>,
+    /// The node's P2P handle, attached post-construction via
+    /// `attach_p2p_node`. Drives the self-closeness gate on client PUTs;
+    /// `None` in unit tests that never attach a node.
+    p2p_node: RwLock<Option<Arc<P2PNode>>>,
 }
 
 impl AntProtocol {
@@ -90,6 +108,7 @@ impl AntProtocol {
             payment_verifier,
             quote_generator,
             fresh_write_tx: None,
+            p2p_node: RwLock::new(None),
         }
     }
 
@@ -99,8 +118,9 @@ impl AntProtocol {
     /// checks can use the live routing view. Idempotent: calling twice
     /// replaces the verifier handle.
     pub fn attach_p2p_node(&self, node: Arc<P2PNode>) {
+        *self.p2p_node.write() = Some(Arc::clone(&node));
         self.payment_verifier.attach_p2p_node(node);
-        debug!("AntProtocol: P2PNode attached for payment live-DHT checks");
+        debug!("AntProtocol: P2PNode attached for payment live-DHT checks and self-closeness gate");
     }
 
     /// Set the channel sender for fresh-write replication events.
@@ -280,9 +300,28 @@ impl AntProtocol {
             return ChunkPutResponse::Error(ProtocolError::StorageFailed(e.to_string()));
         }
 
+        // Self-closeness gate (ADR-0003): accept a client PUT only when this
+        // node is within its own local closest view of the address, so the
+        // fresh replication it triggers is legitimate and cannot mis-penalise
+        // honest peers. The width is the client's PUT fallback ceiling
+        // (`SELF_CLOSENESS_GATE_WIDTH`), so a client routing past full
+        // close-group members onto further peers is still accepted here.
+        // Skipped when no P2P handle is attached (unit tests). Bind the handle
+        // out of the lock first so no guard is held across the `.await`.
+        let attached = self.p2p_node.read().as_ref().map(Arc::clone);
+        if let Some(p2p) = attached {
+            let self_id = *p2p.peer_id();
+            if !admission::is_responsible(&self_id, &address, &p2p, SELF_CLOSENESS_GATE_WIDTH).await
+            {
+                debug!("Rejecting PUT for {addr_hex}: not within local closest peers");
+                return ChunkPutResponse::Error(ProtocolError::StorageFailed(
+                    "node is not within its local closest peers for this address".to_string(),
+                ));
+            }
+        }
+
         // 5. Verify payment. The ClientPut context applies the store-strength
-        // payment cache and verifies live proofs. Direct client PUT does not
-        // reject based on this node's local storage-responsibility view.
+        //    payment cache and verifies live proofs.
         let payment_result = self
             .payment_verifier
             .verify_payment(
