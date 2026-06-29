@@ -10,6 +10,7 @@
 //! [`crate::replication::subtree`].
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::logging::{debug, info, warn};
 use rand::Rng;
@@ -136,6 +137,15 @@ pub async fn run_subtree_audit(
         |p| p.real_leaf_count() as usize,
     );
     let timeout = config.audit_response_timeout(subtree_leaves);
+    let started = Instant::now();
+    info!(
+        "Audit challenge send_request started: audit_type=storage_commitment_subtree, \
+         audit_phase=subtree_round, challenged_peer={challenged_peer}, \
+         challenge_id={challenge_id}, key_count={key_count}, subtree_leaves={subtree_leaves}, \
+         timeout_ms={}, encoded_len={}",
+        timeout.as_millis(),
+        encoded.len(),
+    );
 
     let response = match p2p_node
         .send_request(challenged_peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
@@ -143,10 +153,31 @@ pub async fn run_subtree_audit(
     {
         Ok(resp) => resp,
         Err(e) => {
+            let elapsed = started.elapsed();
+            warn!(
+                "Audit challenge send_request failed: audit_type=storage_commitment_subtree, \
+                 audit_phase=subtree_round, audit_outcome=send_request_failed, \
+                 challenged_peer={challenged_peer}, challenge_id={challenge_id}, \
+                 key_count={key_count}, subtree_leaves={subtree_leaves}, timeout_ms={}, \
+                 elapsed_ms={}, send_error={:?}",
+                timeout.as_millis(),
+                elapsed.as_millis(),
+                e.to_string(),
+            );
             debug!("Audit: subtree challenge to {challenged_peer} timed out / failed: {e}");
             return failed(challenged_peer, challenge_id, AuditFailureReason::Timeout);
         }
     };
+    let elapsed = started.elapsed();
+    info!(
+        "Audit challenge response received: audit_type=storage_commitment_subtree, \
+         audit_phase=subtree_round, audit_outcome=response_received, \
+         challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={key_count}, \
+         subtree_leaves={subtree_leaves}, timeout_ms={}, elapsed_ms={}, response_len={}",
+        timeout.as_millis(),
+        elapsed.as_millis(),
+        response.data.len(),
+    );
 
     let resp_msg = match ReplicationMessage::decode(&response.data) {
         Ok(m) => m,
@@ -224,6 +255,17 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
     // the multi-MiB reply (handshake + upload + busy disk) — the round-1
     // hashes-only floor would be too tight for 2 × 4 MiB (§4).
     let timeout = ctx.config.byte_audit_response_timeout(keys.len());
+    let started = Instant::now();
+    info!(
+        "Audit challenge send_request started: audit_type=storage_commitment_byte, \
+         audit_phase=byte_round, challenged_peer={}, challenge_id={}, key_count={}, \
+         timeout_ms={}, encoded_len={}",
+        ctx.challenged_peer,
+        ctx.challenge_id,
+        keys.len(),
+        timeout.as_millis(),
+        encoded.len(),
+    );
     let response = match ctx
         .p2p_node
         .send_request(
@@ -236,6 +278,19 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
     {
         Ok(resp) => resp,
         Err(e) => {
+            let elapsed = started.elapsed();
+            warn!(
+                "Audit challenge send_request failed: audit_type=storage_commitment_byte, \
+                 audit_phase=byte_round, audit_outcome=send_request_failed, \
+                 challenged_peer={}, challenge_id={}, key_count={}, timeout_ms={}, \
+                 elapsed_ms={}, send_error={:?}",
+                ctx.challenged_peer,
+                ctx.challenge_id,
+                keys.len(),
+                timeout.as_millis(),
+                elapsed.as_millis(),
+                e.to_string(),
+            );
             debug!(
                 "Audit: byte challenge to {} timed out / failed: {e}",
                 ctx.challenged_peer
@@ -243,6 +298,18 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
             return ByteRound::Timeout;
         }
     };
+    let elapsed = started.elapsed();
+    info!(
+        "Audit challenge response received: audit_type=storage_commitment_byte, \
+         audit_phase=byte_round, audit_outcome=response_received, challenged_peer={}, \
+         challenge_id={}, key_count={}, timeout_ms={}, elapsed_ms={}, response_len={}",
+        ctx.challenged_peer,
+        ctx.challenge_id,
+        keys.len(),
+        timeout.as_millis(),
+        elapsed.as_millis(),
+        response.data.len(),
+    );
 
     let resp_msg = match ReplicationMessage::decode(&response.data) {
         Ok(m) => m,
@@ -776,6 +843,7 @@ fn failed(
     let summary = subtree_failure_summary(&reason);
     AuditTickResult::Failed {
         evidence: FailureEvidence::AuditFailure {
+            audit_type: "storage_commitment",
             challenge_id,
             challenged_peer: *challenged_peer,
             confirmed_failed_keys: Vec::new(),

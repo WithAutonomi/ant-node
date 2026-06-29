@@ -207,6 +207,8 @@ pub enum FailureEvidence {
     },
     /// Audit failure with confirmed responsible keys.
     AuditFailure {
+        /// Which audit produced this failure evidence.
+        audit_type: &'static str,
         /// Unique identifier for the audit challenge.
         challenge_id: u64,
         /// The peer that was challenged.

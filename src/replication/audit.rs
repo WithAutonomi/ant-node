@@ -697,6 +697,7 @@ async fn handle_classified_audit_failure(
 
     // Step 9d: Non-empty confirmed set -> emit evidence.
     let evidence = FailureEvidence::AuditFailure {
+        audit_type: "responsible_chunk",
         challenge_id,
         challenged_peer: *challenged_peer,
         confirmed_failed_keys,
@@ -1366,6 +1367,7 @@ mod tests {
         // no-penalty outcome (the caller checks is_empty before emitting).
         let peer = PeerId::from_bytes(peer_id);
         let evidence = FailureEvidence::AuditFailure {
+            audit_type: "responsible_chunk",
             challenge_id: 5500,
             challenged_peer: peer,
             confirmed_failed_keys: confirmed_failures,
@@ -1935,6 +1937,7 @@ mod tests {
         // Step 3: Construct evidence for confirmed failures only.
         let challenged_peer = PeerId::from_bytes(peer_id);
         let evidence = FailureEvidence::AuditFailure {
+            audit_type: "responsible_chunk",
             challenge_id: 5300,
             challenged_peer,
             confirmed_failed_keys: confirmed,

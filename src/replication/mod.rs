@@ -1764,7 +1764,9 @@ async fn handle_replication_message(
             // throttled (and it cannot starve other peers, since its share is
             // capped per-peer).
             info!(
-                "Audit challenge received: kind=subtree source={source} request_response={}",
+                "Audit challenge received: kind=subtree source={source} challenge_id={} \
+                 request_response={}",
+                challenge.challenge_id,
                 rr_message_id.is_some(),
             );
             let Some(guard) =
@@ -3853,6 +3855,7 @@ async fn handle_subtree_audit_result(
         }
         AuditTickResult::Failed { evidence } => {
             if let FailureEvidence::AuditFailure {
+                audit_type,
                 challenged_peer,
                 confirmed_failed_keys,
                 summary,
@@ -3864,7 +3867,7 @@ async fn handle_subtree_audit_result(
                 // first-failed-key correlation handle.
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    "Audit failure for {challenged_peer}: audit_type={audit_type}, reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
