@@ -23,6 +23,7 @@ pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
+pub mod possession;
 pub mod protocol;
 pub mod pruning;
 pub mod quorum;
@@ -215,18 +216,6 @@ pub struct ReplicationEngine {
     /// are lightweight (`PeerSyncRecord` is two fields) and peer IDs are
     /// naturally bounded by the routing table's k-bucket capacity.
     sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
-    /// Per-peer consecutive audit-timeout strike counter.
-    ///
-    /// A timeout increments the peer's strike count; a successful audit
-    /// response resets it to zero. Only when a peer reaches
-    /// [`config::AUDIT_TIMEOUT_STRIKE_THRESHOLD`] consecutive timeouts is a
-    /// timeout reported as an `ApplicationFailure` trust event. This separates
-    /// honest transient slowness (resets on the next normal response) from a
-    /// peer that does not store the data and is slow on every audit. Lives
-    /// outside `NeighborSyncState` so it is never wiped by a neighbor-sync
-    /// cycle reset. Grows with peer churn like `sync_history`; entries are a
-    /// single `u32` and peer IDs are bounded by k-bucket capacity.
-    audit_timeout_strikes: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Per-peer cooldown for gossip-triggered subtree audits (ADR-0002).
     ///
     /// Records when each peer was last audited so a burst of gossiped
@@ -302,7 +291,7 @@ pub struct ReplicationEngine {
     /// [`MAX_AUDIT_RESPONSES_PER_PEER`]. The GLOBAL semaphore alone is not
     /// flood-fair: one peer spamming challenges could occupy every slot and
     /// starve honest auditors, whose dropped challenges then convert to
-    /// timeouts and record strikes on the HONEST peers (codex-r2 A). This
+    /// audit timeouts against HONEST peers (codex-r2 A). This
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -311,6 +300,12 @@ pub struct ReplicationEngine {
     /// When present, `start()` spawns a drainer task that calls
     /// `replicate_fresh` for each event.
     fresh_write_rx: Option<mpsc::UnboundedReceiver<fresh::FreshWriteEvent>>,
+    /// Sender for delayed possession-check events (ADR-0003). The fresh-write
+    /// drainer pushes the responsible close-group peers here after each fresh
+    /// replication; the possession-check scheduler drains the paired receiver.
+    possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
+    /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
+    possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -345,6 +340,7 @@ impl ReplicationEngine {
 
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
         let config = Arc::new(config);
+        let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
             config: Arc::clone(&config),
@@ -355,7 +351,6 @@ impl ReplicationEngine {
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
-            audit_timeout_strikes: Arc::new(RwLock::new(HashMap::new())),
             audit_on_gossip_cooldown: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
@@ -373,6 +368,8 @@ impl ReplicationEngine {
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_write_rx: Some(fresh_write_rx),
+            possession_check_tx,
+            possession_check_rx: Some(possession_check_rx),
             shutdown,
             task_handles: Vec::new(),
         })
@@ -475,6 +472,26 @@ impl ReplicationEngine {
         .await
     }
 
+    /// Test-only: run the possession check immediately for `key` against
+    /// `peers`, bypassing the scheduler's randomised 5-15 minute settle delay.
+    ///
+    /// Penalises any peer that does not hold `key` at `AuditChallenge`
+    /// severity (ADR-0003). Lets e2e tests assert the detection+penalty path
+    /// deterministically without waiting for the scheduled check.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn run_possession_check_now(&self, key: XorName, peers: Vec<PeerId>) {
+        possession::run_possession_check(
+            key,
+            peers,
+            &self.p2p_node,
+            &self.storage,
+            &self.config,
+            &self.sync_state,
+            &self.shutdown,
+        )
+        .await;
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -500,6 +517,7 @@ impl ReplicationEngine {
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
+        self.start_possession_check_scheduler();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -566,9 +584,13 @@ impl ReplicationEngine {
         self.sync_trigger.notify_one();
     }
 
-    /// Execute fresh replication for a newly stored record.
+    /// Execute fresh replication for a newly stored record, then schedule the
+    /// delayed possession check for the responsible close-group peers
+    /// (ADR-0003). The production PUT path schedules via the fresh-write
+    /// drainer; this direct entry point schedules here so callers (and tests)
+    /// that drive replication directly still get the possession check.
     pub async fn replicate_fresh(&self, key: &XorName, data: &[u8], proof_of_payment: &[u8]) {
-        fresh::replicate_fresh(
+        let peers = fresh::replicate_fresh(
             key,
             data,
             proof_of_payment,
@@ -578,6 +600,11 @@ impl ReplicationEngine {
             &self.send_semaphore,
         )
         .await;
+        if !peers.is_empty() {
+            let _ = self
+                .possession_check_tx
+                .send(possession::PossessionCheckEvent { key: *key, peers });
+        }
     }
 
     // =======================================================================
@@ -594,6 +621,7 @@ impl ReplicationEngine {
         let paid_list = Arc::clone(&self.paid_list);
         let config = Arc::clone(&self.config);
         let send_semaphore = Arc::clone(&self.send_semaphore);
+        let possession_tx = self.possession_check_tx.clone();
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -602,7 +630,7 @@ impl ReplicationEngine {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => {
                         let Some(event) = event else { break };
-                        fresh::replicate_fresh(
+                        let peers = fresh::replicate_fresh(
                             &event.key,
                             &event.data,
                             &event.payment_proof,
@@ -612,10 +640,78 @@ impl ReplicationEngine {
                             &send_semaphore,
                         )
                         .await;
+                        // Schedule the delayed possession check (ADR-0003) for
+                        // the responsible close-group peers. A closed receiver
+                        // (engine shutting down) is ignored.
+                        if !peers.is_empty() {
+                            let _ = possession_tx.send(possession::PossessionCheckEvent {
+                                key: event.key,
+                                peers,
+                            });
+                        }
                     }
                 }
             }
             debug!("Fresh-write drainer shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Spawn the possession-check scheduler (ADR-0003).
+    ///
+    /// Drains scheduled possession-check events and, for each, waits a
+    /// randomised 5-15 minute settle delay before probing every responsible
+    /// peer for actual possession. A peer that cryptographically fails to prove
+    /// possession, including by timeout, is penalised at `AuditChallenge`
+    /// severity.
+    fn start_possession_check_scheduler(&mut self) {
+        let Some(mut rx) = self.possession_check_rx.take() else {
+            return;
+        };
+        let p2p = Arc::clone(&self.p2p_node);
+        let storage = Arc::clone(&self.storage);
+        let config = Arc::clone(&self.config);
+        let sync_state = Arc::clone(&self.sync_state);
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        let Some(event) = event else { break };
+                        // Spawn a per-chunk delayed check so the drain loop
+                        // keeps pace with the write rate. Each check sleeps the
+                        // randomised settle delay, then probes every peer.
+                        let p2p = Arc::clone(&p2p);
+                        let storage = Arc::clone(&storage);
+                        let config = Arc::clone(&config);
+                        let sync_state = Arc::clone(&sync_state);
+                        let shutdown = shutdown.clone();
+                        let delay_min = config.possession_check_delay_min;
+                        let delay_max = config.possession_check_delay_max;
+                        tokio::spawn(async move {
+                            let delay = possession::random_delay(delay_min, delay_max);
+                            tokio::select! {
+                                () = shutdown.cancelled() => {}
+                                () = tokio::time::sleep(delay) => {
+                                    possession::run_possession_check(
+                                        event.key,
+                                        event.peers,
+                                        &p2p,
+                                        &storage,
+                                        &config,
+                                        &sync_state,
+                                        &shutdown,
+                                    )
+                                    .await;
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            debug!("Possession-check scheduler shut down");
         });
         self.task_handles.push(handle);
     }
@@ -642,7 +738,6 @@ impl ReplicationEngine {
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
-        let audit_timeout_strikes = Arc::clone(&self.audit_timeout_strikes);
         let audit_on_gossip_cooldown = Arc::clone(&self.audit_on_gossip_cooldown);
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
@@ -655,7 +750,6 @@ impl ReplicationEngine {
             config: Arc::clone(&config),
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
-            audit_timeout_strikes: Arc::clone(&audit_timeout_strikes),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
         };
 
@@ -777,10 +871,6 @@ impl ReplicationEngine {
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
-                                // Drop the timeout-strike entry too, so a
-                                // departed peer leaves no residual (keeps this
-                                // map bounded under churn, like its siblings).
-                                audit_timeout_strikes.write().await.remove(&peer_id);
                                 // Same for the gossip-audit cooldown (ADR-0002).
                                 audit_on_gossip_cooldown.write().await.remove(&peer_id);
                                 // The sticky `commitment_capable` flag is
@@ -827,7 +917,6 @@ impl ReplicationEngine {
             config: Arc::clone(&config),
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
-            audit_timeout_strikes: Arc::clone(&self.audit_timeout_strikes),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
         };
 
@@ -910,12 +999,6 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
-        // Needed so the responsible-chunk audit routes failures through the same
-        // strike/grace path as the storage-commitment audit (timeouts graced,
-        // not penalised on the first occurrence) and can revoke holder credit on
-        // a confirmed failure.
-        let recent_provers = Arc::clone(&self.recent_provers);
-        let audit_timeout_strikes = Arc::clone(&self.audit_timeout_strikes);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -949,15 +1032,7 @@ impl ReplicationEngine {
                     )
                     .await
                 };
-                handle_audit_result(
-                    &result,
-                    &p2p,
-                    &sync_state,
-                    &recent_provers,
-                    &audit_timeout_strikes,
-                    &config,
-                )
-                .await;
+                handle_audit_result(&result, &p2p, &sync_state, &config).await;
             }
 
             // Then run periodically.
@@ -981,15 +1056,7 @@ impl ReplicationEngine {
                             )
                             .await
                         };
-                        handle_audit_result(
-                    &result,
-                    &p2p,
-                    &sync_state,
-                    &recent_provers,
-                    &audit_timeout_strikes,
-                    &config,
-                )
-                .await;
+                        handle_audit_result(&result, &p2p, &sync_state, &config).await;
                     }
                 }
             }
@@ -1531,9 +1598,9 @@ impl Drop for AuditResponderGuard {
 
 /// Try to admit one audit-responder task for `source`: take a global permit AND
 /// a per-peer slot (both bounded). Returns `None` (caller drops the challenge,
-/// which the auditor graces as a timeout) if either ceiling is hit, so one
-/// flooder can neither exhaust the global pool's effect on others nor exceed
-/// its own per-peer share (codex-r2 A).
+/// leaving the remote auditor to apply that audit path's timeout policy) if
+/// either ceiling is hit, so one flooder can neither exhaust the global pool's
+/// effect on others nor exceed its own per-peer share (codex-r2 A).
 async fn admit_audit_responder(
     semaphore: &Arc<Semaphore>,
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -1703,8 +1770,9 @@ async fn handle_replication_message(
             // block all other replication traffic until its digests complete
             // (head-of-line blocking). The same flood-fair admission applies: a
             // global ceiling AND a per-peer cap, dropping the challenge if either
-            // is hit (an honest auditor graces a non-response as a timeout, while
-            // a flooder is held to its per-peer share and cannot starve others).
+            // is hit. Responsible/prune audit timeouts are penalised by the
+            // caller, so the caps must remain high enough for honest audit load;
+            // the per-peer share still prevents one flooder from starving others.
             let Some(guard) =
                 admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
                     .await
@@ -1748,10 +1816,10 @@ async fn handle_replication_message(
             //
             // A bounded, flood-fair admission restores backpressure (codex#1 +
             // codex-r2 A): a global ceiling AND a per-peer cap. If either is hit
-            // we drop this challenge — the auditor graces a non-response as a
-            // timeout, so an honest auditor is unaffected and only a flooder is
-            // throttled (and it cannot starve other peers, since its share is
-            // capped per-peer).
+            // we drop this challenge. Subtree auditors grace timeout
+            // non-responses, so capacity drops throttle flooders without turning
+            // into trust penalties (and one source cannot starve other peers,
+            // since its share is capped per-peer).
             info!(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
@@ -1982,13 +2050,19 @@ async fn handle_fresh_offer(
         return Ok(());
     }
 
-    // Rule 7: check storage admission. Fresh chunk receivers accept the close
-    // group plus a small margin to absorb local routing-table disagreement.
+    // Rule 7: check storage admission. Fresh chunk receivers accept across the
+    // paid-close-group neighbourhood (`paid_list_close_group_size`, = K_BUCKET_SIZE,
+    // the same width client PUTs use), not just the close group plus a small
+    // margin (ADR-0003). During full-node shunning a healthy replica's routing
+    // table may still list closer full nodes it hasn't evicted yet, ranking it
+    // outside the narrow window in its own view; the wider accept window absorbs
+    // that transient skew so the chunk still lands. Retention (pruning) stays at
+    // `storage_admission_width`, so steady-state replication is unchanged.
     if !admission::is_responsible(
         &self_id,
         &offer.key,
         p2p_node,
-        storage_admission_width(config.close_group_size),
+        config.paid_list_close_group_size,
     )
     .await
     {
@@ -3686,94 +3760,45 @@ fn first_failed_key_label(confirmed_failed_keys: &[XorName]) -> String {
     )
 }
 
-/// Execute the side effects for a confirmed storage-commitment audit failure.
+/// Execute the side effects for a subtree storage-commitment audit failure.
 ///
-/// [`plan_failed_audit`] is the pure decision INCLUDING the strike selection
-/// (record-a-strike-for-`Timeout` vs leave-untouched for confirmed failures),
-/// extracted so the whole glue — not just the verdict — is testable without a
-/// live `P2PNode`. This function is only the resulting I/O. Timeouts are graced
-/// and rollout-gated (TIMEOUT-EVICTION-DISABLED); confirmed failures penalize on
-/// the first occurrence and revoke holder credit.
-async fn handle_failed_audit(
+/// Subtree timeouts are fully graced: the multi-round, multi-chunk challenge can
+/// legitimately time out on slow or loaded honest peers, so it never touches the
+/// responsible-chunk audit path or its timeout accounting. Confirmed subtree
+/// failures still penalise immediately and revoke holder credit.
+async fn handle_subtree_failed_audit(
     challenged_peer: &PeerId,
     confirmed_failed_key_count: usize,
     reason: &AuditFailureReason,
     p2p_node: &Arc<P2PNode>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     recent_provers: &Arc<RwLock<RecentProvers>>,
-    audit_timeout_strikes: &Arc<RwLock<HashMap<PeerId, u32>>>,
 ) {
-    let action = {
-        let mut strikes = audit_timeout_strikes.write().await;
-        plan_failed_audit(reason, &mut strikes, challenged_peer)
-    };
-    match action {
-        AuditFailureAction::TimeoutGrace => {
-            // Honest transient slowness: no penalty, no credit loss, retain the
-            // bootstrap claim. Only *sustained* timeouts (a peer that always
-            // has to refetch) survive to the threshold — the per-challenge
-            // window is never widened.
-            debug!(
-                "Audit timeout for {challenged_peer} (under the {}-strike threshold); \
-                 within grace, retaining bootstrap claim, no penalty",
-                config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
-            );
-        }
-        AuditFailureAction::TimeoutPenalize => {
-            // Strikes are tracked/logged so the mechanism stays observable; the
-            // trust report that drives eviction is gated behind
-            // `TIMEOUT_EVICTION_ENABLED` (off this release — see its doc for the
-            // rollout-death-spiral rationale). Confirmed storage-integrity
-            // failures (ConfirmedPenalize below) are unaffected.
-            warn!(
-                "Audit timeout for {challenged_peer}: reached the {}-strike threshold of \
-                 consecutive timeouts ({})",
-                config::AUDIT_TIMEOUT_STRIKE_THRESHOLD,
-                if config::TIMEOUT_EVICTION_ENABLED {
-                    "penalizing"
-                } else {
-                    "eviction disabled this release — not penalizing"
-                }
-            );
-            if config::TIMEOUT_EVICTION_ENABLED {
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
-            }
-        }
-        AuditFailureAction::ConfirmedPenalize => {
-            // The caller (handle_subtree_audit_result) already logged the rich
-            // failure line with reason + per-category summary; avoid a redundant
-            // second error log here. `confirmed_failed_key_count` is retained in
-            // the signature for callers/tests that assert on it.
-            let _ = confirmed_failed_key_count;
-            // Peer returned a non-bootstrap response — clear the active claim
-            // while retaining claim history.
-            {
-                let mut state = sync_state.write().await;
-                state.clear_active_bootstrap_claim(challenged_peer);
-            }
-            // Revoke holder credit on a CONFIRMED failure (DigestMismatch /
-            // KeyAbsent / Rejected / MalformedResponse): the peer no longer
-            // provably holds what it committed to, so it must not keep §6
-            // holder credit for the proof TTL. The §5 `forget_commitment` path
-            // only fires on an "unknown commitment hash" reply; genuine byte
-            // loss surfaces here.
-            {
-                let mut provers_guard = recent_provers.write().await;
-                apply_audit_failure_credit_revocation(&mut provers_guard, challenged_peer, reason);
-            }
-            p2p_node
-                .report_trust_event(
-                    challenged_peer,
-                    TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                )
-                .await;
-        }
+    if matches!(reason, AuditFailureReason::Timeout) {
+        debug!(
+            "Audit timeout for {challenged_peer} fully graced \
+             (subtree audit does not evict on timeout)"
+        );
+        return;
     }
+
+    // The caller already logged the rich failure line with reason + per-category
+    // summary; avoid a redundant second error log here.
+    let _ = confirmed_failed_key_count;
+    {
+        let mut state = sync_state.write().await;
+        state.clear_active_bootstrap_claim(challenged_peer);
+    }
+    {
+        let mut provers_guard = recent_provers.write().await;
+        apply_audit_failure_credit_revocation(&mut provers_guard, challenged_peer, reason);
+    }
+    p2p_node
+        .report_trust_event(
+            challenged_peer,
+            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
 }
 
 /// Handle audit result: log findings and emit trust events.
@@ -3782,7 +3807,6 @@ async fn handle_subtree_audit_result(
     p2p_node: &Arc<P2PNode>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     recent_provers: &Arc<RwLock<RecentProvers>>,
-    audit_timeout_strikes: &Arc<RwLock<HashMap<PeerId, u32>>>,
     config: &ReplicationConfig,
 ) {
     match result {
@@ -3796,14 +3820,6 @@ async fn handle_subtree_audit_result(
             {
                 let mut state = sync_state.write().await;
                 state.clear_active_bootstrap_claim(challenged_peer);
-            }
-            // A normal response proves the slowness (if any) was transient, so
-            // reset the timeout-strike counter. Only *sustained* timeouts (a
-            // peer that must refetch on every audit) survive this reset to
-            // accumulate toward the penalty threshold.
-            {
-                let mut strikes = audit_timeout_strikes.write().await;
-                strikes.remove(challenged_peer);
             }
             p2p_node
                 .report_trust_event(
@@ -3831,20 +3847,16 @@ async fn handle_subtree_audit_result(
                     summary.absent_keys,
                     summary.digest_mismatch_keys,
                 );
-                // Route the side effects through the strike-grace path: timeouts
-                // are graced (and rollout-gated by TIMEOUT-EVICTION-DISABLED),
-                // deterministic failures penalize on the first occurrence and
-                // revoke holder credit. Do NOT report ApplicationFailure inline
-                // here — that would evict honest not-yet-upgraded peers on a
-                // single timeout during the breaking rollout.
-                handle_failed_audit(
+                // Route the side effects through the subtree-only failure path.
+                // Responsible-chunk `AuditChallenge` handling intentionally uses
+                // its own old immediate-penalty handler below.
+                handle_subtree_failed_audit(
                     challenged_peer,
                     confirmed_failed_keys.len(),
                     reason,
                     p2p_node,
                     sync_state,
                     recent_provers,
-                    audit_timeout_strikes,
                 )
                 .await;
             }
@@ -3898,11 +3910,9 @@ async fn handle_subtree_audit_result(
 /// bootstrap claim. A `Timeout` does not (the peer may still be legitimately
 /// bootstrapping); every confirmed storage-integrity reason does.
 ///
-/// Both audits now funnel through [`handle_failed_audit`], which derives the
-/// clear-vs-retain decision from [`decide_audit_failure_action`]; this predicate
-/// is retained as the readable single-source-of-truth that those tests assert
-/// against (it is the exact `reason != Timeout` rule the action planner uses).
-#[cfg(test)]
+/// Responsible-chunk `AuditChallenge` failures use this directly: timeouts keep
+/// the bootstrap claim but are still reported as audit failures, matching the
+/// pre-ADR-0002 behaviour.
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
 }
@@ -3910,160 +3920,104 @@ fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
 /// Handle the result of a responsible-chunk audit tick (audit #2): emit trust
 /// events and manage bootstrap-claim state.
 ///
-/// Delegates to [`handle_subtree_audit_result`] so BOTH audits share one
-/// failure path: timeouts go through the strike/grace logic (graced under the
-/// threshold, eviction gated off this release via `TIMEOUT-EVICTION-DISABLED`)
-/// and only confirmed storage-integrity failures penalise on the first
-/// occurrence and revoke holder credit. Previously this handler reported
-/// `ApplicationFailure` inline for EVERY failure including `Timeout`, which —
-/// with the breaking v2 wire change — would false-penalise honest
-/// not-yet-upgraded peers on a single audit. (Audit #2 cannot credit holders,
-/// so the shared handler's strike-reset/credit-revocation is a superset of what
-/// it needs; the responsible-chunk audit never produces `Passed { .. }` with
-/// holder credit, so nothing is over-credited.)
+/// This is intentionally separate from the subtree audit result handler. A
+/// responsible-chunk `AuditChallenge` `Failed` result reports
+/// `ApplicationFailure` immediately for every reason, including `Timeout`,
+/// restoring the pre-ADR-0002 behaviour.
 async fn handle_audit_result(
     result: &AuditTickResult,
     p2p_node: &Arc<P2PNode>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
-    recent_provers: &Arc<RwLock<RecentProvers>>,
-    audit_timeout_strikes: &Arc<RwLock<HashMap<PeerId, u32>>>,
     config: &ReplicationConfig,
 ) {
-    handle_subtree_audit_result(
-        result,
-        p2p_node,
-        sync_state,
-        recent_provers,
-        audit_timeout_strikes,
-        config,
-    )
-    .await;
-}
-
-/// What the audit-failure handler should do for a given failure, given the
-/// peer's post-increment timeout-strike count. Pure (no I/O) so the whole
-/// decision can be exercised end-to-end without a live `P2PNode`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditFailureAction {
-    /// Timeout under the strike threshold: no trust penalty, no credit
-    /// revocation, retain the bootstrap claim (honest transient slowness).
-    TimeoutGrace,
-    /// Timeout at/over the threshold: report `ApplicationFailure`. Bootstrap
-    /// claim retained; holder credit NOT revoked (the peer never admitted byte
-    /// loss). The non-storing-peer case.
-    TimeoutPenalize,
-    /// Confirmed storage-integrity failure: penalize immediately, clear the
-    /// active bootstrap claim, and revoke holder credit.
-    ConfirmedPenalize,
-}
-
-/// Upper bound on a peer's consecutive-timeout strike count. Must exceed the
-/// largest reachable adaptive threshold (base + `MAX_ADAPTIVE_TIMEOUT_GRACE`) so
-/// a genuinely non-responsive peer's count can always catch up to and cross an
-/// inflated threshold — otherwise capping at the base would make timeout
-/// penalties unreachable once the adaptive threshold rose.
-const AUDIT_TIMEOUT_STRIKE_MAX: u32 = 64;
-
-/// Maximum extra grace the adaptive mechanism may add on top of the base
-/// threshold. Bounds how far a (possibly stale) set of timing-out peers can
-/// widen the window, so a small persistent failing cohort cannot push the
-/// threshold arbitrarily high and shield a bad node indefinitely.
-const MAX_ADAPTIVE_TIMEOUT_GRACE: u32 = 2 * config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-
-/// Record an audit timeout for `peer` and return its new consecutive-timeout
-/// strike count, saturating at [`AUDIT_TIMEOUT_STRIKE_MAX`] (well above any
-/// reachable adaptive threshold). A successful audit removes the peer's entry
-/// (the `Passed` arm of [`handle_subtree_audit_result`]), so only *consecutive*
-/// timeouts accumulate here.
-fn record_audit_timeout_strike(strikes: &mut HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
-    let count = strikes.entry(*peer).or_insert(0);
-    *count = count.saturating_add(1).min(AUDIT_TIMEOUT_STRIKE_MAX);
-    *count
-}
-
-/// The adaptive timeout-strike threshold for judging `peer` (ADR-0002 "Network
-/// Resilience"): `min(median of the OTHER timing-out peers' counts,
-/// MAX_ADAPTIVE_TIMEOUT_GRACE) + base threshold`.
-///
-/// In a healthy network almost no peer carries timeout strikes, so the median
-/// is 0 and the threshold is the base [`config::AUDIT_TIMEOUT_STRIKE_THRESHOLD`].
-/// During genuine disruption many *honest* peers time out together, lifting the
-/// median and widening the grace so the audit system does not pile onto a
-/// struggling network — but the widening is capped at `MAX_ADAPTIVE_TIMEOUT_GRACE`
-/// so a stale failing cohort cannot inflate it without bound.
-///
-/// `peer` is EXCLUDED from the median so a lone timing-out peer cannot raise its
-/// own grace bar. Combined with the map being fed ONLY by timeouts (deterministic
-/// failures never touch it), this closes self-inflation and bounds
-/// attacker-inflation of the grace window.
-fn adaptive_timeout_threshold(strikes: &HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
-    let grace = median_timeout_strikes_excluding(strikes, peer).min(MAX_ADAPTIVE_TIMEOUT_GRACE);
-    grace.saturating_add(config::AUDIT_TIMEOUT_STRIKE_THRESHOLD)
-}
-
-/// Lower median of the current per-peer consecutive-timeout counts, excluding
-/// `peer`. No other peers → 0.
-fn median_timeout_strikes_excluding(strikes: &HashMap<PeerId, u32>, peer: &PeerId) -> u32 {
-    let mut counts: Vec<u32> = strikes
-        .iter()
-        .filter(|(p, _)| *p != peer)
-        .map(|(_, c)| *c)
-        .collect();
-    if counts.is_empty() {
-        return 0;
-    }
-    counts.sort_unstable();
-    // Lower median: for even-sized inputs take the lower of the two middle
-    // values ((len-1)/2), so the grace is conservative rather than inflated.
-    counts.get((counts.len() - 1) / 2).copied().unwrap_or(0)
-}
-
-/// Whether a peer's consecutive-timeout strike count reaches the (adaptive)
-/// threshold for emitting an `ApplicationFailure` trust event.
-fn timeout_strike_reaches_threshold(strikes: u32, threshold: u32) -> bool {
-    strikes >= threshold
-}
-
-/// Decide what to do about a confirmed audit failure. `timeout_strikes_after`
-/// is the peer's strike count after recording this event and `timeout_threshold`
-/// the adaptive threshold to compare against (both only meaningful when
-/// `reason == Timeout`). Pure, so the integration-level decision can be asserted
-/// in tests with no networking.
-fn decide_audit_failure_action(
-    reason: &AuditFailureReason,
-    timeout_strikes_after: u32,
-    timeout_threshold: u32,
-) -> AuditFailureAction {
-    if matches!(reason, AuditFailureReason::Timeout) {
-        if timeout_strike_reaches_threshold(timeout_strikes_after, timeout_threshold) {
-            AuditFailureAction::TimeoutPenalize
-        } else {
-            AuditFailureAction::TimeoutGrace
+    match result {
+        AuditTickResult::Passed {
+            challenged_peer,
+            keys_checked,
+        } => {
+            debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
+            {
+                let mut state = sync_state.write().await;
+                state.clear_active_bootstrap_claim(challenged_peer);
+            }
+            p2p_node
+                .report_trust_event(
+                    challenged_peer,
+                    TrustEvent::ApplicationSuccess(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
         }
-    } else {
-        AuditFailureAction::ConfirmedPenalize
+        AuditTickResult::Failed { evidence } => {
+            if let FailureEvidence::AuditFailure {
+                challenged_peer,
+                confirmed_failed_keys,
+                summary,
+                reason,
+                ..
+            } = evidence
+            {
+                let first_failed_key = first_failed_key_label(confirmed_failed_keys);
+                error!(
+                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    confirmed_failed_keys.len(),
+                    summary.challenged_keys,
+                    summary.absent_keys,
+                    summary.digest_mismatch_keys,
+                );
+                if audit_failure_clears_bootstrap_claim(reason) {
+                    let mut state = sync_state.write().await;
+                    state.clear_active_bootstrap_claim(challenged_peer);
+                } else {
+                    debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
+                }
+                p2p_node
+                    .report_trust_event(
+                        challenged_peer,
+                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                    )
+                    .await;
+            }
+        }
+        AuditTickResult::BootstrapClaim { peer } => {
+            let should_report = {
+                let now = Instant::now();
+                let mut state = sync_state.write().await;
+                match state.observe_bootstrap_claim(*peer, now, config.bootstrap_claim_grace_period)
+                {
+                    BootstrapClaimObservation::WithinGrace { .. } => {
+                        debug!("Audit: peer {peer} claims bootstrapping (within grace period)");
+                        false
+                    }
+                    BootstrapClaimObservation::PastGrace { first_seen } => {
+                        warn!(
+                            "Audit: peer {peer} claiming bootstrap past grace period \
+                             ({:?} > {:?}), reporting abuse",
+                            now.duration_since(first_seen),
+                            config.bootstrap_claim_grace_period,
+                        );
+                        true
+                    }
+                    BootstrapClaimObservation::Repeated { first_seen } => {
+                        warn!(
+                            "Audit: peer {peer} repeated bootstrap claim after previously \
+                             stopping; first claim was {:?} ago, reporting abuse",
+                            now.duration_since(first_seen),
+                        );
+                        true
+                    }
+                }
+            };
+            if should_report {
+                p2p_node
+                    .report_trust_event(
+                        peer,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
+            }
+        }
+        AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}
     }
-}
-
-/// Plan the response to a confirmed audit failure, performing the
-/// strike-selection glue in-process: a `Timeout` records a strike against
-/// `peer` (so consecutive timeouts accumulate) and is judged against the
-/// adaptive threshold; every other reason is a confirmed failure that does NOT
-/// touch the strike map. The caller owns the lock and performs the resulting I/O.
-fn plan_failed_audit(
-    reason: &AuditFailureReason,
-    strikes: &mut HashMap<PeerId, u32>,
-    peer: &PeerId,
-) -> AuditFailureAction {
-    // Snapshot the adaptive threshold from the *other* peers' counts (excluding
-    // this peer), so a single peer's own timeouts cannot raise its own grace bar.
-    let threshold = adaptive_timeout_threshold(strikes, peer);
-    let strikes_after = if matches!(reason, AuditFailureReason::Timeout) {
-        record_audit_timeout_strike(strikes, peer)
-    } else {
-        0
-    };
-    decide_audit_failure_action(reason, strikes_after, threshold)
 }
 
 /// Whether a confirmed audit failure with this reason should revoke the
@@ -4109,7 +4063,6 @@ struct GossipAuditTrigger {
     config: Arc<ReplicationConfig>,
     recent_provers: Arc<RwLock<RecentProvers>>,
     sync_state: Arc<RwLock<NeighborSyncState>>,
-    audit_timeout_strikes: Arc<RwLock<HashMap<PeerId, u32>>>,
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
 }
 
@@ -4220,7 +4173,6 @@ async fn maybe_trigger_gossip_audit(
             &trigger.p2p_node,
             &trigger.sync_state,
             &trigger.recent_provers,
-            &trigger.audit_timeout_strikes,
             &trigger.config,
         )
         .await;
@@ -4672,12 +4624,9 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        adaptive_timeout_threshold, apply_audit_failure_credit_revocation,
-        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
-        audit_launch_decision, config, cooldown_allows_audit, decide_audit_failure_action,
-        first_failed_key_label, fresh_offer_payment_context, median_timeout_strikes_excluding,
-        paid_notify_payment_context, plan_failed_audit, record_audit_timeout_strike,
-        timeout_strike_reaches_threshold, AuditFailureAction, AUDIT_TIMEOUT_STRIKE_MAX,
+        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
+        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
+        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
@@ -4726,197 +4675,6 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
-    }
-
-    // HELPER-LEVEL: counter arithmetic + threshold predicate. The reset is
-    // simulated by an in-test `strikes.remove`; the real reset path (the
-    // `Passed` arm) is covered at the glue level below.
-    #[test]
-    fn single_timeout_then_success_emits_no_failure_and_resets() {
-        let peer = strike_peer(1);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        let base = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-        let after_one = record_audit_timeout_strike(&mut strikes, &peer);
-        assert_eq!(after_one, 1);
-        assert!(!timeout_strike_reaches_threshold(after_one, base));
-        strikes.remove(&peer);
-        assert!(!strikes.contains_key(&peer));
-    }
-
-    #[test]
-    fn consecutive_timeouts_cross_threshold_at_n() {
-        let peer = strike_peer(2);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        let n = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-        let mut last = 0;
-        for i in 1..=n {
-            last = record_audit_timeout_strike(&mut strikes, &peer);
-            if i < n {
-                assert!(!timeout_strike_reaches_threshold(last, n));
-            }
-        }
-        assert!(timeout_strike_reaches_threshold(last, n));
-        // The count keeps climbing past the base threshold (so it can also
-        // cross a higher *adaptive* threshold), but is bounded by the strike
-        // cap — no unbounded growth.
-        let mut c = last;
-        for _ in 0..200 {
-            c = record_audit_timeout_strike(&mut strikes, &peer);
-        }
-        assert_eq!(
-            c,
-            super::AUDIT_TIMEOUT_STRIKE_MAX,
-            "count saturates at the max cap"
-        );
-        assert!(c > n, "count must be able to exceed the base threshold");
-    }
-
-    // ADR-0002 Network Resilience: adaptive timeout threshold.
-
-    #[test]
-    fn median_timeout_strikes_basics() {
-        let target = strike_peer(99);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        // No other peers → 0 (healthy network, threshold == base).
-        assert_eq!(median_timeout_strikes_excluding(&strikes, &target), 0);
-        strikes.insert(strike_peer(1), 1);
-        strikes.insert(strike_peer(2), 3);
-        strikes.insert(strike_peer(3), 5);
-        // Sorted [1,3,5], lower-median index 1 → 3.
-        assert_eq!(median_timeout_strikes_excluding(&strikes, &target), 3);
-    }
-
-    // ADVERSARIAL (ADR point e + sybil-inflation bound). Two invariants the
-    // existing suite leaves unpinned:
-    //  1. EVEN-count inputs must take the LOWER of the two middle values. The
-    //     existing basics test only feeds an odd-length cohort, so an
-    //     implementation that used `len/2` (upper median) would still pass it.
-    //     Here [1,4] -> lower median 1 (not 4) and [2,4,6,8] -> 4 (not 6).
-    //  2. A sybil cohort pinned at the *strike cap* (the most an attacker could
-    //     ever drive fabricated peers to) STILL cannot push the grace past
-    //     MAX_ADAPTIVE_TIMEOUT_GRACE: the threshold saturates at base + max
-    //     grace regardless of how high or how numerous the cohort is.
-    // FLIPS IF: median switches to the upper element on even input, or the
-    // grace clamp (`.min(MAX_ADAPTIVE_TIMEOUT_GRACE)`) is removed.
-    #[test]
-    fn even_count_takes_lower_median_and_sybil_cohort_cannot_exceed_grace_bound() {
-        let target = strike_peer(150);
-
-        // Even count == 2: lower of [1, 4] is 1.
-        let mut two: HashMap<PeerId, u32> = HashMap::new();
-        two.insert(strike_peer(1), 1);
-        two.insert(strike_peer(2), 4);
-        assert_eq!(
-            median_timeout_strikes_excluding(&two, &target),
-            1,
-            "even-count median must take the LOWER middle value (1), not the upper (4)"
-        );
-
-        // Even count == 4: sorted [2,4,6,8], lower median index (4-1)/2 = 1 → 4.
-        let mut four: HashMap<PeerId, u32> = HashMap::new();
-        for (i, v) in (10u8..).zip([2u32, 4, 6, 8]) {
-            four.insert(strike_peer(i), v);
-        }
-        assert_eq!(
-            median_timeout_strikes_excluding(&four, &target),
-            4,
-            "even-count median must be the lower middle (4), not the upper (6)"
-        );
-
-        // Sybil cohort pinned at the strike CAP — the strongest inflation an
-        // attacker could mount — must not lift the threshold past base + max
-        // grace. Try several cohort sizes (odd and even) to be sure.
-        for cohort in [2u8, 5, 8, 20] {
-            let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-            for i in 0..cohort {
-                strikes.insert(strike_peer(50 + i), super::AUDIT_TIMEOUT_STRIKE_MAX);
-            }
-            let threshold = adaptive_timeout_threshold(&strikes, &target);
-            assert_eq!(
-                threshold,
-                config::AUDIT_TIMEOUT_STRIKE_THRESHOLD + super::MAX_ADAPTIVE_TIMEOUT_GRACE,
-                "a sybil cohort at the strike cap (size {cohort}) must saturate the grace at \
-                 the bound, never exceed it"
-            );
-        }
-
-        // And even at the bounded-but-inflated threshold, a genuinely
-        // non-responsive target can still cross it (cap > max reachable
-        // threshold), so the bound never shields a bad node forever.
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        for i in 0..8u8 {
-            strikes.insert(strike_peer(80 + i), super::AUDIT_TIMEOUT_STRIKE_MAX);
-        }
-        let threshold = adaptive_timeout_threshold(&strikes, &target);
-        let mut c = 0;
-        for _ in 0..(threshold + 5) {
-            c = record_audit_timeout_strike(&mut strikes, &target);
-        }
-        assert!(
-            timeout_strike_reaches_threshold(c, threshold),
-            "target must still cross the bounded inflated threshold ({c} vs {threshold})"
-        );
-    }
-
-    #[test]
-    fn lone_timing_out_peer_does_not_inflate_its_own_grace() {
-        // The peer under judgement is excluded from the median, so a single bad
-        // peer (the common case) is judged against the base threshold and caught
-        // — it cannot raise its own bar as its strike count climbs.
-        let bad = strike_peer(7);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        strikes.insert(bad, 5); // its own large count must not count
-        assert_eq!(
-            adaptive_timeout_threshold(&strikes, &bad),
-            config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
-        );
-    }
-
-    #[test]
-    fn widespread_timeouts_widen_the_grace() {
-        // Genuine disruption: many OTHER honest peers carry timeout strikes. The
-        // median rises, so the threshold for any given peer widens beyond the
-        // base — the audit system does not pile onto a struggling network.
-        let target = strike_peer(100);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        for i in 0..9u8 {
-            strikes.insert(strike_peer(i), 4);
-        }
-        assert_eq!(
-            adaptive_timeout_threshold(&strikes, &target),
-            4 + config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
-        );
-        assert!(
-            adaptive_timeout_threshold(&strikes, &target) > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
-        );
-    }
-
-    #[test]
-    fn adaptive_grace_only_responds_to_timeouts_not_deterministic_failures() {
-        // The strike map is fed ONLY by timeouts (plan_failed_audit records a
-        // strike for Timeout and never for confirmed failures). So a flood of
-        // deterministic failures cannot inflate the median to buy grace.
-        let target = strike_peer(101);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        // Many confirmed (non-timeout) failures: these must NOT touch the map.
-        for i in 0..9u8 {
-            let action = plan_failed_audit(
-                &AuditFailureReason::DigestMismatch,
-                &mut strikes,
-                &strike_peer(i),
-            );
-            assert_eq!(action, AuditFailureAction::ConfirmedPenalize);
-        }
-        assert!(
-            strikes.is_empty(),
-            "deterministic failures must not record strikes"
-        );
-        // Threshold stays at the base — an attacker cannot widen grace by
-        // failing audits on purpose.
-        assert_eq!(
-            adaptive_timeout_threshold(&strikes, &target),
-            config::AUDIT_TIMEOUT_STRIKE_THRESHOLD
-        );
     }
 
     // ADR-0002: "occasional surprise exams, keeps load low" — the per-peer
@@ -5033,35 +4791,6 @@ mod tests {
     }
 
     #[test]
-    fn inflated_adaptive_threshold_is_still_reachable_and_bounded() {
-        // When the median lifts the threshold above the base, a genuinely
-        // non-responsive peer's strike count must still be able to
-        // reach it (the count is no longer capped at the base). And the grace
-        // widening itself is bounded so it can't shield a bad node forever.
-        let target = strike_peer(200);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        // A cohort of other peers each at a high strike count.
-        for i in 0..9u8 {
-            strikes.insert(strike_peer(i), 10);
-        }
-        let threshold = adaptive_timeout_threshold(&strikes, &target);
-        // Grace is capped, so the threshold cannot exceed base + max grace.
-        assert!(
-            threshold <= config::AUDIT_TIMEOUT_STRIKE_THRESHOLD + super::MAX_ADAPTIVE_TIMEOUT_GRACE
-        );
-        assert!(threshold > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD);
-        // The target peer can accumulate strikes past that inflated threshold.
-        let mut c = 0;
-        for _ in 0..threshold + 5 {
-            c = record_audit_timeout_strike(&mut strikes, &target);
-        }
-        assert!(
-            timeout_strike_reaches_threshold(c, threshold),
-            "a persistent peer must be able to cross the inflated threshold ({c} vs {threshold})"
-        );
-    }
-
-    #[test]
     fn audit_on_gossip_constants_match_adr() {
         // Tripwire on the ADR-locked tunables. The spot-check count sits at the
         // top of the auditor's 3..=5 band (the auditor clamps to that band, so
@@ -5080,159 +4809,6 @@ mod tests {
         ));
         assert!(audit_failure_revokes_holder_credit(
             &AuditFailureReason::DigestMismatch
-        ));
-    }
-
-    // E2E (pure decision): an honest peer that times out once, recovers,
-    // repeatedly, never reaches a penalty because each success resets strikes.
-    // FLIPS IF: the strike threshold is removed or success stops resetting.
-    #[test]
-    fn e2e_honest_intermittent_timeouts_never_penalized() {
-        let peer = strike_peer(10);
-        let base = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        for _ in 0..10 {
-            let after = record_audit_timeout_strike(&mut strikes, &peer);
-            assert_eq!(
-                decide_audit_failure_action(&AuditFailureReason::Timeout, after, base),
-                AuditFailureAction::TimeoutGrace
-            );
-            strikes.remove(&peer);
-        }
-        assert!(!strikes.contains_key(&peer));
-    }
-
-    // E2E: a peer that times out on EVERY audit (never reset) crosses the
-    // threshold and is penalized — the deterrent against non-storing peers.
-    // FLIPS IF: per-challenge window widened so it answers in time, or strikes
-    // reset without a success.
-    #[test]
-    fn e2e_persistent_timeouts_get_penalized() {
-        let peer = strike_peer(11);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        let threshold = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-        let mut penalized_at = None;
-        for tick in 1..=(threshold + 2) {
-            let after = record_audit_timeout_strike(&mut strikes, &peer);
-            if decide_audit_failure_action(&AuditFailureReason::Timeout, after, threshold)
-                == AuditFailureAction::TimeoutPenalize
-                && penalized_at.is_none()
-            {
-                penalized_at = Some(tick);
-            }
-        }
-        assert_eq!(penalized_at, Some(threshold));
-    }
-
-    // Glue: a Timeout through the real plan_failed_audit MUST record a strike on
-    // the map AND penalize once enough accumulate.
-    // FLIPS IF: the handler stops feeding Timeout through the strike counter
-    // (e.g. strikes_after hard-coded to 0). (Mutation-verified.)
-    #[test]
-    fn e2e_glue_timeout_records_strike_and_penalizes_at_threshold() {
-        let peer = strike_peer(20);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        let threshold = config::AUDIT_TIMEOUT_STRIKE_THRESHOLD;
-        let mut action = AuditFailureAction::TimeoutGrace;
-        for tick in 1..=threshold {
-            action = plan_failed_audit(&AuditFailureReason::Timeout, &mut strikes, &peer);
-            assert_eq!(strikes.get(&peer).copied(), Some(tick));
-        }
-        assert_eq!(action, AuditFailureAction::TimeoutPenalize);
-    }
-
-    // Glue: a confirmed failure through plan_failed_audit must NOT touch the
-    // strike map and must return ConfirmedPenalize.
-    #[test]
-    fn e2e_glue_confirmed_failure_leaves_strike_map_untouched() {
-        let peer = strike_peer(21);
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        for reason in [
-            AuditFailureReason::DigestMismatch,
-            AuditFailureReason::KeyAbsent,
-            AuditFailureReason::Rejected,
-            AuditFailureReason::MalformedResponse,
-        ] {
-            assert_eq!(
-                plan_failed_audit(&reason, &mut strikes, &peer),
-                AuditFailureAction::ConfirmedPenalize
-            );
-        }
-        assert!(strikes.is_empty());
-    }
-
-    // ADR-0002 "Accounting and False Positives", adversarial: a DETERMINISTIC
-    // failure is acted on the FIRST time it occurs, "regardless of network
-    // conditions". Here the strike map is pre-loaded with many *other* peers
-    // timing out, which inflates the adaptive timeout grace to its cap — the
-    // most forgiving the network ever gets. Under that maximally-relaxed
-    // window:
-    //   - a brand-new peer's FIRST deterministic failure (DigestMismatch /
-    //     Rejected / MalformedResponse) STILL returns ConfirmedPenalize, never
-    //     a grace lane, and never touches the strike map; while
-    //   - that same peer's FIRST timeout is only TimeoutGrace.
-    // This proves the inflated grace is the timeout-only lane and can NEVER be
-    // weaponized to buy a deterministic failure even one round of delay.
-    // FLIPS IF: deterministic failures start consulting the strike threshold,
-    // or ConfirmedPenalize is collapsed into a timeout action.
-    #[test]
-    fn deterministic_failure_penalizes_first_time_under_inflated_grace() {
-        let mut strikes: HashMap<PeerId, u32> = HashMap::new();
-        // Saturate the adaptive grace: many other peers each carrying a high
-        // consecutive-timeout count, so the median (and thus the grace) is
-        // pushed to its MAX cap for any newly-judged peer.
-        for b in 100..150u8 {
-            let other = strike_peer(b);
-            for _ in 0..AUDIT_TIMEOUT_STRIKE_MAX {
-                record_audit_timeout_strike(&mut strikes, &other);
-            }
-        }
-        let victim = strike_peer(7);
-        // Sanity: the grace seen by the victim is genuinely inflated above base.
-        let inflated = adaptive_timeout_threshold(&strikes, &victim);
-        assert!(
-            inflated > config::AUDIT_TIMEOUT_STRIKE_THRESHOLD,
-            "test precondition: grace must be inflated, got {inflated}"
-        );
-
-        // First deterministic failure of each kind -> ConfirmedPenalize on
-        // occurrence #1, and the victim is never inserted into the strike map.
-        for reason in [
-            AuditFailureReason::DigestMismatch,
-            AuditFailureReason::Rejected,
-            AuditFailureReason::MalformedResponse,
-        ] {
-            let action = plan_failed_audit(&reason, &mut strikes, &victim);
-            assert_eq!(
-                action,
-                AuditFailureAction::ConfirmedPenalize,
-                "{reason:?} must penalize on the first occurrence regardless of grace"
-            );
-            assert_ne!(
-                action,
-                AuditFailureAction::TimeoutPenalize,
-                "a deterministic failure must NOT be routed through the (eviction-gated) \
-                 timeout-penalize lane"
-            );
-            assert!(
-                !strikes.contains_key(&victim),
-                "deterministic failure must not touch the timeout strike map"
-            );
-            // And it always revokes holder credit / clears the claim.
-            assert!(audit_failure_revokes_holder_credit(&reason));
-            assert!(audit_failure_clears_bootstrap_claim(&reason));
-        }
-
-        // The SAME victim's first timeout, under the same inflated grace, is
-        // only TimeoutGrace (no penalty, no revocation, claim retained).
-        let timeout_action = plan_failed_audit(&AuditFailureReason::Timeout, &mut strikes, &victim);
-        assert_eq!(timeout_action, AuditFailureAction::TimeoutGrace);
-        assert_eq!(strikes.get(&victim).copied(), Some(1));
-        assert!(!audit_failure_revokes_holder_credit(
-            &AuditFailureReason::Timeout
-        ));
-        assert!(!audit_failure_clears_bootstrap_claim(
-            &AuditFailureReason::Timeout
         ));
     }
 
@@ -5335,7 +4911,7 @@ mod tests {
 
     #[test]
     fn first_failed_key_label_falls_back_when_empty() {
-        // Should never happen in production (handle_audit_failure rejects
+        // Should never happen in production (audit failure handling rejects
         // empty sets), but the formatter must still produce a valid label
         // so the log line doesn't contain a misleading default.
         assert_eq!(first_failed_key_label(&[]), "0x");
