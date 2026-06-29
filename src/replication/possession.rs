@@ -3,7 +3,7 @@
 //! After a node fresh-replicates a chunk, every close-group peer responsible
 //! for it is checked 5-15 minutes later for actual possession. The check is a
 //! single-key cryptographic
-//! [`AuditChallenge`](crate::replication::protocol::AuditChallenge): the probed
+//! [`AuditChallenge`]: the probed
 //! peer must return `BLAKE3(nonce ‖ peer_id ‖ key ‖ bytes)` computed over the
 //! chunk it claims to hold. It cannot produce that digest without the bytes, so
 //! — unlike a self-reported presence flag — a peer cannot escape the check by
