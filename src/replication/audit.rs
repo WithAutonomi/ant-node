@@ -269,7 +269,8 @@ pub async fn audit_tick_with_repair_proofs(
                     first_key = %first_key,
                     encoded_len,
                     send_error_class,
-                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}",
+                    send_error = %send_error,
+                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}, send_error={send_error:?}",
                     peer_keys.len(),
                     audit_timeout.as_millis(),
                     elapsed.as_millis(),
@@ -292,6 +293,24 @@ pub async fn audit_tick_with_repair_proofs(
             .await;
         }
     };
+
+    let elapsed = audit_started.elapsed();
+    info!(
+        audit_type = "responsible_chunk",
+        audit_phase = "challenge_send",
+        audit_outcome = "response_received",
+        challenged_peer = %challenged_peer,
+        challenge_id,
+        key_count = peer_keys.len(),
+        timeout_ms = audit_timeout.as_millis(),
+        elapsed_ms = elapsed.as_millis(),
+        response_len = response.data.len(),
+        "Audit challenge response received: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=response_received, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, response_len={}",
+        peer_keys.len(),
+        audit_timeout.as_millis(),
+        elapsed.as_millis(),
+        response.data.len(),
+    );
 
     // Step 7: Parse response.
     let resp_msg = match ReplicationMessage::decode(&response.data) {
@@ -571,7 +590,13 @@ async fn verify_digests(
 
     if failed_keys.is_empty() {
         info!(
-            "Audit: peer {challenged_peer} passed (all {} keys verified)",
+            audit_type = "responsible_chunk",
+            audit_phase = "response_verify",
+            audit_outcome = "passed",
+            challenged_peer = %challenged_peer,
+            challenge_id,
+            key_count = keys.len(),
+            "Audit: peer {challenged_peer} passed (all {} keys verified), audit_type=responsible_chunk, challenge_id={challenge_id}",
             keys.len()
         );
         return AuditTickResult::Passed {

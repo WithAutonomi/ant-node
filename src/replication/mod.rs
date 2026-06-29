@@ -1711,10 +1711,21 @@ async fn handle_replication_message(
             else {
                 warn!(
                     "Audit challenge reply not sent: kind=responsible response=dropped \
-                     source={source} (audit-responder capacity reached)"
+                     source={source} challenge_id={} keys={} request_response={} \
+                     (audit-responder capacity reached)",
+                    challenge.challenge_id,
+                    challenge.keys.len(),
+                    rr_message_id.is_some(),
                 );
                 return Ok(());
             };
+            info!(
+                "Audit challenge admitted: kind=responsible source={source} challenge_id={} \
+                 keys={} request_response={}",
+                challenge.challenge_id,
+                challenge.keys.len(),
+                rr_message_id.is_some(),
+            );
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
             let p2p_node = Arc::clone(p2p_node);
@@ -2406,15 +2417,20 @@ async fn handle_audit_challenge_msg(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    let received_at = Instant::now();
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
     info!(
-        "Audit challenge received: kind=responsible keys={} bootstrapping={} request_response={}",
+        "Audit challenge received: kind=responsible source={source} challenge_id={} \
+         keys={} bootstrapping={} stored_chunks={} request_response={}",
+        challenge.challenge_id,
         challenge.keys.len(),
         is_bootstrapping,
+        stored_chunks,
         rr_message_id.is_some(),
     );
 
+    let compute_started = Instant::now();
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
@@ -2423,8 +2439,19 @@ async fn handle_audit_challenge_msg(
         stored_chunks,
     )
     .await;
+    let compute_elapsed = compute_started.elapsed();
     let response_kind = audit_response_kind(&response);
+    info!(
+        "Audit challenge response computed: kind=responsible source={source} challenge_id={} \
+         response={} keys={} compute_ms={} request_response={}",
+        challenge.challenge_id,
+        response_kind,
+        challenge.keys.len(),
+        compute_elapsed.as_millis(),
+        rr_message_id.is_some(),
+    );
 
+    let send_started = Instant::now();
     let sent = send_replication_response_checked(
         source,
         p2p_node,
@@ -2433,18 +2460,30 @@ async fn handle_audit_challenge_msg(
         rr_message_id,
     )
     .await;
+    let send_elapsed = send_started.elapsed();
+    let total_elapsed = received_at.elapsed();
     if sent {
         info!(
-            "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
+            "Audit challenge reply sent: kind=responsible source={source} challenge_id={} \
+             response={} keys={} compute_ms={} send_ms={} total_ms={} request_response={}",
+            challenge.challenge_id,
             response_kind,
             challenge.keys.len(),
+            compute_elapsed.as_millis(),
+            send_elapsed.as_millis(),
+            total_elapsed.as_millis(),
             rr_message_id.is_some(),
         );
     } else {
         warn!(
-            "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
+            "Audit challenge reply not sent: kind=responsible source={source} challenge_id={} \
+             response={} keys={} compute_ms={} send_ms={} total_ms={} request_response={}",
+            challenge.challenge_id,
             response_kind,
             challenge.keys.len(),
+            compute_elapsed.as_millis(),
+            send_elapsed.as_millis(),
+            total_elapsed.as_millis(),
             rr_message_id.is_some(),
         );
     }
