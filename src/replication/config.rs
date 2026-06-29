@@ -58,8 +58,6 @@ pub const FRESH_REPLICATION_DELIVERY_MAX_RETRIES: u32 = 2;
 
 const POSSESSION_CHECK_DELAY_MIN_SECS: u64 = 5 * 60;
 const POSSESSION_CHECK_DELAY_MAX_SECS: u64 = 15 * 60;
-const POSSESSION_CHECK_TIMEOUT_SECS: u64 = 15;
-const POSSESSION_CHECK_RETRY_BACKOFF_SECS: u64 = 30;
 
 /// Lower bound of the delay before a fresh-replication possession check runs
 /// (ADR-0003).
@@ -73,20 +71,9 @@ pub const POSSESSION_CHECK_DELAY_MIN: Duration =
 pub const POSSESSION_CHECK_DELAY_MAX: Duration =
     Duration::from_secs(POSSESSION_CHECK_DELAY_MAX_SECS);
 
-/// Per-peer request timeout for a single possession probe (ADR-0003).
-pub const POSSESSION_CHECK_TIMEOUT: Duration = Duration::from_secs(POSSESSION_CHECK_TIMEOUT_SECS);
-
-/// Maximum possession-probe attempts per peer before giving up without a
-/// verdict (ADR-0003).
-///
-/// A peer unreachable at check time is re-attempted under this bounded grace
-/// and is never penalised as absent.
-pub const POSSESSION_CHECK_MAX_ATTEMPTS: u32 = 3;
-
-/// Backoff between possession-probe attempts when a peer yields no verdict
-/// (ADR-0003).
-pub const POSSESSION_CHECK_RETRY_BACKOFF: Duration =
-    Duration::from_secs(POSSESSION_CHECK_RETRY_BACKOFF_SECS);
+// The possession probe reuses the `AuditChallenge` wire and the bandwidth-
+// calibrated `audit_response_timeout(1)` deadline, so it needs no bespoke
+// per-probe timeout or retry constants.
 
 /// Width used when deciding whether this node may locally store or retain a
 /// chunk.
@@ -149,8 +136,9 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// their disk reads don't stall replication. This caps how many run at once
 /// across the engine, restoring backpressure: a peer flooding audit challenges
 /// cannot fan out unbounded `get_raw` reads or multi-MiB byte serves. When the
-/// cap is hit, the challenge is dropped — the auditor graces a non-response as a
-/// timeout, so honest auditors are unaffected and only a flooder is throttled.
+/// cap is hit, the challenge is dropped and the caller's audit-specific timeout
+/// policy applies. The cap must therefore stay high enough for honest audit
+/// traffic while still throttling flooders.
 /// Sized to cover a handful of concurrent honest auditors (the per-peer
 /// gossip-audit cooldown is 30 min, so genuine concurrent audits are few) while
 /// bounding the byte round's worst-case resident bytes
@@ -161,9 +149,10 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 ///
 /// The global [`MAX_CONCURRENT_AUDIT_RESPONSES`] ceiling alone is not
 /// flood-fair: one peer spamming challenges could occupy every slot and starve
-/// honest auditors (whose dropped challenges convert to timeouts → strikes on
-/// the honest peers). This per-peer cap guarantees no source holds more than
-/// its share, so a flood self-throttles. Audits are cooldown-gated (one
+/// honest auditors (whose dropped challenges convert to audit failures or
+/// timeout verdicts on the challenged peers). This per-peer cap guarantees no
+/// source holds more than its share, so a flood self-throttles. Audits are
+/// cooldown-gated (one
 /// gossip-triggered audit per peer per 30 min), so 2 in-flight per peer
 /// comfortably covers the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 2;
@@ -318,23 +307,6 @@ const _: () = assert!(
     "wire cap must fit at least one max-size chunk per byte-challenge response"
 );
 
-/// Rollout gate for timeout-driven eviction.
-///
-/// When `false`, a peer that crosses the consecutive-timeout strike threshold
-/// is logged but NOT reported to the trust engine (no eviction). This PR is a
-/// breaking wire change (old nodes cannot decode the new `StorageCommitment`
-/// gossip), so a not-yet-upgraded peer times out on every new audit and looks
-/// exactly like a non-storing peer; penalising timeouts during the mixed-version
-/// window would make upgraded nodes evict every old node — a death spiral.
-///
-/// Confirmed storage-integrity failures (`DigestMismatch`/`KeyAbsent`/
-/// `Rejected`/`MalformedResponse`) are NEVER gated by this — those only come
-/// from a peer that actually answered with bad data, never an old node. Flip to
-/// `true` in a small follow-up release once the fleet has upgraded. This is a
-/// real `const` (not commented-out code) so both gate sites compile and stay in
-/// sync, and the flip is one line.
-pub const TIMEOUT_EVICTION_ENABLED: bool = false;
-
 /// Verification request timeout (per-batch).
 const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// Verification request timeout (per-batch).
@@ -353,28 +325,6 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
-
-/// Consecutive audit *timeouts* a peer may accumulate before a timeout is
-/// reported as an `ApplicationFailure` trust event.
-///
-/// The audit response timeout is an economic deterrent calibrated for
-/// residential bandwidth, not a hard cryptographic bound: a single slow
-/// response is routine for an honest node under transient load (GC pause,
-/// disk flush, a burst of concurrent requests). Penalizing on the first
-/// timeout false-positives those nodes.
-///
-/// Requiring `N` *consecutive* timeouts before penalizing removes that
-/// false-positive while preserving the deterrent against a peer that does not
-/// actually store the data and must fetch it at audit time: such a peer is
-/// slow on *every* audit and accumulates a fresh strike each tick until it
-/// crosses the threshold, whereas an honest node answers normally between rare
-/// slow ticks and any success resets its strike counter to zero (see
-/// `handle_audit_result`). The discriminator is *persistence* of slowness
-/// versus *transience*. This deliberately does not widen the per-challenge
-/// window. Applies ONLY to `AuditFailureReason::Timeout`; confirmed
-/// storage-integrity failures (`DigestMismatch` / `KeyAbsent` / `Rejected` /
-/// `MalformedResponse`) remain instantly punishable.
-pub const AUDIT_TIMEOUT_STRIKE_THRESHOLD: u32 = 3;
 
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
@@ -642,12 +592,10 @@ impl ReplicationConfig {
     /// A relay attacker on a residential link (~5-12 MB/s) who must
     /// fetch the same `k × 4 MiB` over the network sees ~10-100× higher
     /// latency than disk for the data alone, plus per-chunk round-trips,
-    /// and misses the budget — recording a timeout strike (per
-    /// `handle_audit_timeout` → `handle_audit_failure`). After
-    /// [`AUDIT_TIMEOUT_STRIKE_THRESHOLD`] consecutive timeouts this would
-    /// fire an `application_failure` trust event — but note that report is
-    /// currently suppressed for the breaking rollout (grep
-    /// TIMEOUT-EVICTION-DISABLED); the strike accounting still runs.
+    /// and misses the budget. In the periodic responsible-chunk
+    /// `AuditChallenge`, prune-confirmation, and ADR-0003 possession-check paths
+    /// that timeout is an immediate audit failure. The heavier subtree audit
+    /// still graces timeouts separately.
     ///
     /// This is an economic deterrent for the §7 relay limit calibrated
     /// for residential bandwidth, NOT a hard bound: a relay on a
@@ -787,14 +735,6 @@ mod tests {
     #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
-    }
-
-    #[test]
-    fn audit_timeout_strike_threshold_is_three() {
-        // Smallest threshold that tolerates back-to-back transient slowness
-        // while still penalizing a persistently-slow non-storing peer within a
-        // few audit ticks.
-        assert_eq!(AUDIT_TIMEOUT_STRIKE_THRESHOLD, 3);
     }
 
     #[test]

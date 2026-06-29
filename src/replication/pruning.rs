@@ -1154,23 +1154,10 @@ async fn peer_proves_record(
     let encoded = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
     let Some(decoded) = send_prune_audit_challenge(&peer, &key, encoded, p2p_node, config).await
     else {
-        // No decoded response means a timeout or an undecodable reply — the
-        // same "no response" case the main audit path treats as a timeout. The
-        // penalty is gated behind `TIMEOUT_EVICTION_ENABLED` (off this
-        // release — a not-yet-upgraded or briefly-slow peer must not be evicted
-        // by a no-response during the breaking rollout). Mirrors the suppressed
-        // timeout penalty in handle_failed_audit; only a DECODED
-        // PruneAuditStatus::Failed below (a peer that answered with bad/absent
-        // bytes) is penalised regardless of the gate.
-        if crate::replication::config::TIMEOUT_EVICTION_ENABLED {
-            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
-        } else {
-            debug!(
-                "Prune audit for {peer} key {} got no decodable response \
-                 (eviction disabled this release — not penalising)",
-                hex::encode(key)
-            );
-        }
+        // No decoded response means a timeout or malformed reply. Prune
+        // confirmation reuses `AuditChallenge` semantics, so this is an immediate
+        // audit failure just like a decoded bad proof below.
+        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
         return None;
     };
 

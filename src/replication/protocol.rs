@@ -438,11 +438,9 @@ pub enum SubtreeAuditResponse {
 /// peer would not prove without touching credit it legitimately re-earned for a
 /// newer commitment. Lying therefore does not let a deleter keep "proven holder"
 /// status for that root until the credit TTL — the loophole a plain timeout
-/// would leave. It also accumulates a timeout strike, so a peer
-/// that self-graces on every audit still crosses the strike threshold once
-/// timeout-eviction is enabled. An honest peer that genuinely rotated simply
-/// re-earns credit on the next audit of its current commitment, so the grace
-/// strips no peer that is actually holding its responsible data. The grace
+/// would leave. A peer that self-graces on every audit remains uncredited for the
+/// pinned commitments it refuses to prove; an honest peer that genuinely rotated
+/// simply re-earns credit on the next audit of its current commitment. The grace
 /// removes only the false TRUST PENALTY for the genuinely-ambiguous
 /// rotated/transient case; it does not remove the possession requirement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -642,7 +640,7 @@ mod tests {
         // The auditor batches its round-2 sample to MAX_BYTE_CHALLENGE_KEYS per
         // challenge precisely so this worst case — every requested chunk at
         // MAX_CHUNK_SIZE — still encodes. If this fails, honest responders
-        // would hit encode errors and be penalized as timeouts.
+        // would hit encode errors and fail otherwise valid byte challenges.
         let items: Vec<SubtreeByteItem> = (0..crate::replication::config::MAX_BYTE_CHALLENGE_KEYS)
             .map(|i| SubtreeByteItem::Present {
                 key: [u8::try_from(i).unwrap_or(u8::MAX); 32],
