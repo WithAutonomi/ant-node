@@ -295,6 +295,18 @@ async fn possession_check_penalises_absent_peer_only() {
     let content = b"adr-0003 possession-check payload";
     let address = compute_address(content);
 
+    // The checker A must hold the chunk it verifies: the possession check
+    // recomputes the audit digest from its own canonical copy. In production the
+    // PUT handler stores K before fresh-replicating; here we store it on the
+    // checker explicitly.
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on a (checker)");
+
     // C holds the chunk; B never stores it.
     c.ant_protocol
         .as_ref()
@@ -391,6 +403,17 @@ async fn possession_scheduler_penalises_absent_close_peer_after_delay() {
     assert!(!close_group.is_empty(), "expected a non-empty close group");
 
     let trust_before: Vec<f64> = close_group.iter().map(|p| p2p_a.peer_trust(p)).collect();
+
+    // The checker must hold the chunk it later probes for: the possession check
+    // recomputes the audit digest from its own copy. `replicate_fresh` assumes
+    // the PUT handler already stored K locally, so store it on the checker here.
+    a.ant_protocol
+        .as_ref()
+        .expect("proto a")
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put on a (checker)");
 
     // Trigger fresh replication; the engine enqueues the possession check, which
     // fires ~200-500 ms later and penalises the absent close peers.
@@ -535,6 +558,18 @@ async fn full_close_group_node_rejects_replica_and_is_penalised_as_absent() {
         !full_storage.exists(&address).expect("exists on full node"),
         "full node must not store the rejected replica"
     );
+
+    // The checker must hold the chunk it probes for: the possession check
+    // recomputes the audit digest from its own copy. `replicate_fresh` assumes
+    // the PUT handler already stored K locally, so store it on the checker here.
+    checker
+        .ant_protocol
+        .as_ref()
+        .expect("checker protocol")
+        .storage()
+        .put(&address, &content)
+        .await
+        .expect("put on checker");
 
     let trust_before = checker_p2p.peer_trust(&full_peer);
     checker_engine
