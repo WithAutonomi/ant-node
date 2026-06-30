@@ -225,7 +225,7 @@ pub enum FailureEvidence {
         /// When this peer was first seen.
         first_seen: Instant,
     },
-    /// ADR-0003: a quote's claimed committed key count contradicts the signed
+    /// ADR-0004: a quote's claimed committed key count contradicts the signed
     /// commitment it pinned. The quote and the commitment are both signed by
     /// the same key, so this is a deterministic, first-occurrence
     /// contradiction — not bad luck — and lands in the same trust lane as a

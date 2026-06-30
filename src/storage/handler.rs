@@ -100,7 +100,7 @@ impl AntProtocol {
         // the invariant automatic for every AntProtocol construction path,
         // including tests and future startup variants.
         //
-        // ADR-0003: the QuoteGenerator no longer prices off `current_chunks()`
+        // ADR-0004: the QuoteGenerator no longer prices off `current_chunks()`
         // — its price is bound to the live storage commitment (see
         // `attach_commitment_source`, wired by the node once the replication
         // engine exists), or baseline when none — so it is NOT attached to the
@@ -161,7 +161,7 @@ impl AntProtocol {
         Arc::clone(&self.payment_verifier)
     }
 
-    /// ADR-0003: attach the replication engine's commitment state as the quote
+    /// ADR-0004: attach the replication engine's commitment state as the quote
     /// generator's commitment source, so quotes force their price from the live
     /// storage commitment and refresh its answerability on issuance.
     ///
@@ -176,7 +176,7 @@ impl AntProtocol {
         self.quote_generator.attach_commitment_source(source);
     }
 
-    /// ADR-0003: return the proof with any commitment sidecars stripped, so a
+    /// ADR-0004: return the proof with any commitment sidecars stripped, so a
     /// replicated/persisted receipt carries only the pin and count (stored
     /// proofs do not grow). Handles BOTH proof types — single-node and
     /// merkle-batch — since both now carry sidecars. An unknown-tagged or
@@ -412,7 +412,7 @@ impl AntProtocol {
                 //    PUTs have no proof to forward, and the chunk would have
                 //    already replicated on the original write that carried one.
                 if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
-                    // ADR-0003: strip any commitment sidecars before forwarding
+                    // ADR-0004: strip any commitment sidecars before forwarding
                     // to replication — the ADR specifies persisted/replicated
                     // receipts "keep only the pin and count, so stored proofs do
                     // not grow." The sidecars were already consumed by this
@@ -572,7 +572,7 @@ impl AntProtocol {
             .create_quote(request.address, data_size_usize, request.data_type)
         {
             Ok(quote) => {
-                // ADR-0003: ship the signed commitment the price was bound to
+                // ADR-0004: ship the signed commitment the price was bound to
                 // alongside the quote ("the commitment arrived with the quote"),
                 // so the client can verify the binding before paying and forward
                 // it as a sidecar in the PUT bundle. Only a commitment-bound
@@ -632,7 +632,7 @@ impl AntProtocol {
             request.merkle_payment_timestamp,
         ) {
             Ok(candidate_node) => {
-                // ADR-0003: ship the signed commitment this candidate priced
+                // ADR-0004: ship the signed commitment this candidate priced
                 // against, so the client can verify the binding before paying
                 // and forward it as a sidecar. Baseline candidates ship none.
                 let commitment = candidate_node
@@ -1410,7 +1410,7 @@ mod tests {
         );
     }
 
-    /// ADR-0003: `strip_commitment_sidecars` removes sidecars from a single-node
+    /// ADR-0004: `strip_commitment_sidecars` removes sidecars from a single-node
     /// proof before replication/persistence (stored proofs do not grow), and is
     /// a no-op on a sidecar-free proof.
     #[test]

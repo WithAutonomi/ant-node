@@ -161,7 +161,7 @@ impl NodeBuilder {
             .await
             {
                 Ok(engine) => {
-                    // ADR-0003: wire the engine's commitment state as the
+                    // ADR-0004: wire the engine's commitment state as the
                     // quote generator's commitment source so quotes force
                     // their price from the live storage commitment. Done
                     // here because the engine owns the commitment state and
@@ -170,13 +170,13 @@ impl NodeBuilder {
                         let concrete = Arc::clone(engine.commitment_state());
                         let source: Arc<dyn crate::payment::quote::CommitmentSource> = concrete;
                         protocol.attach_commitment_source(source);
-                        // ADR-0003: share the engine's gossip commitment
+                        // ADR-0004: share the engine's gossip commitment
                         // cache with the verifier so the cross-check can
                         // resolve quote pins against neighbours' commitments.
                         protocol
                             .payment_verifier_arc()
                             .attach_commitment_cache(Arc::clone(engine.last_commitment_by_peer()));
-                        // ADR-0003: give the verifier the monetized-pin sender so
+                        // ADR-0004: give the verifier the monetized-pin sender so
                         // commitments that back a payment get a deterministic
                         // first audit from the engine's drainer.
                         protocol

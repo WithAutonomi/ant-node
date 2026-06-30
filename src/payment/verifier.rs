@@ -175,7 +175,7 @@ pub enum PaymentStatus {
     PaymentVerified,
 }
 
-/// Outcome of the ADR-0003 quote-vs-commitment cross-check (see
+/// Outcome of the ADR-0004 quote-vs-commitment cross-check (see
 /// [`PaymentVerifier::cross_check_binding`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossCheck {
@@ -211,7 +211,7 @@ impl PaymentStatus {
 /// Default capacity for the merkle pool cache (number of pool hashes to cache).
 const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
 
-/// ADR-0003: max commitment sidecars processed per bundle. A legitimate bundle
+/// ADR-0004: max commitment sidecars processed per bundle. A legitimate bundle
 /// carries at most one commitment per quote/candidate — `CANDIDATES_PER_POOL`
 /// (16) is the larger of the single-node (`CLOSE_GROUP_SIZE` = 7) and merkle
 /// cases, so it covers both. Excess sidecars from a malicious client are
@@ -219,7 +219,7 @@ const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
 const MAX_SIDECARS_PER_BUNDLE: usize = evmlib::merkle_batch_payment::CANDIDATES_PER_POOL;
 
 /// Shared handle to the replication engine's gossip commitment cache
-/// (`last_commitment_by_peer`), used by the ADR-0003 cross-check to resolve a
+/// (`last_commitment_by_peer`), used by the ADR-0004 cross-check to resolve a
 /// quote's pin against a neighbour's recently gossiped commitment. A `tokio`
 /// `RwLock` to match the engine's; read with `.await` on the async path.
 type CommitmentCache = Arc<
@@ -228,7 +228,7 @@ type CommitmentCache = Arc<
     >,
 >;
 
-/// Per-`(peer, pin)` negative cache for unresolved ADR-0003 pin fetches: a pin a
+/// Per-`(peer, pin)` negative cache for unresolved ADR-0004 pin fetches: a pin a
 /// peer answered `NotRetained` (or that timed out) is remembered so repeated
 /// bundles don't re-fetch it. Behind an `Arc` so the detached fetch task owns a
 /// handle without borrowing the verifier.
@@ -291,7 +291,7 @@ pub struct PaymentVerifier {
     /// [`P2PNode`]; set via [`Self::set_peer_id_for_tests`] so unit tests can
     /// drive the freshness logic without wiring a real `P2PNode`.
     test_peer_id_override: RwLock<Option<[u8; 32]>>,
-    /// ADR-0003 gossip commitment cache, shared with the replication engine
+    /// ADR-0004 gossip commitment cache, shared with the replication engine
     /// (`last_commitment_by_peer`). The cross-check resolves a quote's
     /// `commitment_pin` against the neighbour's most recently gossiped
     /// commitment held here, *only if seen within the answerability TTL*;
@@ -300,14 +300,14 @@ pub struct PaymentVerifier {
     /// async verification path. `None` until [`Self::attach_commitment_cache`]
     /// (unit tests, or pre-replication startup).
     commitment_cache: RwLock<Option<CommitmentCache>>,
-    /// ADR-0003 negative cache for unresolved pin fetches: a `(peer, pin)` that
+    /// ADR-0004 negative cache for unresolved pin fetches: a `(peer, pin)` that
     /// resolved to `NotRetained` or timed out is remembered here so repeated
     /// bundles citing the same unknown pin don't re-fetch (bounding the
     /// amplification an attacker can drive). Keyed by `(PeerId, pin)`. Behind an
     /// `Arc` so the detached background fetch task (which runs off the payment
     /// hot path) can read and update it without borrowing the verifier.
     pin_fetch_negative_cache: PinFetchNegativeCache,
-    /// ADR-0003: sender to surface monetized pins (commitments that backed a
+    /// ADR-0004: sender to surface monetized pins (commitments that backed a
     /// payment) to the replication engine's deterministic first-audit drainer.
     /// `None` until [`Self::attach_monetized_pin_sender`] (unit tests, or
     /// pre-replication startup), in which case no first audit is scheduled.
@@ -446,7 +446,7 @@ impl PaymentVerifier {
         }
     }
 
-    /// Attach the ADR-0003 monetized-pin sender (the replication engine's
+    /// Attach the ADR-0004 monetized-pin sender (the replication engine's
     /// first-audit drainer channel) so the cross-check can route commitments
     /// that backed a payment into a deterministic first audit. Idempotent;
     /// absent (unit tests / pre-replication) no first audit is scheduled.
@@ -455,10 +455,10 @@ impl PaymentVerifier {
         tx: tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>,
     ) {
         *self.monetized_pin_tx.write() = Some(tx);
-        debug!("PaymentVerifier: ADR-0003 monetized-pin sender attached");
+        debug!("PaymentVerifier: ADR-0004 monetized-pin sender attached");
     }
 
-    /// Attach the ADR-0003 gossip commitment cache (the replication engine's
+    /// Attach the ADR-0004 gossip commitment cache (the replication engine's
     /// `last_commitment_by_peer`) so the cross-check can resolve a quote's
     /// `commitment_pin` against the neighbour's recently gossiped commitment.
     ///
@@ -468,7 +468,7 @@ impl PaymentVerifier {
     /// and falls back to fetch/skip — never a penalty.
     pub fn attach_commitment_cache(&self, cache: CommitmentCache) {
         *self.commitment_cache.write() = Some(cache);
-        debug!("PaymentVerifier: ADR-0003 commitment cache attached");
+        debug!("PaymentVerifier: ADR-0004 commitment cache attached");
     }
 
     /// Attach the node's [`P2PNode`] handle so paid-quote verification can
@@ -843,7 +843,7 @@ impl PaymentVerifier {
         }
 
         Self::validate_quote_structure(payment)?;
-        // ADR-0003: re-run the `price == calculate_price(committed_key_count)`
+        // ADR-0004: re-run the `price == calculate_price(committed_key_count)`
         // arithmetic/binding check on EVERY quote in the bundle (all single-node
         // quotes), per the ADR's "every storer re-runs the
         // price-equals-formula-of-count check on every quote in the bundle"
@@ -884,13 +884,13 @@ impl PaymentVerifier {
             )));
         }
 
-        // ADR-0003 observe-only telemetry: log off-curve quotes only AFTER the
+        // ADR-0004 observe-only telemetry: log off-curve quotes only AFTER the
         // paid (median) quote's ML-DSA-65 signature has verified above, so
         // unauthenticated senders cannot poison rollout logs. In enforce mode
         // `validate_quote_arithmetic` already rejected; this is a no-op there.
         Self::log_off_curve_single_node(payment);
 
-        // ADR-0003 cross-check + first-audit enqueue (ClientPut only) runs ONLY
+        // ADR-0004 cross-check + first-audit enqueue (ClientPut only) runs ONLY
         // after on-chain payment verification has SUCCEEDED above, so an unpaid
         // (but signed) bundle can never enqueue audits or drive pin fetches —
         // closing the free-amplification path. Fresh client-put bundles only.
@@ -1190,7 +1190,7 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// ADR-0003: enforce that every quoted price lies exactly on the public
+    /// ADR-0004: enforce that every quoted price lies exactly on the public
     /// pricing curve.
     ///
     /// **Scope** (this slice): canonicality only. The gate proves the price is
@@ -1218,17 +1218,17 @@ impl PaymentVerifier {
     /// ([`Self::validate_quote_arithmetic`]) and all 16 merkle candidates
     /// ([`Self::validate_merkle_candidate_arithmetic`]) — because the rule
     /// "every storer re-runs the price-equals-formula-of-count check on every
-    /// quote in the bundle" (ADR-0003) needs no peer-specific state and depends
+    /// quote in the bundle" (ADR-0004) needs no peer-specific state and depends
     /// only on the bundle itself, so every honest storer reaches the same
     /// verdict with no split-brain risk.
     ///
-    /// **Reject-only**, per ADR-0003: no trust evidence is emitted, no audit
+    /// **Reject-only**, per ADR-0004: no trust evidence is emitted, no audit
     /// is scheduled. The rejection is the consequence. The gate is
     /// rollout-gated by
     /// [`crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED`]; when
     /// `false`, off-curve quotes are accepted and only telemetered
     /// ([`Self::log_off_curve_single_node`] /
-    /// [`Self::log_off_curve_merkle`]), matching ADR-0003's observe-only
+    /// [`Self::log_off_curve_merkle`]), matching ADR-0004's observe-only
     /// rollout. Telemetry is invoked **after** ML-DSA-65 signature
     /// verification so unauthenticated senders cannot poison the rollout
     /// logs.
@@ -1239,14 +1239,14 @@ impl PaymentVerifier {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             if let Some(detail) = Self::quote_arithmetic_violation(quote) {
                 return Err(Error::Payment(format!(
-                    "ADR-0003 off-curve quote rejected for peer {encoded_peer_id:?}: {detail}"
+                    "ADR-0004 off-curve quote rejected for peer {encoded_peer_id:?}: {detail}"
                 )));
             }
         }
         Ok(())
     }
 
-    /// The ADR-0003 forced-price rule for a single quote, returning a human
+    /// The ADR-0004 forced-price rule for a single quote, returning a human
     /// diagnostic iff the quote violates it. Shared by single-node quotes and
     /// merkle candidates via [`Self::binding_violation`].
     ///
@@ -1269,7 +1269,7 @@ impl PaymentVerifier {
         )
     }
 
-    /// The shared ADR-0003 binding rule over a `(committed_key_count,
+    /// The shared ADR-0004 binding rule over a `(committed_key_count,
     /// commitment_pin, price)` triple, used for both quote types.
     ///
     /// Enforces, in order:
@@ -1319,7 +1319,7 @@ impl PaymentVerifier {
         }
     }
 
-    /// Pure ADR-0003 cross-check: compare a quote's claimed `(key_count, pin)`
+    /// Pure ADR-0004 cross-check: compare a quote's claimed `(key_count, pin)`
     /// against a resolved signed commitment.
     ///
     /// This is the decision core of "peers cross-check the original": given a
@@ -1365,7 +1365,7 @@ impl PaymentVerifier {
         }
     }
 
-    /// ADR-0003 "peers cross-check the original": for each non-baseline quote in
+    /// ADR-0004 "peers cross-check the original": for each non-baseline quote in
     /// a client-put bundle, resolve its `commitment_pin` against the gossip
     /// commitment cache and report a count/pin contradiction.
     ///
@@ -1387,7 +1387,7 @@ impl PaymentVerifier {
     /// later audit remain the load-bearing checks.
     /// Resolve a cached peer commitment record to its commitment *only if* it
     /// was seen within the answerability TTL; a staler entry is treated as
-    /// unknown (ADR-0003: "a cached commitment older than the answerability TTL
+    /// unknown (ADR-0004: "a cached commitment older than the answerability TTL
     /// is treated as unknown"). Pure over `(record, now, ttl)` so the TTL
     /// boundary is unit-testable without the async cache/network path.
     fn fresh_cached_commitment(
@@ -1428,7 +1428,7 @@ impl PaymentVerifier {
             .and_then(|rec| Self::fresh_cached_commitment(rec, pin, now, ttl))
     }
 
-    /// Parse and validate ADR-0003 commitment sidecars into a `(peer, pin) ->
+    /// Parse and validate ADR-0004 commitment sidecars into a `(peer, pin) ->
     /// commitment` map. Each blob is deserialized and held to the SAME gates as
     /// a gossip-ingested or fetched commitment (peer id derived from its own
     /// `sender_peer_id`, `BLAKE3(pubkey) == sender_peer_id`, valid signature),
@@ -1477,7 +1477,7 @@ impl PaymentVerifier {
         let monetized_pin_tx = self.monetized_pin_tx.read().as_ref().cloned();
         let cache = self.commitment_cache.read().as_ref().map(Arc::clone);
 
-        // ADR-0003 "the commitment arrived with the quote": parse and FULLY
+        // ADR-0004 "the commitment arrived with the quote": parse and FULLY
         // validate the sidecars (peer/pubkey/signature/hash gates, keyed by
         // `(peer, pin)`), so the cross-check resolves synchronously without a
         // gossip-cache hit or a post-payment fetch. An invalid sidecar is simply
@@ -1494,7 +1494,7 @@ impl PaymentVerifier {
             };
             let peer_id = PeerId::from_bytes(*encoded_peer_id.as_bytes());
 
-            // ADR-0003: this commitment backed a payment — route it for a
+            // ADR-0004: this commitment backed a payment — route it for a
             // deterministic first audit (the drainer dedups by pin and respects
             // the cooldown). Best-effort: a closed channel just means no first
             // audit is scheduled, never an error on the payment path.
@@ -1561,7 +1561,7 @@ impl PaymentVerifier {
         let mut fetched = 0usize;
         for (peer_id, pin, quoted_key_count, artifact) in unresolved {
             if fetched >= crate::replication::config::MAX_PIN_FETCHES_PER_BUNDLE {
-                debug!("ADR-0003 pin-fetch cap reached for this bundle; leaving rest graced");
+                debug!("ADR-0004 pin-fetch cap reached for this bundle; leaving rest graced");
                 break;
             }
             // Skip pins already known-unresolvable for this peer.
@@ -1590,7 +1590,7 @@ impl PaymentVerifier {
         }
     }
 
-    /// Apply the ADR-0003 cross-check verdict for one resolved `(peer, pin,
+    /// Apply the ADR-0004 cross-check verdict for one resolved `(peer, pin,
     /// quoted_count)` against `commitment`, emitting a trust failure on a
     /// genuine mismatch (when enforcing) or logging it (observe-only). Shared by
     /// the inline cache pass and the background fetch path so both reach the
@@ -1618,7 +1618,7 @@ impl PaymentVerifier {
         // inflater on the disk bytes.
         if quote_artifact.is_empty() {
             warn!(
-                "ADR-0003 quote/commitment mismatch for {peer_id}: dropping evidence, \
+                "ADR-0004 quote/commitment mismatch for {peer_id}: dropping evidence, \
                  quote artifact failed to serialize (graced; the audit still runs)"
             );
             return;
@@ -1660,7 +1660,7 @@ impl PaymentVerifier {
         let enforce = crate::replication::config::QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED;
         if enforce {
             warn!(
-                "ADR-0003 quote/commitment mismatch (enforcing) for {peer}: quote claims \
+                "ADR-0004 quote/commitment mismatch (enforcing) for {peer}: quote claims \
                  {quoted_key_count} keys but pinned commitment attests {committed_key_count}"
             );
             if let Some(p2p) = p2p {
@@ -1674,7 +1674,7 @@ impl PaymentVerifier {
             }
         } else {
             warn!(
-                "ADR-0003 quote/commitment mismatch observed (not enforcing) for {peer}: quote \
+                "ADR-0004 quote/commitment mismatch observed (not enforcing) for {peer}: quote \
                  claims {quoted_key_count} keys but pinned commitment attests {committed_key_count}"
             );
         }
@@ -1744,14 +1744,14 @@ impl PaymentVerifier {
         for (encoded_peer_id, quote) in &payment.peer_quotes {
             if let Some(detail) = Self::quote_arithmetic_violation(quote) {
                 warn!(
-                    "ADR-0003 off-curve single-node quote observed (not enforcing): \
+                    "ADR-0004 off-curve single-node quote observed (not enforcing): \
                      peer {encoded_peer_id:?} {detail}"
                 );
             }
         }
     }
 
-    /// ADR-0003 sister gate for the merkle batch path: every candidate's
+    /// ADR-0004 sister gate for the merkle batch path: every candidate's
     /// `price` field must lie on the pricing curve, by exact recomputation.
     /// See [`Self::validate_quote_arithmetic`] for the rationale; semantics
     /// (reject-only, rollout-gated, no trust evidence) are identical.
@@ -1768,7 +1768,7 @@ impl PaymentVerifier {
                 &candidate.price,
             ) {
                 return Err(Error::Payment(format!(
-                    "ADR-0003 merkle candidate rejected (reward {}): {detail}",
+                    "ADR-0004 merkle candidate rejected (reward {}): {detail}",
                     candidate.reward_address
                 )));
             }
@@ -1790,7 +1790,7 @@ impl PaymentVerifier {
                 &candidate.price,
             ) {
                 warn!(
-                    "ADR-0003 merkle candidate violation observed (not enforcing): \
+                    "ADR-0004 merkle candidate violation observed (not enforcing): \
                      reward {} {detail}",
                     candidate.reward_address
                 );
@@ -1891,7 +1891,7 @@ impl PaymentVerifier {
     /// rejects duplicate peer IDs and runs before this gate on every path —
     /// so the loop below matches at most one own quote.
     ///
-    /// RETIRED (ADR-0003 hard cutover): no longer called on the verification
+    /// RETIRED (ADR-0004 hard cutover): no longer called on the verification
     /// path. Forced pricing binds a quote's price exactly to its committed count
     /// via `validate_quote_arithmetic`, so a valid quote can never be "stale";
     /// and the committed *responsible* count legitimately differs from the live
@@ -2515,7 +2515,7 @@ impl PaymentVerifier {
             }
         }
 
-        // ADR-0003: every storer re-runs the price-equals-formula-of-count
+        // ADR-0004: every storer re-runs the price-equals-formula-of-count
         // check on every merkle candidate, in every context, before median
         // reconstruction. Runs AFTER signature verification so observe-only
         // telemetry cannot be spoofed by unauthenticated senders. Reject-only
@@ -2702,7 +2702,7 @@ impl PaymentVerifier {
             );
         }
 
-        // ADR-0003: route the merkle-batch candidates through the SAME
+        // ADR-0004: route the merkle-batch candidates through the SAME
         // cross-check + first-audit funnel as single-node quotes, AFTER on-chain
         // verification has succeeded (so an unpaid pool cannot drive audits or
         // fetches). ClientPut only — a replication receipt's pins have aged out.
@@ -2717,7 +2717,7 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// ADR-0003 cross-check for the merkle-batch path: every candidate carries
+    /// ADR-0004 cross-check for the merkle-batch path: every candidate carries
     /// the same signed `(committed_key_count, commitment_pin)` binding as a
     /// single-node quote, so each non-baseline candidate is resolved against the
     /// gossip cache (or fetched) and routed into the deterministic first audit,
@@ -2734,7 +2734,7 @@ impl PaymentVerifier {
         let p2p = self.p2p_node.read().as_ref().map(Arc::clone);
         let monetized_pin_tx = self.monetized_pin_tx.read().as_ref().cloned();
         let cache = self.commitment_cache.read().as_ref().map(Arc::clone);
-        // ADR-0003 "the commitment arrived with the quote" for the merkle path:
+        // ADR-0004 "the commitment arrived with the quote" for the merkle path:
         // validate sidecars exactly as the single-node path does.
         let sidecar_map = Self::index_valid_sidecars(commitment_sidecars);
 
@@ -5238,7 +5238,7 @@ mod tests {
         }
     }
 
-    // ---------- ADR-0003: quote arithmetic re-check ----------
+    // ---------- ADR-0004: quote arithmetic re-check ----------
 
     /// Curve canonicality: any price produced by `calculate_price(n)` is
     /// on-curve by construction. We exercise a spread of `n` covering the
@@ -5287,7 +5287,7 @@ mod tests {
         );
     }
 
-    /// ADR-0003 storer-side gate: a bundle in which every quote is on-curve
+    /// ADR-0004 storer-side gate: a bundle in which every quote is on-curve
     /// passes the gate **and** the per-quote canonicality predicate. Runs in
     /// every context (no `ClientPut` split): the rule depends only on the
     /// bundle, not on per-peer state. The outer `validate_quote_arithmetic`
@@ -5489,7 +5489,7 @@ mod tests {
         );
     }
 
-    // === ADR-0003 binding-shape + cross-check unit tests ===
+    // === ADR-0004 binding-shape + cross-check unit tests ===
 
     use crate::payment::pricing::calculate_price as cp;
 
@@ -5606,7 +5606,7 @@ mod tests {
         );
 
         // Stale: received older than the TTL -> treated as unknown (None), the
-        // ADR-0003 false-positive guard against an aged cache entry.
+        // ADR-0004 false-positive guard against an aged cache entry.
         let stale_at = now
             .checked_sub(ttl + std::time::Duration::from_secs(1))
             .expect("instant in range");

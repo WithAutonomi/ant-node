@@ -1,4 +1,4 @@
-# ADR-0003: Commitment-bound quote pricing
+# ADR-0004: Commitment-bound quote pricing
 
 - **Status:** Proposed
 - **Date:** 2026-06-12

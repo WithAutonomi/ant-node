@@ -1,8 +1,8 @@
-# ADR-0003 implementation slicing
+# ADR-0004 implementation slicing
 
-This file tracks the slicing strategy used to ship ADR-0003 incrementally inside
+This file tracks the slicing strategy used to ship ADR-0004 incrementally inside
 ant-node alone, while the multi-repo evmlib breaking change ripens. The ADR
-itself (`ADR-0003-commitment-bound-quote-pricing.md`) describes the end state;
+itself (`ADR-0004-commitment-bound-quote-pricing.md`) describes the end state;
 this document describes the order in which the end state lands.
 
 The constraint that drives the slicing: `PaymentQuote`, `ProofOfPayment`,
@@ -10,7 +10,7 @@ The constraint that drives the slicing: `PaymentQuote`, `ProofOfPayment`,
 flow into the on-chain `payForQuotes` interface. Adding signed fields to
 `PaymentQuote` is therefore a coordinated four-repo release
 (`evmlib` → `ant-protocol` → `ant-client` → `ant-node`). Until that lands,
-every part of ADR-0003 that does NOT require new signed quote fields can —
+every part of ADR-0004 that does NOT require new signed quote fields can —
 and should — ship behind the rollout const the ADR's "Rollout" section
 already specifies.
 

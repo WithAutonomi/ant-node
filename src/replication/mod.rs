@@ -308,11 +308,11 @@ pub struct ReplicationEngine {
     possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
     /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
-    /// ADR-0003: sender the payment verifier clones to surface monetized pins
+    /// ADR-0004: sender the payment verifier clones to surface monetized pins
     /// for a deterministic first audit. The matching receiver is drained by
     /// `start_first_audit_drainer`.
     monetized_pin_tx: mpsc::UnboundedSender<MonetizedPinEvent>,
-    /// ADR-0003: receiver half of the monetized-pin channel, taken by
+    /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
     monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
     /// Shutdown token.
@@ -351,7 +351,7 @@ impl ReplicationEngine {
         let config = Arc::new(config);
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
-        // ADR-0003: monetized-pin channel (verifier -> first-audit drainer).
+        // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
         let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
 
         Ok(Self {
@@ -389,7 +389,7 @@ impl ReplicationEngine {
         })
     }
 
-    /// ADR-0003: a sender the payment verifier uses to surface monetized pins
+    /// ADR-0004: a sender the payment verifier uses to surface monetized pins
     /// (commitments that backed a payment) for a deterministic first audit.
     /// Cloneable; the engine drains the matching receiver.
     #[must_use]
@@ -540,7 +540,7 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
-        // ADR-0003: deterministic first audit of commitments that backed a
+        // ADR-0004: deterministic first audit of commitments that backed a
         // payment (surfaced by the verifier cross-check).
         self.start_first_audit_drainer();
 
@@ -741,7 +741,7 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
-    /// ADR-0003: drain monetized pins surfaced by the verifier cross-check and
+    /// ADR-0004: drain monetized pins surfaced by the verifier cross-check and
     /// run a **deterministic first audit** of each — the same `run_subtree_audit`
     /// as the gossip path, under the same per-peer cooldown and concurrency
     /// caps, but with the probability lottery BYPASSED (the lottery governs
@@ -2114,7 +2114,7 @@ async fn handle_replication_message(
             Ok(())
         }
         ReplicationMessageBody::GetCommitmentByPin(ref request) => {
-            // ADR-0003: answer a commitment-by-pin fetch from the retained set
+            // ADR-0004: answer a commitment-by-pin fetch from the retained set
             // only. `lookup_by_hash` is an allocation-light read over the
             // bounded slot set; it returns the live current commitment or any
             // still-answerable recently-gossiped/quoted one. A miss is reported
@@ -4288,7 +4288,7 @@ struct AuditTarget {
     key_count: u32,
 }
 
-/// ADR-0003: a commitment that backed a payment, surfaced by the payment
+/// ADR-0004: a commitment that backed a payment, surfaced by the payment
 /// verifier's cross-check so it can receive a **deterministic first audit**.
 ///
 /// Sent from the verifier to the replication engine's first-audit drainer. The

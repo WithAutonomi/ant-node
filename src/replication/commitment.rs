@@ -27,7 +27,7 @@ use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaSecretKey};
 
 use crate::ant_protocol::XorName;
 
-// ADR-0003: the commitment wire type, its pin (`commitment_hash`), its
+// ADR-0004: the commitment wire type, its pin (`commitment_hash`), its
 // signature verification, and the key-count cap are the SINGLE SOURCE OF TRUTH
 // in `ant-protocol` so the paying client and the node verify identically.
 // Re-exported here so all existing `crate::replication::commitment::…` callers
@@ -404,7 +404,7 @@ pub fn sign_commitment(
 // `verify_commitment_signature` (embedded-key) is re-exported from
 // `ant-protocol` above (single source of truth), so the paying client and the
 // node accept exactly the same commitments. The externally-keyed variant was
-// removed in the ADR-0003 move — it had no remaining callers once the embedded-
+// removed in the ADR-0004 move — it had no remaining callers once the embedded-
 // key verify moved to `ant-protocol`.
 
 // ---------------------------------------------------------------------------

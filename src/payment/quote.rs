@@ -27,7 +27,7 @@ pub type XorName = [u8; 32];
 /// Signing function type that takes bytes and returns a signature.
 pub type SignFn = Box<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
 
-/// The commitment binding a quote prices against (ADR-0003).
+/// The commitment binding a quote prices against (ADR-0004).
 ///
 /// `key_count` is the leaf count of the pinned commitment and the sole input to
 /// the price formula; `pin` is that commitment's hash. A quote carries both,
@@ -41,7 +41,7 @@ pub struct QuoteBinding {
     pub pin: [u8; 32],
 }
 
-/// Source of the live storage commitment a quote prices against (ADR-0003).
+/// Source of the live storage commitment a quote prices against (ADR-0004).
 ///
 /// Implemented by the responder-side commitment state. Decouples
 /// [`QuoteGenerator`] from replication internals: the generator only needs the
@@ -54,7 +54,7 @@ pub trait CommitmentSource: Send + Sync {
     /// atomically. `None` if there is no live current commitment.
     fn current_binding_for_quote(&self) -> Option<QuoteBinding>;
 
-    /// ADR-0003: the serialized signed commitment for `pin`, if it is still
+    /// ADR-0004: the serialized signed commitment for `pin`, if it is still
     /// retained, so the quote response can ship it as a sidecar ("the commitment
     /// arrived with the quote"). Returns the same canonical bytes a peer would
     /// receive via `GetCommitmentByPin`, so the client's pin match is identical
@@ -77,11 +77,11 @@ pub struct QuoteGenerator {
     /// `record_store` / `resync_records` accounting surface the storage handler
     /// drives.
     ///
-    /// ADR-0003: this is NO LONGER a pricing input. A quote's price is bound to
+    /// ADR-0004: this is NO LONGER a pricing input. A quote's price is bound to
     /// the live storage commitment via [`Self::commitment_source`] (or baseline
     /// when none); the on-disk/side record count no longer sets the price.
     metrics_tracker: QuotingMetricsTracker,
-    /// ADR-0003 commitment source: the live storage commitment the price is
+    /// ADR-0004 commitment source: the live storage commitment the price is
     /// bound to. When attached, a quote prices against the committed
     /// (responsible) key count and pins that commitment, refreshing its
     /// answerability on issuance. `None` until [`Self::attach_commitment_source`]
@@ -115,7 +115,7 @@ impl QuoteGenerator {
         }
     }
 
-    /// Attach the ADR-0003 commitment source so quotes bind their price to the
+    /// Attach the ADR-0004 commitment source so quotes bind their price to the
     /// node's live storage commitment.
     ///
     /// Idempotent: calling twice replaces the handle. Uses interior mutability
@@ -126,10 +126,10 @@ impl QuoteGenerator {
     /// (no-pin) quotes.
     pub fn attach_commitment_source(&self, source: Arc<dyn CommitmentSource>) {
         *self.commitment_source.write() = Some(source);
-        debug!("QuoteGenerator: ADR-0003 commitment source attached");
+        debug!("QuoteGenerator: ADR-0004 commitment source attached");
     }
 
-    /// ADR-0003: the serialized signed commitment for `pin`, so the quote
+    /// ADR-0004: the serialized signed commitment for `pin`, so the quote
     /// response can ship it as a sidecar. `None` when no commitment source is
     /// attached (baseline / pre-rotation / tests) or the pin is no longer
     /// retained — in which case the response carries no commitment and the
@@ -141,19 +141,19 @@ impl QuoteGenerator {
         source.and_then(|src| src.commitment_blob_for_pin(pin))
     }
 
-    /// Resolve the ADR-0003 pricing inputs a quote should carry, refreshing the
+    /// Resolve the ADR-0004 pricing inputs a quote should carry, refreshing the
     /// pinned commitment's answerability as a side effect.
     ///
     /// Returns `(committed_key_count, commitment_pin, price_count)`:
     /// - with a live commitment, the price is driven by the committed key count
-    ///   and the quote pins that commitment (the ADR-0003 forced price);
+    ///   and the quote pins that commitment (the ADR-0004 forced price);
     /// - with no commitment source or no live current commitment, the node
     ///   emits a true **baseline** quote: `(0, None)` priced at
     ///   `calculate_price(0)`.
     ///
     /// Critically, the no-commitment branch prices at `0`, NOT at the on-disk
     /// record count. A `(committed_key_count = 0, commitment_pin = None)` quote
-    /// is the canonical baseline shape, and ADR-0003's forced-price rule binds
+    /// is the canonical baseline shape, and ADR-0004's forced-price rule binds
     /// that shape to `calculate_price(0)`. Pricing the no-pin quote off the disk
     /// count would mint a `(0, None, price > baseline)` quote — a shape a
     /// modified node could forge to charge above baseline while carrying no
@@ -248,7 +248,7 @@ impl QuoteGenerator {
 
         let timestamp = SystemTime::now();
 
-        // ADR-0003 forced price: when a live commitment exists, the price is a
+        // ADR-0004 forced price: when a live commitment exists, the price is a
         // deterministic function of its committed (responsible) key count, and
         // the quote pins that commitment (refreshing its answerability). Absent
         // a commitment source — observe-only, pre-first-rotation, or unit tests
@@ -352,13 +352,13 @@ impl QuoteGenerator {
             .as_ref()
             .ok_or_else(|| Error::Payment("Quote signing not configured".to_string()))?;
 
-        // ADR-0003 forced price for the merkle-batch candidate, mirroring the
+        // ADR-0004 forced price for the merkle-batch candidate, mirroring the
         // single-node path: bind to the live commitment when present, else
         // baseline with no pin.
         let (committed_key_count, commitment_pin, price_count) = self.resolve_quote_pricing();
         let price = calculate_price(price_count);
 
-        // ADR-0003: sign the commitment binding into the merkle candidate
+        // ADR-0004: sign the commitment binding into the merkle candidate
         // payload too (5-field `bytes_to_sign`), so a count/pin mismatch is
         // genuine same-key-signed evidence. ant-protocol verifies this same
         // 5-field message.
@@ -492,10 +492,10 @@ mod tests {
         }
     }
 
-    /// ADR-0003 forced price (single-node): with a commitment source attached,
+    /// ADR-0004 forced price (single-node): with a commitment source attached,
     /// the quote price is exactly `calculate_price(committed_key_count)`, the
     /// quote carries that count, and it pins the commitment hash. This replaces
-    /// the pre-ADR-0003 "price tracks on-disk count" behaviour — pricing is now
+    /// the pre-ADR-0004 "price tracks on-disk count" behaviour — pricing is now
     /// bound to the signed commitment, not the raw store count.
     #[test]
     fn test_forced_price_binds_to_commitment() {
@@ -530,7 +530,7 @@ mod tests {
         assert_eq!(quote.commitment_pin, Some(pin), "quote pins the commitment");
     }
 
-    /// ADR-0003 baseline: with NO commitment source (fresh node, pre first
+    /// ADR-0004 baseline: with NO commitment source (fresh node, pre first
     /// rotation), the quote is the canonical baseline shape — `(0, None)` priced
     /// at `calculate_price(0)` — NOT priced off the on-disk count. A node can
     /// only charge baseline until it has a commitment it can be audited against.
@@ -822,7 +822,7 @@ mod tests {
         // Verify the timestamp was set correctly
         assert_eq!(candidate.merkle_payment_timestamp, timestamp);
 
-        // ADR-0003: with no commitment source attached, the merkle candidate is
+        // ADR-0004: with no commitment source attached, the merkle candidate is
         // a baseline quote — price `calculate_price(0)`, count 0, no pin —
         // regardless of the side counter. Pricing is bound to the commitment,
         // not the metrics tracker.

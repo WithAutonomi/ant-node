@@ -427,7 +427,7 @@ impl ResponderCommitmentState {
     /// commitment, or `None` if there is no live current (never rotated, or
     /// retired) — in which case the caller must quote the baseline with no pin.
     ///
-    /// ADR-0003 ("quoting is advertising"): issuing a quote that prices against
+    /// ADR-0004 ("quoting is advertising"): issuing a quote that prices against
     /// the current commitment must extend that commitment's answerability
     /// exactly as gossiping it does, so a recently-quoted pin stays resolvable
     /// for its TTL and a peer auditing it cannot false-fail an honest node.
@@ -540,7 +540,7 @@ impl ResponderCommitmentState {
     }
 }
 
-/// ADR-0003: the responder commitment state is the quote generator's commitment
+/// ADR-0004: the responder commitment state is the quote generator's commitment
 /// source. `current_binding_for_quote` snapshots the live current commitment's
 /// `(key_count, pin)` and refreshes its answerability in one atomic step (via
 /// [`ResponderCommitmentState::current_for_quote`]), so a quote that prices
@@ -1193,7 +1193,7 @@ mod tests {
         );
     }
 
-    // === ADR-0003: current_for_quote (quote-issuance answerability) ===
+    // === ADR-0004: current_for_quote (quote-issuance answerability) ===
 
     use crate::payment::quote::CommitmentSource;
 
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn current_for_quote_refreshes_answerability() {
         // Issuing a quote must refresh the current commitment's answerability,
-        // exactly like gossiping it (ADR-0003 "quoting is advertising").
+        // exactly like gossiping it (ADR-0004 "quoting is advertising").
         let (pk, sk) = keypair();
         let pk_bytes = pk.to_bytes();
         let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();

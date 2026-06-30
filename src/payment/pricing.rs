@@ -1,6 +1,6 @@
 //! Quadratic pricing with a baseline floor.
 //!
-//! ADR-0003: the pricing formula is now the **single source of truth** in
+//! ADR-0004: the pricing formula is now the **single source of truth** in
 //! `ant-protocol` (`ant_protocol::payment::pricing`), so the node (when pricing
 //! a quote) and the client (when verifying the forced price before paying)
 //! compute byte-for-byte identical prices and can never drift. This module

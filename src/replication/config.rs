@@ -307,16 +307,16 @@ const _: () = assert!(
     "wire cap must fit at least one max-size chunk per byte-challenge response"
 );
 
-/// Rollout gate for ADR-0003 quote-arithmetic enforcement.
+/// Rollout gate for ADR-0004 quote-arithmetic enforcement.
 ///
 /// When `true`, the payment verifier rejects any quote whose signed price does
 /// not lie exactly on the public pricing curve, i.e. there is no integer
 /// `key_count` for which `calculate_price(key_count) == quote.price`. The check
 /// is exact recomputation against the curve, never price-inversion (which
-/// rounds), per ADR-0003's "never by inverting the price" rule.
+/// rounds), per ADR-0004's "never by inverting the price" rule.
 ///
 /// When `false`, the check still runs and logs every would-be rejection, but
-/// does not reject — matching the ADR-0003 rollout: ship observe-only first,
+/// does not reject — matching the ADR-0004 rollout: ship observe-only first,
 /// enforce only once the fleet has upgraded. Off-curve quotes are honest
 /// errors, not signs of an old node (every honest implementation derives its
 /// price from the same public formula), so flipping this to `true` does not
@@ -324,14 +324,14 @@ const _: () = assert!(
 /// prices off the curve.
 ///
 /// This is a reject-only gate: an off-curve quote produces no trust evidence
-/// and no audit, per ADR-0003 ("an off-curve quote is reject-only"). It does
+/// and no audit, per ADR-0004 ("an off-curve quote is reject-only"). It does
 /// NOT gate the quote/commitment mismatch trust report — see
 /// [`QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED`] for that, kept separate because
-/// the two have different ADR-0003 contracts (this one rejects with no trust
+/// the two have different ADR-0004 contracts (this one rejects with no trust
 /// action; that one reports a deterministic contradiction to the trust engine).
 pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 
-/// Rollout gate for ADR-0003 quote/commitment **mismatch** trust reporting.
+/// Rollout gate for ADR-0004 quote/commitment **mismatch** trust reporting.
 ///
 /// When a client-put quote's signed `committed_key_count` contradicts the
 /// `key_count` of the commitment it pinned (resolved from the gossip cache, a
@@ -347,7 +347,7 @@ pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 /// off-curve price, so it deserves its own dial.
 pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 
-/// ADR-0003: max unresolved quote pins to fetch per payment bundle.
+/// ADR-0004: max unresolved quote pins to fetch per payment bundle.
 ///
 /// A bundle has at most `CLOSE_GROUP_SIZE` quotes; capping fetches per bundle
 /// bounds the amplification a single malicious upload (many distinct unknown
@@ -355,13 +355,13 @@ pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 /// unresolved, i.e. graced — the audit funnel still catches a serving cheater).
 pub const MAX_PIN_FETCHES_PER_BUNDLE: usize = 3;
 
-/// ADR-0003: capacity of the per-peer negative cache for unresolved pin fetches.
+/// ADR-0004: capacity of the per-peer negative cache for unresolved pin fetches.
 ///
 /// A pin that a peer answered `NotRetained` (or that timed out) is remembered so
 /// repeated bundles citing the same unknown pin don't re-fetch.
 pub const PIN_FETCH_NEGATIVE_CACHE_CAPACITY: usize = 4096;
 
-/// ADR-0003: timeout for a `GetCommitmentByPin` fetch.
+/// ADR-0004: timeout for a `GetCommitmentByPin` fetch.
 ///
 /// Sized for a single small round-trip plus the responder's bounded in-memory
 /// lookup; a fetch is off the payment hot path, so this only bounds the
@@ -395,7 +395,7 @@ pub const AUDIT_ON_GOSSIP_PROBABILITY: f64 = 0.2;
 /// seconds. Bounds how often any one peer is audited regardless of gossip rate.
 pub const AUDIT_ON_GOSSIP_COOLDOWN_SECS: u64 = 30 * 60;
 
-/// ADR-0003: first-audit drainer retry cadence for cooldown-pending pins.
+/// ADR-0004: first-audit drainer retry cadence for cooldown-pending pins.
 ///
 /// How often the drainer retries pins it kept pending because their peer was on
 /// cooldown. Finer than the cooldown itself so a monetized commitment is
@@ -403,7 +403,7 @@ pub const AUDIT_ON_GOSSIP_COOLDOWN_SECS: u64 = 30 * 60;
 /// re-checks a small per-peer map, so the tick is cheap.
 pub const FIRST_AUDIT_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// ADR-0003: max monetized-pin events the first-audit drainer drains from its
+/// ADR-0004: max monetized-pin events the first-audit drainer drains from its
 /// channel per wake before it must run the audit-launch phase.
 ///
 /// Bounds the synchronous `try_recv` batch so a sustained producer flood cannot
