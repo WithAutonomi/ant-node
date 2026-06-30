@@ -285,12 +285,9 @@ pub struct PaymentVerifier {
     /// exercise the full verifier path without starting an EVM chain.
     #[cfg(any(test, feature = "test-utils"))]
     test_completed_payments_override: RwLock<HashMap<QuoteHash, Amount>>,
-    /// Test-only override for this node's own peer ID, used by
-    /// `validate_quote_freshness` to pick out the node's own quote from the
-    /// payment bundle. Production code derives it from the attached
-    /// [`P2PNode`]; set via [`Self::set_peer_id_for_tests`] so unit tests can
-    /// drive the freshness logic without wiring a real `P2PNode`.
-    test_peer_id_override: RwLock<Option<[u8; 32]>>,
+    // NOTE: the test-only own-peer-id override was removed with the ADR-retired
+    // quote-freshness/staleness gate (ADR-0004 binds price to the committed
+    // count instead), so it no longer has any reader.
     /// ADR-0004 gossip commitment cache, shared with the replication engine
     /// (`last_commitment_by_peer`). The cross-check resolves a quote's
     /// `commitment_pin` against the neighbour's most recently gossiped
@@ -435,7 +432,6 @@ impl PaymentVerifier {
             test_paid_quote_k_closest_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             test_completed_payments_override: RwLock::new(HashMap::new()),
-            test_peer_id_override: RwLock::new(None),
             commitment_cache: RwLock::new(None),
             pin_fetch_negative_cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(crate::replication::config::PIN_FETCH_NEGATIVE_CACHE_CAPACITY)
@@ -1176,20 +1172,6 @@ impl PaymentVerifier {
         Ok(())
     }
 
-    /// Verify all quotes target the correct content address.
-    fn validate_quote_content(payment: &ProofOfPayment, xorname: &XorName) -> Result<()> {
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            if !verify_quote_content(quote, xorname) {
-                let expected_hex = hex::encode(xorname);
-                let actual_hex = hex::encode(quote.content.0);
-                return Err(Error::Payment(format!(
-                    "Quote content address mismatch for peer {encoded_peer_id:?}: expected {expected_hex}, got {actual_hex}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
     /// ADR-0004: enforce that every quoted price lies exactly on the public
     /// pricing curve.
     ///
@@ -1840,150 +1822,6 @@ impl PaymentVerifier {
     /// in the same saturation regime rather than panicking.
     fn candidate_count_to_usize(candidate_count: u64) -> usize {
         usize::try_from(candidate_count).unwrap_or(usize::MAX)
-    }
-
-    /// Verify quote freshness by price staleness, not wall-clock time and not a
-    /// symmetric record-count delta.
-    ///
-    /// The quote price encodes the quoting node's record count via the quadratic
-    /// pricing formula. We compute the price the node would charge *now* for its
-    /// current fullness and reject the quote only if the client under-paid that
-    /// current price by more than [`QUOTE_PRICE_STALENESS_PCT_TOLERANCE`]. This:
-    ///
-    /// - removes the platform clock dependency that caused Windows/UTC false
-    ///   rejections (timestamps are deliberately unused);
-    /// - never rejects an over-payment (the previous symmetric `abs_diff` check
-    ///   rejected quotes where the node had *fewer* records than when it quoted,
-    ///   i.e. the client paid for a fuller, pricier node — nonsensical to
-    ///   reject); and
-    /// - self-scales with the pricing curve, so benign in-flight churn (a node
-    ///   storing a few replicated records between quoting and verifying) — a
-    ///   negligible price move where the curve is flat — no longer rejects an
-    ///   otherwise-valid payment. On a fresh, rapidly-filling testnet that churn
-    ///   routinely exceeded the old fixed 5-record tolerance and rejected ~100%
-    ///   of uploads via the multiplicative per-chunk effect.
-    ///
-    /// The current record count comes from the attached [`LmdbStorage`] via
-    /// `current_chunks()` — an O(1) B-tree page-header read, authoritative
-    /// regardless of which path stored the record (client PUT, replication
-    /// store, repair fetch) or removed it (prune delete). If no storage source
-    /// is available (mis-configured production startup, or a unit test that
-    /// didn't set a test override), the gate is skipped entirely rather than
-    /// rejecting every quote — see [`Self::current_records_stored`].
-    ///
-    /// **Only this node's own quote is gated.** A bundle contains one quote
-    /// per close-group peer, and fullness across a close group is wildly
-    /// heterogeneous on a real network (a freshly joined node holds tens of
-    /// records while an established neighbour holds thousands). Comparing a
-    /// *neighbour's* quote price against *this node's* record count therefore
-    /// rejects honest payments whenever the group spans more than the
-    /// tolerance — on ant-prod-01 a close group spanning 47..=1788 records
-    /// made the three fullest nodes reject every bundle containing the
-    /// emptiest node's (perfectly fresh, 10-second-old) quote, failing the
-    /// PUT after the client had already paid on-chain. The node can only
-    /// re-derive *its own* price from its own record count, so its own quote
-    /// is the only one it can legitimately call stale. Replay of another
-    /// node's old cheap quote is that node's gate to enforce when the PUT
-    /// reaches it; the on-chain median payment binding is unaffected either
-    /// way.
-    ///
-    /// A bundle holds at most one quote per peer — [`Self::validate_quote_structure`]
-    /// rejects duplicate peer IDs and runs before this gate on every path —
-    /// so the loop below matches at most one own quote.
-    ///
-    /// RETIRED (ADR-0004 hard cutover): no longer called on the verification
-    /// path. Forced pricing binds a quote's price exactly to its committed count
-    /// via `validate_quote_arithmetic`, so a valid quote can never be "stale";
-    /// and the committed *responsible* count legitimately differs from the live
-    /// on-disk `current_chunks()` this gate reads, so running it would
-    /// false-reject healthy ADR quotes (notably baseline quotes from a node that
-    /// holds records but has no live commitment yet). Kept, with its unit tests,
-    /// only to document the legacy gate's exact semantics.
-    #[allow(dead_code)]
-    fn validate_quote_freshness(&self, payment: &ProofOfPayment) -> Result<()> {
-        let Some(current_records) = self.current_records_stored() else {
-            debug!(
-                "PaymentVerifier: no record-count source attached; skipping \
-                 quote price-staleness check"
-            );
-            return Ok(());
-        };
-
-        let Some(self_peer_id) = self.self_peer_id_bytes() else {
-            debug!(
-                "PaymentVerifier: no self peer-id source attached; skipping \
-                 quote price-staleness check"
-            );
-            return Ok(());
-        };
-
-        // The price the node would charge right now for its current fullness,
-        // and the floor a quote may not drop below (one-directional: paying at
-        // or above `current_price` is always accepted).
-        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
-        let min_acceptable_price = current_price.saturating_mul(Amount::from(
-            100u64.saturating_sub(QUOTE_PRICE_STALENESS_PCT_TOLERANCE),
-        )) / Amount::from(100u64);
-
-        let mut own_quote_seen = false;
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            if encoded_peer_id.as_bytes() != &self_peer_id {
-                // A neighbour's quote prices the *neighbour's* fullness; this
-                // node has no basis to judge it against its own record count.
-                continue;
-            }
-            own_quote_seen = true;
-            if quote.price < min_acceptable_price {
-                let quoted_records = derive_records_stored_from_price(quote.price);
-                return Err(Error::Payment(format!(
-                    "Own quote {encoded_peer_id:?} stale: quoted price encodes \
-                     {quoted_records} records but node currently holds {current_records} \
-                     (quoted {}, minimum acceptable {min_acceptable_price} at \
-                     {QUOTE_PRICE_STALENESS_PCT_TOLERANCE}% under-payment tolerance)",
-                    quote.price
-                )));
-            }
-        }
-
-        // Two self-identity notions coexist in this verifier and are expected
-        // to refer to the same node: `validate_local_recipient` matches "us"
-        // by rewards address, this gate by peer ID. They legitimately diverge
-        // when a PUT reaches a node whose own quote isn't in the bundle but
-        // whose rewards address is shared with a quoted sibling (common in
-        // fleet deployments). The gate fail-opens in that case — leave a
-        // breadcrumb, because a silent no-op is exactly what makes a
-        // production incident hard to reconstruct from node logs.
-        if !own_quote_seen {
-            let our_rewards_address_quoted = payment
-                .peer_quotes
-                .iter()
-                .any(|(_, quote)| quote.rewards_address == self.config.local_rewards_address);
-            if our_rewards_address_quoted {
-                debug!(
-                    "PaymentVerifier: bundle contains our rewards address but no quote \
-                     under our peer ID; skipping quote price-staleness check"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Verify each quote's `pub_key` matches the claimed peer ID via BLAKE3.
-    fn validate_peer_bindings(payment: &ProofOfPayment) -> Result<()> {
-        for (encoded_peer_id, quote) in &payment.peer_quotes {
-            let expected_peer_id = peer_id_from_public_key_bytes(&quote.pub_key)
-                .map_err(|e| Error::Payment(format!("Invalid ML-DSA public key in quote: {e}")))?;
-
-            if expected_peer_id.as_bytes() != encoded_peer_id.as_bytes() {
-                let expected_hex = expected_peer_id.to_hex();
-                let actual_hex = hex::encode(encoded_peer_id.as_bytes());
-                return Err(Error::Payment(format!(
-                    "Quote pub_key does not belong to claimed peer {encoded_peer_id:?}: \
-                     BLAKE3(pub_key) = {expected_hex}, peer_id = {actual_hex}"
-                )));
-            }
-        }
-        Ok(())
     }
 
     /// Minimum number of candidate `pub_keys` (out of 16) whose derived
@@ -2790,21 +2628,6 @@ impl PaymentVerifier {
             Self::drain_unresolved_pin_fetches(&p2p, &neg_cache, unresolved).await;
         });
     }
-
-    /// Verify this node is among the paid recipients.
-    fn validate_local_recipient(&self, payment: &ProofOfPayment) -> Result<()> {
-        let local_addr = &self.config.local_rewards_address;
-        let is_recipient = payment
-            .peer_quotes
-            .iter()
-            .any(|(_, quote)| quote.rewards_address == *local_addr);
-        if !is_recipient {
-            return Err(Error::Payment(
-                "Payment proof does not include this node as a recipient".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2854,6 +2677,8 @@ mod tests {
             timestamp: SystemTime::now(),
             price,
             rewards_address: RewardsAddress::new([rewards_seed; 20]),
+            committed_key_count: 0,
+            commitment_pin: None,
             pub_key: pub_key_bytes,
             signature: Vec::new(),
         };
@@ -3863,6 +3688,20 @@ mod tests {
             pub_key: vec![0u8; 64],
             signature: vec![0u8; 64],
         }
+    }
+
+    /// Helper: create a fake quote priced on-curve at `records` stored records
+    /// (price = `calculate_price(records)`), reusing [`make_fake_quote`] for the
+    /// remaining fields. Used by the ADR-0004 arithmetic-gate tests.
+    fn make_fake_quote_at_records(
+        xorname: [u8; 32],
+        timestamp: SystemTime,
+        rewards_address: RewardsAddress,
+        records: usize,
+    ) -> evmlib::PaymentQuote {
+        let mut quote = make_fake_quote(xorname, timestamp, rewards_address);
+        quote.price = crate::payment::pricing::calculate_price(records);
+        quote
     }
 
     /// Helper: wrap quotes into a tagged serialized `PaymentProof`.
