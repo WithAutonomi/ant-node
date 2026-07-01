@@ -187,9 +187,9 @@ pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// Sized to absorb worst-case global RTT for the audit envelope
 /// (the request + response messages are KB-scale, not chunk-scale)
 /// plus scheduling jitter. Tokyo↔NY round-trip is ~150ms each way,
-/// so 2 seconds comfortably covers cross-continent communication
+/// so 4 seconds comfortably covers cross-continent communication
 /// for the round-1 proof, whose payload is hashes (KB-scale).
-const AUDIT_RESPONSE_FLOOR_SECS: u64 = 2;
+const AUDIT_RESPONSE_FLOOR_SECS: u64 = 4;
 
 /// Floor on the round-2 BYTE-challenge deadline.
 ///
@@ -197,11 +197,12 @@ const AUDIT_RESPONSE_FLOOR_SECS: u64 = 2;
 /// `MAX_BYTE_CHALLENGE_KEYS` full chunks (2 × 4 MiB = 8 MiB) back over the
 /// wire, so the envelope must also cover a cold QUIC handshake, the
 /// multi-MiB upload back to the auditor, and a busy honest peer's disk read.
-/// The round-1 2 s floor (sized for a hashes-only reply) is too tight here —
-/// the §4 finding. 5 s matches the cross-continent-RTT + handshake + 8 MiB
-/// transfer budget while keeping a relay that must fetch the bytes over a
-/// residential link outside it (the scaled term adds the per-byte estimate on
-/// top). Mirrors main's more generous byte-round base.
+/// The round-1 4 s floor is still sized for a hashes-only reply; round 2 needs
+/// a larger base for the §4 byte-serving envelope. 5 s matches the
+/// cross-continent-RTT + handshake + 8 MiB transfer budget while keeping a relay
+/// that must fetch the bytes over a residential link outside it (the scaled
+/// term adds the per-byte estimate on top). Mirrors main's more generous
+/// byte-round base.
 const BYTE_AUDIT_RESPONSE_FLOOR_SECS: u64 = 5;
 
 /// Conservative honest-responder read throughput, in bytes per second.
@@ -621,9 +622,9 @@ impl ReplicationConfig {
         // Resolve the scaled term in MILLISECONDS, not seconds: at the
         // byte-round sizes (MAX_BYTE_CHALLENGE_KEYS = 2 → 8 MiB) the per-second
         // quotient `multiplied / bps` integer-truncates to 0, leaving only the
-        // floor (the §4 finding: a 2×4 MiB honest serve under load could blow a
-        // 2 s budget). Computing in ms keeps the sub-second honest-read estimate
-        // (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms) instead of dropping it.
+        // floor. The §4 finding was that byte-serving challenges need the
+        // sub-second honest-read estimate (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms)
+        // instead of dropping it.
         let scaled_ms = multiplied.saturating_mul(1000) / bps;
         // saturating_add avoids a panic if the floor plus the scaled term would
         // overflow `Duration::MAX`.
@@ -767,19 +768,19 @@ mod tests {
 
         // Scaling now resolves in MILLISECONDS so a sub-second honest read no
         // longer truncates to zero (§4). For k=1:
-        // (4_194_304 × 5 × 1000) / 52_428_800 = 400 ms, + 2 s round-1 floor =
-        // 2.4 s (previously collapsed to the bare 2 s floor).
-        assert_eq!(t1, Duration::from_millis(2400));
+        // (4_194_304 × 5 × 1000) / 52_428_800 = 400 ms, + 4 s round-1 floor =
+        // 4.4 s.
+        assert_eq!(t1, Duration::from_millis(4400));
 
         // For k=10: (10 × 4_194_304 × 5 × 1000) / 52_428_800 = 4000 ms scaled,
-        // + 2 s floor = 6 s. An HDD-backed honest peer at 20 MB/s reads 40 MiB
+        // + 4 s floor = 8 s. An HDD-backed honest peer at 20 MB/s reads 40 MiB
         // in ~2 s, comfortably inside; a relay fetching 40 MiB at 5 MB/s
         // residential bandwidth needs ~8 s for the data alone, outside.
-        assert_eq!(t10, Duration::from_secs(6));
+        assert_eq!(t10, Duration::from_secs(8));
 
         // For k=100: (100 × 4_194_304 × 5 × 1000) / 52_428_800 = 40_000 ms
-        // scaled, + 2 s floor = 42 s.
-        assert_eq!(t100, Duration::from_secs(42));
+        // scaled, + 4 s floor = 44 s.
+        assert_eq!(t100, Duration::from_secs(44));
     }
 
     #[test]
@@ -790,7 +791,7 @@ mod tests {
         // well below modern HDDs which sustain 80-150 MB/s sequential)
         // reads 10 × 4 MiB = 40 MiB in ~2 s. Add 300 ms cross-continent
         // RTT, ~10 ms scheduling, ~3 ms ML-DSA sign, and the honest
-        // envelope is ~2.3 s. The 6 s budget at k=10 leaves >3 s of
+        // envelope is ~2.3 s. The 8 s budget at k=10 leaves >5 s of
         // slack.
         let config = ReplicationConfig::default();
         let budget = config.audit_response_timeout(10);
@@ -810,7 +811,7 @@ mod tests {
         // read budget fits inside `audit_response_timeout(k)`, while a
         // relay attacker fetching k*4MiB over residential bandwidth
         // (≈ 5 MB/s realistic for sustained download) does NOT. Spot-
-        // check this at k=100: honest budget is 42s, relay needs at
+        // check this at k=100: honest budget is 44s, relay needs at
         // least 100 * 4 MiB / 5 MB/s = 80s for the data alone, which
         // exceeds the budget.
         let config = ReplicationConfig::default();
