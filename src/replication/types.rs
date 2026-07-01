@@ -92,6 +92,9 @@ pub struct VerificationEntry {
     pub tried_sources: HashSet<PeerId>,
     /// When this entry was created.
     pub created_at: Instant,
+    /// Earliest time this key should be included in another verification
+    /// round.
+    pub next_verify_at: Instant,
     /// The peer that originally hinted this key (for source tracking).
     pub hint_sender: PeerId,
 }
@@ -113,6 +116,9 @@ pub struct FetchCandidate {
     pub distance: XorName,
     /// Verified source peers that responded `Present`.
     pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
 }
 
 impl Eq for FetchCandidate {}
@@ -731,6 +737,7 @@ mod tests {
                 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(1)],
+            retry_verification: None,
         };
 
         let far = FetchCandidate {
@@ -740,6 +747,7 @@ mod tests {
                 0, 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(2)],
+            retry_verification: None,
         };
 
         // In a max-heap the "greatest" element pops first.
@@ -775,12 +783,14 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         let b = FetchCandidate {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         assert_eq!(
@@ -797,12 +807,14 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         let b = FetchCandidate {
             key: [2u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         assert_ne!(

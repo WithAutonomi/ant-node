@@ -56,7 +56,8 @@ use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1181,7 +1182,12 @@ impl ReplicationEngine {
                             );
                             continue;
                         };
-                        q.start_fetch(candidate.key, source, candidate.sources.clone());
+                        q.start_fetch_with_retry(
+                            candidate.key,
+                            source,
+                            candidate.sources.clone(),
+                            candidate.retry_verification,
+                        );
 
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
@@ -1269,15 +1275,20 @@ impl ReplicationEngine {
                                         }));
                                         false
                                     } else {
-                                        q.complete_fetch(&key);
-                                        true
+                                        !q.requeue_fetch_for_verification(
+                                            &key,
+                                            config.verification_request_timeout,
+                                        )
                                     }
                                 }
                             }
                         } else {
-                            // Task panicked — reclaim the in-flight slot.
-                            q.complete_fetch(&key);
-                            true
+                            // Task panicked — retry verification when this was
+                            // a verified repair, otherwise reclaim the slot.
+                            !q.requeue_fetch_for_verification(
+                                &key,
+                                config.verification_request_timeout,
+                            )
                         };
 
                         // Shrink bootstrap pending set on terminal exit.
@@ -2385,13 +2396,39 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // No per-request key count limit: the wire message size limit
-    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Verification
-    // does cheap storage lookups per key, not expensive computation like
-    // audit digest generation.
+    #[derive(Clone, Copy)]
+    enum CachedPaidLookup {
+        NotChecked,
+        Checked(Option<bool>),
+    }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let keys_len = request.keys.len() as u32;
+    #[derive(Clone, Copy)]
+    struct CachedVerificationLookup {
+        present: Option<bool>,
+        paid: CachedPaidLookup,
+    }
+
+    let requested_keys = if request.keys.len() > MAX_VERIFICATION_KEYS_PER_REQUEST {
+        warn!(
+            "Verification request from {source} has {} keys, exceeding max {MAX_VERIFICATION_KEYS_PER_REQUEST}; answering capped prefix",
+            request.keys.len(),
+        );
+        &request.keys[..MAX_VERIFICATION_KEYS_PER_REQUEST]
+    } else {
+        request.keys.as_slice()
+    };
+
+    if request.paid_list_check_indices.len() > request.keys.len() {
+        warn!(
+            "Verification request from {source} has {} paid-list indices for {} keys; rejecting batch",
+            request.paid_list_check_indices.len(),
+            request.keys.len(),
+        );
+        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        return Ok(());
+    }
+
+    let keys_len = u32::try_from(requested_keys.len()).unwrap_or(u32::MAX);
     let paid_check_set: HashSet<u32> = request
         .paid_list_check_indices
         .iter()
@@ -2400,7 +2437,7 @@ async fn handle_verification_request(
             if idx >= keys_len {
                 warn!(
                     "Verification request from {source}: paid_list_check_index {idx} out of bounds (keys.len() = {})",
-                    request.keys.len(),
+                    requested_keys.len(),
                 );
                 false
             } else {
@@ -2409,21 +2446,72 @@ async fn handle_verification_request(
         })
         .collect();
 
-    let mut results = Vec::with_capacity(request.keys.len());
-    for (i, key) in request.keys.iter().enumerate() {
-        let present = storage.exists(key).unwrap_or(false);
-        let paid = if paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX)) {
-            Some(paid_list.contains(key).unwrap_or(false))
+    let mut results = Vec::with_capacity(requested_keys.len());
+    let mut lookup_cache: HashMap<XorName, CachedVerificationLookup> = HashMap::new();
+    for (i, key) in requested_keys.iter().enumerate() {
+        let needs_paid = paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX));
+        let cached = lookup_cache.entry(*key).or_insert_with(|| {
+            let present = match storage.exists(key) {
+                Ok(present) => Some(present),
+                Err(e) => {
+                    warn!(
+                        "Verification request from {source}: failed to check storage for {}: {e}",
+                        hex::encode(key)
+                    );
+                    None
+                }
+            };
+            CachedVerificationLookup {
+                present,
+                paid: CachedPaidLookup::NotChecked,
+            }
+        });
+
+        if needs_paid && matches!(cached.paid, CachedPaidLookup::NotChecked) {
+            cached.paid = CachedPaidLookup::Checked(match paid_list.contains(key) {
+                Ok(paid) => Some(paid),
+                Err(e) => {
+                    warn!(
+                        "Verification request from {source}: failed to check paid-list for {}: {e}",
+                        hex::encode(key)
+                    );
+                    None
+                }
+            });
+        }
+
+        let paid = if needs_paid {
+            match cached.paid {
+                CachedPaidLookup::Checked(paid) => paid,
+                CachedPaidLookup::NotChecked => None,
+            }
         } else {
             None
         };
+
+        if cached.present.is_none() && paid.is_none() {
+            continue;
+        }
+
         results.push(protocol::KeyVerificationResult {
             key: *key,
-            present,
+            present: cached.present.unwrap_or(false),
             paid,
         });
     }
 
+    send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
+
+    Ok(())
+}
+
+async fn send_verification_results(
+    source: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    request_id: u64,
+    results: Vec<protocol::KeyVerificationResult>,
+    rr_message_id: Option<&str>,
+) {
     send_replication_response(
         source,
         p2p_node,
@@ -2432,8 +2520,6 @@ async fn handle_verification_request(
         rr_message_id,
     )
     .await;
-
-    Ok(())
 }
 
 async fn handle_fetch_request(
@@ -3046,6 +3132,7 @@ async fn admit_and_queue_hints(
                     verified_sources: Vec::new(),
                     tried_sources: HashSet::new(),
                     created_at: now,
+                    next_verify_at: now,
                     hint_sender: *source_peer,
                 },
             );
@@ -3070,6 +3157,7 @@ async fn admit_and_queue_hints(
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
+                next_verify_at: now,
                 hint_sender: *source_peer,
             },
         );
@@ -3121,14 +3209,24 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
     // Evict stale entries that have been pending too long (e.g. unreachable
     // verification targets during a network partition).
-    {
+    let stale_pending_keys = {
         let mut q = queues.write().await;
-        q.evict_stale(config::PENDING_VERIFY_MAX_AGE);
+        q.evict_stale(config::PENDING_VERIFY_MAX_AGE)
+    };
+    if !stale_pending_keys.is_empty() {
+        update_bootstrap_after_verification(
+            &stale_pending_keys,
+            bootstrap_state,
+            queues,
+            is_bootstrapping,
+            bootstrap_complete_notify,
+        )
+        .await;
     }
 
     let pending_keys = {
         let q = queues.read().await;
-        q.pending_keys()
+        q.ready_pending_keys(Instant::now())
     };
 
     if pending_keys.is_empty() {
@@ -3231,17 +3329,21 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 terminal_keys.push(key);
                 continue;
             }
-            let sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
+            let mut sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
+            let replica_hint_sender = q.get_pending(&key).and_then(|entry| {
+                (entry.pipeline == HintPipeline::Replica).then_some(entry.hint_sender)
+            });
+            if let Some(hint_sender) = replica_hint_sender {
+                add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
+            }
             if sources.is_empty() {
-                // Terminal failure: remove pending and report. No fetch path.
-                q.remove_pending(&key);
                 warn!(
-                    "Locally paid key {} has no responding holders (possible data loss)",
+                    "Locally paid key {} has no responding holders yet; deferring retry",
                     hex::encode(key)
                 );
-                terminal_keys.push(key);
+                q.defer_pending(&key, config.verification_request_timeout);
             } else {
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
@@ -3339,7 +3441,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             provers_snapshot.is_credited_holder(key, peer, hash)
         };
 
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
+        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline, PeerId)> =
+            Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
@@ -3356,13 +3459,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     config,
                     holder_credit,
                 );
-                evaluated.push((*key, outcome, entry.pipeline));
+                evaluated.push((*key, outcome, entry.pipeline, entry.hint_sender));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _) in &evaluated {
+        for (key, outcome, _, _) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -3382,7 +3485,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // paid-only hint can safely repair a missing replica using sources
         // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline) in &evaluated {
+        for (key, outcome, pipeline, _) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
                 && matches!(
                     outcome,
@@ -3404,37 +3507,41 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
         // Step 5: Update queues with the evaluated outcomes.
         let mut q = queues.write().await;
-        for (key, outcome, pipeline) in evaluated {
+        for (key, outcome, pipeline, hint_sender) in evaluated {
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
+                    let mut fetch_sources = sources;
+                    add_replica_hint_sender_source(&mut fetch_sources, pipeline, hint_sender);
                     let fetch_eligible =
                         pipeline == HintPipeline::Replica || paid_only_fetch_keys.contains(&key);
-                    if fetch_eligible && !sources.is_empty() {
+                    if fetch_eligible && !fetch_sources.is_empty() {
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                         // Atomic remove+enqueue: on fetch_queue capacity miss
                         // the pending entry is preserved so this verified key
                         // is retried on the next cycle (no silent drop).
-                        let _ = q.promote_pending_to_fetch(key, distance, sources);
+                        let _ = q.promote_pending_to_fetch(key, distance, fetch_sources);
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
-                    } else if fetch_eligible && sources.is_empty() {
+                    } else if fetch_eligible && fetch_sources.is_empty() {
                         warn!(
-                            "Verified storage-admitted key {} has no holders (possible data loss)",
+                            "Verified storage-admitted key {} has no holders yet; deferring retry",
                             hex::encode(key)
                         );
-                        q.remove_pending(&key);
-                        terminal_keys.push(key);
+                        q.defer_pending(&key, config.verification_request_timeout);
                     } else {
                         q.remove_pending(&key);
                         terminal_keys.push(key);
                     }
                 }
-                KeyVerificationOutcome::QuorumFailed
-                | KeyVerificationOutcome::QuorumInconclusive => {
+                KeyVerificationOutcome::QuorumFailed => {
                     q.remove_pending(&key);
                     terminal_keys.push(key);
+                }
+                KeyVerificationOutcome::QuorumInconclusive => {
+                    q.set_pending_state(&key, VerificationState::QuorumInconclusive);
+                    q.defer_pending(&key, config.verification_request_timeout);
                 }
             }
         }
@@ -3472,6 +3579,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             target: "ant_node::replication::verification",
             "Replication verification cycle: pending_start={initial_pending_count}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
         );
+    }
+}
+
+fn add_replica_hint_sender_source(
+    sources: &mut Vec<PeerId>,
+    pipeline: HintPipeline,
+    hint_sender: PeerId,
+) {
+    if pipeline == HintPipeline::Replica && !sources.contains(&hint_sender) {
+        sources.push(hint_sender);
     }
 }
 
@@ -4624,13 +4741,14 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
-        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
-        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
+        add_replica_hint_sender_source, apply_audit_failure_credit_revocation,
+        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
+        audit_launch_decision, config, cooldown_allows_audit, first_failed_key_label,
+        fresh_offer_payment_context, paid_notify_payment_context,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
-    use crate::replication::types::AuditFailureReason;
+    use crate::replication::types::{AuditFailureReason, HintPipeline};
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
     use std::time::Duration;
@@ -4662,6 +4780,24 @@ mod tests {
             paid_notify_payment_context(),
             VerificationContext::PaidListAdmission
         );
+    }
+
+    #[test]
+    fn replica_hint_sender_is_added_as_fallback_fetch_source() {
+        const EXISTING_SOURCE_ID: u8 = 1;
+        const HINT_SENDER_ID: u8 = 2;
+        const PAID_ONLY_SENDER_ID: u8 = 3;
+
+        let existing_source = test_peer(EXISTING_SOURCE_ID);
+        let hint_sender = test_peer(HINT_SENDER_ID);
+        let paid_only_sender = test_peer(PAID_ONLY_SENDER_ID);
+        let mut sources = vec![existing_source];
+
+        add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
+        add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
+        add_replica_hint_sender_source(&mut sources, HintPipeline::PaidOnly, paid_only_sender);
+
+        assert_eq!(sources, vec![existing_source, hint_sender]);
     }
 
     #[test]

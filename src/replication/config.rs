@@ -300,6 +300,15 @@ const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(VERIFICATION_REQUEST_TIMEOUT_SECS);
 
+/// Maximum keys in one verification request/response batch.
+///
+/// The 10 MiB replication wire cap is intentionally much higher because other
+/// messages carry hint sets and chunk bytes. Verification requests do local
+/// LMDB lookups per key on the responder's serial replication message path, so
+/// this smaller cap bounds CPU/disk work and keeps honest large rounds
+/// splittable instead of failing one oversized encode.
+pub const MAX_VERIFICATION_KEYS_PER_REQUEST: usize = 1024;
+
 /// Fetch request timeout.
 const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.
