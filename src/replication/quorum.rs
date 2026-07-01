@@ -5,14 +5,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{
+    ReplicationConfig, MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
+};
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
 };
@@ -20,6 +23,12 @@ use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, Prese
 
 /// Verification round duration that is worth surfacing at info level.
 const VERIFICATION_ROUND_SLOW_LOG_MS: u128 = 500;
+
+struct VerificationBatchResult {
+    peer: PeerId,
+    requested_keys: Vec<XorName>,
+    response: Option<ReplicationMessage>,
+}
 
 // ---------------------------------------------------------------------------
 // Verification targets
@@ -351,6 +360,39 @@ fn collect_present_sources(
     present_peers
 }
 
+fn verification_requests_for_peer(
+    peer_keys: &[XorName],
+    paid_check_keys: Option<&HashSet<XorName>>,
+) -> Vec<VerificationRequest> {
+    peer_keys
+        .chunks(MAX_VERIFICATION_KEYS_PER_REQUEST)
+        .map(|key_batch| VerificationRequest {
+            keys: key_batch.to_vec(),
+            paid_list_check_indices: paid_indices_for_key_batch(key_batch, paid_check_keys),
+        })
+        .collect()
+}
+
+fn paid_indices_for_key_batch(
+    key_batch: &[XorName],
+    paid_check_keys: Option<&HashSet<XorName>>,
+) -> Vec<u32> {
+    let Some(paid_keys) = paid_check_keys else {
+        return Vec::new();
+    };
+
+    key_batch
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, key)| {
+            paid_keys
+                .contains(key)
+                .then_some(idx)
+                .and_then(|idx| u32::try_from(idx).ok())
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Network verification round
 // ---------------------------------------------------------------------------
@@ -383,99 +425,26 @@ pub async fn run_verification_round(
         })
         .collect();
 
-    // Send one batched request per peer.
-    let mut handles = Vec::new();
-
-    for (&peer, peer_keys) in &targets.peer_to_keys {
-        let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
-
-        // Build paid_list_check_indices: which of this peer's keys need
-        // paid-list status.
-        let mut paid_indices = Vec::new();
-        for (i, key) in peer_keys.iter().enumerate() {
-            if let Some(paid_keys) = paid_check_keys {
-                if paid_keys.contains(key) {
-                    if let Ok(idx) = u32::try_from(i) {
-                        paid_indices.push(idx);
-                    }
-                }
-            }
-        }
-
-        let request = VerificationRequest {
-            keys: peer_keys.clone(),
-            paid_list_check_indices: paid_indices,
-        };
-
-        let msg = ReplicationMessage {
-            request_id: rand::random(),
-            body: ReplicationMessageBody::VerificationRequest(request),
-        };
-
-        let p2p = Arc::clone(p2p_node);
-        let timeout = config.verification_request_timeout;
-        let peer_id = peer;
-
-        handles.push(tokio::spawn(async move {
-            let encoded = match msg.encode() {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Failed to encode verification request: {e}");
-                    return (peer_id, None);
-                }
-            };
-
-            match p2p
-                .send_request(&peer_id, REPLICATION_PROTOCOL_ID, encoded, timeout)
-                .await
-            {
-                Ok(response) => match ReplicationMessage::decode(&response.data) {
-                    Ok(decoded) => (peer_id, Some(decoded)),
-                    Err(e) => {
-                        warn!("Failed to decode verification response from {peer_id}: {e}");
-                        (peer_id, None)
-                    }
-                },
-                Err(e) => {
-                    debug!("Verification request to {peer_id} failed: {e}");
-                    (peer_id, None)
-                }
-            }
-        }));
-    }
-
-    // Collect responses.
-    for handle in handles {
-        let (peer, response) = match handle.await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Verification task panicked: {e}");
-                continue;
-            }
-        };
-
-        let Some(msg) = response else {
-            // Timeout/error: mark all keys for this peer as unresolved.
-            mark_peer_unresolved(&peer, targets, &mut evidence);
-            continue;
-        };
-
-        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
-            process_verification_response(&peer, &resp, targets, &mut evidence);
-        }
-    }
+    let handles =
+        spawn_verification_batch_tasks(targets, p2p_node, config.verification_request_timeout);
+    collect_verification_batch_results(handles, targets, &mut evidence).await;
 
     let elapsed_ms = started.elapsed().as_millis();
+    let batch_count = targets
+        .peer_to_keys
+        .values()
+        .map(|peer_keys| peer_keys.chunks(MAX_VERIFICATION_KEYS_PER_REQUEST).count())
+        .sum::<usize>();
     if elapsed_ms >= VERIFICATION_ROUND_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::verification",
-            "Slow quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            "Slow quorum verification round: keys={}, peers={peer_count}, batches={batch_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
             keys.len(),
         );
     } else {
         debug!(
             target: "ant_node::replication::verification",
-            "Quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            "Quorum verification round: keys={}, peers={peer_count}, batches={batch_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
             keys.len(),
         );
     }
@@ -483,26 +452,144 @@ pub async fn run_verification_round(
     evidence
 }
 
+fn spawn_verification_batch_tasks(
+    targets: &VerificationTargets,
+    p2p_node: &Arc<P2PNode>,
+    timeout: Duration,
+) -> Vec<JoinHandle<VerificationBatchResult>> {
+    let mut handles = Vec::new();
+
+    for (&peer, peer_keys) in &targets.peer_to_keys {
+        let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
+
+        for request in verification_requests_for_peer(peer_keys, paid_check_keys) {
+            let requested_keys = request.keys.clone();
+            let msg = ReplicationMessage {
+                request_id: rand::random(),
+                body: ReplicationMessageBody::VerificationRequest(request),
+            };
+
+            handles.push(spawn_verification_batch_task(
+                peer,
+                requested_keys,
+                msg,
+                Arc::clone(p2p_node),
+                timeout,
+            ));
+        }
+    }
+
+    handles
+}
+
+fn spawn_verification_batch_task(
+    peer: PeerId,
+    requested_keys: Vec<XorName>,
+    msg: ReplicationMessage,
+    p2p: Arc<P2PNode>,
+    timeout: Duration,
+) -> JoinHandle<VerificationBatchResult> {
+    tokio::spawn(async move {
+        let encoded = match msg.encode() {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to encode verification request: {e}");
+                return VerificationBatchResult {
+                    peer,
+                    requested_keys,
+                    response: None,
+                };
+            }
+        };
+
+        let response = match p2p
+            .send_request(&peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+            .await
+        {
+            Ok(response) => match ReplicationMessage::decode(&response.data) {
+                Ok(decoded) => Some(decoded),
+                Err(e) => {
+                    warn!("Failed to decode verification response from {peer}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                debug!("Verification request to {peer} failed: {e}");
+                None
+            }
+        };
+
+        VerificationBatchResult {
+            peer,
+            requested_keys,
+            response,
+        }
+    })
+}
+
+async fn collect_verification_batch_results(
+    handles: Vec<JoinHandle<VerificationBatchResult>>,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    for handle in handles {
+        let batch = match handle.await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Verification task panicked: {e}");
+                continue;
+            }
+        };
+        let peer = batch.peer;
+
+        let Some(msg) = batch.response else {
+            mark_peer_keys_unresolved(&peer, &batch.requested_keys, targets, evidence);
+            continue;
+        };
+
+        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
+            process_verification_response_for_keys(
+                &peer,
+                &batch.requested_keys,
+                &resp,
+                targets,
+                evidence,
+            );
+        }
+    }
+}
+
 /// Mark all keys for a peer as unresolved (timeout / decode failure).
+#[cfg(test)]
 fn mark_peer_unresolved(
     peer: &PeerId,
     targets: &VerificationTargets,
     evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
 ) {
     if let Some(peer_keys) = targets.peer_to_keys.get(peer) {
-        let is_paid_peer = targets.peer_to_paid_keys.get(peer);
-        for key in peer_keys {
-            if let Some(ev) = evidence.get_mut(key) {
-                ev.presence.insert(*peer, PresenceEvidence::Unresolved);
-                if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
-                    ev.paid_list.insert(*peer, PaidListEvidence::Unresolved);
-                }
+        mark_peer_keys_unresolved(peer, peer_keys, targets, evidence);
+    }
+}
+
+fn mark_peer_keys_unresolved(
+    peer: &PeerId,
+    requested_keys: &[XorName],
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    let paid_check_keys = targets.peer_to_paid_keys.get(peer);
+    for key in requested_keys {
+        if let Some(ev) = evidence.get_mut(key) {
+            ev.presence.insert(*peer, PresenceEvidence::Unresolved);
+            if paid_check_keys.is_some_and(|ks| ks.contains(key)) {
+                ev.paid_list.insert(*peer, PaidListEvidence::Unresolved);
             }
         }
     }
 }
 
 /// Process a single peer's verification response into the evidence map.
+#[cfg(test)]
 fn process_verification_response(
     peer: &PeerId,
     response: &VerificationResponse,
@@ -513,18 +600,30 @@ fn process_verification_response(
         return;
     };
 
+    process_verification_response_for_keys(peer, peer_keys, response, targets, evidence);
+}
+
+fn process_verification_response_for_keys(
+    peer: &PeerId,
+    requested_keys: &[XorName],
+    response: &VerificationResponse,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    let paid_check_keys = targets.peer_to_paid_keys.get(peer);
+
     // Use a HashSet for O(1) key membership checks instead of linear scan,
     // preventing CPU amplification from large responses.
-    let peer_keys_set: HashSet<&XorName> = peer_keys.iter().collect();
+    let requested_keys_set: HashSet<&XorName> = requested_keys.iter().collect();
 
     // Cap results at 2x requested keys to limit processing of stuffed
     // responses while still tolerating some unsolicited entries.
-    let max_results = peer_keys.len().saturating_mul(2);
+    let max_results = requested_keys.len().saturating_mul(2);
     let results = if response.results.len() > max_results {
         warn!(
             "Peer {peer} sent {} verification results but only {} keys were requested — truncating",
             response.results.len(),
-            peer_keys.len(),
+            requested_keys.len(),
         );
         &response.results[..max_results]
     } else {
@@ -533,7 +632,7 @@ fn process_verification_response(
 
     // Match response results to requested keys.
     for result in results {
-        if !peer_keys_set.contains(&result.key) {
+        if !requested_keys_set.contains(&result.key) {
             continue; // Ignore unsolicited key results.
         }
 
@@ -547,25 +646,26 @@ fn process_verification_response(
             ev.presence.insert(*peer, presence);
 
             // Paid-list evidence (only if requested).
-            if let Some(is_paid) = result.paid {
-                let paid = if is_paid {
-                    PaidListEvidence::Confirmed
-                } else {
-                    PaidListEvidence::NotFound
-                };
-                ev.paid_list.insert(*peer, paid);
+            if paid_check_keys.is_some_and(|ks| ks.contains(&result.key)) {
+                if let Some(is_paid) = result.paid {
+                    let paid = if is_paid {
+                        PaidListEvidence::Confirmed
+                    } else {
+                        PaidListEvidence::NotFound
+                    };
+                    ev.paid_list.insert(*peer, paid);
+                }
             }
         }
     }
 
     // Keys that were requested but not in response -> unresolved.
-    let is_paid_peer = targets.peer_to_paid_keys.get(peer);
-    for key in peer_keys {
+    for key in requested_keys {
         if let Some(ev) = evidence.get_mut(key) {
             ev.presence
                 .entry(*peer)
                 .or_insert(PresenceEvidence::Unresolved);
-            if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
+            if paid_check_keys.is_some_and(|ks| ks.contains(key)) {
                 ev.paid_list
                     .entry(*peer)
                     .or_insert(PaidListEvidence::Unresolved);
@@ -594,6 +694,15 @@ mod tests {
     /// Build an `XorName` from a single byte (repeated to 32 bytes).
     fn xor_name_from_byte(b: u8) -> XorName {
         [b; 32]
+    }
+
+    fn xor_name_from_usize(value: usize) -> XorName {
+        let mut name = [0u8; 32];
+        let bytes = u64::try_from(value)
+            .expect("test value fits u64")
+            .to_le_bytes();
+        name[..bytes.len()].copy_from_slice(&bytes);
+        name
     }
 
     /// Helper: build minimal `VerificationTargets` for a single key with
@@ -1050,6 +1159,61 @@ mod tests {
     }
 
     #[test]
+    fn production_paid_list_vote_authorizes_when_storage_majority_missing() {
+        const PRODUCTION_PAID_GROUP: u8 = 20;
+        const STORAGE_HOLDERS_BELOW_QUORUM: usize = 3;
+        const PAID_CONFIRMATIONS_NEEDED: usize = 11;
+        const PAID_PEER_OFFSET: u8 = 30;
+
+        let key = xor_name_from_byte(0x62);
+        let config = ReplicationConfig::default();
+
+        let quorum_peers: Vec<PeerId> =
+            (1..=PRODUCTION_PAID_GROUP).map(peer_id_from_byte).collect();
+        let paid_peers: Vec<PeerId> = (1..=PRODUCTION_PAID_GROUP)
+            .map(|i| peer_id_from_byte(PAID_PEER_OFFSET + i))
+            .collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        let presence = quorum_peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| {
+                (
+                    *peer,
+                    if i < STORAGE_HOLDERS_BELOW_QUORUM {
+                        PresenceEvidence::Present
+                    } else {
+                        PresenceEvidence::Absent
+                    },
+                )
+            })
+            .collect();
+        let paid_list = paid_peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| {
+                (
+                    *peer,
+                    if i < PAID_CONFIRMATIONS_NEEDED {
+                        PaidListEvidence::Confirmed
+                    } else {
+                        PaidListEvidence::NotFound
+                    },
+                )
+            })
+            .collect();
+        let evidence = build_evidence(presence, paid_list);
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { ref sources } if sources.len() == STORAGE_HOLDERS_BELOW_QUORUM),
+            "11/20 paid-list confirmations must authorize repair despite only 3 storage holders, got {outcome:?}"
+        );
+    }
+
+    #[test]
     fn quorum_fails_with_zero_targets_no_paid() {
         let key = xor_name_from_byte(0x70);
         let config = ReplicationConfig::default();
@@ -1227,6 +1391,133 @@ mod tests {
             Some(&PresenceEvidence::Absent),
             "solicited key should have Absent"
         );
+    }
+
+    #[test]
+    fn process_response_ignores_unsolicited_paid_status() {
+        let key = xor_name_from_byte(0xB2);
+        let peer = peer_id_from_byte(4);
+
+        let targets = single_key_targets(&key, vec![peer], vec![]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: HashMap::new(),
+            },
+        ))
+        .collect();
+
+        let response = VerificationResponse {
+            results: vec![KeyVerificationResult {
+                key,
+                present: true,
+                paid: Some(true),
+            }],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert_eq!(ev.presence.get(&peer), Some(&PresenceEvidence::Present));
+        assert!(
+            !ev.paid_list.contains_key(&peer),
+            "paid evidence must be recorded only for requested paid-list checks"
+        );
+    }
+
+    #[test]
+    fn process_batch_response_marks_only_batch_keys_unresolved() {
+        let key_a = xor_name_from_byte(0xB3);
+        let key_b = xor_name_from_byte(0xB4);
+        let peer = peer_id_from_byte(6);
+
+        let targets = VerificationTargets {
+            quorum_targets: [(key_a, vec![peer]), (key_b, vec![peer])]
+                .into_iter()
+                .collect(),
+            paid_targets: [(key_a, vec![peer]), (key_b, vec![peer])]
+                .into_iter()
+                .collect(),
+            paid_group_sizes: [(key_a, 1), (key_b, 1)].into_iter().collect(),
+            all_peers: std::iter::once(peer).collect(),
+            peer_to_keys: std::iter::once((peer, vec![key_a, key_b])).collect(),
+            peer_to_paid_keys: std::iter::once((
+                peer,
+                [key_a, key_b].into_iter().collect::<HashSet<_>>(),
+            ))
+            .collect(),
+        };
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
+            (
+                key_a,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+            (
+                key_b,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        process_verification_response_for_keys(
+            &peer,
+            &[key_a],
+            &VerificationResponse {
+                results: Vec::new(),
+            },
+            &targets,
+            &mut evidence,
+        );
+
+        let ev_a = evidence.get(&key_a).expect("evidence for key_a");
+        assert_eq!(
+            ev_a.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved)
+        );
+        assert_eq!(
+            ev_a.paid_list.get(&peer),
+            Some(&PaidListEvidence::Unresolved)
+        );
+
+        let ev_b = evidence.get(&key_b).expect("evidence for key_b");
+        assert!(
+            !ev_b.presence.contains_key(&peer),
+            "keys outside the failed batch must wait for their own batch result"
+        );
+        assert!(
+            !ev_b.paid_list.contains_key(&peer),
+            "paid status outside the failed batch must not be prefilled"
+        );
+    }
+
+    #[test]
+    fn verification_requests_for_peer_splits_large_batches_and_rebases_paid_indices() {
+        let keys: Vec<XorName> = (0..=MAX_VERIFICATION_KEYS_PER_REQUEST)
+            .map(xor_name_from_usize)
+            .collect();
+        let paid_keys: HashSet<XorName> = [keys[0], keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
+            .into_iter()
+            .collect();
+
+        let requests = verification_requests_for_peer(&keys, Some(&paid_keys));
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].keys.len(), MAX_VERIFICATION_KEYS_PER_REQUEST);
+        assert_eq!(requests[0].paid_list_check_indices, vec![0]);
+        assert_eq!(
+            requests[1].keys,
+            vec![keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
+        );
+        assert_eq!(requests[1].paid_list_check_indices, vec![0]);
     }
 
     // -----------------------------------------------------------------------
