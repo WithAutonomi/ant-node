@@ -2321,9 +2321,9 @@ async fn handle_fresh_offer(
     // part of the immediate write fan-out: this receiver is about to store the
     // record as if the client had PUT it here directly. Storage admission
     // was checked above before proof work. ClientPut verification applies
-    // store-strength cache semantics, paid-quote issuer K-closeness and local
-    // price floor checks for single-node proofs, and merkle candidate
-    // closeness for merkle proofs.
+    // store-strength cache semantics, paid-quote issuer K-closeness checks
+    // for single-node proofs, and merkle candidate closeness for merkle
+    // proofs.
     match payment_verifier
         .verify_payment(
             &offer.key,

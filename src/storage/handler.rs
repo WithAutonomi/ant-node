@@ -94,11 +94,12 @@ impl AntProtocol {
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
         // Wire the PaymentVerifier to the same authoritative store used by this
-        // protocol handler: it checks paid quotes against `current_chunks()`
-        // (the paid-quote price floor / residual freshness gate), so it must
-        // read the same record count this handler serves. Attaching here makes
-        // the invariant automatic for every AntProtocol construction path,
-        // including tests and future startup variants.
+        // protocol handler. Historically the verifier read `current_chunks()`
+        // for the paid-quote price floor; ADR-0004 retired that gate (price is
+        // bound to the live storage commitment, not the local record count), so
+        // the store is no longer consulted for pricing. The attachment is kept
+        // so any future store-backed verifier check reads the same record count
+        // this handler serves, for every AntProtocol construction path.
         //
         // ADR-0004: the QuoteGenerator no longer prices off `current_chunks()`
         // — its price is bound to the live storage commitment (see

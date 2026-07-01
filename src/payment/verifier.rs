@@ -45,20 +45,6 @@ pub const MIN_PAYMENT_PROOF_SIZE_BYTES: usize = 32;
 /// 256 KB provides headroom while still capping memory during verification.
 pub const MAX_PAYMENT_PROOF_SIZE_BYTES: usize = 262_144;
 
-/// Maximum percentage by which the median-paid quote may fall below this
-/// verifier's current local price before a client PUT is rejected.
-///
-/// A 20% floor means a paid quote must be at least `0.8 * P_v`, so an
-/// attacker who controls a real K-close issuer still pays at least
-/// `0.8 * P_v * 3` for an honest verifier. Honest median-paid bundles have
-/// a structural majority guarantee: the four nodes at or below the median
-/// accept unless their own price grows more than `1 / 0.8 = 1.25x` between
-/// quote and PUT. Above-median nodes may reject when `P_v > 1.25 * median`;
-/// those records are backfilled by replication, which deliberately skips
-/// this present-tense floor.
-const PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT: u64 = 20;
-
-const PERCENT_DENOMINATOR: u64 = 100;
 const PAID_QUOTE_PAYMENT_MULTIPLIER: u64 = 3;
 const PAYMENT_VERIFY_SLOW_LOG_MS: u128 = 500;
 
@@ -72,12 +58,6 @@ struct LegacyMedianCandidate<'a> {
     encoded_peer_id: &'a evmlib::EncodedPeerId,
     quote: &'a PaymentQuote,
     expected_amount: Amount,
-}
-
-fn price_floor(current_price: Amount, tolerance_pct: u64) -> Amount {
-    current_price.saturating_mul(Amount::from(
-        PERCENT_DENOMINATOR.saturating_sub(tolerance_pct),
-    )) / Amount::from(PERCENT_DENOMINATOR)
 }
 
 fn median_quote_index(quote_count: usize) -> usize {
@@ -267,13 +247,6 @@ pub struct PaymentVerifier {
     /// paths. `None` in unit tests that pre-set [`Self::test_records_override`];
     /// production startup MUST call [`attach_storage`].
     storage: RwLock<Option<Arc<LmdbStorage>>>,
-    /// Test-only override for the paid-quote local price floor.
-    ///
-    /// When `Some(n)`, `validate_paid_quote_price_floor` uses `n` as the
-    /// current record count instead of querying `storage.current_chunks()`. Set via
-    /// [`Self::set_records_stored_for_tests`] so unit tests that don't wire a
-    /// real `LmdbStorage` can still drive the price-floor logic.
-    test_records_override: RwLock<Option<u64>>,
     /// Test-only override for the paid-quote issuer K-closest check.
     ///
     /// Production code derives closest peers from the attached [`P2PNode`].
@@ -427,7 +400,6 @@ impl PaymentVerifier {
             inflight_closeness,
             p2p_node: RwLock::new(None),
             storage: RwLock::new(None),
-            test_records_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
             test_paid_quote_k_closest_override: RwLock::new(None),
             #[cfg(any(test, feature = "test-utils"))]
@@ -499,15 +471,6 @@ impl PaymentVerifier {
         debug!("PaymentVerifier: LmdbStorage attached for paid-quote price-floor checks");
     }
 
-    /// Test-only setter for the current record count used by paid-quote
-    /// price-floor checks. Lets unit tests drive the floor logic without
-    /// wiring a real `LmdbStorage`. Has no effect in production code because
-    /// production code is expected to call [`Self::attach_storage`] instead.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn set_records_stored_for_tests(&self, count: u64) {
-        *self.test_records_override.write() = Some(count);
-    }
-
     /// Test-only setter for local closest peers used by the paid-quote
     /// issuer K-closest check.
     #[cfg(any(test, feature = "test-utils"))]
@@ -536,32 +499,6 @@ impl PaymentVerifier {
         self.test_completed_payments_override
             .write()
             .insert(quote_hash, amount);
-    }
-
-    /// Snapshot the current record count for paid-quote price-floor checks.
-    ///
-    /// Prefers the attached `LmdbStorage` (authoritative — covers client PUTs,
-    /// replication stores, repair fetches, and prune deletes by definition).
-    /// Falls back to a test override if one was set. Returns `None` only when
-    /// no source is available (mis-configured production startup). The
-    /// paid-quote floor rejects client PUTs because the local floor is
-    /// the economic security gate for this proof policy.
-    fn current_records_stored(&self) -> Option<u64> {
-        // Clone the Arc out and drop the guard before the storage read, so the
-        // `RwLock<Option<Arc<LmdbStorage>>>` is never held across `current_chunks()`.
-        let storage = self.storage.read().as_ref().map(Arc::clone);
-        if let Some(storage) = storage {
-            match storage.current_chunks() {
-                Ok(n) => return Some(n),
-                Err(e) => {
-                    warn!(
-                        "PaymentVerifier: failed to read current_chunks() for price-floor check: {e}"
-                    );
-                    return None;
-                }
-            }
-        }
-        *self.test_records_override.read()
     }
 
     /// Check if payment is required for the given `XorName`.
@@ -812,14 +749,13 @@ impl PaymentVerifier {
     /// 2. Median-priced candidate quotes are derived from the supplied bundle
     /// 3. Each candidate is checked for content binding, peer binding, and a
     ///    valid ML-DSA-65 signature
-    /// 4. Each candidate must also come from a local K-close peer and
-    ///    satisfy the paid-quote price floor
+    /// 4. Each candidate must also come from a local K-close peer
     /// 5. A candidate is accepted only if `completedPayments(quoteHash)` is at
     ///    least 3x the median price
     ///
     /// Non-median quotes are parsed only to locate the median. Their content,
     /// peer bindings, and signatures are deliberately ignored: the paid
-    /// quote's content hash, quote hash, signature, local floor, issuer
+    /// quote's content hash, quote hash, signature, issuer
     /// K-closeness check, and on-chain settlement are the authority. A
     /// one-quote proof is valid when that single quote passes these checks and
     /// was paid 3x.
@@ -955,7 +891,6 @@ impl PaymentVerifier {
 
         self.validate_paid_quote_issuer_k_closest(xorname, &issuer_peer_id)
             .await?;
-        self.validate_paid_quote_price_floor(candidate.quote)?;
 
         Self::validate_paid_quote_signature(candidate).await?;
 
@@ -1047,32 +982,6 @@ impl PaymentVerifier {
         }
 
         Ok(expected_peer_id)
-    }
-
-    fn validate_paid_quote_price_floor(&self, quote: &PaymentQuote) -> Result<()> {
-        let Some(current_records) = self.current_records_stored() else {
-            return Err(Error::Payment(
-                "PaymentVerifier: no record-count source attached; cannot verify \
-                 paid-quote local price floor"
-                    .to_string(),
-            ));
-        };
-
-        let current_price = calculate_price(usize::try_from(current_records).unwrap_or(usize::MAX));
-        let min_acceptable_price = price_floor(current_price, PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT);
-
-        if quote.price < min_acceptable_price {
-            let quoted_records = derive_records_stored_from_price(quote.price);
-            return Err(Error::Payment(format!(
-                "Paid quote price below local floor: quoted price encodes \
-                 {quoted_records} records but node currently holds {current_records} \
-                 (quoted {}, minimum acceptable {min_acceptable_price} at \
-                 {PAID_QUOTE_PRICE_FLOOR_TOLERANCE_PCT}% under-payment tolerance)",
-                quote.price
-            )));
-        }
-
-        Ok(())
     }
 
     async fn validate_paid_quote_issuer_k_closest(
@@ -3003,7 +2912,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_paid_median_full_path_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xA1u8; 32];
         let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         mark_k_closest_paid_candidates(&verifier, &peer_quotes);
@@ -3029,7 +2937,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_single_quote_proof_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xB1u8; 32];
         let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
         let peer_quotes = vec![(peer_id, quote.clone())];
@@ -3050,7 +2957,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_single_quote_proof_requires_three_x_payment() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xB2u8; 32];
         let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
         let peer_quotes = vec![(peer_id, quote.clone())];
@@ -3072,7 +2978,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_too_many_quotes_rejected() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xB3u8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         peer_quotes.push(make_signed_quote(xorname, price_at_records(7), 8));
@@ -3092,7 +2997,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_structural_majority_price_at_median_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(1000);
         let xorname = [0xA2u8; 32];
         let peer_quotes = make_signed_legacy_bundle(
             xorname,
@@ -3127,47 +3031,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_above_median_verifier_rejected_by_floor() {
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(2000);
-        let xorname = [0xA3u8; 32];
-        let peer_quotes = make_signed_legacy_bundle(
-            xorname,
-            [
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(100),
-                crate::payment::pricing::calculate_price(500),
-                crate::payment::pricing::calculate_price(1000),
-                crate::payment::pricing::calculate_price(2000),
-                crate::payment::pricing::calculate_price(4000),
-                crate::payment::pricing::calculate_price(6000),
-            ],
-        );
-        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
-        let expected_amount = expected_median_payment(&peer_quotes);
-        let paid_quote = median_test_candidates(&peer_quotes)
-            .first()
-            .expect("median candidate")
-            .1
-            .clone();
-        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
-
-        let proof_bytes = serialize_proof(peer_quotes);
-        let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await
-            .expect_err("above-median verifier should reject the client PUT");
-
-        assert!(
-            format!("{err}").contains("below local floor"),
-            "Error should mention paid-quote floor: {err}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_legacy_paid_median_issuer_k_closest_rejection() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         verifier.set_paid_quote_k_closest_for_tests(vec![rand::random()]);
         let xorname = [0xA4u8; 32];
         let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
@@ -3192,47 +3057,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_legacy_paid_median_floor_rejection() {
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        let xorname = [0xA5u8; 32];
-        let peer_quotes = make_signed_legacy_bundle(
-            xorname,
-            [
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-            ],
-        );
-        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
-        let expected_amount = expected_median_payment(&peer_quotes);
-        let paid_quote = median_test_candidates(&peer_quotes)
-            .first()
-            .expect("median candidate")
-            .1
-            .clone();
-        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
-
-        let proof_bytes = serialize_proof(peer_quotes);
-        let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await
-            .expect_err("cheap paid median should be rejected");
-
-        assert!(
-            format!("{err}").contains("below local floor"),
-            "Error should mention local floor: {err}"
-        );
-    }
-
-    #[tokio::test]
     async fn test_legacy_zero_price_median_rejected() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xA6u8; 32];
         let peer_quotes = make_signed_legacy_bundle(
             xorname,
@@ -3262,7 +3088,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_paid_quote_content_mismatch_rejected() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xA7u8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         let median_index = median_quote_index(peer_quotes.len());
@@ -3284,7 +3109,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_unpaid_quote_content_mismatch_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xA8u8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         peer_quotes[0].1.content = xor_name::XorName([0xE8u8; 32]);
@@ -3311,7 +3135,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_paid_quote_bad_signature_rejected() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xA9u8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         let median_index = median_quote_index(peer_quotes.len());
@@ -3340,7 +3163,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_unpaid_quote_bad_signature_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xAAu8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         peer_quotes[0].1.signature.push(0xFF);
@@ -3367,7 +3189,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_unpaid_peer_binding_mismatch_accepted() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xABu8; 32];
         let mut peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
         peer_quotes[0].0 = evmlib::EncodedPeerId::new(rand::random());
@@ -3394,7 +3215,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_median_tie_accepts_paid_candidate() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         let xorname = [0xACu8; 32];
         let peer_quotes = make_signed_legacy_bundle(xorname, tied_median_test_prices());
         mark_k_closest_paid_candidates(&verifier, &peer_quotes);
@@ -3421,7 +3241,6 @@ mod tests {
     #[tokio::test]
     async fn test_legacy_paid_list_admission_enforces_issuer_k_closest() {
         let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(0);
         verifier.set_paid_quote_k_closest_for_tests(Vec::new());
         let xorname = [0xB5u8; 32];
         let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
@@ -3446,48 +3265,6 @@ mod tests {
         assert!(
             format!("{err}").contains("not among this node's local"),
             "Error should mention local K-closest peers: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_legacy_paid_list_admission_enforces_full_bundle_floor() {
-        let verifier = create_test_verifier();
-        verifier.set_records_stored_for_tests(6000);
-        let xorname = [0xB6u8; 32];
-        let peer_quotes = make_signed_legacy_bundle(
-            xorname,
-            [
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-                crate::payment::pricing::calculate_price(0),
-            ],
-        );
-        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
-        let expected_amount = expected_median_payment(&peer_quotes);
-        let paid_quote = median_test_candidates(&peer_quotes)
-            .first()
-            .expect("median candidate")
-            .1
-            .clone();
-        mark_candidate_paid(&verifier, &paid_quote, expected_amount);
-
-        let proof_bytes = serialize_proof(peer_quotes);
-        let err = verifier
-            .verify_payment(
-                &xorname,
-                Some(&proof_bytes),
-                VerificationContext::PaidListAdmission,
-            )
-            .await
-            .expect_err("paid-list admission must enforce the floor for full bundles");
-
-        assert!(
-            format!("{err}").contains("below local floor"),
-            "Error should mention the local price floor: {err}"
         );
     }
 
@@ -5084,7 +4861,7 @@ mod tests {
     /// baseline floor (n=0), small counts, the pricing-curve knee
     /// (`n=PRICING_DIVISOR=6000`), and a saturating-arithmetic regime.
     #[test]
-    fn adr0003_on_curve_prices_round_trip() {
+    fn adr0004_on_curve_prices_round_trip() {
         for &n in &[0usize, 1, 2, 100, 5999, 6000, 6001, 50_000, 1_000_000] {
             let price = crate::payment::pricing::calculate_price(n);
             assert!(
@@ -5098,7 +4875,7 @@ mod tests {
     /// point is between two adjacent curve values and must fail the
     /// canonicality predicate. The check IS exact equality, not a tolerance.
     #[test]
-    fn adr0003_off_curve_prices_rejected_by_predicate() {
+    fn adr0004_off_curve_prices_rejected_by_predicate() {
         // n=100 is well above baseline so price ± 1 is non-saturating.
         let on = crate::payment::pricing::calculate_price(100);
         let just_above = on + Amount::from(1u64);
@@ -5117,7 +4894,7 @@ mod tests {
     /// minimum value is `calculate_price(0) = BASELINE`, so any smaller value
     /// has no corresponding `n`.
     #[test]
-    fn adr0003_sub_baseline_price_is_off_curve() {
+    fn adr0004_sub_baseline_price_is_off_curve() {
         let baseline = crate::payment::pricing::calculate_price(0);
         let sub_baseline = baseline - Amount::from(1u64);
         assert!(
@@ -5134,7 +4911,7 @@ mod tests {
     /// per-quote diagnostics assertion is what proves the bundle is genuinely
     /// on-curve regardless of how the const ships.
     #[test]
-    fn adr0003_validate_quote_arithmetic_passes_for_honest_bundle() {
+    fn adr0004_validate_quote_arithmetic_passes_for_honest_bundle() {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let payment = ProofOfPayment {
@@ -5166,10 +4943,10 @@ mod tests {
     /// [`QUOTE_ARITHMETIC_RECHECK_ENABLED`]. We assert the gate's current
     /// observe-only stance: an off-curve quote is accepted with no error.
     /// The enforcement-branch behaviour is exercised separately by
-    /// `adr0003_off_curve_diagnostics_yields_reject_payload` so both branches
+    /// `adr0004_off_curve_diagnostics_yields_reject_payload` so both branches
     /// of the const-gated split are covered in CI.
     #[test]
-    fn adr0003_observe_only_does_not_reject_off_curve_quote() {
+    fn adr0004_observe_only_does_not_reject_off_curve_quote() {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let mut quote = make_fake_quote_at_records(
@@ -5205,7 +4982,7 @@ mod tests {
     /// the const to `true` then merely wires this diagnostic into the outer
     /// `Err` return, which is what `validate_quote_arithmetic` does.
     #[test]
-    fn adr0003_off_curve_diagnostics_yields_reject_payload() {
+    fn adr0004_off_curve_diagnostics_yields_reject_payload() {
         let on = crate::payment::pricing::calculate_price(100);
         let off = on + Amount::from(1u64);
 
@@ -5236,7 +5013,7 @@ mod tests {
     /// some value strictly less than `Amount::MAX` due to the additive
     /// baseline). The gate must reject it.
     #[test]
-    fn adr0003_amount_max_price_is_off_curve() {
+    fn adr0004_amount_max_price_is_off_curve() {
         let price = Amount::MAX;
         assert!(
             !PaymentVerifier::quote_price_is_on_curve(&price),
@@ -5250,7 +5027,7 @@ mod tests {
     /// underlying decision matches the single-node side, so the Merkle gate
     /// inherits the same correctness as `validate_quote_arithmetic`.
     #[test]
-    fn adr0003_merkle_candidate_canonicality_matches_single_node() {
+    fn adr0004_merkle_candidate_canonicality_matches_single_node() {
         // Every on-curve `n` produces a price the predicate accepts; one wei
         // off produces a price the predicate rejects. This is the entire
         // contract; the Merkle gate's outer wrapper enforces the same const
@@ -5281,7 +5058,7 @@ mod tests {
     /// rollout const; the diagnostics path is what carries the rejection
     /// information when enforcement flips on.
     #[test]
-    fn adr0003_merkle_pool_off_curve_candidate_caught_by_diagnostics() {
+    fn adr0004_merkle_pool_off_curve_candidate_caught_by_diagnostics() {
         use evmlib::merkle_payments::MerklePaymentCandidatePool;
 
         let timestamp = 1_700_000_000u64;
