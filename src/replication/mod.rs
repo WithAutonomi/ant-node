@@ -1757,6 +1757,7 @@ impl ReplicationEngine {
                                 "Fetch candidate {} has no sources — dropping",
                                 hex::encode(candidate.key)
                             );
+                            q.discard_fetch_candidate(&candidate);
                             continue;
                         };
                         q.start_fetch_with_retry(
