@@ -44,6 +44,7 @@ use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -822,7 +823,43 @@ impl ReplicationEngine {
                     // previous approach of checking every PeerConnected /
                     // PeerDisconnected event against the close group.
                     dht_event = dht_events.recv() => {
-                        let Ok(dht_event) = dht_event else { continue };
+                        let dht_event = match dht_event {
+                            Ok(event) => event,
+                            Err(RecvError::Lagged(missed)) => {
+                                // Under heavy churn the broadcast buffer can overflow
+                                // and drop routing-table events — the moment
+                                // convergence matters most. A dropped
+                                // KClosestPeersChanged means its entrants were never
+                                // queued, so draining priority_order cannot recover
+                                // them. Resync from ground truth instead: snapshot the
+                                // current close-peer set and queue every member. Dedup
+                                // (queue_priority_peers) and per-peer cooldown
+                                // (select_next_sync_peer) drop peers already queued or
+                                // recently synced, so only genuine entrants surface.
+                                warn!(
+                                    "Missed {missed} DHT routing events (broadcast lag); resynchronizing close-peer set for neighbor sync"
+                                );
+                                let self_id = *p2p.peer_id();
+                                let neighbors = neighbor_sync::snapshot_close_neighbors(
+                                    &p2p,
+                                    &self_id,
+                                    config.neighbor_sync_scope,
+                                )
+                                .await;
+                                let requeued = {
+                                    let mut state = sync_state.write().await;
+                                    state.queue_priority_peers(neighbors)
+                                };
+                                if requeued > 0 {
+                                    debug!(
+                                        "Resync after broadcast lag queued {requeued} close peers for priority neighbor sync"
+                                    );
+                                    sync_trigger.notify_one();
+                                }
+                                continue;
+                            }
+                            Err(RecvError::Closed) => continue,
+                        };
                         match dht_event {
                             DhtNetworkEvent::KClosestPeersChanged { old, new } => {
                                 let old_peers = old
@@ -923,12 +960,22 @@ impl ReplicationEngine {
 
         let handle = tokio::spawn(async move {
             loop {
-                let interval = config.random_neighbor_sync_interval();
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(interval) => {}
-                    () = sync_trigger.notified() => {
-                        debug!("Neighbor sync triggered by topology change");
+                // Park for the periodic tick or an explicit trigger ONLY when no
+                // priority (topology-change) peers are queued. `sync_trigger` is a
+                // coalescing `Notify`, so a churn burst that queues many entrants
+                // produces a single wakeup; parking after draining one batch would
+                // leave the rest waiting up to a full periodic tick. `priority_order`
+                // is the durable record of pending work, so drain it back-to-back —
+                // each round removes the peers it selects (`select_next_sync_peer`),
+                // so the drain terminates once the queue empties.
+                if !sync_state.read().await.has_priority_peers() {
+                    let interval = config.random_neighbor_sync_interval();
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(interval) => {}
+                        () = sync_trigger.notified() => {
+                            debug!("Neighbor sync triggered by topology change");
+                        }
                     }
                 }
                 // Wrap the sync round in a select so shutdown cancels

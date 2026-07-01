@@ -633,6 +633,17 @@ impl NeighborSyncState {
     pub fn is_cycle_complete(&self) -> bool {
         self.priority_order.is_empty() && self.cursor >= self.order.len()
     }
+
+    /// Whether topology-change (priority) peers are still queued.
+    ///
+    /// The neighbor-sync loop drains these back-to-back rather than parking on
+    /// the periodic tick, so a churn burst converges at round-trip speed. The
+    /// `sync_trigger` `Notify` coalesces multiple wakeups into one, so it cannot
+    /// be the sole signal for pending work — this queue is the source of truth.
+    #[must_use]
+    pub fn has_priority_peers(&self) -> bool {
+        !self.priority_order.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1231,6 +1242,31 @@ mod tests {
 
         assert_eq!(state.queue_priority_peers([peer, peer]), 1);
         assert_eq!(state.priority_order.len(), 1);
+    }
+
+    #[test]
+    fn neighbor_sync_has_priority_peers_tracks_queue_and_drain() {
+        // The neighbor-sync loop drains the priority queue back-to-back and only
+        // parks once `has_priority_peers` reports false. Draining removes each
+        // queued peer (as `select_next_sync_peer` does via `remove_peer`), so the
+        // signal must flip to false once every entrant is consumed — this is the
+        // loop's termination guarantee.
+        let first = peer_id_from_byte(6);
+        let second = peer_id_from_byte(7);
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+        assert!(!state.has_priority_peers());
+
+        assert_eq!(state.queue_priority_peers([first, second]), 2);
+        assert!(state.has_priority_peers());
+
+        assert!(state.remove_peer(&first));
+        assert!(state.has_priority_peers(), "one entrant still pending");
+
+        assert!(state.remove_peer(&second));
+        assert!(
+            !state.has_priority_peers(),
+            "drained queue must let the loop park"
+        );
     }
 
     #[test]
