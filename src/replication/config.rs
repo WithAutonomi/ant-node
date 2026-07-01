@@ -40,6 +40,16 @@ pub const QUORUM_THRESHOLD: usize = 4; // floor(CLOSE_GROUP_SIZE / 2) + 1
 /// Maximum number of closest nodes tracking paid status for a key.
 pub const PAID_LIST_CLOSE_GROUP_SIZE: usize = 20;
 
+/// Number of furthest paid-list close-group peers treated as churny edge
+/// voters.
+///
+/// Once the paid-list close group reaches [`PAID_LIST_CLOSE_GROUP_SIZE`], edge
+/// peers are queried, but a negative edge paid-list response does not count
+/// into the paid-list majority denominator. A positive edge response does
+/// count. This absorbs local routing-table disagreement at the boundary of the
+/// paid close group. Undersized groups keep their ordinary strict majority.
+pub const PAID_LIST_FLEX_EDGE_COUNT: usize = 4;
+
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 
