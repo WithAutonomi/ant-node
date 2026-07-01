@@ -121,6 +121,8 @@ pub struct InFlightEntry {
     pub all_sources: Vec<PeerId>,
     /// Sources already attempted (failed or in progress).
     pub tried: HashSet<PeerId>,
+    /// Pending-verification entry to restore if all fetch sources fail.
+    pub retry_verification: Option<VerificationEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -281,6 +283,24 @@ impl ReplicationQueues {
         self.pending_verify.keys().copied().collect()
     }
 
+    /// Collect pending verification keys whose retry delay has elapsed.
+    #[must_use]
+    pub fn ready_pending_keys(&self, now: Instant) -> Vec<XorName> {
+        self.pending_verify
+            .iter()
+            .filter_map(|(key, entry)| (entry.next_verify_at <= now).then_some(*key))
+            .collect()
+    }
+
+    /// Defer a pending key before its next verification attempt.
+    pub fn defer_pending(&mut self, key: &XorName, retry_after: Duration) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
+        entry.next_verify_at = Instant::now() + retry_after;
+        true
+    }
+
     /// Number of keys in pending verification.
     #[must_use]
     pub fn pending_count(&self) -> usize {
@@ -316,11 +336,35 @@ impl ReplicationQueues {
             );
             return false;
         }
+        self.enqueue_fetch_with_retry(key, distance, sources, None)
+    }
+
+    fn enqueue_fetch_with_retry(
+        &mut self,
+        key: XorName,
+        distance: XorName,
+        sources: Vec<PeerId>,
+        retry_verification: Option<VerificationEntry>,
+    ) -> bool {
+        if self.pending_verify.contains_key(&key)
+            || self.fetch_queue_keys.contains(&key)
+            || self.in_flight_fetch.contains_key(&key)
+        {
+            return false;
+        }
+        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
+            debug!(
+                "fetch_queue at capacity ({MAX_FETCH_QUEUE}); dropping new key {}",
+                hex::encode(key)
+            );
+            return false;
+        }
         self.fetch_queue_keys.insert(key);
         self.fetch_queue.push(FetchCandidate {
             key,
             distance,
             sources,
+            retry_verification,
         });
         true
     }
@@ -351,12 +395,12 @@ impl ReplicationQueues {
             return false;
         }
         // Capacity confirmed; safe to release the pending slot and enqueue.
-        let _ = self.remove_pending(&key);
+        let retry_verification = self.remove_pending(&key);
         // enqueue_fetch returns false only on capacity or already-queued; the
         // capacity check above and the just-removed pending state make this
         // succeed. If a concurrent path put the key into fetch_queue/in_flight
         // between, dropping the duplicate is fine.
-        self.enqueue_fetch(key, distance, sources)
+        self.enqueue_fetch_with_retry(key, distance, sources, retry_verification)
     }
 
     /// Dequeue the nearest fetch candidate.
@@ -386,6 +430,17 @@ impl ReplicationQueues {
 
     /// Mark a key as in-flight (actively being fetched from `source`).
     pub fn start_fetch(&mut self, key: XorName, source: PeerId, all_sources: Vec<PeerId>) {
+        self.start_fetch_with_retry(key, source, all_sources, None);
+    }
+
+    /// Mark a key as in-flight and retain verification retry metadata.
+    pub fn start_fetch_with_retry(
+        &mut self,
+        key: XorName,
+        source: PeerId,
+        all_sources: Vec<PeerId>,
+        retry_verification: Option<VerificationEntry>,
+    ) {
         let mut tried = HashSet::new();
         tried.insert(source);
         self.in_flight_fetch.insert(
@@ -396,6 +451,7 @@ impl ReplicationQueues {
                 started_at: Instant::now(),
                 all_sources,
                 tried,
+                retry_verification,
             },
         );
     }
@@ -428,6 +484,27 @@ impl ReplicationQueues {
         }
     }
 
+    /// Complete an exhausted fetch and restore its verification entry for a
+    /// later retry when retry metadata exists.
+    pub fn requeue_fetch_for_verification(&mut self, key: &XorName, retry_after: Duration) -> bool {
+        let Some(mut entry) = self.complete_fetch(key) else {
+            return false;
+        };
+        let Some(mut verification) = entry.retry_verification.take() else {
+            return false;
+        };
+
+        verification.state = VerificationState::PendingVerify;
+        verification.verified_sources.clear();
+        verification.tried_sources.clear();
+        verification.next_verify_at = Instant::now() + retry_after;
+
+        matches!(
+            self.add_pending_verify(*key, verification),
+            AdmissionResult::Admitted | AdmissionResult::AlreadyPresent
+        )
+    }
+
     /// Number of in-flight fetches.
     #[must_use]
     pub fn in_flight_count(&self) -> usize {
@@ -455,21 +532,30 @@ impl ReplicationQueues {
     }
 
     /// Evict stale pending-verification entries older than `max_age`.
-    pub fn evict_stale(&mut self, max_age: Duration) {
+    pub fn evict_stale(&mut self, max_age: Duration) -> Vec<XorName> {
         let now = Instant::now();
-        let before = self.pending_verify.len();
-        let pending_per_sender = &mut self.pending_per_sender;
-        self.pending_verify.retain(|_, entry| {
-            let fresh = now.duration_since(entry.created_at) < max_age;
-            if !fresh {
-                Self::release_sender_slot(pending_per_sender, &entry.hint_sender);
+        let evicted_keys = self
+            .pending_verify
+            .iter()
+            .filter_map(|(key, entry)| {
+                (now.duration_since(entry.created_at) >= max_age).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+
+        for key in &evicted_keys {
+            if let Some(entry) = self.pending_verify.remove(key) {
+                Self::release_sender_slot(&mut self.pending_per_sender, &entry.hint_sender);
             }
-            fresh
-        });
-        let evicted = before.saturating_sub(self.pending_verify.len());
-        if evicted > 0 {
-            debug!("Evicted {evicted} stale pending-verification entries");
         }
+
+        if !evicted_keys.is_empty() {
+            debug!(
+                "Evicted {} stale pending-verification entries",
+                evicted_keys.len()
+            );
+        }
+
+        evicted_keys
     }
 
     /// Number of `pending_verify` entries currently attributed to `sender`.
@@ -506,12 +592,14 @@ mod tests {
 
     /// Create a minimal `VerificationEntry` for testing.
     fn test_entry(sender_byte: u8) -> VerificationEntry {
+        let now = Instant::now();
         VerificationEntry {
             state: VerificationState::PendingVerify,
             pipeline: HintPipeline::Replica,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
-            created_at: Instant::now(),
+            created_at: now,
+            next_verify_at: now,
             hint_sender: peer_id_from_byte(sender_byte),
         }
     }
@@ -651,6 +739,75 @@ mod tests {
         assert!(queues.retry_fetch(&xor_name_from_byte(0xFF)).is_none());
     }
 
+    #[test]
+    fn exhausted_promoted_fetch_requeues_verification() {
+        const KEY_BYTE: u8 = 0x44;
+        const DISTANCE_BYTE: u8 = 0x01;
+        const SOURCE_BYTE: u8 = 2;
+        const HINT_SENDER_BYTE: u8 = 9;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+        const RETRY_DELAY_SLACK: Duration = Duration::from_secs(1);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(KEY_BYTE);
+        let distance = xor_name_from_byte(DISTANCE_BYTE);
+        let source = peer_id_from_byte(SOURCE_BYTE);
+        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
+        let mut entry = test_entry(HINT_SENDER_BYTE);
+        entry.hint_sender = hint_sender;
+
+        assert!(queues.add_pending_verify(key, entry).admitted());
+        assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
+
+        let candidate = queues.dequeue_fetch().expect("fetch candidate");
+        queues.start_fetch_with_retry(
+            candidate.key,
+            source,
+            candidate.sources,
+            candidate.retry_verification,
+        );
+
+        assert!(
+            queues.retry_fetch(&key).is_none(),
+            "single source should be exhausted"
+        );
+        assert!(queues.requeue_fetch_for_verification(&key, RETRY_DELAY));
+
+        assert_eq!(queues.in_flight_count(), 0);
+        assert_eq!(queues.pending_count_for_sender(&hint_sender), 1);
+        assert!(
+            queues.ready_pending_keys(Instant::now()).is_empty(),
+            "requeued key should observe retry delay"
+        );
+
+        let after_retry = Instant::now() + RETRY_DELAY + RETRY_DELAY_SLACK;
+        assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
+    }
+
+    #[test]
+    fn exhausted_direct_fetch_remains_terminal() {
+        const KEY_BYTE: u8 = 0x45;
+        const DISTANCE_BYTE: u8 = 0x01;
+        const SOURCE_BYTE: u8 = 2;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(KEY_BYTE);
+        let source = peer_id_from_byte(SOURCE_BYTE);
+
+        queues.enqueue_fetch(key, xor_name_from_byte(DISTANCE_BYTE), vec![source]);
+        let candidate = queues.dequeue_fetch().expect("fetch candidate");
+        queues.start_fetch(candidate.key, source, candidate.sources);
+
+        assert!(
+            queues.retry_fetch(&key).is_none(),
+            "single source should be exhausted"
+        );
+        assert!(!queues.requeue_fetch_for_verification(&key, RETRY_DELAY));
+        assert_eq!(queues.in_flight_count(), 0);
+        assert_eq!(queues.pending_count(), 0);
+    }
+
     // -- contains_key across pipelines ------------------------------------
 
     #[test]
@@ -726,7 +883,8 @@ mod tests {
         assert_eq!(queues.pending_count(), 1);
         assert_eq!(queues.pending_count_for_sender(&sender), 1);
 
-        queues.evict_stale(Duration::from_secs(1));
+        let evicted = queues.evict_stale(Duration::from_secs(1));
+        assert_eq!(evicted, vec![key]);
         assert_eq!(
             queues.pending_count(),
             0,
@@ -746,12 +904,36 @@ mod tests {
         let key = xor_name_from_byte(0x01);
         queues.add_pending_verify(key, test_entry(1));
 
-        queues.evict_stale(Duration::from_secs(3600));
+        let evicted = queues.evict_stale(Duration::from_secs(3600));
+        assert!(
+            evicted.is_empty(),
+            "fresh entry should not be reported as evicted"
+        );
         assert_eq!(
             queues.pending_count(),
             1,
             "fresh entry should not be evicted"
         );
+    }
+
+    #[test]
+    fn deferred_pending_key_is_not_ready_until_retry_time() {
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+        const RETRY_DELAY_SLACK: Duration = Duration::from_secs(1);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAA);
+        queues.add_pending_verify(key, test_entry(1));
+
+        assert_eq!(queues.ready_pending_keys(Instant::now()), vec![key]);
+        assert!(queues.defer_pending(&key, RETRY_DELAY));
+        assert!(
+            queues.ready_pending_keys(Instant::now()).is_empty(),
+            "deferred key should not be retried immediately"
+        );
+
+        let after_retry = Instant::now() + RETRY_DELAY + RETRY_DELAY_SLACK;
+        assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
     }
 
     // -- remove_pending ---------------------------------------------------
@@ -855,6 +1037,7 @@ mod tests {
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
+            next_verify_at: Instant::now(),
             hint_sender: peer_id_from_byte(1),
         };
 
@@ -874,6 +1057,7 @@ mod tests {
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
+            next_verify_at: Instant::now(),
             hint_sender: peer_id_from_byte(2),
         };
 
@@ -914,6 +1098,7 @@ mod tests {
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
+            next_verify_at: Instant::now(),
             hint_sender,
         };
         assert!(
