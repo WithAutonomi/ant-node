@@ -59,12 +59,14 @@ fn unique_xorname(i: u32) -> [u8; 32] {
 }
 
 fn entry_from(sender: PeerId) -> VerificationEntry {
+    let now = Instant::now();
     VerificationEntry {
         state: VerificationState::PendingVerify,
         pipeline: HintPipeline::Replica,
         verified_sources: Vec::new(),
         tried_sources: HashSet::new(),
-        created_at: Instant::now(),
+        created_at: now,
+        next_verify_at: now,
         hint_sender: sender,
     }
 }

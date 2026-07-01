@@ -95,12 +95,16 @@ pub async fn admit_hints(
         rejected_keys: Vec::new(),
     };
 
-    // Track all processed keys to deduplicate within and across sets.
-    let mut seen = HashSet::new();
+    // Track replica outcomes separately. A replica hint wins over a duplicate
+    // paid hint only when it is actually admitted; if local routing churn
+    // rejects the replica side, the paid-list path still gets a chance.
+    let mut seen_replica = HashSet::new();
+    let mut admitted_replica = HashSet::new();
+    let mut rejected_replica = Vec::new();
 
     // Process replica hints.
     for &key in replica_hints {
-        if !seen.insert(key) {
+        if !seen_replica.insert(key) {
             continue;
         }
 
@@ -110,6 +114,7 @@ pub async fn admit_hints(
 
         if already_local || already_pending {
             result.replica_keys.push(key);
+            admitted_replica.insert(key);
             continue;
         }
 
@@ -122,15 +127,23 @@ pub async fn admit_hints(
         .await
         {
             result.replica_keys.push(key);
+            admitted_replica.insert(key);
         } else {
-            result.rejected_keys.push(key);
+            rejected_replica.push(key);
         }
     }
 
-    // Process paid hints. Cross-set dedup is handled by `seen` — any key
-    // already processed in the replica-hints loop above is skipped here.
+    // Process paid hints. A key already admitted as a replica remains a
+    // replica-pipeline key. If the replica path rejected it, however, paid-list
+    // admission can still authorize metadata convergence for churned views.
+    let mut seen_paid = HashSet::new();
+    let mut admitted_paid = HashSet::new();
+    let mut rejected_paid = Vec::new();
     for &key in paid_hints {
-        if !seen.insert(key) {
+        if !seen_paid.insert(key) {
+            continue;
+        }
+        if admitted_replica.contains(&key) {
             continue;
         }
 
@@ -139,16 +152,25 @@ pub async fn admit_hints(
 
         if already_paid {
             result.paid_only_keys.push(key);
+            admitted_paid.insert(key);
             continue;
         }
 
         if is_in_paid_close_group(self_id, &key, p2p_node, config.paid_list_close_group_size).await
         {
             result.paid_only_keys.push(key);
-        } else {
+            admitted_paid.insert(key);
+        } else if !seen_replica.contains(&key) {
+            rejected_paid.push(key);
+        }
+    }
+
+    for key in rejected_replica {
+        if !admitted_paid.contains(&key) {
             result.rejected_keys.push(key);
         }
     }
+    result.rejected_keys.extend(rejected_paid);
 
     result
 }
@@ -225,27 +247,22 @@ mod tests {
 
     #[test]
     fn deduplication_across_sets() {
-        // If a key appears in replica_hints AND paid_hints, the paid entry
-        // is skipped because seen already contains it from replica processing.
+        // If a key appears in replica_hints AND paid_hints and the replica
+        // side is admitted, the paid entry is skipped because the stronger
+        // replica pipeline already covers paid-list convergence.
         let key = xor_name_from_byte(0xFF);
         let replica_hints = vec![key];
         let paid_hints = vec![key];
 
-        let replica_set: HashSet<XorName> = replica_hints.iter().copied().collect();
-        let mut seen: HashSet<XorName> = HashSet::new();
+        let mut admitted_replica: HashSet<XorName> = HashSet::new();
 
-        // Process replica hints first.
         for &k in &replica_hints {
-            seen.insert(k);
+            admitted_replica.insert(k);
         }
 
-        // Process paid hints: key is already in `seen` AND in `replica_set`.
         let mut paid_admitted = Vec::new();
         for &k in &paid_hints {
-            if !seen.insert(k) {
-                continue; // duplicate
-            }
-            if replica_set.contains(&k) {
+            if admitted_replica.contains(&k) {
                 continue; // cross-set precedence
             }
             paid_admitted.push(k);
@@ -254,6 +271,48 @@ mod tests {
         assert!(
             paid_admitted.is_empty(),
             "paid-hint should be suppressed when key is also a replica hint"
+        );
+    }
+
+    #[test]
+    fn paid_hint_survives_duplicate_replica_rejection() {
+        // With churned local views, a sender may believe we are in the storage
+        // close group while our own view rejects the replica hint. If the same
+        // key also arrives as a paid hint, paid-list admission must still run.
+        let key = xor_name_from_byte(0xEE);
+        let replica_hints = vec![key];
+        let paid_hints = vec![key];
+
+        let mut seen_replica = HashSet::new();
+        let admitted_replica: HashSet<XorName> = HashSet::new();
+        let mut rejected_replica = Vec::new();
+
+        for &k in &replica_hints {
+            if seen_replica.insert(k) {
+                rejected_replica.push(k);
+            }
+        }
+
+        let mut admitted_paid = HashSet::new();
+        for &k in &paid_hints {
+            if admitted_replica.contains(&k) {
+                continue;
+            }
+            let in_paid_close_group = true;
+            if in_paid_close_group {
+                admitted_paid.insert(k);
+            }
+        }
+
+        assert!(
+            admitted_paid.contains(&key),
+            "paid hint must be considered after duplicate replica rejection"
+        );
+        assert!(
+            rejected_replica
+                .into_iter()
+                .all(|k| admitted_paid.contains(&k)),
+            "replica rejection should not remain terminal after paid admission"
         );
     }
 
