@@ -1395,6 +1395,7 @@ impl PaymentVerifier {
                     peer: peer_id,
                     pin,
                     key_count: quote.committed_key_count,
+                    quote_ts: quote.timestamp,
                 });
             }
             // Resolution order: sidecar (synchronous, no state) -> gossip cache
@@ -2498,6 +2499,11 @@ impl PaymentVerifier {
                     peer: peer_id,
                     pin,
                     key_count: candidate.committed_key_count,
+                    quote_ts: std::time::UNIX_EPOCH
+                        .checked_add(std::time::Duration::from_secs(
+                            candidate.merkle_payment_timestamp,
+                        ))
+                        .unwrap_or(std::time::UNIX_EPOCH),
                 });
             }
 

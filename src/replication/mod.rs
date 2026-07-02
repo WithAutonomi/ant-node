@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use lru::LruCache;
 use std::pin::Pin;
@@ -165,6 +165,14 @@ const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 /// durable well before it could matter to a restart, while the write-on-change
 /// guard keeps idle nodes from needless disk writes.
 const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
+
+/// Clock-skew margin for the first-audit in-window screen (ADR-0004 A1 guardrail
+/// A). A monetized pin whose signed quote is older than
+/// `GOSSIP_ANSWERABILITY_TTL - MONETIZED_AUDIT_SKEW_MARGIN` is NOT first-audited:
+/// the responder may have legitimately aged it out, so — with grace removed —
+/// auditing it could false-convict. The margin absorbs auditor/responder clock
+/// skew so the audit always lands strictly inside the responder's window.
+const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(10 * 60);
 
 /// Minimum interval between commitment signature verifications for a
 /// single peer (v10/v12 §2 step 3 + §11 `DoS`).
@@ -772,6 +780,7 @@ impl ReplicationEngine {
     /// deterministic first audit; a peer minting fresh pins faster than the
     /// cooldown forfeits the older ones' coverage, never the newest's (the
     /// channel surfaces newest pins as they are monetized).
+    #[allow(clippy::too_many_lines)]
     fn start_first_audit_drainer(&mut self) {
         let Some(mut rx) = self.monetized_pin_rx.take() else {
             return;
@@ -865,6 +874,24 @@ impl ReplicationEngine {
                 for (peer, event) in snapshot {
                     // Dedup: a pin already first-audited is dropped (done).
                     if first_audited.contains(&event.pin) {
+                        continue;
+                    }
+                    // ADR-0004 A1 (guardrail A): skip a pin whose SIGNED quote is
+                    // older than the answerability window (minus a skew margin).
+                    // The responder may have legitimately aged such a pin out, and
+                    // with grace removed an out-of-window UnknownCommitment would
+                    // false-convict — so a stale client-forwarded quote must not
+                    // trigger a first audit. Legit first-audits fire moments after
+                    // payment (well inside the window); the pin can still be
+                    // audited via the gossip lottery if the responder re-gossips it.
+                    // `elapsed()` errs only for a future quote_ts (fresh) → audit.
+                    if event.quote_ts.elapsed().is_ok_and(|age| {
+                        age + MONETIZED_AUDIT_SKEW_MARGIN
+                            >= crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
+                    }) {
+                        debug!(
+                            "First audit skipped for {peer}: quote older than the answerability window"
+                        );
                         continue;
                     }
                     // Cooldown: if the peer's per-peer audit window is closed, keep
@@ -4363,6 +4390,11 @@ pub struct MonetizedPinEvent {
     pub pin: [u8; 32],
     /// The committed key count (sizes the audit deadline).
     pub key_count: u32,
+    /// The accused's own SIGNED quote timestamp. The first-audit drainer skips a
+    /// pin whose quote is older than the answerability window (ADR-0004 A1
+    /// guardrail A): with grace removed, challenging an aged-out pin would
+    /// false-convict, so a stale client-forwarded quote must not trigger an audit.
+    pub quote_ts: SystemTime,
 }
 
 /// Per-peer audit cooldown check-and-stamp (ADR-0002 "occasional surprise
