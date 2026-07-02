@@ -31,6 +31,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
 use crate::logging::{debug, warn};
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
     ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
 };
@@ -46,6 +48,10 @@ use super::REPLICATION_TRUST_WEIGHT;
 /// A possession probe challenges exactly one key, so the per-probe response
 /// budget is the audit-response timeout sized for a single chunk.
 const POSSESSION_PROBE_KEY_COUNT: usize = 1;
+
+pub(crate) fn possession_probe_response_timeout(config: &ReplicationConfig) -> Duration {
+    config.audit_response_timeout(POSSESSION_PROBE_KEY_COUNT)
+}
 
 /// A scheduled possession check for one freshly-replicated chunk.
 pub struct PossessionCheckEvent {
@@ -63,9 +69,9 @@ enum ProbeOutcome {
     /// Peer failed the audit challenge: absent sentinel, digest mismatch,
     /// rejection, mismatched challenge ID, wrong digest count, or malformed reply.
     Failed,
-    /// No response (transport error / deadline). Penalised immediately at
-    /// audit-failure severity.
-    Timeout,
+    /// No response. Penalised immediately at audit-failure severity; the class
+    /// is node-local observability only.
+    NoResponse(AuditFailureClass),
     /// Peer returned a matching bootstrap claim. Graced only through the shared
     /// bootstrap-claim tracker.
     BootstrapClaim,
@@ -97,6 +103,7 @@ pub fn random_delay(min: Duration, max: Duration) -> Duration {
 ///
 /// A peer that fails to prove possession, including by timeout, is penalised at
 /// `AuditChallenge` severity immediately. A responsive peer is left unrewarded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_possession_check(
     key: XorName,
     peers: Vec<PeerId>,
@@ -104,6 +111,7 @@ pub(crate) async fn run_possession_check(
     storage: &Arc<LmdbStorage>,
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     shutdown: &CancellationToken,
 ) {
     let key_hex = hex::encode(key);
@@ -127,29 +135,33 @@ pub(crate) async fn run_possession_check(
     // Single-key probe budget, matched to the audit response timeout's
     // bandwidth-calibrated deadline (tight enough that a relay that must refetch
     // the bytes blows it, generous for an honest local-disk read).
-    let probe_timeout = config.audit_response_timeout(POSSESSION_PROBE_KEY_COUNT);
+    let probe_timeout = possession_probe_response_timeout(config);
 
     for peer in peers {
         if shutdown.is_cancelled() {
             return;
         }
-        match probe_once(&key, &local_bytes, &peer, p2p_node, probe_timeout).await {
+        match probe_once(
+            &key,
+            &local_bytes,
+            &peer,
+            p2p_node,
+            audit_challenge_coordinator,
+            probe_timeout,
+        )
+        .await
+        {
             ProbeOutcome::Present => {
                 debug!("Possession check: {peer} proved possession of {key_hex}");
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
             }
             ProbeOutcome::Failed => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                report_possession_audit_failure(
-                    &peer,
-                    &key_hex,
-                    "failed to prove possession",
-                    p2p_node,
-                )
-                .await;
+                report_possession_confirmed_failure(&peer, &key_hex, p2p_node).await;
             }
-            ProbeOutcome::Timeout => {
-                report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
+            ProbeOutcome::NoResponse(class) => {
+                audit_metrics::record_audit_no_response(AuditType::Possession, class);
+                report_possession_audit_failure(&peer, &key_hex, class, p2p_node).await;
             }
             ProbeOutcome::BootstrapClaim => {
                 handle_possession_bootstrap_claim(&peer, &key_hex, p2p_node, config, sync_state)
@@ -171,13 +183,42 @@ async fn clear_possession_bootstrap_claim(
     sync_state.write().await.clear_active_bootstrap_claim(peer);
 }
 
+async fn report_possession_confirmed_failure(
+    peer: &PeerId,
+    key_hex: &str,
+    p2p_node: &Arc<P2PNode>,
+) {
+    warn!(
+        audit_type = AuditType::Possession.as_str(),
+        audit_failure_class = "confirmed",
+        peer = %peer,
+        key = %key_hex,
+        trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
+        "Possession check: {peer} failed to prove possession for {key_hex}; penalising at audit severity"
+    );
+    p2p_node
+        .report_trust_event(
+            peer,
+            TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
+}
+
 async fn report_possession_audit_failure(
     peer: &PeerId,
     key_hex: &str,
-    reason: &str,
+    failure_class: AuditFailureClass,
     p2p_node: &Arc<P2PNode>,
 ) {
-    warn!("Possession check: {peer} {reason} for {key_hex}; penalising at audit severity");
+    warn!(
+        audit_type = AuditType::Possession.as_str(),
+        audit_failure_class = failure_class.as_str(),
+        peer = %peer,
+        key = %key_hex,
+        trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
+        "Possession check: {peer} {} for {key_hex}; penalising at audit severity",
+        failure_class.as_str()
+    );
     p2p_node
         .report_trust_event(
             peer,
@@ -252,6 +293,7 @@ async fn probe_once(
     local_bytes: &[u8],
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     probe_timeout: Duration,
 ) -> ProbeOutcome {
     // Fresh nonce per probe so a stored digest cannot be replayed, and bind the
@@ -280,14 +322,26 @@ async fn probe_once(
         return ProbeOutcome::Inconclusive;
     };
 
+    let Some(_slot) = audit_challenge_coordinator.acquire(*peer).await else {
+        warn!("Failed to acquire possession audit coordinator slot for {peer}");
+        return ProbeOutcome::Inconclusive;
+    };
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
         .await
     {
         Ok(response) => response,
         Err(e) => {
-            debug!("Possession probe to {peer} got no response: {e}");
-            return ProbeOutcome::Timeout;
+            let error = e.to_string();
+            let (send_error_class, audit_failure_class) =
+                audit_metrics::classify_audit_send_error(&error);
+            debug!(
+                audit_type = AuditType::Possession.as_str(),
+                audit_failure_class = audit_failure_class.as_str(),
+                send_error_class,
+                "Possession probe to {peer} got no response: {e}"
+            );
+            return ProbeOutcome::NoResponse(audit_failure_class);
         }
     };
 

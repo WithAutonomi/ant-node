@@ -40,6 +40,16 @@ pub const QUORUM_THRESHOLD: usize = 4; // floor(CLOSE_GROUP_SIZE / 2) + 1
 /// Maximum number of closest nodes tracking paid status for a key.
 pub const PAID_LIST_CLOSE_GROUP_SIZE: usize = 20;
 
+/// Number of furthest paid-list close-group peers treated as churny edge
+/// voters.
+///
+/// Once the paid-list close group reaches [`PAID_LIST_CLOSE_GROUP_SIZE`], edge
+/// peers are queried, but a negative edge paid-list response does not count
+/// into the paid-list majority denominator. A positive edge response does
+/// count. This absorbs local routing-table disagreement at the boundary of the
+/// paid close group. Undersized groups keep their ordinary strict majority.
+pub const PAID_LIST_FLEX_EDGE_COUNT: usize = 4;
+
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 
@@ -156,6 +166,18 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 /// gossip-triggered audit per peer per 30 min), so 2 in-flight per peer
 /// comfortably covers the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 2;
+
+/// Maximum concurrent digest-only `AuditChallenge` responses from any single
+/// source peer.
+///
+/// Digest challenges are KB-scale replies: at most
+/// `max_incoming_audit_keys(stored_chunks)` bounded disk reads plus BLAKE3
+/// digests. A higher per-source allowance absorbs the three legitimate issuer
+/// subsystems (responsible-chunk audit, prune confirmation, and possession
+/// checks) from one auditor without weakening the existing subtree/byte audit
+/// budget. The multi-MiB subtree and byte challenge paths intentionally keep
+/// [`MAX_AUDIT_RESPONSES_PER_PEER`] exactly unchanged.
+pub const MAX_DIGEST_AUDIT_RESPONSES_PER_PEER: u32 = 8;
 
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
@@ -299,6 +321,15 @@ const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 /// Verification request timeout (per-batch).
 pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(VERIFICATION_REQUEST_TIMEOUT_SECS);
+
+/// Maximum keys in one verification request/response batch.
+///
+/// The 10 MiB replication wire cap is intentionally much higher because other
+/// messages carry hint sets and chunk bytes. Verification requests do local
+/// LMDB lookups per key on the responder's serial replication message path, so
+/// this smaller cap bounds CPU/disk work and keeps honest large rounds
+/// splittable instead of failing one oversized encode.
+pub const MAX_VERIFICATION_KEYS_PER_REQUEST: usize = 1024;
 
 /// Fetch request timeout.
 const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;

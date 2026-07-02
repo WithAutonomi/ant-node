@@ -5,14 +5,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{
+    ReplicationConfig, MAX_VERIFICATION_KEYS_PER_REQUEST, PAID_LIST_CLOSE_GROUP_SIZE,
+    PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
+};
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
 };
@@ -20,6 +24,19 @@ use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, Prese
 
 /// Verification round duration that is worth surfacing at info level.
 const VERIFICATION_ROUND_SLOW_LOG_MS: u128 = 500;
+
+struct VerificationBatchResult {
+    peer: PeerId,
+    requested_keys: Vec<XorName>,
+    response: Option<ReplicationMessage>,
+}
+
+struct PaidListVoteSummary {
+    confirmed: usize,
+    effective_group_size: usize,
+    max_possible_confirmed: usize,
+    max_possible_group_size: usize,
+}
 
 // ---------------------------------------------------------------------------
 // Verification targets
@@ -36,6 +53,14 @@ pub struct VerificationTargets {
     /// Per-key: self-inclusive paid close-group size used to compute
     /// `ConfirmNeeded(K)`.
     pub paid_group_sizes: HashMap<XorName, usize>,
+    /// Per-key: remote peers in the furthest paid-list positions.
+    ///
+    /// These peers are queried, but only positive paid-list evidence from them
+    /// expands the paid-list majority denominator once the paid group reaches
+    /// the configured 20-peer width. Negative/missing edge evidence is ignored
+    /// for that full-width paid-list quorum because boundary peers can
+    /// legitimately differ under churn.
+    pub paid_edge_targets: HashMap<XorName, HashSet<PeerId>>,
     /// Union of all target peers across all keys.
     pub all_peers: HashSet<PeerId>,
     /// Which keys each peer should be queried about.
@@ -60,6 +85,7 @@ pub async fn compute_verification_targets(
         quorum_targets: HashMap::new(),
         paid_targets: HashMap::new(),
         paid_group_sizes: HashMap::new(),
+        paid_edge_targets: HashMap::new(),
         all_peers: HashSet::new(),
         peer_to_keys: HashMap::new(),
         peer_to_paid_keys: HashMap::new(),
@@ -82,11 +108,18 @@ pub async fn compute_verification_targets(
             .find_closest_nodes_local_with_self(&key, config.paid_list_close_group_size)
             .await;
         let paid_group_size = paid_closest.len();
-        let paid_peers: Vec<PeerId> = paid_closest
-            .iter()
-            .filter(|n| n.peer_id != *self_id)
-            .map(|n| n.peer_id)
-            .collect();
+        let paid_edge_start = paid_group_size.saturating_sub(PAID_LIST_FLEX_EDGE_COUNT);
+        let mut paid_peers = Vec::new();
+        let mut paid_edge_peers = HashSet::new();
+        for (idx, node) in paid_closest.iter().enumerate() {
+            if node.peer_id == *self_id {
+                continue;
+            }
+            paid_peers.push(node.peer_id);
+            if idx >= paid_edge_start {
+                paid_edge_peers.insert(node.peer_id);
+            }
+        }
 
         // VerifyTargets = PaidTargets ∪ QuorumTargets
         for &peer in &quorum_peers {
@@ -106,6 +139,7 @@ pub async fn compute_verification_targets(
         targets.quorum_targets.insert(key, quorum_peers);
         targets.paid_targets.insert(key, paid_peers);
         targets.paid_group_sizes.insert(key, paid_group_size);
+        targets.paid_edge_targets.insert(key, paid_edge_peers);
     }
 
     // Deduplicate keys per peer (a peer in both quorum and paid targets for
@@ -133,6 +167,7 @@ pub async fn compute_presence_targets(
         quorum_targets: HashMap::new(),
         paid_targets: HashMap::new(),
         paid_group_sizes: HashMap::new(),
+        paid_edge_targets: HashMap::new(),
         all_peers: HashSet::new(),
         peer_to_keys: HashMap::new(),
         peer_to_paid_keys: HashMap::new(),
@@ -263,25 +298,9 @@ pub fn evaluate_key_evidence_with_holder_check(
     let paid_peers = targets.paid_targets.get(key).map_or(&[][..], Vec::as_slice);
     let present_peers = collect_present_sources(evidence, quorum_peers, paid_peers);
 
-    // Count paid-list evidence from PaidTargets.
-    let mut paid_confirmed = 0usize;
-    let mut paid_unresolved = 0usize;
-
-    for peer in paid_peers {
-        match evidence.paid_list.get(peer) {
-            Some(PaidListEvidence::Confirmed) => paid_confirmed += 1,
-            Some(PaidListEvidence::NotFound) => {}
-            Some(PaidListEvidence::Unresolved) | None => paid_unresolved += 1,
-        }
-    }
-
     let quorum_needed = config.quorum_needed(quorum_peers.len());
-    let paid_group_size = targets
-        .paid_group_sizes
-        .get(key)
-        .copied()
-        .unwrap_or(paid_peers.len());
-    let confirm_needed = ReplicationConfig::confirm_needed(paid_group_size);
+    let paid_votes = summarize_paid_list_votes(key, evidence, targets, paid_peers);
+    let confirm_needed = ReplicationConfig::confirm_needed(paid_votes.effective_group_size);
 
     // Step 10: Presence quorum reached.
     // quorum_needed == 0 means zero targets exist — quorum is impossible,
@@ -295,14 +314,16 @@ pub fn evaluate_key_evidence_with_holder_check(
     // Step 9: Paid-list majority reached.
     // confirm_needed from 0 paid peers is 1, so this naturally fails with
     // 0 confirmed — no special guard needed. But be explicit for clarity.
-    if paid_group_size > 0 && paid_confirmed >= confirm_needed {
+    if paid_votes.effective_group_size > 0 && paid_votes.confirmed >= confirm_needed {
         return KeyVerificationOutcome::PaidListVerified {
             sources: present_peers,
         };
     }
 
     // Step 14: Fail fast when both paths are impossible.
-    let paid_possible = paid_group_size > 0 && paid_confirmed + paid_unresolved >= confirm_needed;
+    let max_confirm_needed = ReplicationConfig::confirm_needed(paid_votes.max_possible_group_size);
+    let paid_possible = paid_votes.max_possible_group_size > 0
+        && paid_votes.max_possible_confirmed >= max_confirm_needed;
     let quorum_possible =
         quorum_needed > 0 && presence_positive + presence_unresolved >= quorum_needed;
 
@@ -312,6 +333,61 @@ pub fn evaluate_key_evidence_with_holder_check(
 
     // Step 15: Neither success nor fail-fast.
     KeyVerificationOutcome::QuorumInconclusive
+}
+
+fn summarize_paid_list_votes(
+    key: &XorName,
+    evidence: &KeyVerificationEvidence,
+    targets: &VerificationTargets,
+    paid_peers: &[PeerId],
+) -> PaidListVoteSummary {
+    let paid_group_size = targets
+        .paid_group_sizes
+        .get(key)
+        .copied()
+        .unwrap_or(paid_peers.len());
+    let paid_edge_count = if paid_group_size >= PAID_LIST_CLOSE_GROUP_SIZE {
+        PAID_LIST_FLEX_EDGE_COUNT.min(paid_group_size)
+    } else {
+        0
+    };
+    let core_group_size = paid_group_size.saturating_sub(paid_edge_count);
+    let edge_targets = (paid_edge_count > 0)
+        .then(|| targets.paid_edge_targets.get(key))
+        .flatten();
+
+    let mut confirmed = 0usize;
+    let mut confirmed_edge = 0usize;
+    let mut unresolved_core = 0usize;
+    let mut unresolved_edge = 0usize;
+
+    for peer in paid_peers {
+        let is_edge = edge_targets.is_some_and(|peers| peers.contains(peer));
+        match evidence.paid_list.get(peer) {
+            Some(PaidListEvidence::Confirmed) => {
+                confirmed += 1;
+                if is_edge {
+                    confirmed_edge += 1;
+                }
+            }
+            Some(PaidListEvidence::NotFound) => {}
+            Some(PaidListEvidence::Unresolved) | None => {
+                if is_edge {
+                    unresolved_edge += 1;
+                } else {
+                    unresolved_core += 1;
+                }
+            }
+        }
+    }
+
+    let effective_group_size = core_group_size + confirmed_edge;
+    PaidListVoteSummary {
+        confirmed,
+        effective_group_size,
+        max_possible_confirmed: confirmed + unresolved_core + unresolved_edge,
+        max_possible_group_size: effective_group_size + unresolved_edge,
+    }
 }
 
 /// Return peers that gave positive presence evidence for a key.
@@ -351,6 +427,39 @@ fn collect_present_sources(
     present_peers
 }
 
+fn verification_requests_for_peer(
+    peer_keys: &[XorName],
+    paid_check_keys: Option<&HashSet<XorName>>,
+) -> Vec<VerificationRequest> {
+    peer_keys
+        .chunks(MAX_VERIFICATION_KEYS_PER_REQUEST)
+        .map(|key_batch| VerificationRequest {
+            keys: key_batch.to_vec(),
+            paid_list_check_indices: paid_indices_for_key_batch(key_batch, paid_check_keys),
+        })
+        .collect()
+}
+
+fn paid_indices_for_key_batch(
+    key_batch: &[XorName],
+    paid_check_keys: Option<&HashSet<XorName>>,
+) -> Vec<u32> {
+    let Some(paid_keys) = paid_check_keys else {
+        return Vec::new();
+    };
+
+    key_batch
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, key)| {
+            paid_keys
+                .contains(key)
+                .then_some(idx)
+                .and_then(|idx| u32::try_from(idx).ok())
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Network verification round
 // ---------------------------------------------------------------------------
@@ -383,99 +492,26 @@ pub async fn run_verification_round(
         })
         .collect();
 
-    // Send one batched request per peer.
-    let mut handles = Vec::new();
-
-    for (&peer, peer_keys) in &targets.peer_to_keys {
-        let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
-
-        // Build paid_list_check_indices: which of this peer's keys need
-        // paid-list status.
-        let mut paid_indices = Vec::new();
-        for (i, key) in peer_keys.iter().enumerate() {
-            if let Some(paid_keys) = paid_check_keys {
-                if paid_keys.contains(key) {
-                    if let Ok(idx) = u32::try_from(i) {
-                        paid_indices.push(idx);
-                    }
-                }
-            }
-        }
-
-        let request = VerificationRequest {
-            keys: peer_keys.clone(),
-            paid_list_check_indices: paid_indices,
-        };
-
-        let msg = ReplicationMessage {
-            request_id: rand::random(),
-            body: ReplicationMessageBody::VerificationRequest(request),
-        };
-
-        let p2p = Arc::clone(p2p_node);
-        let timeout = config.verification_request_timeout;
-        let peer_id = peer;
-
-        handles.push(tokio::spawn(async move {
-            let encoded = match msg.encode() {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!("Failed to encode verification request: {e}");
-                    return (peer_id, None);
-                }
-            };
-
-            match p2p
-                .send_request(&peer_id, REPLICATION_PROTOCOL_ID, encoded, timeout)
-                .await
-            {
-                Ok(response) => match ReplicationMessage::decode(&response.data) {
-                    Ok(decoded) => (peer_id, Some(decoded)),
-                    Err(e) => {
-                        warn!("Failed to decode verification response from {peer_id}: {e}");
-                        (peer_id, None)
-                    }
-                },
-                Err(e) => {
-                    debug!("Verification request to {peer_id} failed: {e}");
-                    (peer_id, None)
-                }
-            }
-        }));
-    }
-
-    // Collect responses.
-    for handle in handles {
-        let (peer, response) = match handle.await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Verification task panicked: {e}");
-                continue;
-            }
-        };
-
-        let Some(msg) = response else {
-            // Timeout/error: mark all keys for this peer as unresolved.
-            mark_peer_unresolved(&peer, targets, &mut evidence);
-            continue;
-        };
-
-        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
-            process_verification_response(&peer, &resp, targets, &mut evidence);
-        }
-    }
+    let handles =
+        spawn_verification_batch_tasks(targets, p2p_node, config.verification_request_timeout);
+    collect_verification_batch_results(handles, targets, &mut evidence).await;
 
     let elapsed_ms = started.elapsed().as_millis();
+    let batch_count = targets
+        .peer_to_keys
+        .values()
+        .map(|peer_keys| peer_keys.chunks(MAX_VERIFICATION_KEYS_PER_REQUEST).count())
+        .sum::<usize>();
     if elapsed_ms >= VERIFICATION_ROUND_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::verification",
-            "Slow quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            "Slow quorum verification round: keys={}, peers={peer_count}, batches={batch_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
             keys.len(),
         );
     } else {
         debug!(
             target: "ant_node::replication::verification",
-            "Quorum verification round: keys={}, peers={peer_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
+            "Quorum verification round: keys={}, peers={peer_count}, batches={batch_count}, requested_key_refs={requested_key_refs}, elapsed_ms={elapsed_ms}",
             keys.len(),
         );
     }
@@ -483,26 +519,144 @@ pub async fn run_verification_round(
     evidence
 }
 
+fn spawn_verification_batch_tasks(
+    targets: &VerificationTargets,
+    p2p_node: &Arc<P2PNode>,
+    timeout: Duration,
+) -> Vec<JoinHandle<VerificationBatchResult>> {
+    let mut handles = Vec::new();
+
+    for (&peer, peer_keys) in &targets.peer_to_keys {
+        let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
+
+        for request in verification_requests_for_peer(peer_keys, paid_check_keys) {
+            let requested_keys = request.keys.clone();
+            let msg = ReplicationMessage {
+                request_id: rand::random(),
+                body: ReplicationMessageBody::VerificationRequest(request),
+            };
+
+            handles.push(spawn_verification_batch_task(
+                peer,
+                requested_keys,
+                msg,
+                Arc::clone(p2p_node),
+                timeout,
+            ));
+        }
+    }
+
+    handles
+}
+
+fn spawn_verification_batch_task(
+    peer: PeerId,
+    requested_keys: Vec<XorName>,
+    msg: ReplicationMessage,
+    p2p: Arc<P2PNode>,
+    timeout: Duration,
+) -> JoinHandle<VerificationBatchResult> {
+    tokio::spawn(async move {
+        let encoded = match msg.encode() {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to encode verification request: {e}");
+                return VerificationBatchResult {
+                    peer,
+                    requested_keys,
+                    response: None,
+                };
+            }
+        };
+
+        let response = match p2p
+            .send_request(&peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+            .await
+        {
+            Ok(response) => match ReplicationMessage::decode(&response.data) {
+                Ok(decoded) => Some(decoded),
+                Err(e) => {
+                    warn!("Failed to decode verification response from {peer}: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                debug!("Verification request to {peer} failed: {e}");
+                None
+            }
+        };
+
+        VerificationBatchResult {
+            peer,
+            requested_keys,
+            response,
+        }
+    })
+}
+
+async fn collect_verification_batch_results(
+    handles: Vec<JoinHandle<VerificationBatchResult>>,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    for handle in handles {
+        let batch = match handle.await {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Verification task panicked: {e}");
+                continue;
+            }
+        };
+        let peer = batch.peer;
+
+        let Some(msg) = batch.response else {
+            mark_peer_keys_unresolved(&peer, &batch.requested_keys, targets, evidence);
+            continue;
+        };
+
+        if let ReplicationMessageBody::VerificationResponse(resp) = msg.body {
+            process_verification_response_for_keys(
+                &peer,
+                &batch.requested_keys,
+                &resp,
+                targets,
+                evidence,
+            );
+        }
+    }
+}
+
 /// Mark all keys for a peer as unresolved (timeout / decode failure).
+#[cfg(test)]
 fn mark_peer_unresolved(
     peer: &PeerId,
     targets: &VerificationTargets,
     evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
 ) {
     if let Some(peer_keys) = targets.peer_to_keys.get(peer) {
-        let is_paid_peer = targets.peer_to_paid_keys.get(peer);
-        for key in peer_keys {
-            if let Some(ev) = evidence.get_mut(key) {
-                ev.presence.insert(*peer, PresenceEvidence::Unresolved);
-                if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
-                    ev.paid_list.insert(*peer, PaidListEvidence::Unresolved);
-                }
+        mark_peer_keys_unresolved(peer, peer_keys, targets, evidence);
+    }
+}
+
+fn mark_peer_keys_unresolved(
+    peer: &PeerId,
+    requested_keys: &[XorName],
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    let paid_check_keys = targets.peer_to_paid_keys.get(peer);
+    for key in requested_keys {
+        if let Some(ev) = evidence.get_mut(key) {
+            ev.presence.insert(*peer, PresenceEvidence::Unresolved);
+            if paid_check_keys.is_some_and(|ks| ks.contains(key)) {
+                ev.paid_list.insert(*peer, PaidListEvidence::Unresolved);
             }
         }
     }
 }
 
 /// Process a single peer's verification response into the evidence map.
+#[cfg(test)]
 fn process_verification_response(
     peer: &PeerId,
     response: &VerificationResponse,
@@ -513,18 +667,30 @@ fn process_verification_response(
         return;
     };
 
+    process_verification_response_for_keys(peer, peer_keys, response, targets, evidence);
+}
+
+fn process_verification_response_for_keys(
+    peer: &PeerId,
+    requested_keys: &[XorName],
+    response: &VerificationResponse,
+    targets: &VerificationTargets,
+    evidence: &mut HashMap<XorName, KeyVerificationEvidence>,
+) {
+    let paid_check_keys = targets.peer_to_paid_keys.get(peer);
+
     // Use a HashSet for O(1) key membership checks instead of linear scan,
     // preventing CPU amplification from large responses.
-    let peer_keys_set: HashSet<&XorName> = peer_keys.iter().collect();
+    let requested_keys_set: HashSet<&XorName> = requested_keys.iter().collect();
 
     // Cap results at 2x requested keys to limit processing of stuffed
     // responses while still tolerating some unsolicited entries.
-    let max_results = peer_keys.len().saturating_mul(2);
+    let max_results = requested_keys.len().saturating_mul(2);
     let results = if response.results.len() > max_results {
         warn!(
             "Peer {peer} sent {} verification results but only {} keys were requested — truncating",
             response.results.len(),
-            peer_keys.len(),
+            requested_keys.len(),
         );
         &response.results[..max_results]
     } else {
@@ -533,7 +699,7 @@ fn process_verification_response(
 
     // Match response results to requested keys.
     for result in results {
-        if !peer_keys_set.contains(&result.key) {
+        if !requested_keys_set.contains(&result.key) {
             continue; // Ignore unsolicited key results.
         }
 
@@ -547,25 +713,26 @@ fn process_verification_response(
             ev.presence.insert(*peer, presence);
 
             // Paid-list evidence (only if requested).
-            if let Some(is_paid) = result.paid {
-                let paid = if is_paid {
-                    PaidListEvidence::Confirmed
-                } else {
-                    PaidListEvidence::NotFound
-                };
-                ev.paid_list.insert(*peer, paid);
+            if paid_check_keys.is_some_and(|ks| ks.contains(&result.key)) {
+                if let Some(is_paid) = result.paid {
+                    let paid = if is_paid {
+                        PaidListEvidence::Confirmed
+                    } else {
+                        PaidListEvidence::NotFound
+                    };
+                    ev.paid_list.insert(*peer, paid);
+                }
             }
         }
     }
 
     // Keys that were requested but not in response -> unresolved.
-    let is_paid_peer = targets.peer_to_paid_keys.get(peer);
-    for key in peer_keys {
+    for key in requested_keys {
         if let Some(ev) = evidence.get_mut(key) {
             ev.presence
                 .entry(*peer)
                 .or_insert(PresenceEvidence::Unresolved);
-            if is_paid_peer.is_some_and(|ks| ks.contains(key)) {
+            if paid_check_keys.is_some_and(|ks| ks.contains(key)) {
                 ev.paid_list
                     .entry(*peer)
                     .or_insert(PaidListEvidence::Unresolved);
@@ -582,7 +749,25 @@ fn process_verification_response(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::config::PAID_LIST_CLOSE_GROUP_SIZE;
     use crate::replication::protocol::KeyVerificationResult;
+
+    const PAID_LIST_INNER_GROUP_SIZE: usize =
+        PAID_LIST_CLOSE_GROUP_SIZE - PAID_LIST_FLEX_EDGE_COUNT;
+    const PAID_LIST_INNER_MAJORITY: usize = PAID_LIST_INNER_GROUP_SIZE / 2 + 1;
+    const PAID_LIST_ONE_EDGE_GROUP_SIZE: usize = PAID_LIST_INNER_GROUP_SIZE + 1;
+    const PAID_LIST_ONE_EDGE_MAJORITY: usize = PAID_LIST_ONE_EDGE_GROUP_SIZE / 2 + 1;
+    const PAID_LIST_FULL_MAJORITY: usize = PAID_LIST_CLOSE_GROUP_SIZE / 2 + 1;
+    const FIRST_EDGE_INDEX: usize = PAID_LIST_INNER_GROUP_SIZE;
+    const SECOND_EDGE_INDEX: usize = PAID_LIST_INNER_GROUP_SIZE + 1;
+    const THIRD_EDGE_INDEX: usize = PAID_LIST_INNER_GROUP_SIZE + 2;
+    const FOURTH_EDGE_INDEX: usize = PAID_LIST_INNER_GROUP_SIZE + 3;
+    const REMOTE_PAID_PEERS_WITH_SELF_IN_GROUP: usize = PAID_LIST_CLOSE_GROUP_SIZE - 1;
+    const REMOTE_EDGE_COUNT_WHEN_SELF_IN_CORE: usize = PAID_LIST_FLEX_EDGE_COUNT;
+    const REMOTE_EDGE_COUNT_WHEN_SELF_ON_EDGE: usize = PAID_LIST_FLEX_EDGE_COUNT - 1;
+    const SELF_EDGE_REMOTE_FULL_GROUP_SIZE: usize =
+        PAID_LIST_INNER_GROUP_SIZE + REMOTE_EDGE_COUNT_WHEN_SELF_ON_EDGE;
+    const SELF_EDGE_REMOTE_FULL_MAJORITY: usize = SELF_EDGE_REMOTE_FULL_GROUP_SIZE / 2 + 1;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {
@@ -591,9 +776,89 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
+    fn peer_id_from_usize(value: usize) -> PeerId {
+        peer_id_from_byte(u8::try_from(value).expect("test peer id fits u8"))
+    }
+
     /// Build an `XorName` from a single byte (repeated to 32 bytes).
     fn xor_name_from_byte(b: u8) -> XorName {
         [b; 32]
+    }
+
+    fn xor_name_from_usize(value: usize) -> XorName {
+        let mut name = [0u8; 32];
+        let bytes = u64::try_from(value)
+            .expect("test value fits u64")
+            .to_le_bytes();
+        name[..bytes.len()].copy_from_slice(&bytes);
+        name
+    }
+
+    fn paid_edge_targets_for_peers(paid_peers: &[PeerId]) -> HashSet<PeerId> {
+        paid_peers[paid_peers.len().saturating_sub(PAID_LIST_FLEX_EDGE_COUNT)..]
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    fn paid_vote_evidence(
+        paid_peers: &[PeerId],
+        confirmed_indices: &[usize],
+    ) -> Vec<(PeerId, PaidListEvidence)> {
+        let confirmed_indices: HashSet<usize> = confirmed_indices.iter().copied().collect();
+        paid_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer)| {
+                (
+                    *peer,
+                    if confirmed_indices.contains(&idx) {
+                        PaidListEvidence::Confirmed
+                    } else {
+                        PaidListEvidence::NotFound
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn paid_vote_evidence_with_unresolved(
+        paid_peers: &[PeerId],
+        confirmed_indices: &[usize],
+        unresolved_indices: &[usize],
+    ) -> Vec<(PeerId, PaidListEvidence)> {
+        let confirmed_indices: HashSet<usize> = confirmed_indices.iter().copied().collect();
+        let unresolved_indices: HashSet<usize> = unresolved_indices.iter().copied().collect();
+        paid_peers
+            .iter()
+            .enumerate()
+            .map(|(idx, peer)| {
+                let status = if confirmed_indices.contains(&idx) {
+                    PaidListEvidence::Confirmed
+                } else if unresolved_indices.contains(&idx) {
+                    PaidListEvidence::Unresolved
+                } else {
+                    PaidListEvidence::NotFound
+                };
+                (*peer, status)
+            })
+            .collect()
+    }
+
+    fn self_inclusive_paid_targets(
+        key: &XorName,
+        paid_peers: &[PeerId],
+        remote_edge_count: usize,
+    ) -> VerificationTargets {
+        let mut targets = single_key_targets(key, vec![], paid_peers.to_vec());
+        targets
+            .paid_group_sizes
+            .insert(*key, PAID_LIST_CLOSE_GROUP_SIZE);
+        let edge_start = paid_peers.len().saturating_sub(remote_edge_count);
+        targets
+            .paid_edge_targets
+            .insert(*key, paid_peers[edge_start..].iter().copied().collect());
+        targets
     }
 
     /// Helper: build minimal `VerificationTargets` for a single key with
@@ -624,10 +889,12 @@ mod tests {
         }
 
         let paid_group_size = paid_peers.len();
+        let paid_edge_targets = paid_edge_targets_for_peers(&paid_peers);
         VerificationTargets {
             quorum_targets: std::iter::once((key.to_owned(), quorum_peers)).collect(),
             paid_group_sizes: std::iter::once((key.to_owned(), paid_group_size)).collect(),
             paid_targets: std::iter::once((key.to_owned(), paid_peers)).collect(),
+            paid_edge_targets: std::iter::once((key.to_owned(), paid_edge_targets)).collect(),
             all_peers,
             peer_to_keys,
             peer_to_paid_keys,
@@ -990,62 +1257,300 @@ mod tests {
     }
 
     #[test]
-    fn paid_list_majority_uses_self_inclusive_paid_group_size() {
+    fn paid_list_edge_notfound_votes_shrink_denominator_to_inner_group() {
         let key = xor_name_from_byte(0x61);
         let config = ReplicationConfig::default();
 
-        // Real target computation uses PaidCloseGroup(K), which is
-        // self-inclusive. If self is in a 20-node paid group and does not
-        // already have local paid-list state, 10 remote confirmations are not
-        // enough: ConfirmNeeded(20) is 11.
-        let paid_peers: Vec<PeerId> = (1..=19).map(peer_id_from_byte).collect();
-        let mut targets = single_key_targets(&key, vec![], paid_peers.clone());
-        targets.paid_group_sizes.insert(key, 20);
+        let paid_peers: Vec<PeerId> = (1..=PAID_LIST_CLOSE_GROUP_SIZE)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
 
-        let ten_confirmations = build_evidence(
+        let below_threshold = build_evidence(
             vec![],
-            paid_peers
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        *p,
-                        if i < 10 {
-                            PaidListEvidence::Confirmed
-                        } else {
-                            PaidListEvidence::NotFound
-                        },
-                    )
-                })
-                .collect(),
+            paid_vote_evidence(&paid_peers, &[0, 1, 2, 3, 4, 5, 6, 7]),
         );
-        let outcome = evaluate_key_evidence(&key, &ten_confirmations, &targets, &config);
+        let outcome = evaluate_key_evidence(&key, &below_threshold, &targets, &config);
         assert!(
             matches!(outcome, KeyVerificationOutcome::QuorumFailed),
-            "10/20 paid confirmations must not authorize the key, got {outcome:?}"
+            "8/{PAID_LIST_INNER_GROUP_SIZE} paid confirmations must not authorize the key, got {outcome:?}"
         );
 
-        let eleven_confirmations = build_evidence(
+        let threshold_confirmed = build_evidence(
             vec![],
-            paid_peers
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    (
-                        *p,
-                        if i < 11 {
-                            PaidListEvidence::Confirmed
-                        } else {
-                            PaidListEvidence::NotFound
-                        },
-                    )
-                })
-                .collect(),
+            paid_vote_evidence(
+                &paid_peers,
+                &(0..PAID_LIST_INNER_MAJORITY).collect::<Vec<_>>(),
+            ),
         );
-        let outcome = evaluate_key_evidence(&key, &eleven_confirmations, &targets, &config);
+        let outcome = evaluate_key_evidence(&key, &threshold_confirmed, &targets, &config);
         assert!(
             matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
-            "11/20 paid confirmations should authorize the key, got {outcome:?}"
+            "{PAID_LIST_INNER_MAJORITY}/{PAID_LIST_INNER_GROUP_SIZE} paid confirmations should authorize the key, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_positive_edge_votes_expand_denominator() {
+        let key = xor_name_from_byte(0x62);
+        let config = ReplicationConfig::default();
+
+        let paid_peers: Vec<PeerId> = (1..=PAID_LIST_CLOSE_GROUP_SIZE)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+
+        let one_edge_confirmed = build_evidence(
+            vec![],
+            paid_vote_evidence(&paid_peers, &[0, 1, 2, 3, 4, 5, 6, 7, THIRD_EDGE_INDEX]),
+        );
+        let outcome = evaluate_key_evidence(&key, &one_edge_confirmed, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "{PAID_LIST_ONE_EDGE_MAJORITY}/{PAID_LIST_ONE_EDGE_GROUP_SIZE} paid confirmations should authorize the key, got {outcome:?}"
+        );
+
+        let ten_with_all_edges = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &[
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    FIRST_EDGE_INDEX,
+                    SECOND_EDGE_INDEX,
+                    THIRD_EDGE_INDEX,
+                    FOURTH_EDGE_INDEX,
+                ],
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &ten_with_all_edges, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "10/{PAID_LIST_CLOSE_GROUP_SIZE} paid confirmations must not authorize when all edge peers are positive, got {outcome:?}"
+        );
+
+        let eleven_with_all_edges = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &[
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    FIRST_EDGE_INDEX,
+                    SECOND_EDGE_INDEX,
+                    THIRD_EDGE_INDEX,
+                    FOURTH_EDGE_INDEX,
+                ],
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &eleven_with_all_edges, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "{PAID_LIST_FULL_MAJORITY}/{PAID_LIST_CLOSE_GROUP_SIZE} paid confirmations should authorize when all edge peers are positive, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_self_inclusive_missing_core_keeps_inner_threshold() {
+        let key = xor_name_from_byte(0x63);
+        let config = ReplicationConfig::default();
+        let paid_peers: Vec<PeerId> = (1..=REMOTE_PAID_PEERS_WITH_SELF_IN_GROUP)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets =
+            self_inclusive_paid_targets(&key, &paid_peers, REMOTE_EDGE_COUNT_WHEN_SELF_IN_CORE);
+
+        let below_threshold = build_evidence(
+            vec![],
+            paid_vote_evidence(&paid_peers, &[0, 1, 2, 3, 4, 5, 6, 7]),
+        );
+        let outcome = evaluate_key_evidence(&key, &below_threshold, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "8/{PAID_LIST_INNER_GROUP_SIZE} should fail when self is a missing core voter, got {outcome:?}"
+        );
+
+        let threshold_confirmed = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &(0..PAID_LIST_INNER_MAJORITY).collect::<Vec<_>>(),
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &threshold_confirmed, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "{PAID_LIST_INNER_MAJORITY}/{PAID_LIST_INNER_GROUP_SIZE} should pass when self is a missing core voter, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_self_inclusive_missing_edge_discounts_self_edge_only_when_negative() {
+        let key = xor_name_from_byte(0x64);
+        let config = ReplicationConfig::default();
+        let paid_peers: Vec<PeerId> = (1..=REMOTE_PAID_PEERS_WITH_SELF_IN_GROUP)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets =
+            self_inclusive_paid_targets(&key, &paid_peers, REMOTE_EDGE_COUNT_WHEN_SELF_ON_EDGE);
+
+        let inner_threshold_confirmed = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &(0..PAID_LIST_INNER_MAJORITY).collect::<Vec<_>>(),
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &inner_threshold_confirmed, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "{PAID_LIST_INNER_MAJORITY}/{PAID_LIST_INNER_GROUP_SIZE} should pass when self is a missing edge voter, got {outcome:?}"
+        );
+
+        let all_remote_edges_below = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &[
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    PAID_LIST_INNER_GROUP_SIZE,
+                    PAID_LIST_INNER_GROUP_SIZE + 1,
+                    PAID_LIST_INNER_GROUP_SIZE + 2,
+                ],
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &all_remote_edges_below, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "9/{SELF_EDGE_REMOTE_FULL_GROUP_SIZE} should fail when all remote edge peers are positive but self-edge is missing, got {outcome:?}"
+        );
+
+        let all_remote_edges_threshold = build_evidence(
+            vec![],
+            paid_vote_evidence(
+                &paid_peers,
+                &[
+                    0,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    6,
+                    PAID_LIST_INNER_GROUP_SIZE,
+                    PAID_LIST_INNER_GROUP_SIZE + 1,
+                    PAID_LIST_INNER_GROUP_SIZE + 2,
+                ],
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &all_remote_edges_threshold, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "{SELF_EDGE_REMOTE_FULL_MAJORITY}/{SELF_EDGE_REMOTE_FULL_GROUP_SIZE} should pass when all remote edge peers are positive but self-edge is missing, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_unresolved_core_or_edge_keeps_possible_round_inconclusive() {
+        let key = xor_name_from_byte(0x65);
+        let config = ReplicationConfig::default();
+        let paid_peers: Vec<PeerId> = (1..=PAID_LIST_CLOSE_GROUP_SIZE)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+
+        let unresolved_core = build_evidence(
+            vec![],
+            paid_vote_evidence_with_unresolved(&paid_peers, &[0, 1, 2, 3, 4, 5, 6, 7], &[8]),
+        );
+        let outcome = evaluate_key_evidence(&key, &unresolved_core, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumInconclusive),
+            "8 confirmed plus one unresolved core voter can still become 9/{PAID_LIST_INNER_GROUP_SIZE}, got {outcome:?}"
+        );
+
+        let unresolved_edge = build_evidence(
+            vec![],
+            paid_vote_evidence_with_unresolved(
+                &paid_peers,
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                &[FIRST_EDGE_INDEX],
+            ),
+        );
+        let outcome = evaluate_key_evidence(&key, &unresolved_edge, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumInconclusive),
+            "8 confirmed plus one unresolved edge voter can still become 9/{PAID_LIST_ONE_EDGE_GROUP_SIZE}, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn production_paid_list_vote_authorizes_when_storage_majority_missing() {
+        const PRODUCTION_PAID_GROUP: u8 = 20;
+        const STORAGE_HOLDERS_BELOW_QUORUM: usize = 3;
+        const PAID_CONFIRMATIONS_NEEDED: usize = 11;
+        const PAID_PEER_OFFSET: u8 = 30;
+
+        let key = xor_name_from_byte(0x62);
+        let config = ReplicationConfig::default();
+
+        let quorum_peers: Vec<PeerId> =
+            (1..=PRODUCTION_PAID_GROUP).map(peer_id_from_byte).collect();
+        let paid_peers: Vec<PeerId> = (1..=PRODUCTION_PAID_GROUP)
+            .map(|i| peer_id_from_byte(PAID_PEER_OFFSET + i))
+            .collect();
+        let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
+
+        let presence = quorum_peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| {
+                (
+                    *peer,
+                    if i < STORAGE_HOLDERS_BELOW_QUORUM {
+                        PresenceEvidence::Present
+                    } else {
+                        PresenceEvidence::Absent
+                    },
+                )
+            })
+            .collect();
+        let paid_list = paid_peers
+            .iter()
+            .enumerate()
+            .map(|(i, peer)| {
+                (
+                    *peer,
+                    if i < PAID_CONFIRMATIONS_NEEDED {
+                        PaidListEvidence::Confirmed
+                    } else {
+                        PaidListEvidence::NotFound
+                    },
+                )
+            })
+            .collect();
+        let evidence = build_evidence(presence, paid_list);
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { ref sources } if sources.len() == STORAGE_HOLDERS_BELOW_QUORUM),
+            "11/20 paid-list confirmations must authorize repair despite only 3 storage holders, got {outcome:?}"
         );
     }
 
@@ -1229,6 +1734,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn process_response_ignores_unsolicited_paid_status() {
+        let key = xor_name_from_byte(0xB2);
+        let peer = peer_id_from_byte(4);
+
+        let targets = single_key_targets(&key, vec![peer], vec![]);
+
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = std::iter::once((
+            key,
+            KeyVerificationEvidence {
+                presence: HashMap::new(),
+                paid_list: HashMap::new(),
+            },
+        ))
+        .collect();
+
+        let response = VerificationResponse {
+            results: vec![KeyVerificationResult {
+                key,
+                present: true,
+                paid: Some(true),
+            }],
+        };
+
+        process_verification_response(&peer, &response, &targets, &mut evidence);
+
+        let ev = evidence.get(&key).expect("evidence for key");
+        assert_eq!(ev.presence.get(&peer), Some(&PresenceEvidence::Present));
+        assert!(
+            !ev.paid_list.contains_key(&peer),
+            "paid evidence must be recorded only for requested paid-list checks"
+        );
+    }
+
+    #[test]
+    fn process_batch_response_marks_only_batch_keys_unresolved() {
+        let key_a = xor_name_from_byte(0xB3);
+        let key_b = xor_name_from_byte(0xB4);
+        let peer = peer_id_from_byte(6);
+
+        let targets = VerificationTargets {
+            quorum_targets: [(key_a, vec![peer]), (key_b, vec![peer])]
+                .into_iter()
+                .collect(),
+            paid_targets: [(key_a, vec![peer]), (key_b, vec![peer])]
+                .into_iter()
+                .collect(),
+            paid_group_sizes: [(key_a, 1), (key_b, 1)].into_iter().collect(),
+            paid_edge_targets: [
+                (key_a, std::iter::once(peer).collect()),
+                (key_b, std::iter::once(peer).collect()),
+            ]
+            .into_iter()
+            .collect(),
+            all_peers: std::iter::once(peer).collect(),
+            peer_to_keys: std::iter::once((peer, vec![key_a, key_b])).collect(),
+            peer_to_paid_keys: std::iter::once((
+                peer,
+                [key_a, key_b].into_iter().collect::<HashSet<_>>(),
+            ))
+            .collect(),
+        };
+        let mut evidence: HashMap<XorName, KeyVerificationEvidence> = [
+            (
+                key_a,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+            (
+                key_b,
+                KeyVerificationEvidence {
+                    presence: HashMap::new(),
+                    paid_list: HashMap::new(),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        process_verification_response_for_keys(
+            &peer,
+            &[key_a],
+            &VerificationResponse {
+                results: Vec::new(),
+            },
+            &targets,
+            &mut evidence,
+        );
+
+        let ev_a = evidence.get(&key_a).expect("evidence for key_a");
+        assert_eq!(
+            ev_a.presence.get(&peer),
+            Some(&PresenceEvidence::Unresolved)
+        );
+        assert_eq!(
+            ev_a.paid_list.get(&peer),
+            Some(&PaidListEvidence::Unresolved)
+        );
+
+        let ev_b = evidence.get(&key_b).expect("evidence for key_b");
+        assert!(
+            !ev_b.presence.contains_key(&peer),
+            "keys outside the failed batch must wait for their own batch result"
+        );
+        assert!(
+            !ev_b.paid_list.contains_key(&peer),
+            "paid status outside the failed batch must not be prefilled"
+        );
+    }
+
+    #[test]
+    fn verification_requests_for_peer_splits_large_batches_and_rebases_paid_indices() {
+        let keys: Vec<XorName> = (0..=MAX_VERIFICATION_KEYS_PER_REQUEST)
+            .map(xor_name_from_usize)
+            .collect();
+        let paid_keys: HashSet<XorName> = [keys[0], keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
+            .into_iter()
+            .collect();
+
+        let requests = verification_requests_for_peer(&keys, Some(&paid_keys));
+
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].keys.len(), MAX_VERIFICATION_KEYS_PER_REQUEST);
+        assert_eq!(requests[0].paid_list_check_indices, vec![0]);
+        assert_eq!(
+            requests[1].keys,
+            vec![keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
+        );
+        assert_eq!(requests[1].paid_list_check_indices, vec![0]);
+    }
+
     // -----------------------------------------------------------------------
     // mark_peer_unresolved
     // -----------------------------------------------------------------------
@@ -1244,6 +1882,7 @@ mod tests {
             quorum_targets: std::iter::once((key_a, vec![peer])).collect(),
             paid_targets: std::iter::once((key_b, vec![peer])).collect(),
             paid_group_sizes: [(key_a, 0), (key_b, 1)].into_iter().collect(),
+            paid_edge_targets: std::iter::once((key_b, std::iter::once(peer).collect())).collect(),
             all_peers: std::iter::once(peer).collect(),
             peer_to_keys: std::iter::once((peer, vec![key_a, key_b])).collect(),
             peer_to_paid_keys: std::iter::once((peer, std::iter::once(key_b).collect())).collect(),
@@ -1474,6 +2113,8 @@ mod tests {
         let mut paid_targets = HashMap::new();
         let paid_group_size_a = paid_peers_a.len();
         let paid_group_size_b = paid_peers_b.len();
+        let paid_edge_targets_a = paid_edge_targets_for_peers(&paid_peers_a);
+        let paid_edge_targets_b = paid_edge_targets_for_peers(&paid_peers_b);
         paid_targets.insert(*key_a, paid_peers_a);
         paid_targets.insert(*key_b, paid_peers_b);
 
@@ -1481,6 +2122,9 @@ mod tests {
             quorum_targets,
             paid_targets,
             paid_group_sizes: [(*key_a, paid_group_size_a), (*key_b, paid_group_size_b)]
+                .into_iter()
+                .collect(),
+            paid_edge_targets: [(*key_a, paid_edge_targets_a), (*key_b, paid_edge_targets_b)]
                 .into_iter()
                 .collect(),
             all_peers,
@@ -1817,7 +2461,8 @@ mod tests {
         let paid_peers: Vec<PeerId> = (10..=14).map(peer_id_from_byte).collect();
         let targets = single_key_targets(&key, quorum_peers.clone(), paid_peers.clone());
 
-        // All quorum peers Absent; only 2/5 paid confirmations (below 3).
+        // All quorum peers Absent; only one paid confirmation, below the
+        // dynamic edge-aware paid-list threshold.
         let evidence = build_evidence(
             quorum_peers
                 .iter()
@@ -1825,7 +2470,7 @@ mod tests {
                 .collect(),
             vec![
                 (paid_peers[0], PaidListEvidence::Confirmed),
-                (paid_peers[1], PaidListEvidence::Confirmed),
+                (paid_peers[1], PaidListEvidence::NotFound),
                 (paid_peers[2], PaidListEvidence::NotFound),
                 (paid_peers[3], PaidListEvidence::NotFound),
                 (paid_peers[4], PaidListEvidence::NotFound),

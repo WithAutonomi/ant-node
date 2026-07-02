@@ -298,12 +298,14 @@ mod tests {
         let mut queues = ReplicationQueues::new();
 
         // Put the bootstrap key into the pending-verify queue.
+        let now = Instant::now();
         let entry = VerificationEntry {
             state: VerificationState::PendingVerify,
             pipeline: HintPipeline::Replica,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
-            created_at: Instant::now(),
+            created_at: now,
+            next_verify_at: now,
             hint_sender: saorsa_core::identity::PeerId::from_bytes([0u8; 32]),
         };
         queues.add_pending_verify(xor_name_from_byte(0x01), entry);

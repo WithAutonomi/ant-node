@@ -92,6 +92,9 @@ pub struct VerificationEntry {
     pub tried_sources: HashSet<PeerId>,
     /// When this entry was created.
     pub created_at: Instant,
+    /// Earliest time this key should be included in another verification
+    /// round.
+    pub next_verify_at: Instant,
     /// The peer that originally hinted this key (for source tracking).
     pub hint_sender: PeerId,
 }
@@ -113,6 +116,9 @@ pub struct FetchCandidate {
     pub distance: XorName,
     /// Verified source peers that responded `Present`.
     pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
 }
 
 impl Eq for FetchCandidate {}
@@ -627,6 +633,17 @@ impl NeighborSyncState {
     pub fn is_cycle_complete(&self) -> bool {
         self.priority_order.is_empty() && self.cursor >= self.order.len()
     }
+
+    /// Whether topology-change (priority) peers are still queued.
+    ///
+    /// The neighbor-sync loop drains these back-to-back rather than parking on
+    /// the periodic tick, so a churn burst converges at round-trip speed. The
+    /// `sync_trigger` `Notify` coalesces multiple wakeups into one, so it cannot
+    /// be the sole signal for pending work — this queue is the source of truth.
+    #[must_use]
+    pub fn has_priority_peers(&self) -> bool {
+        !self.priority_order.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +748,7 @@ mod tests {
                 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(1)],
+            retry_verification: None,
         };
 
         let far = FetchCandidate {
@@ -740,6 +758,7 @@ mod tests {
                 0, 0, 0, 0, 0,
             ],
             sources: vec![peer_id_from_byte(2)],
+            retry_verification: None,
         };
 
         // In a max-heap the "greatest" element pops first.
@@ -775,12 +794,14 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         let b = FetchCandidate {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         assert_eq!(
@@ -797,12 +818,14 @@ mod tests {
             key: [1u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         let b = FetchCandidate {
             key: [2u8; 32],
             distance: [5u8; 32],
             sources: vec![],
+            retry_verification: None,
         };
 
         assert_ne!(
@@ -1219,6 +1242,31 @@ mod tests {
 
         assert_eq!(state.queue_priority_peers([peer, peer]), 1);
         assert_eq!(state.priority_order.len(), 1);
+    }
+
+    #[test]
+    fn neighbor_sync_has_priority_peers_tracks_queue_and_drain() {
+        // The neighbor-sync loop drains the priority queue back-to-back and only
+        // parks once `has_priority_peers` reports false. Draining removes each
+        // queued peer (as `select_next_sync_peer` does via `remove_peer`), so the
+        // signal must flip to false once every entrant is consumed — this is the
+        // loop's termination guarantee.
+        let first = peer_id_from_byte(6);
+        let second = peer_id_from_byte(7);
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+        assert!(!state.has_priority_peers());
+
+        assert_eq!(state.queue_priority_peers([first, second]), 2);
+        assert!(state.has_priority_peers());
+
+        assert!(state.remove_peer(&first));
+        assert!(state.has_priority_peers(), "one entrant still pending");
+
+        assert!(state.remove_peer(&second));
+        assert!(
+            !state.has_priority_peers(),
+            "drained queue must let the loop park"
+        );
     }
 
     #[test]

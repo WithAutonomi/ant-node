@@ -782,6 +782,7 @@ fn failed(
             summary,
             reason,
         },
+        no_response_class: None,
     }
 }
 
