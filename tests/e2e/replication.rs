@@ -8,6 +8,7 @@
 use super::testnet::TestNetworkConfig;
 use super::TestHarness;
 use ant_node::client::compute_address;
+use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
     storage_admission_width, K_BUCKET_SIZE, REPLICATION_PROTOCOL_ID,
@@ -939,6 +940,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     let config = prune_test_config(close_group_size);
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -974,6 +976,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: false,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -1020,6 +1023,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(confirmed.records_audits_attempted, 1);
@@ -1055,6 +1059,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1085,6 +1090,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1116,6 +1122,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
     let config = prune_test_config(close_group_size);
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1171,6 +1178,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: Some(&committed),
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1202,6 +1210,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1255,6 +1264,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     // Deliberately empty and never populated: candidacy and target selection
     // must not depend on neighbor-sync repair hints.
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1302,6 +1312,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             repair_proofs: &repair_proofs,
             allow_remote_prune_audits: true,
             commitment_state: None,
+            audit_challenge_coordinator: &audit_challenge_coordinator,
         })
         .await;
         assert_eq!(
@@ -1344,6 +1355,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1500,6 +1512,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
     };
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1531,6 +1544,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1565,6 +1579,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
