@@ -746,15 +746,20 @@ impl ResponderCommitmentState {
 /// forward clock skew cannot over-extend answerability.
 fn wall_expiry_to_instant(expires_unix: u64, now_s: SystemTime, now_i: Instant) -> Option<Instant> {
     let expires_wall = UNIX_EPOCH.checked_add(Duration::from_secs(expires_unix))?;
-    let remaining = expires_wall.duration_since(now_s).ok()?;
+    // Apply RESTART_STAMP_GRACE to the persisted deadline BEFORE deciding expiry:
+    // the persisted deadline can be slightly early (a stamp refresh lost in the
+    // last persist window may have already carried the true deadline past the
+    // persisted one — even past `now`). Treating `persisted + grace` as the
+    // effective deadline means an honest node never under-retains across a
+    // restart. A slot only drops here if it expired MORE than the grace ago
+    // (genuine expiry — downtime still counts, minus the grace margin).
+    let effective_wall = expires_wall.checked_add(RESTART_STAMP_GRACE)?;
+    let remaining = effective_wall.duration_since(now_s).ok()?;
     if remaining.is_zero() {
         return None;
     }
-    // Clamp the base remaining to the TTL (so a forward wall-clock skew can't
-    // over-extend beyond one TTL), then add RESTART_STAMP_GRACE so a slightly
-    // stale persisted deadline never causes an honest node to under-retain
-    // across a restart. See RESTART_STAMP_GRACE.
-    now_i.checked_add(remaining.min(GOSSIP_ANSWERABILITY_TTL) + RESTART_STAMP_GRACE)
+    // Clamp so a forward wall-clock skew cannot over-extend beyond one TTL + grace.
+    now_i.checked_add(remaining.min(GOSSIP_ANSWERABILITY_TTL + RESTART_STAMP_GRACE))
 }
 
 /// ADR-0004: the responder commitment state is the quote generator's commitment
@@ -904,6 +909,71 @@ mod tests {
     #[test]
     fn corrupt_retention_snapshot_is_rejected() {
         assert!(PersistedRetention::from_bytes(&[0xffu8; 9]).is_none());
+    }
+
+    /// A snapshot from an incompatible format version is rejected (→ empty
+    /// retention), not silently misdecoded.
+    #[test]
+    fn wrong_format_version_is_rejected() {
+        let entries: Vec<_> = (1..=3u8).map(|i| (key(i), key(i))).collect();
+        let (pk, sk) = keypair();
+        let built = BuiltCommitment::build(entries, &[9; 32], &sk, &pk.to_bytes()).unwrap();
+        let bad = PersistedRetention {
+            version: RETENTION_FORMAT_VERSION + 1,
+            slots: vec![PersistedSlot {
+                commitment: built.commitment().clone(),
+                leaf_keys: vec![key(1)],
+                expires_at_unix: None,
+            }],
+            has_current: true,
+        };
+        let bytes = bad.to_bytes().expect("serialize");
+        assert!(PersistedRetention::from_bytes(&bytes).is_none());
+    }
+
+    /// ADR-0004 A1 restart grace: a persisted deadline that is slightly in the
+    /// PAST (within `RESTART_STAMP_GRACE`, e.g. a stamp refresh lost in the last
+    /// persist window before an unclean restart) must still be answerable — an
+    /// honest node never under-retains across restart. A deadline older than the
+    /// grace is genuinely expired and dropped (downtime still counts).
+    #[test]
+    fn restore_grace_retains_slightly_stale_deadline_but_drops_expired() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let entries: Vec<_> = (1..=3u8).map(|i| (key(i), key(i))).collect();
+        let built = BuiltCommitment::build(entries.clone(), &[0xCD; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+        let leaf_keys: Vec<_> = entries.iter().map(|(k, _)| *k).collect();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs();
+
+        let make = |expires_at_unix: Option<u64>| PersistedRetention {
+            version: RETENTION_FORMAT_VERSION,
+            slots: vec![PersistedSlot {
+                commitment: built.commitment().clone(),
+                leaf_keys: leaf_keys.clone(),
+                expires_at_unix,
+            }],
+            has_current: false, // not current -> retention depends on the stamp
+        };
+
+        // 60s past the persisted deadline — within the grace -> still answerable.
+        let within = ResponderCommitmentState::new();
+        within.restore(&make(Some(now_unix.saturating_sub(60))));
+        assert!(
+            within.lookup_by_hash(&pin).is_some(),
+            "a deadline within RESTART_STAMP_GRACE stays answerable across restart"
+        );
+
+        // 30 min past — well beyond the grace -> genuinely expired, dropped.
+        let beyond = ResponderCommitmentState::new();
+        beyond.restore(&make(Some(now_unix.saturating_sub(30 * 60))));
+        assert!(
+            beyond.lookup_by_hash(&pin).is_none(),
+            "a deadline older than the grace is expired and dropped"
+        );
     }
 
     #[test]
