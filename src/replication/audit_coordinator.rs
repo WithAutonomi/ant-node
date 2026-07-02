@@ -35,6 +35,34 @@ pub(crate) struct AuditChallengePermit {
     permit: Option<OwnedSemaphorePermit>,
 }
 
+/// RAII guard that releases a counted target reference unless disarmed.
+///
+/// A reference is counted *before* `acquire` awaits the per-target semaphore.
+/// Holding this guard across that await guarantees the reference is released
+/// even if the future is dropped while parked in the wait queue (task abort,
+/// enclosing `timeout`, or a racing `select!` branch). On a successful acquire
+/// the guard is disarmed and the returned [`AuditChallengePermit`] assumes the
+/// release on its own drop.
+struct ReferenceGuard<'a> {
+    coordinator: &'a AuditChallengeCoordinator,
+    peer: PeerId,
+    armed: bool,
+}
+
+impl ReferenceGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ReferenceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.coordinator.release_reference(self.peer);
+        }
+    }
+}
+
 impl AuditChallengeCoordinator {
     /// Create an empty coordinator.
     #[must_use]
@@ -55,19 +83,26 @@ impl AuditChallengeCoordinator {
             Arc::clone(&entry.semaphore)
         };
 
-        semaphore.acquire_owned().await.map_or_else(
-            |_| {
-                self.release_reference(peer);
-                None
-            },
-            |permit| {
-                Some(AuditChallengePermit {
-                    coordinator: Arc::clone(self),
-                    peer,
-                    permit: Some(permit),
-                })
-            },
-        )
+        // The reference is now counted. Hold it under an RAII guard across the
+        // await so a dropped/cancelled future still releases it; a closed
+        // semaphore releases it via the same guard on the early return.
+        let mut reference_guard = ReferenceGuard {
+            coordinator: self,
+            peer,
+            armed: true,
+        };
+
+        let Ok(permit) = semaphore.acquire_owned().await else {
+            return None;
+        };
+
+        // Hand the release off to the permit's own drop.
+        reference_guard.disarm();
+        Some(AuditChallengePermit {
+            coordinator: Arc::clone(self),
+            peer,
+            permit: Some(permit),
+        })
     }
 
     #[cfg(test)]
@@ -169,5 +204,30 @@ mod tests {
         let acquired_b = tokio::spawn(async move { coordinator_clone.acquire(target_b).await });
         let result = tokio::time::timeout(SHORT_WAIT, acquired_b).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_releases_reference() {
+        let coordinator = Arc::new(AuditChallengeCoordinator::new());
+        let target = peer(PEER_A);
+        // Saturate the target so a third acquire parks in the wait queue.
+        let first = coordinator.acquire(target).await;
+        let second = coordinator.acquire(target).await;
+        assert!(first.is_some());
+        assert!(second.is_some());
+
+        // A parked acquire whose future is dropped mid-await must not leak the
+        // reference it counted before parking.
+        let parked = coordinator.acquire(target);
+        let dropped = tokio::time::timeout(SHORT_WAIT, parked).await;
+        assert!(dropped.is_err(), "third acquire should still be parked");
+
+        drop(first);
+        drop(second);
+        assert_eq!(
+            coordinator.tracked_target_count(),
+            0,
+            "cancelled wait leaked a target reference"
+        );
     }
 }

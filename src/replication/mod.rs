@@ -50,6 +50,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
@@ -174,6 +175,11 @@ const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
 
 /// Bootstrap drain check interval in seconds.
 const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
+
+/// Grace period `shutdown()` waits for each background task (and, collectively,
+/// the detached fresh-offer worker pool) to observe the cancellation token and
+/// terminate before it gives up and aborts / abandons the wait.
+const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the responder rebuilds + rotates its storage commitment.
 ///
@@ -365,6 +371,11 @@ pub struct ReplicationEngine {
     shutdown: CancellationToken,
     /// Background task handles.
     task_handles: Vec<JoinHandle<()>>,
+    /// Tracks detached, short-lived fresh-offer worker tasks so `shutdown()`
+    /// can drain them. Unlike `task_handles` these are spawned on demand from
+    /// the message handler and hold `Arc<LmdbStorage>` while writing, so they
+    /// must be awaited before the caller may reopen the LMDB environment.
+    worker_tracker: TaskTracker,
 }
 
 impl ReplicationEngine {
@@ -430,6 +441,7 @@ impl ReplicationEngine {
             possession_check_rx: Some(possession_check_rx),
             shutdown,
             task_handles: Vec::new(),
+            worker_tracker: TaskTracker::new(),
         })
     }
 
@@ -622,15 +634,34 @@ impl ReplicationEngine {
     pub async fn shutdown(&mut self) {
         self.shutdown.cancel();
         for (i, mut handle) in self.task_handles.drain(..).enumerate() {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+            match tokio::time::timeout(SHUTDOWN_TASK_DRAIN_TIMEOUT, &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) if e.is_cancelled() => {}
                 Ok(Err(e)) => warn!("Replication task {i} panicked during shutdown: {e}"),
                 Err(_) => {
-                    warn!("Replication task {i} did not stop within 10s, aborting");
+                    warn!(
+                        "Replication task {i} did not stop within {}s, aborting",
+                        SHUTDOWN_TASK_DRAIN_TIMEOUT.as_secs()
+                    );
                     handle.abort();
                 }
             }
+        }
+
+        // Drain detached fresh-offer workers. The serial message handler has
+        // already stopped (its handle is drained above), so no new workers can
+        // be spawned; each observes the cancelled token and finishes promptly,
+        // releasing its `Arc<LmdbStorage>` before this returns.
+        self.worker_tracker.close();
+        if tokio::time::timeout(SHUTDOWN_TASK_DRAIN_TIMEOUT, self.worker_tracker.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                "Fresh-offer workers did not drain within {}s; {} still in flight",
+                SHUTDOWN_TASK_DRAIN_TIMEOUT.as_secs(),
+                self.worker_tracker.len()
+            );
         }
     }
 
@@ -806,6 +837,7 @@ impl ReplicationEngine {
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_key_locks = Arc::clone(&self.fresh_offer_key_locks);
+        let worker_tracker = self.worker_tracker.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
         // commitment can spawn a probabilistic, cooldown-gated subtree audit.
@@ -838,6 +870,8 @@ impl ReplicationEngine {
             audit_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_key_locks,
+            shutdown: shutdown.clone(),
+            worker_tracker,
         };
 
         let (replication_tx, mut replication_rx) =
@@ -1800,6 +1834,12 @@ struct ReplicationMessageHandlerContext {
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_key_locks: FreshOfferKeyLocks,
+    /// Cancellation token so detached fresh-offer workers abort in-flight work
+    /// (payment verification, LMDB writes) when the engine shuts down.
+    shutdown: CancellationToken,
+    /// Tracker the detached fresh-offer workers register with so `shutdown()`
+    /// can await their completion and the release of their `Arc<LmdbStorage>`.
+    worker_tracker: TaskTracker,
 }
 
 struct InboundReplicationMessage {
@@ -2269,18 +2309,30 @@ async fn dispatch_fresh_offer(
     };
 
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    let tracker = ctx.worker_tracker.clone();
+    let shutdown = ctx.shutdown.clone();
+    // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
+    // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
+    // those references be released before the caller reopens the environment.
+    // The `select!` lets it abandon in-flight work promptly on cancellation
+    // instead of blocking shutdown for the full drain grace period.
+    tracker.spawn(async move {
         let _permit = permit;
-        if let Err(e) = handle_fresh_offer_serialized(
-            &source,
-            &offer,
-            &ctx,
-            request_id,
-            rr_message_id.as_deref(),
-        )
-        .await
-        {
-            debug!("Fresh replication offer from {source} error: {e}");
+        tokio::select! {
+            () = shutdown.cancelled() => {
+                debug!("Fresh-offer worker for {source} cancelled during shutdown");
+            }
+            result = handle_fresh_offer_serialized(
+                &source,
+                &offer,
+                &ctx,
+                request_id,
+                rr_message_id.as_deref(),
+            ) => {
+                if let Err(e) = result {
+                    debug!("Fresh replication offer from {source} error: {e}");
+                }
+            }
         }
     });
     Ok(())
