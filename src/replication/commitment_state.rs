@@ -335,6 +335,16 @@ const MAX_RETAINED_GOSSIPED_SLOTS: usize = 16;
 /// interval = 3 h.
 pub(crate) const GOSSIP_ANSWERABILITY_TTL: Duration = Duration::from_secs(3 * 3600);
 
+/// Extra answerability margin applied ONLY when reloading retention after a
+/// restart (ADR-0004 A1). A gossip-stamp refresh in the last persist window may
+/// not have been flushed before an unclean restart, so a persisted deadline can
+/// be slightly early. Adding this margin on reload guarantees an honest node
+/// never *under*-retains across a restart (it may over-retain by the margin,
+/// which is harmless — it only makes the responder answer a little longer, and a
+/// data-deleter still fails the round-2 byte challenge). Sized well above the
+/// persist interval + gossip cadence, far below the TTL.
+const RESTART_STAMP_GRACE: Duration = Duration::from_secs(5 * 60);
+
 /// One persisted retention slot (ADR-0004 A1): the signed commitment, its
 /// committed key set (so the tree can be rebuilt without re-reading chunks), and
 /// the wall-clock time its hash was last gossiped (`None` if never gossiped —
@@ -351,10 +361,18 @@ struct PersistedSlot {
     expires_at_unix: Option<u64>,
 }
 
+/// Persisted-format version. Bump on any layout OR semantic change so an
+/// incompatible on-disk snapshot is rejected (→ empty retention, which self-heals
+/// via re-gossip) rather than silently misinterpreted (e.g. an old field read
+/// under new semantics).
+const RETENTION_FORMAT_VERSION: u32 = 1;
+
 /// The persisted responder retention. Slots are newest-first; `has_current`
 /// says whether `slots[0]` was the live advertised commitment.
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub struct PersistedRetention {
+    /// Format version (see [`RETENTION_FORMAT_VERSION`]); a mismatch is rejected.
+    version: u32,
     slots: Vec<PersistedSlot>,
     has_current: bool,
 }
@@ -368,12 +386,13 @@ impl PersistedRetention {
         postcard::to_allocvec(self).ok()
     }
 
-    /// Decode a persisted snapshot. `None` on a corrupt blob — the caller then
-    /// fails open LOCALLY (empty retention; the node re-gossips a fresh root),
-    /// which never grants a remote grace.
+    /// Decode a persisted snapshot. `None` on a corrupt blob OR a version
+    /// mismatch — the caller then fails open LOCALLY (empty retention; the node
+    /// re-gossips a fresh root), which never grants a remote grace.
     #[must_use]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        postcard::from_bytes(bytes).ok()
+        let this: Self = postcard::from_bytes(bytes).ok()?;
+        (this.version == RETENTION_FORMAT_VERSION).then_some(this)
     }
 
     /// Whether the snapshot holds no slots.
@@ -671,6 +690,7 @@ impl ResponderCommitmentState {
             })
             .collect();
         PersistedRetention {
+            version: RETENTION_FORMAT_VERSION,
             slots,
             has_current: guard.has_current,
         }
@@ -730,7 +750,11 @@ fn wall_expiry_to_instant(expires_unix: u64, now_s: SystemTime, now_i: Instant) 
     if remaining.is_zero() {
         return None;
     }
-    now_i.checked_add(remaining.min(GOSSIP_ANSWERABILITY_TTL))
+    // Clamp the base remaining to the TTL (so a forward wall-clock skew can't
+    // over-extend beyond one TTL), then add RESTART_STAMP_GRACE so a slightly
+    // stale persisted deadline never causes an honest node to under-retain
+    // across a restart. See RESTART_STAMP_GRACE.
+    now_i.checked_add(remaining.min(GOSSIP_ANSWERABILITY_TTL) + RESTART_STAMP_GRACE)
 }
 
 /// ADR-0004: the responder commitment state is the quote generator's commitment

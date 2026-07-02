@@ -4814,11 +4814,14 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
         std::fs::write(&tmp, &bytes)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &path)?;
-        if let Some(dir) = path.parent() {
-            // Fsync the directory so the rename (the durable-commit point) is
-            // not lost on a crash right after it.
-            std::fs::File::open(dir)?.sync_all()?;
-        }
+        // Fsync the directory so the rename (the durable-commit point) is not
+        // lost on a crash right after it. An empty parent (relative filename)
+        // means the current directory.
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
         Ok(())
     })
     .await;
