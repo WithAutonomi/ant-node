@@ -117,13 +117,16 @@ pub enum MissVerdict {
 /// conservatively (that bound imposes no constraint).
 #[must_use]
 pub fn is_admissible(quote_ts: SystemTime, now: SystemTime) -> bool {
+    // Fail CLOSED on the future bound: an unrepresentable `now + skew` rejects.
     let not_future = now
         .checked_add(CLOCK_SKEW_MARGIN)
-        .map_or(true, |upper| quote_ts <= upper);
+        .is_some_and(|upper| quote_ts <= upper);
+    // Lower bound: a near-epoch `now` imposes no "too old" constraint (benign).
     let not_too_old = now
         .checked_sub(MAX_AUDITED_QUOTE_AGE.saturating_add(CLOCK_SKEW_MARGIN))
         .map_or(true, |lower| quote_ts >= lower);
-    not_future && not_too_old
+    // An admitted pin must have a computable confirmation deadline.
+    not_future && not_too_old && confirmation_deadline(quote_ts).is_some()
 }
 
 /// The deadline until which an admitted paid pin is convictable on a definitive
@@ -507,6 +510,67 @@ mod tests {
         let mut tampered = store.clone();
         tampered.insert(xk(3), [0xFFu8; 32]);
         assert!(!rec.holds(|k| tampered.get(k).copied()));
+    }
+
+    /// Capstone (ADR-0004 A1 headline): pay → persist → restart → shed → the
+    /// in-window definitive miss is CONFIRMED, while an honest holder that
+    /// survived the restart answers and is not convicted. This is the exact
+    /// pay-then-shed vector the amendment closes.
+    #[test]
+    fn pay_then_shed_across_restart_is_confirmed_but_honest_holder_is_not() {
+        let now = SystemTime::now();
+        let quote_ts = now; // admitted fresh
+        let quote_ts_unix = quote_ts
+            .duration_since(UNIX_EPOCH)
+            .expect("test clock after epoch")
+            .as_secs();
+
+        let entries: Vec<_> = (1..=5u8).map(|i| (xk(i), bh(i))).collect();
+        let commitment = commitment_over(&entries);
+        let pin = commitment_hash(&commitment).unwrap();
+        assert!(
+            is_admissible(quote_ts, now),
+            "fresh paid quote is admissible"
+        );
+
+        // Node persists the obligation, then "restarts" (drop + reload).
+        let mut ledger = PaidPinLedger::new();
+        ledger.insert(PaidPinRecord {
+            commitment,
+            leaf_keys: entries.iter().map(|(k, _)| *k).collect(),
+            quote_ts_unix,
+        });
+        let bytes = ledger.to_bytes().unwrap();
+        drop(ledger);
+        let reloaded = match PaidPinLedger::load(&bytes) {
+            LoadOutcome::Loaded { ledger, .. } => ledger,
+            LoadOutcome::Corrupt => panic!("valid blob"),
+        };
+        let rec = reloaded.get(&pin).expect("obligation survives restart");
+
+        // The auditor's in-window challenge (issued now).
+        let provenance = PinProvenance::PaidQuote { quote_ts };
+
+        // (a) SHEDDER: cleared its store after payment -> holds() == false ->
+        //     definitive miss -> CONFIRMED (no restart escape).
+        let empty: HashMap<XorName, [u8; 32]> = HashMap::new();
+        assert!(
+            !rec.holds(|k| empty.get(k).copied()),
+            "shedder cannot answer"
+        );
+        assert_eq!(
+            grade_definitive_miss(provenance, now),
+            MissVerdict::Confirmed,
+            "an in-window paid pin the shedder cannot answer is a confirmed failure"
+        );
+
+        // (b) HONEST HOLDER: still holds the data across the restart -> holds()
+        //     == true -> no definitive miss -> never convicted.
+        let store: HashMap<XorName, [u8; 32]> = entries.iter().copied().collect();
+        assert!(
+            rec.holds(|k| store.get(k).copied()),
+            "honest holder answers"
+        );
     }
 
     #[test]
