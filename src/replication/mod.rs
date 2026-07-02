@@ -160,6 +160,12 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// "rotated past" case.
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 
+/// How often the responder retention snapshot is flushed to disk (ADR-0004 A1).
+/// Short relative to the answerability TTL (3 h) so a gossip-stamp refresh is
+/// durable well before it could matter to a restart, while the write-on-change
+/// guard keeps idle nodes from needless disk writes.
+const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
+
 /// Minimum interval between commitment signature verifications for a
 /// single peer (v10/v12 §2 step 3 + §11 `DoS`).
 ///
@@ -363,7 +369,7 @@ impl ReplicationEngine {
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
         let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
 
-        Ok(Self {
+        let engine = Self {
             config: Arc::clone(&config),
             p2p_node,
             storage,
@@ -396,7 +402,13 @@ impl ReplicationEngine {
             monetized_pin_rx: Some(monetized_pin_rx),
             shutdown,
             task_handles: Vec::new(),
-        })
+        };
+        // ADR-0004 A1: reload persisted responder retention BEFORE any task
+        // spawns, so an honest restarted node is answerable for its pre-restart
+        // pins from the first audit it serves, and the persist loop never races
+        // an empty snapshot over the good on-disk file.
+        load_commitment_retention(&engine.commitment_state, &engine.retention_path).await;
+        Ok(engine)
     }
 
     /// ADR-0004: a sender the payment verifier uses to surface monetized pins
@@ -545,6 +557,7 @@ impl ReplicationEngine {
         // Audit #1 (storage-commitment) is gossip-triggered in the message
         // handler when a peer's commitment is ingested, not on a periodic tick.
         self.start_commitment_rotation_loop();
+        self.start_retention_persist_loop();
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
@@ -1268,7 +1281,6 @@ impl ReplicationEngine {
         let storage = Arc::clone(&self.storage);
         let identity = Arc::clone(&self.identity);
         let commitment_state = Arc::clone(&self.commitment_state);
-        let retention_path = self.retention_path.clone();
         let shutdown = self.shutdown.clone();
         let p2p = Arc::clone(&self.p2p_node);
         let config = Arc::clone(&self.config);
@@ -1291,12 +1303,11 @@ impl ReplicationEngine {
             // ML-DSA signatures are randomized so we cannot reproduce
             // the pre-restart hash; the only honest path to recovery
             // is fast re-gossip.
-            // ADR-0004 A1: reload persisted retention BEFORE the first rebuild so
-            // an honest restarted node stays answerable for its pre-restart pins.
-            // The first rebuild no-ops when the key set is unchanged, preserving
-            // the reloaded current pin; otherwise the reloaded roots remain
-            // answerable as retained slots until their gossip TTL lapses.
-            load_commitment_retention(&commitment_state, &retention_path).await;
+            // ADR-0004 A1: retention was reloaded in `new()` (before any task
+            // spawned), so this initial rebuild no-ops when the key set is
+            // unchanged — preserving the reloaded current pin; otherwise the
+            // reloaded roots stay answerable as retained slots until their gossip
+            // TTL lapses. Persistence is handled by the retention-persist loop.
             if let Err(e) =
                 rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p, &config)
                     .await
@@ -1305,8 +1316,6 @@ impl ReplicationEngine {
             } else {
                 sync_trigger.notify_one();
             }
-            // Persist the reloaded + rebuilt retention.
-            persist_commitment_retention(&commitment_state, &retention_path).await;
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
@@ -1322,9 +1331,6 @@ impl ReplicationEngine {
                         ).await {
                             warn!("Commitment rotation failed: {e}");
                         }
-                        // ADR-0004 A1: persist retention every tick so rotations
-                        // and age-outs survive a restart.
-                        persist_commitment_retention(&commitment_state, &retention_path).await;
                         // Piggyback a sweep of expired recent_provers
                         // entries on the rotation tick (same cadence,
                         // 1 h). is_credited_holder already honours the
@@ -1340,6 +1346,37 @@ impl ReplicationEngine {
                 }
             }
             debug!("Commitment rotation loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// ADR-0004 A1: periodically flush the responder retention snapshot to disk
+    /// (write-on-change) so answerability — including gossip-stamp refreshes and
+    /// rotations — survives a restart. Flushes once immediately, then every
+    /// `RETENTION_PERSIST_INTERVAL_SECS`, and once more on shutdown.
+    fn start_retention_persist_loop(&mut self) {
+        let commitment_state = Arc::clone(&self.commitment_state);
+        let retention_path = self.retention_path.clone();
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut last: Option<Vec<u8>> = None;
+            persist_retention_if_changed(&commitment_state, &retention_path, &mut last).await;
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        persist_retention_if_changed(&commitment_state, &retention_path, &mut last)
+                            .await;
+                        break;
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(
+                        RETENTION_PERSIST_INTERVAL_SECS,
+                    )) => {
+                        persist_retention_if_changed(&commitment_state, &retention_path, &mut last)
+                            .await;
+                    }
+                }
+            }
+            debug!("Commitment retention persist loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -4744,27 +4781,57 @@ async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path
     }
 }
 
-/// Persist the responder retention snapshot durably (ADR-0004 A1): serialize,
-/// write to a temp file, fsync it, then atomically rename over the target. On a
-/// serialization error the existing snapshot is left intact (never truncated).
-async fn persist_commitment_retention(state: &ResponderCommitmentState, path: &Path) {
+/// Persist the responder retention snapshot IF it changed since `last` (ADR-0004
+/// A1). Write-on-change keeps frequent gossip-stamp refreshes durable without
+/// needless disk writes on idle nodes. On success updates `last` to the bytes
+/// written; on a serialization/write error the existing on-disk snapshot is left
+/// intact (never truncated).
+async fn persist_retention_if_changed(
+    state: &ResponderCommitmentState,
+    path: &Path,
+    last: &mut Option<Vec<u8>>,
+) {
     let Some(bytes) = state.snapshot().to_bytes() else {
         warn!("Commitment retention: serialization failed; keeping previous snapshot");
         return;
     };
+    if last.as_deref() == Some(bytes.as_slice()) {
+        return;
+    }
+    if write_retention_atomic(path, bytes.clone()).await {
+        *last = Some(bytes);
+    }
+}
+
+/// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →
+/// fsync parent dir (so the rename itself survives a crash). Returns `true` on
+/// success. Only the retention-persist loop writes this path, so a fixed temp
+/// name is safe.
+async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
     let path = path.to_path_buf();
     let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, &bytes)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &path)?;
+        if let Some(dir) = path.parent() {
+            // Fsync the directory so the rename (the durable-commit point) is
+            // not lost on a crash right after it.
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     })
     .await;
     match res {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("Commitment retention: persist failed: {e}"),
-        Err(e) => warn!("Commitment retention: persist task join failed: {e}"),
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("Commitment retention: persist failed: {e}");
+            false
+        }
+        Err(e) => {
+            warn!("Commitment retention: persist task join failed: {e}");
+            false
+        }
     }
 }
 

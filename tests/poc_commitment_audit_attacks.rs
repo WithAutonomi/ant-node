@@ -895,13 +895,15 @@ fn repudiating_a_gossiped_pin_is_detectable_via_lookup_miss() {
         "a gossiped commitment must survive one rotation (no false repudiation)"
     );
 
-    // Rotate + gossip c3. Now the last-2-gossiped are {h3, h2}; h1 has aged out
-    // and is legitimately dropped (the auditor would no longer pin it).
+    // Rotate + gossip c3. Retention is TTL-based (not a fixed count) and no wall
+    // time has elapsed, so every gossiped root stays answerable — a rotation
+    // never repudiates an in-window root an honest node published (that would be
+    // a false conviction once grace is removed). Aging out is time-based (TTL).
     let h3 = r.commit_to_range(24);
     state.mark_gossiped(h3);
     assert!(
-        state.lookup_by_hash(&h1).is_none(),
-        "h1 aged out of the gossip window"
+        state.lookup_by_hash(&h1).is_some(),
+        "h1 stays answerable within its gossip TTL (no count-based eviction)"
     );
     assert!(state.lookup_by_hash(&h2).is_some());
     assert!(state.lookup_by_hash(&h3).is_some());
