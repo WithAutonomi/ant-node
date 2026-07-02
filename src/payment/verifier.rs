@@ -1266,7 +1266,8 @@ impl PaymentVerifier {
     /// answerability TTL is treated as unknown"). An unresolved pin is never a
     /// penalty: it is skipped here (the sidecar and `GetCommitmentByPin` fetch
     /// fallbacks resolve more pins and are layered on next, but a pin that
-    /// resolves nowhere stays graced, exactly like an unanswerable audit pin).
+    /// resolves nowhere is simply skipped at cross-check time — an unresolved pin
+    /// is never a penalty here).
     ///
     /// A genuine [`CrossCheck::Mismatch`] is a deterministic, first-occurrence
     /// contradiction between two same-key-signed artifacts: when enforcing, it

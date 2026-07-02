@@ -10,6 +10,7 @@
 //! [`crate::replication::subtree`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::logging::{debug, info, warn};
 use rand::Rng;
@@ -50,6 +51,41 @@ use crate::replication::audit::AuditTickResult;
 /// faking a fraction `x` of leaves survives only `(1 - x)^k`.
 const BYTE_SPOTCHECK_MIN: u32 = 3;
 const BYTE_SPOTCHECK_MAX: u32 = 5;
+
+/// ADR-0004 A1: with grace removed, the responder retries a TRANSIENT chunk-read
+/// error a few times before rejecting `Transient` (which routes to the timeout
+/// lane). A momentary disk blip usually clears within these attempts; only a
+/// persistent read failure — the node genuinely cannot serve committed bytes —
+/// falls through. Total added latency (attempts × backoff) stays well inside the
+/// audit response deadline.
+const AUDIT_READ_RETRY_ATTEMPTS: u32 = 3;
+const AUDIT_READ_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Read a committed chunk's bytes, retrying a transient read error up to
+/// [`AUDIT_READ_RETRY_ATTEMPTS`] times with [`AUDIT_READ_RETRY_BACKOFF`] between
+/// tries. `Ok(None)` (bytes definitively absent — real loss) is NOT retried; only
+/// an `Err` (transient IO) is. A persistent `Err` is returned so the caller emits
+/// `RejectKind::Transient` (timeout lane).
+async fn get_raw_retrying(
+    storage: &LmdbStorage,
+    key: &XorName,
+) -> crate::error::Result<Option<Vec<u8>>> {
+    let mut attempt = 1u32;
+    loop {
+        match storage.get_raw(key).await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < AUDIT_READ_RETRY_ATTEMPTS => {
+                debug!(
+                    "Audit: transient read error for {} (attempt {attempt}/{AUDIT_READ_RETRY_ATTEMPTS}): {e}; retrying",
+                    hex::encode(key)
+                );
+                attempt += 1;
+                tokio::time::sleep(AUDIT_READ_RETRY_BACKOFF).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// Holder-eligibility cache the auditor credits on a passing audit.
 ///
@@ -179,12 +215,12 @@ enum ByteRound {
     /// The responder rejected the byte challenge (confirmed failure for a
     /// recently pinned commitment).
     Rejected,
-    /// The responder rejected with a GRACED kind (`UnknownCommitment`/
-    /// `Transient`): no trust penalty, but holder credit is revoked — the peer
-    /// answered and could not prove possession, so it must not keep stale credit
-    /// (codex-r2 C). Distinct from a silent network `Timeout`, which keeps credit
-    /// (a dropped packet is not evidence of loss).
-    GracedReject,
+    /// The responder rejected with `Transient` (a local read error): routed to
+    /// the non-response/timeout lane — no trust penalty, but holder credit is
+    /// revoked, because the peer answered and could not prove possession, so it
+    /// must not keep stale credit. Distinct from a silent network `Timeout`,
+    /// which keeps credit (a dropped packet is not evidence of loss).
+    TransientReject,
     /// No response within the byte deadline, or a transport error (graced
     /// timeout). Keeps holder credit.
     Timeout,
@@ -262,22 +298,26 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
             kind,
             reason,
         }) if challenge_id == ctx.challenge_id => {
-            // Graced kinds (rotated past the pin / transient read error, §6/§7)
-            // are not a confirmed cheat — no trust penalty — but the peer DID
-            // answer and could not prove possession, so credit is revoked
-            // (GracedReject), unlike a silent network timeout.
-            if kind.is_graced() {
-                debug!(
-                    "Audit: {} rejected byte challenge (graced, {kind:?}): {reason}",
-                    ctx.challenged_peer
-                );
-                ByteRound::GracedReject
-            } else {
-                warn!(
-                    "Audit: {} rejected byte challenge: {reason}",
-                    ctx.challenged_peer
-                );
-                ByteRound::Rejected
+            // ADR-0004 A1: grace removed. UnknownCommitment/Protocol repudiation
+            // of a pinned root is a confirmed failure; a Transient read error
+            // routes to the timeout lane (credit revoked, no trust penalty) — the
+            // responder retries reads first, so a Transient reaching round 2 means
+            // it still could not serve committed bytes.
+            match kind {
+                RejectKind::UnknownCommitment | RejectKind::Protocol => {
+                    warn!(
+                        "Audit: {} rejected byte challenge ({kind:?}; confirmed): {reason}",
+                        ctx.challenged_peer
+                    );
+                    ByteRound::Rejected
+                }
+                RejectKind::Transient => {
+                    debug!(
+                        "Audit: {} returned Transient for byte challenge (timeout lane): {reason}",
+                        ctx.challenged_peer
+                    );
+                    ByteRound::TransientReject
+                }
             }
         }
         // A node claiming bootstrap MID-AUDIT (it answered round 1) is treated
@@ -325,42 +365,49 @@ async fn dispatch_subtree_response(
             if resp_id != challenge_id {
                 return malformed();
             }
-            // A genuine protocol rejection of a freshly pinned root is a
-            // confirmed failure (repudiating what you just published). But an
-            // `UnknownCommitment`/`Transient` rejection is GRACED (§6/§7): the
-            // peer may have legitimately rotated past a root the auditor still
-            // had cached (retention is capped at the last two gossiped roots),
-            // or hit a transient read error — neither is provable misbehaviour,
-            // so we do NOT apply the trust penalty (return a graced Timeout).
-            if kind.is_graced() {
-                // BUT revoke the holder credit for THIS pinned commitment
-                // (codex-r2 C): the peer did not prove possession of it NOW, so
-                // it must not keep "proven holder" credit for it until the TTL
-                // lapses. Closes the loophole where a deleter lies
-                // `Transient`/`UnknownCommitment` to dodge the confirmed-failure
-                // path and PRESERVE stale credit.
-                //
-                // Scoped to the pinned commitment hash, NOT the whole peer
-                // (codex-r3): a commitment hash is peer-specific (it signs over
-                // `sender_peer_id`), so this revokes exactly this peer's credit
-                // for this commitment. A delayed/stale audit of an OLD commitment
-                // C1 therefore cannot erase the valid credit an honest rotated
-                // peer already re-earned for its CURRENT commitment C2.
-                if let Some(credit) = ctx.credit {
-                    credit
-                        .recent_provers
-                        .write()
-                        .await
-                        .forget_commitment(&ctx.expected_commitment_hash);
+            // ADR-0004 A1: audit grace is REMOVED. Answerability is now
+            // restart-durable (persisted retention) and the auditor only pins
+            // in-window roots, so an honest node can always answer a pin it could
+            // be challenged on. A responsive rejection is therefore graded on the
+            // kind, with no grace:
+            match kind {
+                // Repudiating a pinned root the node published (`UnknownCommitment`)
+                // or an explicit protocol rejection is provable misbehaviour →
+                // confirmed failure (the trust penalty + credit revocation happen
+                // downstream in handle_subtree_failed_audit).
+                RejectKind::UnknownCommitment | RejectKind::Protocol => {
+                    warn!(
+                        "Audit: peer {challenged_peer} rejected subtree challenge \
+                         ({kind:?}; confirmed — grace removed): {reason}"
+                    );
+                    failed(challenged_peer, challenge_id, AuditFailureReason::Rejected)
                 }
-                debug!(
-                    "Audit: peer {challenged_peer} rejected subtree challenge \
-                     (graced, {kind:?}; credit for the pinned commitment revoked): {reason}"
-                );
-                failed(challenged_peer, challenge_id, AuditFailureReason::Timeout)
-            } else {
-                warn!("Audit: peer {challenged_peer} rejected subtree challenge: {reason}");
-                failed(challenged_peer, challenge_id, AuditFailureReason::Rejected)
+                // A transient local read error is not a provable cheat, but it is
+                // not graced-with-standing either: the responder retries reads
+                // first (see handle_subtree_challenge), so a `Transient` that
+                // still reaches the auditor means the node could not serve data it
+                // committed to. Route it to the non-response/timeout lane — no
+                // trust penalty, but revoke the holder credit for THIS pinned
+                // commitment so it gains no positive standing (a Transient-spammer
+                // profits nothing). Distinguishing malicious from genuine
+                // transient IO network-wide is the out-of-scope distributed
+                // non-response problem. Scoped to the commitment hash, not the
+                // whole peer, so a stale audit of an old commitment cannot erase
+                // credit re-earned for a newer one.
+                RejectKind::Transient => {
+                    if let Some(credit) = ctx.credit {
+                        credit
+                            .recent_provers
+                            .write()
+                            .await
+                            .forget_commitment(&ctx.expected_commitment_hash);
+                    }
+                    debug!(
+                        "Audit: peer {challenged_peer} returned Transient for subtree challenge \
+                         (timeout lane; credit for the pinned commitment revoked): {reason}"
+                    );
+                    failed(challenged_peer, challenge_id, AuditFailureReason::Timeout)
+                }
             }
         }
         ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof {
@@ -606,11 +653,11 @@ async fn verify_subtree_response(
     // CRITICAL: verify each batch's served bytes AS IT ARRIVES, against that
     // batch's own sampled leaves, and return a CONFIRMED failure immediately.
     // Deferring all verification until every batch is collected would let a
-    // later batch's graced Timeout (`round_failure`) mask a deterministic
+    // later batch's timeout-lane Timeout (`round_failure`) mask a deterministic
     // failure already proven by an earlier batch (an absent committed key or a
-    // hash mismatch) — a confirmed cheat would be downgraded to a graced
-    // timeout. A Timeout/Rejected/Malformed only becomes the verdict if NO
-    // earlier batch already produced confirmed bad bytes.
+    // hash mismatch) — a confirmed cheat would be downgraded to a timeout. A
+    // Timeout/Rejected/Malformed only becomes the verdict if NO earlier batch
+    // already produced confirmed bad bytes.
     let verdict = 'rounds: {
         for batch in sampled.chunks(MAX_BYTE_CHALLENGE_KEYS) {
             let batch_keys: Vec<XorName> = batch.iter().map(|l| l.key).collect();
@@ -641,13 +688,13 @@ async fn verify_subtree_response(
                 ByteRound::Rejected => {
                     break 'rounds AuditVerdict::Fail(AuditFailureReason::Rejected)
                 }
-                // Graced reject (rotated past the pin / transient): no trust
-                // penalty, but the peer answered and could not prove possession,
-                // so revoke the holder credit for THIS pinned commitment
-                // (codex-r2 C) before taking the graced Timeout verdict. Scoped
-                // to the commitment hash, not the whole peer (codex-r3), so it
-                // never erases credit the peer re-earned for a newer commitment.
-                ByteRound::GracedReject => {
+                // Transient reject (a local read error): ADR-0004 A1 routes it to
+                // the timeout lane — no trust penalty, but revoke the holder
+                // credit for THIS pinned commitment (the peer answered and could
+                // not prove possession) before taking the Timeout verdict. Scoped
+                // to the commitment hash, not the whole peer, so it never erases
+                // credit the peer re-earned for a newer commitment.
+                ByteRound::TransientReject => {
                     if let Some(credit) = ctx.credit {
                         credit
                             .recent_provers
@@ -787,8 +834,8 @@ fn failed(
 
 /// Map a subtree-audit `reason` to a single-failure [`AuditFailureSummary`].
 ///
-/// A `Timeout` is not (yet) a confirmed failure (it is graced), so it rolls up
-/// as zero confirmed failures; every other reason is one confirmed failure,
+/// A `Timeout` is not a confirmed failure (it is the non-response/timeout lane),
+/// so it rolls up as zero confirmed failures; every other reason is one confirmed failure,
 /// categorised where the category is meaningful (byte/nonce/root mismatch →
 /// `digest_mismatch_keys`; explicit absent → `absent_keys`).
 fn subtree_failure_summary(reason: &AuditFailureReason) -> AuditFailureSummary {
@@ -888,7 +935,7 @@ pub async fn handle_subtree_challenge(
     // of subtree size, hashing each into its plain + nonced leaf.
     let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
     for key in &plan.leaf_keys {
-        let bytes = match storage.get_raw(key).await {
+        let bytes = match get_raw_retrying(storage, key).await {
             Ok(Some(bytes)) => bytes,
             // Key is in our committed tree but definitively NOT stored — real
             // storage loss / the classic deleter. For a recently gossiped pin
@@ -904,9 +951,10 @@ pub async fn handle_subtree_challenge(
                     reason: format!("missing bytes for committed key: {}", hex::encode(key)),
                 };
             }
-            // Transient storage read error — NOT evidence of missing data (§7).
-            // Reject as graced (timeout-class) so a flaky disk never brands an
-            // honest holder a deleter.
+            // Persistent transient read error after retries — NOT proof of missing
+            // data. Reject `Transient`; the auditor routes it to the timeout lane
+            // (no confirmed penalty) so a genuinely flaky disk is not branded a
+            // deleter, while gaining no positive standing.
             Err(e) => {
                 warn!(
                     "Subtree audit: storage read error for committed key {}: {e} \
@@ -1019,7 +1067,7 @@ pub async fn handle_subtree_byte_challenge(
             items.push(SubtreeByteItem::Absent { key: *key });
             continue;
         }
-        match storage.get_raw(key).await {
+        match get_raw_retrying(storage, key).await {
             // Committed key, bytes present → serve them.
             Ok(Some(bytes)) => items.push(SubtreeByteItem::Present { key: *key, bytes }),
             // Committed key, definitively absent → provable failure (§7: this is
@@ -1031,10 +1079,10 @@ pub async fn handle_subtree_byte_challenge(
                 );
                 items.push(SubtreeByteItem::Absent { key: *key });
             }
-            // Transient storage read error → do NOT brand the peer a deleter
-            // (§7). Reject the whole challenge as a graced (timeout-class)
-            // outcome so a flaky LMDB read never manufactures a confirmed
-            // possession failure on an honest holder.
+            // Persistent transient read error after retries → do NOT brand the
+            // peer a deleter. Reject `Transient`; the auditor routes it to the
+            // timeout lane so a flaky LMDB read never manufactures a confirmed
+            // possession failure on an honest holder (which also gains no credit).
             Err(e) => {
                 warn!(
                     "Subtree byte audit: storage read error for committed key {}: {e} \
