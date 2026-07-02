@@ -228,8 +228,7 @@ impl ReplicationQueues {
             );
             return AdmissionResult::CapacityRejected;
         }
-        self.pending_verify.insert(key, entry);
-        *self.pending_per_sender.entry(sender).or_insert(0) += 1;
+        self.insert_pending_unchecked(key, entry);
         AdmissionResult::Admitted
     }
 
@@ -267,6 +266,17 @@ impl ReplicationQueues {
                 pending_per_sender.remove(sender);
             }
         }
+    }
+
+    fn insert_pending_unchecked(&mut self, key: XorName, entry: VerificationEntry) {
+        let sender = entry.hint_sender;
+        let replaced = self.pending_verify.insert(key, entry);
+        debug_assert!(
+            replaced.is_none(),
+            "pending entry inserted twice for {}",
+            hex::encode(key)
+        );
+        *self.pending_per_sender.entry(sender).or_insert(0) += 1;
     }
 
     fn reserve_retry_slot(&mut self, sender: PeerId) {
@@ -473,6 +483,12 @@ impl ReplicationQueues {
     /// Returns `None` when the queue is empty.  Silently skips candidates
     /// that are somehow already in-flight.  Concurrency is enforced by the
     /// fetch worker, not by this method.
+    ///
+    /// A returned candidate may carry a live verification retry-slot
+    /// reservation. Callers must consume it with
+    /// [`Self::start_dequeued_fetch`], [`Self::discard_fetch_candidate`], or
+    /// [`Self::requeue_candidate_for_verification`] so that reservation is
+    /// either transferred, released, or restored to `pending_verify`.
     pub fn dequeue_fetch(&mut self) -> Option<FetchCandidate> {
         while let Some(candidate) = self.fetch_queue.pop() {
             self.fetch_queue_keys.remove(&candidate.key);
@@ -495,11 +511,22 @@ impl ReplicationQueues {
     // -----------------------------------------------------------------------
 
     /// Mark a key as in-flight (actively being fetched from `source`).
+    ///
+    /// Candidates returned by [`Self::dequeue_fetch`] MUST be consumed by a
+    /// by-value dequeued-candidate method instead. They may carry a live
+    /// verification retry-slot reservation; [`Self::start_dequeued_fetch`]
+    /// transfers that reservation into the in-flight entry.
     pub fn start_fetch(&mut self, key: XorName, source: PeerId, all_sources: Vec<PeerId>) {
         self.start_fetch_with_retry(key, source, all_sources, None);
     }
 
     /// Mark a key as in-flight and retain verification retry metadata.
+    ///
+    /// This is for direct starts where the caller already owns any retry
+    /// reservation paired with `retry_verification`. Candidates obtained from
+    /// [`Self::dequeue_fetch`] MUST be consumed intact via a by-value
+    /// dequeued-candidate method, otherwise their reserved verification
+    /// capacity can be orphaned.
     pub fn start_fetch_with_retry(
         &mut self,
         key: XorName,
@@ -525,6 +552,18 @@ impl ReplicationQueues {
         }
     }
 
+    /// Consume a dequeued fetch candidate and transfer its retry reservation
+    /// into the in-flight entry.
+    pub fn start_dequeued_fetch(&mut self, candidate: FetchCandidate, source: PeerId) {
+        let FetchCandidate {
+            key,
+            sources,
+            retry_verification,
+            ..
+        } = candidate;
+        self.start_fetch_with_retry(key, source, sources, retry_verification);
+    }
+
     /// Mark a fetch as completed (success or permanent failure).
     pub fn complete_fetch(&mut self, key: &XorName) -> Option<InFlightEntry> {
         let removed = self.in_flight_fetch.remove(key);
@@ -534,9 +573,14 @@ impl ReplicationQueues {
         removed
     }
 
-    /// Drop a queued fetch candidate without starting it.
-    pub fn discard_fetch_candidate(&mut self, candidate: &FetchCandidate) {
-        self.release_retry_slot_for_candidate(candidate);
+    /// Drop a dequeued fetch candidate without starting it.
+    pub fn discard_fetch_candidate(&mut self, candidate: FetchCandidate) {
+        let FetchCandidate {
+            retry_verification, ..
+        } = candidate;
+        if let Some(verification) = retry_verification {
+            self.release_retry_slot(&verification.hint_sender);
+        }
     }
 
     /// Mark the current fetch attempt as failed and try the next untried source.
@@ -562,6 +606,33 @@ impl ReplicationQueues {
         }
     }
 
+    /// Consume a dequeued candidate and restore its verification entry for a
+    /// later retry when retry metadata exists.
+    pub fn requeue_candidate_for_verification(
+        &mut self,
+        candidate: FetchCandidate,
+        retry_after: Duration,
+    ) -> bool {
+        let FetchCandidate {
+            key,
+            retry_verification,
+            ..
+        } = candidate;
+        let Some(mut verification) = retry_verification else {
+            return false;
+        };
+        let sender = verification.hint_sender;
+
+        verification.state = VerificationState::PendingVerify;
+        verification.verified_sources.clear();
+        verification.tried_sources.clear();
+        verification.next_verify_at = Instant::now() + retry_after;
+
+        self.insert_pending_unchecked(key, verification);
+        self.release_retry_slot(&sender);
+        true
+    }
+
     /// Complete an exhausted fetch and restore its verification entry for a
     /// later retry when retry metadata exists.
     pub fn requeue_fetch_for_verification(&mut self, key: &XorName, retry_after: Duration) -> bool {
@@ -578,8 +649,7 @@ impl ReplicationQueues {
         verification.tried_sources.clear();
         verification.next_verify_at = Instant::now() + retry_after;
 
-        self.pending_verify.insert(*key, verification);
-        *self.pending_per_sender.entry(sender).or_insert(0) += 1;
+        self.insert_pending_unchecked(*key, verification);
         self.release_retry_slot(&sender);
         true
     }
@@ -691,6 +761,111 @@ mod tests {
         }
     }
 
+    struct ReservedCandidateAtSenderCap {
+        queues: ReplicationQueues,
+        key: XorName,
+        source: PeerId,
+        hint_sender: PeerId,
+        fresh_key: XorName,
+        candidate: FetchCandidate,
+        base_sender_count: usize,
+        pre_promotion_sender_count: usize,
+    }
+
+    fn assert_sender_cap_rejects_key(
+        queues: &mut ReplicationQueues,
+        key: XorName,
+        sender_byte: u8,
+    ) {
+        assert_eq!(
+            queues.add_pending_verify(key, test_entry(sender_byte)),
+            AdmissionResult::CapacityRejected,
+            "fresh key should be rejected while sender capacity is exhausted"
+        );
+    }
+
+    fn assert_sender_released_slot_admits_key(
+        queues: &mut ReplicationQueues,
+        sender: &PeerId,
+        sender_byte: u8,
+        key: XorName,
+        expected_count_before_admission: usize,
+    ) {
+        assert_eq!(
+            queues.pending_count_for_sender(sender),
+            expected_count_before_admission,
+            "sender capacity should return to the expected count"
+        );
+        assert!(
+            queues
+                .add_pending_verify(key, test_entry(sender_byte))
+                .admitted(),
+            "fresh key should be admitted after a retry reservation is released"
+        );
+        assert_eq!(
+            queues.pending_count_for_sender(sender),
+            expected_count_before_admission + 1,
+            "fresh key should consume the released sender slot"
+        );
+    }
+
+    fn reserved_candidate_at_sender_cap() -> ReservedCandidateAtSenderCap {
+        const PROMOTED_KEY_INDEX: u32 = 40_000;
+        const FILLER_KEY_OFFSET: u32 = 50_000;
+        const FRESH_KEY_INDEX: u32 = 60_000;
+        const DISTANCE_BYTE: u8 = 0x01;
+        const SOURCE_BYTE: u8 = 2;
+        const HINT_SENDER_BYTE: u8 = 9;
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_u32(PROMOTED_KEY_INDEX);
+        let distance = xor_name_from_byte(DISTANCE_BYTE);
+        let source = peer_id_from_byte(SOURCE_BYTE);
+        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
+        let fresh_key = xor_name_from_u32(FRESH_KEY_INDEX);
+        let base_sender_count = MAX_PENDING_VERIFY_PER_PEER - 1;
+        let pre_promotion_sender_count = MAX_PENDING_VERIFY_PER_PEER;
+
+        assert!(queues
+            .add_pending_verify(key, test_entry(HINT_SENDER_BYTE))
+            .admitted());
+        for i in 0..base_sender_count {
+            let key_index = FILLER_KEY_OFFSET + u32::try_from(i).expect("test index fits u32");
+            assert!(
+                queues
+                    .add_pending_verify(xor_name_from_u32(key_index), test_entry(HINT_SENDER_BYTE))
+                    .admitted(),
+                "filler key should be admitted before the sender reaches its cap"
+            );
+        }
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            pre_promotion_sender_count,
+            "sender should be exactly at capacity before promotion"
+        );
+        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
+
+        assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            pre_promotion_sender_count,
+            "promoted candidate should retain its sender capacity reservation"
+        );
+        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
+
+        let candidate = queues.dequeue_fetch().expect("fetch candidate");
+        ReservedCandidateAtSenderCap {
+            queues,
+            key,
+            source,
+            hint_sender,
+            fresh_key,
+            candidate,
+            base_sender_count,
+            pre_promotion_sender_count,
+        }
+    }
+
     // -- add_pending_verify dedup ------------------------------------------
 
     #[test]
@@ -752,9 +927,11 @@ mod tests {
 
         let first = queues.dequeue_fetch().expect("should dequeue");
         assert_eq!(first.key, near_key, "nearest key should dequeue first");
+        queues.discard_fetch_candidate(first);
 
         let second = queues.dequeue_fetch().expect("should dequeue");
         assert_eq!(second.key, far_key, "farthest key should dequeue second");
+        queues.discard_fetch_candidate(second);
     }
 
     #[test]
@@ -847,12 +1024,7 @@ mod tests {
         assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
 
         let candidate = queues.dequeue_fetch().expect("fetch candidate");
-        queues.start_fetch_with_retry(
-            candidate.key,
-            source,
-            candidate.sources,
-            candidate.retry_verification,
-        );
+        queues.start_dequeued_fetch(candidate, source);
 
         assert!(
             queues.retry_fetch(&key).is_none(),
@@ -918,12 +1090,7 @@ mod tests {
         );
 
         let candidate = queues.dequeue_fetch().expect("fetch candidate");
-        queues.start_fetch_with_retry(
-            candidate.key,
-            source,
-            candidate.sources,
-            candidate.retry_verification,
-        );
+        queues.start_dequeued_fetch(candidate, source);
         assert!(
             queues.retry_fetch(&key).is_none(),
             "single source should be exhausted"
@@ -942,6 +1109,188 @@ mod tests {
     }
 
     #[test]
+    fn start_dequeued_fetch_then_complete_releases_reserved_sender_capacity() {
+        const HINT_SENDER_BYTE: u8 = 9;
+
+        let ReservedCandidateAtSenderCap {
+            mut queues,
+            key,
+            source,
+            hint_sender,
+            fresh_key,
+            candidate,
+            base_sender_count,
+            ..
+        } = reserved_candidate_at_sender_cap();
+
+        queues.start_dequeued_fetch(candidate, source);
+        assert!(queues.complete_fetch(&key).is_some());
+
+        assert_sender_released_slot_admits_key(
+            &mut queues,
+            &hint_sender,
+            HINT_SENDER_BYTE,
+            fresh_key,
+            base_sender_count,
+        );
+    }
+
+    #[test]
+    fn start_dequeued_fetch_then_exhaust_requeues_with_reserved_sender_capacity() {
+        const HINT_SENDER_BYTE: u8 = 9;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+
+        let ReservedCandidateAtSenderCap {
+            mut queues,
+            key,
+            source,
+            hint_sender,
+            fresh_key,
+            candidate,
+            pre_promotion_sender_count,
+            ..
+        } = reserved_candidate_at_sender_cap();
+
+        queues.start_dequeued_fetch(candidate, source);
+        assert!(
+            queues.retry_fetch(&key).is_none(),
+            "single source should be exhausted"
+        );
+        assert!(
+            queues.requeue_fetch_for_verification(&key, RETRY_DELAY),
+            "exhausted fetch should restore retry metadata"
+        );
+
+        assert!(queues.get_pending(&key).is_some());
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            pre_promotion_sender_count,
+            "requeued key should convert its reservation back to a pending slot"
+        );
+        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
+    }
+
+    #[test]
+    fn discard_dequeued_fetch_candidate_releases_reserved_sender_capacity() {
+        const HINT_SENDER_BYTE: u8 = 9;
+
+        let ReservedCandidateAtSenderCap {
+            mut queues,
+            hint_sender,
+            fresh_key,
+            candidate,
+            base_sender_count,
+            ..
+        } = reserved_candidate_at_sender_cap();
+
+        queues.discard_fetch_candidate(candidate);
+
+        assert_sender_released_slot_admits_key(
+            &mut queues,
+            &hint_sender,
+            HINT_SENDER_BYTE,
+            fresh_key,
+            base_sender_count,
+        );
+    }
+
+    #[test]
+    fn requeue_dequeued_fetch_candidate_restores_pending_sender_capacity() {
+        const HINT_SENDER_BYTE: u8 = 9;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+
+        let ReservedCandidateAtSenderCap {
+            mut queues,
+            key,
+            hint_sender,
+            fresh_key,
+            candidate,
+            pre_promotion_sender_count,
+            ..
+        } = reserved_candidate_at_sender_cap();
+
+        assert!(
+            queues.requeue_candidate_for_verification(candidate, RETRY_DELAY),
+            "dequeued retry candidate should be restored to pending verification"
+        );
+
+        assert!(queues.get_pending(&key).is_some());
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            pre_promotion_sender_count,
+            "requeued candidate should convert its reservation back to a pending slot"
+        );
+        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
+    }
+
+    #[test]
+    fn no_sources_dequeued_candidate_requeues_for_verification() {
+        const KEY_INDEX: u32 = 70_000;
+        const DISTANCE_BYTE: u8 = 0x01;
+        const HINT_SENDER_BYTE: u8 = 9;
+        const VERIFIED_SOURCE_BYTE: u8 = 2;
+        const TRIED_SOURCE_BYTE: u8 = 3;
+        const RETRY_DELAY: Duration = Duration::from_secs(15);
+        const RETRY_DELAY_SLACK: Duration = Duration::from_secs(1);
+        const REQUEUED_SENDER_COUNT: usize = 1;
+        const EMPTY_SENDER_COUNT: usize = 0;
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_u32(KEY_INDEX);
+        let distance = xor_name_from_byte(DISTANCE_BYTE);
+        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
+        let verified_source = peer_id_from_byte(VERIFIED_SOURCE_BYTE);
+        let tried_source = peer_id_from_byte(TRIED_SOURCE_BYTE);
+        let mut entry = test_entry(HINT_SENDER_BYTE);
+        entry.state = VerificationState::QueuedForFetch;
+        entry.verified_sources.push(verified_source);
+        entry.tried_sources.insert(tried_source);
+
+        assert!(queues.add_pending_verify(key, entry).admitted());
+        assert!(queues.promote_pending_to_fetch(key, distance, Vec::new()));
+
+        let candidate = queues.dequeue_fetch().expect("fetch candidate");
+        assert!(
+            candidate.sources.is_empty(),
+            "test candidate should exercise the no-sources branch"
+        );
+        assert!(
+            queues.requeue_candidate_for_verification(candidate, RETRY_DELAY),
+            "no-sources retry candidate should be restored to pending verification"
+        );
+
+        let pending = queues.get_pending(&key).expect("key should be pending");
+        assert_eq!(pending.state, VerificationState::PendingVerify);
+        assert!(
+            pending.verified_sources.is_empty(),
+            "verified sources should be cleared before retry"
+        );
+        assert!(
+            pending.tried_sources.is_empty(),
+            "tried sources should be cleared before retry"
+        );
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            REQUEUED_SENDER_COUNT,
+            "retry reservation should be converted back to one pending slot"
+        );
+        assert!(
+            queues.ready_pending_keys(Instant::now()).is_empty(),
+            "requeued key should observe retry delay"
+        );
+
+        let after_retry = Instant::now() + RETRY_DELAY + RETRY_DELAY_SLACK;
+        assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
+
+        assert!(queues.remove_pending(&key).is_some());
+        assert_eq!(
+            queues.pending_count_for_sender(&hint_sender),
+            EMPTY_SENDER_COUNT,
+            "removing the requeued entry should leave no reserved sender slot"
+        );
+    }
+
+    #[test]
     fn exhausted_direct_fetch_remains_terminal() {
         const KEY_BYTE: u8 = 0x45;
         const DISTANCE_BYTE: u8 = 0x01;
@@ -954,7 +1303,7 @@ mod tests {
 
         queues.enqueue_fetch(key, xor_name_from_byte(DISTANCE_BYTE), vec![source]);
         let candidate = queues.dequeue_fetch().expect("fetch candidate");
-        queues.start_fetch(candidate.key, source, candidate.sources);
+        queues.start_dequeued_fetch(candidate, source);
 
         assert!(
             queues.retry_fetch(&key).is_none(),
@@ -1156,11 +1505,8 @@ mod tests {
 
         // Step 5: Dequeue, start fetch -> key is in-flight.
         let candidate = queues.dequeue_fetch().expect("should dequeue");
-        queues.start_fetch(
-            candidate.key,
-            candidate.sources[0],
-            candidate.sources.clone(),
-        );
+        let source = candidate.sources[0];
+        queues.start_dequeued_fetch(candidate, source);
 
         // Step 6: Attempt to add to PendingVerify while in-flight -> reject.
         assert!(
@@ -1282,7 +1628,7 @@ mod tests {
         let candidate = queues.dequeue_fetch().expect("should dequeue");
         assert_eq!(candidate.key, key);
         assert_eq!(candidate.sources.len(), 2);
-        queues.start_fetch(key, source_a, candidate.sources);
+        queues.start_dequeued_fetch(candidate, source_a);
         assert_eq!(queues.in_flight_count(), 1);
         assert_eq!(queues.fetch_queue_count(), 0);
         assert!(

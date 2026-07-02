@@ -1382,26 +1382,24 @@ impl ReplicationEngine {
                         let Some(candidate) = q.dequeue_fetch() else {
                             break;
                         };
+                        let fetch_key = candidate.key;
                         let Some(&source) = candidate.sources.first() else {
                             warn!(
-                                "Fetch candidate {} has no sources — dropping",
-                                hex::encode(candidate.key)
+                                "Fetch candidate {} has no sources; requeueing for verification",
+                                hex::encode(fetch_key)
                             );
-                            q.discard_fetch_candidate(&candidate);
+                            let _ = q.requeue_candidate_for_verification(
+                                candidate,
+                                config.verification_request_timeout,
+                            );
                             continue;
                         };
-                        q.start_fetch_with_retry(
-                            candidate.key,
-                            source,
-                            candidate.sources.clone(),
-                            candidate.retry_verification,
-                        );
+                        q.start_dequeued_fetch(candidate, source);
 
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
                         let token = shutdown.clone();
-                        let fetch_key = candidate.key;
                         in_flight.push(Box::pin(async move {
                             let handle = tokio::spawn(async move {
                                 // Cancel-aware: abort when the engine shuts down.
