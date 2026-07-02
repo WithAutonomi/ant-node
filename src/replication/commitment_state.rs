@@ -17,15 +17,21 @@
 //!   semantics specified in v6 §2: an in-flight reader holding its
 //!   `Arc` is unaffected by a concurrent rotate).
 //!
-//! No persistent disk state. Trees are rebuilt from `LmdbStorage` at
-//! the next rotation tick. Memory cost is bounded by
+//! Retention is persisted across restart (ADR-0004 A1): [`ResponderCommitmentState::snapshot`]
+//! captures the signed commitments + their key sets + gossip stamps, and
+//! [`ResponderCommitmentState::restore`] reloads them and rebuilds each tree from
+//! its persisted key set — so an honest restarted node can answer every pin that
+//! is still inside its answerability window, and an unanswerable pin is provable
+//! misbehaviour rather than an honest crash-restart. Trees are otherwise rebuilt
+//! from `LmdbStorage` at the next rotation tick. Memory cost is bounded by
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use saorsa_pqc::api::sig::MlDsaSecretKey;
+use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
@@ -262,6 +268,32 @@ impl BuiltCommitment {
     pub fn contains_key(&self, key: &XorName) -> bool {
         self.tree.contains_key(key)
     }
+
+    /// The committed leaf keys — the key set persisted so this commitment can be
+    /// rebuilt after a restart without re-reading chunks.
+    #[must_use]
+    pub fn leaf_keys(&self) -> Vec<XorName> {
+        self.tree.leaf_keys()
+    }
+
+    /// Reconstruct a `BuiltCommitment` from a persisted signed commitment and a
+    /// `tree` rebuilt from its leaf keys — WITHOUT re-signing, so the pin
+    /// (`commitment_hash`) is preserved exactly across a restart (ML-DSA
+    /// signatures are randomized, so re-signing would change the pin). Verifies
+    /// the rebuilt tree matches the signed `root` and `key_count`; returns `None`
+    /// on mismatch (corrupt/stale persisted data) — never trusts the blob.
+    #[must_use]
+    pub fn from_persisted(commitment: StorageCommitment, tree: MerkleTree) -> Option<Self> {
+        if tree.root() != commitment.root || tree.key_count() != commitment.key_count {
+            return None;
+        }
+        let cached_hash = commitment_hash(&commitment)?;
+        Some(Self {
+            commitment,
+            cached_hash,
+            tree,
+        })
+    }
 }
 
 /// Number of recently-gossiped commitments a responder stays answerable for
@@ -291,6 +323,49 @@ const RETAINED_GOSSIPED_COMMITMENTS: usize = 2;
 /// `RETAINED_GOSSIPED_COMMITMENTS = 2` this is `(2 + 1) ×` the 1 h rotation
 /// interval = 3 h.
 pub(crate) const GOSSIP_ANSWERABILITY_TTL: Duration = Duration::from_secs(3 * 3600);
+
+/// One persisted retention slot (ADR-0004 A1): the signed commitment, its
+/// committed key set (so the tree can be rebuilt without re-reading chunks), and
+/// the wall-clock time its hash was last gossiped (`None` if never gossiped —
+/// then it only survives reload while it is the current slot).
+#[derive(Serialize, Deserialize)]
+struct PersistedSlot {
+    commitment: StorageCommitment,
+    leaf_keys: Vec<XorName>,
+    last_gossiped_unix: Option<u64>,
+}
+
+/// The persisted responder retention. Slots are newest-first; `has_current`
+/// says whether `slots[0]` was the live advertised commitment.
+#[derive(Serialize, Deserialize, Default)]
+pub struct PersistedRetention {
+    slots: Vec<PersistedSlot>,
+    has_current: bool,
+}
+
+impl PersistedRetention {
+    /// Serialize for durable persistence (caller writes it atomically). `None`
+    /// on a serialization error, so the caller can refuse to overwrite the
+    /// durable file rather than truncate it.
+    #[must_use]
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        postcard::to_allocvec(self).ok()
+    }
+
+    /// Decode a persisted snapshot. `None` on a corrupt blob — the caller then
+    /// fails open LOCALLY (empty retention; the node re-gossips a fresh root),
+    /// which never grants a remote grace.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        postcard::from_bytes(bytes).ok()
+    }
+
+    /// Whether the snapshot holds no slots.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
 
 /// Responder retention state (ADR-0002).
 ///
@@ -538,6 +613,88 @@ impl ResponderCommitmentState {
         guard.has_current = false;
         guard.recently_gossiped.clear();
     }
+
+    /// Snapshot retention for durable persistence (ADR-0004 A1): each slot's
+    /// signed commitment + committed key set + wall-clock gossip stamp. Reloading
+    /// this after a restart makes every still-in-window pin answerable again, so
+    /// an unanswerable pin is provable misbehaviour, not an honest crash-restart.
+    #[must_use]
+    pub fn snapshot(&self) -> PersistedRetention {
+        let now_i = Instant::now();
+        let now_s = SystemTime::now();
+        let guard = self.inner.read();
+        let slots = guard
+            .slots
+            .iter()
+            .map(|c| {
+                let last_gossiped_unix = guard
+                    .recently_gossiped
+                    .iter()
+                    .find(|g| g.hash == c.cached_hash)
+                    .and_then(|g| {
+                        let age = now_i.saturating_duration_since(g.last_gossiped_at);
+                        now_s
+                            .checked_sub(age)
+                            .and_then(|w| w.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                    });
+                PersistedSlot {
+                    commitment: c.commitment().clone(),
+                    leaf_keys: c.leaf_keys(),
+                    last_gossiped_unix,
+                }
+            })
+            .collect();
+        PersistedRetention {
+            slots,
+            has_current: guard.has_current,
+        }
+    }
+
+    /// Reload retention from a persisted snapshot at startup (ADR-0004 A1).
+    /// Rebuilds each slot's tree from its persisted (content-addressed) key set,
+    /// verifies it against the signed root, converts wall-clock gossip stamps
+    /// back to the monotonic clock, drops corrupt or already-expired slots, and
+    /// enforces retention. Replaces any existing state.
+    pub fn restore(&self, persisted: &PersistedRetention) {
+        let now_i = Instant::now();
+        let now_s = SystemTime::now();
+        let mut guard = self.inner.write();
+        guard.slots.clear();
+        guard.recently_gossiped.clear();
+        guard.has_current = false;
+        for slot in &persisted.slots {
+            let entries: Vec<_> = slot.leaf_keys.iter().map(|k| (*k, *k)).collect();
+            let Ok(tree) = MerkleTree::build(entries) else {
+                continue;
+            };
+            let Some(built) = BuiltCommitment::from_persisted(slot.commitment.clone(), tree) else {
+                continue;
+            };
+            let hash = built.cached_hash;
+            guard.slots.push(Arc::new(built));
+            if let Some(unix) = slot.last_gossiped_unix {
+                if let Some(instant) = wall_unix_to_instant(unix, now_s, now_i) {
+                    guard.recently_gossiped.push(GossipedAt {
+                        hash,
+                        last_gossiped_at: instant,
+                    });
+                }
+            }
+        }
+        guard.has_current = persisted.has_current && !guard.slots.is_empty();
+        prune_slots(&mut guard, now_i);
+    }
+}
+
+/// Convert a persisted wall-clock unix stamp back to a monotonic [`Instant`],
+/// given the current wall-clock/monotonic pair. `None` if the stamp is in the
+/// future (clock moved backwards) or underflows — then the slot is treated as
+/// having no gossip stamp (retained only while it is the current slot).
+fn wall_unix_to_instant(unix: u64, now_s: SystemTime, now_i: Instant) -> Option<Instant> {
+    let when = UNIX_EPOCH.checked_add(Duration::from_secs(unix))?;
+    let age = now_s.duration_since(when).ok()?;
+    now_i.checked_sub(age)
 }
 
 /// ADR-0004: the responder commitment state is the quote generator's commitment
@@ -644,6 +801,48 @@ mod tests {
 
     fn keypair() -> (saorsa_pqc::api::sig::MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair().unwrap()
+    }
+
+    /// ADR-0004 A1: retention survives a restart. A snapshot → serialize →
+    /// deserialize → restore into a fresh state keeps the exact pre-restart pin
+    /// answerable (signature preserved, not re-signed) and its keys held — so an
+    /// honest restarted node is not falsely convicted once grace is removed.
+    #[test]
+    fn retention_survives_restart_via_snapshot_reload() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        // Content-addressed leaves (bytes_hash := key), matching production.
+        let entries: Vec<_> = (1..=5u8).map(|i| (key(i), key(i))).collect();
+        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        state.mark_gossiped(pin);
+        assert!(state.lookup_by_hash(&pin).is_some());
+        assert!(state.is_held(&key(3)));
+
+        // "Restart": snapshot -> bytes -> reload into a fresh state.
+        let bytes = state.snapshot().to_bytes().expect("serialize");
+        let reloaded = PersistedRetention::from_bytes(&bytes).expect("deserialize");
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&reloaded);
+
+        // The pre-restart pin is still answerable, with the SAME hash, and its
+        // committed keys are still held.
+        let got = fresh.lookup_by_hash(&pin).expect("pin survives restart");
+        assert_eq!(got.hash(), pin, "pin preserved (not re-signed)");
+        assert!(
+            fresh.is_held(&key(3)),
+            "committed key still held after restart"
+        );
+    }
+
+    /// A corrupt snapshot blob decodes to `None`, so the caller fails open with
+    /// empty retention rather than trusting garbage.
+    #[test]
+    fn corrupt_retention_snapshot_is_rejected() {
+        assert!(PersistedRetention::from_bytes(&[0xffu8; 9]).is_none());
     }
 
     #[test]

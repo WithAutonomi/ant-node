@@ -36,7 +36,7 @@ pub mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -56,7 +56,9 @@ use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
-use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
+use crate::replication::commitment_state::{
+    PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState,
+};
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
@@ -248,6 +250,12 @@ pub struct ReplicationEngine {
     /// outbound `NeighborSyncRequest`/`Response`; consulted by the
     /// commitment-bound audit handler.
     commitment_state: Arc<ResponderCommitmentState>,
+    /// Path to the persisted responder retention snapshot
+    /// (`{root_dir}/commitment_retention.bin`): reloaded on startup so an honest
+    /// node's answerability survives restart (ADR-0004 A1), which is what makes
+    /// removing audit grace safe (an unanswerable in-window pin is then provable
+    /// misbehaviour, not an honest crash-restart).
+    retention_path: PathBuf,
     /// Auditor-side per-peer commitment record (last known commitment +
     /// sticky `commitment_capable` flag).
     ///
@@ -373,6 +381,7 @@ impl ReplicationEngine {
             bootstrap_complete_notify: Arc::new(Notify::new()),
             identity,
             commitment_state: Arc::new(ResponderCommitmentState::new()),
+            retention_path: root_dir.join("commitment_retention.bin"),
             last_commitment_by_peer: Arc::new(RwLock::new(HashMap::new())),
             ever_capable_peers: Arc::new(RwLock::new(HashSet::new())),
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
@@ -1259,6 +1268,7 @@ impl ReplicationEngine {
         let storage = Arc::clone(&self.storage);
         let identity = Arc::clone(&self.identity);
         let commitment_state = Arc::clone(&self.commitment_state);
+        let retention_path = self.retention_path.clone();
         let shutdown = self.shutdown.clone();
         let p2p = Arc::clone(&self.p2p_node);
         let config = Arc::clone(&self.config);
@@ -1281,6 +1291,12 @@ impl ReplicationEngine {
             // ML-DSA signatures are randomized so we cannot reproduce
             // the pre-restart hash; the only honest path to recovery
             // is fast re-gossip.
+            // ADR-0004 A1: reload persisted retention BEFORE the first rebuild so
+            // an honest restarted node stays answerable for its pre-restart pins.
+            // The first rebuild no-ops when the key set is unchanged, preserving
+            // the reloaded current pin; otherwise the reloaded roots remain
+            // answerable as retained slots until their gossip TTL lapses.
+            load_commitment_retention(&commitment_state, &retention_path).await;
             if let Err(e) =
                 rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p, &config)
                     .await
@@ -1289,6 +1305,8 @@ impl ReplicationEngine {
             } else {
                 sync_trigger.notify_one();
             }
+            // Persist the reloaded + rebuilt retention.
+            persist_commitment_retention(&commitment_state, &retention_path).await;
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
@@ -1304,6 +1322,9 @@ impl ReplicationEngine {
                         ).await {
                             warn!("Commitment rotation failed: {e}");
                         }
+                        // ADR-0004 A1: persist retention every tick so rotations
+                        // and age-outs survive a restart.
+                        persist_commitment_retention(&commitment_state, &retention_path).await;
                         // Piggyback a sweep of expired recent_provers
                         // entries on the rotation tick (same cadence,
                         // 1 h). is_credited_holder already honours the
@@ -4686,6 +4707,66 @@ async fn ingest_peer_commitment(
 // ---------------------------------------------------------------------------
 // Storage-bound audit (v12) — responder commitment rotation
 // ---------------------------------------------------------------------------
+
+/// Reload persisted responder retention at startup (ADR-0004 A1). A missing file
+/// is a normal fresh start; a corrupt snapshot is logged and skipped (fail-open
+/// LOCALLY — the node re-gossips a fresh root — which never grants a remote grace).
+async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path) {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                "Commitment retention: no snapshot at {} (fresh start)",
+                path.display()
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Commitment retention: failed to read {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if let Some(persisted) = PersistedRetention::from_bytes(&bytes) {
+        state.restore(&persisted);
+        info!(
+            "Commitment retention: reloaded {} slot(s) from {}",
+            state.retained_slot_count(),
+            path.display()
+        );
+    } else {
+        warn!(
+            "Commitment retention: corrupt snapshot at {}; starting with empty retention",
+            path.display()
+        );
+    }
+}
+
+/// Persist the responder retention snapshot durably (ADR-0004 A1): serialize,
+/// write to a temp file, fsync it, then atomically rename over the target. On a
+/// serialization error the existing snapshot is left intact (never truncated).
+async fn persist_commitment_retention(state: &ResponderCommitmentState, path: &Path) {
+    let Some(bytes) = state.snapshot().to_bytes() else {
+        warn!("Commitment retention: serialization failed; keeping previous snapshot");
+        return;
+    };
+    let path = path.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Commitment retention: persist failed: {e}"),
+        Err(e) => warn!("Commitment retention: persist task join failed: {e}"),
+    }
+}
 
 /// Read the current LMDB key set, build + sign a fresh
 /// `StorageCommitment`, and rotate it into `state` as the new `current`.

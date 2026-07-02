@@ -199,6 +199,15 @@ impl MerkleTree {
         u32::try_from(self.leaves.len()).unwrap_or(u32::MAX)
     }
 
+    /// The committed leaf keys, in the tree's sorted order. Lets a persisted
+    /// commitment be rebuilt from its key set alone — `MerkleTree::build(keys
+    /// .map(|k| (k, k)))` for content-addressed leaves — without re-reading
+    /// chunks, so a restart can restore the exact signed root (ADR-0004 A1).
+    #[must_use]
+    pub fn leaf_keys(&self) -> Vec<XorName> {
+        self.leaves.iter().map(|(k, _)| *k).collect()
+    }
+
     /// Inclusion path for `key` from its leaf up to (but not including)
     /// the root.
     ///
