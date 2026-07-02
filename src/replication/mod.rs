@@ -166,13 +166,19 @@ const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 /// guard keeps idle nodes from needless disk writes.
 const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
 
-/// Clock-skew margin for the first-audit in-window screen (ADR-0004 A1 guardrail
-/// A). A monetized pin whose signed quote is older than
-/// `GOSSIP_ANSWERABILITY_TTL - MONETIZED_AUDIT_SKEW_MARGIN` is NOT first-audited:
-/// the responder may have legitimately aged it out, so — with grace removed —
-/// auditing it could false-convict. The margin absorbs auditor/responder clock
-/// skew so the audit always lands strictly inside the responder's window.
-const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(10 * 60);
+/// Maximum tolerated auditor↔responder wall-clock skew for the first-audit
+/// in-window screen (ADR-0004 A1 guardrail A). The screen accepts a monetized pin
+/// for first audit only if its SIGNED `quote_ts` lands in
+/// `[now - (GOSSIP_ANSWERABILITY_TTL - MONETIZED_AUDIT_SKEW_MARGIN), now + MONETIZED_AUDIT_SKEW_MARGIN]`
+/// — fail-closed on BOTH ends: a quote dated too far in the future (a
+/// badly-skewed or replayed quote) and one too old (the responder may have aged
+/// the pin out) are both skipped, so — with grace removed — a stale/skewed quote
+/// cannot frame an honest node. This assumes bounded clock skew (nodes NTP-synced
+/// within this margin); a legit first audit fires moments after payment
+/// (`quote_ts ≈ now`), far from either bound. The gossip-lottery path (which pins
+/// the responder's OWN freshly-gossiped root) is the clock-skew-immune backstop.
+/// 30 min dwarfs any realistic honest skew while leaving a wide audit window.
+const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(30 * 60);
 
 /// Minimum interval between commitment signature verifications for a
 /// single peer (v10/v12 §2 step 3 + §11 `DoS`).
@@ -876,21 +882,28 @@ impl ReplicationEngine {
                     if first_audited.contains(&event.pin) {
                         continue;
                     }
-                    // ADR-0004 A1 (guardrail A): skip a pin whose SIGNED quote is
-                    // older than the answerability window (minus a skew margin).
-                    // The responder may have legitimately aged such a pin out, and
-                    // with grace removed an out-of-window UnknownCommitment would
-                    // false-convict — so a stale client-forwarded quote must not
-                    // trigger a first audit. Legit first-audits fire moments after
-                    // payment (well inside the window); the pin can still be
-                    // audited via the gossip lottery if the responder re-gossips it.
-                    // `elapsed()` errs only for a future quote_ts (fresh) → audit.
-                    if event.quote_ts.elapsed().is_ok_and(|age| {
-                        age + MONETIZED_AUDIT_SKEW_MARGIN
-                            >= crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-                    }) {
+                    // ADR-0004 A1 (guardrail A): only first-audit a pin whose SIGNED
+                    // quote_ts lands inside the answerability window, fail-closed on
+                    // BOTH ends (see MONETIZED_AUDIT_SKEW_MARGIN). With grace removed,
+                    // auditing an out-of-window pin the responder may have aged out
+                    // would false-convict, so a stale OR far-future/skewed quote is
+                    // skipped. Legit first-audits fire moments after payment
+                    // (quote_ts ≈ now); a skipped pin can still be gossip-lottery
+                    // audited. All comparisons use duration_since (no overflow).
+                    let now = SystemTime::now();
+                    let too_future = event
+                        .quote_ts
+                        .duration_since(now)
+                        .is_ok_and(|ahead| ahead > MONETIZED_AUDIT_SKEW_MARGIN);
+                    let audit_cutoff =
+                        crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
+                            .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN);
+                    let too_old = now
+                        .duration_since(event.quote_ts)
+                        .is_ok_and(|age| age >= audit_cutoff);
+                    if too_future || too_old {
                         debug!(
-                            "First audit skipped for {peer}: quote older than the answerability window"
+                            "First audit skipped for {peer}: quote_ts outside the answerability window"
                         );
                         continue;
                     }
