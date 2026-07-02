@@ -2004,7 +2004,7 @@ async fn scenario_9_fetch_retry_uses_alternate_source() {
     let candidate = queues.dequeue_fetch().expect("dequeue");
 
     // Start in-flight with first source
-    queues.start_fetch(key, source_a, candidate.sources);
+    queues.start_dequeued_fetch(candidate, source_a);
 
     // First source fails -> retry should give source_b
     let next = queues.retry_fetch(&key);
@@ -2031,8 +2031,8 @@ async fn scenario_10_fetch_retry_exhaustion() {
 
     // Single source
     queues.enqueue_fetch(key, distance, vec![source]);
-    let _candidate = queues.dequeue_fetch().expect("dequeue");
-    queues.start_fetch(key, source, vec![source]);
+    let candidate = queues.dequeue_fetch().expect("dequeue");
+    queues.start_dequeued_fetch(candidate, source);
 
     // Source fails -> no alternates -> exhausted
     let next = queues.retry_fetch(&key);
