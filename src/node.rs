@@ -143,31 +143,56 @@ impl NodeBuilder {
         }
 
         // Initialize replication engine (if storage is enabled)
-        let replication_engine =
-            if let (Some(ref protocol), Some(fresh_rx)) = (&ant_protocol, fresh_write_rx) {
-                let storage_arc = protocol.storage();
-                let payment_verifier_arc = protocol.payment_verifier_arc();
-                match ReplicationEngine::new(
-                    repl_config,
-                    Arc::clone(&p2p_arc),
-                    storage_arc,
-                    payment_verifier_arc,
-                    Arc::clone(&identity),
-                    &self.config.root_dir,
-                    fresh_rx,
-                    shutdown.clone(),
-                )
-                .await
-                {
-                    Ok(engine) => Some(engine),
-                    Err(e) => {
-                        warn!("Failed to initialize replication engine: {e}");
-                        None
+        let replication_engine = if let (Some(ref protocol), Some(fresh_rx)) =
+            (&ant_protocol, fresh_write_rx)
+        {
+            let storage_arc = protocol.storage();
+            let payment_verifier_arc = protocol.payment_verifier_arc();
+            match ReplicationEngine::new(
+                repl_config,
+                Arc::clone(&p2p_arc),
+                storage_arc,
+                payment_verifier_arc,
+                Arc::clone(&identity),
+                &self.config.root_dir,
+                fresh_rx,
+                shutdown.clone(),
+            )
+            .await
+            {
+                Ok(engine) => {
+                    // ADR-0004: wire the engine's commitment state as the
+                    // quote generator's commitment source so quotes force
+                    // their price from the live storage commitment. Done
+                    // here because the engine owns the commitment state and
+                    // is built after the protocol.
+                    if let Some(ref protocol) = ant_protocol {
+                        let concrete = Arc::clone(engine.commitment_state());
+                        let source: Arc<dyn crate::payment::quote::CommitmentSource> = concrete;
+                        protocol.attach_commitment_source(source);
+                        // ADR-0004: share the engine's gossip commitment
+                        // cache with the verifier so the cross-check can
+                        // resolve quote pins against neighbours' commitments.
+                        protocol
+                            .payment_verifier_arc()
+                            .attach_commitment_cache(Arc::clone(engine.last_commitment_by_peer()));
+                        // ADR-0004: give the verifier the monetized-pin sender so
+                        // commitments that back a payment get a deterministic
+                        // first audit from the engine's drainer.
+                        protocol
+                            .payment_verifier_arc()
+                            .attach_monetized_pin_sender(engine.monetized_pin_sender());
                     }
+                    Some(engine)
                 }
-            } else {
-                None
-            };
+                Err(e) => {
+                    warn!("Failed to initialize replication engine: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         let node = RunningNode {
             config: self.config,

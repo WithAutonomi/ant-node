@@ -93,15 +93,20 @@ impl AntProtocol {
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
-        // Keep the PaymentVerifier's paid-quote price floor and the
-        // QuoteGenerator's pricing wired to the same authoritative store used
-        // by this protocol handler. Both must read the same record count: the
-        // generator prices quotes from current_chunks(), and the verifier later
-        // checks the paid median quote against current_chunks(). Attaching both
-        // here makes the invariant automatic for every AntProtocol
-        // construction path, including tests and future startup variants.
+        // Wire the PaymentVerifier to the same authoritative store used by this
+        // protocol handler. Historically the verifier read `current_chunks()`
+        // for the paid-quote price floor; ADR-0004 retired that gate (price is
+        // bound to the live storage commitment, not the local record count), so
+        // the store is no longer consulted for pricing. The attachment is kept
+        // so any future store-backed verifier check reads the same record count
+        // this handler serves, for every AntProtocol construction path.
+        //
+        // ADR-0004: the QuoteGenerator no longer prices off `current_chunks()`
+        // — its price is bound to the live storage commitment (see
+        // `attach_commitment_source`, wired by the node once the replication
+        // engine exists), or baseline when none — so it is NOT attached to the
+        // store here.
         payment_verifier.attach_storage(Arc::clone(&storage));
-        quote_generator.attach_storage(Arc::clone(&storage));
 
         Self {
             storage,
@@ -155,6 +160,52 @@ impl AntProtocol {
     #[must_use]
     pub fn payment_verifier_arc(&self) -> Arc<PaymentVerifier> {
         Arc::clone(&self.payment_verifier)
+    }
+
+    /// ADR-0004: attach the replication engine's commitment state as the quote
+    /// generator's commitment source, so quotes force their price from the live
+    /// storage commitment and refresh its answerability on issuance.
+    ///
+    /// Called once, after both the protocol and the replication engine exist
+    /// (the engine owns the [`ResponderCommitmentState`](crate::replication::commitment_state::ResponderCommitmentState)).
+    /// Until this is wired, the quote generator has no commitment source and
+    /// falls back to baseline (no-pin) pricing.
+    pub fn attach_commitment_source(
+        &self,
+        source: Arc<dyn crate::payment::quote::CommitmentSource>,
+    ) {
+        self.quote_generator.attach_commitment_source(source);
+    }
+
+    /// ADR-0004: return the proof with any commitment sidecars stripped, so a
+    /// replicated/persisted receipt carries only the pin and count (stored
+    /// proofs do not grow). Handles BOTH proof types — single-node and
+    /// merkle-batch — since both now carry sidecars. An unknown-tagged or
+    /// unparseable proof is returned unchanged. Best-effort: any
+    /// deserialize/reserialize failure returns the original bytes rather than
+    /// corrupting the proof.
+    fn strip_commitment_sidecars(proof: Vec<u8>) -> Vec<u8> {
+        use crate::payment::proof::{
+            deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type,
+            serialize_merkle_proof, serialize_single_node_proof, ProofType,
+        };
+        match detect_proof_type(&proof) {
+            Some(ProofType::SingleNode) => match deserialize_single_node_proof(&proof) {
+                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
+                    parsed.commitment_sidecars.clear();
+                    serialize_single_node_proof(&parsed).unwrap_or(proof)
+                }
+                _ => proof, // already sidecar-free, or unparseable: leave as-is
+            },
+            Some(ProofType::Merkle) => match deserialize_merkle_proof(&proof) {
+                Ok(mut parsed) if !parsed.commitment_sidecars.is_empty() => {
+                    parsed.commitment_sidecars.clear();
+                    serialize_merkle_proof(&parsed).unwrap_or(proof)
+                }
+                _ => proof,
+            },
+            _ => proof, // unknown tag: nothing to strip
+        }
     }
 
     /// Handle an incoming request and produce a response.
@@ -362,6 +413,16 @@ impl AntProtocol {
                 //    PUTs have no proof to forward, and the chunk would have
                 //    already replicated on the original write that carried one.
                 if let (Some(ref tx), Some(proof)) = (&self.fresh_write_tx, request.payment_proof) {
+                    // ADR-0004: strip any commitment sidecars before forwarding
+                    // to replication — the ADR specifies persisted/replicated
+                    // receipts "keep only the pin and count, so stored proofs do
+                    // not grow." The sidecars were already consumed by this
+                    // node's client-put cross-check; replicas resolve pins via
+                    // gossip/fetch (their context is Replication, which skips the
+                    // cross-check anyway). Best-effort: if sanitisation fails,
+                    // fall back to the original proof rather than dropping the
+                    // replication entirely.
+                    let proof = Self::strip_commitment_sidecars(proof);
                     // `request.content` is now `bytes::Bytes`; FreshWriteEvent
                     // still carries the chunk as `Vec<u8>` for compatibility
                     // with the replication wire format, so materialise once
@@ -512,11 +573,22 @@ impl AntProtocol {
             .create_quote(request.address, data_size_usize, request.data_type)
         {
             Ok(quote) => {
+                // ADR-0004: ship the signed commitment the price was bound to
+                // alongside the quote ("the commitment arrived with the quote"),
+                // so the client can verify the binding before paying and forward
+                // it as a sidecar in the PUT bundle. Only a commitment-bound
+                // quote pins anything; a baseline `(0, None)` quote carries no
+                // commitment. A pin that has rotated out resolves to `None` and
+                // the client falls back to gossip/fetch.
+                let commitment = quote
+                    .commitment_pin
+                    .and_then(|pin| self.quote_generator.commitment_blob_for_pin(pin));
                 // Serialize the quote
                 match rmp_serde::to_vec(&quote) {
                     Ok(quote_bytes) => ChunkQuoteResponse::Success {
                         quote: quote_bytes,
                         already_stored,
+                        commitment,
                     },
                     Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
                         "Failed to serialize quote: {e}"
@@ -560,14 +632,23 @@ impl AntProtocol {
             request.data_type,
             request.merkle_payment_timestamp,
         ) {
-            Ok(candidate_node) => match rmp_serde::to_vec(&candidate_node) {
-                Ok(bytes) => MerkleCandidateQuoteResponse::Success {
-                    candidate_node: bytes,
-                },
-                Err(e) => MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
-                    "Failed to serialize merkle candidate node: {e}"
-                ))),
-            },
+            Ok(candidate_node) => {
+                // ADR-0004: ship the signed commitment this candidate priced
+                // against, so the client can verify the binding before paying
+                // and forward it as a sidecar. Baseline candidates ship none.
+                let commitment = candidate_node
+                    .commitment_pin
+                    .and_then(|pin| self.quote_generator.commitment_blob_for_pin(pin));
+                match rmp_serde::to_vec(&candidate_node) {
+                    Ok(bytes) => MerkleCandidateQuoteResponse::Success {
+                        candidate_node: bytes,
+                        commitment,
+                    },
+                    Err(e) => MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(
+                        format!("Failed to serialize merkle candidate node: {e}"),
+                    )),
+                }
+            }
             Err(e) => {
                 MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(e.to_string()))
             }
@@ -1121,7 +1202,7 @@ mod tests {
         assert_eq!(response.request_id, 600);
         match response.body {
             ChunkMessageBody::MerkleCandidateQuoteResponse(
-                MerkleCandidateQuoteResponse::Success { candidate_node },
+                MerkleCandidateQuoteResponse::Success { candidate_node, .. },
             ) => {
                 let candidate: MerklePaymentCandidateNode =
                     rmp_serde::from_slice(&candidate_node).expect("deserialize candidate node");
@@ -1328,5 +1409,35 @@ mod tests {
             "deleting data must lower the observable quote price \
              (full={price_full:?}, after={price_after:?})"
         );
+    }
+
+    /// ADR-0004: `strip_commitment_sidecars` removes sidecars from a single-node
+    /// proof before replication/persistence (stored proofs do not grow), and is
+    /// a no-op on a sidecar-free proof.
+    #[test]
+    fn strip_commitment_sidecars_clears_single_node_sidecars() {
+        use crate::payment::proof::{
+            deserialize_single_node_proof, serialize_single_node_proof, PaymentProof,
+        };
+        use evmlib::ProofOfPayment;
+
+        let with_sidecars = PaymentProof {
+            proof_of_payment: ProofOfPayment {
+                peer_quotes: vec![],
+            },
+            tx_hashes: vec![],
+            commitment_sidecars: vec![vec![1u8; 16], vec![2u8; 16]],
+        };
+        let bytes = serialize_single_node_proof(&with_sidecars).expect("serialize");
+        let stripped = AntProtocol::strip_commitment_sidecars(bytes);
+        let parsed = deserialize_single_node_proof(&stripped).expect("deserialize stripped");
+        assert!(
+            parsed.commitment_sidecars.is_empty(),
+            "sidecars must be stripped before replication"
+        );
+
+        // Idempotent: stripping an already-sidecar-free proof returns it intact.
+        let again = AntProtocol::strip_commitment_sidecars(stripped.clone());
+        assert_eq!(again, stripped, "stripping a sidecar-free proof is a no-op");
     }
 }

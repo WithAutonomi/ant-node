@@ -34,10 +34,12 @@ pub mod subtree;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::num::NonZeroUsize;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
+use lru::LruCache;
 use std::pin::Pin;
 
 use crate::logging::{debug, error, info, warn};
@@ -53,7 +55,9 @@ use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
-use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
+use crate::replication::commitment_state::{
+    PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState,
+};
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
@@ -155,6 +159,44 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// "rotated past" case.
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 
+/// How often the responder retention snapshot is flushed to disk (ADR-0004 A1).
+/// Short relative to the answerability TTL (3 h) so a gossip-stamp refresh is
+/// durable well before it could matter to a restart, while the write-on-change
+/// guard keeps idle nodes from needless disk writes.
+const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
+
+/// Maximum tolerated auditor↔responder wall-clock skew for the first-audit
+/// in-window screen (ADR-0004 A1 guardrail A). The screen accepts a monetized pin
+/// for first audit only if its SIGNED `quote_ts` lands in
+/// `[now - (GOSSIP_ANSWERABILITY_TTL - MONETIZED_AUDIT_SKEW_MARGIN), now + MONETIZED_AUDIT_SKEW_MARGIN]`
+/// — fail-closed on BOTH ends: a quote dated too far in the future (a
+/// badly-skewed or replayed quote) and one too old (the responder may have aged
+/// the pin out) are both skipped, so — with grace removed — a stale/skewed quote
+/// cannot frame an honest node. This assumes bounded clock skew (nodes NTP-synced
+/// within this margin); a legit first audit fires moments after payment
+/// (`quote_ts ≈ now`), far from either bound. The gossip-lottery path (which pins
+/// the responder's OWN freshly-gossiped root) is the clock-skew-immune backstop.
+/// 30 min dwarfs any realistic honest skew while leaving a wide audit window.
+const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(30 * 60);
+
+/// ADR-0004 A1 (guardrail A): whether a monetized pin's SIGNED `quote_ts` lands
+/// inside the answerability window relative to `now`, so first-auditing it cannot
+/// false-convict once grace is removed. Fail-closed on BOTH ends (see
+/// [`MONETIZED_AUDIT_SKEW_MARGIN`]): a quote more than the skew margin in the
+/// future, or older than `GOSSIP_ANSWERABILITY_TTL - margin`, is out of window.
+/// All comparisons use `duration_since` (no `Duration` overflow).
+fn quote_within_audit_window(quote_ts: SystemTime, now: SystemTime) -> bool {
+    let too_future = quote_ts
+        .duration_since(now)
+        .is_ok_and(|ahead| ahead > MONETIZED_AUDIT_SKEW_MARGIN);
+    let audit_cutoff = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
+        .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN);
+    let too_old = now
+        .duration_since(quote_ts)
+        .is_ok_and(|age| age >= audit_cutoff);
+    !(too_future || too_old)
+}
+
 /// Minimum interval between commitment signature verifications for a
 /// single peer (v10/v12 §2 step 3 + §11 `DoS`).
 ///
@@ -245,6 +287,12 @@ pub struct ReplicationEngine {
     /// outbound `NeighborSyncRequest`/`Response`; consulted by the
     /// commitment-bound audit handler.
     commitment_state: Arc<ResponderCommitmentState>,
+    /// Path to the persisted responder retention snapshot
+    /// (`{root_dir}/commitment_retention.bin`): reloaded on startup so an honest
+    /// node's answerability survives restart (ADR-0004 A1), which is what makes
+    /// removing audit grace safe (an unanswerable in-window pin is then provable
+    /// misbehaviour, not an honest crash-restart).
+    retention_path: PathBuf,
     /// Auditor-side per-peer commitment record (last known commitment +
     /// sticky `commitment_capable` flag).
     ///
@@ -306,6 +354,13 @@ pub struct ReplicationEngine {
     possession_check_tx: mpsc::UnboundedSender<possession::PossessionCheckEvent>,
     /// Receiver paired with `possession_check_tx`; taken by the scheduler task.
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
+    /// ADR-0004: sender the payment verifier clones to surface monetized pins
+    /// for a deterministic first audit. The matching receiver is drained by
+    /// `start_first_audit_drainer`.
+    monetized_pin_tx: mpsc::UnboundedSender<MonetizedPinEvent>,
+    /// ADR-0004: receiver half of the monetized-pin channel, taken by
+    /// `start_first_audit_drainer`.
+    monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -342,7 +397,10 @@ impl ReplicationEngine {
         let config = Arc::new(config);
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
-        Ok(Self {
+        // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
+        let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
+
+        let engine = Self {
             config: Arc::clone(&config),
             p2p_node,
             storage,
@@ -360,6 +418,7 @@ impl ReplicationEngine {
             bootstrap_complete_notify: Arc::new(Notify::new()),
             identity,
             commitment_state: Arc::new(ResponderCommitmentState::new()),
+            retention_path: root_dir.join("commitment_retention.bin"),
             last_commitment_by_peer: Arc::new(RwLock::new(HashMap::new())),
             ever_capable_peers: Arc::new(RwLock::new(HashSet::new())),
             recent_provers: Arc::new(RwLock::new(RecentProvers::new())),
@@ -370,9 +429,25 @@ impl ReplicationEngine {
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
+            monetized_pin_tx,
+            monetized_pin_rx: Some(monetized_pin_rx),
             shutdown,
             task_handles: Vec::new(),
-        })
+        };
+        // ADR-0004 A1: reload persisted responder retention BEFORE any task
+        // spawns, so an honest restarted node is answerable for its pre-restart
+        // pins from the first audit it serves, and the persist loop never races
+        // an empty snapshot over the good on-disk file.
+        load_commitment_retention(&engine.commitment_state, &engine.retention_path).await;
+        Ok(engine)
+    }
+
+    /// ADR-0004: a sender the payment verifier uses to surface monetized pins
+    /// (commitments that backed a payment) for a deterministic first audit.
+    /// Cloneable; the engine drains the matching receiver.
+    #[must_use]
+    pub fn monetized_pin_sender(&self) -> mpsc::UnboundedSender<MonetizedPinEvent> {
+        self.monetized_pin_tx.clone()
     }
 
     /// Get a reference to the `PaidList`.
@@ -513,11 +588,15 @@ impl ReplicationEngine {
         // Audit #1 (storage-commitment) is gossip-triggered in the message
         // handler when a peer's commitment is ingested, not on a periodic tick.
         self.start_commitment_rotation_loop();
+        self.start_retention_persist_loop();
         self.start_fetch_worker();
         self.start_verification_worker();
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
+        // ADR-0004: deterministic first audit of commitments that backed a
+        // payment (surfaced by the verifier cross-check).
+        self.start_first_audit_drainer();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -712,6 +791,170 @@ impl ReplicationEngine {
                 }
             }
             debug!("Possession-check scheduler shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// ADR-0004: drain monetized pins surfaced by the verifier cross-check and
+    /// run a **deterministic first audit** of each — the same `run_subtree_audit`
+    /// as the gossip path, under the same per-peer cooldown and concurrency
+    /// caps, but with the probability lottery BYPASSED (the lottery governs
+    /// re-audits only). Deduped by pin via a bounded set so a pin gets one
+    /// deterministic first audit; a peer minting fresh pins faster than the
+    /// cooldown forfeits the older ones' coverage, never the newest's (the
+    /// channel surfaces newest pins as they are monetized).
+    #[allow(clippy::too_many_lines)]
+    fn start_first_audit_drainer(&mut self) {
+        let Some(mut rx) = self.monetized_pin_rx.take() else {
+            return;
+        };
+        let gossip_audit = GossipAuditTrigger {
+            p2p_node: Arc::clone(&self.p2p_node),
+            config: Arc::clone(&self.config),
+            recent_provers: Arc::clone(&self.recent_provers),
+            sync_state: Arc::clone(&self.sync_state),
+            cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+        };
+        let shutdown = self.shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            // Bounded dedup of pins that have ALREADY been given their
+            // deterministic first audit. A pin is inserted ONLY when an audit is
+            // actually launched (never on a cooldown skip), so a pin skipped now
+            // can still be first-audited later.
+            let mut first_audited: LruCache<[u8; 32], ()> = LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            );
+            // PERSISTENT pending queue: the most-recently-monetized pin per peer
+            // that has NOT yet been first-audited. A pin stays here until it is
+            // ACTUALLY first-audited (enters `first_audited`) — never removed for
+            // any weaker reason (e.g. a cooldown stamp), so an unaudited monetized
+            // pin is never silently forgotten. Newest-per-peer: a fresher pin for
+            // the same peer replaces the older one. Memory is bounded by an LRU:
+            // each entry needs a SETTLED on-chain payment, so the realistic count
+            // is tiny; the LRU is a pure DoS backstop that, only under an absurd
+            // flood, evicts the LEAST-RECENTLY-MONETIZED peer (the one most likely
+            // already superseded) — never the newest.
+            let mut pending: LruCache<PeerId, MonetizedPinEvent> = LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            );
+            // Periodic retry tick for pending (cooldown-blocked) pins. Created
+            // once; `Skip` so a backlog of missed ticks collapses to one.
+            let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                // Wake on: shutdown, a new monetized pin, OR a periodic tick so
+                // pending (cooldown-blocked) pins get retried once their window
+                // reopens even if no new pin arrives.
+                let drained_new = tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => match event {
+                        Some(e) => {
+                            // Newest-per-peer: a fresher pin replaces the older one,
+                            // BUT only if it is not already first-audited — an
+                            // already-audited duplicate must never overwrite an
+                            // unaudited pending pin for the same peer (it would then
+                            // be dropped as "done" and the unaudited pin lost). Cap
+                            // the per-wake batch drain (FIRST_AUDIT_DRAIN_BATCH) so a
+                            // sustained flood can't starve the audit-launch phase.
+                            if !first_audited.contains(&e.pin) {
+                                pending.put(e.peer, e);
+                            }
+                            let mut drained = 1usize;
+                            while drained < config::FIRST_AUDIT_DRAIN_BATCH {
+                                match rx.try_recv() {
+                                    Ok(e) => {
+                                        if !first_audited.contains(&e.pin) {
+                                            pending.put(e.peer, e);
+                                        }
+                                        drained += 1;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            true
+                        }
+                        None => break,
+                    },
+                    _ = tick.tick() => false,
+                };
+                let _ = drained_new;
+
+                if pending.is_empty() {
+                    continue;
+                }
+
+                // Try to launch an audit for each pending peer; keep the ones
+                // still blocked by cooldown for the next tick. Drain into a vec
+                // first so we can re-insert the still-blocked ones afterwards
+                // (LruCache has no drain). `iter()` yields most- to least-recently-
+                // used; we reverse so re-inserting blocked entries below restores
+                // their relative recency (oldest re-put first → stays the eviction
+                // victim, newest stays most-recently-used).
+                let snapshot: Vec<(PeerId, MonetizedPinEvent)> =
+                    pending.iter().rev().map(|(p, e)| (*p, *e)).collect();
+                pending.clear();
+                for (peer, event) in snapshot {
+                    // Dedup: a pin already first-audited is dropped (done).
+                    if first_audited.contains(&event.pin) {
+                        continue;
+                    }
+                    // ADR-0004 A1 (guardrail A): only first-audit a pin whose SIGNED
+                    // quote_ts lands inside the answerability window. With grace
+                    // removed, auditing an out-of-window pin the responder may have
+                    // aged out would false-convict, so a stale OR far-future/skewed
+                    // quote is skipped. Legit first-audits fire moments after
+                    // payment (quote_ts ≈ now); a skipped pin can still be
+                    // gossip-lottery audited.
+                    if !quote_within_audit_window(event.quote_ts, SystemTime::now()) {
+                        debug!(
+                            "First audit skipped for {peer}: quote_ts outside the answerability window"
+                        );
+                        continue;
+                    }
+                    // Cooldown: if the peer's per-peer audit window is closed, keep
+                    // this pin pending and retry on a later tick once it reopens.
+                    // We do NOT treat "cooldown closed" as "already audited" (a
+                    // losing gossip lottery can stamp the window without auditing),
+                    // so the pin stays pending until it gets a REAL first audit; it
+                    // is only ever evicted by the LRU memory backstop above, which
+                    // drops the least-recently-monetized peer, not this newest one.
+                    {
+                        let now = Instant::now();
+                        let mut map = gossip_audit.cooldown.write().await;
+                        if !cooldown_allows_audit(&mut map, &peer, now) {
+                            pending.put(peer, event);
+                            continue;
+                        }
+                    }
+                    // Audit is launching: now mark the pin first-audited.
+                    first_audited.put(event.pin, ());
+                    let trigger = gossip_audit.clone();
+                    tokio::spawn(async move {
+                        let credit = storage_commitment_audit::AuditCredit {
+                            recent_provers: &trigger.recent_provers,
+                        };
+                        let result = storage_commitment_audit::run_subtree_audit(
+                            &trigger.p2p_node,
+                            &trigger.config,
+                            &event.peer,
+                            event.pin,
+                            event.key_count,
+                            Some(&credit),
+                        )
+                        .await;
+                        handle_subtree_audit_result(
+                            &result,
+                            &trigger.p2p_node,
+                            &trigger.sync_state,
+                            &trigger.recent_provers,
+                            &trigger.config,
+                        )
+                        .await;
+                    });
+                }
+            }
+            debug!("First-audit drainer shut down");
         });
         self.task_handles.push(handle);
     }
@@ -1105,6 +1348,11 @@ impl ReplicationEngine {
             // ML-DSA signatures are randomized so we cannot reproduce
             // the pre-restart hash; the only honest path to recovery
             // is fast re-gossip.
+            // ADR-0004 A1: retention was reloaded in `new()` (before any task
+            // spawned), so this initial rebuild no-ops when the key set is
+            // unchanged — preserving the reloaded current pin; otherwise the
+            // reloaded roots stay answerable as retained slots until their gossip
+            // TTL lapses. Persistence is handled by the retention-persist loop.
             if let Err(e) =
                 rebuild_and_rotate_commitment(&storage, &identity, &commitment_state, &p2p, &config)
                     .await
@@ -1143,6 +1391,37 @@ impl ReplicationEngine {
                 }
             }
             debug!("Commitment rotation loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// ADR-0004 A1: periodically flush the responder retention snapshot to disk
+    /// (write-on-change) so answerability — including gossip-stamp refreshes and
+    /// rotations — survives a restart. Flushes once immediately, then every
+    /// `RETENTION_PERSIST_INTERVAL_SECS`, and once more on shutdown.
+    fn start_retention_persist_loop(&mut self) {
+        let commitment_state = Arc::clone(&self.commitment_state);
+        let retention_path = self.retention_path.clone();
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let mut last: Option<Vec<u8>> = None;
+            persist_retention_if_changed(&commitment_state, &retention_path, &mut last).await;
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        persist_retention_if_changed(&commitment_state, &retention_path, &mut last)
+                            .await;
+                        break;
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_secs(
+                        RETENTION_PERSIST_INTERVAL_SECS,
+                    )) => {
+                        persist_retention_if_changed(&commitment_state, &retention_path, &mut last)
+                            .await;
+                    }
+                }
+            }
+            debug!("Commitment retention persist loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -1938,6 +2217,41 @@ async fn handle_replication_message(
             });
             Ok(())
         }
+        ReplicationMessageBody::GetCommitmentByPin(ref request) => {
+            // ADR-0004: answer a commitment-by-pin fetch from the retained set
+            // only. `lookup_by_hash` is an allocation-light read over the
+            // bounded slot set; it returns the live current commitment or any
+            // still-answerable recently-gossiped/quoted one. A miss is reported
+            // as `NotRetained` (graced, never confirmed) rather than an error,
+            // so an aged-out pin can never brand an honest node.
+            //
+            // Reuse the audit-responder admission guard (global ceiling + per-peer
+            // cap) so a flood of fetches cannot drive unbounded commitment
+            // clone/encode/send work; over-limit is dropped, which the fetching
+            // peer graces exactly like a missed audit response.
+            let Some(_guard) =
+                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
+                    .await
+            else {
+                debug!("GetCommitmentByPin from {source} dropped: responder capacity reached");
+                return Ok(());
+            };
+            let response = my_commitment_state.lookup_by_hash(&request.pin).map_or(
+                protocol::GetCommitmentByPinResponse::NotRetained { pin: request.pin },
+                |built| protocol::GetCommitmentByPinResponse::Found {
+                    commitment: built.commitment().clone(),
+                },
+            );
+            send_replication_response(
+                source,
+                p2p_node,
+                msg.request_id,
+                ReplicationMessageBody::GetCommitmentByPinResponse(response),
+                rr_message_id,
+            )
+            .await;
+            Ok(())
+        }
         // Response messages are handled by their respective request initiators.
         ReplicationMessageBody::FreshReplicationResponse(_)
         | ReplicationMessageBody::NeighborSyncResponse(_)
@@ -1945,7 +2259,8 @@ async fn handle_replication_message(
         | ReplicationMessageBody::FetchResponse(_)
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
-        | ReplicationMessageBody::SubtreeByteResponse(_) => Ok(()),
+        | ReplicationMessageBody::SubtreeByteResponse(_)
+        | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
     }
 }
 
@@ -2110,9 +2425,9 @@ async fn handle_fresh_offer(
     // part of the immediate write fan-out: this receiver is about to store the
     // record as if the client had PUT it here directly. Storage admission
     // was checked above before proof work. ClientPut verification applies
-    // store-strength cache semantics, paid-quote issuer K-closeness and local
-    // price floor checks for single-node proofs, and merkle candidate
-    // closeness for merkle proofs.
+    // store-strength cache semantics, paid-quote issuer K-closeness checks
+    // for single-node proofs, and merkle candidate closeness for merkle
+    // proofs.
     match payment_verifier
         .verify_payment(
             &offer.key,
@@ -4077,6 +4392,29 @@ struct AuditTarget {
     key_count: u32,
 }
 
+/// ADR-0004: a commitment that backed a payment, surfaced by the payment
+/// verifier's cross-check so it can receive a **deterministic first audit**.
+///
+/// Sent from the verifier to the replication engine's first-audit drainer. The
+/// drainer dedups by `pin` (a pin gets one deterministic first audit; later
+/// audits of the same peer revert to the gossip lottery), orders most-recently-
+/// monetized first, and runs the same `run_subtree_audit` under the same
+/// per-peer cooldown and concurrency caps — only the lottery is bypassed.
+#[derive(Debug, Clone, Copy)]
+pub struct MonetizedPinEvent {
+    /// The peer whose commitment backed the payment.
+    pub peer: PeerId,
+    /// The pinned commitment hash.
+    pub pin: [u8; 32],
+    /// The committed key count (sizes the audit deadline).
+    pub key_count: u32,
+    /// The accused's own SIGNED quote timestamp. The first-audit drainer skips a
+    /// pin whose quote is older than the answerability window (ADR-0004 A1
+    /// guardrail A): with grace removed, challenging an aged-out pin would
+    /// false-convict, so a stale client-forwarded quote must not trigger an audit.
+    pub quote_ts: SystemTime,
+}
+
 /// Per-peer audit cooldown check-and-stamp (ADR-0002 "occasional surprise
 /// exams, keeps load low"). Returns `true` if `peer` may be audited now (and
 /// stamps `now`), `false` if it was audited within
@@ -4457,6 +4795,99 @@ async fn ingest_peer_commitment(
 // Storage-bound audit (v12) — responder commitment rotation
 // ---------------------------------------------------------------------------
 
+/// Reload persisted responder retention at startup (ADR-0004 A1). A missing file
+/// is a normal fresh start; a corrupt snapshot is logged and skipped (fail-open
+/// LOCALLY — the node re-gossips a fresh root — which never grants a remote grace).
+async fn load_commitment_retention(state: &ResponderCommitmentState, path: &Path) {
+    let bytes = match tokio::fs::read(path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            debug!(
+                "Commitment retention: no snapshot at {} (fresh start)",
+                path.display()
+            );
+            return;
+        }
+        Err(e) => {
+            warn!(
+                "Commitment retention: failed to read {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    if let Some(persisted) = PersistedRetention::from_bytes(&bytes) {
+        state.restore(&persisted);
+        info!(
+            "Commitment retention: reloaded {} slot(s) from {}",
+            state.retained_slot_count(),
+            path.display()
+        );
+    } else {
+        warn!(
+            "Commitment retention: corrupt snapshot at {}; starting with empty retention",
+            path.display()
+        );
+    }
+}
+
+/// Persist the responder retention snapshot IF it changed since `last` (ADR-0004
+/// A1). Write-on-change keeps frequent gossip-stamp refreshes durable without
+/// needless disk writes on idle nodes. On success updates `last` to the bytes
+/// written; on a serialization/write error the existing on-disk snapshot is left
+/// intact (never truncated).
+async fn persist_retention_if_changed(
+    state: &ResponderCommitmentState,
+    path: &Path,
+    last: &mut Option<Vec<u8>>,
+) {
+    let Some(bytes) = state.snapshot().to_bytes() else {
+        warn!("Commitment retention: serialization failed; keeping previous snapshot");
+        return;
+    };
+    if last.as_deref() == Some(bytes.as_slice()) {
+        return;
+    }
+    if write_retention_atomic(path, bytes.clone()).await {
+        *last = Some(bytes);
+    }
+}
+
+/// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →
+/// fsync parent dir (so the rename itself survives a crash). Returns `true` on
+/// success. Only the retention-persist loop writes this path, so a fixed temp
+/// name is safe.
+async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
+    let path = path.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &bytes)?;
+        std::fs::File::open(&tmp)?.sync_all()?;
+        std::fs::rename(&tmp, &path)?;
+        // Fsync the directory so the rename (the durable-commit point) is not
+        // lost on a crash right after it. An empty parent (relative filename)
+        // means the current directory.
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!("Commitment retention: persist failed: {e}");
+            false
+        }
+        Err(e) => {
+            warn!("Commitment retention: persist task join failed: {e}");
+            false
+        }
+    }
+}
+
 /// Read the current LMDB key set, build + sign a fresh
 /// `StorageCommitment`, and rotate it into `state` as the new `current`.
 /// The prior `current` is demoted to `previous`; the prior `previous` is
@@ -4627,6 +5058,7 @@ mod tests {
         apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
         audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
         first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
+        quote_within_audit_window, MONETIZED_AUDIT_SKEW_MARGIN,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
@@ -4635,6 +5067,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use std::time::Instant;
+    use std::time::SystemTime;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -4662,6 +5095,35 @@ mod tests {
             paid_notify_payment_context(),
             VerificationContext::PaidListAdmission
         );
+    }
+
+    /// ADR-0004 A1 (guardrail A): the monetized first-audit only fires for a
+    /// signed quote inside the answerability window, fail-closed on BOTH ends so a
+    /// stale or future/skewed client-forwarded quote cannot frame an honest node.
+    #[test]
+    fn monetized_quote_audit_window_fails_closed_both_ends() {
+        use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
+        let now = SystemTime::now();
+        // Fresh (just quoted) and small future/past skew -> audited.
+        assert!(quote_within_audit_window(now, now));
+        assert!(quote_within_audit_window(
+            now + Duration::from_secs(60),
+            now
+        ));
+        assert!(quote_within_audit_window(
+            now - Duration::from_secs(3600),
+            now
+        ));
+        // Far future (badly-skewed / replayed) -> skipped.
+        assert!(!quote_within_audit_window(
+            now + MONETIZED_AUDIT_SKEW_MARGIN + Duration::from_secs(60),
+            now
+        ));
+        // Older than the window -> skipped (pin may have aged out).
+        assert!(!quote_within_audit_window(
+            now - GOSSIP_ANSWERABILITY_TTL,
+            now
+        ));
     }
 
     #[test]

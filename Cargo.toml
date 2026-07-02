@@ -39,14 +39,14 @@ mimalloc = "0.1"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.2.2"
+ant-protocol = "2.3.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.26.2"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
-evmlib = "0.8.1"
+evmlib = "0.9.0"
 xor_name = "5"
 
 # Caching - LRU cache for verified XorNames
@@ -196,3 +196,18 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
+
+# ─── TEMPORARY: STRIP BEFORE MERGE — ADR-0004 coordinated cutover ───
+# The ADR-0004 versions of evmlib (0.9.0) and ant-protocol (2.3.0) — carrying
+# the signed quote fields `committed_key_count` / `commitment_pin` — are NOT yet
+# published to crates.io, so this crate cannot build against crates.io. These git
+# patches point both deps at their PR branches, whose package versions are
+# exactly the 0.9.0 / 2.3.0 already pinned in [dependencies] above, so CI can
+# build the coordinated change end-to-end.
+#
+# AT RELEASE (once evmlib 0.9.0 then ant-protocol 2.3.0 are published, in that
+# order): delete this entire [patch.crates-io] block. The [dependencies] pins are
+# already at the published versions, so nothing else changes.
+[patch.crates-io]
+evmlib = { git = "https://github.com/WithAutonomi/evmlib", branch = "adr-0003-signed-quote-fields" }
+ant-protocol = { git = "https://github.com/WithAutonomi/ant-protocol", branch = "adr-0003-commitment-bound-pricing" }

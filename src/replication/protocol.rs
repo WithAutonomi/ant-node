@@ -125,6 +125,19 @@ pub enum ReplicationMessageBody {
     SubtreeByteChallenge(SubtreeByteChallenge),
     /// Response carrying the requested chunks' original bytes (round 2).
     SubtreeByteResponse(SubtreeByteResponse),
+
+    // === Commitment fetch by pin (ADR-0004) ===
+    // APPENDED at the end so postcard variant discriminants of all the
+    // pre-existing variants are unchanged — old nodes keep decoding every
+    // message they already understood; only these two new indices are unknown
+    // to them (and they never receive them, since old nodes never send the
+    // matching request).
+    /// Fetch a retained commitment by its pin (ADR-0004): used to resolve a
+    /// quote's `commitment_pin` when the sidecar is absent and the gossip cache
+    /// has no fresh copy.
+    GetCommitmentByPin(GetCommitmentByPin),
+    /// Response to [`Self::GetCommitmentByPin`].
+    GetCommitmentByPinResponse(GetCommitmentByPinResponse),
 }
 
 // ---------------------------------------------------------------------------
@@ -291,6 +304,41 @@ pub enum FetchResponse {
 }
 
 // ---------------------------------------------------------------------------
+// Commitment fetch by pin (ADR-0004)
+// ---------------------------------------------------------------------------
+
+/// Request a retained commitment by its pin (commitment hash).
+///
+/// ADR-0004: a storer cross-checking a quote whose `commitment_pin` it does not
+/// already hold (no sidecar, no fresh gossip copy) fetches the signed
+/// commitment so it can verify the binding and route the commitment into audit.
+/// The responder answers only from its retained set, so this never forces a
+/// node to reconstruct or re-sign anything.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetCommitmentByPin {
+    /// The commitment hash (pin) being resolved.
+    pub pin: [u8; 32],
+}
+
+/// Response to [`GetCommitmentByPin`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GetCommitmentByPinResponse {
+    /// The pin resolved to a retained, signed commitment.
+    Found {
+        /// The signed commitment matching the requested pin. The fetcher
+        /// re-verifies its signature and peer binding before trusting it.
+        commitment: crate::replication::commitment::StorageCommitment,
+    },
+    /// The pin is not among the responder's retained commitments (rotated/aged
+    /// out, or never held). ADR-0004 treats this as graced, never confirmed:
+    /// an unanswerable pin is indistinguishable from an honest crash-restart.
+    NotRetained {
+        /// Echo of the requested pin, for matching.
+        pin: [u8; 32],
+    },
+}
+
+// ---------------------------------------------------------------------------
 // Audit Messages
 // ---------------------------------------------------------------------------
 
@@ -419,53 +467,34 @@ pub enum SubtreeAuditResponse {
 /// Why a responder rejected an audit challenge, in a form the auditor can act
 /// on without string-matching.
 ///
-/// The distinction matters for accounting: a responder that no longer RETAINS
-/// the pinned commitment may simply have rotated past it legitimately — the
-/// auditor can pin a root it gossiped a while ago, or one whose newer
-/// replacements the auditor never observed (retention is capped at the last two
-/// *gossiped* roots, so a peer that rotated several times within the
-/// answerability window can honestly drop an older one). That is NOT provable
-/// misbehaviour, so it is GRACED like a timeout. Every other rejection is a
-/// genuine protocol fault the auditor confirms.
-///
-/// **Self-grace is bounded and does not preserve stale credit.** A Byzantine
-/// peer can deliberately claim `UnknownCommitment`/`Transient` to dodge the
-/// confirmed-failure *trust penalty*. But the auditor still REVOKES the holder
-/// credit for the PINNED commitment on any graced rejection (it answered and
-/// could not prove possession now — see the credit revocation in
-/// `storage_commitment_audit`'s rejection handling). The revocation is scoped to
-/// the pinned commitment hash, so it strips exactly the credit for the root the
-/// peer would not prove without touching credit it legitimately re-earned for a
-/// newer commitment. Lying therefore does not let a deleter keep "proven holder"
-/// status for that root until the credit TTL — the loophole a plain timeout
-/// would leave. A peer that self-graces on every audit remains uncredited for the
-/// pinned commitments it refuses to prove; an honest peer that genuinely rotated
-/// simply re-earns credit on the next audit of its current commitment. The grace
-/// removes only the false TRUST PENALTY for the genuinely-ambiguous
-/// rotated/transient case; it does not remove the possession requirement.
+/// ADR-0004 Amendment 1: audit **grace is removed**. Answerability is now
+/// restart-durable (the responder persists and reloads its commitment retention)
+/// and the auditor only pins roots inside the answerability window, so an honest
+/// node can always answer a pin it could be challenged on. The auditor therefore
+/// grades a responsive rejection purely by kind, with no grace:
+/// - `UnknownCommitment` / `Protocol` → **confirmed failure**: repudiating a
+///   pinned root the node published (and may have been paid for), or an explicit
+///   protocol fault.
+/// - `Transient` → routed to the **non-response/timeout lane** (no trust penalty,
+///   but the holder credit for the pinned commitment IS revoked). The responder
+///   retries reads before emitting `Transient`, so one that still reaches the
+///   auditor means the node could not serve data it committed to. A
+///   `Transient`-spammer thus gains no positive standing; deterministically
+///   distinguishing malicious from genuine transient IO network-wide is the
+///   out-of-scope distributed non-response problem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectKind {
-    /// The responder does not retain the pinned commitment (rotated past it).
-    /// GRACED — indistinguishable from legitimate rotation the auditor missed.
+    /// The responder does not retain the pinned commitment. With restart-durable
+    /// retention and in-window auditing this is provable repudiation of a root
+    /// the node published → CONFIRMED failure.
     UnknownCommitment,
-    /// A transient, recoverable condition on the responder (e.g. a storage read
-    /// error) that is NOT evidence of missing data. GRACED like a timeout so a
-    /// flaky disk never manufactures a confirmed possession failure.
+    /// A transient, recoverable local condition (e.g. a storage read error),
+    /// emitted only after the responder's read retries failed. Routed to the
+    /// timeout lane (holder credit revoked, no trust penalty).
     Transient,
     /// Any other rejection (wrong target peer, no commitment state, malformed
     /// proof plan, oversized byte challenge, …). CONFIRMED failure.
     Protocol,
-}
-
-impl RejectKind {
-    /// Whether the auditor should GRACE this rejection (treat like a timeout —
-    /// no confirmed penalty, no holder-credit revocation) rather than confirm
-    /// it. Only genuine protocol faults are confirmed; rotation/transient
-    /// conditions are graced because they are not provable misbehaviour.
-    #[must_use]
-    pub fn is_graced(self) -> bool {
-        matches!(self, Self::UnknownCommitment | Self::Transient)
-    }
 }
 
 /// Round 2 of the storage audit (ADR-0002): the **surprise byte challenge**.
@@ -547,8 +576,9 @@ pub enum SubtreeByteResponse {
         challenge_id: u64,
     },
     /// The responder rejects the byte challenge outright. `kind` drives the
-    /// auditor's accounting: [`RejectKind::UnknownCommitment`] (rotated past the
-    /// pin) is graced; everything else is a confirmed failure, like round 1.
+    /// auditor's accounting (ADR-0004 A1: grace removed): [`RejectKind::Transient`]
+    /// routes to the timeout lane (no trust penalty, holder credit revoked); every
+    /// other kind is a confirmed failure, like round 1.
     Rejected {
         /// The challenge this response answers.
         challenge_id: u64,

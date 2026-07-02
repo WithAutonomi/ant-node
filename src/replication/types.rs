@@ -225,6 +225,38 @@ pub enum FailureEvidence {
         /// When this peer was first seen.
         first_seen: Instant,
     },
+    /// ADR-0004: a quote's claimed committed key count contradicts the signed
+    /// commitment it pinned. The quote and the commitment are both signed by
+    /// the same key, so this is a deterministic, first-occurrence
+    /// contradiction — not bad luck — and lands in the same trust lane as a
+    /// confirmed deterministic audit failure. Reported only in the
+    /// client-put context (a replication receipt's pin has legitimately aged
+    /// out). The fields are the portable contradiction: any third party
+    /// holding the two signed artifacts can recompute it.
+    QuoteCommitmentMismatch {
+        /// The peer whose quote and commitment disagree.
+        peer: PeerId,
+        /// The commitment hash the quote pinned (identifies the signed
+        /// commitment artifact); equals `commitment.hash()`.
+        pinned_commitment: [u8; 32],
+        /// The key count the quote claimed (and priced against).
+        quoted_key_count: u32,
+        /// The key count the pinned commitment actually attests.
+        committed_key_count: u32,
+        /// The signed quote artifact that carries the contradicting
+        /// `committed_key_count` + pin, ML-DSA-signed by `peer`, as canonical
+        /// serialized bytes. Carried opaquely (rmp of a `PaymentQuote` on the
+        /// single-node path, or a `MerklePaymentCandidateNode` on the merkle
+        /// path) so the one variant serves both paths; a third party
+        /// deserializes and re-verifies it against `peer`.
+        quote_artifact: Vec<u8>,
+        /// The signed commitment artifact the quote pinned (ML-DSA-signed by
+        /// the same `peer`). Together with `quote_artifact`, this is the
+        /// PORTABLE evidence: any third party re-verifies both signatures and
+        /// recomputes `quoted_key_count != commitment.key_count` without
+        /// trusting the reporter.
+        commitment: Box<crate::replication::commitment::StorageCommitment>,
+    },
 }
 
 /// Reason for audit failure.

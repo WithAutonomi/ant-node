@@ -187,6 +187,7 @@ async fn test_attack_valid_msgpack_empty_quotes() -> Result<(), Box<dyn std::err
             peer_quotes: vec![],
         },
         tx_hashes: vec![],
+        commitment_sidecars: vec![],
     };
     let proof_bytes =
         rmp_serde::to_vec(&empty_proof).map_err(|e| format!("Serialize failed: {e}"))?;

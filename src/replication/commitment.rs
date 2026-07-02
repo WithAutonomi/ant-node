@@ -23,21 +23,20 @@
 //! reward-eligibility cache) lives here yet — that's the next phase.
 
 use blake3::Hasher;
-use saorsa_pqc::api::sig::{
-    ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey, MlDsaSignature, MlDsaVariant,
-};
-use serde::{Deserialize, Serialize};
+use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaSecretKey};
 
 use crate::ant_protocol::XorName;
 
-/// Domain-separation tag for the commitment signature.
-///
-/// Signed payload is BLAKE3 over (this tag || canonical commitment fields).
-pub const DOMAIN_COMMITMENT: &[u8] = b"autonomi.ant.replication.storage_commitment.v1";
-
-/// Domain-separation tag for the auditor's pin: BLAKE3 over (this tag ||
-/// canonical commitment blob).
-pub const DOMAIN_COMMITMENT_HASH: &[u8] = b"autonomi.ant.replication.commitment_hash.v1";
+// ADR-0004: the commitment wire type, its pin (`commitment_hash`), its
+// signature verification, and the key-count cap are the SINGLE SOURCE OF TRUTH
+// in `ant-protocol` so the paying client and the node verify identically.
+// Re-exported here so all existing `crate::replication::commitment::…` callers
+// keep resolving. The Merkle tree, inclusion paths, and signing stay node-side
+// below (the client never builds or signs a commitment, only verifies one).
+pub use ::ant_protocol::payment::commitment::{
+    commitment_hash, verify_commitment_signature, StorageCommitment, DOMAIN_COMMITMENT,
+    DOMAIN_COMMITMENT_HASH, MAX_COMMITMENT_KEY_COUNT, MAX_COMMITMENT_SIDECAR_BYTES,
+};
 
 /// Domain-separation tag for Merkle leaves: `BLAKE3(this || key || H(bytes))`.
 pub const DOMAIN_LEAF: &[u8] = b"autonomi.ant.replication.storage_leaf.v1";
@@ -45,56 +44,9 @@ pub const DOMAIN_LEAF: &[u8] = b"autonomi.ant.replication.storage_leaf.v1";
 /// Domain-separation tag for Merkle internal nodes: `BLAKE3(this || left || right)`.
 pub const DOMAIN_NODE: &[u8] = b"autonomi.ant.replication.storage_node.v1";
 
-/// Maximum number of keys a single commitment may cover.
-///
-/// Bounds the Merkle path depth (audit responses carry `O(log2 key_count)`
-/// hashes per key) and the responder-side tree memory. A node storing more
-/// keys than this would need to split its claim — out of scope for v1.
-pub const MAX_COMMITMENT_KEY_COUNT: u32 = 1_000_000;
-
-/// Signed storage commitment.
-///
-/// Piggybacked on neighbour-sync gossip. The signature commits to the
-/// Merkle root, key count, sender peer ID, **and the sender's ML-DSA-65
-/// public key** under [`DOMAIN_COMMITMENT`].
-///
-/// Embedding the public key lets any receiver verify the signature
-/// without an external `PeerId → MlDsaPublicKey` lookup. Binding the
-/// public key in the signed payload prevents a key-swap attack where an
-/// adversary keeps the message body but re-signs it under a different key
-/// to claim a different identity. The peer-id binding (gate 2a in
-/// `verify_commitment_bound_response`) still ensures the embedded key
-/// belongs to the gossiping peer.
-///
-/// # Wire size
-///
-/// One commitment is approximately 5.3 KiB:
-///   - root: 32 B
-///   - `key_count`: 4 B
-///   - `sender_peer_id`: 32 B
-///   - `sender_public_key`: 1952 B (ML-DSA-65 public key)
-///   - signature: 3293 B (ML-DSA-65 signature)
-///
-/// Piggybacked on every `NeighborSyncRequest`/`Response` (~1 h interval
-/// per close-group peer at the neighbour-sync cooldown cadence). At a
-/// realistic close-group size of 8 with bidirectional sync, that's
-/// roughly 8 × 2 × 5.3 KiB / hour = ~85 KiB/h of additional gossip
-/// per node. Negligible against typical chunk-transfer bandwidth.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StorageCommitment {
-    /// Merkle root over the responder's claimed keys.
-    pub root: [u8; 32],
-    /// Number of leaves committed over.
-    pub key_count: u32,
-    /// Sender peer ID, bound to the signature.
-    pub sender_peer_id: [u8; 32],
-    /// Sender's ML-DSA-65 public key bytes (1952 bytes). Embedded so
-    /// receivers can verify the signature without a separate pubkey
-    /// directory. Bound by the signature.
-    pub sender_public_key: Vec<u8>,
-    /// ML-DSA-65 signature over canonical commitment fields. 3293 bytes.
-    pub signature: Vec<u8>,
-}
+// `MAX_COMMITMENT_KEY_COUNT` and `StorageCommitment` are re-exported from
+// `ant-protocol` above (single source of truth); their fields and wire size are
+// documented there.
 
 // ---------------------------------------------------------------------------
 // Hashing helpers
@@ -123,33 +75,8 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-/// The auditor's pin: `BLAKE3(DOMAIN_COMMITMENT_HASH || postcard(commitment))`.
-///
-/// Equal commitments produce equal hashes; any change to `root`, `key_count`,
-/// peer ID, or signature changes the hash because postcard's canonical
-/// encoding includes a length prefix for `signature`. The audit challenge
-/// carries this value; the audit response must include a commitment that
-/// hashes to the same value, defeating fresh-commitment substitution.
-///
-/// Postcard encoding is the same canonical wire form the rest of the
-/// replication protocol uses (`MessageCodec::encode`), so an encoded
-/// commitment from a `NeighborSyncRequest` produces the same hash as the
-/// same commitment received in an `AuditResponse`.
-///
-/// # Errors
-///
-/// Returns `None` only if postcard fails to serialize the commitment, which
-/// in practice means the signature is somehow `> isize::MAX` bytes — not
-/// reachable for ML-DSA-65 (3293 bytes). Callers may safely treat `None` as
-/// a malformed commitment and drop it.
-#[must_use]
-pub fn commitment_hash(c: &StorageCommitment) -> Option<[u8; 32]> {
-    let serialized = postcard::to_allocvec(c).ok()?;
-    let mut h = Hasher::new();
-    h.update(DOMAIN_COMMITMENT_HASH);
-    h.update(&serialized);
-    Some(*h.finalize().as_bytes())
-}
+// `commitment_hash` is re-exported from `ant-protocol` above (single source of
+// truth for the pin), so the paying client and the node compute the same pin.
 
 /// Canonical bytes the ML-DSA signature covers: the commitment fields
 /// minus the signature itself.
@@ -270,6 +197,15 @@ impl MerkleTree {
     pub fn key_count(&self) -> u32 {
         // Cast is safe because build() rejects > MAX_COMMITMENT_KEY_COUNT.
         u32::try_from(self.leaves.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The committed leaf keys, in the tree's sorted order. Lets a persisted
+    /// commitment be rebuilt from its key set alone — `MerkleTree::build(keys
+    /// .map(|k| (k, k)))` for content-addressed leaves — without re-reading
+    /// chunks, so a restart can restore the exact signed root (ADR-0004 A1).
+    #[must_use]
+    pub fn leaf_keys(&self) -> Vec<XorName> {
+        self.leaves.iter().map(|(k, _)| *k).collect()
     }
 
     /// Inclusion path for `key` from its leaf up to (but not including)
@@ -474,48 +410,11 @@ pub fn sign_commitment(
     Ok(sig.to_bytes())
 }
 
-/// Verify a commitment's signature using the embedded `sender_public_key`.
-///
-/// Returns `true` iff the signature is valid for `(root, key_count,
-/// sender_peer_id, sender_public_key)` under `c.sender_public_key` and
-/// [`DOMAIN_COMMITMENT`]. Returns `false` on key-format or signature-format
-/// errors so the caller can simply drop the gossip.
-///
-/// Verifying against the embedded key removes the need for an external
-/// `PeerId → MlDsaPublicKey` lookup. The peer-id binding gate in
-/// `ingest_peer_commitment` (and the auditor's `evaluate_subtree_structure`)
-/// still ensures the embedded key belongs to the claimed peer.
-#[must_use]
-pub fn verify_commitment_signature(c: &StorageCommitment) -> bool {
-    let Ok(public_key) = MlDsaPublicKey::from_bytes(MlDsaVariant::MlDsa65, &c.sender_public_key)
-    else {
-        return false;
-    };
-    verify_commitment_signature_with_key(c, &public_key)
-}
-
-/// Verify a commitment's signature against an externally provided key.
-///
-/// Test-helper variant. Production code should use [`verify_commitment_signature`]
-/// since the key is embedded in the commitment.
-#[must_use]
-pub fn verify_commitment_signature_with_key(
-    c: &StorageCommitment,
-    public_key: &MlDsaPublicKey,
-) -> bool {
-    let payload = commitment_signed_payload(
-        &c.root,
-        c.key_count,
-        &c.sender_peer_id,
-        &c.sender_public_key,
-    );
-    let Ok(sig) = MlDsaSignature::from_bytes(MlDsaVariant::MlDsa65, &c.signature) else {
-        return false;
-    };
-    let dsa = ml_dsa_65();
-    dsa.verify_with_context(public_key, &payload, &sig, DOMAIN_COMMITMENT)
-        .unwrap_or(false)
-}
+// `verify_commitment_signature` (embedded-key) is re-exported from
+// `ant-protocol` above (single source of truth), so the paying client and the
+// node accept exactly the same commitments. The externally-keyed variant was
+// removed in the ADR-0004 move — it had no remaining callers once the embedded-
+// key verify moved to `ant-protocol`.
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -546,6 +445,7 @@ pub enum CommitmentError {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use saorsa_pqc::api::sig::MlDsaPublicKey;
 
     fn xn(byte: u8) -> XorName {
         [byte; 32]

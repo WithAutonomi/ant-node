@@ -17,19 +17,26 @@
 //!   semantics specified in v6 §2: an in-flight reader holding its
 //!   `Arc` is unaffected by a concurrent rotate).
 //!
-//! No persistent disk state. Trees are rebuilt from `LmdbStorage` at
-//! the next rotation tick. Memory cost is bounded by
+//! Retention is persisted across restart (ADR-0004 A1): [`ResponderCommitmentState::snapshot`]
+//! captures the signed commitments + their key sets + gossip stamps, and
+//! [`ResponderCommitmentState::restore`] reloads them and rebuilds each tree from
+//! its persisted key set — so an honest restarted node can answer every pin that
+//! is still inside its answerability window, and an unanswerable pin is provable
+//! misbehaviour rather than an honest crash-restart. Trees are otherwise rebuilt
+//! from `LmdbStorage` at the next rotation tick. Memory cost is bounded by
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use parking_lot::RwLock;
 use saorsa_pqc::api::sig::MlDsaSecretKey;
+use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{
-    commitment_hash, sign_commitment, CommitmentError, MerkleTree, StorageCommitment,
+    commitment_hash, sign_commitment, verify_commitment_signature, CommitmentError, MerkleTree,
+    StorageCommitment,
 };
 
 /// Auditor-side per-peer commitment state.
@@ -262,20 +269,56 @@ impl BuiltCommitment {
     pub fn contains_key(&self, key: &XorName) -> bool {
         self.tree.contains_key(key)
     }
+
+    /// The committed leaf keys — the key set persisted so this commitment can be
+    /// rebuilt after a restart without re-reading chunks.
+    #[must_use]
+    pub fn leaf_keys(&self) -> Vec<XorName> {
+        self.tree.leaf_keys()
+    }
+
+    /// Reconstruct a `BuiltCommitment` from a persisted signed commitment and a
+    /// `tree` rebuilt from its leaf keys — WITHOUT re-signing, so the pin
+    /// (`commitment_hash`) is preserved exactly across a restart (ML-DSA
+    /// signatures are randomized, so re-signing would change the pin).
+    ///
+    /// Returns `None` (never trusts the blob) unless the rebuilt tree matches the
+    /// signed `root` and `key_count` AND the embedded-key ML-DSA signature still
+    /// verifies — so a corrupted or forged persisted commitment is rejected.
+    #[must_use]
+    pub fn from_persisted(commitment: StorageCommitment, tree: MerkleTree) -> Option<Self> {
+        if tree.root() != commitment.root || tree.key_count() != commitment.key_count {
+            return None;
+        }
+        if !verify_commitment_signature(&commitment) {
+            return None;
+        }
+        let cached_hash = commitment_hash(&commitment)?;
+        Some(Self {
+            commitment,
+            cached_hash,
+            tree,
+        })
+    }
 }
 
-/// Number of recently-gossiped commitments a responder stays answerable for
-/// (ADR-0002 "you stay answerable for what you publish").
+/// Expected steady-state count of retained recently-gossiped commitments (the
+/// last ~two, plus the current one) — used only as an initial `Vec` capacity
+/// hint. Retention itself is TTL-based (see [`GOSSIP_ANSWERABILITY_TTL`] and
+/// [`prune_slots`]), NOT a hard count: a commitment stays answerable for the
+/// full TTL after its last gossip regardless of how many rotations occur.
 ///
-/// The auditor only ever pins a commitment it received via gossip, so retaining
-/// the last two **actually-gossiped** commitments (plus the current one)
-/// guarantees an honest node can always answer a pin the auditor could have
-/// formed. Two — not one — absorbs the race where the auditor pins the
-/// commitment a node published just before its newest one. Retention is keyed on
-/// gossip emission, NOT on the rotation timer: a node that rebuilds its tree
-/// faster than it gossips never drops a commitment it actually put on the wire,
-/// so it is never wrongly failed for "unknown commitment hash".
+/// (A hard count cap was a flawed proxy — under a restart with a shifted
+/// responsible range, an in-window root could be evicted by count before its
+/// TTL, which after grace removal would be a false conviction.)
 const RETAINED_GOSSIPED_COMMITMENTS: usize = 2;
+
+/// Hard upper bound on retained gossip records — a pure memory backstop against
+/// pathological churn (e.g. an implausibly fast rotation producing many distinct
+/// in-window roots). At the 1 h rotation cadence and 3 h TTL only ~3 distinct
+/// roots are ever in-window, so this is never hit in practice; it exists solely
+/// so `recently_gossiped` cannot grow unbounded.
+const MAX_RETAINED_GOSSIPED_SLOTS: usize = 16;
 
 /// How long a gossiped commitment stays answerable after it was last put on the
 /// wire. Retention (and therefore the pruner's `is_held` deletion veto) is
@@ -292,6 +335,73 @@ const RETAINED_GOSSIPED_COMMITMENTS: usize = 2;
 /// interval = 3 h.
 pub(crate) const GOSSIP_ANSWERABILITY_TTL: Duration = Duration::from_secs(3 * 3600);
 
+/// Extra answerability margin applied ONLY when reloading retention after a
+/// restart (ADR-0004 A1). A gossip-stamp refresh in the last persist window may
+/// not have been flushed before an unclean restart, so a persisted deadline can
+/// be slightly early. Adding this margin on reload guarantees an honest node
+/// never *under*-retains across a restart (it may over-retain by the margin,
+/// which is harmless — it only makes the responder answer a little longer, and a
+/// data-deleter still fails the round-2 byte challenge). Sized well above the
+/// persist interval + gossip cadence, far below the TTL.
+const RESTART_STAMP_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// One persisted retention slot (ADR-0004 A1): the signed commitment, its
+/// committed key set (so the tree can be rebuilt without re-reading chunks), and
+/// the wall-clock time its hash was last gossiped (`None` if never gossiped —
+/// then it only survives reload while it is the current slot).
+#[derive(Serialize, Deserialize)]
+struct PersistedSlot {
+    commitment: StorageCommitment,
+    leaf_keys: Vec<XorName>,
+    /// Absolute wall-clock time (unix secs) at which this slot's answerability
+    /// expires. Storing the ABSOLUTE deadline (not the last-gossip time) makes
+    /// downtime count against the TTL: a node down past the deadline reloads the
+    /// slot as already expired. `None` if the slot was never gossiped — then it
+    /// survives reload only while it is the current slot.
+    expires_at_unix: Option<u64>,
+}
+
+/// Persisted-format version. Bump on any layout OR semantic change so an
+/// incompatible on-disk snapshot is rejected (→ empty retention, which self-heals
+/// via re-gossip) rather than silently misinterpreted (e.g. an old field read
+/// under new semantics).
+const RETENTION_FORMAT_VERSION: u32 = 1;
+
+/// The persisted responder retention. Slots are newest-first; `has_current`
+/// says whether `slots[0]` was the live advertised commitment.
+#[derive(Serialize, Deserialize)]
+pub struct PersistedRetention {
+    /// Format version (see [`RETENTION_FORMAT_VERSION`]); a mismatch is rejected.
+    version: u32,
+    slots: Vec<PersistedSlot>,
+    has_current: bool,
+}
+
+impl PersistedRetention {
+    /// Serialize for durable persistence (caller writes it atomically). `None`
+    /// on a serialization error, so the caller can refuse to overwrite the
+    /// durable file rather than truncate it.
+    #[must_use]
+    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+        postcard::to_allocvec(self).ok()
+    }
+
+    /// Decode a persisted snapshot. `None` on a corrupt blob OR a version
+    /// mismatch — the caller then fails open LOCALLY (empty retention; the node
+    /// re-gossips a fresh root), which never grants a remote grace.
+    #[must_use]
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let this: Self = postcard::from_bytes(bytes).ok()?;
+        (this.version == RETENTION_FORMAT_VERSION).then_some(this)
+    }
+
+    /// Whether the snapshot holds no slots.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+}
+
 /// Responder retention state (ADR-0002).
 ///
 /// Keeps the current (latest-rotated) commitment plus every commitment whose
@@ -302,14 +412,18 @@ pub struct ResponderCommitmentState {
     inner: RwLock<Inner>,
 }
 
-/// A commitment hash that was emitted on the wire, with the wall-clock time it
-/// was last gossiped. The `last_gossiped_at` is the answerability anchor: the
-/// record (and any slot it retains) expires `GOSSIP_ANSWERABILITY_TTL` after
-/// this instant, independent of rotation ticks or distinct-hash churn.
+/// A commitment hash that was emitted on the wire, with the monotonic instant at
+/// which its answerability EXPIRES (`last_gossiped_at + GOSSIP_ANSWERABILITY_TTL`).
+///
+/// Storing the deadline rather than the last-gossip instant makes reload after a
+/// restart robust: `restore` sets `expires_at = now + remaining` (pure addition),
+/// so an OS reboot — where the monotonic clock resets and uptime can be far less
+/// than the wall-clock age — cannot underflow and wrongly drop a still-in-window
+/// root.
 #[derive(Clone, Copy)]
 struct GossipedAt {
     hash: [u8; 32],
-    last_gossiped_at: Instant,
+    expires_at: Instant,
 }
 
 struct Inner {
@@ -422,6 +536,34 @@ impl ResponderCommitmentState {
         Some(current)
     }
 
+    /// Atomically snapshot the current commitment to PIN IN A QUOTE and refresh
+    /// its answerability, under a single lock. Returns the live current
+    /// commitment, or `None` if there is no live current (never rotated, or
+    /// retired) — in which case the caller must quote the baseline with no pin.
+    ///
+    /// ADR-0004 ("quoting is advertising"): issuing a quote that prices against
+    /// the current commitment must extend that commitment's answerability
+    /// exactly as gossiping it does, so a recently-quoted pin stays resolvable
+    /// for its TTL and a peer auditing it cannot false-fail an honest node.
+    /// This deliberately mirrors [`Self::current_for_gossip`]: same atomic
+    /// snapshot-and-stamp, same TOCTOU-free guarantee that anything a quote can
+    /// pin is simultaneously retained. It refreshes the CURRENT commitment only
+    /// — a retired or merely-retained-but-not-current commitment is never
+    /// returned here, so quote traffic can never keep a stale fat commitment
+    /// alive (it can only be answered, via `lookup_by_hash`, until its own
+    /// gossip/quote stamp lapses).
+    #[must_use]
+    pub fn current_for_quote(&self) -> Option<Arc<BuiltCommitment>> {
+        let now = Instant::now();
+        let mut guard = self.inner.write();
+        if !guard.has_current {
+            return None;
+        }
+        let current = guard.slots.first().map(Arc::clone)?;
+        mark_gossiped_locked(&mut guard, current.cached_hash, now);
+        Some(current)
+    }
+
     /// Expire retention purely by the wall clock, without building, signing, or
     /// rotating anything. Call once per rotation tick so a gossiped commitment's
     /// answerability deadline advances even when the rotation no-op guard
@@ -510,6 +652,139 @@ impl ResponderCommitmentState {
         guard.has_current = false;
         guard.recently_gossiped.clear();
     }
+
+    /// Snapshot retention for durable persistence (ADR-0004 A1): each slot's
+    /// signed commitment + committed key set + wall-clock gossip stamp. Reloading
+    /// this after a restart makes every still-in-window pin answerable again, so
+    /// an unanswerable pin is provable misbehaviour, not an honest crash-restart.
+    #[must_use]
+    pub fn snapshot(&self) -> PersistedRetention {
+        let now_i = Instant::now();
+        let now_s = SystemTime::now();
+        let guard = self.inner.read();
+        let slots = guard
+            .slots
+            .iter()
+            .map(|c| {
+                let expires_at_unix = guard
+                    .recently_gossiped
+                    .iter()
+                    .find(|g| g.hash == c.cached_hash)
+                    .and_then(|g| {
+                        // Persist the ABSOLUTE wall-clock deadline = now + remaining,
+                        // so a restart accounts for downtime. Skip if already expired.
+                        let remaining = g.expires_at.saturating_duration_since(now_i);
+                        if remaining.is_zero() {
+                            return None;
+                        }
+                        now_s
+                            .checked_add(remaining)
+                            .and_then(|w| w.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                    });
+                PersistedSlot {
+                    commitment: c.commitment().clone(),
+                    leaf_keys: c.leaf_keys(),
+                    expires_at_unix,
+                }
+            })
+            .collect();
+        PersistedRetention {
+            version: RETENTION_FORMAT_VERSION,
+            slots,
+            has_current: guard.has_current,
+        }
+    }
+
+    /// Reload retention from a persisted snapshot at startup (ADR-0004 A1).
+    /// Rebuilds each slot's tree from its persisted (content-addressed) key set,
+    /// verifies it against the signed root, converts wall-clock gossip stamps
+    /// back to the monotonic clock, drops corrupt or already-expired slots, and
+    /// enforces retention. Replaces any existing state.
+    pub fn restore(&self, persisted: &PersistedRetention) {
+        let now_i = Instant::now();
+        let now_s = SystemTime::now();
+        let mut guard = self.inner.write();
+        guard.slots.clear();
+        guard.recently_gossiped.clear();
+        guard.has_current = false;
+        // Track whether the FIRST persisted slot (the pre-restart current)
+        // restored successfully — `has_current` may only be honoured if it did,
+        // else a later slot would be wrongly promoted to current.
+        let mut first_slot_restored = false;
+        for (i, slot) in persisted.slots.iter().enumerate() {
+            let entries: Vec<_> = slot.leaf_keys.iter().map(|k| (*k, *k)).collect();
+            let Ok(tree) = MerkleTree::build(entries) else {
+                continue;
+            };
+            let Some(built) = BuiltCommitment::from_persisted(slot.commitment.clone(), tree) else {
+                continue;
+            };
+            let hash = built.cached_hash;
+            if i == 0 {
+                first_slot_restored = true;
+            }
+            guard.slots.push(Arc::new(built));
+            if let Some(exp_unix) = slot.expires_at_unix {
+                if let Some(expires_at) = wall_expiry_to_instant(exp_unix, now_s, now_i) {
+                    guard
+                        .recently_gossiped
+                        .push(GossipedAt { hash, expires_at });
+                }
+            }
+        }
+        guard.has_current = persisted.has_current && first_slot_restored;
+        prune_slots(&mut guard, now_i);
+    }
+}
+
+/// Convert a persisted ABSOLUTE wall-clock expiry (unix secs) to a monotonic
+/// [`Instant`] deadline, given the current wall-clock/monotonic pair. Returns
+/// `None` if the deadline has already passed (downtime consumed the TTL). Uses
+/// `now_i + remaining` (addition), so it never underflows across an OS reboot
+/// where the monotonic clock has reset; `remaining` is clamped to the TTL so a
+/// forward clock skew cannot over-extend answerability.
+fn wall_expiry_to_instant(expires_unix: u64, now_s: SystemTime, now_i: Instant) -> Option<Instant> {
+    let expires_wall = UNIX_EPOCH.checked_add(Duration::from_secs(expires_unix))?;
+    // Apply RESTART_STAMP_GRACE to the persisted deadline BEFORE deciding expiry:
+    // the persisted deadline can be slightly early (a stamp refresh lost in the
+    // last persist window may have already carried the true deadline past the
+    // persisted one — even past `now`). Treating `persisted + grace` as the
+    // effective deadline means an honest node never under-retains across a
+    // restart. A slot only drops here if it expired MORE than the grace ago
+    // (genuine expiry — downtime still counts, minus the grace margin).
+    let effective_wall = expires_wall.checked_add(RESTART_STAMP_GRACE)?;
+    let remaining = effective_wall.duration_since(now_s).ok()?;
+    if remaining.is_zero() {
+        return None;
+    }
+    // Clamp so a forward wall-clock skew cannot over-extend beyond one TTL + grace.
+    now_i.checked_add(remaining.min(GOSSIP_ANSWERABILITY_TTL + RESTART_STAMP_GRACE))
+}
+
+/// ADR-0004: the responder commitment state is the quote generator's commitment
+/// source. `current_binding_for_quote` snapshots the live current commitment's
+/// `(key_count, pin)` and refreshes its answerability in one atomic step (via
+/// [`ResponderCommitmentState::current_for_quote`]), so a quote that prices
+/// against the current commitment keeps it answerable for its TTL.
+impl crate::payment::quote::CommitmentSource for ResponderCommitmentState {
+    fn current_binding_for_quote(&self) -> Option<crate::payment::quote::QuoteBinding> {
+        self.current_for_quote()
+            .map(|built| crate::payment::quote::QuoteBinding {
+                key_count: built.commitment().key_count,
+                pin: built.hash(),
+            })
+    }
+
+    fn commitment_blob_for_pin(&self, pin: [u8; 32]) -> Option<Vec<u8>> {
+        // rmp-encode the `StorageCommitment` itself — the EXACT form the storer's
+        // `index_valid_sidecars` deserializes (`rmp_serde::from_slice::<StorageCommitment>`),
+        // so a sidecar shipped here resolves identically to one fetched via
+        // `GetCommitmentByPin`. Only retained pins resolve; a rotated-out pin
+        // yields `None` and the response simply carries no commitment.
+        let built = self.lookup_by_hash(&pin)?;
+        rmp_serde::to_vec(built.commitment()).ok()
+    }
 }
 
 /// Enforce retention as of `now`: first expire any gossip record older than
@@ -533,22 +808,23 @@ fn mark_gossiped_locked(inner: &mut Inner, hash: [u8; 32], now: Instant) {
         0,
         GossipedAt {
             hash,
-            last_gossiped_at: now,
+            expires_at: now + GOSSIP_ANSWERABILITY_TTL,
         },
     );
+    // Retention is TTL-based; truncation is only a memory backstop and must never
+    // drop an unexpired (still-in-window) record, so it caps at a value far above
+    // the number of roots that can be in-window at once.
     inner
         .recently_gossiped
-        .truncate(RETAINED_GOSSIPED_COMMITMENTS);
+        .truncate(MAX_RETAINED_GOSSIPED_SLOTS);
     prune_slots(inner, now);
 }
 
 fn prune_slots(inner: &mut Inner, now: Instant) {
     // 1. TTL-expire gossip records first (the answerability anchor). A record
-    //    whose last gossip is older than the window no longer keeps anything
+    //    whose answerability deadline has passed no longer keeps anything
     //    answerable, regardless of distinct-hash churn or rotation ticks.
-    inner
-        .recently_gossiped
-        .retain(|g| now.duration_since(g.last_gossiped_at) < GOSSIP_ANSWERABILITY_TTL);
+    inner.recently_gossiped.retain(|g| g.expires_at > now);
 
     // 2. Keep the live current slot (only while has_current) + any slot still
     //    covered by an unexpired record. Snapshot the live hashes first to avoid
@@ -591,6 +867,113 @@ mod tests {
 
     fn keypair() -> (saorsa_pqc::api::sig::MlDsaPublicKey, MlDsaSecretKey) {
         ml_dsa_65().generate_keypair().unwrap()
+    }
+
+    /// ADR-0004 A1: retention survives a restart. A snapshot → serialize →
+    /// deserialize → restore into a fresh state keeps the exact pre-restart pin
+    /// answerable (signature preserved, not re-signed) and its keys held — so an
+    /// honest restarted node is not falsely convicted once grace is removed.
+    #[test]
+    fn retention_survives_restart_via_snapshot_reload() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        // Content-addressed leaves (bytes_hash := key), matching production.
+        let entries: Vec<_> = (1..=5u8).map(|i| (key(i), key(i))).collect();
+        let built = BuiltCommitment::build(entries, &[0xAB; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+
+        let state = ResponderCommitmentState::new();
+        state.rotate(built);
+        state.mark_gossiped(pin);
+        assert!(state.lookup_by_hash(&pin).is_some());
+        assert!(state.is_held(&key(3)));
+
+        // "Restart": snapshot -> bytes -> reload into a fresh state.
+        let bytes = state.snapshot().to_bytes().expect("serialize");
+        let reloaded = PersistedRetention::from_bytes(&bytes).expect("deserialize");
+        let fresh = ResponderCommitmentState::new();
+        fresh.restore(&reloaded);
+
+        // The pre-restart pin is still answerable, with the SAME hash, and its
+        // committed keys are still held.
+        let got = fresh.lookup_by_hash(&pin).expect("pin survives restart");
+        assert_eq!(got.hash(), pin, "pin preserved (not re-signed)");
+        assert!(
+            fresh.is_held(&key(3)),
+            "committed key still held after restart"
+        );
+    }
+
+    /// A corrupt snapshot blob decodes to `None`, so the caller fails open with
+    /// empty retention rather than trusting garbage.
+    #[test]
+    fn corrupt_retention_snapshot_is_rejected() {
+        assert!(PersistedRetention::from_bytes(&[0xffu8; 9]).is_none());
+    }
+
+    /// A snapshot from an incompatible format version is rejected (→ empty
+    /// retention), not silently misdecoded.
+    #[test]
+    fn wrong_format_version_is_rejected() {
+        let entries: Vec<_> = (1..=3u8).map(|i| (key(i), key(i))).collect();
+        let (pk, sk) = keypair();
+        let built = BuiltCommitment::build(entries, &[9; 32], &sk, &pk.to_bytes()).unwrap();
+        let bad = PersistedRetention {
+            version: RETENTION_FORMAT_VERSION + 1,
+            slots: vec![PersistedSlot {
+                commitment: built.commitment().clone(),
+                leaf_keys: vec![key(1)],
+                expires_at_unix: None,
+            }],
+            has_current: true,
+        };
+        let bytes = bad.to_bytes().expect("serialize");
+        assert!(PersistedRetention::from_bytes(&bytes).is_none());
+    }
+
+    /// ADR-0004 A1 restart grace: a persisted deadline that is slightly in the
+    /// PAST (within `RESTART_STAMP_GRACE`, e.g. a stamp refresh lost in the last
+    /// persist window before an unclean restart) must still be answerable — an
+    /// honest node never under-retains across restart. A deadline older than the
+    /// grace is genuinely expired and dropped (downtime still counts).
+    #[test]
+    fn restore_grace_retains_slightly_stale_deadline_but_drops_expired() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let entries: Vec<_> = (1..=3u8).map(|i| (key(i), key(i))).collect();
+        let built = BuiltCommitment::build(entries.clone(), &[0xCD; 32], &sk, &pk_bytes).unwrap();
+        let pin = built.hash();
+        let leaf_keys: Vec<_> = entries.iter().map(|(k, _)| *k).collect();
+        let now_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("after epoch")
+            .as_secs();
+
+        let make = |expires_at_unix: Option<u64>| PersistedRetention {
+            version: RETENTION_FORMAT_VERSION,
+            slots: vec![PersistedSlot {
+                commitment: built.commitment().clone(),
+                leaf_keys: leaf_keys.clone(),
+                expires_at_unix,
+            }],
+            has_current: false, // not current -> retention depends on the stamp
+        };
+
+        // 60s past the persisted deadline — within the grace -> still answerable.
+        let within = ResponderCommitmentState::new();
+        within.restore(&make(Some(now_unix.saturating_sub(60))));
+        assert!(
+            within.lookup_by_hash(&pin).is_some(),
+            "a deadline within RESTART_STAMP_GRACE stays answerable across restart"
+        );
+
+        // 30 min past — well beyond the grace -> genuinely expired, dropped.
+        let beyond = ResponderCommitmentState::new();
+        beyond.restore(&make(Some(now_unix.saturating_sub(30 * 60))));
+        assert!(
+            beyond.lookup_by_hash(&pin).is_none(),
+            "a deadline older than the grace is expired and dropped"
+        );
     }
 
     #[test]
@@ -702,7 +1085,8 @@ mod tests {
     #[test]
     fn gossiped_commitment_stays_answerable_across_rotations() {
         // ADR-0002: a commitment that was actually gossiped stays answerable
-        // even after rotation, until it falls out of the last-2-gossiped window.
+        // even after rotation, for its gossip TTL (retention is TTL-based, not a
+        // fixed count).
         let (pk, sk) = keypair();
         let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
@@ -723,38 +1107,40 @@ mod tests {
         );
         assert!(state.lookup_by_hash(&h2).is_some());
 
-        // Rotate to c3 and gossip it. Now the last-2-gossiped are {h3, h2};
-        // h1 has fallen out of the window and is dropped.
+        // Rotate to c3 and gossip it. Retention is TTL-based, not a fixed count:
+        // no wall time has elapsed here, so c1 and c2 are still within their
+        // gossip TTL and MUST remain answerable — a rotation never evicts an
+        // in-window root (count-based eviction would be a false conviction once
+        // grace is removed). Aging out BY TTL is covered by the synthetic-clock
+        // prune_slots tests.
         let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h3 = c3.hash();
         state.rotate(c3);
         state.mark_gossiped(h3);
         assert!(
-            state.lookup_by_hash(&h1).is_none(),
-            "c1 aged out of gossip window"
+            state.lookup_by_hash(&h1).is_some(),
+            "c1 stays answerable across rotations while within its gossip TTL"
         );
         assert!(state.lookup_by_hash(&h2).is_some());
         assert!(state.lookup_by_hash(&h3).is_some());
     }
 
     #[test]
-    fn current_plus_last_two_gossiped_are_simultaneously_answerable() {
-        // ADR-0002 "Two, not one": the retention depth must keep BOTH of the
-        // last two gossiped commitments answerable at the same time, alongside
-        // the current one. This is the property that "absorbs the race where an
-        // auditor asks about the commitment a node published just before its
-        // newest one". The existing across-rotations test only ever checks two
-        // hashes at once; this one proves three DISTINCT commitments are live
-        // simultaneously and that the third-oldest gossiped root is dropped —
-        // i.e. RETAINED_GOSSIPED_COMMITMENTS is exactly 2, not 1 and not 3.
+    fn current_and_recently_gossiped_roots_stay_answerable_within_ttl() {
+        // Retention is TTL-based: the current commitment AND every distinct root
+        // gossiped within the answerability TTL are simultaneously answerable —
+        // which absorbs the race where an auditor asks about a root published
+        // just before the newest one, with NO count-based eviction (that was a
+        // false-conviction bug once grace is removed). No wall time elapses here,
+        // so all three distinct roots stay live; aging out is time-based and
+        // covered by the synthetic-clock prune_slots tests.
         let (pk, sk) = keypair();
         let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
 
-        // Gossip three commitments in order: c1, c2, c3. After this the current
-        // slot is c3 and the last-two-gossiped are {h3, h2}. But c2 and c1 also
-        // need to be checked relative to the window: once c3 is gossiped, the
-        // window is {h3, h2}; c1 (the 3rd-oldest gossiped) must be gone.
+        // Gossip three distinct commitments in order: c1, c2, c3. All were put
+        // on the wire within the TTL, so all three stay simultaneously
+        // answerable (current c3 plus the recently-gossiped c2 and c1).
         let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h1 = c1.hash();
         state.rotate(c1);
@@ -779,10 +1165,9 @@ mod tests {
         );
         assert_ne!(h1, h2, "the two retained commitments must be distinct");
 
-        // Now gossip a third distinct commitment c3. Window becomes {h3, h2}.
-        // c3 (current) + c2 + c1: c1 must now be dropped (3rd-oldest gossiped),
-        // while c2 and c3 remain. This proves depth is exactly 2 beyond... no:
-        // depth is 2 gossiped TOTAL including current's hash once gossiped.
+        // Now gossip a third distinct commitment c3. All of c1, c2, c3 were
+        // gossiped within the TTL (no wall time elapsed), so all three remain
+        // simultaneously answerable — retention is bounded by TTL, not a count.
         let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h3 = c3.hash();
         state.rotate(c3);
@@ -796,20 +1181,21 @@ mod tests {
         );
         assert!(
             state.lookup_by_hash(&h2).is_some(),
-            "c2 (published just before newest) answerable — the race-absorbing slot"
+            "c2 answerable within its TTL"
         );
         assert!(
-            state.lookup_by_hash(&h1).is_none(),
-            "c1 is the 3rd-oldest gossiped root and MUST be dropped — depth is exactly 2"
+            state.lookup_by_hash(&h1).is_some(),
+            "c1 also stays answerable within its TTL — no count-based eviction"
         );
     }
 
     #[test]
-    fn is_held_tracks_keys_across_the_retention_window_and_ages_them_out() {
+    fn is_held_tracks_keys_across_the_retention_window() {
         // The pruner's deletion veto relies on `is_held`: a key committed under
-        // ANY retained slot (current + last-2-gossiped) must read held, and must
-        // stop reading held once its commitment ages out of the window — that is
-        // the bounded reprieve, not a permanent pin. This mirrors the
+        // ANY retained slot (current + any root gossiped within the TTL) must
+        // read held. It stops reading held once its commitment ages out BY TTL —
+        // a bounded reprieve, not a permanent pin (the time-based age-out is
+        // covered by the synthetic-clock prune_slots tests). This mirrors the
         // round-2 responder's `built.proof_for(key).is_some()` check folded over
         // the slots, so "pruner won't delete" == "responder owes an answer".
         let (pk, sk) = keypair();
@@ -840,20 +1226,19 @@ mod tests {
         );
         assert!(state.is_held(&key(2)), "newly committed key is held");
 
-        // c3 commits to key(3). Window becomes {h3, h2}; h1 ages out, so key(1)
-        // is no longer held anywhere -> the pruner may now reclaim it.
+        // c3 commits to key(3). No wall time has elapsed, so c1 and c2 are still
+        // within their gossip TTL: key(1), key(2), key(3) are all still held (no
+        // count-based age-out). key(1) is reclaimed only once c1's TTL lapses,
+        // which the synthetic-clock prune_slots tests cover.
         let c3 = BuiltCommitment::build(vec![(key(3), bh(3))], &[0; 32], &sk, &pk_bytes).unwrap();
         let h3 = c3.hash();
         state.rotate(c3);
         state.mark_gossiped(h3);
         assert!(
-            !state.is_held(&key(1)),
-            "key whose commitments all aged out of the retention window is no longer held"
+            state.is_held(&key(1)),
+            "key(1) still held within c1's gossip TTL (no count-based eviction)"
         );
-        assert!(
-            state.is_held(&key(2)),
-            "key(2) still held via the previous gossiped slot"
-        );
+        assert!(state.is_held(&key(2)), "key(2) still held");
         assert!(state.is_held(&key(3)), "current key held");
     }
 
@@ -893,11 +1278,11 @@ mod tests {
             recently_gossiped: vec![
                 GossipedAt {
                     hash: h_current,
-                    last_gossiped_at: now,
+                    expires_at: now + GOSSIP_ANSWERABILITY_TTL,
                 },
                 GossipedAt {
                     hash: h_stale,
-                    last_gossiped_at: base,
+                    expires_at: base + GOSSIP_ANSWERABILITY_TTL,
                 },
             ],
         };
@@ -942,12 +1327,12 @@ mod tests {
             recently_gossiped: vec![
                 GossipedAt {
                     hash: h_current,
-                    last_gossiped_at: now,
+                    expires_at: now + GOSSIP_ANSWERABILITY_TTL,
                 },
                 GossipedAt {
                     // Gossiped a while ago, but still comfortably within the TTL.
                     hash: h_prev,
-                    last_gossiped_at: base,
+                    expires_at: base + GOSSIP_ANSWERABILITY_TTL,
                 },
             ],
         };
@@ -1009,7 +1394,7 @@ mod tests {
             has_current: false, // already retired
             recently_gossiped: vec![GossipedAt {
                 hash: h1,
-                last_gossiped_at: base,
+                expires_at: base + GOSSIP_ANSWERABILITY_TTL,
             }],
         };
 
@@ -1039,7 +1424,7 @@ mod tests {
             has_current: false, // retired
             recently_gossiped: vec![GossipedAt {
                 hash: h1,
-                last_gossiped_at: base,
+                expires_at: base + GOSSIP_ANSWERABILITY_TTL,
             }],
         };
 
@@ -1138,5 +1523,95 @@ mod tests {
             state.lookup_by_hash(&h1).is_some(),
             "gossiped commitment must survive ungossiped rebuilds"
         );
+    }
+
+    // === ADR-0004: current_for_quote (quote-issuance answerability) ===
+
+    use crate::payment::quote::CommitmentSource;
+
+    #[test]
+    fn current_for_quote_returns_current_binding_and_is_current_only() {
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        // No current yet -> baseline (None).
+        assert!(state.current_binding_for_quote().is_none());
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        state.mark_gossiped(h1);
+        let c2 = BuiltCommitment::build(
+            vec![(key(2), bh(2)), (key(3), bh(3))],
+            &peer_id,
+            &sk,
+            &pk_bytes,
+        )
+        .unwrap();
+        let h2 = c2.hash();
+        state.rotate(c2);
+
+        // current_for_quote returns the CURRENT (c2) binding, never the
+        // previous (c1) — a quote may pin only the live current commitment.
+        let binding = state
+            .current_binding_for_quote()
+            .expect("current binding present");
+        assert_eq!(
+            binding.pin, h2,
+            "must bind the current commitment, not previous"
+        );
+        assert_eq!(binding.key_count, 2, "current commitment's key count");
+        assert_ne!(
+            binding.pin, h1,
+            "must never pin the retired/previous commitment"
+        );
+    }
+
+    #[test]
+    fn current_for_quote_refreshes_answerability() {
+        // Issuing a quote must refresh the current commitment's answerability,
+        // exactly like gossiping it (ADR-0004 "quoting is advertising").
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        // NOT gossiped; instead "quote" it. The quote-issuance refresh must make
+        // it answerable just as a gossip emission would.
+        let binding = state.current_binding_for_quote().expect("binding");
+        assert_eq!(binding.pin, h1);
+        assert!(
+            state.lookup_by_hash(&h1).is_some(),
+            "a quoted current pin must be answerable (issuance refreshed retention)"
+        );
+    }
+
+    #[test]
+    fn retired_current_cannot_be_quoted() {
+        // After retire_current (node has no responsible keys), there is no live
+        // current commitment, so current_for_quote yields baseline — a retired
+        // commitment can never be newly quoted.
+        let (pk, sk) = keypair();
+        let pk_bytes = pk.to_bytes();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let state = ResponderCommitmentState::new();
+
+        let c1 = BuiltCommitment::build(vec![(key(1), bh(1))], &peer_id, &sk, &pk_bytes).unwrap();
+        let h1 = c1.hash();
+        state.rotate(c1);
+        state.mark_gossiped(h1);
+        state.retire_current();
+
+        assert!(
+            state.current_binding_for_quote().is_none(),
+            "a retired current commitment must not be quotable"
+        );
+        // ...but it stays answerable for any in-flight pin until its TTL lapses.
+        assert!(state.lookup_by_hash(&h1).is_some());
     }
 }
