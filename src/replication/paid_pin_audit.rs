@@ -8,8 +8,8 @@
 //! rotate past it, have the deterministic first audit graced as
 //! `UnknownCommitment`):
 //!   1. **answerability ≥ quote validity** — the confirmation window fits under
-//!      the commitment answerability TTL ([`answerability_bound_holds`], asserted
-//!      at startup);
+//!      the commitment answerability TTL ([`answerability_bound_holds`],
+//!      enforced at startup via [`ensure_answerability_bound`]);
 //!   2. **retention survives restart** — the [`PaidPinLedger`] persists and
 //!      reloads paid obligations.
 //!
@@ -23,7 +23,7 @@
 //! responder/grader, the pruner byte-veto, and payment verification is tracked
 //! in the implementation-notes checklist.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -46,18 +46,33 @@ pub const MAX_FIRST_AUDIT_DELAY: Duration = Duration::from_secs((30 + 5 + 2 + 5)
 /// confirmation window.
 pub const CLOCK_SKEW_MARGIN: Duration = Duration::from_secs(10 * 60);
 
+/// Total span from a quote's signed timestamp to its confirmation deadline
+/// (`MAX_AUDITED_QUOTE_AGE + MAX_FIRST_AUDIT_DELAY + CLOCK_SKEW_MARGIN`).
+pub const CONFIRMATION_SPAN: Duration = Duration::from_secs((60 + 42 + 10) * 60);
+
 /// Rule 1: the confirmation window must fit inside commitment answerability.
 ///
 /// So a pin backing a still-live paid quote is always answerable by an honest
-/// holder. Call at startup and refuse to boot if this returns
-/// `false` (a misconfiguration would let a paid pin age out before its first
-/// audit, reopening pay-then-shed).
+/// holder. See also [`ensure_answerability_bound`].
 #[must_use]
 pub fn answerability_bound_holds() -> bool {
-    MAX_AUDITED_QUOTE_AGE
-        .saturating_add(MAX_FIRST_AUDIT_DELAY)
-        .saturating_add(CLOCK_SKEW_MARGIN)
-        <= GOSSIP_ANSWERABILITY_TTL
+    CONFIRMATION_SPAN <= GOSSIP_ANSWERABILITY_TTL
+}
+
+/// Startup guard for rule 1.
+///
+/// `Err` if the confirmation window would exceed commitment answerability (a
+/// misconfiguration that would let a paid pin age out before its first audit,
+/// reopening pay-then-shed). The node MUST refuse to start on `Err`.
+///
+/// # Errors
+/// Returns `Err` when [`answerability_bound_holds`] is false.
+pub fn ensure_answerability_bound() -> Result<(), &'static str> {
+    if answerability_bound_holds() {
+        Ok(())
+    } else {
+        Err("ADR-0004 A1: confirmation window exceeds GOSSIP_ANSWERABILITY_TTL")
+    }
 }
 
 // --- The decision: provenance-scoped grading of a *definitive* miss ---------
@@ -68,7 +83,8 @@ pub fn answerability_bound_holds() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinProvenance {
     /// Learned from an accepted client-put payment bundle, carrying the accused's
-    /// signed quote (with `quote_ts`) and its signed commitment sidecar.
+    /// signed quote (with `quote_ts`) and its signed commitment sidecar. Only
+    /// admitted after [`is_admissible`] passed at ingestion.
     PaidQuote {
         /// The accused's own signed quote timestamp — the sole time basis for
         /// the confirmation deadline (never the auditor's clock).
@@ -91,33 +107,51 @@ pub enum MissVerdict {
     Graced,
 }
 
-/// The deadline until which a paid pin is convictable on a definitive miss.
+/// Two-sided freshness check applied at INGESTION (admission) — the only place
+/// wall-clock `now` is consulted.
 ///
-/// Derived from the accused's SIGNED `quote_ts`. Returns `None` for a quote
-/// dated more than [`CLOCK_SKEW_MARGIN`] in the future (never extend
-/// answerability from the future — treated as corrupt/hostile).
+/// A paid pin is admissible iff its signed `quote_ts` is neither older than
+/// `MAX_AUDITED_QUOTE_AGE + CLOCK_SKEW_MARGIN` nor more than `CLOCK_SKEW_MARGIN`
+/// in the future. Grading is then evaluation-time independent (see
+/// [`grade_definitive_miss`]). Overflow/underflow of a bound is treated
+/// conservatively (that bound imposes no constraint).
 #[must_use]
-pub fn confirmation_deadline(quote_ts: SystemTime, now: SystemTime) -> Option<SystemTime> {
-    if quote_ts > now + CLOCK_SKEW_MARGIN {
-        return None;
-    }
-    Some(quote_ts + MAX_AUDITED_QUOTE_AGE + MAX_FIRST_AUDIT_DELAY + CLOCK_SKEW_MARGIN)
+pub fn is_admissible(quote_ts: SystemTime, now: SystemTime) -> bool {
+    let not_future = now
+        .checked_add(CLOCK_SKEW_MARGIN)
+        .map_or(true, |upper| quote_ts <= upper);
+    let not_too_old = now
+        .checked_sub(MAX_AUDITED_QUOTE_AGE.saturating_add(CLOCK_SKEW_MARGIN))
+        .map_or(true, |lower| quote_ts >= lower);
+    not_future && not_too_old
+}
+
+/// The deadline until which an admitted paid pin is convictable on a definitive
+/// miss.
+///
+/// Derived solely from the accused's SIGNED `quote_ts` (never the auditor's
+/// clock), so grading is deterministic. `None` if the addition overflows
+/// (treated as corrupt — never convict).
+#[must_use]
+pub fn confirmation_deadline(quote_ts: SystemTime) -> Option<SystemTime> {
+    quote_ts.checked_add(CONFIRMATION_SPAN)
 }
 
 /// Grade a *definitive* miss.
 ///
 /// `challenge_issued_at` is the auditor's own signed challenge time. Confirmed
-/// iff the source is a paid quote and the challenge was
-/// issued at-or-before the confirmation deadline; otherwise graced. Non-response
-/// is not graded here (it stays in the timeout lane).
+/// iff the source is a paid quote and the challenge was issued at-or-before the
+/// confirmation deadline; otherwise graced. Depends only on the signed evidence
+/// (`quote_ts`, `challenge_issued_at`), not on the current clock, so a given
+/// evidence bundle always grades the same. Non-response is not graded here (it
+/// stays in the timeout lane).
 #[must_use]
 pub fn grade_definitive_miss(
     provenance: PinProvenance,
     challenge_issued_at: SystemTime,
-    now: SystemTime,
 ) -> MissVerdict {
     match provenance {
-        PinProvenance::PaidQuote { quote_ts } => match confirmation_deadline(quote_ts, now) {
+        PinProvenance::PaidQuote { quote_ts } => match confirmation_deadline(quote_ts) {
             Some(deadline) if challenge_issued_at <= deadline => MissVerdict::Confirmed,
             _ => MissVerdict::Graced,
         },
@@ -146,16 +180,25 @@ pub struct PaidPinRecord {
 }
 
 impl PaidPinRecord {
-    /// The pin (commitment hash) this record answers for.
+    /// The pin (commitment hash) this record answers for. `None` only on a
+    /// serialization failure that cannot occur for a well-formed commitment.
     #[must_use]
     pub fn pin(&self) -> Option<[u8; 32]> {
         commitment_hash(&self.commitment)
     }
 
-    /// The signed quote time as a [`SystemTime`].
+    /// The signed quote time. `None` if `quote_ts_unix` overflows `SystemTime`
+    /// (treated as corrupt — never panics).
     #[must_use]
-    pub fn quote_ts(&self) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(self.quote_ts_unix)
+    pub fn quote_ts(&self) -> Option<SystemTime> {
+        UNIX_EPOCH.checked_add(Duration::from_secs(self.quote_ts_unix))
+    }
+
+    /// This record's confirmation deadline, or `None` if the timestamp is corrupt
+    /// or overflows.
+    #[must_use]
+    pub fn confirmation_deadline(&self) -> Option<SystemTime> {
+        self.quote_ts().and_then(confirmation_deadline)
     }
 
     /// Rebuild the committed tree from the CURRENT bytes-hashes of `leaf_keys`
@@ -178,12 +221,29 @@ impl PaidPinRecord {
     }
 }
 
+/// Outcome of loading a persisted ledger, so the caller can implement the
+/// required local-halt-on-corruption behavior instead of silently proceeding.
+#[derive(Debug)]
+pub enum LoadOutcome {
+    /// The blob decoded; the ledger is the validated set (entries with an
+    /// unhashable/mismatched pin were dropped).
+    Loaded {
+        /// The reloaded, pin-revalidated ledger.
+        ledger: PaidPinLedger,
+        /// Number of entries dropped because their recomputed pin was missing.
+        dropped: usize,
+    },
+    /// The blob failed to decode. The caller MUST fail-open LOCALLY (stop issuing
+    /// above-baseline quotes until rebuilt) — never a remote grace.
+    Corrupt,
+}
+
 /// Restart-durable set of paid-pin obligations, keyed by pin.
 ///
-/// Separate from the gossip retention cache. Persisted (atomically; see
-/// impl-notes R1d) and reloaded on startup so a restart never loses a paid
-/// obligation.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// Separate from the gossip retention cache. The persisted form is a plain list
+/// of records; on load each pin is RECOMPUTED from its record (the persisted key
+/// is never trusted), so a tampered blob cannot bind a pin to the wrong record.
+#[derive(Debug, Default, Clone)]
 pub struct PaidPinLedger {
     by_pin: HashMap<[u8; 32], PaidPinRecord>,
 }
@@ -196,10 +256,14 @@ impl PaidPinLedger {
     }
 
     /// Admit a paid-pin obligation (idempotent per pin). A record whose
-    /// commitment cannot be hashed is dropped.
-    pub fn insert(&mut self, record: PaidPinRecord) {
-        if let Some(pin) = record.pin() {
-            self.by_pin.insert(pin, record);
+    /// commitment cannot be hashed is dropped and this returns `false`.
+    pub fn insert(&mut self, record: PaidPinRecord) -> bool {
+        match record.pin() {
+            Some(pin) => {
+                self.by_pin.insert(pin, record);
+                true
+            }
+            None => false,
         }
     }
 
@@ -211,7 +275,7 @@ impl PaidPinLedger {
 
     /// The keys held under any live paid pin — the pruner's `is_held` veto set.
     #[must_use]
-    pub fn vetoed_keys(&self) -> std::collections::HashSet<XorName> {
+    pub fn vetoed_keys(&self) -> HashSet<XorName> {
         self.by_pin
             .values()
             .flat_map(|r| r.leaf_keys.iter().copied())
@@ -231,24 +295,41 @@ impl PaidPinLedger {
     }
 
     /// Serialize for durable persistence (caller writes it atomically).
-    #[must_use]
-    pub fn to_bytes(&self) -> Vec<u8> {
-        postcard::to_allocvec(self).unwrap_or_default()
+    ///
+    /// The persisted form is the list of records (no keys). On a serialization
+    /// error the caller MUST NOT overwrite the durable ledger.
+    ///
+    /// # Errors
+    /// Propagates a `postcard` serialization error.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        let records: Vec<&PaidPinRecord> = self.by_pin.values().collect();
+        postcard::to_allocvec(&records)
     }
 
-    /// Reload after restart. A corrupt blob yields an empty ledger: fail-open
-    /// *locally* — the node stops issuing above-baseline quotes until rebuilt —
-    /// which never grants a remote grace (a remote auditor still convicts an
-    /// in-window definitive miss).
+    /// Reload after restart, revalidating every pin.
+    ///
+    /// Returns [`LoadOutcome::Corrupt`] on a decode failure so the caller can
+    /// fail-open locally; on success, entries whose pin cannot be recomputed are
+    /// dropped and every kept entry is keyed by its recomputed pin.
     #[must_use]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        postcard::from_bytes(bytes).unwrap_or_default()
+    pub fn load(bytes: &[u8]) -> LoadOutcome {
+        postcard::from_bytes::<Vec<PaidPinRecord>>(bytes).map_or(LoadOutcome::Corrupt, |records| {
+            let mut ledger = Self::new();
+            let mut dropped = 0usize;
+            for r in records {
+                if !ledger.insert(r) {
+                    dropped += 1;
+                }
+            }
+            LoadOutcome::Loaded { ledger, dropped }
+        })
     }
 
-    /// Drop obligations whose confirmation window has fully closed.
+    /// Drop obligations whose confirmation window has fully closed (or whose
+    /// timestamp is corrupt).
     pub fn prune_expired(&mut self, now: SystemTime) {
         self.by_pin
-            .retain(|_, r| confirmation_deadline(r.quote_ts(), now).is_some_and(|d| now <= d));
+            .retain(|_, r| r.confirmation_deadline().is_some_and(|d| now <= d));
     }
 }
 
@@ -279,106 +360,139 @@ mod tests {
         }
     }
 
+    fn record(quote_ts_unix: u64) -> (PaidPinRecord, [u8; 32], Vec<(XorName, [u8; 32])>) {
+        let entries: Vec<_> = (1..=5u8).map(|i| (xk(i), bh(i))).collect();
+        let commitment = commitment_over(&entries);
+        let pin = commitment_hash(&commitment).unwrap();
+        (
+            PaidPinRecord {
+                commitment,
+                leaf_keys: entries.iter().map(|(k, _)| *k).collect(),
+                quote_ts_unix,
+            },
+            pin,
+            entries,
+        )
+    }
+
     #[test]
     fn startup_answerability_bound_holds() {
-        // Rule 1: refuse to boot if the confirmation window exceeds the TTL.
-        assert!(
-            answerability_bound_holds(),
-            "confirmation window ({:?}) must fit under GOSSIP_ANSWERABILITY_TTL ({:?})",
-            MAX_AUDITED_QUOTE_AGE + MAX_FIRST_AUDIT_DELAY + CLOCK_SKEW_MARGIN,
-            GOSSIP_ANSWERABILITY_TTL
-        );
+        assert!(answerability_bound_holds());
+        assert!(ensure_answerability_bound().is_ok());
+        assert!(CONFIRMATION_SPAN <= GOSSIP_ANSWERABILITY_TTL);
     }
 
     #[test]
-    fn in_window_paid_definitive_miss_is_confirmed() {
+    fn admission_two_sided_freshness() {
         let now = SystemTime::now();
-        // Fresh paid quote, audited immediately -> confirmed.
+        assert!(is_admissible(now, now)); // fresh
+        assert!(is_admissible(now - MAX_AUDITED_QUOTE_AGE, now)); // within age
+        assert!(!is_admissible(
+            now - MAX_AUDITED_QUOTE_AGE - CLOCK_SKEW_MARGIN - Duration::from_secs(60),
+            now
+        )); // too old
+        assert!(!is_admissible(
+            now + CLOCK_SKEW_MARGIN + Duration::from_secs(60),
+            now
+        )); // future beyond skew
+    }
+
+    #[test]
+    fn grading_is_evaluation_time_independent() {
+        let quote_ts = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let deadline = confirmation_deadline(quote_ts).unwrap();
+        // in-window (incl exactly at the deadline) -> Confirmed
         assert_eq!(
-            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts: now }, now, now),
+            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts }, quote_ts),
             MissVerdict::Confirmed
         );
-        // Audited after the full 30-min cooldown (still inside the window) ->
-        // still confirmed (the two-window fix: cooldown delay does not grace).
-        let later = now + MAX_AUDITED_QUOTE_AGE + MAX_FIRST_AUDIT_DELAY;
         assert_eq!(
-            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts: now }, later, later),
+            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts }, deadline),
             MissVerdict::Confirmed
         );
-    }
-
-    #[test]
-    fn out_of_window_paid_miss_is_graced() {
-        let now = SystemTime::now();
-        let late = now
-            + MAX_AUDITED_QUOTE_AGE
-            + MAX_FIRST_AUDIT_DELAY
-            + CLOCK_SKEW_MARGIN
-            + Duration::from_secs(60);
+        // one second past the deadline -> Graced
         assert_eq!(
-            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts: now }, late, late),
+            grade_definitive_miss(
+                PinProvenance::PaidQuote { quote_ts },
+                deadline + Duration::from_secs(1)
+            ),
             MissVerdict::Graced
         );
     }
 
     #[test]
-    fn gossip_receipt_and_future_quote_are_graced() {
-        let now = SystemTime::now();
+    fn non_paid_provenance_always_graced() {
+        let t = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
         assert_eq!(
-            grade_definitive_miss(PinProvenance::GossipLottery, now, now),
+            grade_definitive_miss(PinProvenance::GossipLottery, t),
             MissVerdict::Graced
         );
         assert_eq!(
-            grade_definitive_miss(PinProvenance::Receipt, now, now),
+            grade_definitive_miss(PinProvenance::Receipt, t),
             MissVerdict::Graced
         );
-        // A future-dated quote beyond skew yields no deadline -> graced (cannot
-        // push the window out).
-        let future = now + CLOCK_SKEW_MARGIN + Duration::from_secs(3600);
-        assert_eq!(
-            grade_definitive_miss(PinProvenance::PaidQuote { quote_ts: future }, now, now),
-            MissVerdict::Graced
-        );
+    }
+
+    #[test]
+    fn corrupt_timestamp_never_panics_and_is_graced() {
+        // u64::MAX seconds overflows SystemTime -> None deadline -> Graced, no panic.
+        let (rec, _, _) = record(u64::MAX);
+        assert!(rec.quote_ts().is_none());
+        assert!(rec.confirmation_deadline().is_none());
     }
 
     #[test]
     fn ledger_survives_restart() {
-        // Rule 2: a paid obligation persists across a simulated restart.
-        let entries: Vec<_> = (1..=5u8).map(|i| (xk(i), bh(i))).collect();
-        let commitment = commitment_over(&entries);
-        let pin = commitment_hash(&commitment).unwrap();
-
+        let (rec, pin, _) = record(1_800_000_000);
+        let root = rec.commitment.root;
         let mut ledger = PaidPinLedger::new();
-        ledger.insert(PaidPinRecord {
-            commitment: commitment.clone(),
-            leaf_keys: entries.iter().map(|(k, _)| *k).collect(),
-            quote_ts_unix: 1_800_000_000,
-        });
+        assert!(ledger.insert(rec));
         assert_eq!(ledger.len(), 1);
 
         // persist -> drop -> reload == restart
-        let bytes = ledger.to_bytes();
+        let bytes = ledger.to_bytes().unwrap();
         drop(ledger);
-        let reloaded = PaidPinLedger::from_bytes(&bytes);
-
-        let rec = reloaded
-            .get(&pin)
-            .expect("paid pin must be answerable after restart");
-        assert_eq!(rec.commitment.root, commitment.root);
-        assert_eq!(rec.leaf_keys.len(), 5);
+        let reloaded = match PaidPinLedger::load(&bytes) {
+            LoadOutcome::Loaded { ledger, dropped } => {
+                assert_eq!(dropped, 0);
+                ledger
+            }
+            LoadOutcome::Corrupt => panic!("valid blob must not be Corrupt"),
+        };
+        let r = reloaded.get(&pin).expect("paid pin survives restart");
+        assert_eq!(r.commitment.root, root);
+        assert_eq!(r.leaf_keys.len(), 5);
         assert!(reloaded.vetoed_keys().contains(&xk(3)));
     }
 
     #[test]
-    fn holds_rebuilds_from_bytes_and_verifies_root() {
-        // answerability == data durability: reload rebuilds the tree from the
-        // durable chunk bytes and checks the signed root.
-        let entries: Vec<_> = (1..=5u8).map(|i| (xk(i), bh(i))).collect();
-        let rec = PaidPinRecord {
-            commitment: commitment_over(&entries),
-            leaf_keys: entries.iter().map(|(k, _)| *k).collect(),
-            quote_ts_unix: 1_800_000_000,
+    fn corrupt_blob_loads_as_corrupt_not_empty() {
+        // Garbage must decode to Corrupt (so the caller can local-halt), NOT
+        // silently to an empty ledger.
+        assert!(matches!(
+            PaidPinLedger::load(&[0xffu8; 7]),
+            LoadOutcome::Corrupt
+        ));
+    }
+
+    #[test]
+    fn reload_rekeys_by_recomputed_pin() {
+        // The persisted form carries no keys; reload rebuilds the map from
+        // record.pin(), so a lookup by the true pin resolves.
+        let (rec, pin, _) = record(1_800_000_000);
+        let mut ledger = PaidPinLedger::new();
+        ledger.insert(rec);
+        let bytes = ledger.to_bytes().unwrap();
+        let reloaded = match PaidPinLedger::load(&bytes) {
+            LoadOutcome::Loaded { ledger, .. } => ledger,
+            LoadOutcome::Corrupt => panic!("valid"),
         };
+        assert!(reloaded.get(&pin).is_some());
+    }
+
+    #[test]
+    fn holds_rebuilds_from_bytes_and_verifies_root() {
+        let (rec, _, entries) = record(1_800_000_000);
         let store: HashMap<XorName, [u8; 32]> = entries.iter().copied().collect();
 
         // Honest holder: all bytes present and unchanged -> can answer.
@@ -398,15 +512,10 @@ mod tests {
     #[test]
     fn prune_expired_drops_closed_windows() {
         let base = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
-        let entries: Vec<_> = (1..=3u8).map(|i| (xk(i), bh(i))).collect();
+        let (rec, _, _) = record(1_800_000_000);
         let mut ledger = PaidPinLedger::new();
-        ledger.insert(PaidPinRecord {
-            commitment: commitment_over(&entries),
-            leaf_keys: entries.iter().map(|(k, _)| *k).collect(),
-            quote_ts_unix: 1_800_000_000,
-        });
+        ledger.insert(rec);
         assert_eq!(ledger.len(), 1);
-        // Well past the confirmation window -> pruned.
         ledger.prune_expired(base + Duration::from_secs(24 * 60 * 60));
         assert_eq!(ledger.len(), 0);
     }
