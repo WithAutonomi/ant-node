@@ -11,6 +11,8 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -42,6 +44,10 @@ pub enum AuditTickResult {
     Failed {
         /// Evidence of the failure for trust engine.
         evidence: FailureEvidence,
+        /// Node-local no-response class for metrics/logs. This is deliberately
+        /// kept out of [`FailureEvidence`] so no serialized evidence format or
+        /// wire protocol changes.
+        no_response_class: Option<&'static str>,
     },
     /// Audit target claimed bootstrapping.
     BootstrapClaim {
@@ -68,21 +74,15 @@ fn first_challenged_key_label(keys: &[XorName]) -> String {
 /// The current core networking layer can wrap request deadline timeouts inside
 /// display strings, so this deliberately remains a bounded heuristic for logs
 /// rather than protocol/trust semantics.
-fn classify_audit_send_error(error: &str) -> &'static str {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("timed out") || lower.contains("timeout") {
-        "timeout"
-    } else if lower.contains("peer not found") || lower.contains("no channel") {
-        "peer_unavailable"
-    } else if lower.contains("connection") || lower.contains("connect") || lower.contains("dial") {
-        "connection_failed"
-    } else if lower.contains("closed") || lower.contains("dropped") {
-        "connection_closed"
-    } else if lower.contains("transport") {
-        "transport_error"
-    } else {
-        "other"
-    }
+fn classify_audit_send_error(error: &str) -> (&'static str, AuditFailureClass) {
+    audit_metrics::classify_audit_send_error(error)
+}
+
+pub(crate) fn responsible_audit_response_timeout(
+    config: &ReplicationConfig,
+    key_count: usize,
+) -> std::time::Duration {
+    config.audit_response_timeout(key_count)
 }
 
 // ---------------------------------------------------------------------------
@@ -105,12 +105,14 @@ pub async fn audit_tick(
     is_bootstrapping: bool,
 ) -> AuditTickResult {
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
     audit_tick_with_repair_proofs(
         p2p_node,
         storage,
         config,
         sync_history,
         &repair_proofs,
+        &audit_challenge_coordinator,
         0,
         is_bootstrapping,
     )
@@ -123,13 +125,18 @@ pub async fn audit_tick(
 /// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
 /// callers that have not adopted repair proofs remain conservative and do not
 /// audit peers for unproven keys.
-#[allow(clippy::implicit_hasher, clippy::too_many_lines)]
+#[allow(
+    clippy::implicit_hasher,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
     config: &ReplicationConfig,
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     current_sync_epoch: u64,
     is_bootstrapping: bool,
 ) -> AuditTickResult {
@@ -238,8 +245,12 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
+    let Some(_slot) = audit_challenge_coordinator.acquire(challenged_peer).await else {
+        warn!("Audit: failed to acquire outbound audit coordinator slot for {challenged_peer}");
+        return AuditTickResult::Idle;
+    };
     let encoded_len = encoded.len();
-    let audit_timeout = config.audit_response_timeout(peer_keys.len());
+    let audit_timeout = responsible_audit_response_timeout(config, peer_keys.len());
     let audit_started = Instant::now();
     let response = match p2p_node
         .send_request(
@@ -252,15 +263,20 @@ pub async fn audit_tick_with_repair_proofs(
     {
         Ok(resp) => resp,
         Err(e) => {
+            let send_error = e.to_string();
+            let (send_error_class, audit_failure_class) = classify_audit_send_error(&send_error);
+            audit_metrics::record_audit_no_response(
+                AuditType::ResponsibleChunk,
+                audit_failure_class,
+            );
             if enabled!(crate::logging::Level::WARN) {
                 let elapsed = audit_started.elapsed();
-                let send_error = e.to_string();
-                let send_error_class = classify_audit_send_error(&send_error);
                 let first_key = first_challenged_key_label(&peer_keys);
                 warn!(
-                    audit_type = "responsible_chunk",
+                    audit_type = AuditType::ResponsibleChunk.as_str(),
                     audit_phase = "challenge_send",
                     audit_outcome = "send_request_failed",
+                    audit_failure_class = audit_failure_class.as_str(),
                     challenged_peer = %challenged_peer,
                     challenge_id,
                     key_count = peer_keys.len(),
@@ -269,7 +285,8 @@ pub async fn audit_tick_with_repair_proofs(
                     first_key = %first_key,
                     encoded_len,
                     send_error_class,
-                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}",
+                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, audit_failure_class={}, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}",
+                    audit_failure_class.as_str(),
                     peer_keys.len(),
                     audit_timeout.as_millis(),
                     elapsed.as_millis(),
@@ -279,13 +296,16 @@ pub async fn audit_tick_with_repair_proofs(
                 challenged_peer = %challenged_peer,
                 challenge_id,
                 send_error = %e,
+                audit_failure_class = audit_failure_class.as_str(),
                 "Audit challenge raw send_request error"
             );
-            // Timeout — need responsibility confirmation before penalty.
+            // No-response verdicts still use the existing Timeout evidence
+            // reason; the class is node-local observability only.
             return handle_audit_timeout(
                 &challenged_peer,
                 challenge_id,
                 &peer_keys,
+                audit_failure_class,
                 p2p_node,
                 config,
             )
@@ -587,6 +607,7 @@ async fn verify_digests(
         &failed_keys,
         AuditFailureReason::DigestMismatch,
         keys.len(),
+        None,
         p2p_node,
         config,
     )
@@ -617,18 +638,21 @@ async fn handle_audit_failure(
         &failures,
         reason,
         failed_keys.len(),
+        None,
         p2p_node,
         config,
     )
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_classified_audit_failure(
     challenged_peer: &PeerId,
     challenge_id: u64,
     failed_keys: &[AuditKeyFailure],
     reason: AuditFailureReason,
     challenged_key_count: usize,
+    no_response_class: Option<&'static str>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> AuditTickResult {
@@ -679,7 +703,10 @@ async fn handle_classified_audit_failure(
         reason,
     };
 
-    AuditTickResult::Failed { evidence }
+    AuditTickResult::Failed {
+        evidence,
+        no_response_class,
+    }
 }
 
 /// Handle audit timeout (no response received).
@@ -687,14 +714,22 @@ async fn handle_audit_timeout(
     challenged_peer: &PeerId,
     challenge_id: u64,
     keys: &[XorName],
+    no_response_class: AuditFailureClass,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> AuditTickResult {
-    handle_audit_failure(
+    let failures = keys
+        .iter()
+        .copied()
+        .map(AuditKeyFailure::unclassified)
+        .collect::<Vec<_>>();
+    handle_classified_audit_failure(
         challenged_peer,
         challenge_id,
-        keys,
+        &failures,
         AuditFailureReason::Timeout,
+        keys.len(),
+        Some(no_response_class.as_str()),
         p2p_node,
         config,
     )
@@ -822,25 +857,32 @@ mod tests {
     fn classify_audit_send_error_uses_bounded_classes() {
         assert_eq!(
             classify_audit_send_error("request to peer timed out after 10s"),
-            "timeout"
+            ("response_timeout", AuditFailureClass::Timeout)
         );
         assert_eq!(
             classify_audit_send_error("peer not found in active channels"),
-            "peer_unavailable"
+            ("peer_unavailable", AuditFailureClass::Unreachable)
         );
         assert_eq!(
             classify_audit_send_error("dial failed for all candidate addresses"),
-            "connection_failed"
+            ("connection_failed", AuditFailureClass::Unreachable)
         );
         assert_eq!(
             classify_audit_send_error("response receiver dropped before delivery"),
-            "connection_closed"
+            ("connection_closed", AuditFailureClass::Unreachable)
         );
         assert_eq!(
             classify_audit_send_error("transport stream error"),
-            "transport_error"
+            ("transport_error", AuditFailureClass::Unreachable)
         );
-        assert_eq!(classify_audit_send_error("unexpected error"), "other");
+        assert_eq!(
+            classify_audit_send_error("operation timed out after 10s"),
+            ("transport_timeout", AuditFailureClass::Unreachable)
+        );
+        assert_eq!(
+            classify_audit_send_error("unexpected error"),
+            ("other", AuditFailureClass::Unreachable)
+        );
     }
 
     /// Create a test `LmdbStorage` backed by a temp directory.

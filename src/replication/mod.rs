@@ -16,6 +16,8 @@
 
 pub mod admission;
 pub mod audit;
+pub mod audit_coordinator;
+pub(crate) mod audit_metrics;
 pub mod bootstrap;
 pub mod commitment;
 pub mod commitment_state;
@@ -45,7 +47,7 @@ use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
 use rand::Rng;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -53,12 +55,15 @@ use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::AuditResponderClass;
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{PeerCommitmentRecord, ResponderCommitmentState};
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_VERIFICATION_KEYS_PER_REQUEST,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -83,6 +88,30 @@ use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
 
+/// Bounded handoff from the P2P broadcast receiver to serial non-audit
+/// replication processing.
+///
+/// The receiver fast-paths digest `AuditChallenge`s immediately and queues
+/// bulk/non-audit messages here. If this fills, the receiver handles the
+/// message inline instead of dropping it, preserving delivery while bounding
+/// memory.
+const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 256;
+
+/// Maximum fresh-replication offers processed away from the serial
+/// non-audit loop.
+///
+/// Fresh offers can perform an on-chain payment verification and a 4 MiB LMDB
+/// write. Four workers keep that latency off the responder dispatch path while
+/// keeping concurrent EVM/storage pressure small and predictable.
+const FRESH_OFFER_WORKER_LIMIT: usize = 4;
+
+/// Number of fixed keyed locks used to preserve fresh-offer ordering per key.
+///
+/// A fixed shard set avoids unbounded per-key lock state. Same-key offers map
+/// to the same shard and serialize; unrelated keys usually progress
+/// independently under the worker bound.
+const FRESH_OFFER_KEY_LOCK_SHARDS: usize = 64;
+
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::ClientPut
 }
@@ -91,8 +120,22 @@ fn paid_notify_payment_context() -> VerificationContext {
     VerificationContext::PaidListAdmission
 }
 
+fn new_fresh_offer_key_locks() -> FreshOfferKeyLocks {
+    Arc::new(
+        (0..FRESH_OFFER_KEY_LOCK_SHARDS)
+            .map(|_| Arc::new(Mutex::new(())))
+            .collect(),
+    )
+}
+
+fn fresh_offer_key_lock_index(key: &XorName) -> usize {
+    usize::from(key[0]) % FRESH_OFFER_KEY_LOCK_SHARDS
+}
+
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
+
+type FreshOfferKeyLocks = Arc<Vec<Arc<Mutex<()>>>>;
 
 /// Shared dependencies for one verification worker cycle.
 struct VerificationCycleContext<'a> {
@@ -297,6 +340,16 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Shared auditor-side limiter for outbound digest `AuditChallenge`s.
+    ///
+    /// Responsible-chunk audits, prune confirmations, and possession checks
+    /// all use this before sending so local bursts wait instead of breaching
+    /// the responder's deployed per-source admission cap.
+    audit_challenge_coordinator: Arc<AuditChallengeCoordinator>,
+    /// Bounded worker permits for expensive fresh-offer handling.
+    fresh_offer_worker_semaphore: Arc<Semaphore>,
+    /// Fixed shard locks preserving per-key fresh-offer ordering.
+    fresh_offer_key_locks: FreshOfferKeyLocks,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -369,6 +422,9 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
+            fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
+            fresh_offer_key_locks: new_fresh_offer_key_locks(),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -489,6 +545,7 @@ impl ReplicationEngine {
             &self.storage,
             &self.config,
             &self.sync_state,
+            &self.audit_challenge_coordinator,
             &self.shutdown,
         )
         .await;
@@ -674,6 +731,7 @@ impl ReplicationEngine {
         let storage = Arc::clone(&self.storage);
         let config = Arc::clone(&self.config);
         let sync_state = Arc::clone(&self.sync_state);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let shutdown = self.shutdown.clone();
 
         let handle = tokio::spawn(async move {
@@ -689,6 +747,7 @@ impl ReplicationEngine {
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
                         let sync_state = Arc::clone(&sync_state);
+                        let audit_challenge_coordinator = Arc::clone(&audit_challenge_coordinator);
                         let shutdown = shutdown.clone();
                         let delay_min = config.possession_check_delay_min;
                         let delay_max = config.possession_check_delay_max;
@@ -704,6 +763,7 @@ impl ReplicationEngine {
                                         &storage,
                                         &config,
                                         &sync_state,
+                                        &audit_challenge_coordinator,
                                         &shutdown,
                                     )
                                     .await;
@@ -744,6 +804,8 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
+        let fresh_offer_key_locks = Arc::clone(&self.fresh_offer_key_locks);
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
         // commitment can spawn a probabilistic, cooldown-gated subtree audit.
@@ -755,61 +817,154 @@ impl ReplicationEngine {
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
         };
 
+        let handler_context = ReplicationMessageHandlerContext {
+            p2p_node: Arc::clone(&p2p),
+            storage,
+            paid_list,
+            payment_verifier,
+            queues,
+            config: Arc::clone(&config),
+            is_bootstrapping,
+            bootstrap_state,
+            sync_history,
+            sync_cycle_epoch,
+            repair_proofs: Arc::clone(&repair_proofs),
+            last_commitment_by_peer: Arc::clone(&last_commitment_by_peer),
+            ever_capable_peers,
+            sig_verify_attempts: Arc::clone(&sig_verify_attempts),
+            my_commitment_state,
+            gossip_audit,
+            audit_responder_semaphore,
+            audit_responder_inflight,
+            fresh_offer_worker_semaphore,
+            fresh_offer_key_locks,
+        };
+
+        let (replication_tx, mut replication_rx) =
+            mpsc::channel::<InboundReplicationMessage>(INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY);
+        let serial_context = handler_context.clone();
+        let serial_shutdown = shutdown.clone();
+        let serial_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = serial_shutdown.cancelled() => break,
+                    inbound = replication_rx.recv() => {
+                        let Some(inbound) = inbound else { break };
+                        let source = inbound.source;
+                        match handle_replication_message(
+                            &source,
+                            inbound.msg,
+                            &serial_context,
+                            inbound.received_at,
+                            inbound.rr_message_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                debug!("Replication message from {source} error: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("Replication non-audit serial handler shut down");
+        });
+        self.task_handles.push(serial_handle);
+
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = p2p_events.recv() => {
-                        let Ok(event) = event else { continue };
-                        if let P2PEvent::Message {
-                            topic,
-                            source: Some(source),
-                            data,
-                            ..
-                        } = event {
-                            // Determine if this is a replication message
-                            // and whether it arrived via the /rr/ request-response
-                            // path (which wraps payloads in RequestResponseEnvelope).
-                            let rr_info = if topic == REPLICATION_PROTOCOL_ID {
-                                Some((data.clone(), None))
-                            } else if topic.starts_with(RR_PREFIX)
-                                && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => {
+                                handle_replication_event_recv_error(&error);
+                                continue;
+                            }
+                        };
+                        let Some((source, payload, rr_message_id)) =
+                            replication_payload_from_event(event)
+                        else {
+                            continue;
+                        };
+                        let received_at = Instant::now();
+                        let msg = match ReplicationMessage::decode(&payload) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                debug!("Replication message from {source} decode error: {e}");
+                                continue;
+                            }
+                        };
+                        let inbound = InboundReplicationMessage {
+                            source,
+                            msg,
+                            rr_message_id,
+                            received_at,
+                        };
+                        if matches!(
+                            inbound.msg.body,
+                            ReplicationMessageBody::AuditChallenge(_)
+                        ) {
+                            let source = inbound.source;
+                            match handle_replication_message(
+                                &source,
+                                inbound.msg,
+                                &handler_context,
+                                inbound.received_at,
+                                inbound.rr_message_id.as_deref(),
+                            )
+                            .await
                             {
-                                P2PNode::parse_request_envelope(&data)
-                                    .filter(|(_, is_resp, _)| !is_resp)
-                                    .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
-                            } else {
-                                None
-                            };
-                            if let Some((payload, rr_message_id)) = rr_info {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    debug!("Replication message from {source} error: {e}");
+                                }
+                            }
+                            continue;
+                        }
+                        match replication_tx.try_send(inbound) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(inbound)) => {
+                                warn!(
+                                    "Replication non-audit queue full; handling message from {} inline",
+                                    inbound.source
+                                );
+                                let source = inbound.source;
                                 match handle_replication_message(
                                     &source,
-                                    &payload,
-                                    &p2p,
-                                    &storage,
-                                    &paid_list,
-                                    &payment_verifier,
-                                    &queues,
-                                    &config,
-                                    &is_bootstrapping,
-                                    &bootstrap_state,
-                                    &sync_history,
-                                    &sync_cycle_epoch,
-                                    &repair_proofs,
-                                    &last_commitment_by_peer,
-                                    &ever_capable_peers,
-                                    &sig_verify_attempts,
-                                    &my_commitment_state,
-                                    &gossip_audit,
-                                    &audit_responder_semaphore,
-                                    &audit_responder_inflight,
-                                    rr_message_id.as_deref(),
-                                ).await {
+                                    inbound.msg,
+                                    &handler_context,
+                                    inbound.received_at,
+                                    inbound.rr_message_id.as_deref(),
+                                )
+                                .await
+                                {
                                     Ok(()) => {}
                                     Err(e) => {
-                                        debug!(
-                                            "Replication message from {source} error: {e}"
-                                        );
+                                        debug!("Replication message from {source} error: {e}");
+                                    }
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(inbound)) => {
+                                warn!(
+                                    "Replication non-audit queue closed; handling message from {} inline",
+                                    inbound.source
+                                );
+                                let source = inbound.source;
+                                match handle_replication_message(
+                                    &source,
+                                    inbound.msg,
+                                    &handler_context,
+                                    inbound.received_at,
+                                    inbound.rr_message_id.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        debug!("Replication message from {source} error: {e}");
                                     }
                                 }
                             }
@@ -946,6 +1101,7 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -999,6 +1155,7 @@ impl ReplicationEngine {
                         &last_commitment_by_peer,
                         &ever_capable_peers,
                         &sig_verify_attempts,
+                        &audit_challenge_coordinator,
                         &gossip_audit,
                     ) => {}
                 }
@@ -1047,6 +1204,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -1075,6 +1233,7 @@ impl ReplicationEngine {
                         &config,
                         &history,
                         &repair_proofs,
+                        &audit_challenge_coordinator,
                         current_sync_epoch,
                         bootstrapping,
                     )
@@ -1099,6 +1258,7 @@ impl ReplicationEngine {
                                 &config,
                                 &history,
                                 &repair_proofs,
+                                &audit_challenge_coordinator,
                                 current_sync_epoch,
                                 bootstrapping,
                             )
@@ -1620,6 +1780,83 @@ struct AuditResponderGuard {
     peer: PeerId,
 }
 
+#[derive(Clone)]
+struct ReplicationMessageHandlerContext {
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<LmdbStorage>,
+    paid_list: Arc<PaidList>,
+    payment_verifier: Arc<PaymentVerifier>,
+    queues: Arc<RwLock<ReplicationQueues>>,
+    config: Arc<ReplicationConfig>,
+    is_bootstrapping: Arc<RwLock<bool>>,
+    bootstrap_state: Arc<RwLock<BootstrapState>>,
+    sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    sync_cycle_epoch: Arc<RwLock<u64>>,
+    repair_proofs: Arc<RwLock<RepairProofs>>,
+    last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: Arc<RwLock<HashSet<PeerId>>>,
+    sig_verify_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    my_commitment_state: Arc<ResponderCommitmentState>,
+    gossip_audit: GossipAuditTrigger,
+    audit_responder_semaphore: Arc<Semaphore>,
+    audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    fresh_offer_worker_semaphore: Arc<Semaphore>,
+    fresh_offer_key_locks: FreshOfferKeyLocks,
+}
+
+struct InboundReplicationMessage {
+    source: PeerId,
+    msg: ReplicationMessage,
+    rr_message_id: Option<String>,
+    received_at: Instant,
+}
+
+impl AuditResponderClass {
+    const fn per_peer_limit(self) -> u32 {
+        match self {
+            Self::Digest => MAX_DIGEST_AUDIT_RESPONSES_PER_PEER,
+            Self::Subtree | Self::Byte => MAX_AUDIT_RESPONSES_PER_PEER,
+        }
+    }
+}
+
+fn handle_replication_event_recv_error(error: &RecvError) {
+    match error {
+        RecvError::Lagged(missed) => {
+            audit_metrics::record_replication_event_lagged(*missed);
+            warn!(
+                "Missed {missed} P2P events on replication branch (broadcast lag); \
+                 replication messages may have been dropped before dispatch"
+            );
+        }
+        RecvError::Closed => {
+            warn!("P2P event stream closed on replication branch");
+        }
+    }
+}
+
+fn replication_payload_from_event(event: P2PEvent) -> Option<(PeerId, Vec<u8>, Option<String>)> {
+    let P2PEvent::Message {
+        topic,
+        source: Some(source),
+        data,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    if topic == REPLICATION_PROTOCOL_ID {
+        return Some((source, data, None));
+    }
+    if topic.starts_with(RR_PREFIX) && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID {
+        return P2PNode::parse_request_envelope(&data)
+            .filter(|(_, is_resp, _)| !is_resp)
+            .map(|(msg_id, _, payload)| (source, payload, Some(msg_id)));
+    }
+    None
+}
+
 impl Drop for AuditResponderGuard {
     fn drop(&mut self) {
         // Decrement (and prune to keep the map bounded) without blocking the
@@ -1664,6 +1901,7 @@ async fn admit_audit_responder(
     semaphore: &Arc<Semaphore>,
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
     source: &PeerId,
+    class: AuditResponderClass,
 ) -> Option<AuditResponderGuard> {
     // Per-peer cap first (cheap, and the fairness-critical bound), committed
     // under the write lock so concurrent challenges from the same peer can't
@@ -1671,7 +1909,7 @@ async fn admit_audit_responder(
     {
         let mut map = inflight.write().await;
         let entry = map.entry(*source).or_insert(0);
-        if *entry >= MAX_AUDIT_RESPONSES_PER_PEER {
+        if *entry >= class.per_peer_limit() {
             return None;
         }
         *entry += 1;
@@ -1700,61 +1938,31 @@ async fn admit_audit_responder(
 /// When `rr_message_id` is `Some`, the request arrived via the `/rr/`
 /// request-response path and the response must be sent via `send_response`
 /// so saorsa-core can route it back to the waiting `send_request` caller.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 async fn handle_replication_message(
     source: &PeerId,
-    data: &[u8],
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    payment_verifier: &Arc<PaymentVerifier>,
-    queues: &Arc<RwLock<ReplicationQueues>>,
-    config: &ReplicationConfig,
-    is_bootstrapping: &Arc<RwLock<bool>>,
-    bootstrap_state: &Arc<RwLock<BootstrapState>>,
-    sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
-    sync_cycle_epoch: &Arc<RwLock<u64>>,
-    repair_proofs: &Arc<RwLock<RepairProofs>>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
-    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
-    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
-    my_commitment_state: &Arc<ResponderCommitmentState>,
-    gossip_audit: &GossipAuditTrigger,
-    audit_responder_semaphore: &Arc<Semaphore>,
-    audit_responder_inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    msg: ReplicationMessage,
+    ctx: &ReplicationMessageHandlerContext,
+    received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let msg = ReplicationMessage::decode(data)
-        .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
-
     match msg.body {
-        ReplicationMessageBody::FreshReplicationOffer(ref offer) => {
-            handle_fresh_offer(
-                source,
-                offer,
-                storage,
-                paid_list,
-                payment_verifier,
-                p2p_node,
-                config,
-                msg.request_id,
-                rr_message_id,
-            )
-            .await
+        ReplicationMessageBody::FreshReplicationOffer(offer) => {
+            dispatch_fresh_offer(*source, offer, ctx, msg.request_id, rr_message_id).await
         }
         ReplicationMessageBody::PaidNotify(ref notify) => {
             handle_paid_notify(
                 source,
                 notify,
-                paid_list,
-                payment_verifier,
-                p2p_node,
-                config,
+                &ctx.paid_list,
+                &ctx.payment_verifier,
+                &ctx.p2p_node,
+                &ctx.config,
             )
             .await
         }
         ReplicationMessageBody::NeighborSyncRequest(ref request) => {
-            let bootstrapping = *is_bootstrapping.read().await;
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
             // Phase-3 storage-bound audit: store the sender's
             // commitment for use as `expected_commitment_hash` in
             // future audits. Verify signature before storing so a peer
@@ -1762,31 +1970,31 @@ async fn handle_replication_message(
             if let Some(target) = ingest_peer_commitment(
                 source,
                 request.commitment.as_ref(),
-                p2p_node,
-                last_commitment_by_peer,
-                ever_capable_peers,
-                sig_verify_attempts,
+                &ctx.p2p_node,
+                &ctx.last_commitment_by_peer,
+                &ctx.ever_capable_peers,
+                &ctx.sig_verify_attempts,
             )
             .await
             {
-                maybe_trigger_gossip_audit(gossip_audit, source, target).await;
+                maybe_trigger_gossip_audit(&ctx.gossip_audit, source, target).await;
             }
             handle_neighbor_sync_request(
                 source,
                 request,
-                p2p_node,
-                storage,
-                paid_list,
-                queues,
-                config,
+                &ctx.p2p_node,
+                &ctx.storage,
+                &ctx.paid_list,
+                &ctx.queues,
+                &ctx.config,
                 bootstrapping,
-                bootstrap_state,
-                sync_history,
-                sync_cycle_epoch,
-                repair_proofs,
+                &ctx.bootstrap_state,
+                &ctx.sync_history,
+                &ctx.sync_cycle_epoch,
+                &ctx.repair_proofs,
                 // Atomically snapshot + mark-gossiped: emitted in the sync
                 // response, so we must stay answerable for it (ADR-0002).
-                my_commitment_state
+                ctx.my_commitment_state
                     .current_for_gossip()
                     .map(|b| b.commitment().clone()),
                 msg.request_id,
@@ -1798,9 +2006,9 @@ async fn handle_replication_message(
             handle_verification_request(
                 source,
                 request,
-                storage,
-                paid_list,
-                p2p_node,
+                &ctx.storage,
+                &ctx.paid_list,
+                &ctx.p2p_node,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1810,8 +2018,8 @@ async fn handle_replication_message(
             handle_fetch_request(
                 source,
                 request,
-                storage,
-                p2p_node,
+                &ctx.storage,
+                &ctx.p2p_node,
                 msg.request_id,
                 rr_message_id,
             )
@@ -1832,19 +2040,33 @@ async fn handle_replication_message(
             // is hit. Responsible/prune audit timeouts are penalised by the
             // caller, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
+            let Some(guard) = admit_audit_responder(
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
+                source,
+                AuditResponderClass::Digest,
+            )
+            .await
             else {
+                audit_metrics::record_admission_drop(AuditResponderClass::Digest);
                 warn!(
                     "Audit challenge reply not sent: kind=responsible response=dropped \
-                     source={source} (audit-responder capacity reached)"
+                     source={source} responder_class={} (audit-responder capacity reached)",
+                    AuditResponderClass::Digest.as_str(),
                 );
                 return Ok(());
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let dispatch_latency = received_at.elapsed();
+            audit_metrics::record_digest_dispatch_latency(dispatch_latency);
+            debug!(
+                audit_type = "digest_responder",
+                dispatch_latency_ms = dispatch_latency.as_millis(),
+                source = %source,
+                "Audit challenge dispatch latency measured"
+            );
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -1883,20 +2105,26 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
+            let Some(guard) = admit_audit_responder(
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
+                source,
+                AuditResponderClass::Subtree,
+            )
+            .await
             else {
+                audit_metrics::record_admission_drop(AuditResponderClass::Subtree);
                 warn!(
                     "Audit challenge reply not sent: kind=subtree response=dropped \
-                     source={source} (audit-responder capacity reached)"
+                     source={source} responder_class={} (audit-responder capacity reached)",
+                    AuditResponderClass::Subtree.as_str(),
                 );
                 return Ok(());
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
-            let my_commitment_state = Arc::clone(my_commitment_state);
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
+            let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -1945,20 +2173,26 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=byte source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
+            let Some(guard) = admit_audit_responder(
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
+                source,
+                AuditResponderClass::Byte,
+            )
+            .await
             else {
+                audit_metrics::record_admission_drop(AuditResponderClass::Byte);
                 warn!(
                     "Audit challenge reply not sent: kind=byte response=dropped \
-                     source={source} (audit-responder capacity reached)"
+                     source={source} responder_class={} (audit-responder capacity reached)",
+                    AuditResponderClass::Byte.as_str(),
                 );
                 return Ok(());
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
-            let my_commitment_state = Arc::clone(my_commitment_state);
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
+            let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
@@ -2011,6 +2245,71 @@ async fn handle_replication_message(
 // ---------------------------------------------------------------------------
 // Per-message-type handlers
 // ---------------------------------------------------------------------------
+
+async fn dispatch_fresh_offer(
+    source: PeerId,
+    offer: protocol::FreshReplicationOffer,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    let permit = Arc::clone(&ctx.fresh_offer_worker_semaphore).try_acquire_owned();
+    let Ok(permit) = permit else {
+        debug!(
+            "Fresh-offer worker pool saturated; handling offer for {} from {source} inline",
+            hex::encode(offer.key)
+        );
+        return handle_fresh_offer_serialized(
+            &source,
+            &offer,
+            ctx,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await;
+    };
+
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        if let Err(e) = handle_fresh_offer_serialized(
+            &source,
+            &offer,
+            &ctx,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!("Fresh replication offer from {source} error: {e}");
+        }
+    });
+    Ok(())
+}
+
+async fn handle_fresh_offer_serialized(
+    source: &PeerId,
+    offer: &protocol::FreshReplicationOffer,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let lock_index = fresh_offer_key_lock_index(&offer.key);
+    let _key_guard = ctx.fresh_offer_key_locks[lock_index].lock().await;
+    handle_fresh_offer(
+        source,
+        offer,
+        &ctx.storage,
+        &ctx.paid_list,
+        &ctx.payment_verifier,
+        &ctx.p2p_node,
+        &ctx.config,
+        request_id,
+        rr_message_id,
+    )
+    .await
+}
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_fresh_offer(
@@ -2788,6 +3087,7 @@ async fn run_neighbor_sync_round(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
 ) {
     let self_id = *p2p_node.peer_id();
@@ -2830,6 +3130,7 @@ async fn run_neighbor_sync_round(
             repair_proof_now: None,
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
+            audit_challenge_coordinator,
         })
         .await;
 
@@ -3993,7 +4294,10 @@ async fn handle_subtree_audit_result(
                 )
                 .await;
         }
-        AuditTickResult::Failed { evidence } => {
+        AuditTickResult::Failed {
+            evidence,
+            no_response_class,
+        } => {
             if let FailureEvidence::AuditFailure {
                 challenged_peer,
                 confirmed_failed_keys,
@@ -4005,8 +4309,10 @@ async fn handle_subtree_audit_result(
                 // Rich diagnostics (from main's audit-failure logging) + the
                 // first-failed-key correlation handle.
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
+                let audit_failure_class = no_response_class.unwrap_or("confirmed");
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    "Audit failure for {challenged_peer}: reason={reason:?}, audit_failure_class={}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    audit_failure_class,
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
@@ -4112,7 +4418,10 @@ async fn handle_audit_result(
                 )
                 .await;
         }
-        AuditTickResult::Failed { evidence } => {
+        AuditTickResult::Failed {
+            evidence,
+            no_response_class,
+        } => {
             if let FailureEvidence::AuditFailure {
                 challenged_peer,
                 confirmed_failed_keys,
@@ -4122,8 +4431,10 @@ async fn handle_audit_result(
             } = evidence
             {
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
+                let audit_failure_class = no_response_class.unwrap_or("confirmed");
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    "Audit failure for {challenged_peer}: reason={reason:?}, audit_failure_class={}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    audit_failure_class,
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
@@ -4789,18 +5100,23 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        add_replica_hint_sender_source, apply_audit_failure_credit_revocation,
-        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
-        audit_launch_decision, config, cooldown_allows_audit, first_failed_key_label,
-        fresh_offer_payment_context, paid_notify_payment_context,
+        add_replica_hint_sender_source, admit_audit_responder,
+        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
+        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
+        first_failed_key_label, fresh_offer_payment_context, handle_replication_event_recv_error,
+        paid_notify_payment_context, AuditResponderClass,
     };
     use crate::payment::VerificationContext;
+    use crate::replication::audit_metrics;
     use crate::replication::recent_provers::RecentProvers;
     use crate::replication::types::{AuditFailureReason, HintPipeline};
+    use crate::replication::{audit, possession, pruning};
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
+    use tokio::sync::{RwLock, Semaphore};
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -4827,6 +5143,90 @@ mod tests {
         assert_eq!(
             paid_notify_payment_context(),
             VerificationContext::PaidListAdmission
+        );
+    }
+
+    #[tokio::test]
+    async fn replication_branch_lagged_events_are_counted() {
+        let before = audit_metrics::replication_event_lagged_total();
+        handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Lagged(3));
+        let after = audit_metrics::replication_event_lagged_total();
+        assert_eq!(after.saturating_sub(before), 3);
+    }
+
+    #[tokio::test]
+    async fn digest_admission_gets_higher_per_peer_cap_subtree_stays_at_two() {
+        let peer = test_peer(0x44);
+        let semaphore = Arc::new(Semaphore::new(config::MAX_CONCURRENT_AUDIT_RESPONSES));
+
+        let digest_inflight = Arc::new(RwLock::new(HashMap::new()));
+        let mut digest_guards = Vec::new();
+        for _ in 0..config::MAX_DIGEST_AUDIT_RESPONSES_PER_PEER {
+            let guard = admit_audit_responder(
+                &semaphore,
+                &digest_inflight,
+                &peer,
+                AuditResponderClass::Digest,
+            )
+            .await;
+            assert!(guard.is_some());
+            digest_guards.push(guard);
+        }
+        assert!(
+            admit_audit_responder(
+                &semaphore,
+                &digest_inflight,
+                &peer,
+                AuditResponderClass::Digest,
+            )
+            .await
+            .is_none(),
+            "digest class must stop at its documented per-source cap"
+        );
+        drop(digest_guards);
+
+        let subtree_inflight = Arc::new(RwLock::new(HashMap::new()));
+        let mut subtree_guards = Vec::new();
+        for _ in 0..config::MAX_AUDIT_RESPONSES_PER_PEER {
+            let guard = admit_audit_responder(
+                &semaphore,
+                &subtree_inflight,
+                &peer,
+                AuditResponderClass::Subtree,
+            )
+            .await;
+            assert!(guard.is_some());
+            subtree_guards.push(guard);
+        }
+        assert!(
+            admit_audit_responder(
+                &semaphore,
+                &subtree_inflight,
+                &peer,
+                AuditResponderClass::Subtree,
+            )
+            .await
+            .is_none(),
+            "subtree class must retain the deployed cap of two"
+        );
+    }
+
+    #[test]
+    fn in_scope_audit_deadlines_share_one_formula() {
+        let config = config::ReplicationConfig::default();
+        for key_count in [1, 4, 16] {
+            assert_eq!(
+                audit::responsible_audit_response_timeout(&config, key_count),
+                config.audit_response_timeout(key_count)
+            );
+            assert_eq!(
+                pruning::prune_audit_response_timeout(&config, key_count),
+                config.audit_response_timeout(key_count)
+            );
+        }
+        assert_eq!(
+            possession::possession_probe_response_timeout(&config),
+            config.audit_response_timeout(1)
         );
     }
 
