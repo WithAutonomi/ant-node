@@ -17,6 +17,8 @@ use saorsa_core::{DHTNode, P2PNode};
 use tokio::sync::RwLock;
 
 use crate::ant_protocol::XorName;
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
@@ -94,6 +96,8 @@ pub struct PrunePassContext<'a> {
     /// round-2 byte challenge cannot false-positive an honest node). `None` on
     /// the legacy/test-only prune path, which keeps the pre-retention behavior.
     pub commitment_state: Option<&'a Arc<ResponderCommitmentState>>,
+    /// Shared outbound limiter for digest `AuditChallenge`s.
+    pub audit_challenge_coordinator: &'a Arc<AuditChallengeCoordinator>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +105,12 @@ enum PruneAuditStatus {
     Proven,
     Failed,
     Bootstrapping,
+}
+
+enum PruneAuditChallengeResult {
+    Response(Box<ReplicationMessage>),
+    NoResponse(AuditFailureClass),
+    MalformedResponse,
 }
 
 #[derive(Debug, Default)]
@@ -236,6 +246,7 @@ pub async fn run_prune_pass(
     allow_remote_prune_audits: bool,
 ) -> PruneResult {
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
     run_prune_pass_with_context(PrunePassContext {
         self_id,
         storage,
@@ -249,6 +260,7 @@ pub async fn run_prune_pass(
         repair_proof_now: None,
         allow_remote_prune_audits,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await
 }
@@ -377,6 +389,7 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         ctx.p2p_node,
         ctx.config,
         ctx.sync_state,
+        ctx.audit_challenge_coordinator,
     )
     .await;
     let (keys_to_delete, revalidated_cleared) = revalidated_record_prune_keys(
@@ -951,6 +964,7 @@ async fn collect_record_prune_proofs(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
 ) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
         return HashMap::new();
@@ -966,6 +980,7 @@ async fn collect_record_prune_proofs(
                 p2p_node,
                 config,
                 sync_state,
+                audit_challenge_coordinator,
                 &report_state,
             )
         })
@@ -1136,6 +1151,7 @@ fn target_peers_reported_present(
 
 /// Challenge a peer to prove it holds the exact record bytes for `key`.
 /// `None` means the peer failed to provide usable proof.
+#[allow(clippy::too_many_arguments)]
 async fn peer_proves_record(
     peer: PeerId,
     key: XorName,
@@ -1143,6 +1159,7 @@ async fn peer_proves_record(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     report_state: &PruneAuditReportState,
 ) -> Option<(PeerId, XorName)> {
     let local_bytes = local_record_bytes(&key, storage).await?;
@@ -1152,14 +1169,39 @@ async fn peer_proves_record(
         (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
     };
     let (encoded, key_count) = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
-    let Some(decoded) =
-        send_prune_audit_challenge(&peer, &key, encoded, key_count, p2p_node, config).await
-    else {
-        // No decoded response means a timeout or malformed reply. Prune
-        // confirmation reuses `AuditChallenge` semantics, so this is an immediate
-        // audit failure just like a decoded bad proof below.
-        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
-        return None;
+    let decoded = match send_prune_audit_challenge(
+        &peer,
+        &key,
+        encoded,
+        key_count,
+        p2p_node,
+        config,
+        audit_challenge_coordinator,
+    )
+    .await
+    {
+        PruneAuditChallengeResult::Response(decoded) => *decoded,
+        PruneAuditChallengeResult::NoResponse(class) => {
+            // No response means an immediate audit failure, but keep the local
+            // class split so timeout metrics are not polluted by pre-delivery
+            // failures.
+            audit_metrics::record_audit_no_response(AuditType::Prune, class);
+            report_prune_audit_failure_once(
+                &peer,
+                &key,
+                p2p_node,
+                config,
+                report_state,
+                Some(class),
+            )
+            .await;
+            return None;
+        }
+        PruneAuditChallengeResult::MalformedResponse => {
+            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state, None)
+                .await;
+            return None;
+        }
     };
 
     let status =
@@ -1176,7 +1218,8 @@ async fn peer_proves_record(
             None
         }
         PruneAuditStatus::Failed => {
-            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state, None)
+                .await;
             None
         }
     }
@@ -1221,6 +1264,13 @@ fn encode_prune_audit_challenge(
     Some((encoded, key_count))
 }
 
+pub(crate) fn prune_audit_response_timeout(
+    config: &ReplicationConfig,
+    key_count: usize,
+) -> Duration {
+    config.audit_response_timeout(key_count)
+}
+
 async fn send_prune_audit_challenge(
     peer: &PeerId,
     key: &XorName,
@@ -1228,19 +1278,33 @@ async fn send_prune_audit_challenge(
     key_count: usize,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Option<ReplicationMessage> {
-    let timeout = config.audit_response_timeout(key_count);
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
+) -> PruneAuditChallengeResult {
+    let Some(_slot) = audit_challenge_coordinator.acquire(*peer).await else {
+        warn!(
+            "Prune audit challenge for {} against {peer} could not acquire coordinator slot",
+            hex::encode(key)
+        );
+        return PruneAuditChallengeResult::MalformedResponse;
+    };
+    let timeout = prune_audit_response_timeout(config, key_count);
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await
     {
         Ok(response) => response,
         Err(e) => {
+            let error = e.to_string();
+            let (send_error_class, audit_failure_class) =
+                audit_metrics::classify_audit_send_error(&error);
             debug!(
+                audit_type = AuditType::Prune.as_str(),
+                audit_failure_class = audit_failure_class.as_str(),
+                send_error_class,
                 "Prune audit challenge for {} against {peer} failed: {e}",
                 hex::encode(key)
             );
-            return None;
+            return PruneAuditChallengeResult::NoResponse(audit_failure_class);
         }
     };
 
@@ -1248,11 +1312,11 @@ async fn send_prune_audit_challenge(
         Ok(msg) => msg,
         Err(e) => {
             warn!("Failed to decode prune audit response from {peer}: {e}");
-            return None;
+            return PruneAuditChallengeResult::MalformedResponse;
         }
     };
 
-    Some(decoded)
+    PruneAuditChallengeResult::Response(Box::new(decoded))
 }
 
 fn prune_audit_response_status(
@@ -1371,6 +1435,7 @@ async fn report_prune_audit_failure_once(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     report_state: &PruneAuditReportState,
+    failure_class: Option<AuditFailureClass>,
 ) -> bool {
     let should_report = peer_is_currently_responsible(peer, key, p2p_node, config).await
         && reserve_prune_audit_failure_report(report_state, peer).await;
@@ -1378,6 +1443,16 @@ async fn report_prune_audit_failure_once(
         return false;
     }
 
+    let audit_failure_class = failure_class.map_or("failed", AuditFailureClass::as_str);
+    warn!(
+        audit_type = AuditType::Prune.as_str(),
+        audit_failure_class,
+        peer = %peer,
+        key = %hex::encode(key),
+        trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
+        "Prune audit failure: peer={peer}, audit_failure_class={audit_failure_class}, key={}",
+        hex::encode(key)
+    );
     p2p_node
         .report_trust_event(
             peer,

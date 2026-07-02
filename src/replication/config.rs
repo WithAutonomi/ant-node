@@ -167,6 +167,18 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 /// comfortably covers the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 2;
 
+/// Maximum concurrent digest-only `AuditChallenge` responses from any single
+/// source peer.
+///
+/// Digest challenges are KB-scale replies: at most
+/// `max_incoming_audit_keys(stored_chunks)` bounded disk reads plus BLAKE3
+/// digests. A higher per-source allowance absorbs the three legitimate issuer
+/// subsystems (responsible-chunk audit, prune confirmation, and possession
+/// checks) from one auditor without weakening the existing subtree/byte audit
+/// budget. The multi-MiB subtree and byte challenge paths intentionally keep
+/// [`MAX_AUDIT_RESPONSES_PER_PEER`] exactly unchanged.
+pub const MAX_DIGEST_AUDIT_RESPONSES_PER_PEER: u32 = 8;
+
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
 /// Uses `std::thread::available_parallelism()` so the node scales to the
