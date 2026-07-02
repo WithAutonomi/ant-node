@@ -56,7 +56,7 @@ const BYTE_SPOTCHECK_MAX: u32 = 5;
 /// error a few times before rejecting `Transient` (which routes to the timeout
 /// lane). A momentary disk blip usually clears within these attempts; only a
 /// persistent read failure — the node genuinely cannot serve committed bytes —
-/// falls through. Total added latency (attempts × backoff) stays well inside the
+/// falls through. Total added latency ((attempts − 1) × backoff) stays well inside the
 /// audit response deadline.
 const AUDIT_READ_RETRY_ATTEMPTS: u32 = 3;
 const AUDIT_READ_RETRY_BACKOFF: Duration = Duration::from_millis(200);
@@ -84,6 +84,29 @@ async fn get_raw_retrying(
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// How the auditor grades a *responsive* audit rejection (ADR-0004 A1: grace
+/// removed). The decision is a pure function of the [`RejectKind`] so it can be
+/// unit-tested independently of the P2P/side-effect machinery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectGrade {
+    /// Provable misbehaviour → confirmed failure (trust penalty + credit
+    /// revocation downstream).
+    Confirmed,
+    /// Non-response/timeout lane: no trust penalty, but the pinned commitment's
+    /// holder credit is revoked (the peer answered but could not prove possession).
+    TimeoutLane,
+}
+
+/// Grade a responsive rejection. Repudiating a pinned root (`UnknownCommitment`)
+/// or an explicit protocol fault is a confirmed failure; a `Transient` read error
+/// (already retried by the responder) routes to the timeout lane.
+const fn grade_reject(kind: RejectKind) -> RejectGrade {
+    match kind {
+        RejectKind::UnknownCommitment | RejectKind::Protocol => RejectGrade::Confirmed,
+        RejectKind::Transient => RejectGrade::TimeoutLane,
     }
 }
 
@@ -303,15 +326,15 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
             // routes to the timeout lane (credit revoked, no trust penalty) — the
             // responder retries reads first, so a Transient reaching round 2 means
             // it still could not serve committed bytes.
-            match kind {
-                RejectKind::UnknownCommitment | RejectKind::Protocol => {
+            match grade_reject(kind) {
+                RejectGrade::Confirmed => {
                     warn!(
                         "Audit: {} rejected byte challenge ({kind:?}; confirmed): {reason}",
                         ctx.challenged_peer
                     );
                     ByteRound::Rejected
                 }
-                RejectKind::Transient => {
+                RejectGrade::TimeoutLane => {
                     debug!(
                         "Audit: {} returned Transient for byte challenge (timeout lane): {reason}",
                         ctx.challenged_peer
@@ -370,31 +393,27 @@ async fn dispatch_subtree_response(
             // in-window roots, so an honest node can always answer a pin it could
             // be challenged on. A responsive rejection is therefore graded on the
             // kind, with no grace:
-            match kind {
+            match grade_reject(kind) {
                 // Repudiating a pinned root the node published (`UnknownCommitment`)
-                // or an explicit protocol rejection is provable misbehaviour →
-                // confirmed failure (the trust penalty + credit revocation happen
+                // or an explicit protocol fault is provable misbehaviour →
+                // confirmed failure (trust penalty + credit revocation happen
                 // downstream in handle_subtree_failed_audit).
-                RejectKind::UnknownCommitment | RejectKind::Protocol => {
+                RejectGrade::Confirmed => {
                     warn!(
                         "Audit: peer {challenged_peer} rejected subtree challenge \
                          ({kind:?}; confirmed — grace removed): {reason}"
                     );
                     failed(challenged_peer, challenge_id, AuditFailureReason::Rejected)
                 }
-                // A transient local read error is not a provable cheat, but it is
-                // not graced-with-standing either: the responder retries reads
-                // first (see handle_subtree_challenge), so a `Transient` that
-                // still reaches the auditor means the node could not serve data it
-                // committed to. Route it to the non-response/timeout lane — no
-                // trust penalty, but revoke the holder credit for THIS pinned
-                // commitment so it gains no positive standing (a Transient-spammer
-                // profits nothing). Distinguishing malicious from genuine
-                // transient IO network-wide is the out-of-scope distributed
-                // non-response problem. Scoped to the commitment hash, not the
-                // whole peer, so a stale audit of an old commitment cannot erase
-                // credit re-earned for a newer one.
-                RejectKind::Transient => {
+                // A transient local read error (already retried by the responder)
+                // is not a provable cheat, but not graced-with-standing either:
+                // route it to the non-response/timeout lane — no trust penalty, but
+                // revoke the holder credit for THIS pinned commitment so it gains
+                // no positive standing (a Transient-spammer profits nothing).
+                // Scoped to the commitment hash, not the whole peer, so a stale
+                // audit of an old commitment cannot erase credit re-earned for a
+                // newer one.
+                RejectGrade::TimeoutLane => {
                     if let Some(credit) = ctx.credit {
                         credit
                             .recent_provers
@@ -1111,6 +1130,26 @@ mod tests {
     use crate::replication::commitment_state::BuiltCommitment;
     use crate::replication::subtree::{build_subtree_proof, nonced_leaf_hash, SubtreeLeaf};
     use saorsa_pqc::api::sig::ml_dsa_65;
+
+    /// ADR-0004 A1 grade flip (grace removed): a responsive `UnknownCommitment`
+    /// or `Protocol` rejection is a CONFIRMED failure; only `Transient` routes to
+    /// the timeout lane. This pure decision backs both audit rounds
+    /// (`Confirmed → AuditFailureReason::Rejected` / `ByteRound::Rejected`;
+    /// `TimeoutLane → AuditFailureReason::Timeout` + pinned-credit revocation).
+    #[test]
+    fn grade_reject_removes_grace_for_unknown_commitment() {
+        assert_eq!(
+            grade_reject(RejectKind::UnknownCommitment),
+            RejectGrade::Confirmed,
+            "an unanswerable pinned root is now a confirmed failure, not graced"
+        );
+        assert_eq!(grade_reject(RejectKind::Protocol), RejectGrade::Confirmed);
+        assert_eq!(
+            grade_reject(RejectKind::Transient),
+            RejectGrade::TimeoutLane,
+            "a transient read error routes to the timeout lane (no confirmed penalty)"
+        );
+    }
 
     // The two-round audit splits into SHIPPED pure functions exercised directly
     // here (no reimplementation that could drift):
