@@ -294,26 +294,31 @@ editing an Accepted ADR.
 
 ---
 
-## Amendment 1 (2026-07-02): a paid commitment must stay answerable until its quote can no longer be audited, and across restarts
+## Amendment 1 (2026-07-02): audit grace is removed — a responsive audit miss is always a confirmed failure
 
-The original decision graces an unanswerable quoted pin ("indistinguishable from
-an honest crash-restart; retention is in-memory by design"). That grace is the
-pay-then-shed hole: a node can be paid for a fat commitment, delete or rotate
-past it, and have the deterministic first audit graced as `UnknownCommitment`. We
-close it with two rules that make an unanswerable *paid* pin provable misbehaviour
-rather than an honest accident: **(1) answerability ≥ quote validity** — a
-commitment (its leaves and the bytes they commit) stays answerable for at least
-as long as a quote priced against it can still be paid and first-audited
-(`quote_ts + max-quote-age + max-first-audit-delay ≤ commitment answerability`,
-asserted at startup; the node also refuses to accept payment on an above-baseline
-quote older than that window); and **(2) retention survives restart** — retained
-commitments are persisted and reloaded, so answerability is exactly as durable as
-the stored data, and a restart is no longer an excuse.
+The original decision graces an unanswerable pin as "indistinguishable from an
+honest crash-restart (retention is in-memory by design)". That grace — for every
+`UnknownCommitment`, not just paid pins — is the quote-gaming loophole: a node can
+be paid/credited for a commitment it cannot prove and escape by answering
+`UnknownCommitment`/`Transient`. We remove grace entirely, made safe by
+guaranteeing an honest node is always answerable for any pin it can be challenged
+on: **(1) answerability survives restart** — the responder persists and reloads
+its commitment retention (the signed commitments, their key sets, and gossip
+deadlines), rebuilding each Merkle tree from the still-durable chunk bytes, so a
+restart is no longer an excuse (ML-DSA signatures are randomized, so it is the
+persisted *signed* commitment — never a re-signed rebuild — that preserves the
+exact pin); and **(2) the auditor only challenges in-window pins** — the
+gossip-lottery and downgrade paths pin the responder's own freshly-gossiped root
+by construction, and the monetized first-audit path screens a client-forwarded
+quote to the answerability window (assuming bounded clock skew).
 
-With both, an honest holder can always answer an in-window paid pin, so a
-**responsive** node that returns `UnknownCommitment` (or missing/wrong bytes) for
-one is a **confirmed audit failure**, not graced. (Only definitive repudiation is
-newly convicted; sustained *silence* remains ADR-0002's existing timeout lane, and
-gossip-only, aged, or non-paid pins keep the existing grace.) This supersedes the
-"unanswerable quoted pin is graced, never confirmed" rule for the paid-pin case;
-its regression test is inverted accordingly.
+With both, an honest responsive node can always answer a pin an auditor could
+form, so a **responsive** rejection is graded with no grace: `UnknownCommitment`
+(or missing / wrong bytes) is a **confirmed** failure; `Transient` (a local read
+error, retried first by the responder) routes to the non-response/timeout lane —
+no trust penalty, but the holder credit for the pin is revoked, so it gains no
+standing. Only genuine **silence** stays ADR-0002's timeout lane; deterministically
+attributing malicious silence/transient conditions network-wide is the
+(out-of-scope) distributed non-response problem. This supersedes the "unanswerable
+quoted pin is graced, never confirmed" rule and deletes `RejectKind::is_graced`;
+the regression tests are updated accordingly.

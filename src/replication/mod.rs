@@ -23,7 +23,6 @@ pub mod config;
 pub mod fresh;
 pub mod neighbor_sync;
 pub mod paid_list;
-pub mod paid_pin_audit;
 pub mod possession;
 pub mod protocol;
 pub mod pruning;
