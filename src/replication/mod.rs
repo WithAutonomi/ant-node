@@ -5207,6 +5207,7 @@ mod tests {
             .is_none(),
             "subtree class must retain the deployed cap of two"
         );
+        drop(subtree_guards);
     }
 
     #[test]
