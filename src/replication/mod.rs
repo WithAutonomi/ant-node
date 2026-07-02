@@ -179,6 +179,24 @@ const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
 /// 30 min dwarfs any realistic honest skew while leaving a wide audit window.
 const MONETIZED_AUDIT_SKEW_MARGIN: Duration = Duration::from_secs(30 * 60);
 
+/// ADR-0004 A1 (guardrail A): whether a monetized pin's SIGNED `quote_ts` lands
+/// inside the answerability window relative to `now`, so first-auditing it cannot
+/// false-convict once grace is removed. Fail-closed on BOTH ends (see
+/// [`MONETIZED_AUDIT_SKEW_MARGIN`]): a quote more than the skew margin in the
+/// future, or older than `GOSSIP_ANSWERABILITY_TTL - margin`, is out of window.
+/// All comparisons use `duration_since` (no `Duration` overflow).
+fn quote_within_audit_window(quote_ts: SystemTime, now: SystemTime) -> bool {
+    let too_future = quote_ts
+        .duration_since(now)
+        .is_ok_and(|ahead| ahead > MONETIZED_AUDIT_SKEW_MARGIN);
+    let audit_cutoff = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
+        .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN);
+    let too_old = now
+        .duration_since(quote_ts)
+        .is_ok_and(|age| age >= audit_cutoff);
+    !(too_future || too_old)
+}
+
 /// Minimum interval between commitment signature verifications for a
 /// single peer (v10/v12 §2 step 3 + §11 `DoS`).
 ///
@@ -882,25 +900,13 @@ impl ReplicationEngine {
                         continue;
                     }
                     // ADR-0004 A1 (guardrail A): only first-audit a pin whose SIGNED
-                    // quote_ts lands inside the answerability window, fail-closed on
-                    // BOTH ends (see MONETIZED_AUDIT_SKEW_MARGIN). With grace removed,
-                    // auditing an out-of-window pin the responder may have aged out
-                    // would false-convict, so a stale OR far-future/skewed quote is
-                    // skipped. Legit first-audits fire moments after payment
-                    // (quote_ts ≈ now); a skipped pin can still be gossip-lottery
-                    // audited. All comparisons use duration_since (no overflow).
-                    let now = SystemTime::now();
-                    let too_future = event
-                        .quote_ts
-                        .duration_since(now)
-                        .is_ok_and(|ahead| ahead > MONETIZED_AUDIT_SKEW_MARGIN);
-                    let audit_cutoff =
-                        crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-                            .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN);
-                    let too_old = now
-                        .duration_since(event.quote_ts)
-                        .is_ok_and(|age| age >= audit_cutoff);
-                    if too_future || too_old {
+                    // quote_ts lands inside the answerability window. With grace
+                    // removed, auditing an out-of-window pin the responder may have
+                    // aged out would false-convict, so a stale OR far-future/skewed
+                    // quote is skipped. Legit first-audits fire moments after
+                    // payment (quote_ts ≈ now); a skipped pin can still be
+                    // gossip-lottery audited.
+                    if !quote_within_audit_window(event.quote_ts, SystemTime::now()) {
                         debug!(
                             "First audit skipped for {peer}: quote_ts outside the answerability window"
                         );
@@ -5052,6 +5058,7 @@ mod tests {
         apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
         audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
         first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
+        quote_within_audit_window, MONETIZED_AUDIT_SKEW_MARGIN,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
@@ -5060,6 +5067,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use std::time::Instant;
+    use std::time::SystemTime;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -5087,6 +5095,35 @@ mod tests {
             paid_notify_payment_context(),
             VerificationContext::PaidListAdmission
         );
+    }
+
+    /// ADR-0004 A1 (guardrail A): the monetized first-audit only fires for a
+    /// signed quote inside the answerability window, fail-closed on BOTH ends so a
+    /// stale or future/skewed client-forwarded quote cannot frame an honest node.
+    #[test]
+    fn monetized_quote_audit_window_fails_closed_both_ends() {
+        use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
+        let now = SystemTime::now();
+        // Fresh (just quoted) and small future/past skew -> audited.
+        assert!(quote_within_audit_window(now, now));
+        assert!(quote_within_audit_window(
+            now + Duration::from_secs(60),
+            now
+        ));
+        assert!(quote_within_audit_window(
+            now - Duration::from_secs(3600),
+            now
+        ));
+        // Far future (badly-skewed / replayed) -> skipped.
+        assert!(!quote_within_audit_window(
+            now + MONETIZED_AUDIT_SKEW_MARGIN + Duration::from_secs(60),
+            now
+        ));
+        // Older than the window -> skipped (pin may have aged out).
+        assert!(!quote_within_audit_window(
+            now - GOSSIP_ANSWERABILITY_TTL,
+            now
+        ));
     }
 
     #[test]
