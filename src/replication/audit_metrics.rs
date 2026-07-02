@@ -50,6 +50,7 @@ static DIGEST_DISPATCH_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static DIGEST_DISPATCH_LATENCY_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
 static DIGEST_DISPATCH_LATENCY_MAX_MS: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(feature = "logging")]
 impl AuditType {
     /// Stable structured-log label.
     #[must_use]
@@ -73,6 +74,7 @@ impl AuditFailureClass {
     }
 }
 
+#[cfg(feature = "logging")]
 impl AuditResponderClass {
     /// Stable structured-log label.
     #[must_use]
