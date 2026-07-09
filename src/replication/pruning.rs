@@ -958,10 +958,10 @@ async fn collect_record_prune_proofs(
 
     let report_state = PruneAuditReportState::default();
     let mut requests = stream::iter(build_peer_audit_challenges(candidates))
-        .map(|(peer, key)| {
-            peer_proves_record(
+        .map(|(peer, keys)| {
+            peer_proves_records(
                 peer,
-                key,
+                keys,
                 storage,
                 p2p_node,
                 config,
@@ -972,8 +972,8 @@ async fn collect_record_prune_proofs(
         .buffer_unordered(MAX_CONCURRENT_PRUNE_AUDIT_CHALLENGES);
 
     let mut present_by_key = HashMap::<XorName, HashSet<PeerId>>::new();
-    while let Some(proof) = requests.next().await {
-        if let Some((peer, key)) = proof {
+    while let Some(proofs) = requests.next().await {
+        for (peer, key) in proofs {
             present_by_key.entry(key).or_default().insert(peer);
         }
     }
@@ -1061,14 +1061,22 @@ async fn revalidated_record_prune_keys(
     (keys_to_delete, cleared)
 }
 
-fn build_peer_audit_challenges(candidates: &[RecordPruneCandidate]) -> Vec<(PeerId, XorName)> {
-    let mut challenges = Vec::new();
+fn build_peer_audit_challenges(candidates: &[RecordPruneCandidate]) -> Vec<(PeerId, Vec<XorName>)> {
+    let mut keys_by_peer: HashMap<PeerId, Vec<XorName>> = HashMap::new();
     for candidate in candidates {
         for peer in &candidate.target_peers {
-            challenges.push((*peer, candidate.key));
+            keys_by_peer.entry(*peer).or_default().push(candidate.key);
         }
     }
-    challenges
+
+    keys_by_peer
+        .into_iter()
+        .map(|(peer, mut keys)| {
+            keys.sort_unstable();
+            keys.dedup();
+            (peer, keys)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1134,52 +1142,89 @@ fn target_peers_reported_present(
     proven >= proofs_needed
 }
 
-/// Challenge a peer to prove it holds the exact record bytes for `key`.
-/// `None` means the peer failed to provide usable proof.
-async fn peer_proves_record(
+/// Challenge a peer to prove it holds the exact record bytes for one or more keys.
+///
+/// Batching by peer prevents a prune pass from firing many simultaneous one-key
+/// `AuditChallenge`s at the same target. The responder already supports
+/// multi-key challenges, so we preserve per-key proof accounting while reducing
+/// per-peer request bursts.
+async fn peer_proves_records(
     peer: PeerId,
-    key: XorName,
+    keys: Vec<XorName>,
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     report_state: &PruneAuditReportState,
-) -> Option<(PeerId, XorName)> {
-    let local_bytes = local_record_bytes(&key, storage).await?;
+) -> Vec<(PeerId, XorName)> {
+    let mut challenge_material = Vec::new();
+    for key in keys {
+        if let Some(local_bytes) = local_record_bytes(&key, storage).await {
+            challenge_material.push((key, local_bytes));
+        }
+    }
+    if challenge_material.is_empty() {
+        return Vec::new();
+    }
 
+    let challenge_keys: Vec<XorName> = challenge_material.iter().map(|(key, _)| *key).collect();
     let (challenge_id, nonce) = {
         let mut rng = rand::thread_rng();
         (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
     };
-    let (encoded, key_count) = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
+    let Some((encoded, key_count)) =
+        encode_prune_audit_challenge(&peer, &challenge_keys, challenge_id, nonce)
+    else {
+        return Vec::new();
+    };
     let Some(decoded) =
-        send_prune_audit_challenge(&peer, &key, encoded, key_count, p2p_node, config).await
+        send_prune_audit_challenge(&peer, encoded, key_count, p2p_node, config).await
     else {
         // No decoded response means a timeout or malformed reply. Prune
         // confirmation reuses `AuditChallenge` semantics, so this is an immediate
-        // audit failure just like a decoded bad proof below.
-        report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
-        return None;
+        // audit failure just like a decoded bad proof below. Keep the historical
+        // one-report-per-peer-per-pass guard by attempting each key against the
+        // shared `report_state`.
+        for key in &challenge_keys {
+            report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await;
+        }
+        return Vec::new();
     };
 
-    let status =
-        prune_audit_response_status(decoded, challenge_id, &peer, &key, &nonce, &local_bytes);
-    if prune_audit_response_clears_bootstrap_claim(status) {
+    let statuses =
+        prune_audit_response_statuses(decoded, challenge_id, &peer, &nonce, &challenge_material);
+    let mut clear_bootstrap_claim = false;
+    let mut proven = Vec::new();
+
+    for (key, status) in statuses {
+        if prune_audit_response_clears_bootstrap_claim(status) {
+            clear_bootstrap_claim = true;
+        }
+
+        match status {
+            PruneAuditStatus::Proven => proven.push((peer, key)),
+            PruneAuditStatus::Bootstrapping => {
+                report_prune_bootstrap_claim(
+                    &peer,
+                    &key,
+                    p2p_node,
+                    config,
+                    sync_state,
+                    report_state,
+                )
+                .await;
+            }
+            PruneAuditStatus::Failed => {
+                report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+            }
+        }
+    }
+
+    if clear_bootstrap_claim {
         clear_prune_bootstrap_claim(&peer, sync_state).await;
     }
 
-    match status {
-        PruneAuditStatus::Proven => Some((peer, key)),
-        PruneAuditStatus::Bootstrapping => {
-            report_prune_bootstrap_claim(&peer, &key, p2p_node, config, sync_state, report_state)
-                .await;
-            None
-        }
-        PruneAuditStatus::Failed => {
-            report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
-            None
-        }
-    }
+    proven
 }
 
 fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool {
@@ -1190,18 +1235,20 @@ fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool
 // challenges, which reuse the same wire message) lives in
 // `super::handle_audit_challenge_msg` -> `audit::handle_audit_challenge`, the
 // responsible-chunk audit responder. No separate prune-only responder is needed.
-
 fn encode_prune_audit_challenge(
     peer: &PeerId,
-    key: XorName,
+    keys: &[XorName],
     challenge_id: u64,
     nonce: [u8; 32],
 ) -> Option<(Vec<u8>, usize)> {
+    if keys.is_empty() {
+        return None;
+    }
     let challenge = AuditChallenge {
         challenge_id,
         nonce,
         challenged_peer_id: *peer.as_bytes(),
-        keys: vec![key],
+        keys: keys.to_vec(),
     };
     let key_count = challenge.keys.len();
     let msg = ReplicationMessage {
@@ -1212,8 +1259,8 @@ fn encode_prune_audit_challenge(
         Ok(data) => data,
         Err(e) => {
             warn!(
-                "Failed to encode prune audit challenge for {} against {peer}: {e}",
-                hex::encode(key),
+                "Failed to encode prune audit challenge with {} keys against {peer}: {e}",
+                keys.len(),
             );
             return None;
         }
@@ -1223,7 +1270,6 @@ fn encode_prune_audit_challenge(
 
 async fn send_prune_audit_challenge(
     peer: &PeerId,
-    key: &XorName,
     encoded: Vec<u8>,
     key_count: usize,
     p2p_node: &Arc<P2PNode>,
@@ -1236,10 +1282,7 @@ async fn send_prune_audit_challenge(
     {
         Ok(response) => response,
         Err(e) => {
-            debug!(
-                "Prune audit challenge for {} against {peer} failed: {e}",
-                hex::encode(key)
-            );
+            debug!("Prune audit challenge with {key_count} keys against {peer} failed: {e}");
             return None;
         }
     };
@@ -1255,59 +1298,77 @@ async fn send_prune_audit_challenge(
     Some(decoded)
 }
 
-fn prune_audit_response_status(
+fn prune_audit_response_statuses(
     decoded: ReplicationMessage,
     challenge_id: u64,
     peer: &PeerId,
-    key: &XorName,
     nonce: &[u8; 32],
-    local_bytes: &[u8],
-) -> PruneAuditStatus {
+    challenge_material: &[(XorName, Vec<u8>)],
+) -> Vec<(XorName, PruneAuditStatus)> {
+    let failed_all = |reason: &str| {
+        warn!(
+            "Prune audit proof batch from {peer} failed for {} keys: {reason}",
+            challenge_material.len()
+        );
+        challenge_material
+            .iter()
+            .map(|(key, _)| (*key, PruneAuditStatus::Failed))
+            .collect()
+    };
+
     match decoded.body {
         ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
             challenge_id: resp_id,
             digests,
         }) => {
             if resp_id != challenge_id {
-                warn!("Prune audit challenge ID mismatch from {peer}");
-                return PruneAuditStatus::Failed;
+                return failed_all("challenge id mismatch");
             }
-            let [digest] = digests.as_slice() else {
-                warn!(
-                    "Prune audit response from {peer} returned {} digests for one challenged key",
+            if digests.len() != challenge_material.len() {
+                return failed_all(&format!(
+                    "returned {} digests for {} challenged keys",
                     digests.len(),
-                );
-                return PruneAuditStatus::Failed;
-            };
-            if *digest == ABSENT_KEY_DIGEST {
-                warn!(
-                    "Prune audit proof from {peer} failed for {}: peer reports key absent",
-                    hex::encode(key)
-                );
-                return PruneAuditStatus::Failed;
+                    challenge_material.len()
+                ));
             }
-            if audit_digest_proves_key(peer, key, nonce, local_bytes, digest) {
-                PruneAuditStatus::Proven
-            } else {
-                warn!(
-                    "Prune audit proof from {peer} failed for {}: digest mismatch",
-                    hex::encode(key)
-                );
-                PruneAuditStatus::Failed
-            }
+
+            challenge_material
+                .iter()
+                .zip(digests.iter())
+                .map(|((key, local_bytes), digest)| {
+                    if *digest == ABSENT_KEY_DIGEST {
+                        warn!(
+                            "Prune audit proof from {peer} failed for {}: peer reports key absent",
+                            hex::encode(key)
+                        );
+                        return (*key, PruneAuditStatus::Failed);
+                    }
+                    if audit_digest_proves_key(peer, key, nonce, local_bytes, digest) {
+                        (*key, PruneAuditStatus::Proven)
+                    } else {
+                        warn!(
+                            "Prune audit proof from {peer} failed for {}: digest mismatch",
+                            hex::encode(key)
+                        );
+                        (*key, PruneAuditStatus::Failed)
+                    }
+                })
+                .collect()
         }
         ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
             challenge_id: resp_id,
         }) => {
             if resp_id == challenge_id {
                 warn!(
-                    "Prune audit proof for {} blocked by bootstrap claim from {peer}",
-                    hex::encode(key)
+                    "Prune audit proof batch for {} keys blocked by bootstrap claim from {peer}",
+                    challenge_material.len()
                 );
-                PruneAuditStatus::Bootstrapping
+                challenge_material
+                    .iter()
+                    .map(|(key, _)| (*key, PruneAuditStatus::Bootstrapping))
+                    .collect()
             } else {
-                warn!("Prune audit challenge ID mismatch on Bootstrapping from {peer}");
-                PruneAuditStatus::Failed
+                failed_all("challenge id mismatch on Bootstrapping")
             }
         }
         ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
@@ -1316,18 +1377,18 @@ fn prune_audit_response_status(
         }) => {
             if resp_id == challenge_id {
                 warn!(
-                    "Prune audit proof for {} rejected by {peer}: {reason}",
-                    hex::encode(key)
+                    "Prune audit proof batch for {} keys rejected by {peer}: {reason}",
+                    challenge_material.len()
                 );
             } else {
                 warn!("Prune audit challenge ID mismatch on Rejected from {peer}");
             }
-            PruneAuditStatus::Failed
+            challenge_material
+                .iter()
+                .map(|(key, _)| (*key, PruneAuditStatus::Failed))
+                .collect()
         }
-        _ => {
-            warn!("Unexpected prune audit response type from {peer}");
-            PruneAuditStatus::Failed
-        }
+        _ => failed_all("unexpected response type"),
     }
 }
 
@@ -1510,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_audit_challenges_are_one_per_candidate_peer() {
+    fn prune_audit_challenges_are_batched_by_target_peer() {
         let peer_a = peer_id_from_byte(1);
         let peer_b = peer_id_from_byte(2);
         let key_a = key_from_byte(0xA);
@@ -1521,11 +1582,48 @@ mod tests {
         ];
 
         let mut challenges = build_peer_audit_challenges(&candidates);
-        challenges.sort_unstable_by_key(|(peer, key)| (*peer.as_bytes(), *key));
+        for (_, keys) in &mut challenges {
+            keys.sort_unstable();
+        }
+        challenges.sort_unstable_by_key(|(peer, keys)| (*peer.as_bytes(), keys.clone()));
 
-        let mut expected = vec![(peer_a, key_a), (peer_b, key_a), (peer_b, key_b)];
-        expected.sort_unstable_by_key(|(peer, key)| (*peer.as_bytes(), *key));
+        let mut expected = vec![(peer_a, vec![key_a]), (peer_b, vec![key_a, key_b])];
+        expected.sort_unstable_by_key(|(peer, keys)| (*peer.as_bytes(), keys.clone()));
         assert_eq!(challenges, expected);
+    }
+
+    #[test]
+    fn prune_audit_batched_digest_response_is_evaluated_per_key() {
+        let peer = peer_id_from_byte(7);
+        let key_a = key_from_byte(0xA);
+        let key_b = key_from_byte(0xB);
+        let nonce = [0x7A; 32];
+        let bytes_a = b"record-a".to_vec();
+        let bytes_b = b"record-b".to_vec();
+        let digest_a = compute_audit_digest(&nonce, peer.as_bytes(), &key_a, &bytes_a);
+        let msg = ReplicationMessage {
+            request_id: 42,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+                challenge_id: 42,
+                digests: vec![digest_a, ABSENT_KEY_DIGEST],
+            }),
+        };
+
+        let statuses = prune_audit_response_statuses(
+            msg,
+            42,
+            &peer,
+            &nonce,
+            &[(key_a, bytes_a), (key_b, bytes_b)],
+        );
+
+        assert_eq!(
+            statuses,
+            vec![
+                (key_a, PruneAuditStatus::Proven),
+                (key_b, PruneAuditStatus::Failed),
+            ]
+        );
     }
 
     #[test]
