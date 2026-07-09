@@ -55,20 +55,9 @@ pub fn unix_now_secs() -> u64 {
 }
 
 /// Length of one tally day bucket in seconds.
-///
-/// Defaults to a wall-clock day; the `ADR5_DAY_SECS` environment variable
-/// shortens it for tests and local testnets (time compression: a "week" of
-/// dues in minutes). Read once.
+#[must_use]
 pub fn tally_day_secs() -> u64 {
-    use std::sync::OnceLock;
-    static DAY_SECS: OnceLock<u64> = OnceLock::new();
-    *DAY_SECS.get_or_init(|| {
-        std::env::var("ADR5_DAY_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(86_400)
-    })
+    86_400
 }
 
 /// One day bucket of outcomes for one observed peer.

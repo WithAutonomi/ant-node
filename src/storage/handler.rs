@@ -308,18 +308,6 @@ impl AntProtocol {
         let addr_hex = hex::encode(address);
         debug!("Handling PUT request for {addr_hex}");
 
-        // ADR-0005 run-3 fat-pin cheater (test only): a freeloader refuses new
-        // storage at the REQUEST boundary — before the chunk reaches the store
-        // — so no re-supply rebuilds its audit passes. A request already
-        // admitted before the flag flip may still land (bounded stragglers);
-        // that does not corrupt the measurement (see the cheat branch in
-        // replication::mod). Inert in production (flag only set by env-gated cheat).
-        if crate::replication::adr5_refuses_new_storage() {
-            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
-                "node in ADR5 test cheat mode: refusing storage".to_string(),
-            ));
-        }
-
         // 1. Validate chunk size
         if request.content.len() > MAX_CHUNK_SIZE {
             return ChunkPutResponse::Error(ProtocolError::ChunkTooLarge {

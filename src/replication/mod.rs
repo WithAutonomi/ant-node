@@ -160,84 +160,9 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// "rotated past" case.
 const COMMITMENT_ROTATION_INTERVAL_SECS: u64 = 3600;
 
-/// ADR-0005 run-3 pure-freeloader flag (test only): set when the fat-pin
-/// cheat fires, so the node refuses ALL new storage afterwards (no re-supply
-/// can rebuild its audit passes). Process-global, inert in production because
-/// nothing sets it unless `ADR5_TEST_CHEAT_DELETE_AFTER_SECS` triggers.
-static ADR5_CHEATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether this node has entered fat-pin cheat mode (test only). Checked on
-/// the storage-admission path so a cheater stays a pure freeloader.
-#[must_use]
-pub fn adr5_is_cheating() -> bool {
-    ADR5_CHEATING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// ADR-0005 idle-honest flag (test only): set when the idle seam fires. An
-/// idle node KEEPS all its earned data (so it keeps passing audits) but
-/// accepts no NEW storage — the quiescent-honest case. Inert in production.
-static ADR5_IDLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether this node has gone idle-honest (test only): refuses new storage but
-/// serves everything it already holds, so it stays auditable and eligible.
-#[must_use]
-pub fn adr5_is_idle() -> bool {
-    ADR5_IDLE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Whether this node refuses new storage (test only).
-///
-/// True for a fat-pin freeloader (which also deleted its data) or an
-/// idle-honest node (which keeps it). One predicate for the three
-/// storage-admission boundaries. Inert in production.
-#[must_use]
-pub fn adr5_refuses_new_storage() -> bool {
-    adr5_is_cheating() || adr5_is_idle()
-}
-
-/// ADR-0005 idle-honest delay (test only): seconds of uptime after which the
-/// node stops accepting new storage (but keeps serving what it has). `None` in
-/// production (env unset).
-fn adr5_test_idle_after() -> Option<std::time::Duration> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    (*V.get_or_init(|| {
-        std::env::var("ADR5_TEST_IDLE_AFTER_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    }))
-    .map(std::time::Duration::from_secs)
-}
-
-/// ADR-0005 run-2 fat-pin cheater delay (test only): seconds of uptime after
-/// which the rotation loop deletes all chunks and freezes the fat commitment.
-/// `None` in production (env unset) — the seam is inert.
-fn adr5_test_cheat_delete_after() -> Option<std::time::Duration> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    (*V.get_or_init(|| {
-        std::env::var("ADR5_TEST_CHEAT_DELETE_AFTER_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-    }))
-    .map(std::time::Duration::from_secs)
-}
-
-/// Effective rotation interval: production hourly, or the ADR-0005 testnet
-/// override (`ADR5_TEST_ROTATION_SECS`) so freshly-stored chunks enter a
-/// commitment — and therefore the audit/tally lane — within compressed days.
+/// Effective rotation interval.
 fn commitment_rotation_interval() -> std::time::Duration {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    std::time::Duration::from_secs(*V.get_or_init(|| {
-        std::env::var("ADR5_TEST_ROTATION_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(COMMITMENT_ROTATION_INTERVAL_SECS)
-    }))
+    std::time::Duration::from_secs(COMMITMENT_ROTATION_INTERVAL_SECS)
 }
 
 /// How often the responder retention snapshot is flushed to disk (ADR-0004 A1).
@@ -288,20 +213,9 @@ fn quote_within_audit_window(quote_ts: SystemTime, now: SystemTime) -> bool {
 /// (the 10-20 min neighbor-sync round on each peer).
 const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
 
-/// The effective per-peer sig-verify interval: production value above, or the
-/// compressed neighbor-sync interval when the ADR-0005 testnet knob is set —
-/// otherwise the 60 s cap would silently throttle the compressed gossip lane
-/// back to ~1 valid ingest/min/pair and starve the tally cadence.
+/// The effective per-peer sig-verify interval.
 fn commitment_sig_verify_min_interval() -> Duration {
-    use std::sync::OnceLock;
-    static V: OnceLock<Duration> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ADR5_TEST_NEIGHBOR_SYNC_SECS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .map_or(COMMITMENT_SIG_VERIFY_MIN_INTERVAL, Duration::from_secs)
-    })
+    COMMITMENT_SIG_VERIFY_MIN_INTERVAL
 }
 
 /// Hard cap on the size of `last_commitment_by_peer`.
@@ -463,6 +377,9 @@ pub struct ReplicationEngine {
     /// lock because the quote handler reads it synchronously; every critical
     /// section is short and never held across an await.
     audit_tally: Arc<std::sync::RwLock<audit_tally::AuditTally>>,
+    /// Wakes the persistence loop for negative audit-tally evidence that must
+    /// not wait for the periodic retention flush cadence.
+    audit_tally_persist_trigger: Arc<Notify>,
     /// Path to the persisted tally snapshot (`{root_dir}/audit_tally.bin`),
     /// written on change alongside the retention snapshot.
     audit_tally_path: PathBuf,
@@ -537,6 +454,7 @@ impl ReplicationEngine {
             monetized_pin_tx,
             monetized_pin_rx: Some(monetized_pin_rx),
             audit_tally: Arc::new(std::sync::RwLock::new(audit_tally::AuditTally::default())),
+            audit_tally_persist_trigger: Arc::new(Notify::new()),
             audit_tally_path: root_dir.join("audit_tally.bin"),
             shutdown,
             task_handles: Vec::new(),
@@ -932,6 +850,7 @@ impl ReplicationEngine {
             sync_state: Arc::clone(&self.sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
             audit_tally: Arc::clone(&self.audit_tally),
+            audit_tally_persist_trigger: Arc::clone(&self.audit_tally_persist_trigger),
         };
         let shutdown = self.shutdown.clone();
 
@@ -943,7 +862,7 @@ impl ReplicationEngine {
             let mut first_audited: LruCache<[u8; 32], ()> = LruCache::new(
                 NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
             );
-            // PERSISTENT pending queue: the most-recently-monetized pin per peer
+            // MEMORY-ONLY pending queue: the most-recently-monetized pin per peer
             // that has NOT yet been first-audited. A pin stays here until it is
             // ACTUALLY first-audited (enters `first_audited`) — never removed for
             // any weaker reason (e.g. a cooldown stamp), so an unaudited monetized
@@ -953,6 +872,10 @@ impl ReplicationEngine {
             // is tiny; the LRU is a pure DoS backstop that, only under an absurd
             // flood, evicts the LEAST-RECENTLY-MONETIZED peer (the one most likely
             // already superseded) — never the newest.
+            // TODO(ADR-0005 durability): Persist this queue, plus enough
+            // first-audit launch/dedup state to avoid re-auditing completed pins,
+            // so a restart cannot forget a paid pin before its deterministic
+            // first audit.
             let mut pending: LruCache<PeerId, MonetizedPinEvent> = LruCache::new(
                 NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
             );
@@ -1068,6 +991,7 @@ impl ReplicationEngine {
                             &trigger.recent_provers,
                             &trigger.config,
                             &trigger.audit_tally,
+                            &trigger.audit_tally_persist_trigger,
                         )
                         .await;
                         // ADR-0005: this is the MONETIZED first-audit lane. A
@@ -1086,11 +1010,16 @@ impl ReplicationEngine {
                                 },
                         } = &result
                         {
-                            if let Ok(mut tally) = trigger.audit_tally.write() {
-                                tally.record_unanswered_monetized_challenge(
-                                    *challenged_peer,
-                                    audit_tally::unix_now_secs(),
-                                );
+                            let recorded_fence =
+                                trigger.audit_tally.write().is_ok_and(|mut tally| {
+                                    tally.record_unanswered_monetized_challenge(
+                                        *challenged_peer,
+                                        audit_tally::unix_now_secs(),
+                                    );
+                                    true
+                                });
+                            if recorded_fence {
+                                trigger.audit_tally_persist_trigger.notify_one();
                             }
                         }
                     });
@@ -1125,6 +1054,7 @@ impl ReplicationEngine {
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_on_gossip_cooldown = Arc::clone(&self.audit_on_gossip_cooldown);
         let audit_tally = Arc::clone(&self.audit_tally);
+        let audit_tally_persist_trigger = Arc::clone(&self.audit_tally_persist_trigger);
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
@@ -1138,6 +1068,7 @@ impl ReplicationEngine {
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
             audit_tally: Arc::clone(&audit_tally),
+            audit_tally_persist_trigger: Arc::clone(&audit_tally_persist_trigger),
         };
 
         let handle = tokio::spawn(async move {
@@ -1306,6 +1237,7 @@ impl ReplicationEngine {
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
             audit_tally: Arc::clone(&self.audit_tally),
+            audit_tally_persist_trigger: Arc::clone(&self.audit_tally_persist_trigger),
         };
 
         let handle = tokio::spawn(async move {
@@ -1506,80 +1438,10 @@ impl ReplicationEngine {
             } else {
                 sync_trigger.notify_one();
             }
-            // ADR-0005 run-2 fat-pin cheater seam (test only). When
-            // `ADR5_TEST_CHEAT_DELETE_AFTER_SECS` is set, after that uptime the
-            // node DELETES all its chunks once and then FREEZES its commitment
-            // (skips every rotation) — so it keeps quoting and answering the
-            // pin it can no longer serve. Its next byte challenge is a
-            // confirmed failure -> deterministic conviction, exactly the
-            // delete-and-keep-collecting attacker. No effect without the env.
-            let cheat_after = adr5_test_cheat_delete_after();
-            // ADR-0005 idle-honest seam (test only): after `ADR5_TEST_IDLE_AFTER_SECS`
-            // the node stops accepting NEW storage but keeps everything it has,
-            // so it stays auditable and should stay eligible — the quiescent
-            // honest case. No delete, no freeze; rotation continues normally.
-            let idle_after = adr5_test_idle_after();
-            let started = tokio::time::Instant::now();
-            let mut cheating = false;
-            let mut idle = false;
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     () = tokio::time::sleep(commitment_rotation_interval()) => {
-                        if let Some(after) = idle_after {
-                            if !idle && started.elapsed() >= after {
-                                ADR5_IDLE.store(true, std::sync::atomic::Ordering::Relaxed);
-                                warn!("ADR5 TEST IDLE: node going quiescent (keeps data, refuses new storage)");
-                                idle = true;
-                            }
-                        }
-                        if let Some(after) = cheat_after {
-                            if !cheating && started.elapsed() >= after {
-                                // Become a pure freeloader: the flag gates every
-                                // storage-REQUEST boundary (PUT handler,
-                                // replication offer, fetch/repair worker), so no
-                                // re-supply can rebuild audit passes. Set the
-                                // flag FIRST, then purge all keys once. A store
-                                // already admitted before the flag flip can leave
-                                // a few stragglers, but the subtree audit's round
-                                // 1 reads EVERY leaf of a >= ceil(sqrt(N)) subtree
-                                // — one absent leaf fails it confirmed — so fewer
-                                // than ceil(sqrt(N)) survivors cannot pass any
-                                // audit, and the measurement is sound (a delete
-                                // error or a residual reaching ceil(sqrt(N))
-                                // invalidates the run, guarded by the runner).
-                                ADR5_CHEATING
-                                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                                let mut deleted = 0usize;
-                                let mut delete_errs = 0usize;
-                                match storage.all_keys().await {
-                                    Ok(keys) => {
-                                        for k in &keys {
-                                            match storage.delete(k).await {
-                                                Ok(_) => deleted += 1,
-                                                Err(e) => {
-                                                    delete_errs += 1;
-                                                    warn!("ADR5 TEST CHEAT: delete failed: {e}");
-                                                }
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        delete_errs += 1;
-                                        warn!("ADR5 TEST CHEAT: all_keys failed: {e}");
-                                    }
-                                }
-                                warn!(
-                                    "ADR5 TEST CHEAT: purged {deleted} chunk(s) ({delete_errs} \
-                                     error(s)), freezing fat commitment, refusing all new storage"
-                                );
-                                cheating = true;
-                            }
-                            if cheating {
-                                // Frozen: keep the fat pin, never rebuild.
-                                continue;
-                            }
-                        }
                         if let Err(e) = rebuild_and_rotate_commitment(
                             &storage,
                             &identity,
@@ -1608,14 +1470,16 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
-    /// ADR-0004 A1: periodically flush the responder retention snapshot to disk
-    /// (write-on-change) so answerability — including gossip-stamp refreshes and
-    /// rotations — survives a restart. Flushes once immediately, then every
-    /// `RETENTION_PERSIST_INTERVAL_SECS`, and once more on shutdown.
+    /// ADR-0004 A1 / ADR-0005: flush responder retention and the observer audit
+    /// tally to disk with write-on-change snapshots. Both flush once
+    /// immediately, then every `RETENTION_PERSIST_INTERVAL_SECS`, and once more
+    /// on shutdown; negative audit-tally evidence also wakes an immediate tally
+    /// flush.
     fn start_retention_persist_loop(&mut self) {
         let commitment_state = Arc::clone(&self.commitment_state);
         let retention_path = self.retention_path.clone();
         let audit_tally = Arc::clone(&self.audit_tally);
+        let audit_tally_persist_trigger = Arc::clone(&self.audit_tally_persist_trigger);
         let audit_tally_path = self.audit_tally_path.clone();
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
@@ -1644,9 +1508,16 @@ impl ReplicationEngine {
                         )
                         .await;
                     }
+                    () = audit_tally_persist_trigger.notified() => {
+                        persist_audit_tally_if_changed(
+                            &audit_tally, &audit_tally_path, &mut last_tally,
+                        )
+                        .await;
+                    }
                 }
             }
             debug!("Commitment retention persist loop shut down");
+            debug!("Audit tally persist loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -2703,12 +2574,6 @@ async fn handle_fresh_offer(
             .await;
             return Ok(());
         }
-    }
-
-    // ADR-0005 (test only): a fat-pin freeloader OR an idle-honest node
-    // refuses replicated offers at the request boundary. Inert in production.
-    if adr5_refuses_new_storage() {
-        return Ok(());
     }
 
     // Rule 6: add to PaidForList.
@@ -4199,15 +4064,6 @@ async fn execute_single_fetch(
                         };
                     }
 
-                    // ADR-0005 (test only): a freeloader or idle-honest node does
-                    // not store fetched/repaired records either. Inert in prod.
-                    if adr5_refuses_new_storage() {
-                        return FetchOutcome {
-                            key,
-                            result: FetchResult::SourceFailed,
-                        };
-                    }
-
                     if let Err(e) = storage.put(&resp_key, &data).await {
                         warn!(
                             "Failed to store fetched record {}: {e}",
@@ -4321,6 +4177,7 @@ fn first_failed_key_label(confirmed_failed_keys: &[XorName]) -> String {
 /// legitimately time out on slow or loaded honest peers, so it never touches the
 /// responsible-chunk audit path or its timeout accounting. Confirmed subtree
 /// failures still penalise immediately and revoke holder credit.
+#[allow(clippy::too_many_arguments)]
 async fn handle_subtree_failed_audit(
     challenged_peer: &PeerId,
     confirmed_failed_key_count: usize,
@@ -4329,6 +4186,7 @@ async fn handle_subtree_failed_audit(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     recent_provers: &Arc<RwLock<RecentProvers>>,
     audit_tally: &std::sync::RwLock<audit_tally::AuditTally>,
+    audit_tally_persist_trigger: &Notify,
 ) {
     if matches!(reason, AuditFailureReason::Timeout) {
         debug!(
@@ -4340,8 +4198,12 @@ async fn handle_subtree_failed_audit(
 
     // ADR-0005: a confirmed subtree failure is a deterministic conviction —
     // the peer's tally row is zeroed and its dues start over.
-    if let Ok(mut tally) = audit_tally.write() {
+    let recorded_conviction = audit_tally.write().is_ok_and(|mut tally| {
         tally.record_conviction(*challenged_peer, audit_tally::unix_now_secs());
+        true
+    });
+    if recorded_conviction {
+        audit_tally_persist_trigger.notify_one();
     }
 
     // The caller already logged the rich failure line with reason + per-category
@@ -4371,6 +4233,7 @@ async fn handle_subtree_audit_result(
     recent_provers: &Arc<RwLock<RecentProvers>>,
     config: &ReplicationConfig,
     audit_tally: &std::sync::RwLock<audit_tally::AuditTally>,
+    audit_tally_persist_trigger: &Notify,
 ) {
     match result {
         AuditTickResult::Passed {
@@ -4429,6 +4292,7 @@ async fn handle_subtree_audit_result(
                     sync_state,
                     recent_provers,
                     audit_tally,
+                    audit_tally_persist_trigger,
                 )
                 .await;
             }
@@ -4641,6 +4505,8 @@ struct GossipAuditTrigger {
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// ADR-0005: subtree-audit outcomes land here as tally facts.
     audit_tally: Arc<std::sync::RwLock<audit_tally::AuditTally>>,
+    /// Wakes the audit-tally persist loop after negative evidence.
+    audit_tally_persist_trigger: Arc<Notify>,
 }
 
 /// What a gossip ingest yields for the audit trigger: the commitment hash to
@@ -4775,6 +4641,7 @@ async fn maybe_trigger_gossip_audit(
             &trigger.recent_provers,
             &trigger.config,
             &trigger.audit_tally,
+            &trigger.audit_tally_persist_trigger,
         )
         .await;
     });
@@ -5160,7 +5027,7 @@ async fn persist_audit_tally_if_changed(
     if last.as_deref() == Some(bytes.as_slice()) {
         return;
     }
-    if write_retention_atomic(path, bytes.clone()).await {
+    if write_retention_atomic(path, bytes.clone(), "Audit tally").await {
         *last = Some(bytes);
     }
 }
@@ -5182,16 +5049,16 @@ async fn persist_retention_if_changed(
     if last.as_deref() == Some(bytes.as_slice()) {
         return;
     }
-    if write_retention_atomic(path, bytes.clone()).await {
+    if write_retention_atomic(path, bytes.clone(), "Commitment retention").await {
         *last = Some(bytes);
     }
 }
 
 /// Durably write `bytes` to `path`: temp file → fsync temp → atomic rename →
 /// fsync parent dir (so the rename itself survives a crash). Returns `true` on
-/// success. Only the retention-persist loop writes this path, so a fixed temp
-/// name is safe.
-async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
+/// success. Only the persistence loop writes each target path, so a fixed temp
+/// name per target is safe.
+async fn write_retention_atomic(path: &Path, bytes: Vec<u8>, label: &'static str) -> bool {
     let path = path.to_path_buf();
     let res = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         let tmp = path.with_extension("tmp");
@@ -5212,11 +5079,11 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
     match res {
         Ok(Ok(())) => true,
         Ok(Err(e)) => {
-            warn!("Commitment retention: persist failed: {e}");
+            warn!("{label}: persist failed: {e}");
             false
         }
         Err(e) => {
-            warn!("Commitment retention: persist task join failed: {e}");
+            warn!("{label}: persist task join failed: {e}");
             false
         }
     }

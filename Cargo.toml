@@ -39,7 +39,7 @@ mimalloc = "0.1"
 # Until then, the git pin tracks the matching saorsa-core lineage
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
-ant-protocol = "2.3.0"
+ant-protocol = "3.0.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
 saorsa-core = "0.26.2"
@@ -197,10 +197,10 @@ cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
 
-# ADR-0005 depends on the audit-report wire types added to ant-protocol in
-# https://github.com/WithAutonomi/ant-protocol/pull/19, not yet on crates.io.
-# Point the pin at that PR branch so this builds in CI. Revert to a published
-# ant-protocol version bump once the wire types are released (evmlib is
-# re-exported through ant-protocol, so no separate evmlib pin is needed).
+# ADR-0005 coordinated cutover: pin ant-protocol to the immutable rev of the
+# audit-report wire-types PR (github.com/WithAutonomi/ant-protocol/pull/19).
+# An immutable rev (not a mutable branch) keeps the build reproducible; the
+# committed Cargo.lock records the exact resolution. STRIP BEFORE MERGE —
+# replace with the published ant-protocol 3.0.0 once it lands on crates.io.
 [patch.crates-io]
-ant-protocol = { git = "https://github.com/grumbach/ant-protocol.git", branch = "adr-0005-earned-reward-eligibility" }
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol", rev = "2015113270bbde8204a1740674bed2ada52d2ca6" }

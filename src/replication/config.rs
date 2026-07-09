@@ -382,60 +382,16 @@ pub const AUDIT_ON_GOSSIP_PROBABILITY: f64 = 0.2;
 /// seconds. Bounds how often any one peer is audited regardless of gossip rate.
 pub const AUDIT_ON_GOSSIP_COOLDOWN_SECS: u64 = 30 * 60;
 
-/// ADR-0005 testnet-only audit-cadence compression knobs. Production never
-/// sets these; a time-compressed local testnet ("a day" is `ADR5_DAY_SECS`)
-/// sets them so audits outpace compressed days. Each reads its env var once.
-fn adr5_test_env_u64(name: &'static str) -> Option<u64> {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|v| *v > 0)
-}
-
-/// `ADR5_TEST_AUDIT_TICK_SECS`: fixed audit tick interval override (both ends
-/// of the production 10-20 min band). NOTE: the tick drives the
-/// responsible-chunk audit lane, which deliberately does NOT feed the
-/// ADR-0005 tally — compress it for general audit liveness, but the
-/// tally-producing cadence is the gossip lane below.
-pub(crate) fn adr5_test_audit_tick() -> Option<Duration> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    (*V.get_or_init(|| adr5_test_env_u64("ADR5_TEST_AUDIT_TICK_SECS"))).map(Duration::from_secs)
-}
-
-/// `ADR5_TEST_NEIGHBOR_SYNC_SECS`: fixed neighbor-sync interval override
-/// (both ends of the production 10-20 min band) — ALSO overrides the 1 h
-/// per-peer sync cooldown, which would otherwise cap any pair at one sync per
-/// hour regardless of interval. This is the cadence that feeds the ADR-0005
-/// tally: every sync ingests peers' commitments, and each VALID ingest rolls
-/// the (audit-cooldown-gated) subtree-audit lottery whose passes and
-/// convictions the tally records.
-pub(crate) fn adr5_test_neighbor_sync() -> Option<Duration> {
-    use std::sync::OnceLock;
-    static V: OnceLock<Option<u64>> = OnceLock::new();
-    (*V.get_or_init(|| adr5_test_env_u64("ADR5_TEST_NEIGHBOR_SYNC_SECS"))).map(Duration::from_secs)
-}
-
-/// `ADR5_TEST_AUDIT_COOLDOWN_SECS`: per-peer gossip-audit cooldown override.
+/// Per-peer gossip-audit cooldown, in seconds.
+#[must_use]
 pub fn audit_on_gossip_cooldown_secs() -> u64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<u64> = OnceLock::new();
-    *V.get_or_init(|| {
-        adr5_test_env_u64("ADR5_TEST_AUDIT_COOLDOWN_SECS").unwrap_or(AUDIT_ON_GOSSIP_COOLDOWN_SECS)
-    })
+    AUDIT_ON_GOSSIP_COOLDOWN_SECS
 }
 
-/// `ADR5_TEST_AUDIT_PROBABILITY`: gossip-audit lottery override, parsed as a
-/// float and clamped to [0, 1].
+/// Gossip-audit lottery probability.
+#[must_use]
 pub fn audit_on_gossip_probability() -> f64 {
-    use std::sync::OnceLock;
-    static V: OnceLock<f64> = OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("ADR5_TEST_AUDIT_PROBABILITY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .map_or(AUDIT_ON_GOSSIP_PROBABILITY, |p| p.clamp(0.0, 1.0))
-    })
+    AUDIT_ON_GOSSIP_PROBABILITY
 }
 
 /// ADR-0004: first-audit drainer retry cadence for cooldown-pending pins.
@@ -551,15 +507,13 @@ impl Default for ReplicationConfig {
             paid_list_close_group_size: PAID_LIST_CLOSE_GROUP_SIZE,
             neighbor_sync_scope: NEIGHBOR_SYNC_SCOPE,
             neighbor_sync_peer_count: NEIGHBOR_SYNC_PEER_COUNT,
-            neighbor_sync_interval_min: adr5_test_neighbor_sync()
-                .unwrap_or(NEIGHBOR_SYNC_INTERVAL_MIN),
-            neighbor_sync_interval_max: adr5_test_neighbor_sync()
-                .unwrap_or(NEIGHBOR_SYNC_INTERVAL_MAX),
-            neighbor_sync_cooldown: adr5_test_neighbor_sync().unwrap_or(NEIGHBOR_SYNC_COOLDOWN),
+            neighbor_sync_interval_min: NEIGHBOR_SYNC_INTERVAL_MIN,
+            neighbor_sync_interval_max: NEIGHBOR_SYNC_INTERVAL_MAX,
+            neighbor_sync_cooldown: NEIGHBOR_SYNC_COOLDOWN,
             self_lookup_interval_min: SELF_LOOKUP_INTERVAL_MIN,
             self_lookup_interval_max: SELF_LOOKUP_INTERVAL_MAX,
-            audit_tick_interval_min: adr5_test_audit_tick().unwrap_or(AUDIT_TICK_INTERVAL_MIN),
-            audit_tick_interval_max: adr5_test_audit_tick().unwrap_or(AUDIT_TICK_INTERVAL_MAX),
+            audit_tick_interval_min: AUDIT_TICK_INTERVAL_MIN,
+            audit_tick_interval_max: AUDIT_TICK_INTERVAL_MAX,
             audit_response_floor: Duration::from_secs(AUDIT_RESPONSE_FLOOR_SECS),
             audit_honest_read_bps: AUDIT_HONEST_READ_BPS,
             audit_response_honest_multiplier: AUDIT_RESPONSE_HONEST_MULTIPLIER,

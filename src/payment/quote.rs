@@ -8,7 +8,7 @@
 //! and will be fully integrated when the node is initialized.
 
 use crate::error::{Error, Result};
-use crate::logging::debug;
+use crate::logging::{debug, warn};
 use crate::payment::metrics::QuotingMetricsTracker;
 use crate::payment::pricing::calculate_price;
 use evmlib::merkle_payments::MerklePaymentCandidateNode;
@@ -151,11 +151,21 @@ impl QuoteGenerator {
     /// sign — a response without a report is valid, it just doesn't vouch.
     #[must_use]
     pub fn build_audit_report(&self, nonce: [u8; 32]) -> Option<Vec<u8>> {
+        use ant_protocol::payment::{MAX_AUDIT_REPORT_BYTES, MAX_REPORT_DAYS, MAX_REPORT_ROWS};
         let source = self.report_source.read().as_ref().map(Arc::clone)?;
         let sign_fn = self.sign_fn.as_ref()?;
-        let rows = source.report_rows();
+        let mut rows = source.report_rows();
         if rows.is_empty() {
             return None;
+        }
+        // Producer-side cap enforcement (ADR-0005): the source truncates, but the
+        // producer must NOT rely on that discipline — it enforces the structural
+        // caps itself so a malformed or oversized report is never signed or put on
+        // the wire. Verifiers reject an over-cap report wholesale, so emitting one
+        // would only cost this node its own vouch.
+        rows.truncate(MAX_REPORT_ROWS);
+        for row in &mut rows {
+            row.days.truncate(MAX_REPORT_DAYS);
         }
         let reporter_peer_id = source.reporter_peer_id();
         let payload =
@@ -170,7 +180,20 @@ impl QuoteGenerator {
             rows,
             signature,
         };
-        rmp_serde::to_vec(&report).ok()
+        let bytes = rmp_serde::to_vec(&report).ok()?;
+        // Enforce the serialized byte cap the verifier expects (a report over
+        // MAX_AUDIT_REPORT_BYTES is dropped whole on receipt): never put an
+        // over-cap report on the wire. With the row/day caps above this is
+        // unreachable for an honest tally, but the guard makes the invariant local.
+        if bytes.len() > MAX_AUDIT_REPORT_BYTES {
+            warn!(
+                "ADR-0005: built audit report {} B exceeds cap {} B; omitting",
+                bytes.len(),
+                MAX_AUDIT_REPORT_BYTES
+            );
+            return None;
+        }
+        Some(bytes)
     }
 
     /// Attach the ADR-0004 commitment source so quotes bind their price to the
