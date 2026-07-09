@@ -143,7 +143,7 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// gossip-audit cooldown is 30 min, so genuine concurrent audits are few) while
 /// bounding the byte round's worst-case resident bytes
 /// (`N × MAX_BYTE_CHALLENGE_KEYS × MAX_CHUNK_SIZE`).
-pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
+pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
 ///
@@ -153,9 +153,9 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 /// timeout verdicts on the challenged peers). This per-peer cap guarantees no
 /// source holds more than its share, so a flood self-throttles. Audits are
 /// cooldown-gated (one
-/// gossip-triggered audit per peer per 30 min), so 2 in-flight per peer
-/// comfortably covers the legitimate round-1 + round-2 overlap.
-pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 2;
+/// gossip-triggered audit per peer per 30 min), so 4 in-flight per peer leaves
+/// headroom beyond the legitimate round-1 + round-2 overlap.
+pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 4;
 
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
