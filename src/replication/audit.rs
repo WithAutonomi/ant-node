@@ -174,7 +174,7 @@ pub async fn audit_tick_with_repair_proofs(
         return AuditTickResult::Idle;
     }
 
-    let sample_count = ReplicationConfig::audit_sample_count(all_keys.len());
+    let sample_count = ReplicationConfig::responsible_audit_key_limit(all_keys.len());
     let sampled_keys: Vec<XorName> = {
         let mut rng = rand::thread_rng();
         all_keys

@@ -373,6 +373,7 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
 
     let present_by_key = collect_record_prune_proofs(
         &candidates,
+        stored_keys.len(),
         ctx.storage,
         ctx.p2p_node,
         ctx.config,
@@ -947,6 +948,7 @@ async fn delete_stored_records(
 /// stored keys, including out-of-range keys retained by hysteresis.
 async fn collect_record_prune_proofs(
     candidates: &[RecordPruneCandidate],
+    local_stored_key_count: usize,
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
@@ -956,20 +958,25 @@ async fn collect_record_prune_proofs(
         return HashMap::new();
     }
 
+    let max_keys_per_challenge =
+        ReplicationConfig::responsible_audit_key_limit(local_stored_key_count);
     let report_state = PruneAuditReportState::default();
-    let mut requests = stream::iter(build_peer_audit_challenges(candidates))
-        .map(|(peer, keys)| {
-            peer_proves_records(
-                peer,
-                keys,
-                storage,
-                p2p_node,
-                config,
-                sync_state,
-                &report_state,
-            )
-        })
-        .buffer_unordered(MAX_CONCURRENT_PRUNE_AUDIT_CHALLENGES);
+    let mut requests = stream::iter(build_peer_audit_challenges(
+        candidates,
+        max_keys_per_challenge,
+    ))
+    .map(|(peer, keys)| {
+        peer_proves_records(
+            peer,
+            keys,
+            storage,
+            p2p_node,
+            config,
+            sync_state,
+            &report_state,
+        )
+    })
+    .buffer_unordered(MAX_CONCURRENT_PRUNE_AUDIT_CHALLENGES);
 
     let mut present_by_key = HashMap::<XorName, HashSet<PeerId>>::new();
     while let Some(proofs) = requests.next().await {
@@ -1061,7 +1068,11 @@ async fn revalidated_record_prune_keys(
     (keys_to_delete, cleared)
 }
 
-fn build_peer_audit_challenges(candidates: &[RecordPruneCandidate]) -> Vec<(PeerId, Vec<XorName>)> {
+fn build_peer_audit_challenges(
+    candidates: &[RecordPruneCandidate],
+    max_keys_per_challenge: usize,
+) -> Vec<(PeerId, Vec<XorName>)> {
+    let max_keys_per_challenge = max_keys_per_challenge.max(1);
     let mut keys_by_peer: HashMap<PeerId, Vec<XorName>> = HashMap::new();
     for candidate in candidates {
         for peer in &candidate.target_peers {
@@ -1069,14 +1080,16 @@ fn build_peer_audit_challenges(candidates: &[RecordPruneCandidate]) -> Vec<(Peer
         }
     }
 
-    keys_by_peer
-        .into_iter()
-        .map(|(peer, mut keys)| {
-            keys.sort_unstable();
-            keys.dedup();
-            (peer, keys)
-        })
-        .collect()
+    let mut challenges = Vec::new();
+    for (peer, mut keys) in keys_by_peer {
+        keys.sort_unstable();
+        keys.dedup();
+        challenges.extend(
+            keys.chunks(max_keys_per_challenge)
+                .map(|chunk| (peer, chunk.to_vec())),
+        );
+    }
+    challenges
 }
 
 #[cfg(test)]
@@ -1581,7 +1594,7 @@ mod tests {
             candidate(key_b, vec![peer_b]),
         ];
 
-        let mut challenges = build_peer_audit_challenges(&candidates);
+        let mut challenges = build_peer_audit_challenges(&candidates, 2);
         for (_, keys) in &mut challenges {
             keys.sort_unstable();
         }
@@ -1590,6 +1603,33 @@ mod tests {
         let mut expected = vec![(peer_a, vec![key_a]), (peer_b, vec![key_a, key_b])];
         expected.sort_unstable_by_key(|(peer, keys)| (*peer.as_bytes(), keys.clone()));
         assert_eq!(challenges, expected);
+    }
+
+    #[test]
+    fn prune_audit_challenges_split_peer_batches_at_responsible_audit_limit() {
+        let peer = peer_id_from_byte(1);
+        let candidates = vec![
+            candidate(key_from_byte(0xA), vec![peer]),
+            candidate(key_from_byte(0xB), vec![peer]),
+            candidate(key_from_byte(0xC), vec![peer]),
+            candidate(key_from_byte(0xD), vec![peer]),
+            candidate(key_from_byte(0xE), vec![peer]),
+        ];
+
+        let mut challenges = build_peer_audit_challenges(&candidates, 2);
+        for (_, keys) in &mut challenges {
+            keys.sort_unstable();
+        }
+        challenges.sort_unstable_by_key(|(_, keys)| keys.clone());
+
+        assert_eq!(
+            challenges,
+            vec![
+                (peer, vec![key_from_byte(0xA), key_from_byte(0xB)]),
+                (peer, vec![key_from_byte(0xC), key_from_byte(0xD)]),
+                (peer, vec![key_from_byte(0xE)]),
+            ]
+        );
     }
 
     #[test]

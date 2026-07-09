@@ -623,15 +623,30 @@ impl ReplicationConfig {
         sqrt.max(1).min(total_keys)
     }
 
+    /// Maximum number of keys this node should send in one responsible-chunk
+    /// [`AuditChallenge`].
+    ///
+    /// This is the sender-side limit used by the normal responsible audit path:
+    /// one challenge samples at most `sqrt(local_stored_keys)` keys. Other paths
+    /// that reuse the same `AuditChallenge` wire message, such as
+    /// prune-confirmation audits, should chunk to this same limit instead of
+    /// inventing a larger batch size.
+    ///
+    /// [`AuditChallenge`]: crate::replication::protocol::AuditChallenge
+    #[must_use]
+    pub fn responsible_audit_key_limit(local_stored_keys: usize) -> usize {
+        Self::audit_sample_count(local_stored_keys)
+    }
+
     /// Maximum number of keys to accept in an incoming audit challenge.
     ///
-    /// Scales dynamically: `2 * audit_sample_count(stored_chunks)`. The 2x
-    /// margin accounts for the challenger having a larger store than us and
-    /// therefore sampling more keys.
+    /// Scales dynamically from the same responsible-audit sender limit, with a
+    /// 2x margin to account for the challenger having a larger local store than
+    /// us and therefore sampling more keys.
     #[must_use]
     pub fn max_incoming_audit_keys(stored_chunks: usize) -> usize {
         // Allow at least 1 key so a newly-joined node can still be audited.
-        (2 * Self::audit_sample_count(stored_chunks)).max(1)
+        (2 * Self::responsible_audit_key_limit(stored_chunks)).max(1)
     }
 
     /// Compute the audit response timeout for a challenge with
@@ -1011,20 +1026,31 @@ mod tests {
     }
 
     #[test]
+    fn responsible_audit_key_limit_matches_audit_sample_count() {
+        for stored_keys in [0, 1, 3, 4, 25, 100, 1_000, 10_000, 1_000_000] {
+            assert_eq!(
+                ReplicationConfig::responsible_audit_key_limit(stored_keys),
+                ReplicationConfig::audit_sample_count(stored_keys),
+                "responsible audit sender limit must stay identical to audit sample count"
+            );
+        }
+    }
+
+    #[test]
     fn max_incoming_audit_keys_scales_dynamically() {
         // Empty store: at least 1 key accepted.
         assert_eq!(ReplicationConfig::max_incoming_audit_keys(0), 1);
 
-        // 1 chunk: 2 * sqrt(1) = 2.
+        // 1 chunk: 2 * responsible_audit_key_limit(1) = 2.
         assert_eq!(ReplicationConfig::max_incoming_audit_keys(1), 2);
 
-        // 100 chunks: 2 * sqrt(100) = 20.
+        // 100 chunks: 2 * responsible_audit_key_limit(100) = 20.
         assert_eq!(ReplicationConfig::max_incoming_audit_keys(100), 20);
 
-        // 1M chunks: 2 * sqrt(1_000_000) = 2_000.
+        // 1M chunks: 2 * responsible_audit_key_limit(1_000_000) = 2_000.
         assert_eq!(ReplicationConfig::max_incoming_audit_keys(1_000_000), 2_000);
 
-        // 5M chunks: 2 * sqrt(5_000_000) = 4_472.
+        // 5M chunks: 2 * responsible_audit_key_limit(5_000_000) = 4_472.
         assert_eq!(ReplicationConfig::max_incoming_audit_keys(5_000_000), 4_472);
     }
 
