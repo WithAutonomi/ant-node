@@ -37,6 +37,10 @@ pub enum AuditTickResult {
         challenged_peer: PeerId,
         /// Number of keys verified.
         keys_checked: usize,
+        /// Key count of the audited storage commitment — `Some` only for the
+        /// subtree (commitment) audit lane, which is the only lane that feeds
+        /// the ADR-0005 audit tally ("audited clean at this size").
+        commitment_key_count: Option<u32>,
     },
     /// Audit found failures (after responsibility confirmation).
     Failed {
@@ -577,6 +581,9 @@ async fn verify_digests(
         return AuditTickResult::Passed {
             challenged_peer: *challenged_peer,
             keys_checked: keys.len(),
+            // Responsible-chunk audits challenge single chunks, not a
+            // commitment — they never feed the ADR-0005 tally.
+            commitment_key_count: None,
         };
     }
 

@@ -748,27 +748,39 @@ async fn verify_subtree_response(
             warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
             failed(challenged_peer, challenge_id, reason)
         }
-        AuditVerdict::Pass { checked } => {
-            // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
-            observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
-            // Credit the peer as a proven holder of its committed keys.
-            if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
-                let now = std::time::Instant::now();
-                let mut provers = credit.recent_provers.write().await;
-                for leaf in &proof.leaves {
-                    provers.record_proof(leaf.key, *challenged_peer, pin, now);
-                }
-            }
-            info!(
-                "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
-                 byte-checked)",
-                proof.leaves.len()
-            );
-            AuditTickResult::Passed {
-                challenged_peer: *challenged_peer,
-                keys_checked: checked,
-            }
+        AuditVerdict::Pass { checked } => credit_and_pass(ctx, commitment, proof, checked).await,
+    }
+}
+
+/// Full-pass epilogue of [`verify_subtree_response`]: soft closeness
+/// observation, proven-holder credit, and the `Passed` result carrying the
+/// audited commitment's key count (the ADR-0005 "at this size" fact).
+async fn credit_and_pass(
+    ctx: &AuditCtx<'_>,
+    commitment: &StorageCommitment,
+    proof: &SubtreeProof,
+    checked: usize,
+) -> AuditTickResult {
+    let challenged_peer = ctx.challenged_peer;
+    // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
+    observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
+    // Credit the peer as a proven holder of its committed keys.
+    if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
+        let now = std::time::Instant::now();
+        let mut provers = credit.recent_provers.write().await;
+        for leaf in &proof.leaves {
+            provers.record_proof(leaf.key, *challenged_peer, pin, now);
         }
+    }
+    info!(
+        "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
+         byte-checked)",
+        proof.leaves.len()
+    );
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: checked,
+        commitment_key_count: Some(commitment.key_count),
     }
 }
 

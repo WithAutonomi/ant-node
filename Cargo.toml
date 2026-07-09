@@ -196,3 +196,11 @@ unused_async = "allow"
 cognitive_complexity = "allow"
 # Allow non-const functions during initial development (may need runtime features later)
 missing_const_for_fn = "allow"
+
+# ADR-0005 depends on the audit-report wire types added to ant-protocol in
+# https://github.com/WithAutonomi/ant-protocol/pull/19, not yet on crates.io.
+# Point the pin at that PR branch so this builds in CI. Revert to a published
+# ant-protocol version bump once the wire types are released (evmlib is
+# re-exported through ant-protocol, so no separate evmlib pin is needed).
+[patch.crates-io]
+ant-protocol = { git = "https://github.com/grumbach/ant-protocol.git", branch = "adr-0005-earned-reward-eligibility" }

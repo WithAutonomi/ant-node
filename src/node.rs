@@ -170,6 +170,15 @@ impl NodeBuilder {
                         let concrete = Arc::clone(engine.commitment_state());
                         let source: Arc<dyn crate::payment::quote::CommitmentSource> = concrete;
                         protocol.attach_commitment_source(source);
+                        // ADR-0005: wire the engine's audit tally as the quote
+                        // generator's report source so quote responses carry
+                        // this node's signed audit report.
+                        let report_source: Arc<dyn crate::payment::quote::AuditReportSource> =
+                            Arc::new(crate::replication::audit_tally::TallyReportSource::new(
+                                engine.audit_tally_handle(),
+                                *identity.peer_id().as_bytes(),
+                            ));
+                        protocol.attach_report_source(report_source);
                         // ADR-0004: share the engine's gossip commitment
                         // cache with the verifier so the cross-check can
                         // resolve quote pins against neighbours' commitments.

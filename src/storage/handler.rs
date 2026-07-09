@@ -177,6 +177,13 @@ impl AntProtocol {
         self.quote_generator.attach_commitment_source(source);
     }
 
+    /// ADR-0005: wire the replication engine's audit tally as the quote
+    /// generator's report source, so quote responses testify with this node's
+    /// signed audit report.
+    pub fn attach_report_source(&self, source: Arc<dyn crate::payment::quote::AuditReportSource>) {
+        self.quote_generator.attach_report_source(source);
+    }
+
     /// ADR-0004: return the proof with any commitment sidecars stripped, so a
     /// replicated/persisted receipt carries only the pin and count (stored
     /// proofs do not grow). Handles BOTH proof types — single-node and
@@ -300,6 +307,18 @@ impl AntProtocol {
         let address = request.address;
         let addr_hex = hex::encode(address);
         debug!("Handling PUT request for {addr_hex}");
+
+        // ADR-0005 run-3 fat-pin cheater (test only): a freeloader refuses new
+        // storage at the REQUEST boundary — before the chunk reaches the store
+        // — so no re-supply rebuilds its audit passes. A request already
+        // admitted before the flag flip may still land (bounded stragglers);
+        // that does not corrupt the measurement (see the cheat branch in
+        // replication::mod). Inert in production (flag only set by env-gated cheat).
+        if crate::replication::adr5_refuses_new_storage() {
+            return ChunkPutResponse::Error(ProtocolError::StorageFailed(
+                "node in ADR5 test cheat mode: refusing storage".to_string(),
+            ));
+        }
 
         // 1. Validate chunk size
         if request.content.len() > MAX_CHUNK_SIZE {
@@ -583,12 +602,20 @@ impl AntProtocol {
                 let commitment = quote
                     .commitment_pin
                     .and_then(|pin| self.quote_generator.commitment_blob_for_pin(pin));
+                // ADR-0005: this node's signed audit report (its tally rows,
+                // bound to the client's request nonce). `None` when there is
+                // nothing to testify — the response is valid, it just doesn't
+                // vouch for anyone.
+                let audit_report = self
+                    .quote_generator
+                    .build_audit_report(request.report_nonce);
                 // Serialize the quote
                 match rmp_serde::to_vec(&quote) {
                     Ok(quote_bytes) => ChunkQuoteResponse::Success {
                         quote: quote_bytes,
                         already_stored,
                         commitment,
+                        audit_report,
                     },
                     Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(format!(
                         "Failed to serialize quote: {e}"
@@ -639,10 +666,15 @@ impl AntProtocol {
                 let commitment = candidate_node
                     .commitment_pin
                     .and_then(|pin| self.quote_generator.commitment_blob_for_pin(pin));
+                // ADR-0005: same signed audit report as the single-node path.
+                let audit_report = self
+                    .quote_generator
+                    .build_audit_report(request.report_nonce);
                 match rmp_serde::to_vec(&candidate_node) {
                     Ok(bytes) => MerkleCandidateQuoteResponse::Success {
                         candidate_node: bytes,
                         commitment,
+                        audit_report,
                     },
                     Err(e) => MerkleCandidateQuoteResponse::Error(ProtocolError::QuoteFailed(
                         format!("Failed to serialize merkle candidate node: {e}"),
@@ -773,6 +805,109 @@ mod tests {
 
         let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
         (protocol, temp_dir)
+    }
+
+    /// Like [`create_test_protocol`] but also returns the identity's public
+    /// key bytes, for tests that need the peer binding (ADR-0005 reports).
+    async fn create_test_protocol_with_identity() -> (AntProtocol, TempDir, Vec<u8>) {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let storage_config = LmdbStorageConfig {
+            root_dir: temp_dir.path().to_path_buf(),
+            disk_reserve: 0,
+            ..LmdbStorageConfig::test_default()
+        };
+        let storage = Arc::new(
+            LmdbStorage::new(storage_config)
+                .await
+                .expect("create storage"),
+        );
+        let rewards_address = RewardsAddress::new([1u8; 20]);
+        let payment_config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100_000,
+            close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
+            local_rewards_address: rewards_address,
+        };
+        let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
+        let mut quote_generator =
+            QuoteGenerator::new(rewards_address, QuotingMetricsTracker::new(100));
+        let identity = NodeIdentity::generate().expect("generate identity");
+        let pub_key_bytes = identity.public_key().as_bytes().to_vec();
+        let sk_bytes = identity.secret_key_bytes().to_vec();
+        let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("deserialize secret key");
+        quote_generator.set_signer(pub_key_bytes.clone(), move |msg| {
+            use saorsa_pqc::pqc::MlDsaOperations;
+            MlDsa65::new()
+                .sign(&sk, msg)
+                .map_or_else(|_| vec![], |sig| sig.as_bytes().to_vec())
+        });
+        let protocol = AntProtocol::new(storage, payment_verifier, Arc::new(quote_generator));
+        (protocol, temp_dir, pub_key_bytes)
+    }
+
+    /// ADR-0005 end-to-end through the handler: a quote request whose node has
+    /// tally rows yields a response carrying a signed report that echoes the
+    /// request nonce and verifies against the quote's own key; with no rows the
+    /// response carries no report.
+    #[tokio::test]
+    async fn quote_response_carries_verifiable_audit_report() {
+        use crate::payment::quote::AuditReportSource;
+        use ant_protocol::payment::{verify_audit_report, AuditReport, AuditReportDay};
+
+        struct OneRow {
+            reporter_peer_id: [u8; 32],
+        }
+        impl AuditReportSource for OneRow {
+            fn reporter_peer_id(&self) -> [u8; 32] {
+                self.reporter_peer_id
+            }
+            fn report_rows(&self) -> Vec<ant_protocol::payment::AuditReportRow> {
+                vec![ant_protocol::payment::AuditReportRow {
+                    subject_peer_id: [6u8; 32],
+                    days: vec![AuditReportDay {
+                        age_days: 0,
+                        passes: 2,
+                        max_passed_key_count: 77,
+                    }],
+                    fenced: false,
+                    convicted: false,
+                }]
+            }
+        }
+
+        let (protocol, _temp, pub_key_bytes) = create_test_protocol_with_identity().await;
+        let reporter_peer_id = *blake3::hash(&pub_key_bytes).as_bytes();
+
+        // No report source attached -> no report on the wire.
+        let request = ChunkQuoteRequest {
+            address: [0x21u8; 32],
+            data_size: 100,
+            data_type: DATA_TYPE_CHUNK,
+            report_nonce: [0xABu8; 32],
+        };
+        let ChunkQuoteResponse::Success { audit_report, .. } = protocol.handle_quote(&request)
+        else {
+            panic!("expected quote success");
+        };
+        assert!(audit_report.is_none(), "no source -> no report");
+
+        // Attach a source with one row; the response must testify with it.
+        protocol.attach_report_source(Arc::new(OneRow { reporter_peer_id }));
+
+        let ChunkQuoteResponse::Success { audit_report, .. } = protocol.handle_quote(&request)
+        else {
+            panic!("expected quote success");
+        };
+        let bytes = audit_report.expect("report attached");
+        let report: AuditReport = rmp_serde::from_slice(&bytes).expect("report parses");
+        assert_eq!(
+            report.nonce, [0xABu8; 32],
+            "report echoes the request nonce"
+        );
+        assert!(
+            verify_audit_report(&report, &pub_key_bytes, &reporter_peer_id, &[0xABu8; 32]),
+            "handler-built report verifies against the quote key"
+        );
     }
 
     #[tokio::test]
@@ -1185,6 +1320,7 @@ mod tests {
             data_type: DATA_TYPE_CHUNK,
             data_size: 4096,
             merkle_payment_timestamp: timestamp,
+            report_nonce: [0u8; 32],
         };
         let msg = ChunkMessage {
             request_id: 600,
@@ -1268,6 +1404,7 @@ mod tests {
             address,
             data_size: content.len() as u64,
             data_type: DATA_TYPE_CHUNK,
+            report_nonce: [0u8; 32],
         };
         let quote_msg = ChunkMessage {
             request_id: 301,
@@ -1299,6 +1436,7 @@ mod tests {
             address: new_address,
             data_size: 100,
             data_type: DATA_TYPE_CHUNK,
+            report_nonce: [0u8; 32],
         };
         let quote_msg2 = ChunkMessage {
             request_id: 302,
@@ -1333,6 +1471,7 @@ mod tests {
             address: [0xAAu8; 32], // a quote-only probe, not one of the stored chunks
             data_size: 100,
             data_type: DATA_TYPE_CHUNK,
+            report_nonce: [0u8; 32],
         };
         let _ = protocol.handle_quote(&quote_request);
         protocol.priced_records_stored()

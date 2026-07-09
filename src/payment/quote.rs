@@ -66,6 +66,20 @@ pub trait CommitmentSource: Send + Sync {
     fn commitment_blob_for_pin(&self, pin: [u8; 32]) -> Option<Vec<u8>>;
 }
 
+/// Source of the node's audit-tally rows for the ADR-0005 report.
+///
+/// Shipped on quote responses. Implemented by the replication engine's tally;
+/// decouples [`QuoteGenerator`] from replication internals the same way
+/// [`CommitmentSource`] does.
+pub trait AuditReportSource: Send + Sync {
+    /// This node's own peer id (the report's `reporter_peer_id`).
+    fn reporter_peer_id(&self) -> [u8; 32];
+
+    /// The tally rows as they stand right now (pruned to the window and capped
+    /// to the wire limits). Empty when this observer has no testimony yet.
+    fn report_rows(&self) -> Vec<ant_protocol::payment::AuditReportRow>;
+}
+
 /// Quote generator for creating payment quotes.
 ///
 /// Uses the node's signing capabilities to sign quotes, which clients
@@ -93,6 +107,10 @@ pub struct QuoteGenerator {
     sign_fn: Option<SignFn>,
     /// Public key bytes for the quote.
     pub_key: Vec<u8>,
+    /// ADR-0005 report source: the audit tally this node testifies from on
+    /// quote responses. `None` until [`Self::attach_report_source`] is called
+    /// (pre-wiring / unit tests), in which case responses carry no report.
+    report_source: RwLock<Option<Arc<dyn AuditReportSource>>>,
 }
 
 impl QuoteGenerator {
@@ -112,7 +130,47 @@ impl QuoteGenerator {
             commitment_source: RwLock::new(None),
             sign_fn: None,
             pub_key: Vec::new(),
+            report_source: RwLock::new(None),
         }
+    }
+
+    /// Attach the ADR-0005 report source so quote responses can ship this
+    /// node's signed audit report. Idempotent, interior mutability — same
+    /// contract as [`Self::attach_commitment_source`].
+    pub fn attach_report_source(&self, source: Arc<dyn AuditReportSource>) {
+        *self.report_source.write() = Some(source);
+        debug!("QuoteGenerator: ADR-0005 audit-report source attached");
+    }
+
+    /// Build this node's signed audit report for a quote response (ADR-0005).
+    ///
+    /// `nonce` is the client's request nonce, echoed and signed so the report
+    /// is provably generated for this request. Returns the rmp-serialized
+    /// [`ant_protocol::payment::AuditReport`], or `None` when no source is
+    /// attached, the tally is empty (nothing to testify), or the node cannot
+    /// sign — a response without a report is valid, it just doesn't vouch.
+    #[must_use]
+    pub fn build_audit_report(&self, nonce: [u8; 32]) -> Option<Vec<u8>> {
+        let source = self.report_source.read().as_ref().map(Arc::clone)?;
+        let sign_fn = self.sign_fn.as_ref()?;
+        let rows = source.report_rows();
+        if rows.is_empty() {
+            return None;
+        }
+        let reporter_peer_id = source.reporter_peer_id();
+        let payload =
+            ant_protocol::payment::audit_report_signed_payload(&reporter_peer_id, &nonce, &rows);
+        let signature = sign_fn(&payload);
+        if signature.is_empty() {
+            return None;
+        }
+        let report = ant_protocol::payment::AuditReport {
+            reporter_peer_id,
+            nonce,
+            rows,
+            signature,
+        };
+        rmp_serde::to_vec(&report).ok()
     }
 
     /// Attach the ADR-0004 commitment source so quotes bind their price to the
@@ -470,6 +528,96 @@ mod tests {
         });
 
         generator
+    }
+
+    /// Fixed-rows [`AuditReportSource`] for tests.
+    struct FixedReportSource {
+        reporter_peer_id: [u8; 32],
+        rows: Vec<ant_protocol::payment::AuditReportRow>,
+    }
+    impl AuditReportSource for FixedReportSource {
+        fn reporter_peer_id(&self) -> [u8; 32] {
+            self.reporter_peer_id
+        }
+        fn report_rows(&self) -> Vec<ant_protocol::payment::AuditReportRow> {
+            self.rows.clone()
+        }
+    }
+
+    /// ADR-0005 report round-trip with REAL keys: the node-side
+    /// `build_audit_report` output must verify with the client-side
+    /// `verify_audit_report` against the same pubkey, reporter id, and nonce —
+    /// this is the guard against signer/verifier payload-framing drift. Also
+    /// asserts the nonce binding (wrong nonce fails) and the empty-tally and
+    /// no-source `None` paths.
+    #[test]
+    fn test_audit_report_round_trip_real_keys() {
+        use ant_protocol::payment::{verify_audit_report, AuditReport, AuditReportDay};
+
+        let ml_dsa = MlDsa65::new();
+        let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keypair generation");
+        let pub_key_bytes = public_key.as_bytes().to_vec();
+        // The reporter id is the peer binding the client already checked for
+        // the quote: BLAKE3(pub_key).
+        let reporter_peer_id = *blake3::hash(&pub_key_bytes).as_bytes();
+
+        let mut generator = QuoteGenerator::new(
+            RewardsAddress::new([3u8; 20]),
+            QuotingMetricsTracker::new(10),
+        );
+        let sk_bytes = secret_key.as_bytes().to_vec();
+        generator.set_signer(pub_key_bytes.clone(), move |msg| {
+            let sk = MlDsaSecretKey::from_bytes(&sk_bytes).expect("secret key parse");
+            MlDsa65::new()
+                .sign(&sk, msg)
+                .expect("signing")
+                .as_bytes()
+                .to_vec()
+        });
+
+        let nonce = [9u8; 32];
+        assert!(
+            generator.build_audit_report(nonce).is_none(),
+            "no source attached -> no report"
+        );
+
+        generator.attach_report_source(Arc::new(FixedReportSource {
+            reporter_peer_id,
+            rows: Vec::new(),
+        }));
+        assert!(
+            generator.build_audit_report(nonce).is_none(),
+            "empty tally -> no report (nothing to testify)"
+        );
+
+        let rows = vec![ant_protocol::payment::AuditReportRow {
+            subject_peer_id: [5u8; 32],
+            days: vec![AuditReportDay {
+                age_days: 0,
+                passes: 4,
+                max_passed_key_count: 1234,
+            }],
+            fenced: false,
+            convicted: false,
+        }];
+        generator.attach_report_source(Arc::new(FixedReportSource {
+            reporter_peer_id,
+            rows: rows.clone(),
+        }));
+
+        let bytes = generator
+            .build_audit_report(nonce)
+            .expect("report with rows");
+        let report: AuditReport = rmp_serde::from_slice(&bytes).expect("report parses");
+        assert_eq!(report.rows, rows, "rows survive the wire encoding");
+        assert!(
+            verify_audit_report(&report, &pub_key_bytes, &reporter_peer_id, &nonce),
+            "node-signed report must verify client-side"
+        );
+        assert!(
+            !verify_audit_report(&report, &pub_key_bytes, &reporter_peer_id, &[0u8; 32]),
+            "a different nonce must not verify (no precompute/replay)"
+        );
     }
 
     /// Fixed-binding [`CommitmentSource`] for tests: always reports the same
