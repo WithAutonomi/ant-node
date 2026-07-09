@@ -1170,10 +1170,14 @@ async fn peer_proves_records(
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     report_state: &PruneAuditReportState,
 ) -> Vec<(PeerId, XorName)> {
+    let (challenge_id, nonce) = {
+        let mut rng = rand::thread_rng();
+        (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
+    };
     let mut challenge_material = Vec::new();
     for key in keys {
-        if let Some(local_bytes) = local_record_bytes(&key, storage).await {
-            challenge_material.push((key, local_bytes));
+        if let Some(expected_digest) = local_record_digest(&peer, &key, &nonce, storage).await {
+            challenge_material.push((key, expected_digest));
         }
     }
     if challenge_material.is_empty() {
@@ -1181,10 +1185,6 @@ async fn peer_proves_records(
     }
 
     let challenge_keys: Vec<XorName> = challenge_material.iter().map(|(key, _)| *key).collect();
-    let (challenge_id, nonce) = {
-        let mut rng = rand::thread_rng();
-        (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
-    };
     let Some((encoded, key_count)) =
         encode_prune_audit_challenge(&peer, &challenge_keys, challenge_id, nonce)
     else {
@@ -1198,15 +1198,22 @@ async fn peer_proves_records(
         // audit failure just like a decoded bad proof below. Keep the historical
         // one-report-per-peer-per-pass guard by attempting each key against the
         // shared `report_state`.
+        let mut audit_failure_reported = false;
         for key in &challenge_keys {
-            report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await;
+            if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await {
+                audit_failure_reported = true;
+                break;
+            }
+        }
+        if audit_failure_reported {
+            debug!("Prune audit: reported one failure for timed-out/malformed batch from {peer}");
         }
         return Vec::new();
     };
 
-    let statuses =
-        prune_audit_response_statuses(decoded, challenge_id, &peer, &nonce, &challenge_material);
+    let statuses = prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
     let mut clear_bootstrap_claim = false;
+    let mut audit_failure_reported = false;
     let mut proven = Vec::new();
 
     for (key, status) in statuses {
@@ -1228,7 +1235,12 @@ async fn peer_proves_records(
                 .await;
             }
             PruneAuditStatus::Failed => {
-                report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state).await;
+                if !audit_failure_reported
+                    && report_prune_audit_failure_once(&peer, &key, p2p_node, config, report_state)
+                        .await
+                {
+                    audit_failure_reported = true;
+                }
             }
         }
     }
@@ -1315,8 +1327,7 @@ fn prune_audit_response_statuses(
     decoded: ReplicationMessage,
     challenge_id: u64,
     peer: &PeerId,
-    nonce: &[u8; 32],
-    challenge_material: &[(XorName, Vec<u8>)],
+    challenge_material: &[(XorName, [u8; 32])],
 ) -> Vec<(XorName, PruneAuditStatus)> {
     let failed_all = |reason: &str| {
         warn!(
@@ -1348,7 +1359,7 @@ fn prune_audit_response_statuses(
             challenge_material
                 .iter()
                 .zip(digests.iter())
-                .map(|((key, local_bytes), digest)| {
+                .map(|((key, expected_digest), digest)| {
                     if *digest == ABSENT_KEY_DIGEST {
                         warn!(
                             "Prune audit proof from {peer} failed for {}: peer reports key absent",
@@ -1356,7 +1367,7 @@ fn prune_audit_response_statuses(
                         );
                         return (*key, PruneAuditStatus::Failed);
                     }
-                    if audit_digest_proves_key(peer, key, nonce, local_bytes, digest) {
+                    if digest == expected_digest {
                         (*key, PruneAuditStatus::Proven)
                     } else {
                         warn!(
@@ -1405,6 +1416,17 @@ fn prune_audit_response_statuses(
     }
 }
 
+async fn local_record_digest(
+    peer: &PeerId,
+    key: &XorName,
+    nonce: &[u8; 32],
+    storage: &Arc<LmdbStorage>,
+) -> Option<[u8; 32]> {
+    local_record_bytes(key, storage)
+        .await
+        .map(|bytes| compute_audit_digest(nonce, peer.as_bytes(), key, &bytes))
+}
+
 async fn local_record_bytes(key: &XorName, storage: &Arc<LmdbStorage>) -> Option<Vec<u8>> {
     match storage.get_raw(key).await {
         Ok(Some(bytes)) => Some(bytes),
@@ -1425,6 +1447,7 @@ async fn local_record_bytes(key: &XorName, storage: &Arc<LmdbStorage>) -> Option
     }
 }
 
+#[cfg(test)]
 fn audit_digest_proves_key(
     peer: &PeerId,
     key: &XorName,
@@ -1639,13 +1662,13 @@ mod tests {
         let key_b = key_from_byte(0xB);
         let nonce = [0x7A; 32];
         let bytes_a = b"record-a".to_vec();
-        let bytes_b = b"record-b".to_vec();
-        let digest_a = compute_audit_digest(&nonce, peer.as_bytes(), &key_a, &bytes_a);
+        let expected_a = compute_audit_digest(&nonce, peer.as_bytes(), &key_a, &bytes_a);
+        let expected_b = compute_audit_digest(&nonce, peer.as_bytes(), &key_b, b"record-b");
         let msg = ReplicationMessage {
             request_id: 42,
             body: ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
                 challenge_id: 42,
-                digests: vec![digest_a, ABSENT_KEY_DIGEST],
+                digests: vec![expected_a, ABSENT_KEY_DIGEST],
             }),
         };
 
@@ -1653,8 +1676,7 @@ mod tests {
             msg,
             42,
             &peer,
-            &nonce,
-            &[(key_a, bytes_a), (key_b, bytes_b)],
+            &[(key_a, expected_a), (key_b, expected_b)],
         );
 
         assert_eq!(

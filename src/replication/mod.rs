@@ -1991,20 +1991,16 @@ async fn admit_audit_responder(
     let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
         let peer_inflight = {
             let mut map = inflight.write().await;
-            match map.get_mut(source) {
+            map.remove(source).map_or(0, |n| {
                 // Report the per-peer occupancy AFTER releasing our rolled-back
                 // slot: the share still held by this source's other in-flight
                 // tasks (below the cap, since the per-peer check passed).
-                Some(n) => {
-                    *n = n.saturating_sub(1);
-                    let remaining = *n;
-                    if *n == 0 {
-                        map.remove(source);
-                    }
-                    remaining
+                let remaining = n.saturating_sub(1);
+                if remaining > 0 {
+                    map.insert(*source, remaining);
                 }
-                None => 0,
-            }
+                remaining
+            })
         };
         return Err(AuditResponderAdmissionFailure {
             reason: AuditResponderRejectReason::GlobalPoolFull,
@@ -5229,9 +5225,8 @@ mod tests {
             }
         }
 
-        let err = match admit_audit_responder(&semaphore, &inflight, &peer).await {
-            Ok(_) => panic!("admission should fail once per-peer cap is full"),
-            Err(err) => err,
+        let Err(err) = admit_audit_responder(&semaphore, &inflight, &peer).await else {
+            panic!("admission should fail once per-peer cap is full");
         };
         assert_eq!(err.reason, AuditResponderRejectReason::PerPeerCapFull);
         assert_eq!(err.peer_inflight, MAX_AUDIT_RESPONSES_PER_PEER);
@@ -5256,9 +5251,8 @@ mod tests {
             );
         }
 
-        let err = match admit_audit_responder(&semaphore, &inflight, &peer).await {
-            Ok(_) => panic!("admission should fail once global pool is full"),
-            Err(err) => err,
+        let Err(err) = admit_audit_responder(&semaphore, &inflight, &peer).await else {
+            panic!("admission should fail once global pool is full");
         };
         assert_eq!(err.reason, AuditResponderRejectReason::GlobalPoolFull);
         assert_eq!(err.global_inflight, MAX_CONCURRENT_AUDIT_RESPONSES);
