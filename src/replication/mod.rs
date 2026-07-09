@@ -34,6 +34,7 @@ pub mod subtree;
 pub mod types;
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -1830,6 +1831,77 @@ impl ReplicationEngine {
 // Free functions for background tasks
 // ===========================================================================
 
+/// Which ceiling rejected an audit-responder admission attempt.
+///
+/// Stable, machine-readable so a production log-scrape can bucket drops by
+/// cause. A 24 h node log collapsed 117 dropped responsible replies into a
+/// single opaque "capacity reached" line; this splits the two distinct causes
+/// so the next such investigation can tell a global-pool exhaustion (the whole
+/// node is saturated) from a per-peer cap hit (one source is self-throttling)
+/// without re-instrumenting.
+///
+/// This branch runs a SINGLE shared audit-responder pool for all challenge
+/// kinds (responsible / subtree / byte), so there is no separate slow/fast
+/// pool to distinguish here — the `kind=` log field already separates the
+/// responsible (fast-path) challenge from the heavier subtree/byte ones. If a
+/// dedicated slow pool is later split out, add its variants here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuditResponderRejectReason {
+    /// The global [`MAX_CONCURRENT_AUDIT_RESPONSES`] semaphore had no permit
+    /// free; the per-peer cap was not the binding constraint.
+    GlobalPoolFull,
+    /// `source` already held its [`MAX_AUDIT_RESPONSES_PER_PEER`] in-flight
+    /// share, so the global permit was never attempted.
+    PerPeerCapFull,
+}
+
+impl AuditResponderRejectReason {
+    /// Stable token emitted as `reason=<token>` in drop logs. Keep these values
+    /// frozen — production log tooling greps for them.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::GlobalPoolFull => "global_pool_full",
+            Self::PerPeerCapFull => "per_peer_cap_full",
+        }
+    }
+}
+
+/// Why an audit-responder admission attempt failed, with the decision-time
+/// capacity counters that let a drop be logged with full context.
+///
+/// `global_inflight`/`peer_inflight` are best-effort snapshots taken as the
+/// decision was made (the two ceilings are read under different locks, so they
+/// are not a single atomic view), but they are exact enough to tell a saturated
+/// node from a single self-throttling flooder.
+#[derive(Debug, Clone, Copy)]
+struct AuditResponderAdmissionFailure {
+    reason: AuditResponderRejectReason,
+    /// Global permits in use across the whole engine at decision time.
+    global_inflight: usize,
+    /// Configured global ceiling ([`MAX_CONCURRENT_AUDIT_RESPONSES`]).
+    global_limit: usize,
+    /// In-flight audit responders already held for `source` at decision time.
+    peer_inflight: u32,
+    /// Configured per-peer ceiling ([`MAX_AUDIT_RESPONSES_PER_PEER`]).
+    peer_limit: u32,
+}
+
+impl fmt::Display for AuditResponderAdmissionFailure {
+    /// Renders the stable `reason=... global_inflight=... global_limit=...
+    /// peer_inflight=... peer_limit=...` suffix appended to every drop log.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "reason={} global_inflight={} global_limit={} peer_inflight={} peer_limit={}",
+            self.reason.as_str(),
+            self.global_inflight,
+            self.global_limit,
+            self.peer_inflight,
+            self.peer_limit,
+        )
+    }
+}
+
 /// RAII admission for one audit-responder task: holds the GLOBAL permit and,
 /// on drop, decrements the PER-PEER in-flight count. Moving this into the
 /// spawned task ties both bounds to the task's exact lifetime — no manual
@@ -1876,39 +1948,73 @@ impl Drop for AuditResponderGuard {
 }
 
 /// Try to admit one audit-responder task for `source`: take a global permit AND
-/// a per-peer slot (both bounded). Returns `None` (caller drops the challenge,
-/// leaving the remote auditor to apply that audit path's timeout policy) if
-/// either ceiling is hit, so one flooder can neither exhaust the global pool's
-/// effect on others nor exceed its own per-peer share (codex-r2 A).
+/// a per-peer slot (both bounded). Returns `Err` with the binding ceiling and
+/// its decision-time counters (caller drops the challenge, leaving the remote
+/// auditor to apply that audit path's timeout policy) if either ceiling is hit,
+/// so one flooder can neither exhaust the global pool's effect on others nor
+/// exceed its own per-peer share (codex-r2 A). The `Err` reason lets the caller
+/// log exactly WHY the drop happened rather than a single opaque "capacity
+/// reached".
 async fn admit_audit_responder(
     semaphore: &Arc<Semaphore>,
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
     source: &PeerId,
-) -> Option<AuditResponderGuard> {
+) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
+    let global_limit = MAX_CONCURRENT_AUDIT_RESPONSES;
+    let peer_limit = MAX_AUDIT_RESPONSES_PER_PEER;
+    // `available_permits()` is a cheap atomic load; `global_limit - available`
+    // is the best-effort in-flight count at decision time. Not synchronized with
+    // the per-peer lock, so it is a snapshot, not a single atomic view.
+    let global_inflight = |sem: &Semaphore| global_limit.saturating_sub(sem.available_permits());
+
     // Per-peer cap first (cheap, and the fairness-critical bound), committed
     // under the write lock so concurrent challenges from the same peer can't
     // both slip past the cap.
     {
         let mut map = inflight.write().await;
         let entry = map.entry(*source).or_insert(0);
-        if *entry >= MAX_AUDIT_RESPONSES_PER_PEER {
-            return None;
+        if *entry >= peer_limit {
+            let peer_inflight = *entry;
+            drop(map); // release before the (unrelated) semaphore read
+            return Err(AuditResponderAdmissionFailure {
+                reason: AuditResponderRejectReason::PerPeerCapFull,
+                global_inflight: global_inflight(semaphore),
+                global_limit,
+                peer_inflight,
+                peer_limit,
+            });
         }
         *entry += 1;
     }
     // Then the global ceiling. If it's exhausted, give back the per-peer slot we
     // just claimed so it isn't leaked.
     let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
-        let mut map = inflight.write().await;
-        if let Some(n) = map.get_mut(source) {
-            *n = n.saturating_sub(1);
-            if *n == 0 {
-                map.remove(source);
+        let peer_inflight = {
+            let mut map = inflight.write().await;
+            match map.get_mut(source) {
+                // Report the per-peer occupancy AFTER releasing our rolled-back
+                // slot: the share still held by this source's other in-flight
+                // tasks (below the cap, since the per-peer check passed).
+                Some(n) => {
+                    *n = n.saturating_sub(1);
+                    let remaining = *n;
+                    if *n == 0 {
+                        map.remove(source);
+                    }
+                    remaining
+                }
+                None => 0,
             }
-        }
-        return None;
+        };
+        return Err(AuditResponderAdmissionFailure {
+            reason: AuditResponderRejectReason::GlobalPoolFull,
+            global_inflight: global_inflight(semaphore),
+            global_limit,
+            peer_inflight,
+            peer_limit,
+        });
     };
-    Some(AuditResponderGuard {
+    Ok(AuditResponderGuard {
         _permit: permit,
         inflight: Arc::clone(inflight),
         peer: *source,
@@ -2052,15 +2158,21 @@ async fn handle_replication_message(
             // is hit. Responsible/prune audit timeouts are penalised by the
             // caller, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
-            else {
-                warn!(
-                    "Audit challenge reply not sent: kind=responsible response=dropped \
-                     source={source} (audit-responder capacity reached)"
-                );
-                return Ok(());
+            let guard = match admit_audit_responder(
+                audit_responder_semaphore,
+                audit_responder_inflight,
+                source,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    warn!(
+                        "Audit challenge reply not sent: kind=responsible response=dropped \
+                         source={source} {failure}"
+                    );
+                    return Ok(());
+                }
             };
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
@@ -2103,15 +2215,21 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
-            else {
-                warn!(
-                    "Audit challenge reply not sent: kind=subtree response=dropped \
-                     source={source} (audit-responder capacity reached)"
-                );
-                return Ok(());
+            let guard = match admit_audit_responder(
+                audit_responder_semaphore,
+                audit_responder_inflight,
+                source,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    warn!(
+                        "Audit challenge reply not sent: kind=subtree response=dropped \
+                         source={source} {failure}"
+                    );
+                    return Ok(());
+                }
             };
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
@@ -2165,15 +2283,21 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=byte source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let Some(guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
-            else {
-                warn!(
-                    "Audit challenge reply not sent: kind=byte response=dropped \
-                     source={source} (audit-responder capacity reached)"
-                );
-                return Ok(());
+            let guard = match admit_audit_responder(
+                audit_responder_semaphore,
+                audit_responder_inflight,
+                source,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    warn!(
+                        "Audit challenge reply not sent: kind=byte response=dropped \
+                         source={source} {failure}"
+                    );
+                    return Ok(());
+                }
             };
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
@@ -2229,12 +2353,18 @@ async fn handle_replication_message(
             // cap) so a flood of fetches cannot drive unbounded commitment
             // clone/encode/send work; over-limit is dropped, which the fetching
             // peer graces exactly like a missed audit response.
-            let Some(_guard) =
-                admit_audit_responder(audit_responder_semaphore, audit_responder_inflight, source)
-                    .await
-            else {
-                debug!("GetCommitmentByPin from {source} dropped: responder capacity reached");
-                return Ok(());
+            let _guard = match admit_audit_responder(
+                audit_responder_semaphore,
+                audit_responder_inflight,
+                source,
+            )
+            .await
+            {
+                Ok(guard) => guard,
+                Err(failure) => {
+                    debug!("GetCommitmentByPin from {source} dropped: {failure}");
+                    return Ok(());
+                }
             };
             let response = my_commitment_state.lookup_by_hash(&request.pin).map_or(
                 protocol::GetCommitmentByPinResponse::NotRetained { pin: request.pin },
@@ -5055,19 +5185,23 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::{
-        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
-        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
-        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
-        quote_within_audit_window, MONETIZED_AUDIT_SKEW_MARGIN,
+        admit_audit_responder, apply_audit_failure_credit_revocation,
+        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
+        audit_launch_decision, config, cooldown_allows_audit, first_failed_key_label,
+        fresh_offer_payment_context, paid_notify_payment_context, quote_within_audit_window,
+        AuditResponderRejectReason, MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES,
+        MONETIZED_AUDIT_SKEW_MARGIN,
     };
     use crate::payment::VerificationContext;
     use crate::replication::recent_provers::RecentProvers;
     use crate::replication::types::AuditFailureReason;
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
+    use tokio::sync::{RwLock, Semaphore};
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -5079,6 +5213,60 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    #[tokio::test]
+    async fn audit_responder_admission_reports_per_peer_cap_full() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA1);
+
+        let mut guards = Vec::new();
+        for _ in 0..MAX_AUDIT_RESPONSES_PER_PEER {
+            match admit_audit_responder(&semaphore, &inflight, &peer).await {
+                Ok(guard) => guards.push(guard),
+                Err(err) => panic!("unexpected admission failure before peer cap: {err:?}"),
+            }
+        }
+
+        let err = match admit_audit_responder(&semaphore, &inflight, &peer).await {
+            Ok(_) => panic!("admission should fail once per-peer cap is full"),
+            Err(err) => err,
+        };
+        assert_eq!(err.reason, AuditResponderRejectReason::PerPeerCapFull);
+        assert_eq!(err.peer_inflight, MAX_AUDIT_RESPONSES_PER_PEER);
+        assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
+        assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
+
+        drop(guards);
+    }
+
+    #[tokio::test]
+    async fn audit_responder_admission_reports_global_pool_full() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA2);
+
+        let mut held_global_permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_AUDIT_RESPONSES {
+            held_global_permits.push(
+                Arc::clone(&semaphore)
+                    .try_acquire_owned()
+                    .expect("test should be able to exhaust the global pool"),
+            );
+        }
+
+        let err = match admit_audit_responder(&semaphore, &inflight, &peer).await {
+            Ok(_) => panic!("admission should fail once global pool is full"),
+            Err(err) => err,
+        };
+        assert_eq!(err.reason, AuditResponderRejectReason::GlobalPoolFull);
+        assert_eq!(err.global_inflight, MAX_CONCURRENT_AUDIT_RESPONSES);
+        assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
+        assert_eq!(err.peer_inflight, 0);
+        assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
+
+        drop(held_global_permits);
     }
 
     #[test]
