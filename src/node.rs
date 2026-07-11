@@ -176,12 +176,13 @@ impl NodeBuilder {
                         protocol
                             .payment_verifier_arc()
                             .attach_commitment_cache(Arc::clone(engine.last_commitment_by_peer()));
-                        // ADR-0004: give the verifier the monetized-pin sender so
-                        // commitments that back a payment get a deterministic
-                        // first audit from the engine's drainer.
-                        protocol
-                            .payment_verifier_arc()
-                            .attach_monetized_pin_sender(engine.monetized_pin_sender());
+                        // EXPERIMENT: leave the ADR-0004 monetized-pin sender
+                        // detached so paid PUTs do not enqueue deterministic
+                        // first audits. Quote/commitment verification and the
+                        // existing gossip-lottery audit path remain unchanged.
+                        info!(
+                            "EXPERIMENT: ADR-0004 deterministic first audits disabled; monetized-pin sender not attached"
+                        );
                     }
                     Some(engine)
                 }
