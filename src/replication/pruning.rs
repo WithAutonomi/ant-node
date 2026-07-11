@@ -37,6 +37,9 @@ use crate::storage::LmdbStorage;
 use super::REPLICATION_TRUST_WEIGHT;
 
 const MAX_CONCURRENT_PRUNE_AUDIT_CHALLENGES: usize = 32;
+/// Preserve the pre-#164 minimum response budget for one-key prune audits while
+/// retaining dynamic scaling for larger future prune challenge batches.
+const PRUNE_AUDIT_RESPONSE_MIN: Duration = Duration::from_secs(10);
 
 /// Maximum expired `PaidForList` entries selected for verification per prune
 /// pass. The unique peer fan-out for those entries is capped separately.
@@ -1250,7 +1253,7 @@ async fn send_prune_audit_challenge(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> Option<(ReplicationMessage, Duration, Duration)> {
-    let timeout = config.audit_response_timeout(key_count);
+    let timeout = prune_audit_response_timeout(config, key_count);
     let started = Instant::now();
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
@@ -1307,6 +1310,12 @@ async fn send_prune_audit_challenge(
     };
 
     Some((decoded, started.elapsed(), timeout))
+}
+
+fn prune_audit_response_timeout(config: &ReplicationConfig, key_count: usize) -> Duration {
+    config
+        .audit_response_timeout(key_count)
+        .max(PRUNE_AUDIT_RESPONSE_MIN)
 }
 
 /// Bounded classification for observability only. The transport currently
@@ -1558,6 +1567,23 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_audit_timeout_has_ten_second_minimum_and_keeps_dynamic_scaling() {
+        let config = ReplicationConfig::default();
+        assert_eq!(
+            prune_audit_response_timeout(&config, 1),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            prune_audit_response_timeout(&config, 10),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            prune_audit_response_timeout(&config, 100),
+            Duration::from_secs(44)
+        );
+    }
 
     #[test]
     fn classify_prune_audit_send_error_uses_bounded_classes() {
