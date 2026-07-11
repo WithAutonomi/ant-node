@@ -1152,7 +1152,7 @@ async fn peer_proves_record(
         (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
     };
     let (encoded, key_count) = encode_prune_audit_challenge(&peer, key, challenge_id, nonce)?;
-    let Some(decoded) =
+    let Some((decoded, elapsed, timeout)) =
         send_prune_audit_challenge(&peer, &key, encoded, key_count, p2p_node, config).await
     else {
         // No decoded response means a timeout or malformed reply. Prune
@@ -1167,6 +1167,27 @@ async fn peer_proves_record(
     if prune_audit_response_clears_bootstrap_claim(status) {
         clear_prune_bootstrap_claim(&peer, sync_state).await;
     }
+
+    let outcome = match status {
+        PruneAuditStatus::Proven => "proven",
+        PruneAuditStatus::Bootstrapping => "bootstrapping",
+        PruneAuditStatus::Failed => "proof_failed",
+    };
+    info!(
+        audit_type = "prune",
+        audit_phase = "challenge_response",
+        audit_outcome = outcome,
+        challenged_peer = %peer,
+        challenge_id,
+        key_count,
+        timeout_ms = timeout.as_millis(),
+        elapsed_ms = elapsed.as_millis(),
+        challenged_key = %hex::encode(key),
+        "Prune audit outcome: audit_type=prune, audit_phase=challenge_response, audit_outcome={outcome}, challenged_peer={peer}, challenge_id={challenge_id}, key_count={key_count}, timeout_ms={}, elapsed_ms={}, challenged_key={}",
+        timeout.as_millis(),
+        elapsed.as_millis(),
+        hex::encode(key),
+    );
 
     match status {
         PruneAuditStatus::Proven => Some((peer, key)),
@@ -1228,14 +1249,33 @@ async fn send_prune_audit_challenge(
     key_count: usize,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Option<ReplicationMessage> {
+) -> Option<(ReplicationMessage, Duration, Duration)> {
     let timeout = config.audit_response_timeout(key_count);
+    let started = Instant::now();
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await
     {
         Ok(response) => response,
         Err(e) => {
+            let elapsed = started.elapsed();
+            let send_error = e.to_string();
+            let send_error_class = classify_prune_audit_send_error(&send_error);
+            warn!(
+                audit_type = "prune",
+                audit_phase = "challenge_send",
+                audit_outcome = "send_request_failed",
+                challenged_peer = %peer,
+                key_count,
+                timeout_ms = timeout.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                challenged_key = %hex::encode(key),
+                send_error_class,
+                "Prune audit outcome: audit_type=prune, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={peer}, key_count={key_count}, timeout_ms={}, elapsed_ms={}, challenged_key={}, send_error_class={send_error_class}",
+                timeout.as_millis(),
+                elapsed.as_millis(),
+                hex::encode(key),
+            );
             debug!(
                 "Prune audit challenge for {} against {peer} failed: {e}",
                 hex::encode(key)
@@ -1247,12 +1287,42 @@ async fn send_prune_audit_challenge(
     let decoded = match ReplicationMessage::decode(&response.data) {
         Ok(msg) => msg,
         Err(e) => {
-            warn!("Failed to decode prune audit response from {peer}: {e}");
+            let elapsed = started.elapsed();
+            warn!(
+                audit_type = "prune",
+                audit_phase = "challenge_decode",
+                audit_outcome = "malformed_response",
+                challenged_peer = %peer,
+                key_count,
+                timeout_ms = timeout.as_millis(),
+                elapsed_ms = elapsed.as_millis(),
+                challenged_key = %hex::encode(key),
+                "Prune audit outcome: audit_type=prune, audit_phase=challenge_decode, audit_outcome=malformed_response, challenged_peer={peer}, key_count={key_count}, timeout_ms={}, elapsed_ms={}, challenged_key={}: {e}",
+                timeout.as_millis(),
+                elapsed.as_millis(),
+                hex::encode(key),
+            );
             return None;
         }
     };
 
-    Some(decoded)
+    Some((decoded, started.elapsed(), timeout))
+}
+
+/// Bounded classification for observability only. The transport currently
+/// exposes some request failures through display strings, so this must not be
+/// used for trust or protocol decisions.
+fn classify_prune_audit_send_error(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        "timeout"
+    } else if lower.contains("peer not found") || lower.contains("no channel") {
+        "peer_unavailable"
+    } else if lower.contains("encode") || lower.contains("decode") {
+        "codec"
+    } else {
+        "transport"
+    }
 }
 
 fn prune_audit_response_status(
@@ -1488,6 +1558,26 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classify_prune_audit_send_error_uses_bounded_classes() {
+        assert_eq!(
+            classify_prune_audit_send_error("request timed out after 4.4s"),
+            "timeout"
+        );
+        assert_eq!(
+            classify_prune_audit_send_error("peer not found in routing table"),
+            "peer_unavailable"
+        );
+        assert_eq!(
+            classify_prune_audit_send_error("no channel available"),
+            "peer_unavailable"
+        );
+        assert_eq!(
+            classify_prune_audit_send_error("transport closed"),
+            "transport"
+        );
+    }
 
     fn peer_id_from_byte(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
