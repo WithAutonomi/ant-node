@@ -169,11 +169,11 @@ pub async fn note_capacity_rejected(
 /// Called whenever `source` completes an admission cycle with zero
 /// capacity rejections: the source successfully re-delivered any hints
 /// that previously overflowed, so its contribution to "bootstrap not
-/// drained" is retired. No-op if the source had no outstanding rejections.
+/// drained" is retired. Returns whether an outstanding entry was removed.
 pub async fn clear_capacity_rejected(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     source: &saorsa_core::identity::PeerId,
-) {
+) -> bool {
     let mut state = bootstrap_state.write().await;
     if state.capacity_rejected_sources.remove(source) {
         let n = state.capacity_rejected_sources.len();
@@ -181,6 +181,9 @@ pub async fn clear_capacity_rejected(
             "Bootstrap: cleared outstanding capacity rejections for {source} \
              ({n} sources still outstanding)"
         );
+        true
+    } else {
+        false
     }
 }
 
