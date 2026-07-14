@@ -1297,6 +1297,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_history = Arc::clone(&self.sync_history);
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
@@ -1564,6 +1565,14 @@ impl ReplicationEngine {
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                update_bootstrap_after_peer_removed(
+                                    &peer_id,
+                                    &handler_context.bootstrap_state,
+                                    &handler_context.queues,
+                                    &handler_context.is_bootstrapping,
+                                    &bootstrap_complete_notify,
+                                )
+                                .await;
                                 // v12: drop the commitment bytes and the
                                 // recent-prover credit so a churn / sybil
                                 // attacker cannot leave behind one
@@ -4714,6 +4723,26 @@ async fn update_bootstrap_after_verification(
     }
 }
 
+/// Retire bootstrap work owed by a peer that permanently left the routing
+/// table, then immediately re-check drain so this removal can complete
+/// bootstrap without waiting for an unrelated pipeline event.
+async fn update_bootstrap_after_peer_removed(
+    peer: &PeerId,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+) {
+    if !bootstrap::clear_capacity_rejected(bootstrap_state, peer).await {
+        return;
+    }
+
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
+    }
+}
+
 /// Set `is_bootstrapping` to `false` and wake all waiters.
 async fn complete_bootstrap(
     is_bootstrapping: &Arc<RwLock<bool>>,
@@ -6031,6 +6060,39 @@ mod tests {
         assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
 
         drop(held_global_permits);
+    }
+
+    #[tokio::test]
+    async fn peer_removed_clears_capacity_rejection_and_completes_bootstrap() {
+        let peer = test_peer(0xA5);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
+        let is_bootstrapping = Arc::new(RwLock::new(true));
+        let bootstrap_complete_notify = Arc::new(Notify::new());
+
+        super::bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
+        {
+            let q = queues.read().await;
+            assert!(
+                !super::bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await,
+                "capacity rejection should initially block bootstrap drain"
+            );
+        }
+
+        update_bootstrap_after_peer_removed(
+            &peer,
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+        )
+        .await;
+
+        let state = bootstrap_state.read().await;
+        assert!(state.capacity_rejected_sources.is_empty());
+        assert!(state.is_drained());
+        drop(state);
+        assert!(!*is_bootstrapping.read().await);
     }
 
     #[test]
