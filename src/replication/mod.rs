@@ -1278,6 +1278,16 @@ impl ReplicationEngine {
                 if oldest_first_pass {
                     snapshot.reverse();
                 }
+                // Whether this pass actually spent a launch token. The lane
+                // alternates on LAUNCHES, never on passes: most passes launch
+                // nothing (the bucket is empty between refills), and a pass is
+                // triggered by ingress as well as by the tick — so flipping per
+                // pass would let an attacker steer lane parity with the timing
+                // of its own nominations, and always hand the token-bearing pass
+                // to the newest lane. Flipping per launch makes CONSECUTIVE
+                // LAUNCHES strictly alternate, whatever the scan pattern in
+                // between, so the oldest lane cannot be skipped.
+                let mut launched_this_pass = false;
                 let mut deferred: Vec<(PeerId, MonetizedPinEvent)> = Vec::new();
                 for (peer, event) in snapshot {
                     // Dedup: a pin already first-audited is dropped (done).
@@ -1367,6 +1377,7 @@ impl ReplicationEngine {
                     // which an unresponsive peer could otherwise farm for load.
                     limiter.commit_launch(peer, event.key_count, assess_now);
                     first_audited.put(event.pin, ());
+                    launched_this_pass = true;
                     observability.launched.fetch_add(1, Ordering::Relaxed);
                     // Drop-guarded slot: released when the audit task finishes,
                     // panics, or is cancelled — the in-flight cap can never
@@ -1485,7 +1496,12 @@ impl ReplicationEngine {
                         pending.put(peer, event);
                     }
                 }
-                oldest_first_pass = !oldest_first_pass;
+                // Flip ONLY when a token was actually spent (see
+                // `launched_this_pass`): a barren scan — however it was
+                // triggered — must not advance the lane.
+                if launched_this_pass {
+                    oldest_first_pass = !oldest_first_pass;
+                }
             }
             debug!("First-audit drainer shut down");
         });
@@ -6048,6 +6064,66 @@ mod tests {
         assert_eq!(
             limiter.assess(&peer, 10, base, 0),
             LimiterVerdict::WindowDeduped
+        );
+    }
+
+    /// ADR-0004 Amendment 2 anti-starvation invariant: the launch lane must
+    /// advance per LAUNCH, never per pass. Passes are triggered by ingress as
+    /// well as by the retry tick and most of them spend no token (the bucket
+    /// is empty between refills), so a per-pass flip would let an attacker
+    /// steer lane parity purely with the timing of its own nominations and
+    /// keep every token-bearing pass on the newest lane — starving an aging
+    /// pin with nothing but fresh decoys. This models the drainer's lane rule
+    /// against that exact attack: barren scans (however many, however timed)
+    /// must not advance the lane, so consecutive launches strictly alternate.
+    #[test]
+    fn first_audit_lane_alternates_per_launch_not_per_pass() {
+        // Mirrors the drainer: `oldest_first_pass` flips iff a token was spent.
+        fn run_pass(lane_oldest: &mut bool, tokens: &mut u32) -> Option<bool> {
+            let lane = *lane_oldest;
+            if *tokens == 0 {
+                return None; // barren scan: no launch, no flip
+            }
+            *tokens -= 1;
+            *lane_oldest = !*lane_oldest;
+            Some(lane)
+        }
+
+        let mut lane_oldest = false;
+        let mut tokens = 0u32;
+        let mut launch_lanes = Vec::new();
+
+        // The attacker injects nominations to force barren scans, trying to
+        // land every refill on the newest lane.
+        for _ in 0..8 {
+            for _ in 0..5 {
+                // Barren scans between refills: attacker-controlled in number.
+                assert_eq!(
+                    run_pass(&mut lane_oldest, &mut tokens),
+                    None,
+                    "a scan with no token must not launch"
+                );
+            }
+            tokens += 1; // refill
+            let lane =
+                run_pass(&mut lane_oldest, &mut tokens).expect("a refilled bucket must launch");
+            launch_lanes.push(lane);
+        }
+
+        // Consecutive launches alternate, so the oldest lane gets served every
+        // other launch no matter how the attacker times its ingress.
+        for (i, lane) in launch_lanes.iter().enumerate() {
+            assert_eq!(
+                *lane,
+                i % 2 == 1,
+                "launch {i} landed on the wrong lane: barren scans must not \
+                 advance lane parity"
+            );
+        }
+        assert_eq!(
+            launch_lanes.iter().filter(|oldest| **oldest).count(),
+            4,
+            "half of all launches must serve the oldest lane"
         );
     }
 

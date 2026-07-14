@@ -416,13 +416,17 @@ settlement nominates every paid index, principal recycles through
 sybil-controlled reward addresses (the real costs are gas, liquidity, and
 close-group positioning, not the transferred amount), and a sidecar-only
 target pin has NO lottery backstop. The scheduler therefore does not rely on
-economics alone: launch passes alternate between newest-first and
-oldest-first, so fresh decoys cannot displace an aging pin from the oldest
-lane — suppressing it would additionally require pre-aged pending decoys at
-every observer, which that lane itself drains and the per-peer re-audit
-window blocks from refreshing. Residual exposure is the reduced coverage
-latency any bounded scheduler has under sustained hostile load, not
-indefinite suppression. (2) *Settlement overwrite (pre-existing,
+economics alone: consecutive LAUNCHES strictly alternate between a
+newest-first and an oldest-first lane (the lane advances only when a token is
+actually spent, never on a barren scan, so nomination timing cannot steer
+lane parity). Fresh decoys therefore cannot capture the oldest lane, and an
+aging pin is served there. The remaining suppression routes both cost real
+settled payments at scale: pre-aged pending decoys at every observer (which
+the oldest lane itself drains, and which the per-peer re-audit window blocks
+from refreshing), or evicting the target from a 4096-entry pending LRU with
+that many fresher distinct-peer nominations. Residual exposure is therefore
+increased coverage latency under sustained, paid, well-positioned hostile
+load — not free or indefinite suppression. (2) *Settlement overwrite (pre-existing,
 contract-level):* the vault's `payForQuotes` unconditionally overwrites
 `completedPayments[quoteHash]`, so a third party who learns a quote hash can
 overwrite the record (already breaking the long-standing amount check with a
