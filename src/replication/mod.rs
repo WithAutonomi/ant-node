@@ -274,9 +274,12 @@ const MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE: usize = 3;
 /// Bootstrap drain check interval in seconds.
 const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 
-/// Grace period `shutdown()` waits for each background task (and, collectively,
-/// the detached fresh-offer worker pool) to observe the cancellation token and
-/// terminate before it gives up and aborts / abandons the wait.
+/// Grace period `shutdown()` waits for each long-lived background task to
+/// observe the cancellation token and terminate before aborting it.
+///
+/// Detached fresh-offer workers are drained without a timeout because they may
+/// be awaiting a `spawn_blocking` LMDB transaction, which continues running if
+/// its async waiter is dropped.
 const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the responder rebuilds + rotates its storage commitment.
@@ -829,19 +832,11 @@ impl ReplicationEngine {
 
         // Drain detached fresh-offer workers. The serial message handler has
         // already stopped (its handle is drained above), so no new workers can
-        // be spawned; each observes the cancelled token and finishes promptly,
-        // releasing its `Arc<LmdbStorage>` before this returns.
+        // be spawned. A started worker must run through any LMDB write: dropping
+        // the async waiter does not cancel `spawn_blocking`, and would let this
+        // tracker report drained while the transaction still owns the env.
         self.worker_tracker.close();
-        if tokio::time::timeout(SHUTDOWN_TASK_DRAIN_TIMEOUT, self.worker_tracker.wait())
-            .await
-            .is_err()
-        {
-            warn!(
-                "Fresh-offer workers did not drain within {}s; {} still in flight",
-                SHUTDOWN_TASK_DRAIN_TIMEOUT.as_secs(),
-                self.worker_tracker.len()
-            );
-        }
+        self.worker_tracker.wait().await;
     }
 
     /// Trigger an early neighbor sync round.
@@ -1351,7 +1346,6 @@ impl ReplicationEngine {
             audit_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_key_locks,
-            shutdown: shutdown.clone(),
             worker_tracker,
         };
 
@@ -2486,9 +2480,6 @@ struct ReplicationMessageHandlerContext {
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_key_locks: FreshOfferKeyLocks,
-    /// Cancellation token so detached fresh-offer workers abort in-flight work
-    /// (payment verification, LMDB writes) when the engine shuts down.
-    shutdown: CancellationToken,
     /// Tracker the detached fresh-offer workers register with so `shutdown()`
     /// can await their completion and the release of their `Arc<LmdbStorage>`.
     worker_tracker: TaskTracker,
@@ -3045,29 +3036,23 @@ async fn dispatch_fresh_offer(
 
     let ctx = ctx.clone();
     let tracker = ctx.worker_tracker.clone();
-    let shutdown = ctx.shutdown.clone();
     // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
     // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
     // those references be released before the caller reopens the environment.
-    // The `select!` lets it abandon in-flight work promptly on cancellation
-    // instead of blocking shutdown for the full drain grace period.
+    // Do not cancel a started handler: `storage.put()` awaits `spawn_blocking`,
+    // and dropping that awaiter would detach the live LMDB transaction.
     tracker.spawn(async move {
         let _permit = permit;
-        tokio::select! {
-            () = shutdown.cancelled() => {
-                debug!("Fresh-offer worker for {source} cancelled during shutdown");
-            }
-            result = handle_fresh_offer_serialized(
-                &source,
-                &offer,
-                &ctx,
-                request_id,
-                rr_message_id.as_deref(),
-            ) => {
-                if let Err(e) = result {
-                    debug!("Fresh replication offer from {source} error: {e}");
-                }
-            }
+        if let Err(e) = handle_fresh_offer_serialized(
+            &source,
+            &offer,
+            &ctx,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!("Fresh replication offer from {source} error: {e}");
         }
     });
     Ok(())
