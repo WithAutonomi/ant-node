@@ -771,6 +771,17 @@ impl crate::payment::quote::CommitmentSource for ResponderCommitmentState {
             })
     }
 
+    fn current_binding_snapshot(&self) -> Option<crate::payment::quote::QuoteBinding> {
+        // Read-only sibling of `current_binding_for_quote`: same live current
+        // commitment (via `current()`), but no gossip stamp — the price-floor
+        // consumer reads pricing state without extending answerability.
+        self.current()
+            .map(|built| crate::payment::quote::QuoteBinding {
+                key_count: built.commitment().key_count,
+                pin: built.hash(),
+            })
+    }
+
     fn commitment_blob_for_pin(&self, pin: [u8; 32]) -> Option<Vec<u8>> {
         // rmp-encode the `StorageCommitment` itself — the EXACT form the storer's
         // `index_valid_sidecars` deserializes (`rmp_serde::from_slice::<StorageCommitment>`),

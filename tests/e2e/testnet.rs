@@ -1141,6 +1141,7 @@ impl TestNetwork {
             cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
             close_group_size: replication_config.close_group_size,
             local_rewards_address: rewards_address,
+            price_floor: ant_node::payment::PriceFloorConfig::default(),
         };
         let payment_verifier = PaymentVerifier::new(payment_config);
 

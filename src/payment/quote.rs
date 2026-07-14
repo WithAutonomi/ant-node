@@ -54,6 +54,14 @@ pub trait CommitmentSource: Send + Sync {
     /// atomically. `None` if there is no live current commitment.
     fn current_binding_for_quote(&self) -> Option<QuoteBinding>;
 
+    /// Non-mutating snapshot of the current commitment's binding: the same
+    /// value [`Self::current_binding_for_quote`] prices from, WITHOUT
+    /// refreshing answerability. For read-only consumers — the payment
+    /// verifier's price-floor policy reads the local commitment price here —
+    /// that must not extend retention: "quoting is advertising" applies to
+    /// issued quotes only, not to a verifier consulting its own price.
+    fn current_binding_snapshot(&self) -> Option<QuoteBinding>;
+
     /// ADR-0004: the serialized signed commitment for `pin`, if it is still
     /// retained, so the quote response can ship it as a sidecar ("the commitment
     /// arrived with the quote"). Returns the same canonical bytes a peer would
@@ -484,6 +492,10 @@ mod tests {
                 key_count: self.key_count,
                 pin: self.pin,
             })
+        }
+
+        fn current_binding_snapshot(&self) -> Option<QuoteBinding> {
+            self.current_binding_for_quote()
         }
 
         fn commitment_blob_for_pin(&self, _pin: [u8; 32]) -> Option<Vec<u8>> {

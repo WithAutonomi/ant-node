@@ -170,11 +170,17 @@ impl AntProtocol {
     /// (the engine owns the [`ResponderCommitmentState`](crate::replication::commitment_state::ResponderCommitmentState)).
     /// Until this is wired, the quote generator has no commitment source and
     /// falls back to baseline (no-pin) pricing.
+    ///
+    /// The same source is forwarded to the payment verifier's price-floor
+    /// policy (read-only snapshot), so this node's quotes and its floor are
+    /// priced from one commitment by construction.
     pub fn attach_commitment_source(
         &self,
         source: Arc<dyn crate::payment::quote::CommitmentSource>,
     ) {
-        self.quote_generator.attach_commitment_source(source);
+        self.quote_generator
+            .attach_commitment_source(Arc::clone(&source));
+        self.payment_verifier.attach_local_commitment_source(source);
     }
 
     /// ADR-0004: return the proof with any commitment sidecars stripped, so a
@@ -753,6 +759,7 @@ mod tests {
             cache_capacity: 100_000,
             close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
+            price_floor: crate::payment::PriceFloorConfig::default(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(100);
