@@ -183,9 +183,6 @@ impl ReplicationQueues {
                         .entry(source)
                         .or_default()
                         .insert(key);
-                    // Corroborated work no longer needs the singleton
-                    // aggregation hold and should be eligible immediately.
-                    existing.next_verify_at = existing.next_verify_at.min(Instant::now());
                 }
             }
             if entry.pipeline == HintPipeline::Replica {
@@ -850,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_pending_hint_adds_live_source() {
+    fn duplicate_pending_hint_adds_live_source_without_bypassing_deferral() {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
         let source_a = peer_id_from_byte(1);
@@ -868,10 +865,9 @@ mod tests {
                 .hint_sources,
             HashSet::from([source_a, source_b])
         );
-        assert_eq!(
-            queues.ready_pending_keys(Instant::now()),
-            vec![key],
-            "corroboration should end the singleton aggregation hold"
+        assert!(
+            queues.ready_pending_keys(Instant::now()).is_empty(),
+            "a duplicate source must not bypass verification retry deferral"
         );
     }
 
