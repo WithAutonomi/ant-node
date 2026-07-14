@@ -275,9 +275,9 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// Grace period `shutdown()` waits for each long-lived background task to
 /// observe the cancellation token and terminate before aborting it.
 ///
-/// Detached fresh-offer workers are drained without a timeout because they may
-/// be awaiting a `spawn_blocking` LMDB transaction, which continues running if
-/// its async waiter is dropped.
+/// Detached tasks are drained without a timeout because storage-capable work
+/// may be awaiting a `spawn_blocking` LMDB operation, which continues running
+/// if its async waiter is dropped.
 const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the responder rebuilds + rotates its storage commitment.
@@ -526,11 +526,12 @@ pub struct ReplicationEngine {
     shutdown: CancellationToken,
     /// Background task handles.
     task_handles: Vec<JoinHandle<()>>,
-    /// Tracks detached, short-lived fresh-offer worker tasks so `shutdown()`
-    /// can drain them. Unlike `task_handles` these are spawned on demand from
-    /// the message handler and hold `Arc<LmdbStorage>` while writing, so they
-    /// must be awaited before the caller may reopen the LMDB environment.
-    worker_tracker: TaskTracker,
+    /// Tracks detached, short-lived work spawned by background producers.
+    ///
+    /// Fresh-offer workers, audit responders, audit launches, and delayed
+    /// possession checks may retain storage or P2P state after their producer
+    /// exits, so shutdown drains them before those resources may be reopened.
+    detached_task_tracker: TaskTracker,
 }
 
 impl ReplicationEngine {
@@ -602,7 +603,7 @@ impl ReplicationEngine {
             monetized_pin_rx: Some(monetized_pin_rx),
             shutdown,
             task_handles: Vec::new(),
-            worker_tracker: TaskTracker::new(),
+            detached_task_tracker: TaskTracker::new(),
         };
         // ADR-0004 A1: reload persisted responder retention BEFORE any task
         // spawns, so an honest restarted node is answerable for its pre-restart
@@ -829,13 +830,12 @@ impl ReplicationEngine {
             }
         }
 
-        // Drain detached fresh-offer workers. The serial message handler has
-        // already stopped (its handle is drained above), so no new workers can
-        // be spawned. A started worker must run through any LMDB write: dropping
-        // the async waiter does not cancel `spawn_blocking`, and would let this
-        // tracker report drained while the transaction still owns the env.
-        self.worker_tracker.close();
-        self.worker_tracker.wait().await;
+        // All producers have stopped, so close and drain their detached work.
+        // A started storage operation must run to completion: dropping an async
+        // waiter does not cancel `spawn_blocking`, and would let shutdown return
+        // while an LMDB transaction still owns the environment.
+        self.detached_task_tracker.close();
+        self.detached_task_tracker.wait().await;
     }
 
     /// Trigger an early neighbor sync round.
@@ -937,6 +937,7 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let shutdown = self.shutdown.clone();
+        let detached_task_tracker = self.detached_task_tracker.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -955,7 +956,7 @@ impl ReplicationEngine {
                         let shutdown = shutdown.clone();
                         let delay_min = config.possession_check_delay_min;
                         let delay_max = config.possession_check_delay_max;
-                        tokio::spawn(async move {
+                        detached_task_tracker.spawn(async move {
                             let delay = possession::random_delay(delay_min, delay_max);
                             tokio::select! {
                                 () = shutdown.cancelled() => {}
@@ -1001,8 +1002,10 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&self.sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            detached_task_tracker: self.detached_task_tracker.clone(),
         };
         let shutdown = self.shutdown.clone();
+        let detached_task_tracker = self.detached_task_tracker.clone();
         let observability = Arc::new(FirstAuditObservability::default());
 
         let handle = tokio::spawn(async move {
@@ -1218,7 +1221,7 @@ impl ReplicationEngine {
                     );
                     let trigger = gossip_audit.clone();
                     let audit_observability = Arc::clone(&observability);
-                    tokio::spawn(async move {
+                    detached_task_tracker.spawn(async move {
                         let started = Instant::now();
                         let credit = storage_commitment_audit::AuditCredit {
                             recent_provers: &trigger.recent_provers,
@@ -1312,7 +1315,7 @@ impl ReplicationEngine {
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_key_locks = Arc::clone(&self.fresh_offer_key_locks);
-        let worker_tracker = self.worker_tracker.clone();
+        let detached_task_tracker = self.detached_task_tracker.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
         // commitment can spawn a probabilistic, cooldown-gated subtree audit.
@@ -1322,6 +1325,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
+            detached_task_tracker: detached_task_tracker.clone(),
         };
 
         let handler_context = ReplicationMessageHandlerContext {
@@ -1345,7 +1349,7 @@ impl ReplicationEngine {
             audit_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_key_locks,
-            worker_tracker,
+            detached_task_tracker,
         };
 
         let (replication_tx, mut replication_rx) =
@@ -1618,6 +1622,7 @@ impl ReplicationEngine {
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
+        let detached_task_tracker = self.detached_task_tracker.clone();
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -1628,6 +1633,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            detached_task_tracker,
         };
 
         let handle = tokio::spawn(async move {
@@ -2405,9 +2411,9 @@ struct ReplicationMessageHandlerContext {
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_key_locks: FreshOfferKeyLocks,
-    /// Tracker the detached fresh-offer workers register with so `shutdown()`
-    /// can await their completion and the release of their `Arc<LmdbStorage>`.
-    worker_tracker: TaskTracker,
+    /// Shared tracker for detached work so `shutdown()` can await release of
+    /// storage and P2P resources after all producer tasks have stopped.
+    detached_task_tracker: TaskTracker,
 }
 
 struct InboundReplicationMessage {
@@ -2676,7 +2682,7 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            tokio::spawn(async move {
+            ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
                 if let Err(e) = handle_audit_challenge_msg(
                     &source,
@@ -2734,7 +2740,7 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            tokio::spawn(async move {
+            ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
                 let response = storage_commitment_audit::handle_subtree_challenge(
                     &challenge,
@@ -2802,7 +2808,7 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            tokio::spawn(async move {
+            ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
                 let response = storage_commitment_audit::handle_subtree_byte_challenge(
                     &challenge,
@@ -2918,7 +2924,7 @@ async fn dispatch_fresh_offer(
     };
 
     let ctx = ctx.clone();
-    let tracker = ctx.worker_tracker.clone();
+    let tracker = ctx.detached_task_tracker.clone();
     // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
     // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
     // those references be released before the caller reopens the environment.
@@ -5310,6 +5316,7 @@ struct GossipAuditTrigger {
     recent_provers: Arc<RwLock<RecentProvers>>,
     sync_state: Arc<RwLock<NeighborSyncState>>,
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    detached_task_tracker: TaskTracker,
 }
 
 /// What a gossip ingest yields for the audit trigger: the commitment hash to
@@ -5422,9 +5429,10 @@ async fn maybe_trigger_gossip_audit(
         }
     }
 
+    let detached_task_tracker = trigger.detached_task_tracker.clone();
     let trigger = trigger.clone();
     let peer = *peer;
-    tokio::spawn(async move {
+    detached_task_tracker.spawn(async move {
         let credit = storage_commitment_audit::AuditCredit {
             recent_provers: &trigger.recent_provers,
         };
