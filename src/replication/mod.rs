@@ -81,6 +81,21 @@ use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
 
+/// Count of monetized-pin nominations DROPPED at the bounded ingress channel
+/// because it was full (Amendment 2). Process-global because the producer is
+/// the payment verifier (a different module) and the drop happens before the
+/// per-drainer `received` counter. A non-zero value is the rollout signal that
+/// nomination ingress is saturating — benign (penalty-free, lottery/next-
+/// payment covered) but worth watching. `Closed` (engine shut down) is not
+/// counted: it is not a saturation signal.
+static FIRST_AUDIT_INGRESS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one ingress-full drop. Called by the payment verifier's `try_send`
+/// sites; read by the drainer's periodic summary.
+pub(crate) fn note_monetized_ingress_drop() {
+    FIRST_AUDIT_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 #[derive(Default)]
 struct FirstAuditObservability {
     received: AtomicU64,
@@ -1234,7 +1249,8 @@ impl ReplicationEngine {
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
+                        FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
                         observability.coalesced.load(Ordering::Relaxed),
@@ -1388,6 +1404,12 @@ impl ReplicationEngine {
                     // comment above): consecutive launches strictly alternate,
                     // including the two launches of a full burst in one pass.
                     oldest_first_lane = !oldest_first_lane;
+                    // `launched` counts SCHEDULED audits (a token was spent).
+                    // A pin that ages out during the post-jitter re-screen is
+                    // counted separately under `outside_answerability_window`
+                    // and sends nothing, so actual wire challenges are
+                    // `launched - (post-jitter aborts)`; the terminal counters
+                    // (passed/timeout/…) reconcile it exactly.
                     observability.launched.fetch_add(1, Ordering::Relaxed);
                     // Drop-guarded slot: released when the audit task finishes,
                     // panics, or is cancelled — the in-flight cap can never

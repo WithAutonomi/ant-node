@@ -1750,13 +1750,19 @@ impl PaymentVerifier {
             if is_paid {
                 if let Some(ref tx) = monetized_pin_tx {
                     // Bounded queue: drop on full (best-effort, penalty-free;
-                    // the peer's next settled payment re-nominates it).
-                    let _ = tx.try_send(crate::replication::MonetizedPinEvent {
-                        peer: peer_id,
-                        pin,
-                        key_count: quote.committed_key_count,
-                        quote_ts: quote.timestamp,
-                    });
+                    // the peer's next settled payment re-nominates it). Count a
+                    // Full drop so ingress saturation is observable; a Closed
+                    // channel just means the engine is shutting down.
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(crate::replication::MonetizedPinEvent {
+                            peer: peer_id,
+                            pin,
+                            key_count: quote.committed_key_count,
+                            quote_ts: quote.timestamp,
+                        })
+                    {
+                        crate::replication::note_monetized_ingress_drop();
+                    }
                 }
             }
             // Resolution order: sidecar (synchronous, no state) -> gossip cache
@@ -2874,17 +2880,23 @@ impl PaymentVerifier {
             if paid_indices.contains(&idx) {
                 if let Some(ref tx) = monetized_pin_tx {
                     // Bounded queue: drop on full (best-effort, penalty-free;
-                    // the peer's next settled payment re-nominates it).
-                    let _ = tx.try_send(crate::replication::MonetizedPinEvent {
-                        peer: peer_id,
-                        pin,
-                        key_count: candidate.committed_key_count,
-                        quote_ts: std::time::UNIX_EPOCH
-                            .checked_add(std::time::Duration::from_secs(
-                                candidate.merkle_payment_timestamp,
-                            ))
-                            .unwrap_or(std::time::UNIX_EPOCH),
-                    });
+                    // the peer's next settled payment re-nominates it). Count a
+                    // Full drop so ingress saturation is observable; a Closed
+                    // channel just means the engine is shutting down.
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(crate::replication::MonetizedPinEvent {
+                            peer: peer_id,
+                            pin,
+                            key_count: candidate.committed_key_count,
+                            quote_ts: std::time::UNIX_EPOCH
+                                .checked_add(std::time::Duration::from_secs(
+                                    candidate.merkle_payment_timestamp,
+                                ))
+                                .unwrap_or(std::time::UNIX_EPOCH),
+                        })
+                    {
+                        crate::replication::note_monetized_ingress_drop();
+                    }
                 }
             }
 
