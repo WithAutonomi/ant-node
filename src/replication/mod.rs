@@ -610,11 +610,14 @@ pub struct ReplicationEngine {
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
     /// ADR-0004: sender the payment verifier clones to surface monetized pins
     /// for a deterministic first audit. The matching receiver is drained by
-    /// `start_first_audit_drainer`.
-    monetized_pin_tx: mpsc::UnboundedSender<MonetizedPinEvent>,
+    /// `start_first_audit_drainer`. BOUNDED (Amendment 2): the producer
+    /// `try_send`s and drops on a full queue, so ingress memory is capped just
+    /// like launches; a dropped nomination is penalty-free and the peer stays
+    /// covered by the gossip lottery.
+    monetized_pin_tx: mpsc::Sender<MonetizedPinEvent>,
     /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
-    monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
+    monetized_pin_rx: Option<mpsc::Receiver<MonetizedPinEvent>>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -652,7 +655,11 @@ impl ReplicationEngine {
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
-        let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
+        // Bounded (Amendment 2): every stage of the first-audit pipeline is
+        // now capacity-limited — ingress queue here, pending set (LRU), and
+        // launch rate (token bucket).
+        let (monetized_pin_tx, monetized_pin_rx) =
+            mpsc::channel(config::FIRST_AUDIT_INGRESS_CAPACITY);
 
         let engine = Self {
             config: Arc::clone(&config),
@@ -697,10 +704,11 @@ impl ReplicationEngine {
     }
 
     /// ADR-0004: a sender the payment verifier uses to surface monetized pins
-    /// (commitments that backed a payment) for a deterministic first audit.
-    /// Cloneable; the engine drains the matching receiver.
+    /// (commitments that backed a payment) for a first audit. Cloneable; the
+    /// engine drains the matching receiver. Bounded: senders must `try_send`
+    /// and treat a full queue as a benign drop (Amendment 2 best-effort).
     #[must_use]
-    pub fn monetized_pin_sender(&self) -> mpsc::UnboundedSender<MonetizedPinEvent> {
+    pub fn monetized_pin_sender(&self) -> mpsc::Sender<MonetizedPinEvent> {
         self.monetized_pin_tx.clone()
     }
 
@@ -1375,6 +1383,24 @@ impl ReplicationEngine {
                                 .unwrap_or(u64::MAX),
                         );
                         tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
+                        // Re-screen answerability AFTER the jitter sleep so the
+                        // no-false-conviction invariant (ADR-0004 A1) holds by
+                        // construction, independent of how the skew margin and
+                        // the jitter are sized relative to each other. A pin
+                        // that aged out during the sleep is skipped with no
+                        // consequence for the peer (slot released by the drop
+                        // guard; pin stays first_audited — lottery covers it).
+                        if !quote_within_audit_window(event.quote_ts, SystemTime::now()) {
+                            audit_observability
+                                .outside_answerability_window
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "First-audit scheduler: audit_trigger=first_monetized outcome=outside_answerability_window post_jitter=true peer={} pin={} key_count={}",
+                                event.peer, hex::encode(event.pin), event.key_count
+                            );
+                            drop(inflight_slot);
+                            return;
+                        }
                         let started = Instant::now();
                         let credit = storage_commitment_audit::AuditCredit {
                             recent_provers: &trigger.recent_provers,

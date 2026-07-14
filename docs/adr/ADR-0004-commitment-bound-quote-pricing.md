@@ -396,3 +396,28 @@ an explicit load budget, not a per-payment guarantee. The scheduler's funnel
 cooldown_deferred / launched / terminal outcomes, plus tokens and in-flight
 gauges) is exported in the periodic scheduler summary so this coverage is
 measurable in production.
+
+**Every pipeline stage is bounded, and the invariants hold by construction.**
+The verifier-to-drainer nomination channel is bounded (producers `try_send`
+and drop on full — penalty-free, lottery-covered), the pending set is a
+bounded newest-per-peer LRU, and launches are token-bucketed. The A1
+answerability screen runs both before launch selection and again after the
+jitter sleep, so a pin can never be challenged outside its window regardless
+of how deferral time, jitter, and the skew margin compose.
+
+**Accepted residuals.** (1) *Budget-exhaustion starvation:* an uploader can
+keep an observer's launch budget saturated with newer settled payments so an
+older pending pin expires un-first-audited. Each such nomination requires a
+distinct real settled payment (window dedup suppresses repeats per issuer),
+so starving all ~5-9 storers of one chunk for the whole 2.5h eligible window
+costs dozens of on-chain payments plus gas per observer to shield a single
+overcharged payment — economically irrational, and the cheater's gossiped
+commitments remain under the ADR-0002 lottery throughout. (2) *Settlement
+overwrite (pre-existing, contract-level):* the vault's `payForQuotes`
+unconditionally overwrites `completedPayments[quoteHash]`, so a third party
+who learns a quote hash can overwrite the record (already breaking the
+long-standing amount check with a 1-wei payment, on all node versions) and
+now equivalently the rewards-address binding. This griefing race predates
+this amendment and needs a vault-side fix (reject or accumulate on existing
+entries); it is tracked as follow-up work, not a property this ADR can
+enforce from the node side.

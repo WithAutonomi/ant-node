@@ -472,6 +472,17 @@ pub const FIRST_AUDIT_COUNT_JUMP_NUM: u64 = 3;
 /// [`FIRST_AUDIT_COUNT_JUMP_NUM`].
 pub const FIRST_AUDIT_COUNT_JUMP_DEN: u64 = 2;
 
+/// ADR-0004 Amendment 2: capacity of the bounded verifier-to-drainer
+/// monetized-pin channel.
+///
+/// Nominations are gated behind SETTLED on-chain payments, so legitimate
+/// ingress is tiny; the drainer drains every wake (batched at
+/// [`FIRST_AUDIT_DRAIN_BATCH`]) and coalesces newest-per-peer, so a backlog
+/// this deep implies the drainer is starved, not that work is arriving fast.
+/// Producers `try_send` and drop on full: a dropped nomination is
+/// penalty-free, and the peer remains covered by the gossip-lottery path.
+pub const FIRST_AUDIT_INGRESS_CAPACITY: usize = 1024;
+
 /// Number of subtree leaves spot-checked against real chunk bytes per audit
 /// (ADR-0002 real-bytes layer).
 ///

@@ -432,7 +432,7 @@ pub struct PaymentVerifier {
     /// `None` until [`Self::attach_monetized_pin_sender`] (unit tests, or
     /// pre-replication startup), in which case no first audit is scheduled.
     monetized_pin_tx:
-        RwLock<Option<tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>>>,
+        RwLock<Option<tokio::sync::mpsc::Sender<crate::replication::MonetizedPinEvent>>>,
     /// Price-floor input: the SAME live commitment source the local
     /// `QuoteGenerator` prices from, read via the non-mutating snapshot so the
     /// floor never extends commitment answerability. `None` until
@@ -584,7 +584,7 @@ impl PaymentVerifier {
     /// absent (unit tests / pre-replication) no first audit is scheduled.
     pub fn attach_monetized_pin_sender(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>,
+        tx: tokio::sync::mpsc::Sender<crate::replication::MonetizedPinEvent>,
     ) {
         *self.monetized_pin_tx.write() = Some(tx);
         debug!("PaymentVerifier: ADR-0004 monetized-pin sender attached");
@@ -1749,7 +1749,9 @@ impl PaymentVerifier {
             let is_paid = paid_peer.is_some_and(|paid| paid == *encoded_peer_id.as_bytes());
             if is_paid {
                 if let Some(ref tx) = monetized_pin_tx {
-                    let _ = tx.send(crate::replication::MonetizedPinEvent {
+                    // Bounded queue: drop on full (best-effort, penalty-free;
+                    // the gossip lottery still covers the peer).
+                    let _ = tx.try_send(crate::replication::MonetizedPinEvent {
                         peer: peer_id,
                         pin,
                         key_count: quote.committed_key_count,
@@ -2871,7 +2873,9 @@ impl PaymentVerifier {
             // pool candidate (16) was nominated per verified proof.
             if paid_indices.contains(&idx) {
                 if let Some(ref tx) = monetized_pin_tx {
-                    let _ = tx.send(crate::replication::MonetizedPinEvent {
+                    // Bounded queue: drop on full (best-effort, penalty-free;
+                    // the gossip lottery still covers the peer).
+                    let _ = tx.try_send(crate::replication::MonetizedPinEvent {
                         peer: peer_id,
                         pin,
                         key_count: candidate.committed_key_count,
@@ -4861,7 +4865,7 @@ mod tests {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         verifier.attach_monetized_pin_sender(tx);
 
         let ids: Vec<[u8; 32]> = (1..=3u8).map(|b| [b; 32]).collect();
@@ -4904,7 +4908,7 @@ mod tests {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let verifier = create_test_verifier();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         verifier.attach_monetized_pin_sender(tx);
 
         let mut quote =
@@ -4926,7 +4930,7 @@ mod tests {
         use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerkleTree};
 
         let verifier = create_test_verifier();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         verifier.attach_monetized_pin_sender(tx);
 
         let timestamp = std::time::SystemTime::now()
