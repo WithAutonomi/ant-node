@@ -33,7 +33,7 @@ pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -1109,14 +1109,13 @@ impl ReplicationEngine {
             // first-audit load independent of upload volume: payments only
             // NOMINATE pins, the clock launches them.
             let mut limiter = FirstAuditLimiter::new(Instant::now());
-            // Launch-pass direction flip-flop (Amendment 2 anti-starvation):
-            // passes alternate between newest-first (freshest answerability
-            // windows get budget) and oldest-first (an aging pin cannot be
-            // starved out of its eligibility window by a stream of newer
-            // nominations — the attacker would need PRE-aged decoys at every
-            // observer, which the oldest lane itself drains and the per-peer
-            // re-audit window blocks from refreshing).
-            let mut oldest_first_pass = false;
+            // Launch lane (Amendment 2 anti-starvation), flipped on every
+            // COMMITTED LAUNCH — see the launch loop below. Consecutive
+            // launches therefore strictly alternate between the newest pending
+            // pin (freshest answerability window) and the oldest (which can
+            // then never be starved out of its eligibility window by a stream
+            // of fresher nominations, however the attacker times them).
+            let mut oldest_first_lane = false;
             // Periodic retry tick for pending (cooldown/budget-blocked) pins.
             // Created once; `Skip` so a backlog of missed ticks collapses to one.
             let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
@@ -1265,31 +1264,39 @@ impl ReplicationEngine {
 
                 // Try to launch an audit for each pending peer; keep the ones
                 // blocked by cooldown or budget for the next tick. Drain into a
-                // vec first (LruCache has no drain). `iter()` yields most- to
-                // least-recently-used; the pass direction alternates (see
-                // `oldest_first_pass`) so budget is shared between the newest
-                // pins (freshest answerability) and the oldest (starvation
-                // resistance). Deferred entries are collected and re-inserted
-                // afterwards with relative recency restored (oldest re-put
-                // first → stays the eviction victim).
-                let mut snapshot: Vec<(PeerId, MonetizedPinEvent)> =
-                    pending.iter().map(|(p, e)| (*p, *e)).collect();
+                // deque first (LruCache has no drain). `iter()` yields most- to
+                // least-recently-used, so the FRONT is the newest-monetized pin
+                // and the BACK is the oldest.
+                //
+                // ADR-0004 Amendment 2 anti-starvation lane: each launch takes
+                // its candidate from the front (newest: freshest answerability
+                // window) or the back (oldest: cannot be starved), and the lane
+                // flips ON EVERY COMMITTED LAUNCH — never per pass. Passes are
+                // triggered by ingress as well as by the retry tick, and most
+                // spend no token (the bucket is empty between refills), so a
+                // per-pass flip would let an attacker steer lane parity with the
+                // timing of its own nominations (barren scans) and keep every
+                // token-bearing launch on the newest lane. Flipping per launch
+                // makes CONSECUTIVE LAUNCHES strictly alternate — including the
+                // two launches of a full burst inside ONE pass — so an aging pin
+                // is always served by the next oldest-lane launch.
+                //
+                // Each entry keeps its snapshot index (0 = newest) so deferred
+                // entries can be re-inserted oldest-first afterwards, restoring
+                // the LRU's relative recency (oldest re-put first → stays the
+                // eviction victim) no matter which ends they were popped from.
+                let mut queue: VecDeque<(usize, PeerId, MonetizedPinEvent)> = pending
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (p, e))| (i, *p, *e))
+                    .collect();
                 pending.clear();
-                if oldest_first_pass {
-                    snapshot.reverse();
-                }
-                // Whether this pass actually spent a launch token. The lane
-                // alternates on LAUNCHES, never on passes: most passes launch
-                // nothing (the bucket is empty between refills), and a pass is
-                // triggered by ingress as well as by the tick — so flipping per
-                // pass would let an attacker steer lane parity with the timing
-                // of its own nominations, and always hand the token-bearing pass
-                // to the newest lane. Flipping per launch makes CONSECUTIVE
-                // LAUNCHES strictly alternate, whatever the scan pattern in
-                // between, so the oldest lane cannot be skipped.
-                let mut launched_this_pass = false;
-                let mut deferred: Vec<(PeerId, MonetizedPinEvent)> = Vec::new();
-                for (peer, event) in snapshot {
+                let mut deferred: Vec<(usize, PeerId, MonetizedPinEvent)> = Vec::new();
+                while let Some((idx, peer, event)) = if oldest_first_lane {
+                    queue.pop_back()
+                } else {
+                    queue.pop_front()
+                } {
                     // Dedup: a pin already first-audited is dropped (done).
                     if first_audited.contains(&event.pin) {
                         observability.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -1334,7 +1341,7 @@ impl ReplicationEngine {
                             continue;
                         }
                         LimiterVerdict::RateDeferred => {
-                            deferred.push((peer, event));
+                            deferred.push((idx, peer, event));
                             observability
                                 .rate_deferred_attempts
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1357,7 +1364,7 @@ impl ReplicationEngine {
                         let now = Instant::now();
                         let mut map = gossip_audit.cooldown.write().await;
                         if !cooldown_allows_audit(&mut map, &peer, now) {
-                            deferred.push((peer, event));
+                            deferred.push((idx, peer, event));
                             observability
                                 .cooldown_deferred_attempts
                                 .fetch_add(1, Ordering::Relaxed);
@@ -1377,7 +1384,10 @@ impl ReplicationEngine {
                     // which an unresponsive peer could otherwise farm for load.
                     limiter.commit_launch(peer, event.key_count, assess_now);
                     first_audited.put(event.pin, ());
-                    launched_this_pass = true;
+                    // Flip the lane on EVERY committed launch (see the lane
+                    // comment above): consecutive launches strictly alternate,
+                    // including the two launches of a full burst in one pass.
+                    oldest_first_lane = !oldest_first_lane;
                     observability.launched.fetch_add(1, Ordering::Relaxed);
                     // Drop-guarded slot: released when the audit task finishes,
                     // panics, or is cancelled — the in-flight cap can never
@@ -1482,25 +1492,15 @@ impl ReplicationEngine {
                         .await;
                     });
                 }
-                // Re-insert deferred entries oldest-first so the LRU's
-                // relative recency is restored (newest stays most-recently-
-                // used and is the last to be capacity-evicted). The collection
-                // order follows the pass direction, so a newest-first pass
-                // reverses and an oldest-first pass inserts in order.
-                if oldest_first_pass {
-                    for (peer, event) in deferred {
-                        pending.put(peer, event);
-                    }
-                } else {
-                    for (peer, event) in deferred.into_iter().rev() {
-                        pending.put(peer, event);
-                    }
-                }
-                // Flip ONLY when a token was actually spent (see
-                // `launched_this_pass`): a barren scan — however it was
-                // triggered — must not advance the lane.
-                if launched_this_pass {
-                    oldest_first_pass = !oldest_first_pass;
+                // Re-insert deferred entries oldest-first so the LRU's relative
+                // recency is restored (oldest re-put first → stays the eviction
+                // victim; newest stays most-recently-used). Entries were popped
+                // from BOTH ends as the lane alternated, so sort by the snapshot
+                // index (0 = newest) descending rather than relying on the
+                // collection order.
+                deferred.sort_unstable_by_key(|(idx, _, _)| std::cmp::Reverse(*idx));
+                for (_, peer, event) in deferred {
+                    pending.put(peer, event);
                 }
             }
             debug!("First-audit drainer shut down");
@@ -6068,61 +6068,86 @@ mod tests {
     }
 
     /// ADR-0004 Amendment 2 anti-starvation invariant: the launch lane must
-    /// advance per LAUNCH, never per pass. Passes are triggered by ingress as
-    /// well as by the retry tick and most of them spend no token (the bucket
-    /// is empty between refills), so a per-pass flip would let an attacker
-    /// steer lane parity purely with the timing of its own nominations and
-    /// keep every token-bearing pass on the newest lane — starving an aging
-    /// pin with nothing but fresh decoys. This models the drainer's lane rule
-    /// against that exact attack: barren scans (however many, however timed)
-    /// must not advance the lane, so consecutive launches strictly alternate.
+    /// advance on every COMMITTED LAUNCH — never per pass, and never once per
+    /// pass regardless of how many tokens that pass spends.
+    ///
+    /// Two ways to get this wrong, both of which let fresh decoys crowd out an
+    /// aging pin, and both of which this test rejects:
+    ///
+    /// 1. *Flip per pass.* Passes are triggered by ingress as well as by the
+    ///    retry tick, and most spend no token (the bucket is empty between
+    ///    refills), so an attacker could inject nominations to force barren
+    ///    scans, steer lane parity, and keep every token-bearing launch on the
+    ///    newest lane.
+    /// 2. *Flip once per pass that launched.* A full burst spends two tokens
+    ///    inside ONE pass; a single flip afterwards yields `newest, newest,
+    ///    oldest` instead of a strict alternation.
+    ///
+    /// This models the drainer's real loop — a deque popped from the front
+    /// (newest) or the back (oldest) with the lane flipped at each launch —
+    /// and asserts strict alternation across barren scans AND multi-token
+    /// bursts.
     #[test]
-    fn first_audit_lane_alternates_per_launch_not_per_pass() {
-        // Mirrors the drainer: `oldest_first_pass` flips iff a token was spent.
-        fn run_pass(lane_oldest: &mut bool, tokens: &mut u32) -> Option<bool> {
-            let lane = *lane_oldest;
-            if *tokens == 0 {
-                return None; // barren scan: no launch, no flip
+    fn first_audit_lane_alternates_per_launch_across_barren_scans_and_bursts() {
+        /// One drainer pass over `queue_len` pending pins with `tokens`
+        /// available. Returns the lane each launch used, in order.
+        fn run_pass(lane_oldest: &mut bool, tokens: &mut u32, queue_len: usize) -> Vec<bool> {
+            let mut launched = Vec::new();
+            let mut remaining = queue_len;
+            while remaining > 0 && *tokens > 0 {
+                // The lane picks the end of the deque; the launch flips it.
+                launched.push(*lane_oldest);
+                *lane_oldest = !*lane_oldest;
+                *tokens -= 1;
+                remaining -= 1;
             }
-            *tokens -= 1;
-            *lane_oldest = !*lane_oldest;
-            Some(lane)
+            launched
         }
 
         let mut lane_oldest = false;
         let mut tokens = 0u32;
-        let mut launch_lanes = Vec::new();
+        let mut lanes = Vec::new();
 
-        // The attacker injects nominations to force barren scans, trying to
-        // land every refill on the newest lane.
-        for _ in 0..8 {
+        // Attacker forces barren scans between refills, trying to land every
+        // token on the newest lane. A barren pass launches nothing, so it
+        // cannot advance the lane.
+        for _ in 0..4 {
             for _ in 0..5 {
-                // Barren scans between refills: attacker-controlled in number.
-                assert_eq!(
-                    run_pass(&mut lane_oldest, &mut tokens),
-                    None,
-                    "a scan with no token must not launch"
+                assert!(
+                    run_pass(&mut lane_oldest, &mut tokens, 8).is_empty(),
+                    "a pass with no tokens must not launch and must not flip"
                 );
             }
-            tokens += 1; // refill
-            let lane =
-                run_pass(&mut lane_oldest, &mut tokens).expect("a refilled bucket must launch");
-            launch_lanes.push(lane);
+            tokens += 1;
+            lanes.extend(run_pass(&mut lane_oldest, &mut tokens, 8));
         }
 
-        // Consecutive launches alternate, so the oldest lane gets served every
-        // other launch no matter how the attacker times its ingress.
-        for (i, lane) in launch_lanes.iter().enumerate() {
+        // A full burst spends BOTH tokens in a single pass: those two launches
+        // must still alternate with each other.
+        tokens += config::FIRST_AUDIT_BUDGET_BURST;
+        let burst = run_pass(&mut lane_oldest, &mut tokens, 8);
+        assert_eq!(
+            burst.len(),
+            config::FIRST_AUDIT_BUDGET_BURST as usize,
+            "a full burst must launch every token it holds"
+        );
+        lanes.extend(burst);
+
+        // ...and a later single-token pass continues the same alternation.
+        tokens += 1;
+        lanes.extend(run_pass(&mut lane_oldest, &mut tokens, 8));
+
+        for (i, lane) in lanes.iter().enumerate() {
             assert_eq!(
                 *lane,
                 i % 2 == 1,
-                "launch {i} landed on the wrong lane: barren scans must not \
-                 advance lane parity"
+                "launch {i} landed on the wrong lane: consecutive launches must \
+                 strictly alternate across barren scans AND multi-token bursts"
             );
         }
         assert_eq!(
-            launch_lanes.iter().filter(|oldest| **oldest).count(),
-            4,
+            lanes.iter().filter(|oldest| **oldest).count(),
+            lanes.len() / 2,
             "half of all launches must serve the oldest lane"
         );
     }

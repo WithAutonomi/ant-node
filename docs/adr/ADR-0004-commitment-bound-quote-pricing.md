@@ -417,16 +417,24 @@ sybil-controlled reward addresses (the real costs are gas, liquidity, and
 close-group positioning, not the transferred amount), and a sidecar-only
 target pin has NO lottery backstop. The scheduler therefore does not rely on
 economics alone: consecutive LAUNCHES strictly alternate between a
-newest-first and an oldest-first lane (the lane advances only when a token is
-actually spent, never on a barren scan, so nomination timing cannot steer
-lane parity). Fresh decoys therefore cannot capture the oldest lane, and an
-aging pin is served there. The remaining suppression routes both cost real
-settled payments at scale: pre-aged pending decoys at every observer (which
-the oldest lane itself drains, and which the per-peer re-audit window blocks
-from refreshing), or evicting the target from a 4096-entry pending LRU with
-that many fresher distinct-peer nominations. Residual exposure is therefore
-increased coverage latency under sustained, paid, well-positioned hostile
-load — not free or indefinite suppression. (2) *Settlement overwrite (pre-existing,
+newest-first and an oldest-first lane. The lane advances on every committed
+launch — not per scheduling pass (most pass over an empty bucket, and a pass
+is triggered by ingress, so per-pass parity would be attacker-steerable) and
+not once per launching pass (a full burst spends two tokens in one pass, and
+those two must alternate with each other). Fresh decoy nominations therefore
+cannot capture the oldest lane, and an aging pin is served there.
+
+Two suppression routes remain, both requiring real settled payments at scale.
+An attacker holding pre-aged pending decoys at every observer can occupy the
+oldest lane too — though that lane drains them, and the per-peer re-audit
+window blocks the same issuers from refreshing them. And 4096 fresher
+distinct-peer nominations at an observer evict the target from that
+observer's pending LRU, which is permanent for that nomination: coverage then
+depends on the peer's NEXT settled payment (or, for a gossiped commitment, on
+the ADR-0002 lottery). We accept this: both routes cost per-observer sybil
+positioning plus a stream of genuine on-chain settlements, and neither is
+free or silent — the scheduler funnel exports capacity evictions and lane
+outcomes. (2) *Settlement overwrite (pre-existing,
 contract-level):* the vault's `payForQuotes` unconditionally overwrites
 `completedPayments[quoteHash]`, so a third party who learns a quote hash can
 overwrite the record (already breaking the long-standing amount check with a
