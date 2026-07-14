@@ -89,6 +89,8 @@ struct FirstAuditObservability {
     duplicates: AtomicU64,
     capacity_evicted: AtomicU64,
     cooldown_deferred_attempts: AtomicU64,
+    rate_deferred_attempts: AtomicU64,
+    window_deduped: AtomicU64,
     launched: AtomicU64,
     passed: AtomicU64,
     timed_out: AtomicU64,
@@ -163,6 +165,148 @@ fn queue_first_audit_event(
             peer: evicted_peer,
             pin: evicted.pin,
         },
+    }
+}
+
+/// A first audit the limiter recently launched at a peer: when, and the
+/// committed key count that was audited (for the count-jump override).
+#[derive(Debug, Clone, Copy)]
+struct RecentFirstAudit {
+    launched_at: Instant,
+    key_count: u32,
+}
+
+/// ADR-0004 Amendment 2: whether `new_count` exceeds `audited_count` by more
+/// than the [`config::FIRST_AUDIT_COUNT_JUMP_NUM`]/
+/// [`config::FIRST_AUDIT_COUNT_JUMP_DEN`] ratio (`new > old * NUM / DEN`,
+/// overflow-free integer math). A jump re-nominates a peer despite a recent
+/// first audit: an inflated SIDECAR-ONLY pin is visible to payment verifiers
+/// only, so no gossip-lottery audit can ever cover it.
+const fn first_audit_count_jump(audited_count: u32, new_count: u32) -> bool {
+    (new_count as u64) * config::FIRST_AUDIT_COUNT_JUMP_DEN
+        > (audited_count as u64) * config::FIRST_AUDIT_COUNT_JUMP_NUM
+}
+
+/// The launch limiter's verdict for one pending monetized pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterVerdict {
+    /// Within budget and window: the caller may launch (and MUST call
+    /// [`FirstAuditLimiter::commit_launch`] if it actually does).
+    Admit,
+    /// Launch-rate budget or in-flight cap exhausted. Penalty-free: keep the
+    /// pin pending and retry on a later tick.
+    RateDeferred,
+    /// The peer had a first audit within
+    /// [`config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL`] and the new pin's count
+    /// shows no [`first_audit_count_jump`]. Drop the nomination (the
+    /// gossip-lottery re-audit path is unaffected).
+    WindowDeduped,
+}
+
+/// ADR-0004 Amendment 2: the first-audit launch limiter — a token bucket
+/// (launch rate), an in-flight cap, and a per-peer re-audit window that
+/// survives pin rotation.
+///
+/// This is the load-bearing aggregate bound the original scheduler lacked:
+/// fleet-wide first-audit pressure becomes `nodes x refill-rate` instead of
+/// `uploads x pinned-quotes-per-proof x verifying-storers`. Pure over passed
+/// `now`/`inflight` values so every decision is unit-testable without a
+/// runtime.
+struct FirstAuditLimiter {
+    /// Launch tokens available, at most [`config::FIRST_AUDIT_BUDGET_BURST`].
+    tokens: u32,
+    /// Refill anchor. While the bucket is full this tracks `now` (a full
+    /// bucket accrues nothing); while below capacity it advances only by
+    /// whole refill intervals so fractional elapsed time is never lost.
+    last_refill: Instant,
+    /// Peers given a first audit recently, with the audited key count.
+    /// Bounded like the drainer's other per-peer maps.
+    recent: LruCache<PeerId, RecentFirstAudit>,
+}
+
+impl FirstAuditLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: config::FIRST_AUDIT_BUDGET_BURST,
+            last_refill: now,
+            recent: LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            ),
+        }
+    }
+
+    /// Whether the per-peer re-audit window admits a nomination for `peer`
+    /// carrying `key_count` at `now`. Read-only (`peek`), so it is safe to
+    /// call at ENQUEUE time — suppressed nominations never occupy pending
+    /// slots — without disturbing LRU recency.
+    fn window_allows(&self, peer: &PeerId, key_count: u32, now: Instant) -> bool {
+        self.recent.peek(peer).map_or(true, |prev| {
+            now.saturating_duration_since(prev.launched_at)
+                >= config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL
+                || first_audit_count_jump(prev.key_count, key_count)
+        })
+    }
+
+    /// Refill the token bucket for the time elapsed up to `now`.
+    fn refill(&mut self, now: Instant) {
+        if self.tokens >= config::FIRST_AUDIT_BUDGET_BURST {
+            // Full bucket accrues nothing; keep the anchor current so the
+            // next consumption starts its interval from here.
+            self.last_refill = now;
+            return;
+        }
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let earned = elapsed.as_nanos() / interval.as_nanos().max(1);
+        if earned == 0 {
+            return;
+        }
+        let capacity_gap = u128::from(config::FIRST_AUDIT_BUDGET_BURST - self.tokens);
+        if earned >= capacity_gap {
+            self.tokens = config::FIRST_AUDIT_BUDGET_BURST;
+            self.last_refill = now;
+        } else {
+            // earned < capacity_gap <= u32::MAX, so both casts are lossless.
+            self.tokens = self
+                .tokens
+                .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX));
+            let advance = interval.saturating_mul(u32::try_from(earned).unwrap_or(u32::MAX));
+            self.last_refill = self.last_refill.checked_add(advance).unwrap_or(now);
+        }
+    }
+
+    /// Decide whether a pending pin may launch now. Consumes NOTHING: the
+    /// caller runs the remaining (per-peer cooldown) gate and calls
+    /// [`Self::commit_launch`] only for a launch that actually happens, so a
+    /// deferral elsewhere never burns budget or stamps the window.
+    fn assess(
+        &mut self,
+        peer: &PeerId,
+        key_count: u32,
+        now: Instant,
+        inflight: u64,
+    ) -> LimiterVerdict {
+        if !self.window_allows(peer, key_count, now) {
+            return LimiterVerdict::WindowDeduped;
+        }
+        self.refill(now);
+        if inflight >= config::FIRST_AUDIT_MAX_INFLIGHT || self.tokens == 0 {
+            return LimiterVerdict::RateDeferred;
+        }
+        LimiterVerdict::Admit
+    }
+
+    /// Consume one token and stamp the per-peer window for a launch that is
+    /// actually happening.
+    fn commit_launch(&mut self, peer: PeerId, key_count: u32, now: Instant) {
+        self.tokens = self.tokens.saturating_sub(1);
+        self.recent.put(
+            peer,
+            RecentFirstAudit {
+                launched_at: now,
+                key_count,
+            },
+        );
     }
 }
 
@@ -933,8 +1077,13 @@ impl ReplicationEngine {
             let mut pending: LruCache<PeerId, MonetizedPinEvent> = LruCache::new(
                 NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
             );
-            // Periodic retry tick for pending (cooldown-blocked) pins. Created
-            // once; `Skip` so a backlog of missed ticks collapses to one.
+            // ADR-0004 Amendment 2: the launch limiter (token bucket +
+            // in-flight cap + per-peer re-audit window). This is what makes
+            // first-audit load independent of upload volume: payments only
+            // NOMINATE pins, the clock launches them.
+            let mut limiter = FirstAuditLimiter::new(Instant::now());
+            // Periodic retry tick for pending (cooldown/budget-blocked) pins.
+            // Created once; `Skip` so a backlog of missed ticks collapses to one.
             let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_summary = Instant::now();
@@ -958,6 +1107,15 @@ impl ReplicationEngine {
                                 observability.duplicates.fetch_add(1, Ordering::Relaxed);
                                 debug!(
                                     "First-audit scheduler: audit_trigger=first_monetized outcome=duplicate peer={} pin={} key_count={} pending={}",
+                                    e.peer, hex::encode(e.pin), e.key_count, pending.len()
+                                );
+                            } else if !limiter.window_allows(&e.peer, e.key_count, Instant::now()) {
+                                // Recently first-audited peer, no count jump:
+                                // drop at the door so rotated pins never
+                                // occupy pending slots or re-arm launches.
+                                observability.window_deduped.fetch_add(1, Ordering::Relaxed);
+                                debug!(
+                                    "First-audit scheduler: audit_trigger=first_monetized outcome=window_deduped peer={} pin={} key_count={} pending={}",
                                     e.peer, hex::encode(e.pin), e.key_count, pending.len()
                                 );
                             } else {
@@ -997,6 +1155,14 @@ impl ReplicationEngine {
                                             observability
                                                 .duplicates
                                                 .fetch_add(1, Ordering::Relaxed);
+                                        } else if !limiter.window_allows(
+                                            &e.peer,
+                                            e.key_count,
+                                            Instant::now(),
+                                        ) {
+                                            observability
+                                                .window_deduped
+                                                .fetch_add(1, Ordering::Relaxed);
                                         } else {
                                             match queue_first_audit_event(&mut pending, e) {
                                                 FirstAuditQueueOutcome::Queued => {
@@ -1034,13 +1200,15 @@ impl ReplicationEngine {
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
                         observability.coalesced.load(Ordering::Relaxed),
                         observability.duplicates.load(Ordering::Relaxed),
                         observability.capacity_evicted.load(Ordering::Relaxed),
                         observability.cooldown_deferred_attempts.load(Ordering::Relaxed),
+                        observability.rate_deferred_attempts.load(Ordering::Relaxed),
+                        observability.window_deduped.load(Ordering::Relaxed),
                         observability.launched.load(Ordering::Relaxed),
                         observability.passed.load(Ordering::Relaxed),
                         observability.timed_out.load(Ordering::Relaxed),
@@ -1051,6 +1219,7 @@ impl ReplicationEngine {
                         observability.outside_answerability_window.load(Ordering::Relaxed),
                         pending.len(),
                         observability.inflight.load(Ordering::Relaxed),
+                        limiter.tokens,
                     );
                     last_summary = Instant::now();
                 }
@@ -1060,15 +1229,19 @@ impl ReplicationEngine {
                 }
 
                 // Try to launch an audit for each pending peer; keep the ones
-                // still blocked by cooldown for the next tick. Drain into a vec
-                // first so we can re-insert the still-blocked ones afterwards
-                // (LruCache has no drain). `iter()` yields most- to least-recently-
-                // used; we reverse so re-inserting blocked entries below restores
-                // their relative recency (oldest re-put first → stays the eviction
-                // victim, newest stays most-recently-used).
+                // blocked by cooldown or budget for the next tick. Drain into a
+                // vec first (LruCache has no drain). `iter()` yields most- to
+                // least-recently-used, and with the Amendment 2 launch budget
+                // that order is load-bearing: the NEWEST-monetized peers must
+                // consume tokens first (freshest answerability windows, per the
+                // ADR's newest-first coverage rule), with older pins deferred.
+                // Deferred entries are collected and re-inserted afterwards in
+                // reverse order so relative recency is restored (oldest re-put
+                // first → stays the eviction victim).
                 let snapshot: Vec<(PeerId, MonetizedPinEvent)> =
-                    pending.iter().rev().map(|(p, e)| (*p, *e)).collect();
+                    pending.iter().map(|(p, e)| (*p, *e)).collect();
                 pending.clear();
+                let mut deferred: Vec<(PeerId, MonetizedPinEvent)> = Vec::new();
                 for (peer, event) in snapshot {
                     // Dedup: a pin already first-audited is dropped (done).
                     if first_audited.contains(&event.pin) {
@@ -1092,6 +1265,40 @@ impl ReplicationEngine {
                         );
                         continue;
                     }
+                    // ADR-0004 Amendment 2 launch limiter: per-peer re-audit
+                    // window (drop), then launch-rate budget + in-flight cap
+                    // (penalty-free deferral: the pin stays pending). Assessed
+                    // BEFORE the cooldown gate so a budget deferral never burns
+                    // the peer's 30-min cooldown stamp; nothing is consumed
+                    // until `commit_launch` below.
+                    let assess_now = Instant::now();
+                    match limiter.assess(
+                        &peer,
+                        event.key_count,
+                        assess_now,
+                        observability.inflight.load(Ordering::Relaxed),
+                    ) {
+                        LimiterVerdict::WindowDeduped => {
+                            observability.window_deduped.fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "First-audit scheduler: audit_trigger=first_monetized outcome=window_deduped peer={peer} pin={} key_count={} pending={}",
+                                hex::encode(event.pin), event.key_count, pending.len()
+                            );
+                            continue;
+                        }
+                        LimiterVerdict::RateDeferred => {
+                            deferred.push((peer, event));
+                            observability
+                                .rate_deferred_attempts
+                                .fetch_add(1, Ordering::Relaxed);
+                            debug!(
+                                "First-audit scheduler: audit_trigger=first_monetized outcome=rate_deferred peer={peer} pin={} key_count={} deferred={} tokens={}",
+                                hex::encode(event.pin), event.key_count, deferred.len(), limiter.tokens
+                            );
+                            continue;
+                        }
+                        LimiterVerdict::Admit => {}
+                    }
                     // Cooldown: if the peer's per-peer audit window is closed, keep
                     // this pin pending and retry on a later tick once it reopens.
                     // We do NOT treat "cooldown closed" as "already audited" (a
@@ -1103,18 +1310,20 @@ impl ReplicationEngine {
                         let now = Instant::now();
                         let mut map = gossip_audit.cooldown.write().await;
                         if !cooldown_allows_audit(&mut map, &peer, now) {
-                            pending.put(peer, event);
+                            deferred.push((peer, event));
                             observability
                                 .cooldown_deferred_attempts
                                 .fetch_add(1, Ordering::Relaxed);
                             debug!(
-                                "First-audit scheduler: audit_trigger=first_monetized outcome=cooldown_deferred peer={peer} pin={} key_count={} pending={}",
-                                hex::encode(event.pin), event.key_count, pending.len()
+                                "First-audit scheduler: audit_trigger=first_monetized outcome=cooldown_deferred peer={peer} pin={} key_count={} deferred={}",
+                                hex::encode(event.pin), event.key_count, deferred.len()
                             );
                             continue;
                         }
                     }
-                    // Audit is launching: now mark the pin first-audited.
+                    // Audit is launching: consume budget, stamp the per-peer
+                    // window, and mark the pin first-audited.
+                    limiter.commit_launch(peer, event.key_count, assess_now);
                     first_audited.put(event.pin, ());
                     observability.launched.fetch_add(1, Ordering::Relaxed);
                     observability.inflight.fetch_add(1, Ordering::Relaxed);
@@ -1126,6 +1335,19 @@ impl ReplicationEngine {
                     let trigger = gossip_audit.clone();
                     let audit_observability = Arc::clone(&observability);
                     tokio::spawn(async move {
+                        // ADR-0004 Amendment 2: jitter the send. Every storer of
+                        // a chunk verifies the same payment at the same instant;
+                        // unjittered, the whole close group would challenge the
+                        // paid peer simultaneously and trip its per-peer
+                        // responder admission cap (drops that auditors then
+                        // record as Timeout). The in-flight slot is already
+                        // held, so jittered launches cannot pile up beyond the
+                        // cap either.
+                        let jitter_ms = rand::thread_rng().gen_range(
+                            0..=u64::try_from(config::FIRST_AUDIT_LAUNCH_JITTER_MAX.as_millis())
+                                .unwrap_or(u64::MAX),
+                        );
+                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
                         let started = Instant::now();
                         let credit = storage_commitment_audit::AuditCredit {
                             recent_provers: &trigger.recent_provers,
@@ -1183,6 +1405,12 @@ impl ReplicationEngine {
                         )
                         .await;
                     });
+                }
+                // Re-insert deferred entries oldest-first so the LRU's
+                // relative recency is restored (newest stays most-recently-
+                // used and is the last to be capacity-evicted).
+                for (peer, event) in deferred.into_iter().rev() {
+                    pending.put(peer, event);
                 }
             }
             debug!("First-audit drainer shut down");
@@ -5442,6 +5670,25 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use super::{
+        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
+        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
+        first_audit_count_jump, first_audit_terminal_outcome, first_failed_key_label,
+        fresh_offer_payment_context, paid_notify_payment_context, queue_first_audit_event,
+        quote_within_audit_window, FirstAuditLimiter, FirstAuditQueueOutcome,
+        FirstAuditTerminalOutcome, LimiterVerdict, MonetizedPinEvent, MONETIZED_AUDIT_SKEW_MARGIN,
+    };
+    use crate::payment::VerificationContext;
+    use crate::replication::audit::AuditTickResult;
+    use crate::replication::recent_provers::RecentProvers;
+    use crate::replication::types::{AuditFailureReason, AuditFailureSummary, FailureEvidence};
+    use lru::LruCache;
+    use saorsa_core::identity::PeerId;
+    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use std::time::Duration;
+    use std::time::Instant;
+    use std::time::SystemTime;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -5589,6 +5836,157 @@ mod tests {
             pending.peek(&other_peer.peer).map(|event| event.pin),
             Some([3; 32])
         );
+    }
+
+    // -- ADR-0004 Amendment 2: first-audit launch limiter --------------------
+
+    #[test]
+    fn first_audit_limiter_enforces_burst_then_refills() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+
+        // The full burst is admitted back-to-back (distinct peers).
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let peer = test_peer(u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&peer, 10, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(peer, 10, base);
+        }
+        // Bucket empty: the next distinct peer is deferred, never dropped.
+        let extra = test_peer(0xEE);
+        assert_eq!(
+            limiter.assess(&extra, 10, base, 0),
+            LimiterVerdict::RateDeferred
+        );
+
+        // One full interval later exactly one token is available again.
+        let later = base + interval;
+        assert_eq!(limiter.assess(&extra, 10, later, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(extra, 10, later);
+        let extra2 = test_peer(0xEF);
+        assert_eq!(
+            limiter.assess(&extra2, 10, later, 0),
+            LimiterVerdict::RateDeferred
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_refill_keeps_fractional_remainder() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let peer = test_peer(u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&peer, 1, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(peer, 1, base);
+        }
+        // 1.5 intervals later one token is earned and the half interval is
+        // NOT lost to drift...
+        let at_1_5 = base + interval + interval / 2;
+        let p = test_peer(0xAA);
+        assert_eq!(limiter.assess(&p, 1, at_1_5, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(p, 1, at_1_5);
+        // ...so the next token arrives at 2.0 intervals, not 2.5.
+        let at_2_0 = base + interval * 2;
+        let q = test_peer(0xAB);
+        assert_eq!(limiter.assess(&q, 1, at_2_0, 0), LimiterVerdict::Admit);
+    }
+
+    #[test]
+    fn first_audit_limiter_inflight_cap_defers_until_slot_frees() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(1);
+        assert_eq!(
+            limiter.assess(&peer, 1, base, config::FIRST_AUDIT_MAX_INFLIGHT),
+            LimiterVerdict::RateDeferred
+        );
+        // A freed slot admits without any clock movement.
+        assert_eq!(
+            limiter.assess(&peer, 1, base, config::FIRST_AUDIT_MAX_INFLIGHT - 1),
+            LimiterVerdict::Admit
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_assess_consumes_nothing() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(3);
+        // Repeated assessment must not burn budget or stamp the window: only
+        // `commit_launch` consumes (the cooldown gate between assess and
+        // commit can defer, and that deferral must be free).
+        for _ in 0..10 {
+            assert_eq!(limiter.assess(&peer, 5, base, 0), LimiterVerdict::Admit);
+        }
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let p = test_peer(0x20 + u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&p, 5, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(p, 5, base);
+        }
+    }
+
+    #[test]
+    fn first_audit_limiter_window_dedups_rotated_pins_and_count_jump_overrides() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(7);
+        assert_eq!(limiter.assess(&peer, 100, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(peer, 100, base);
+
+        // A rotated pin with a similar count inside the window is dropped...
+        let soon = base + Duration::from_secs(60);
+        assert_eq!(
+            limiter.assess(&peer, 100, soon, 0),
+            LimiterVerdict::WindowDeduped
+        );
+        // ...even at the exact jump boundary (new*DEN == old*NUM is no jump)...
+        assert_eq!(
+            limiter.assess(&peer, 150, soon, 0),
+            LimiterVerdict::WindowDeduped
+        );
+        // ...but a >1.5x committed-count jump re-nominates immediately (an
+        // inflated sidecar-only pin is invisible to the gossip lottery, so
+        // the window must not shield it).
+        assert_eq!(limiter.assess(&peer, 151, soon, 0), LimiterVerdict::Admit);
+
+        // Window expiry re-admits an unchanged count.
+        let expired = base + config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL;
+        assert_eq!(
+            limiter.assess(&peer, 100, expired, 0),
+            LimiterVerdict::Admit
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_window_verdict_outranks_empty_budget() {
+        // A window-deduped nomination must be DROPPED, not kept pending as
+        // rate-deferred, even when the bucket is also empty: re-queuing a
+        // suppressed rotation would hold a pending slot for two hours.
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(9);
+        assert_eq!(limiter.assess(&peer, 10, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(peer, 10, base);
+        let other = test_peer(10);
+        assert_eq!(limiter.assess(&other, 10, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(other, 10, base);
+        assert_eq!(
+            limiter.assess(&peer, 10, base, 0),
+            LimiterVerdict::WindowDeduped
+        );
+    }
+
+    #[test]
+    fn first_audit_count_jump_boundaries() {
+        // Exactly 1.5x is NOT a jump; strictly above is.
+        assert!(!first_audit_count_jump(100, 150));
+        assert!(first_audit_count_jump(100, 151));
+        // Anything beats an audited zero; zero never jumps.
+        assert!(first_audit_count_jump(0, 1));
+        assert!(!first_audit_count_jump(0, 0));
+        // Equal max counts must not jump (and must not overflow).
+        assert!(!first_audit_count_jump(u32::MAX, u32::MAX));
     }
 
     #[test]

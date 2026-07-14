@@ -334,3 +334,64 @@ attributing malicious silence/transient conditions network-wide is the
 (out-of-scope) distributed non-response problem. This supersedes the "unanswerable
 quoted pin is graced, never confirmed" rule and deletes `RejectKind::is_graced`;
 the regression tests are updated accordingly.
+
+---
+
+## Amendment 2 (2026-07-14): first audits are bounded best-effort sampling — payments nominate, the clock launches
+
+The original decision made the monetized first audit deterministic: every pinned
+quote in every verified client-put proof entered the first-audit queue at every
+verifying storer, gated only by the per-peer 30-minute cooldown. That per-peer
+gate bounds one observer against one peer but places no bound on the aggregate:
+fleet-wide launch pressure scaled as
+`uploads x pinned-quotes-per-proof x verifying-storers`, with hourly commitment
+rotation re-arming pin-level dedup every rotation. In the v0.14.3 production
+rollout this amplification saturated the audit-responder admission pools;
+overflow challenges were dropped and recorded by auditors as Timeout failures
+(545k Timeout errors/24h fleet-wide, ~31% slower downloads). A matched staging
+ablation attributed 97.7% of storage-commitment audit traffic and 99.955% of
+one-key timeout failures to this path, and a per-service concurrency cap alone
+(without a launch-rate budget) reproduced the storm. Amendment 1's answerability
+guarantees are unaffected; this amendment changes only who is nominated and how
+fast nominations launch.
+
+**Nomination narrows to paid pins.** Only the candidate whose on-chain
+settlement actually verified is nominated: the single-node path nominates the
+settlement-verified median candidate (not the whole bundle), and the merkle
+path nominates the contract-paid indices (not the whole pool). Unpaid quotes
+earned nothing; their gossiped commitments remain under the ADR-0002 lottery.
+The storer-side cross-check (arithmetic re-check and mismatch evidence) still
+runs on every quote and candidate.
+
+**Launches are budgeted, not deterministic.** Each node's first-audit drainer
+runs a launch limiter: a token bucket (burst 2, one token per 5 minutes — a
+hard per-node ceiling of 12 launches/hour), an in-flight cap (2), and a uniform
+0-30s launch jitter so the storers of one chunk, which all verify the same
+payment at the same instant, do not challenge the paid peer simultaneously.
+Fleet-wide first-audit pressure is therefore `nodes x refill-rate`, independent
+of upload volume. Budget deferral is penalty-free: a deferred pin stays pending
+(newest-per-peer, bounded) and launches when tokens allow; only audits that
+actually launch have consequences.
+
+**Per-peer re-audit window survives pin rotation.** After a first audit
+launches at a peer, further nominations for that peer are dropped for 2 hours
+(inside the 3h answerability TTL) — unless the new pin's committed key count
+exceeds the audited one by more than 1.5x, which re-nominates immediately. The
+jump override preserves the anti-inflation property this queue exists for: an
+inflated commitment delivered only as a quote sidecar is visible to payment
+verifiers alone, so no gossip-lottery audit can ever select it; a peer that
+passes an audit on an honest count and then mints a much larger sidecar-only
+commitment is re-audited at once. Ordinary rotations with a stable count stop
+re-arming the fleet.
+
+**Coverage restated.** "The latest commitment earning money for a peer always
+faces an audit soon" becomes: the FIRST commitment earning money for a peer,
+and any later commitment whose claimed count materially jumps, faces an audit
+soon (minutes, from multiple independent storers, each within its own budget);
+commitments rotated without material count change rely on the ADR-0002 lottery
+for re-audit. First-audit coverage is best-effort supplementary sampling under
+an explicit load budget, not a per-payment guarantee. The scheduler's funnel
+(received / queued / coalesced / duplicates / window_deduped / rate_deferred /
+cooldown_deferred / launched / terminal outcomes, plus tokens and in-flight
+gauges) is exported in the periodic scheduler summary so this coverage is
+measurable in production.

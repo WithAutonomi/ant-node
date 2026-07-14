@@ -975,15 +975,23 @@ impl PaymentVerifier {
         // The paid (median) price and settled on-chain amount of the winning
         // candidate, kept for the receiver-side price-floor policy below.
         let mut verified_paid_quote: Option<(Amount, Amount)> = None;
+        // ADR-0004 Amendment 2: remember WHICH candidate's on-chain settlement
+        // verified — only that peer's commitment actually earned money, so only
+        // its pin is nominated for a deterministic first audit below. The
+        // non-median quotes merely locate the median and stay covered by the
+        // gossip-lottery audit path.
+        let mut paid_peer: Option<[u8; 32]> = None;
 
         for candidate in candidates {
             let paid_price = candidate.quote.price;
+            let candidate_peer = *candidate.encoded_peer_id.as_bytes();
             match self
                 .verify_legacy_median_candidate(xorname, candidate)
                 .await
             {
                 Ok(settled_amount) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
+                    paid_peer = Some(candidate_peer);
                     break;
                 }
                 Err(err) => failures.push(err.to_string()),
@@ -1022,7 +1030,8 @@ impl PaymentVerifier {
         // bundle can never enqueue audits or drive pin fetches — closing the
         // free-amplification path.
         if context.is_store_admission() {
-            self.cross_check_quotes(payment, commitment_sidecars).await;
+            self.cross_check_quotes(payment, commitment_sidecars, paid_peer)
+                .await;
         }
 
         if crate::logging::enabled!(crate::logging::Level::INFO) {
@@ -1635,7 +1644,12 @@ impl PaymentVerifier {
     /// missing cache or absent `P2PNode` degrades to "resolve nothing", never an
     /// error on the payment path — the synchronous arithmetic gate and the
     /// later audit remain the load-bearing checks.
-    async fn cross_check_quotes(&self, payment: &ProofOfPayment, commitment_sidecars: &[Vec<u8>]) {
+    async fn cross_check_quotes(
+        &self,
+        payment: &ProofOfPayment,
+        commitment_sidecars: &[Vec<u8>],
+        paid_peer: Option<[u8; 32]>,
+    ) {
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
         let p2p = self.p2p_node.read().as_ref().map(Arc::clone);
@@ -1659,17 +1673,24 @@ impl PaymentVerifier {
             };
             let peer_id = PeerId::from_bytes(*encoded_peer_id.as_bytes());
 
-            // ADR-0004: this commitment backed a payment — route it for a
-            // deterministic first audit (the drainer dedups by pin and respects
-            // the cooldown). Best-effort: a closed channel just means no first
-            // audit is scheduled, never an error on the payment path.
-            if let Some(ref tx) = monetized_pin_tx {
-                let _ = tx.send(crate::replication::MonetizedPinEvent {
-                    peer: peer_id,
-                    pin,
-                    key_count: quote.committed_key_count,
-                    quote_ts: quote.timestamp,
-                });
+            // ADR-0004 Amendment 2: only the PAID candidate's commitment earned
+            // money, so only its pin is routed for a deterministic first audit
+            // (the drainer dedups, rate-budgets, and respects the cooldown).
+            // Pre-amendment this fired for every pinned quote in the bundle —
+            // up to CLOSE_GROUP_SIZE audits per proof for peers that were never
+            // paid — a 7x term in the fleet-wide amplification that degraded
+            // v0.14.3. Best-effort: a closed channel just means no first audit
+            // is scheduled, never an error on the payment path.
+            let is_paid = paid_peer.is_some_and(|paid| paid == *encoded_peer_id.as_bytes());
+            if is_paid {
+                if let Some(ref tx) = monetized_pin_tx {
+                    let _ = tx.send(crate::replication::MonetizedPinEvent {
+                        peer: peer_id,
+                        pin,
+                        key_count: quote.committed_key_count,
+                        quote_ts: quote.timestamp,
+                    });
+                }
             }
             // Resolution order: sidecar (synchronous, no state) -> gossip cache
             // (fresh within TTL) -> fetch fallback (collected as unresolved).
@@ -2730,10 +2751,19 @@ impl PaymentVerifier {
         // fetches). Store admissions only (direct PUT + immediate fresh
         // replication, the paths that previously verified under `ClientPut`) —
         // a paid-list receipt's pins have aged out.
+        // Amendment 2: only the candidates the contract actually PAID
+        // (`paid_node_addresses` indices, verified above) are nominated for
+        // first audits; the rest of the pool merely established the median.
         if context.is_store_admission() {
+            let paid_indices: std::collections::HashSet<usize> = payment_info
+                .paid_node_addresses
+                .iter()
+                .map(|(_, idx, _)| *idx)
+                .collect();
             self.cross_check_merkle_candidates(
                 &merkle_proof.winner_pool,
                 &merkle_proof.commitment_sidecars,
+                &paid_indices,
             )
             .await;
         }
@@ -2752,6 +2782,7 @@ impl PaymentVerifier {
         &self,
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
         commitment_sidecars: &[Vec<u8>],
+        paid_indices: &std::collections::HashSet<usize>,
     ) {
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
@@ -2763,23 +2794,29 @@ impl PaymentVerifier {
         let sidecar_map = Self::index_valid_sidecars(commitment_sidecars);
 
         let mut unresolved: Vec<(PeerId, [u8; 32], u32, Vec<u8>)> = Vec::new();
-        for candidate in &pool.candidate_nodes {
+        for (idx, candidate) in pool.candidate_nodes.iter().enumerate() {
             let Some(pin) = candidate.commitment_pin else {
                 continue; // baseline candidate pins nothing
             };
             let peer_id = PeerId::from_bytes(*blake3::hash(&candidate.pub_key).as_bytes());
 
-            if let Some(ref tx) = monetized_pin_tx {
-                let _ = tx.send(crate::replication::MonetizedPinEvent {
-                    peer: peer_id,
-                    pin,
-                    key_count: candidate.committed_key_count,
-                    quote_ts: std::time::UNIX_EPOCH
-                        .checked_add(std::time::Duration::from_secs(
-                            candidate.merkle_payment_timestamp,
-                        ))
-                        .unwrap_or(std::time::UNIX_EPOCH),
-                });
+            // ADR-0004 Amendment 2: nominate only the candidates the contract
+            // actually paid — the unpaid pool members earned nothing and stay
+            // covered by the gossip-lottery audit path. Pre-amendment every
+            // pool candidate (16) was nominated per verified proof.
+            if paid_indices.contains(&idx) {
+                if let Some(ref tx) = monetized_pin_tx {
+                    let _ = tx.send(crate::replication::MonetizedPinEvent {
+                        peer: peer_id,
+                        pin,
+                        key_count: candidate.committed_key_count,
+                        quote_ts: std::time::UNIX_EPOCH
+                            .checked_add(std::time::Duration::from_secs(
+                                candidate.merkle_payment_timestamp,
+                            ))
+                            .unwrap_or(std::time::UNIX_EPOCH),
+                    });
+                }
             }
 
             let resolved = match sidecar_map.get(&(peer_id, pin)) {
@@ -4712,6 +4749,130 @@ mod tests {
         let xorname = first_address.0;
 
         (merkle_proof, pool_hash, xorname, timestamp)
+    }
+
+    /// ADR-0004 Amendment 2: only the PAID (settlement-verified) quote's pin is
+    /// nominated for a deterministic first audit; the unpaid bundle quotes are
+    /// cross-checked but never enqueue audits.
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_only_paid_single_node_quote() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        verifier.attach_monetized_pin_sender(tx);
+
+        let ids: Vec<[u8; 32]> = (1..=3u8).map(|b| [b; 32]).collect();
+        let payment = ProofOfPayment {
+            peer_quotes: ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let pin_byte = u8::try_from(i).expect("small bundle") + 1;
+                    let mut quote = make_fake_quote(
+                        [0xD0; 32],
+                        SystemTime::now(),
+                        RewardsAddress::new([pin_byte; 20]),
+                    );
+                    quote.commitment_pin = Some([pin_byte; 32]);
+                    quote.committed_key_count = 100;
+                    (EncodedPeerId::new(*id), quote)
+                })
+                .collect(),
+        };
+
+        // The middle quote is the candidate whose on-chain settlement verified.
+        let paid = ids.get(1).copied().expect("paid id");
+        verifier.cross_check_quotes(&payment, &[], Some(paid)).await;
+
+        let event = rx.try_recv().expect("the paid quote must be nominated");
+        assert_eq!(event.peer, PeerId::from_bytes(paid));
+        assert_eq!(event.pin, [2u8; 32]);
+        assert!(
+            rx.try_recv().is_err(),
+            "unpaid bundle quotes must not be nominated for first audits"
+        );
+    }
+
+    /// ADR-0004 Amendment 2: with no verified paid candidate, nothing is
+    /// nominated (defensive: the caller never reaches the cross-check on a
+    /// failed verification, but the emission itself must also fail closed).
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_nothing_without_paid_peer() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        verifier.attach_monetized_pin_sender(tx);
+
+        let mut quote =
+            make_fake_quote([0xD1; 32], SystemTime::now(), RewardsAddress::new([1; 20]));
+        quote.commitment_pin = Some([1u8; 32]);
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new([1u8; 32]), quote)],
+        };
+
+        verifier.cross_check_quotes(&payment, &[], None).await;
+        assert!(rx.try_recv().is_err(), "no paid peer, no nomination");
+    }
+
+    /// ADR-0004 Amendment 2, merkle path: only the candidates at the
+    /// contract-verified PAID indices are nominated; the rest of the pool
+    /// merely established the median and must not enqueue audits.
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_only_paid_merkle_candidates() {
+        use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerkleTree};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        verifier.attach_monetized_pin_sender(tx);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let mut candidate_nodes = make_candidate_nodes(timestamp);
+        for (i, candidate) in candidate_nodes.iter_mut().enumerate() {
+            candidate.commitment_pin = Some([u8::try_from(i & 0xFF).expect("byte"); 32]);
+            candidate.committed_key_count = 50;
+        }
+        let addresses: Vec<xor_name::XorName> = (0..4u8)
+            .map(|i| xor_name::XorName::from_content(&[i]))
+            .collect();
+        let tree = MerkleTree::from_xornames(addresses).expect("tree");
+        let midpoint_proof = tree
+            .reward_candidates(timestamp)
+            .expect("reward candidates")
+            .first()
+            .expect("at least one candidate")
+            .clone();
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof,
+            candidate_nodes,
+        };
+
+        let paid_indices: std::collections::HashSet<usize> = [1usize, 3].into_iter().collect();
+        verifier
+            .cross_check_merkle_candidates(&pool, &[], &paid_indices)
+            .await;
+
+        let mut nominated = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            nominated.push(event);
+        }
+        assert_eq!(
+            nominated.len(),
+            2,
+            "only the PAID candidates are nominated, not the whole pool"
+        );
+        for (event, idx) in nominated.iter().zip([1usize, 3]) {
+            let candidate = pool.candidate_nodes.get(idx).expect("paid candidate");
+            assert_eq!(
+                event.peer,
+                PeerId::from_bytes(*blake3::hash(&candidate.pub_key).as_bytes())
+            );
+            assert_eq!(event.pin, [u8::try_from(idx).expect("byte"); 32]);
+        }
     }
 
     /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65
