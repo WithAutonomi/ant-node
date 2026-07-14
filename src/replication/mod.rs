@@ -69,8 +69,8 @@ use crate::replication::commitment_state::{
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_VERIFICATION_KEYS_PER_CYCLE,
-    MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_VERIFICATION_KEYS_PER_CYCLE, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -3537,15 +3537,16 @@ async fn handle_verification_request(
         paid: CachedPaidLookup,
     }
 
-    let requested_keys = if request.keys.len() > MAX_VERIFICATION_KEYS_PER_REQUEST {
+    if verification_request_exceeds_limit(request.keys.len()) {
         warn!(
-            "Verification request from {source} has {} keys, exceeding max {MAX_VERIFICATION_KEYS_PER_REQUEST}; answering capped prefix",
+            "Verification request from {source} has {} keys, exceeding max {MAX_INCOMING_VERIFICATION_KEYS}; rejecting batch",
             request.keys.len(),
         );
-        &request.keys[..MAX_VERIFICATION_KEYS_PER_REQUEST]
-    } else {
-        request.keys.as_slice()
-    };
+        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        return Ok(());
+    }
+
+    let requested_keys = request.keys.as_slice();
 
     if request.paid_list_check_indices.len() > request.keys.len() {
         warn!(
@@ -3632,6 +3633,10 @@ async fn handle_verification_request(
     send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
 
     Ok(())
+}
+
+const fn verification_request_exceeds_limit(key_count: usize) -> bool {
+    key_count > MAX_INCOMING_VERIFICATION_KEYS
 }
 
 async fn send_verification_results(
@@ -6110,6 +6115,16 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn verification_receiver_accepts_a_full_cycle_and_rejects_more() {
+        assert!(!verification_request_exceeds_limit(
+            config::MAX_VERIFICATION_KEYS_PER_CYCLE
+        ));
+        assert!(verification_request_exceeds_limit(
+            config::MAX_VERIFICATION_KEYS_PER_CYCLE + 1
+        ));
     }
 
     fn test_key(b: u8) -> crate::ant_protocol::XorName {
