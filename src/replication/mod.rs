@@ -47,7 +47,7 @@ use std::pin::Pin;
 
 use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt};
+use futures::{future::join_all, Future, StreamExt};
 use rand::Rng;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
@@ -66,8 +66,8 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, HINT_SOURCE_AGGREGATION_WINDOW,
-    MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
     MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_VERIFICATION_KEYS_PER_CYCLE,
     MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
 };
@@ -2229,36 +2229,41 @@ impl ReplicationEngine {
                 )
                 .await;
 
-                for peer in batch {
-                    if shutdown.is_cancelled() {
-                        break;
+                // Keep the batch outstanding until every response has been
+                // admitted and bootstrap accounting is updated. The verification
+                // worker uses this counter as a batch barrier, so it cannot race
+                // the source aggregation below.
+                bootstrap::increment_pending_requests(&bootstrap_state, batch.len()).await;
+                let bootstrapping = *is_bootstrapping.read().await;
+
+                let sync_futures = batch.iter().map(|peer| {
+                    let peer = *peer;
+                    let hints = hints_by_peer.remove(&peer).unwrap_or_default();
+                    // Atomically snapshot + mark-gossiped for each emitted
+                    // bootstrap request so we remain answerable for it.
+                    let commitment = my_commitment_state
+                        .current_for_gossip()
+                        .map(|binding| binding.commitment().clone());
+                    let p2p = &p2p;
+                    let config = &config;
+                    async move {
+                        let outcome = neighbor_sync::sync_with_peer_with_hints(
+                            &peer,
+                            p2p,
+                            config,
+                            bootstrapping,
+                            hints,
+                            commitment,
+                        )
+                        .await;
+                        (peer, outcome)
                     }
+                });
+                let completed = join_all(sync_futures).await;
 
-                    // Re-read on each iteration so peers see current state.
-                    let bootstrapping = *is_bootstrapping.read().await;
-
-                    bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
-
-                    let hints = hints_by_peer.remove(peer).unwrap_or_default();
-                    let outcome = neighbor_sync::sync_with_peer_with_hints(
-                        peer,
-                        &p2p,
-                        &config,
-                        bootstrapping,
-                        hints,
-                        // Atomically snapshot + mark-gossiped: emitted in the
-                        // bootstrap-sync request, so we stay answerable for it
-                        // (ADR-0002). One critical section avoids a TOCTOU where a
-                        // concurrent retire/rotate drops the slot between read and
-                        // mark.
-                        my_commitment_state
-                            .current_for_gossip()
-                            .map(|b| b.commitment().clone()),
-                    )
-                    .await;
-
-                    bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
-
+                // Process response metadata before exposing any of this batch's
+                // hints to verification.
+                for (peer, outcome) in &completed {
                     if let Some(outcome) = outcome {
                         // Ingest the peer's piggybacked commitment from the
                         // response (same verification as the request path).
@@ -2292,41 +2297,68 @@ impl ReplicationEngine {
                                 &sync_cycle_epoch,
                             )
                             .await;
-                            // Admit hints into verification pipeline.
-                            let outcome = admit_and_queue_hints(
+                        }
+                    }
+                }
+
+                let pending_keys: HashSet<XorName> = {
+                    let q = queues.read().await;
+                    q.pending_keys().into_iter().collect()
+                };
+                let admission_futures = completed.iter().map(|(_, outcome)| async {
+                    match outcome {
+                        Some(outcome) if !outcome.response.bootstrapping => Some(
+                            admission::admit_hints(
                                 &self_id,
-                                peer,
                                 &outcome.response.replica_hints,
                                 &outcome.response.paid_hints,
                                 &p2p,
                                 &config,
                                 &storage,
                                 &paid_list,
-                                &queues,
+                                &pending_keys,
                             )
-                            .await;
+                            .await,
+                        ),
+                        _ => None,
+                    }
+                });
+                let admitted = join_all(admission_futures).await;
 
-                            // Track discovered keys for drain detection.
-                            if !outcome.discovered.is_empty() {
-                                bootstrap::track_discovered_keys(
-                                    &bootstrap_state,
-                                    &outcome.discovered,
+                // Queue every peer's admitted hints under one write lock. Once
+                // released, source-count ordering sees the complete batch.
+                let batch_outcomes = {
+                    let mut q = queues.write().await;
+                    completed
+                        .iter()
+                        .zip(admitted)
+                        .filter_map(|((peer, _), admitted)| {
+                            admitted.map(|admitted| {
+                                (
+                                    *peer,
+                                    queue_admitted_hints(peer, admitted, &storage, &mut q),
                                 )
-                                .await;
-                            }
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                };
 
-                            // Record / retire capacity rejections so the
-                            // drain check correctly reflects whether each
-                            // source still owes us re-hinted work after
-                            // queue overflow.
-                            if outcome.capacity_rejected_count > 0 {
-                                bootstrap::note_capacity_rejected(&bootstrap_state, *peer).await;
-                            } else {
-                                bootstrap::clear_capacity_rejected(&bootstrap_state, peer).await;
-                            }
-                        }
+                let mut batch_discovered = HashSet::new();
+                for (_, outcome) in &batch_outcomes {
+                    batch_discovered.extend(outcome.discovered.iter().copied());
+                }
+                if !batch_discovered.is_empty() {
+                    bootstrap::track_discovered_keys(&bootstrap_state, &batch_discovered).await;
+                }
+                for (peer, outcome) in batch_outcomes {
+                    if outcome.capacity_rejected_count > 0 {
+                        bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
+                    } else {
+                        bootstrap::clear_capacity_rejected(&bootstrap_state, &peer).await;
                     }
                 }
+
+                bootstrap::decrement_pending_requests(&bootstrap_state, batch.len()).await;
             }
 
             // Check drain condition.
@@ -4102,9 +4134,18 @@ async fn admit_and_queue_hints(
     )
     .await;
 
+    let mut q = queues.write().await;
+    queue_admitted_hints(source_peer, admitted, storage, &mut q)
+}
+
+fn queue_admitted_hints(
+    source_peer: &PeerId,
+    admitted: admission::AdmissionResult,
+    storage: &LmdbStorage,
+    q: &mut ReplicationQueues,
+) -> AdmissionOutcome {
     let mut discovered = HashSet::new();
     let mut capacity_rejected_count: usize = 0;
-    let mut q = queues.write().await;
     let now = Instant::now();
 
     for key in admitted.replica_keys {
@@ -4117,7 +4158,7 @@ async fn admit_and_queue_hints(
                     verified_sources: Vec::new(),
                     tried_sources: HashSet::new(),
                     created_at: now,
-                    next_verify_at: now + HINT_SOURCE_AGGREGATION_WINDOW,
+                    next_verify_at: now,
                     hint_sources: HashSet::from([*source_peer]),
                     replica_hint_sources: HashSet::from([*source_peer]),
                 },
@@ -4143,7 +4184,7 @@ async fn admit_and_queue_hints(
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
-                next_verify_at: now + HINT_SOURCE_AGGREGATION_WINDOW,
+                next_verify_at: now,
                 hint_sources: HashSet::from([*source_peer]),
                 replica_hint_sources: HashSet::new(),
             },
@@ -4194,6 +4235,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         recent_provers,
     } = ctx;
 
+    // Bootstrap admits one concurrent neighbor batch as an atomic source
+    // aggregation unit. Do not select newly queued keys until that batch's
+    // hints and drain accounting have both been published.
+    if bootstrap_state.read().await.pending_peer_requests > 0 {
+        return;
+    }
+
     // Evict stale entries that have been pending too long (e.g. unreachable
     // verification targets during a network partition).
     let stale_pending_keys = {
@@ -4213,6 +4261,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
     let pending_keys = {
         let q = queues.read().await;
+        // Re-check while holding the queue read lock. This closes the race
+        // where a bootstrap batch starts after the early check: the batch
+        // cannot publish its hints under the queue write lock until this
+        // selection either returns or declines to run.
+        if bootstrap_state.read().await.pending_peer_requests > 0 {
+            return;
+        }
         q.ready_pending_keys(Instant::now())
             .into_iter()
             .take(MAX_VERIFICATION_KEYS_PER_CYCLE)

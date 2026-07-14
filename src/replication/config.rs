@@ -405,13 +405,6 @@ pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
 /// launching hundreds or thousands of network requests at once.
 pub const MAX_CONCURRENT_VERIFICATION_REQUESTS: usize = 32;
 
-/// Brief hold for a newly admitted singleton hint.
-///
-/// This lets nearby sync responses corroborate it before scheduling. A second
-/// live source makes the key ready immediately; genuinely singleton work
-/// proceeds after this short window.
-pub const HINT_SOURCE_AGGREGATION_WINDOW: Duration = Duration::from_secs(2);
-
 /// Fetch request timeout.
 const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.
