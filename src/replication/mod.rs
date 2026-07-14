@@ -612,8 +612,9 @@ pub struct ReplicationEngine {
     /// for a deterministic first audit. The matching receiver is drained by
     /// `start_first_audit_drainer`. BOUNDED (Amendment 2): the producer
     /// `try_send`s and drops on a full queue, so ingress memory is capped just
-    /// like launches; a dropped nomination is penalty-free and the peer stays
-    /// covered by the gossip lottery.
+    /// like launches; a dropped nomination is penalty-free — the peer's
+    /// gossiped commitments stay lottery-covered and its next settled payment
+    /// re-nominates the paid pin.
     monetized_pin_tx: mpsc::Sender<MonetizedPinEvent>,
     /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
@@ -1108,6 +1109,14 @@ impl ReplicationEngine {
             // first-audit load independent of upload volume: payments only
             // NOMINATE pins, the clock launches them.
             let mut limiter = FirstAuditLimiter::new(Instant::now());
+            // Launch-pass direction flip-flop (Amendment 2 anti-starvation):
+            // passes alternate between newest-first (freshest answerability
+            // windows get budget) and oldest-first (an aging pin cannot be
+            // starved out of its eligibility window by a stream of newer
+            // nominations — the attacker would need PRE-aged decoys at every
+            // observer, which the oldest lane itself drains and the per-peer
+            // re-audit window blocks from refreshing).
+            let mut oldest_first_pass = false;
             // Periodic retry tick for pending (cooldown/budget-blocked) pins.
             // Created once; `Skip` so a backlog of missed ticks collapses to one.
             let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
@@ -1257,16 +1266,18 @@ impl ReplicationEngine {
                 // Try to launch an audit for each pending peer; keep the ones
                 // blocked by cooldown or budget for the next tick. Drain into a
                 // vec first (LruCache has no drain). `iter()` yields most- to
-                // least-recently-used, and with the Amendment 2 launch budget
-                // that order is load-bearing: the NEWEST-monetized peers must
-                // consume tokens first (freshest answerability windows, per the
-                // ADR's newest-first coverage rule), with older pins deferred.
-                // Deferred entries are collected and re-inserted afterwards in
-                // reverse order so relative recency is restored (oldest re-put
+                // least-recently-used; the pass direction alternates (see
+                // `oldest_first_pass`) so budget is shared between the newest
+                // pins (freshest answerability) and the oldest (starvation
+                // resistance). Deferred entries are collected and re-inserted
+                // afterwards with relative recency restored (oldest re-put
                 // first → stays the eviction victim).
-                let snapshot: Vec<(PeerId, MonetizedPinEvent)> =
+                let mut snapshot: Vec<(PeerId, MonetizedPinEvent)> =
                     pending.iter().map(|(p, e)| (*p, *e)).collect();
                 pending.clear();
+                if oldest_first_pass {
+                    snapshot.reverse();
+                }
                 let mut deferred: Vec<(PeerId, MonetizedPinEvent)> = Vec::new();
                 for (peer, event) in snapshot {
                     // Dedup: a pin already first-audited is dropped (done).
@@ -1389,7 +1400,8 @@ impl ReplicationEngine {
                         // the jitter are sized relative to each other. A pin
                         // that aged out during the sleep is skipped with no
                         // consequence for the peer (slot released by the drop
-                        // guard; pin stays first_audited — lottery covers it).
+                        // guard; pin stays first_audited; the peer's next
+                        // settled payment re-nominates it).
                         if !quote_within_audit_window(event.quote_ts, SystemTime::now()) {
                             audit_observability
                                 .outside_answerability_window
@@ -1461,10 +1473,19 @@ impl ReplicationEngine {
                 }
                 // Re-insert deferred entries oldest-first so the LRU's
                 // relative recency is restored (newest stays most-recently-
-                // used and is the last to be capacity-evicted).
-                for (peer, event) in deferred.into_iter().rev() {
-                    pending.put(peer, event);
+                // used and is the last to be capacity-evicted). The collection
+                // order follows the pass direction, so a newest-first pass
+                // reverses and an oldest-first pass inserts in order.
+                if oldest_first_pass {
+                    for (peer, event) in deferred {
+                        pending.put(peer, event);
+                    }
+                } else {
+                    for (peer, event) in deferred.into_iter().rev() {
+                        pending.put(peer, event);
+                    }
                 }
+                oldest_first_pass = !oldest_first_pass;
             }
             debug!("First-audit drainer shut down");
         });

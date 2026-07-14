@@ -1750,7 +1750,7 @@ impl PaymentVerifier {
             if is_paid {
                 if let Some(ref tx) = monetized_pin_tx {
                     // Bounded queue: drop on full (best-effort, penalty-free;
-                    // the gossip lottery still covers the peer).
+                    // the peer's next settled payment re-nominates it).
                     let _ = tx.try_send(crate::replication::MonetizedPinEvent {
                         peer: peer_id,
                         pin,
@@ -2874,7 +2874,7 @@ impl PaymentVerifier {
             if paid_indices.contains(&idx) {
                 if let Some(ref tx) = monetized_pin_tx {
                     // Bounded queue: drop on full (best-effort, penalty-free;
-                    // the gossip lottery still covers the peer).
+                    // the peer's next settled payment re-nominates it).
                     let _ = tx.try_send(crate::replication::MonetizedPinEvent {
                         peer: peer_id,
                         pin,

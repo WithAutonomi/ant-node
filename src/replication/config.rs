@@ -480,7 +480,8 @@ pub const FIRST_AUDIT_COUNT_JUMP_DEN: u64 = 2;
 /// [`FIRST_AUDIT_DRAIN_BATCH`]) and coalesces newest-per-peer, so a backlog
 /// this deep implies the drainer is starved, not that work is arriving fast.
 /// Producers `try_send` and drop on full: a dropped nomination is
-/// penalty-free, and the peer remains covered by the gossip-lottery path.
+/// penalty-free; the peer's gossiped commitments stay lottery-covered and
+/// its next settled payment re-nominates the paid pin.
 pub const FIRST_AUDIT_INGRESS_CAPACITY: usize = 1024;
 
 /// Number of subtree leaves spot-checked against real chunk bytes per audit

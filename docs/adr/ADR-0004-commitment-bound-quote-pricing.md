@@ -405,19 +405,29 @@ answerability screen runs both before launch selection and again after the
 jitter sleep, so a pin can never be challenged outside its window regardless
 of how deferral time, jitter, and the skew margin compose.
 
-**Accepted residuals.** (1) *Budget-exhaustion starvation:* an uploader can
-keep an observer's launch budget saturated with newer settled payments so an
-older pending pin expires un-first-audited. Each such nomination requires a
-distinct real settled payment (window dedup suppresses repeats per issuer),
-so starving all ~5-9 storers of one chunk for the whole 2.5h eligible window
-costs dozens of on-chain payments plus gas per observer to shield a single
-overcharged payment — economically irrational, and the cheater's gossiped
-commitments remain under the ADR-0002 lottery throughout. (2) *Settlement
-overwrite (pre-existing, contract-level):* the vault's `payForQuotes`
-unconditionally overwrites `completedPayments[quoteHash]`, so a third party
-who learns a quote hash can overwrite the record (already breaking the
-long-standing amount check with a 1-wei payment, on all node versions) and
-now equivalently the rewards-address binding. This griefing race predates
-this amendment and needs a vault-side fix (reject or accumulate on existing
-entries); it is tracked as follow-up work, not a property this ADR can
-enforce from the node side.
+**Accepted residuals.** (1) *Budget-exhaustion starvation, mitigated by
+alternating lanes:* an attacker can try to keep observers' launch budgets
+saturated with newer settled decoy nominations so an older pending pin
+expires un-first-audited. Stated precisely: suppressing one pin requires
+outcompeting roughly 31 launch opportunities per observer over the 150-minute
+eligibility window; a single decoy settlement consumes budget at every storer
+of its chunk simultaneously (a cohort, not per-observer, cost), a merkle
+settlement nominates every paid index, principal recycles through
+sybil-controlled reward addresses (the real costs are gas, liquidity, and
+close-group positioning, not the transferred amount), and a sidecar-only
+target pin has NO lottery backstop. The scheduler therefore does not rely on
+economics alone: launch passes alternate between newest-first and
+oldest-first, so fresh decoys cannot displace an aging pin from the oldest
+lane — suppressing it would additionally require pre-aged pending decoys at
+every observer, which that lane itself drains and the per-peer re-audit
+window blocks from refreshing. Residual exposure is the reduced coverage
+latency any bounded scheduler has under sustained hostile load, not
+indefinite suppression. (2) *Settlement overwrite (pre-existing,
+contract-level):* the vault's `payForQuotes` unconditionally overwrites
+`completedPayments[quoteHash]`, so a third party who learns a quote hash can
+overwrite the record (already breaking the long-standing amount check with a
+1-wei payment, on all node versions) and now equivalently the
+rewards-address binding. This griefing race predates this amendment and
+needs a vault-side fix (reject or accumulate on existing entries); it is
+tracked as follow-up work, not a property this ADR can enforce from the node
+side.
