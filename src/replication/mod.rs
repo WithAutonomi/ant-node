@@ -176,6 +176,24 @@ struct RecentFirstAudit {
     key_count: u32,
 }
 
+/// Holds one first-audit in-flight slot; decrements the gauge on drop so a
+/// panicking or cancelled audit task can never leak a slot and wedge the
+/// [`config::FIRST_AUDIT_MAX_INFLIGHT`] cap shut.
+struct FirstAuditInflightSlot(Arc<FirstAuditObservability>);
+
+impl FirstAuditInflightSlot {
+    fn acquire(observability: &Arc<FirstAuditObservability>) -> Self {
+        observability.inflight.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(observability))
+    }
+}
+
+impl Drop for FirstAuditInflightSlot {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// ADR-0004 Amendment 2: whether `new_count` exceeds `audited_count` by more
 /// than the [`config::FIRST_AUDIT_COUNT_JUMP_NUM`]/
 /// [`config::FIRST_AUDIT_COUNT_JUMP_DEN`] ratio (`new > old * NUM / DEN`,
@@ -1322,11 +1340,19 @@ impl ReplicationEngine {
                         }
                     }
                     // Audit is launching: consume budget, stamp the per-peer
-                    // window, and mark the pin first-audited.
+                    // window, and mark the pin first-audited. All three commit
+                    // at LAUNCH (not at completion), matching the pre-existing
+                    // `first_audited` semantics: an unproductive launch consumes
+                    // the peer's slot, and re-coverage comes from the count-jump
+                    // override or the gossip lottery — never from re-launching,
+                    // which an unresponsive peer could otherwise farm for load.
                     limiter.commit_launch(peer, event.key_count, assess_now);
                     first_audited.put(event.pin, ());
                     observability.launched.fetch_add(1, Ordering::Relaxed);
-                    observability.inflight.fetch_add(1, Ordering::Relaxed);
+                    // Drop-guarded slot: released when the audit task finishes,
+                    // panics, or is cancelled — the in-flight cap can never
+                    // wedge shut on a leaked slot.
+                    let inflight_slot = FirstAuditInflightSlot::acquire(&observability);
                     debug!(
                         "First-audit scheduler: audit_trigger=first_monetized outcome=launched peer={peer} pin={} key_count={} pending={} inflight={}",
                         hex::encode(event.pin), event.key_count, pending.len(),
@@ -1335,6 +1361,7 @@ impl ReplicationEngine {
                     let trigger = gossip_audit.clone();
                     let audit_observability = Arc::clone(&observability);
                     tokio::spawn(async move {
+                        let inflight_slot = inflight_slot;
                         // ADR-0004 Amendment 2: jitter the send. Every storer of
                         // a chunk verifies the same payment at the same instant;
                         // unjittered, the whole close group would challenge the
@@ -1388,7 +1415,7 @@ impl ReplicationEngine {
                                     .fetch_add(1, Ordering::Relaxed);
                             }
                         }
-                        audit_observability.inflight.fetch_sub(1, Ordering::Relaxed);
+                        drop(inflight_slot);
                         debug!(
                             "First-audit scheduler: audit_trigger=first_monetized outcome={} peer={} pin={} key_count={} elapsed_ms={} inflight={}",
                             outcome.as_str(),

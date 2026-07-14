@@ -351,6 +351,11 @@ type CommitmentCache = Arc<
 /// handle without borrowing the verifier.
 type PinFetchNegativeCache = Arc<Mutex<LruCache<(PeerId, [u8; 32]), ()>>>;
 
+/// Test-override shape for one on-chain settlement: the settled amount and
+/// the recorded `bytes16` rewards-address prefix (`None` = matches the quote).
+#[cfg(any(test, feature = "test-utils"))]
+type TestSettlementOverride = (Amount, Option<[u8; 16]>);
+
 /// Main payment verifier for ant-node.
 ///
 /// Uses:
@@ -396,9 +401,13 @@ pub struct PaymentVerifier {
     /// Test-only override for `completedPayments(quote_hash)`.
     ///
     /// Production always queries the payment vault; unit tests use this to
-    /// exercise the full verifier path without starting an EVM chain.
+    /// exercise the full verifier path without starting an EVM chain. Maps a
+    /// quote hash to the settled amount plus the recorded rewards-address
+    /// prefix (`None` means "matches the quote", the honest-settlement
+    /// default). The prefix is 16 bytes because the vault packs the address
+    /// as `bytes16` in the `completedPayments` slot.
     #[cfg(any(test, feature = "test-utils"))]
-    test_completed_payments_override: RwLock<HashMap<QuoteHash, Amount>>,
+    test_completed_payments_override: RwLock<HashMap<QuoteHash, TestSettlementOverride>>,
     // NOTE: the test-only own-peer-id override was removed with the ADR-retired
     // quote-freshness/staleness gate (ADR-0004 binds price to the committed
     // count instead), so it no longer has any reader.
@@ -677,12 +686,40 @@ impl PaymentVerifier {
         self.set_paid_quote_k_closest_for_tests(peer_ids);
     }
 
-    /// Test-only setter for an on-chain completed payment amount.
+    /// Test-only setter for an on-chain completed payment amount. The recorded
+    /// rewards address is treated as matching the quote (honest settlement).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_completed_payment_for_tests(&self, quote_hash: QuoteHash, amount: Amount) {
         self.test_completed_payments_override
             .write()
-            .insert(quote_hash, amount);
+            .insert(quote_hash, (amount, None));
+    }
+
+    /// Test-only setter for an on-chain completed payment with an explicit
+    /// recorded rewards address, to exercise the settlement-redirect rejection.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_completed_payment_with_address_for_tests(
+        &self,
+        quote_hash: QuoteHash,
+        amount: Amount,
+        rewards_address: evmlib::RewardsAddress,
+    ) {
+        self.test_completed_payments_override.write().insert(
+            quote_hash,
+            (amount, Some(Self::rewards_address_prefix(&rewards_address))),
+        );
+    }
+
+    /// The vault's `completedPayments` slot packs the payee as
+    /// `bytes16(bytes20(rewardsAddress))` — the leading 16 bytes of the
+    /// address (Solidity `bytesN` conversions truncate on the right). This is
+    /// the form the on-chain record is compared in.
+    fn rewards_address_prefix(rewards_address: &evmlib::RewardsAddress) -> [u8; 16] {
+        let mut prefix = [0u8; 16];
+        if let Some(head) = rewards_address.as_slice().get(..16) {
+            prefix.copy_from_slice(head);
+        }
+        prefix
     }
 
     /// Check if payment is required for the given `XorName`.
@@ -1103,9 +1140,29 @@ impl PaymentVerifier {
 
         Self::validate_paid_quote_signature(candidate).await?;
 
-        let on_chain_amount = self
-            .completed_payment_amount(candidate.quote.hash())
+        let (on_chain_amount, recorded_rewards_prefix) = self
+            .completed_payment_settlement(candidate.quote.hash())
             .await?;
+        // ADR-0004 Amendment 2: the settlement must be RECORDED FOR THE QUOTE'S
+        // rewards address, not merely under its quote hash. The vault stores
+        // whatever `(rewardsAddress, amount)` the payer supplied for the hash,
+        // so an amount-only check would accept a payment the client redirected
+        // to its own wallet — the issuer would be treated (and first-audited)
+        // as "paid" without ever being compensated. Honest clients build the
+        // payment from the quote itself, so this never rejects a legit upload.
+        // The vault packs the payee as `bytes16`, so the comparison is on the
+        // leading 16 bytes (128 bits — far beyond grinding range).
+        if let Some(recorded) = recorded_rewards_prefix {
+            let expected = Self::rewards_address_prefix(&candidate.quote.rewards_address);
+            if recorded != expected {
+                return Err(Error::Payment(format!(
+                    "Median-priced quote settlement for peer {:?} was redirected: recorded rewards address prefix {} does not match the quote's {}",
+                    candidate.encoded_peer_id,
+                    hex::encode(recorded),
+                    hex::encode(expected)
+                )));
+            }
+        }
         if on_chain_amount >= candidate.expected_amount {
             return Ok(on_chain_amount);
         }
@@ -1220,7 +1277,15 @@ impl PaymentVerifier {
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
     }
 
-    async fn completed_payment_amount(&self, quote_hash: QuoteHash) -> Result<Amount> {
+    /// Look up the on-chain settlement recorded for `quote_hash`: the settled
+    /// amount and the `bytes16` rewards-address prefix it was recorded for.
+    /// The prefix is `None` only on the test-override path (meaning "matches
+    /// the quote"); the production contract read always returns the recorded
+    /// prefix so the caller's redirect check always applies.
+    async fn completed_payment_settlement(
+        &self,
+        quote_hash: QuoteHash,
+    ) -> Result<(Amount, Option<[u8; 16]>)> {
         #[cfg(any(test, feature = "test-utils"))]
         {
             let completed_payment_override = {
@@ -1229,8 +1294,8 @@ impl PaymentVerifier {
                     .get(&quote_hash)
                     .copied()
             };
-            if let Some(amount) = completed_payment_override {
-                return Ok(amount);
+            if let Some((amount, recorded)) = completed_payment_override {
+                return Ok((amount, recorded));
             }
         }
 
@@ -1244,7 +1309,7 @@ impl PaymentVerifier {
             .await
             .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
-        Ok(Amount::from(result.amount))
+        Ok((Amount::from(result.amount), Some(result.rewardsAddress.0)))
     }
 
     fn validate_paid_quote_peer_binding(
@@ -3280,6 +3345,43 @@ mod tests {
         assert_eq!(
             result.expect("paid median should verify"),
             PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// ADR-0004 Amendment 2: a settlement recorded under the median quote's
+    /// hash but redirected to a DIFFERENT rewards address must be rejected —
+    /// otherwise a client could "pay" its own wallet while the issuer is
+    /// treated (and first-audited) as paid without ever being compensated.
+    #[tokio::test]
+    async fn test_legacy_paid_median_redirected_settlement_rejected() {
+        let verifier = create_test_verifier();
+        let xorname = [0xA2u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        // Full amount, but recorded for an address that is not the quote's.
+        let attacker_address = RewardsAddress::new([0xEEu8; 20]);
+        assert_ne!(attacker_address, paid_quote.rewards_address);
+        verifier.set_completed_payment_with_address_for_tests(
+            paid_quote.hash(),
+            expected_amount,
+            attacker_address,
+        );
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        let err = result.expect_err("redirected settlement must be rejected");
+        assert!(
+            format!("{err}").contains("redirected"),
+            "Error should mention the settlement redirect: {err}"
         );
     }
 

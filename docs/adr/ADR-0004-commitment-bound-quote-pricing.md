@@ -365,7 +365,8 @@ runs on every quote and candidate.
 
 **Launches are budgeted, not deterministic.** Each node's first-audit drainer
 runs a launch limiter: a token bucket (burst 2, one token per 5 minutes — a
-hard per-node ceiling of 12 launches/hour), an in-flight cap (2), and a uniform
+sustained per-node rate of 12 launches/hour, plus at most the burst of 2 in
+the first hour), an in-flight cap (2), and a uniform
 0-30s launch jitter so the storers of one chunk, which all verify the same
 payment at the same instant, do not challenge the paid peer simultaneously.
 Fleet-wide first-audit pressure is therefore `nodes x refill-rate`, independent

@@ -412,10 +412,11 @@ pub const FIRST_AUDIT_DRAIN_BATCH: usize = 64;
 /// scheduler scaled with `uploads x pinned-quotes-per-proof x verifying-storers`
 /// (measured at ~110 storage-commitment audit events/hour/service in the
 /// DEV-01 staging run, with 77.7% of launches timing out in the DEV-03
-/// per-service-concurrency attempt). At 5 minutes the hard ceiling is
-/// 12 launches/hour/node; steady-state demand sits far below it because
-/// nomination is paid-pin-only and re-nominations are suppressed by
-/// [`FIRST_AUDIT_PEER_REAUDIT_INTERVAL`].
+/// per-service-concurrency attempt). At 5 minutes the sustained rate is
+/// 12 launches/hour/node (a drained burst bucket adds at most
+/// [`FIRST_AUDIT_BUDGET_BURST`] more in the first hour); steady-state demand
+/// sits far below it because nomination is paid-pin-only and re-nominations
+/// are suppressed by [`FIRST_AUDIT_PEER_REAUDIT_INTERVAL`].
 pub const FIRST_AUDIT_LAUNCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// ADR-0004 Amendment 2: token-bucket capacity for monetized first-audit

@@ -348,7 +348,7 @@ fn percentile_ms(sorted: &[Duration], pct: f64) -> u128 {
 #[serial]
 #[allow(clippy::too_many_lines)]
 async fn first_audit_ab_workload() {
-    if std::env::var("FIRST_AUDIT_AB").is_err() {
+    if std::env::var("FIRST_AUDIT_AB").ok().as_deref() != Some("1") {
         eprintln!("first_audit_ab_workload skipped: set FIRST_AUDIT_AB=1 to run");
         return;
     }
