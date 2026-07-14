@@ -383,15 +383,6 @@ const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(VERIFICATION_REQUEST_TIMEOUT_SECS);
 
-/// Maximum keys in one verification request/response batch.
-///
-/// The 10 MiB replication wire cap is intentionally much higher because other
-/// messages carry hint sets and chunk bytes. Verification requests do local
-/// LMDB lookups per key on the responder's serial replication message path, so
-/// this smaller cap bounds CPU/disk work and keeps honest large rounds
-/// splittable instead of failing one oversized encode.
-pub const MAX_VERIFICATION_KEYS_PER_REQUEST: usize = 1024;
-
 /// Maximum ready hints processed by one verification cycle.
 ///
 /// The pending queue may be much larger, but source-count ordering only has a
@@ -399,6 +390,15 @@ pub const MAX_VERIFICATION_KEYS_PER_REQUEST: usize = 1024;
 /// today's roughly 6k-chunk average bootstrap within one cycle while preventing
 /// a full emergency-cap queue from creating one enormous verification round.
 pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
+
+/// Maximum keys accepted in one incoming verification request.
+///
+/// Senders aggregate all keys for a peer into one request. Matching this limit
+/// to the cycle bound lets an honest round use one request per peer while still
+/// bounding the LMDB work performed on the responder's serial replication
+/// message path. Oversized requests are rejected as an empty, wire-compatible
+/// verification response.
+pub const MAX_INCOMING_VERIFICATION_KEYS: usize = MAX_VERIFICATION_KEYS_PER_CYCLE;
 
 /// Maximum simultaneous verification request/response exchanges.
 /// Larger rounds remain fully batched but wait for a permit instead of

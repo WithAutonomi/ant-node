@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
-    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, MAX_VERIFICATION_KEYS_PER_REQUEST,
-    PAID_LIST_CLOSE_GROUP_SIZE, PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, PAID_LIST_CLOSE_GROUP_SIZE,
+    PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
@@ -428,17 +428,14 @@ fn collect_present_sources(
     present_peers
 }
 
-fn verification_requests_for_peer(
+fn verification_request_for_peer(
     peer_keys: &[XorName],
     paid_check_keys: Option<&HashSet<XorName>>,
-) -> Vec<VerificationRequest> {
-    peer_keys
-        .chunks(MAX_VERIFICATION_KEYS_PER_REQUEST)
-        .map(|key_batch| VerificationRequest {
-            keys: key_batch.to_vec(),
-            paid_list_check_indices: paid_indices_for_key_batch(key_batch, paid_check_keys),
-        })
-        .collect()
+) -> VerificationRequest {
+    VerificationRequest {
+        keys: peer_keys.to_vec(),
+        paid_list_check_indices: paid_indices_for_key_batch(peer_keys, paid_check_keys),
+    }
 }
 
 fn paid_indices_for_key_batch(
@@ -498,11 +495,7 @@ pub async fn run_verification_round(
     collect_verification_batch_results(handles, targets, &mut evidence).await;
 
     let elapsed_ms = started.elapsed().as_millis();
-    let batch_count = targets
-        .peer_to_keys
-        .values()
-        .map(|peer_keys| peer_keys.chunks(MAX_VERIFICATION_KEYS_PER_REQUEST).count())
-        .sum::<usize>();
+    let batch_count = targets.peer_to_keys.len();
     if elapsed_ms >= VERIFICATION_ROUND_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::verification",
@@ -531,22 +524,21 @@ fn spawn_verification_batch_tasks(
     for (&peer, peer_keys) in &targets.peer_to_keys {
         let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
 
-        for request in verification_requests_for_peer(peer_keys, paid_check_keys) {
-            let requested_keys = request.keys.clone();
-            let msg = ReplicationMessage {
-                request_id: rand::random(),
-                body: ReplicationMessageBody::VerificationRequest(request),
-            };
+        let request = verification_request_for_peer(peer_keys, paid_check_keys);
+        let requested_keys = request.keys.clone();
+        let msg = ReplicationMessage {
+            request_id: rand::random(),
+            body: ReplicationMessageBody::VerificationRequest(request),
+        };
 
-            handles.push(spawn_verification_batch_task(
-                peer,
-                requested_keys,
-                msg,
-                Arc::clone(p2p_node),
-                timeout,
-                Arc::clone(&semaphore),
-            ));
-        }
+        handles.push(spawn_verification_batch_task(
+            peer,
+            requested_keys,
+            msg,
+            Arc::clone(p2p_node),
+            timeout,
+            Arc::clone(&semaphore),
+        ));
     }
 
     handles
@@ -1858,24 +1850,20 @@ mod tests {
     }
 
     #[test]
-    fn verification_requests_for_peer_splits_large_batches_and_rebases_paid_indices() {
-        let keys: Vec<XorName> = (0..=MAX_VERIFICATION_KEYS_PER_REQUEST)
+    fn verification_request_for_peer_keeps_all_keys_and_indexes_paid_checks() {
+        let keys: Vec<XorName> = (0..=crate::replication::config::MAX_VERIFICATION_KEYS_PER_CYCLE)
             .map(xor_name_from_usize)
             .collect();
-        let paid_keys: HashSet<XorName> = [keys[0], keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
-            .into_iter()
-            .collect();
+        let last_index = crate::replication::config::MAX_VERIFICATION_KEYS_PER_CYCLE;
+        let paid_keys: HashSet<XorName> = [keys[0], keys[last_index]].into_iter().collect();
 
-        let requests = verification_requests_for_peer(&keys, Some(&paid_keys));
+        let request = verification_request_for_peer(&keys, Some(&paid_keys));
 
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].keys.len(), MAX_VERIFICATION_KEYS_PER_REQUEST);
-        assert_eq!(requests[0].paid_list_check_indices, vec![0]);
+        assert_eq!(request.keys, keys);
         assert_eq!(
-            requests[1].keys,
-            vec![keys[MAX_VERIFICATION_KEYS_PER_REQUEST]]
+            request.paid_list_check_indices,
+            vec![0, u32::try_from(last_index).unwrap()]
         );
-        assert_eq!(requests[1].paid_list_check_indices, vec![0]);
     }
 
     // -----------------------------------------------------------------------
