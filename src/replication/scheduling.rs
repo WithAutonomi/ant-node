@@ -29,41 +29,11 @@ use saorsa_core::identity::PeerId;
 /// only from close-group-sized verification evidence, never from attacker
 /// hint volume).
 ///
-/// This global cap alone is **not** sufficient: with blind capacity-reject a
-/// single malicious routing-table peer could fill the whole map with cheap
-/// admission-passing junk and starve every honest peer's hints until the
-/// 30-minute `evict_stale` backstop fires (and re-fill immediately after).
-/// Honest-replication fairness is therefore enforced by
-/// [`MAX_PENDING_VERIFY_PER_PEER`] below; this global value is only the
-/// memory backstop.
+/// Source-aware scheduling processes corroborated hints first and trust
+/// penalties remove peers that submit directly contradicted singleton hints.
+/// This cap remains the final memory circuit breaker during the interval
+/// between admission, verification, trust eviction, and source cleanup.
 pub const MAX_PENDING_VERIFY: usize = 131_072;
-
-/// Per-source hard cap on `pending_verify` entries attributed to a single
-/// `hint_sender` peer.
-///
-/// This is the actual D1 defence. Each pending entry records the peer that
-/// hinted it (`VerificationEntry::hint_sender`); a single source may occupy
-/// at most this many slots. A flooding peer can therefore consume only its
-/// own quota — it can never deny slots to honest peers, because honest
-/// sources are accounted independently. Set well above any legitimate
-/// per-peer hint working set (a healthy neighbour syncs at most a few
-/// thousand keys to us per cycle) yet small enough that
-/// `MAX_PENDING_VERIFY / MAX_PENDING_VERIFY_PER_PEER` distinct malicious
-/// peers would be required to approach the global cap.
-///
-/// Residual (accepted, follow-up): with the current ratio, ~16 distinct
-/// `PeerId`s that are *all* simultaneously in the victim's routing table
-/// (gated by `sender_in_rt`) could still collectively reach the global
-/// `MAX_PENDING_VERIFY` backstop. `hint_sender` is the cryptographically
-/// authenticated connection identity (not a forgeable payload field), so
-/// this requires running ~16 real Kademlia-adjacent Sybil nodes — a large
-/// step up from the single-peer pre-fix attack, and the worst case degrades
-/// only to the bounded memory backstop, not silent permanent starvation of
-/// non-Sybil peers (each keeps its independent quota). A future hardening
-/// (reserved headroom for under-quota sources, or a per-source cap that
-/// scales with distinct-source pressure) is tracked as a follow-up and is
-/// intentionally out of scope for this `DoS` fix.
-pub const MAX_PENDING_VERIFY_PER_PEER: usize = 8_192;
 
 /// Hard upper bound on the number of keys held in `fetch_queue`.
 ///
@@ -90,7 +60,7 @@ pub enum AdmissionResult {
     /// Key was already in some pipeline stage; the existing entry is left
     /// in place. No retry required.
     AlreadyPresent,
-    /// Global or per-source capacity bound rejected the entry. The caller
+    /// Global capacity bound rejected the entry. The caller
     /// MUST treat this as work still to do (not as silently completed).
     CapacityRejected,
 }
@@ -155,15 +125,12 @@ pub struct ReplicationQueues {
     fetch_queue_keys: HashSet<XorName>,
     /// Active downloads keyed by `XorName`.
     in_flight_fetch: HashMap<XorName, InFlightEntry>,
-    /// Number of `pending_verify` entries currently attributed to each
-    /// `hint_sender` peer. Maintained in lockstep with `pending_verify`
-    /// (insert/remove/evict).
-    pending_per_sender: HashMap<PeerId, usize>,
+    /// Reverse index for removing a departed peer from every pending hint
+    /// without scanning the entire pending table.
+    pending_keys_by_source: HashMap<PeerId, HashSet<XorName>>,
     /// Pending-verification capacity slots reserved by retry-capable keys that
     /// have left `pending_verify` for `fetch_queue` / `in_flight_fetch`.
     retry_reserved_slots: usize,
-    /// Per-source view of [`Self::retry_reserved_slots`].
-    retry_reserved_per_sender: HashMap<PeerId, usize>,
 }
 
 impl Default for ReplicationQueues {
@@ -181,9 +148,8 @@ impl ReplicationQueues {
             fetch_queue: BinaryHeap::new(),
             fetch_queue_keys: HashSet::new(),
             in_flight_fetch: HashMap::new(),
-            pending_per_sender: HashMap::new(),
+            pending_keys_by_source: HashMap::new(),
             retry_reserved_slots: 0,
-            retry_reserved_per_sender: HashMap::new(),
         }
     }
 
@@ -195,10 +161,9 @@ impl ReplicationQueues {
     ///
     /// Returns an [`AdmissionResult`] distinguishing the three outcomes:
     /// * `Admitted` — newly inserted.
-    /// * `AlreadyPresent` — Rule 8 cross-queue dedup (the key is already in
-    ///   `pending_verify`, `fetch_queue`, or `in_flight_fetch`); the existing
-    ///   entry remains and there is no work to retry.
-    /// * `CapacityRejected` — global or per-source bound hit; the work is
+    /// * `AlreadyPresent` — Rule 8 cross-queue dedup. For a key still in
+    ///   `pending_verify`, the new advertiser is merged into its source set.
+    /// * `CapacityRejected` — the global bound was hit; the work is
     ///   genuinely lost and the caller (e.g. bootstrap drain accounting,
     ///   source-side retry) MUST treat this as still-outstanding work, not as
     ///   "done". Without this distinction a bootstrap snapshot whose hints
@@ -208,22 +173,66 @@ impl ReplicationQueues {
         key: XorName,
         entry: VerificationEntry,
     ) -> AdmissionResult {
-        if self.contains_key(&key) {
+        if let Some(existing) = self.pending_verify.get_mut(&key) {
+            existing
+                .replica_hint_sources
+                .extend(entry.replica_hint_sources.iter().copied());
+            for source in entry.hint_sources {
+                if existing.hint_sources.insert(source) {
+                    self.pending_keys_by_source
+                        .entry(source)
+                        .or_default()
+                        .insert(key);
+                    // Corroborated work no longer needs the singleton
+                    // aggregation hold and should be eligible immediately.
+                    existing.next_verify_at = existing.next_verify_at.min(Instant::now());
+                }
+            }
+            if entry.pipeline == HintPipeline::Replica {
+                existing.pipeline = HintPipeline::Replica;
+            }
+            return AdmissionResult::AlreadyPresent;
+        }
+        if self.fetch_queue_keys.contains(&key) {
+            let pipeline = entry.pipeline;
+            let mut candidates = std::mem::take(&mut self.fetch_queue).into_vec();
+            if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.key == key) {
+                if pipeline == HintPipeline::Replica {
+                    for source in &entry.replica_hint_sources {
+                        if !candidate.sources.contains(source) {
+                            candidate.sources.push(*source);
+                        }
+                    }
+                }
+                if let Some(retry) = &mut candidate.retry_verification {
+                    retry
+                        .replica_hint_sources
+                        .extend(entry.replica_hint_sources);
+                    retry.hint_sources.extend(entry.hint_sources);
+                }
+            }
+            self.fetch_queue = BinaryHeap::from(candidates);
+            return AdmissionResult::AlreadyPresent;
+        }
+        if let Some(in_flight) = self.in_flight_fetch.get_mut(&key) {
+            if entry.pipeline == HintPipeline::Replica {
+                for source in &entry.replica_hint_sources {
+                    if !in_flight.all_sources.contains(source) {
+                        in_flight.all_sources.push(*source);
+                    }
+                }
+            }
+            if let Some(retry) = &mut in_flight.retry_verification {
+                retry
+                    .replica_hint_sources
+                    .extend(entry.replica_hint_sources);
+                retry.hint_sources.extend(entry.hint_sources);
+            }
             return AdmissionResult::AlreadyPresent;
         }
         if self.pending_capacity_used() >= MAX_PENDING_VERIFY {
             debug!(
                 "pending_verify at global capacity ({MAX_PENDING_VERIFY}); rejecting key {}",
-                hex::encode(key)
-            );
-            return AdmissionResult::CapacityRejected;
-        }
-        let sender = entry.hint_sender;
-        let sender_count = self.sender_capacity_used(&sender);
-        if sender_count >= MAX_PENDING_VERIFY_PER_PEER {
-            debug!(
-                "peer {sender} at per-source pending cap ({MAX_PENDING_VERIFY_PER_PEER}); \
-                 rejecting key {} (honest peers are unaffected)",
                 hex::encode(key)
             );
             return AdmissionResult::CapacityRejected;
@@ -238,69 +247,46 @@ impl ReplicationQueues {
             .saturating_add(self.retry_reserved_slots)
     }
 
-    fn sender_capacity_used(&self, sender: &PeerId) -> usize {
-        self.pending_per_sender
-            .get(sender)
-            .copied()
-            .unwrap_or(0)
-            .saturating_add(
-                self.retry_reserved_per_sender
-                    .get(sender)
-                    .copied()
-                    .unwrap_or(0),
-            )
-    }
-
-    /// Decrement (and prune at zero) the per-sender counter for `sender`.
-    ///
-    /// Kept private so the counter can only move in lockstep with
-    /// `pending_verify` mutations. The decrement uses `saturating_sub` so a
-    /// hypothetical future invariant break (a release without a matching
-    /// admission) self-heals to zero instead of panicking on `usize`
-    /// underflow; `debug_assert!` still surfaces such a break in test builds.
-    fn release_sender_slot(pending_per_sender: &mut HashMap<PeerId, usize>, sender: &PeerId) {
-        if let Some(count) = pending_per_sender.get_mut(sender) {
-            debug_assert!(*count > 0, "per-sender counter underflow for {sender}");
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                pending_per_sender.remove(sender);
-            }
-        }
-    }
-
     fn insert_pending_unchecked(&mut self, key: XorName, entry: VerificationEntry) {
-        let sender = entry.hint_sender;
+        debug_assert!(
+            !entry.hint_sources.is_empty(),
+            "pending hint inserted without a live source"
+        );
+        debug_assert!(
+            entry.replica_hint_sources.is_subset(&entry.hint_sources),
+            "replica advertisers must be included in all hint sources"
+        );
+        for source in &entry.hint_sources {
+            self.pending_keys_by_source
+                .entry(*source)
+                .or_default()
+                .insert(key);
+        }
         let replaced = self.pending_verify.insert(key, entry);
         debug_assert!(
             replaced.is_none(),
             "pending entry inserted twice for {}",
             hex::encode(key)
         );
-        *self.pending_per_sender.entry(sender).or_insert(0) += 1;
     }
 
-    fn reserve_retry_slot(&mut self, sender: PeerId) {
+    fn reserve_retry_slot(&mut self) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_add(1);
-        *self.retry_reserved_per_sender.entry(sender).or_insert(0) += 1;
     }
 
-    fn release_retry_slot(&mut self, sender: &PeerId) {
-        if !self.retry_reserved_per_sender.contains_key(sender) {
-            return;
-        }
+    fn release_retry_slot(&mut self) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_sub(1);
-        Self::release_sender_slot(&mut self.retry_reserved_per_sender, sender);
     }
 
     fn release_retry_slot_for_entry(&mut self, entry: &InFlightEntry) {
-        if let Some(verification) = &entry.retry_verification {
-            self.release_retry_slot(&verification.hint_sender);
+        if entry.retry_verification.is_some() {
+            self.release_retry_slot();
         }
     }
 
     fn release_retry_slot_for_candidate(&mut self, candidate: &FetchCandidate) {
-        if let Some(verification) = &candidate.retry_verification {
-            self.release_retry_slot(&verification.hint_sender);
+        if candidate.retry_verification.is_some() {
+            self.release_retry_slot();
         }
     }
 
@@ -313,14 +299,7 @@ impl ReplicationQueues {
     /// Advance a pending entry's verification `state`, returning the entry's
     /// `pipeline` (so the caller can branch on it) when the key was found.
     ///
-    /// Replaces a prior `get_pending_mut` which handed out `&mut VerificationEntry`
-    /// and relied on a doc-comment to keep callers from re-assigning
-    /// `hint_sender`. The per-source quota counter (`pending_per_sender`) is
-    /// keyed by `hint_sender` recorded at admission; re-attributing a live
-    /// entry to a different peer would orphan a count and silently desync
-    /// the quota — exactly the silent-starvation class this fix prevents.
-    /// Narrowing the mutation API to a single setter makes that mistake
-    /// impossible to commit by accident.
+    /// Narrow mutation API used by the verification state machine.
     pub fn set_pending_state(
         &mut self,
         key: &XorName,
@@ -335,9 +314,20 @@ impl ReplicationQueues {
     pub fn remove_pending(&mut self, key: &XorName) -> Option<VerificationEntry> {
         let removed = self.pending_verify.remove(key);
         if let Some(entry) = &removed {
-            Self::release_sender_slot(&mut self.pending_per_sender, &entry.hint_sender);
+            self.remove_key_from_source_index(key, &entry.hint_sources);
         }
         removed
+    }
+
+    fn remove_key_from_source_index(&mut self, key: &XorName, sources: &HashSet<PeerId>) {
+        for source in sources {
+            if let Some(keys) = self.pending_keys_by_source.get_mut(source) {
+                keys.remove(key);
+                if keys.is_empty() {
+                    self.pending_keys_by_source.remove(source);
+                }
+            }
+        }
     }
 
     /// Collect all pending verification keys (for batch processing).
@@ -349,10 +339,100 @@ impl ReplicationQueues {
     /// Collect pending verification keys whose retry delay has elapsed.
     #[must_use]
     pub fn ready_pending_keys(&self, now: Instant) -> Vec<XorName> {
-        self.pending_verify
+        let mut ready = self
+            .pending_verify
             .iter()
             .filter_map(|(key, entry)| (entry.next_verify_at <= now).then_some(*key))
-            .collect()
+            .collect::<Vec<_>>();
+        ready.sort_unstable_by(|a, b| {
+            let entry_a = &self.pending_verify[a];
+            let entry_b = &self.pending_verify[b];
+            entry_b
+                .hint_sources
+                .len()
+                .cmp(&entry_a.hint_sources.len())
+                .then_with(|| entry_a.created_at.cmp(&entry_b.created_at))
+                .then_with(|| a.cmp(b))
+        });
+        ready
+    }
+
+    /// Remove a departed routing-table peer from every pending hint it
+    /// advertised. Entries with no remaining live advertisers are dropped.
+    ///
+    /// Returns keys that became orphaned so bootstrap accounting can retire
+    /// them and re-check its drain transition.
+    pub fn remove_hint_source(&mut self, source: &PeerId) -> Vec<XorName> {
+        let keys = self
+            .pending_keys_by_source
+            .remove(source)
+            .unwrap_or_default();
+        let mut orphaned = Vec::new();
+
+        for key in keys {
+            let became_orphaned = if let Some(entry) = self.pending_verify.get_mut(&key) {
+                entry.hint_sources.remove(source);
+                entry.replica_hint_sources.remove(source);
+                if entry.replica_hint_sources.is_empty() {
+                    entry.pipeline = HintPipeline::PaidOnly;
+                }
+                entry.hint_sources.is_empty()
+            } else {
+                false
+            };
+
+            if became_orphaned {
+                self.pending_verify.remove(&key);
+                orphaned.push(key);
+            }
+        }
+
+        let mut retry_releases = 0usize;
+        let mut retained_candidates = Vec::new();
+        for mut candidate in std::mem::take(&mut self.fetch_queue).into_vec() {
+            candidate.sources.retain(|peer| peer != source);
+            if let Some(verification) = &mut candidate.retry_verification {
+                if verification.hint_sources.remove(source) {
+                    verification.replica_hint_sources.remove(source);
+                    if verification.replica_hint_sources.is_empty() {
+                        verification.pipeline = HintPipeline::PaidOnly;
+                    }
+                    if verification.hint_sources.is_empty() {
+                        retry_releases += 1;
+                        candidate.retry_verification = None;
+                    }
+                }
+            }
+            if candidate.sources.is_empty() && candidate.retry_verification.is_none() {
+                self.fetch_queue_keys.remove(&candidate.key);
+                orphaned.push(candidate.key);
+            } else {
+                retained_candidates.push(candidate);
+            }
+        }
+        self.fetch_queue = BinaryHeap::from(retained_candidates);
+
+        for entry in self.in_flight_fetch.values_mut() {
+            entry.all_sources.retain(|peer| peer != source);
+            if let Some(verification) = &mut entry.retry_verification {
+                if verification.hint_sources.remove(source) {
+                    verification.replica_hint_sources.remove(source);
+                    if verification.replica_hint_sources.is_empty() {
+                        verification.pipeline = HintPipeline::PaidOnly;
+                    }
+                    if verification.hint_sources.is_empty() {
+                        retry_releases += 1;
+                        entry.retry_verification = None;
+                    }
+                }
+            }
+        }
+
+        for _ in 0..retry_releases {
+            self.release_retry_slot();
+        }
+
+        orphaned
     }
 
     /// Defer a pending key before its next verification attempt.
@@ -459,21 +539,17 @@ impl ReplicationQueues {
         }
         // Capacity confirmed; safe to release the pending slot and enqueue.
         let retry_verification = self.remove_pending(&key);
-        let retry_sender = retry_verification
-            .as_ref()
-            .map(|verification| verification.hint_sender);
-        if let Some(sender) = retry_sender {
-            self.reserve_retry_slot(sender);
+        let reserved_retry = retry_verification.is_some();
+        if reserved_retry {
+            self.reserve_retry_slot();
         }
         // enqueue_fetch returns false only on capacity or already-queued; the
         // capacity check above and the just-removed pending state make this
         // succeed. If a concurrent path put the key into fetch_queue/in_flight
         // between, dropping the duplicate is fine.
         let enqueued = self.enqueue_fetch_with_retry(key, distance, sources, retry_verification);
-        if !enqueued {
-            if let Some(sender) = retry_sender {
-                self.release_retry_slot(&sender);
-            }
+        if !enqueued && reserved_retry {
+            self.release_retry_slot();
         }
         enqueued
     }
@@ -578,8 +654,8 @@ impl ReplicationQueues {
         let FetchCandidate {
             retry_verification, ..
         } = candidate;
-        if let Some(verification) = retry_verification {
-            self.release_retry_slot(&verification.hint_sender);
+        if retry_verification.is_some() {
+            self.release_retry_slot();
         }
     }
 
@@ -621,15 +697,13 @@ impl ReplicationQueues {
         let Some(mut verification) = retry_verification else {
             return false;
         };
-        let sender = verification.hint_sender;
-
         verification.state = VerificationState::PendingVerify;
         verification.verified_sources.clear();
         verification.tried_sources.clear();
         verification.next_verify_at = Instant::now() + retry_after;
 
         self.insert_pending_unchecked(key, verification);
-        self.release_retry_slot(&sender);
+        self.release_retry_slot();
         true
     }
 
@@ -642,15 +716,13 @@ impl ReplicationQueues {
         let Some(mut verification) = entry.retry_verification.take() else {
             return false;
         };
-        let sender = verification.hint_sender;
-
         verification.state = VerificationState::PendingVerify;
         verification.verified_sources.clear();
         verification.tried_sources.clear();
         verification.next_verify_at = Instant::now() + retry_after;
 
         self.insert_pending_unchecked(*key, verification);
-        self.release_retry_slot(&sender);
+        self.release_retry_slot();
         true
     }
 
@@ -692,9 +764,7 @@ impl ReplicationQueues {
             .collect::<Vec<_>>();
 
         for key in &evicted_keys {
-            if let Some(entry) = self.pending_verify.remove(key) {
-                Self::release_sender_slot(&mut self.pending_per_sender, &entry.hint_sender);
-            }
+            self.remove_pending(key);
         }
 
         if !evicted_keys.is_empty() {
@@ -705,15 +775,6 @@ impl ReplicationQueues {
         }
 
         evicted_keys
-    }
-
-    /// Number of `pending_verify` entries currently attributed to `sender`.
-    /// Includes retry reservations held by verified keys currently in the fetch
-    /// pipeline, because those reservations still consume the sender's fairness
-    /// quota.
-    #[must_use]
-    pub fn pending_count_for_sender(&self, sender: &PeerId) -> usize {
-        self.sender_capacity_used(sender)
     }
 }
 
@@ -757,112 +818,8 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: now,
             next_verify_at: now,
-            hint_sender: peer_id_from_byte(sender_byte),
-        }
-    }
-
-    struct ReservedCandidateAtSenderCap {
-        queues: ReplicationQueues,
-        key: XorName,
-        source: PeerId,
-        hint_sender: PeerId,
-        fresh_key: XorName,
-        candidate: FetchCandidate,
-        base_sender_count: usize,
-        pre_promotion_sender_count: usize,
-    }
-
-    fn assert_sender_cap_rejects_key(
-        queues: &mut ReplicationQueues,
-        key: XorName,
-        sender_byte: u8,
-    ) {
-        assert_eq!(
-            queues.add_pending_verify(key, test_entry(sender_byte)),
-            AdmissionResult::CapacityRejected,
-            "fresh key should be rejected while sender capacity is exhausted"
-        );
-    }
-
-    fn assert_sender_released_slot_admits_key(
-        queues: &mut ReplicationQueues,
-        sender: &PeerId,
-        sender_byte: u8,
-        key: XorName,
-        expected_count_before_admission: usize,
-    ) {
-        assert_eq!(
-            queues.pending_count_for_sender(sender),
-            expected_count_before_admission,
-            "sender capacity should return to the expected count"
-        );
-        assert!(
-            queues
-                .add_pending_verify(key, test_entry(sender_byte))
-                .admitted(),
-            "fresh key should be admitted after a retry reservation is released"
-        );
-        assert_eq!(
-            queues.pending_count_for_sender(sender),
-            expected_count_before_admission + 1,
-            "fresh key should consume the released sender slot"
-        );
-    }
-
-    fn reserved_candidate_at_sender_cap() -> ReservedCandidateAtSenderCap {
-        const PROMOTED_KEY_INDEX: u32 = 40_000;
-        const FILLER_KEY_OFFSET: u32 = 50_000;
-        const FRESH_KEY_INDEX: u32 = 60_000;
-        const DISTANCE_BYTE: u8 = 0x01;
-        const SOURCE_BYTE: u8 = 2;
-        const HINT_SENDER_BYTE: u8 = 9;
-
-        let mut queues = ReplicationQueues::new();
-        let key = xor_name_from_u32(PROMOTED_KEY_INDEX);
-        let distance = xor_name_from_byte(DISTANCE_BYTE);
-        let source = peer_id_from_byte(SOURCE_BYTE);
-        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
-        let fresh_key = xor_name_from_u32(FRESH_KEY_INDEX);
-        let base_sender_count = MAX_PENDING_VERIFY_PER_PEER - 1;
-        let pre_promotion_sender_count = MAX_PENDING_VERIFY_PER_PEER;
-
-        assert!(queues
-            .add_pending_verify(key, test_entry(HINT_SENDER_BYTE))
-            .admitted());
-        for i in 0..base_sender_count {
-            let key_index = FILLER_KEY_OFFSET + u32::try_from(i).expect("test index fits u32");
-            assert!(
-                queues
-                    .add_pending_verify(xor_name_from_u32(key_index), test_entry(HINT_SENDER_BYTE))
-                    .admitted(),
-                "filler key should be admitted before the sender reaches its cap"
-            );
-        }
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            pre_promotion_sender_count,
-            "sender should be exactly at capacity before promotion"
-        );
-        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
-
-        assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            pre_promotion_sender_count,
-            "promoted candidate should retain its sender capacity reservation"
-        );
-        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
-
-        let candidate = queues.dequeue_fetch().expect("fetch candidate");
-        ReservedCandidateAtSenderCap {
-            queues,
-            key,
-            source,
-            hint_sender,
-            fresh_key,
-            candidate,
-            base_sender_count,
-            pre_promotion_sender_count,
+            hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
+            replica_hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
         }
     }
 
@@ -877,12 +834,137 @@ mod tests {
     }
 
     #[test]
-    fn add_pending_verify_duplicate_rejected() {
+    fn large_single_source_backlog_is_not_subject_to_a_per_peer_cap() {
+        const KEY_COUNT: u32 = 10_000;
+        let mut queues = ReplicationQueues::new();
+
+        for index in 0..KEY_COUNT {
+            assert!(
+                queues
+                    .add_pending_verify(xor_name_from_u32(index), test_entry(1))
+                    .admitted(),
+                "key {index} should be admitted below the global emergency bound"
+            );
+        }
+        assert_eq!(queues.pending_count(), KEY_COUNT as usize);
+    }
+
+    #[test]
+    fn duplicate_pending_hint_adds_live_source() {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
-        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+        let source_a = peer_id_from_byte(1);
+        let source_b = peer_id_from_byte(2);
+        let mut first = test_entry(1);
+        first.next_verify_at = Instant::now() + Duration::from_secs(60);
+        assert!(queues.add_pending_verify(key, first).admitted());
+        assert!(queues.ready_pending_keys(Instant::now()).is_empty());
         assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
         assert_eq!(queues.pending_count(), 1);
+        assert_eq!(
+            queues
+                .get_pending(&key)
+                .expect("pending entry")
+                .hint_sources,
+            HashSet::from([source_a, source_b])
+        );
+        assert_eq!(
+            queues.ready_pending_keys(Instant::now()),
+            vec![key],
+            "corroboration should end the singleton aggregation hold"
+        );
+    }
+
+    #[test]
+    fn ready_pending_keys_prioritizes_more_live_sources_then_age() {
+        let mut queues = ReplicationQueues::new();
+        let oldest_singleton = xor_name_from_byte(0x10);
+        let newer_singleton = xor_name_from_byte(0x20);
+        let corroborated = xor_name_from_byte(0x30);
+        let now = Instant::now();
+
+        let mut oldest = test_entry(1);
+        oldest.created_at = now.checked_sub(Duration::from_secs(2)).unwrap();
+        let mut newer = test_entry(1);
+        newer.created_at = now.checked_sub(Duration::from_secs(1)).unwrap();
+        let mut multi = test_entry(1);
+        multi.created_at = now;
+
+        assert!(queues
+            .add_pending_verify(oldest_singleton, oldest)
+            .admitted());
+        assert!(queues.add_pending_verify(newer_singleton, newer).admitted());
+        assert!(queues.add_pending_verify(corroborated, multi).admitted());
+        assert_eq!(
+            queues.add_pending_verify(corroborated, test_entry(2)),
+            AdmissionResult::AlreadyPresent
+        );
+
+        assert_eq!(
+            queues.ready_pending_keys(Instant::now()),
+            vec![corroborated, oldest_singleton, newer_singleton]
+        );
+    }
+
+    #[test]
+    fn peer_removal_drops_orphans_and_preserves_corroborated_hints() {
+        let mut queues = ReplicationQueues::new();
+        let source_a = peer_id_from_byte(1);
+        let source_b = peer_id_from_byte(2);
+        let orphaned_key = xor_name_from_byte(0x40);
+        let shared_key = xor_name_from_byte(0x41);
+
+        assert!(queues
+            .add_pending_verify(orphaned_key, test_entry(1))
+            .admitted());
+        assert!(queues
+            .add_pending_verify(shared_key, test_entry(1))
+            .admitted());
+        assert_eq!(
+            queues.add_pending_verify(shared_key, test_entry(2)),
+            AdmissionResult::AlreadyPresent
+        );
+
+        assert_eq!(queues.remove_hint_source(&source_a), vec![orphaned_key]);
+        let shared = queues
+            .get_pending(&shared_key)
+            .expect("shared hint retained");
+        assert_eq!(shared.hint_sources, HashSet::from([source_b]));
+
+        assert_eq!(queues.remove_hint_source(&source_b), vec![shared_key]);
+        assert_eq!(queues.pending_count(), 0);
+    }
+
+    #[test]
+    fn peer_removal_prunes_fetch_and_retry_sources() {
+        let mut queues = ReplicationQueues::new();
+        let source_a = peer_id_from_byte(1);
+        let source_b = peer_id_from_byte(2);
+        let key = xor_name_from_byte(0x42);
+
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+        assert_eq!(
+            queues.add_pending_verify(key, test_entry(2)),
+            AdmissionResult::AlreadyPresent
+        );
+        assert!(queues.promote_pending_to_fetch(
+            key,
+            xor_name_from_byte(0x01),
+            vec![source_a, source_b],
+        ));
+
+        assert!(queues.remove_hint_source(&source_a).is_empty());
+        let candidate = queues.dequeue_fetch().expect("candidate remains fetchable");
+        assert_eq!(candidate.sources, vec![source_b]);
+        assert_eq!(
+            candidate
+                .retry_verification
+                .as_ref()
+                .expect("retry provenance retained")
+                .hint_sources,
+            HashSet::from([source_b])
+        );
+        queues.discard_fetch_candidate(candidate);
     }
 
     #[test]
@@ -1016,9 +1098,7 @@ mod tests {
         let key = xor_name_from_byte(KEY_BYTE);
         let distance = xor_name_from_byte(DISTANCE_BYTE);
         let source = peer_id_from_byte(SOURCE_BYTE);
-        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
-        let mut entry = test_entry(HINT_SENDER_BYTE);
-        entry.hint_sender = hint_sender;
+        let entry = test_entry(HINT_SENDER_BYTE);
 
         assert!(queues.add_pending_verify(key, entry).admitted());
         assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
@@ -1033,7 +1113,6 @@ mod tests {
         assert!(queues.requeue_fetch_for_verification(&key, RETRY_DELAY));
 
         assert_eq!(queues.in_flight_count(), 0);
-        assert_eq!(queues.pending_count_for_sender(&hint_sender), 1);
         assert!(
             queues.ready_pending_keys(Instant::now()).is_empty(),
             "requeued key should observe retry delay"
@@ -1041,186 +1120,6 @@ mod tests {
 
         let after_retry = Instant::now() + RETRY_DELAY + RETRY_DELAY_SLACK;
         assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
-    }
-
-    #[test]
-    fn promoted_fetch_reserves_sender_capacity_for_requeue() {
-        const PROMOTED_KEY_INDEX: u32 = 10_000;
-        const EXTRA_KEY_OFFSET: u32 = 20_000;
-        const REJECTED_KEY_INDEX: u32 = 30_000;
-        const DISTANCE_BYTE: u8 = 0x01;
-        const SOURCE_BYTE: u8 = 2;
-        const HINT_SENDER_BYTE: u8 = 9;
-        const RETRY_DELAY: Duration = Duration::from_secs(15);
-
-        let mut queues = ReplicationQueues::new();
-        let key = xor_name_from_u32(PROMOTED_KEY_INDEX);
-        let distance = xor_name_from_byte(DISTANCE_BYTE);
-        let source = peer_id_from_byte(SOURCE_BYTE);
-        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
-        let mut entry = test_entry(HINT_SENDER_BYTE);
-        entry.hint_sender = hint_sender;
-
-        assert!(queues.add_pending_verify(key, entry).admitted());
-        assert!(queues.promote_pending_to_fetch(key, distance, vec![source]));
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            1,
-            "fetch candidate must retain its sender quota reservation"
-        );
-
-        for i in 0..(MAX_PENDING_VERIFY_PER_PEER - 1) {
-            let key_index = EXTRA_KEY_OFFSET + u32::try_from(i).expect("test index fits u32");
-            let mut entry = test_entry(HINT_SENDER_BYTE);
-            entry.hint_sender = hint_sender;
-            assert!(
-                queues
-                    .add_pending_verify(xor_name_from_u32(key_index), entry)
-                    .admitted(),
-                "sender should admit up to the quota not including the reserved fetch slot"
-            );
-        }
-
-        let mut rejected_entry = test_entry(HINT_SENDER_BYTE);
-        rejected_entry.hint_sender = hint_sender;
-        assert_eq!(
-            queues.add_pending_verify(xor_name_from_u32(REJECTED_KEY_INDEX), rejected_entry),
-            AdmissionResult::CapacityRejected,
-            "reserved fetch slot must count toward the per-sender capacity"
-        );
-
-        let candidate = queues.dequeue_fetch().expect("fetch candidate");
-        queues.start_dequeued_fetch(candidate, source);
-        assert!(
-            queues.retry_fetch(&key).is_none(),
-            "single source should be exhausted"
-        );
-        assert!(
-            queues.requeue_fetch_for_verification(&key, RETRY_DELAY),
-            "requeue must use the reserved slot even while the sender is at capacity"
-        );
-
-        assert!(queues.get_pending(&key).is_some());
-        assert_eq!(queues.pending_count(), MAX_PENDING_VERIFY_PER_PEER);
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            MAX_PENDING_VERIFY_PER_PEER
-        );
-    }
-
-    #[test]
-    fn start_dequeued_fetch_then_complete_releases_reserved_sender_capacity() {
-        const HINT_SENDER_BYTE: u8 = 9;
-
-        let ReservedCandidateAtSenderCap {
-            mut queues,
-            key,
-            source,
-            hint_sender,
-            fresh_key,
-            candidate,
-            base_sender_count,
-            ..
-        } = reserved_candidate_at_sender_cap();
-
-        queues.start_dequeued_fetch(candidate, source);
-        assert!(queues.complete_fetch(&key).is_some());
-
-        assert_sender_released_slot_admits_key(
-            &mut queues,
-            &hint_sender,
-            HINT_SENDER_BYTE,
-            fresh_key,
-            base_sender_count,
-        );
-    }
-
-    #[test]
-    fn start_dequeued_fetch_then_exhaust_requeues_with_reserved_sender_capacity() {
-        const HINT_SENDER_BYTE: u8 = 9;
-        const RETRY_DELAY: Duration = Duration::from_secs(15);
-
-        let ReservedCandidateAtSenderCap {
-            mut queues,
-            key,
-            source,
-            hint_sender,
-            fresh_key,
-            candidate,
-            pre_promotion_sender_count,
-            ..
-        } = reserved_candidate_at_sender_cap();
-
-        queues.start_dequeued_fetch(candidate, source);
-        assert!(
-            queues.retry_fetch(&key).is_none(),
-            "single source should be exhausted"
-        );
-        assert!(
-            queues.requeue_fetch_for_verification(&key, RETRY_DELAY),
-            "exhausted fetch should restore retry metadata"
-        );
-
-        assert!(queues.get_pending(&key).is_some());
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            pre_promotion_sender_count,
-            "requeued key should convert its reservation back to a pending slot"
-        );
-        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
-    }
-
-    #[test]
-    fn discard_dequeued_fetch_candidate_releases_reserved_sender_capacity() {
-        const HINT_SENDER_BYTE: u8 = 9;
-
-        let ReservedCandidateAtSenderCap {
-            mut queues,
-            hint_sender,
-            fresh_key,
-            candidate,
-            base_sender_count,
-            ..
-        } = reserved_candidate_at_sender_cap();
-
-        queues.discard_fetch_candidate(candidate);
-
-        assert_sender_released_slot_admits_key(
-            &mut queues,
-            &hint_sender,
-            HINT_SENDER_BYTE,
-            fresh_key,
-            base_sender_count,
-        );
-    }
-
-    #[test]
-    fn requeue_dequeued_fetch_candidate_restores_pending_sender_capacity() {
-        const HINT_SENDER_BYTE: u8 = 9;
-        const RETRY_DELAY: Duration = Duration::from_secs(15);
-
-        let ReservedCandidateAtSenderCap {
-            mut queues,
-            key,
-            hint_sender,
-            fresh_key,
-            candidate,
-            pre_promotion_sender_count,
-            ..
-        } = reserved_candidate_at_sender_cap();
-
-        assert!(
-            queues.requeue_candidate_for_verification(candidate, RETRY_DELAY),
-            "dequeued retry candidate should be restored to pending verification"
-        );
-
-        assert!(queues.get_pending(&key).is_some());
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            pre_promotion_sender_count,
-            "requeued candidate should convert its reservation back to a pending slot"
-        );
-        assert_sender_cap_rejects_key(&mut queues, fresh_key, HINT_SENDER_BYTE);
     }
 
     #[test]
@@ -1232,13 +1131,10 @@ mod tests {
         const TRIED_SOURCE_BYTE: u8 = 3;
         const RETRY_DELAY: Duration = Duration::from_secs(15);
         const RETRY_DELAY_SLACK: Duration = Duration::from_secs(1);
-        const REQUEUED_SENDER_COUNT: usize = 1;
-        const EMPTY_SENDER_COUNT: usize = 0;
 
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_u32(KEY_INDEX);
         let distance = xor_name_from_byte(DISTANCE_BYTE);
-        let hint_sender = peer_id_from_byte(HINT_SENDER_BYTE);
         let verified_source = peer_id_from_byte(VERIFIED_SOURCE_BYTE);
         let tried_source = peer_id_from_byte(TRIED_SOURCE_BYTE);
         let mut entry = test_entry(HINT_SENDER_BYTE);
@@ -1269,11 +1165,6 @@ mod tests {
             pending.tried_sources.is_empty(),
             "tried sources should be cleared before retry"
         );
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            REQUEUED_SENDER_COUNT,
-            "retry reservation should be converted back to one pending slot"
-        );
         assert!(
             queues.ready_pending_keys(Instant::now()).is_empty(),
             "requeued key should observe retry delay"
@@ -1283,11 +1174,6 @@ mod tests {
         assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
 
         assert!(queues.remove_pending(&key).is_some());
-        assert_eq!(
-            queues.pending_count_for_sender(&hint_sender),
-            EMPTY_SENDER_COUNT,
-            "removing the requeued entry should leave no reserved sender slot"
-        );
     }
 
     #[test]
@@ -1374,11 +1260,7 @@ mod tests {
         let mut queues = ReplicationQueues::new();
         let key = xor_name_from_byte(0x01);
 
-        // Go through the public `add_pending_verify` so the per-sender
-        // counter is correctly bumped — the entry's `hint_sender` slot must
-        // be released by `evict_stale` and we want to exercise that path.
         let mut entry = test_entry(1);
-        let sender = entry.hint_sender;
         // Backdate via the same defensive checked_sub used elsewhere so
         // freshly-booted CI clocks don't trip us up.
         entry.created_at = Instant::now()
@@ -1387,7 +1269,6 @@ mod tests {
         assert!(queues.add_pending_verify(key, entry).admitted());
 
         assert_eq!(queues.pending_count(), 1);
-        assert_eq!(queues.pending_count_for_sender(&sender), 1);
 
         let evicted = queues.evict_stale(Duration::from_secs(1));
         assert_eq!(evicted, vec![key]);
@@ -1395,12 +1276,6 @@ mod tests {
             queues.pending_count(),
             0,
             "entry older than max_age should be evicted"
-        );
-        // Per-sender counter must be released alongside the map removal.
-        assert_eq!(
-            queues.pending_count_for_sender(&sender),
-            0,
-            "evict_stale must release the per-sender slot"
         );
     }
 
@@ -1541,7 +1416,8 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             next_verify_at: Instant::now(),
-            hint_sender: peer_id_from_byte(1),
+            hint_sources: HashSet::from([peer_id_from_byte(1)]),
+            replica_hint_sources: HashSet::from([peer_id_from_byte(1)]),
         };
 
         assert!(queues.add_pending_verify(key, entry).admitted());
@@ -1561,7 +1437,8 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             next_verify_at: Instant::now(),
-            hint_sender: peer_id_from_byte(2),
+            hint_sources: HashSet::from([peer_id_from_byte(2)]),
+            replica_hint_sources: HashSet::new(),
         };
 
         assert!(
@@ -1592,7 +1469,6 @@ mod tests {
         let distance = xor_name_from_byte(0x01);
         let source_a = peer_id_from_byte(1);
         let source_b = peer_id_from_byte(2);
-        let hint_sender = peer_id_from_byte(3);
 
         // Stage 1: Hint admitted → PendingVerify
         let entry = VerificationEntry {
@@ -1602,7 +1478,8 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
             next_verify_at: Instant::now(),
-            hint_sender,
+            hint_sources: HashSet::from([peer_id_from_byte(3)]),
+            replica_hint_sources: HashSet::from([peer_id_from_byte(3)]),
         };
         assert!(
             queues.add_pending_verify(key, entry).admitted(),

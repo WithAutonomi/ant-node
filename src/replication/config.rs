@@ -392,6 +392,26 @@ pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
 /// splittable instead of failing one oversized encode.
 pub const MAX_VERIFICATION_KEYS_PER_REQUEST: usize = 1024;
 
+/// Maximum ready hints processed by one verification cycle.
+///
+/// The pending queue may be much larger, but source-count ordering only has a
+/// practical effect when each cycle takes a bounded prefix. This value keeps
+/// today's roughly 6k-chunk average bootstrap within one cycle while preventing
+/// a full emergency-cap queue from creating one enormous verification round.
+pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
+
+/// Maximum simultaneous verification request/response exchanges.
+/// Larger rounds remain fully batched but wait for a permit instead of
+/// launching hundreds or thousands of network requests at once.
+pub const MAX_CONCURRENT_VERIFICATION_REQUESTS: usize = 32;
+
+/// Brief hold for a newly admitted singleton hint.
+///
+/// This lets nearby sync responses corroborate it before scheduling. A second
+/// live source makes the key ready immediately; genuinely singleton work
+/// proceeds after this short window.
+pub const HINT_SOURCE_AGGREGATION_WINDOW: Duration = Duration::from_secs(2);
+
 /// Fetch request timeout.
 const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.

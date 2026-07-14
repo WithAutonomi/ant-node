@@ -67,10 +67,10 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_VERIFICATION_KEYS_PER_REQUEST,
-    REPLICATION_PROTOCOL_ID,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, HINT_SOURCE_AGGREGATION_WINDOW,
+    MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_VERIFICATION_KEYS_PER_CYCLE,
+    MAX_VERIFICATION_KEYS_PER_REQUEST, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -82,7 +82,8 @@ use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
-    NeighborSyncState, PeerSyncRecord, RepairProofs, VerificationEntry, VerificationState,
+    NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
+    VerificationState,
 };
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::{NodeIdentity, PeerId};
@@ -265,6 +266,10 @@ const VERIFICATION_CYCLE_SLOW_LOG_MS: u128 = 500;
 /// and bootstrap claim abuse. Distinct from `AUDIT_FAILURE_TRUST_WEIGHT` which
 /// is reserved for confirmed audit failures.
 const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
+/// Bound trust updates from one verification cycle. A malicious peer can
+/// advertise thousands of bad singleton keys at once; a few independent
+/// contradictions are enough for the trust engine without flooding it.
+const MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE: usize = 3;
 
 /// Bootstrap drain check interval in seconds.
 const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
@@ -4186,8 +4191,8 @@ async fn handle_sync_response(
 /// Outcome of [`admit_and_queue_hints`].
 ///
 /// `capacity_rejected_count` is non-zero when one or more legitimately
-/// admissible hints were dropped because `pending_verify`'s global or
-/// per-source bound was hit. Callers that care about completeness
+/// admissible hints were dropped because `pending_verify`'s global emergency
+/// bound was hit. Callers that care about completeness
 /// (bootstrap drain accounting) MUST NOT treat their work as complete while
 /// this is > 0 — the source will need to re-hint after capacity frees up.
 struct AdmissionOutcome {
@@ -4239,8 +4244,9 @@ async fn admit_and_queue_hints(
                     verified_sources: Vec::new(),
                     tried_sources: HashSet::new(),
                     created_at: now,
-                    next_verify_at: now,
-                    hint_sender: *source_peer,
+                    next_verify_at: now + HINT_SOURCE_AGGREGATION_WINDOW,
+                    hint_sources: HashSet::from([*source_peer]),
+                    replica_hint_sources: HashSet::from([*source_peer]),
                 },
             );
             match result {
@@ -4264,8 +4270,9 @@ async fn admit_and_queue_hints(
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
-                next_verify_at: now,
-                hint_sender: *source_peer,
+                next_verify_at: now + HINT_SOURCE_AGGREGATION_WINDOW,
+                hint_sources: HashSet::from([*source_peer]),
+                replica_hint_sources: HashSet::new(),
             },
         );
         match result {
@@ -4334,6 +4341,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     let pending_keys = {
         let q = queues.read().await;
         q.ready_pending_keys(Instant::now())
+            .into_iter()
+            .take(MAX_VERIFICATION_KEYS_PER_CYCLE)
+            .collect::<Vec<_>>()
     };
 
     if pending_keys.is_empty() {
@@ -4439,11 +4449,11 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             let mut sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
-            let replica_hint_sender = q.get_pending(&key).and_then(|entry| {
-                (entry.pipeline == HintPipeline::Replica).then_some(entry.hint_sender)
+            let replica_hint_sources = q.get_pending(&key).and_then(|entry| {
+                (entry.pipeline == HintPipeline::Replica).then_some(&entry.replica_hint_sources)
             });
-            if let Some(hint_sender) = replica_hint_sender {
-                add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
+            if let Some(hint_sources) = replica_hint_sources {
+                add_replica_hint_sources(&mut sources, HintPipeline::Replica, hint_sources);
             }
             if sources.is_empty() {
                 warn!(
@@ -4548,8 +4558,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             provers_snapshot.is_credited_holder(key, peer, hash)
         };
 
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline, PeerId)> =
-            Vec::new();
+        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
@@ -4566,13 +4575,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     config,
                     holder_credit,
                 );
-                evaluated.push((*key, outcome, entry.pipeline, entry.hint_sender));
+                evaluated.push((*key, outcome, entry.pipeline));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _, _) in &evaluated {
+        for (key, outcome, _) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -4592,7 +4601,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // paid-only hint can safely repair a missing replica using sources
         // from the same verification round.
         let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline, _) in &evaluated {
+        for (key, outcome, pipeline) in &evaluated {
             if *pipeline == HintPipeline::PaidOnly
                 && matches!(
                     outcome,
@@ -4613,13 +4622,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Step 5: Update queues with the evaluated outcomes.
+        let mut bad_singleton_hints: HashMap<PeerId, usize> = HashMap::new();
         let mut q = queues.write().await;
-        for (key, outcome, pipeline, hint_sender) in evaluated {
+        for (key, outcome, pipeline) in evaluated {
+            let replica_hint_sources = q
+                .get_pending(&key)
+                .map(|entry| entry.replica_hint_sources.clone())
+                .unwrap_or_default();
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
                     let mut fetch_sources = sources;
-                    add_replica_hint_sender_source(&mut fetch_sources, pipeline, hint_sender);
+                    add_replica_hint_sources(&mut fetch_sources, pipeline, &replica_hint_sources);
                     let fetch_eligible =
                         pipeline == HintPipeline::Replica || paid_only_fetch_keys.contains(&key);
                     if fetch_eligible && !fetch_sources.is_empty() {
@@ -4643,6 +4657,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     }
                 }
                 KeyVerificationOutcome::QuorumFailed => {
+                    if let Some(ev) = evidence.get(&key) {
+                        if let Some(source) = directly_contradicted_singleton_hint_source(
+                            pipeline,
+                            &replica_hint_sources,
+                            &KeyVerificationOutcome::QuorumFailed,
+                            ev,
+                        ) {
+                            *bad_singleton_hints.entry(source).or_insert(0) += 1;
+                        }
+                    }
                     q.remove_pending(&key);
                     terminal_keys.push(key);
                 }
@@ -4650,6 +4674,23 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     q.set_pending_state(&key, VerificationState::QuorumInconclusive);
                     q.defer_pending(&key, config.verification_request_timeout);
                 }
+            }
+        }
+        drop(q);
+
+        for (peer, bad_hint_count) in bad_singleton_hints {
+            let reports = bad_hint_count.min(MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE);
+            warn!(
+                "Peer {peer} directly contradicted {bad_hint_count} sole-source replica hints; \
+                 reporting {reports} bounded trust failure(s)"
+            );
+            for _ in 0..reports {
+                p2p_node
+                    .report_trust_event(
+                        &peer,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
             }
         }
     }
@@ -4689,14 +4730,38 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     }
 }
 
-fn add_replica_hint_sender_source(
+fn add_replica_hint_sources(
     sources: &mut Vec<PeerId>,
     pipeline: HintPipeline,
-    hint_sender: PeerId,
+    replica_hint_sources: &HashSet<PeerId>,
 ) {
-    if pipeline == HintPipeline::Replica && !sources.contains(&hint_sender) {
-        sources.push(hint_sender);
+    if pipeline != HintPipeline::Replica {
+        return;
     }
+    for source in replica_hint_sources {
+        if !sources.contains(source) {
+            sources.push(*source);
+        }
+    }
+}
+
+/// Return the sole advertiser only when the verification round directly
+/// contradicts its replica claim. Timeouts, inconclusive rounds, paid-only
+/// advertisements, and corroborated hints are deliberately non-penalizing.
+fn directly_contradicted_singleton_hint_source(
+    pipeline: HintPipeline,
+    replica_hint_sources: &HashSet<PeerId>,
+    outcome: &KeyVerificationOutcome,
+    evidence: &crate::replication::types::KeyVerificationEvidence,
+) -> Option<PeerId> {
+    if pipeline != HintPipeline::Replica
+        || !matches!(outcome, KeyVerificationOutcome::QuorumFailed)
+        || replica_hint_sources.len() != 1
+    {
+        return None;
+    }
+    let source = *replica_hint_sources.iter().next()?;
+    (evidence.presence.get(&source) == Some(&PresenceEvidence::Absent)).then_some(source)
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -4733,10 +4798,19 @@ async fn update_bootstrap_after_peer_removed(
     is_bootstrapping: &Arc<RwLock<bool>>,
     bootstrap_complete_notify: &Arc<Notify>,
 ) {
-    if !bootstrap::clear_capacity_rejected(bootstrap_state, peer).await {
-        return;
+    let orphaned_keys = queues.write().await.remove_hint_source(peer);
+    let cleared_rejection = bootstrap::clear_capacity_rejected(bootstrap_state, peer).await;
+
+    if !orphaned_keys.is_empty() {
+        let mut state = bootstrap_state.write().await;
+        for key in &orphaned_keys {
+            state.remove_key(key);
+        }
     }
 
+    if orphaned_keys.is_empty() && !cleared_rejection {
+        return;
+    }
     let q = queues.read().await;
     if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
         complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
@@ -5991,6 +6065,7 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::replication::types::KeyVerificationEvidence;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -6002,6 +6077,61 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    #[test]
+    fn bad_hint_penalty_requires_directly_absent_sole_replica_source() {
+        let source = test_peer(0x91);
+        let corroborator = test_peer(0x92);
+        let mut evidence = KeyVerificationEvidence {
+            presence: HashMap::from([(source, PresenceEvidence::Absent)]),
+            paid_list: HashMap::new(),
+        };
+        let failed = KeyVerificationOutcome::QuorumFailed;
+
+        assert_eq!(
+            directly_contradicted_singleton_hint_source(
+                HintPipeline::Replica,
+                &HashSet::from([source]),
+                &failed,
+                &evidence,
+            ),
+            Some(source)
+        );
+        assert_eq!(
+            directly_contradicted_singleton_hint_source(
+                HintPipeline::Replica,
+                &HashSet::from([source, corroborator]),
+                &failed,
+                &evidence,
+            ),
+            None,
+            "corroborated hints must not use the sole-source penalty lane"
+        );
+        assert_eq!(
+            directly_contradicted_singleton_hint_source(
+                HintPipeline::PaidOnly,
+                &HashSet::from([source]),
+                &failed,
+                &evidence,
+            ),
+            None,
+            "paid-list advertisements do not claim possession"
+        );
+
+        evidence
+            .presence
+            .insert(source, PresenceEvidence::Unresolved);
+        assert_eq!(
+            directly_contradicted_singleton_hint_source(
+                HintPipeline::Replica,
+                &HashSet::from([source]),
+                &KeyVerificationOutcome::QuorumInconclusive,
+                &evidence,
+            ),
+            None,
+            "timeouts and inconclusive evidence are neutral"
+        );
     }
 
     #[tokio::test]
@@ -6065,11 +6195,27 @@ mod tests {
     #[tokio::test]
     async fn peer_removed_clears_capacity_rejection_and_completes_bootstrap() {
         let peer = test_peer(0xA5);
+        let key = test_key(0xA5);
         let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
         let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
         let is_bootstrapping = Arc::new(RwLock::new(true));
         let bootstrap_complete_notify = Arc::new(Notify::new());
 
+        let now = Instant::now();
+        queues.write().await.add_pending_verify(
+            key,
+            VerificationEntry {
+                state: VerificationState::PendingVerify,
+                pipeline: HintPipeline::Replica,
+                verified_sources: Vec::new(),
+                tried_sources: HashSet::new(),
+                created_at: now,
+                next_verify_at: now,
+                hint_sources: HashSet::from([peer]),
+                replica_hint_sources: HashSet::from([peer]),
+            },
+        );
+        super::bootstrap::track_discovered_keys(&bootstrap_state, &HashSet::from([key])).await;
         super::bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
         {
             let q = queues.read().await;
@@ -6090,6 +6236,7 @@ mod tests {
 
         let state = bootstrap_state.read().await;
         assert!(state.capacity_rejected_sources.is_empty());
+        assert!(state.pending_keys.is_empty());
         assert!(state.is_drained());
         drop(state);
         assert!(!*is_bootstrapping.read().await);
@@ -6312,7 +6459,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_hint_sender_is_added_as_fallback_fetch_source() {
+    fn replica_hint_sources_are_added_as_fallback_fetch_sources() {
         const EXISTING_SOURCE_ID: u8 = 1;
         const HINT_SENDER_ID: u8 = 2;
         const PAID_ONLY_SENDER_ID: u8 = 3;
@@ -6322,9 +6469,11 @@ mod tests {
         let paid_only_sender = test_peer(PAID_ONLY_SENDER_ID);
         let mut sources = vec![existing_source];
 
-        add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
-        add_replica_hint_sender_source(&mut sources, HintPipeline::Replica, hint_sender);
-        add_replica_hint_sender_source(&mut sources, HintPipeline::PaidOnly, paid_only_sender);
+        let hint_sources = HashSet::from([hint_sender]);
+        let paid_only_sources = HashSet::from([paid_only_sender]);
+        add_replica_hint_sources(&mut sources, HintPipeline::Replica, &hint_sources);
+        add_replica_hint_sources(&mut sources, HintPipeline::Replica, &hint_sources);
+        add_replica_hint_sources(&mut sources, HintPipeline::PaidOnly, &paid_only_sources);
 
         assert_eq!(sources, vec![existing_source, hint_sender]);
     }
