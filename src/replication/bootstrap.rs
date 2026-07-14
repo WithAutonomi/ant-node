@@ -309,7 +309,10 @@ mod tests {
             tried_sources: HashSet::new(),
             created_at: now,
             next_verify_at: now,
-            hint_sender: saorsa_core::identity::PeerId::from_bytes([0u8; 32]),
+            hint_sources: HashSet::from([saorsa_core::identity::PeerId::from_bytes([0u8; 32])]),
+            replica_hint_sources: HashSet::from([saorsa_core::identity::PeerId::from_bytes(
+                [0u8; 32],
+            )]),
         };
         queues.add_pending_verify(xor_name_from_byte(0x01), entry);
 
