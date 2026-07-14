@@ -95,8 +95,12 @@ pub struct VerificationEntry {
     /// Earliest time this key should be included in another verification
     /// round.
     pub next_verify_at: Instant,
-    /// The peer that originally hinted this key (for source tracking).
-    pub hint_sender: PeerId,
+    /// Routing-table peers that advertised this key and have not subsequently
+    /// departed. Duplicate hints add to this set instead of being discarded.
+    pub hint_sources: HashSet<PeerId>,
+    /// Subset of [`Self::hint_sources`] that advertised a replica hint and
+    /// therefore claimed chunk possession. Paid-only advertisers are excluded.
+    pub replica_hint_sources: HashSet<PeerId>,
 }
 
 // ---------------------------------------------------------------------------

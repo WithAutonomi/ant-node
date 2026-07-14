@@ -10,12 +10,13 @@ use std::time::{Duration, Instant};
 use crate::logging::{debug, info, warn};
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
-    ReplicationConfig, MAX_VERIFICATION_KEYS_PER_REQUEST, PAID_LIST_CLOSE_GROUP_SIZE,
-    PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, MAX_VERIFICATION_KEYS_PER_REQUEST,
+    PAID_LIST_CLOSE_GROUP_SIZE, PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
@@ -525,6 +526,7 @@ fn spawn_verification_batch_tasks(
     timeout: Duration,
 ) -> Vec<JoinHandle<VerificationBatchResult>> {
     let mut handles = Vec::new();
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_VERIFICATION_REQUESTS));
 
     for (&peer, peer_keys) in &targets.peer_to_keys {
         let paid_check_keys = targets.peer_to_paid_keys.get(&peer);
@@ -542,6 +544,7 @@ fn spawn_verification_batch_tasks(
                 msg,
                 Arc::clone(p2p_node),
                 timeout,
+                Arc::clone(&semaphore),
             ));
         }
     }
@@ -555,8 +558,16 @@ fn spawn_verification_batch_task(
     msg: ReplicationMessage,
     p2p: Arc<P2PNode>,
     timeout: Duration,
+    semaphore: Arc<Semaphore>,
 ) -> JoinHandle<VerificationBatchResult> {
     tokio::spawn(async move {
+        let Ok(_permit) = semaphore.acquire_owned().await else {
+            return VerificationBatchResult {
+                peer,
+                requested_keys,
+                response: None,
+            };
+        };
         let encoded = match msg.encode() {
             Ok(data) => data,
             Err(e) => {
