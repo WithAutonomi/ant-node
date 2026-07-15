@@ -407,10 +407,11 @@ soon (minutes, from multiple independent storers, each within its own budget);
 commitments rotated without material count change rely on the ADR-0002 lottery
 for re-audit. First-audit coverage is best-effort supplementary sampling under
 an explicit load budget, not a per-payment guarantee. The scheduler's funnel
-(received / queued / coalesced / duplicates / window_deduped / rate_deferred /
-cooldown_deferred / launched / terminal outcomes, plus tokens and in-flight
-gauges) is exported in the periodic scheduler summary so this coverage is
-measurable in production.
+(received / queued / coalesced / suppressed_lower / duplicates /
+capacity_evicted / window_deduped / rate_deferred / cooldown_deferred /
+launched / terminal outcomes, plus tokens and in-flight gauges) is exported in
+the periodic scheduler summary so this coverage is measurable in production;
+`suppressed_lower` in particular surfaces attempted cheaper-pin self-erasure.
 
 **Every pipeline stage is bounded, and the invariants hold by construction.**
 The verifier-to-drainer nomination channel is bounded (producers `try_send`

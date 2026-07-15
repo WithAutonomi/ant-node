@@ -103,6 +103,10 @@ struct FirstAuditObservability {
     coalesced: AtomicU64,
     duplicates: AtomicU64,
     capacity_evicted: AtomicU64,
+    /// A strictly-lower-count same-peer nomination that was dropped so a
+    /// higher-count pending pin survived. A sustained rise is the signal of an
+    /// attempted "erase the inflated pin with a cheaper one" self-suppression.
+    suppressed_lower: AtomicU64,
     cooldown_deferred_attempts: AtomicU64,
     rate_deferred_attempts: AtomicU64,
     window_deduped: AtomicU64,
@@ -541,8 +545,11 @@ impl FirstAuditScheduler {
             FirstAuditQueueOutcome::Queued => {
                 obs.queued.fetch_add(1, Ordering::Relaxed);
             }
-            FirstAuditQueueOutcome::Coalesced | FirstAuditQueueOutcome::SuppressedLower => {
+            FirstAuditQueueOutcome::Coalesced => {
                 obs.coalesced.fetch_add(1, Ordering::Relaxed);
+            }
+            FirstAuditQueueOutcome::SuppressedLower => {
+                obs.suppressed_lower.fetch_add(1, Ordering::Relaxed);
             }
             FirstAuditQueueOutcome::CapacityEvicted { .. } => {
                 obs.queued.fetch_add(1, Ordering::Relaxed);
@@ -697,13 +704,18 @@ impl FirstAuditScheduler {
             obs.cooldown_deferred_attempts
                 .fetch_add(1, Ordering::Relaxed);
             drop(inflight);
-            // Count a capacity eviction if the requeue pushed a different peer
-            // out of the full LRU (the ADR promises capacity loss is
-            // observable); the nomination itself was already counted at ingress.
-            if let FirstAuditQueueOutcome::CapacityEvicted { .. } =
-                coalesce_first_audit_event(&mut self.pending, event, false)
-            {
-                obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
+            // Account for the requeue outcome (the nomination itself was already
+            // counted at ingress, so `queued` is not re-incremented): a capacity
+            // eviction of a DIFFERENT peer and a suppressed reserved event are
+            // both observable per the ADR funnel.
+            match coalesce_first_audit_event(&mut self.pending, event, false) {
+                FirstAuditQueueOutcome::CapacityEvicted { .. } => {
+                    obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
+                }
+                FirstAuditQueueOutcome::SuppressedLower => {
+                    obs.suppressed_lower.fetch_add(1, Ordering::Relaxed);
+                }
+                FirstAuditQueueOutcome::Queued | FirstAuditQueueOutcome::Coalesced => {}
             }
             return None;
         }
@@ -1642,11 +1654,12 @@ impl ReplicationEngine {
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
                         observability.coalesced.load(Ordering::Relaxed),
+                        observability.suppressed_lower.load(Ordering::Relaxed),
                         observability.duplicates.load(Ordering::Relaxed),
                         observability.capacity_evicted.load(Ordering::Relaxed),
                         observability.cooldown_deferred_attempts.load(Ordering::Relaxed),
@@ -6535,6 +6548,140 @@ mod tests {
         );
         assert!(scheduler.first_audited.is_empty());
         assert!(scheduler.limiter.recent.peek(&peer).is_none());
+    }
+
+    /// A flood of strictly-lower-count same-peer nominations must neither
+    /// displace the retained higher pin NOR disturb its LRU position (each is
+    /// suppressed via `peek`, no `push`), and each must be counted as
+    /// `suppressed_lower` — the attempted cheaper-pin self-erasure signal.
+    #[test]
+    fn first_audit_suppressed_lower_flood_leaves_recency_and_counts() {
+        let mut pending: LruCache<PeerId, MonetizedPinEvent> =
+            LruCache::new(NonZeroUsize::new(2).unwrap());
+        let victim = test_peer(1);
+        let other = test_peer(2);
+        // Victim (high count) inserted first (older), then `other` (newer/MRU).
+        let _ = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: victim,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+        let _ = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: other,
+                pin: [9; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+
+        // Flood the victim with cheaper nominations.
+        let mut suppressed = 0u64;
+        for i in 0..8u8 {
+            let out = coalesce_first_audit_event(
+                &mut pending,
+                MonetizedPinEvent {
+                    peer: victim,
+                    pin: [i; 32],
+                    key_count: 50,
+                    quote_ts: SystemTime::now(),
+                },
+                true,
+            );
+            assert_eq!(out, FirstAuditQueueOutcome::SuppressedLower);
+            suppressed += 1;
+        }
+        assert_eq!(suppressed, 8);
+        // Victim pin/count unchanged.
+        assert_eq!(
+            pending.peek(&victim).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400))
+        );
+        // Recency unchanged: `other` is still MRU (a new distinct peer at cap 2
+        // would evict the LRU; the victim must be the LRU, so `third` evicts the
+        // victim, not `other`).
+        let third = test_peer(3);
+        let out = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: third,
+                pin: [7; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+        assert_eq!(
+            out,
+            FirstAuditQueueOutcome::CapacityEvicted {
+                peer: victim,
+                pin: [1; 32]
+            },
+            "the suppressed-lower flood must not have promoted the victim above `other`"
+        );
+    }
+
+    /// The cooldown-race requeue counts a genuine different-peer capacity
+    /// eviction (the ADR promises capacity loss is observable).
+    #[test]
+    fn first_audit_cooldown_race_requeue_counts_capacity_eviction() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono);
+        // Pending capacity 1 so a requeue of a different peer must evict.
+        scheduler.pending = LruCache::new(NonZeroUsize::new(1).unwrap());
+        let reserved_peer = test_peer(1);
+        let other_peer = test_peer(2);
+
+        // Reserve peer 1.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: reserved_peer,
+                pin: [1; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+
+        // A DIFFERENT peer fills the single pending slot during the reservation.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: other_peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve peer 1: cooldown race -> requeue peer 1, evicting peer 2.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(reserved_peer, mono);
+        let cap_before = obs.capacity_evicted.load(Ordering::Relaxed);
+        assert!(scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .is_none());
+        assert_eq!(
+            obs.capacity_evicted.load(Ordering::Relaxed),
+            cap_before + 1,
+            "the requeue eviction of a different peer is counted"
+        );
+        assert_eq!(
+            scheduler.pending.peek(&reserved_peer).map(|e| e.pin),
+            Some([1; 32])
+        );
     }
 
     /// ADR-0004 Amendment 2 (reviewer blocker): a strictly-lower-count same-peer
