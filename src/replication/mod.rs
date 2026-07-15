@@ -37,6 +37,7 @@ pub mod types;
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -87,6 +88,7 @@ use crate::replication::types::{
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
+use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
 
 #[derive(Default)]
 struct FirstAuditObservability {
@@ -1391,10 +1393,10 @@ impl ReplicationEngine {
                     event = p2p_events.recv() => {
                         let event = match event {
                             Ok(event) => event,
-                            Err(error) => {
-                                handle_replication_event_recv_error(&error);
-                                continue;
-                            }
+                            Err(error) => match handle_replication_event_recv_error(&error) {
+                                ControlFlow::Continue(()) => continue,
+                                ControlFlow::Break(()) => break,
+                            },
                         };
                         let Some((source, payload, rr_message_id)) =
                             replication_payload_from_event(event)
@@ -1525,7 +1527,14 @@ impl ReplicationEngine {
                                 }
                                 continue;
                             }
-                            Err(RecvError::Closed) => continue,
+                            Err(RecvError::Closed) => {
+                                // A closed broadcast channel never yields again;
+                                // continuing would spin the select! loop forever.
+                                warn!(
+                                    "DHT event stream closed on replication branch; stopping message handler"
+                                );
+                                break;
+                            }
                         };
                         match dht_event {
                             DhtNetworkEvent::KClosestPeersChanged { old, new } => {
@@ -2432,7 +2441,7 @@ impl AuditResponderClass {
     }
 }
 
-fn handle_replication_event_recv_error(error: &RecvError) {
+fn handle_replication_event_recv_error(error: &RecvError) -> ControlFlow<()> {
     match error {
         RecvError::Lagged(missed) => {
             audit_metrics::record_replication_event_lagged(*missed);
@@ -2440,9 +2449,13 @@ fn handle_replication_event_recv_error(error: &RecvError) {
                 "Missed {missed} P2P events on replication branch (broadcast lag); \
                  replication messages may have been dropped before dispatch"
             );
+            ControlFlow::Continue(())
         }
         RecvError::Closed => {
-            warn!("P2P event stream closed on replication branch");
+            // A closed broadcast channel never yields again, so the branch
+            // would otherwise be immediately ready on every select! iteration.
+            warn!("P2P event stream closed on replication branch; stopping message handler");
+            ControlFlow::Break(())
         }
     }
 }
@@ -5846,8 +5859,6 @@ async fn rebuild_and_rotate_commitment(
     p2p: &Arc<P2PNode>,
     config: &Arc<ReplicationConfig>,
 ) -> Result<()> {
-    use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
-
     let stored_keys = storage
         .all_keys()
         .await
@@ -5993,36 +6004,7 @@ async fn rebuild_and_rotate_commitment(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
-    use super::{
-        add_replica_hint_sources, admit_audit_responder, apply_audit_failure_credit_revocation,
-        audit_failure_clears_bootstrap_claim, audit_failure_revokes_holder_credit,
-        audit_launch_decision, config, cooldown_allows_audit,
-        directly_contradicted_singleton_hint_source, first_audit_terminal_outcome,
-        first_failed_key_label, fresh_offer_payment_context, handle_replication_event_recv_error,
-        paid_notify_payment_context, queue_first_audit_event, quote_within_audit_window,
-        update_bootstrap_after_peer_removed, verification_request_exceeds_limit,
-        AuditResponderClass, FirstAuditQueueOutcome, FirstAuditTerminalOutcome,
-        KeyVerificationOutcome, MonetizedPinEvent, MONETIZED_AUDIT_SKEW_MARGIN,
-    };
-    use crate::payment::VerificationContext;
-    use crate::replication::audit::AuditTickResult;
-    use crate::replication::audit_metrics;
-    use crate::replication::recent_provers::RecentProvers;
-    use crate::replication::scheduling::ReplicationQueues;
-    use crate::replication::types::{
-        AuditFailureReason, AuditFailureSummary, BootstrapState, FailureEvidence, HintPipeline,
-        KeyVerificationEvidence, PresenceEvidence, VerificationEntry, VerificationState,
-    };
-    use crate::replication::{audit, possession, pruning};
-    use lru::LruCache;
-    use saorsa_core::identity::PeerId;
-    use std::collections::{HashMap, HashSet};
-    use std::num::NonZeroUsize;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use std::time::Instant;
-    use std::time::SystemTime;
-    use tokio::sync::{Notify, RwLock, Semaphore};
+    use super::*;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -6050,7 +6032,7 @@ mod tests {
     fn bad_hint_penalty_requires_directly_absent_sole_replica_source() {
         let source = test_peer(0x91);
         let corroborator = test_peer(0x92);
-        let mut evidence = KeyVerificationEvidence {
+        let mut evidence = types::KeyVerificationEvidence {
             presence: HashMap::from([(source, PresenceEvidence::Absent)]),
             paid_list: HashMap::new(),
         };
@@ -6163,7 +6145,7 @@ mod tests {
                 challenge_id: 1,
                 challenged_peer: peer,
                 confirmed_failed_keys: vec![test_key(1)],
-                summary: AuditFailureSummary::default(),
+                summary: types::AuditFailureSummary::default(),
                 reason: AuditFailureReason::Timeout,
             },
             no_response_class: Some("timeout"),
@@ -6257,7 +6239,6 @@ mod tests {
     /// stale or future/skewed client-forwarded quote cannot frame an honest node.
     #[test]
     fn monetized_quote_audit_window_fails_closed_both_ends() {
-        use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
         let now = SystemTime::now();
         // Fresh (just quoted) and small future/past skew -> audited.
         assert!(quote_within_audit_window(now, now));
@@ -6276,7 +6257,7 @@ mod tests {
         ));
         // Older than the window -> skipped (pin may have aged out).
         assert!(!quote_within_audit_window(
-            now - GOSSIP_ANSWERABILITY_TTL,
+            now - commitment_state::GOSSIP_ANSWERABILITY_TTL,
             now
         ));
     }
@@ -6284,9 +6265,19 @@ mod tests {
     #[tokio::test]
     async fn replication_branch_lagged_events_are_counted() {
         let before = audit_metrics::replication_event_lagged_total();
-        handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Lagged(3));
+        let flow = handle_replication_event_recv_error(
+            &tokio::sync::broadcast::error::RecvError::Lagged(3),
+        );
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
         let after = audit_metrics::replication_event_lagged_total();
         assert_eq!(after.saturating_sub(before), 3);
+    }
+
+    #[tokio::test]
+    async fn replication_branch_closed_events_stop_the_loop() {
+        let flow =
+            handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Closed);
+        assert_eq!(flow, std::ops::ControlFlow::Break(()));
     }
 
     #[tokio::test]
