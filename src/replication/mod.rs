@@ -38,6 +38,7 @@ pub mod types;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1392,10 +1393,10 @@ impl ReplicationEngine {
                     event = p2p_events.recv() => {
                         let event = match event {
                             Ok(event) => event,
-                            Err(error) => {
-                                handle_replication_event_recv_error(&error);
-                                continue;
-                            }
+                            Err(error) => match handle_replication_event_recv_error(&error) {
+                                ControlFlow::Continue(()) => continue,
+                                ControlFlow::Break(()) => break,
+                            },
                         };
                         let Some((source, payload, rr_message_id)) =
                             replication_payload_from_event(event)
@@ -1526,7 +1527,14 @@ impl ReplicationEngine {
                                 }
                                 continue;
                             }
-                            Err(RecvError::Closed) => continue,
+                            Err(RecvError::Closed) => {
+                                // A closed broadcast channel never yields again;
+                                // continuing would spin the select! loop forever.
+                                warn!(
+                                    "DHT event stream closed on replication branch; stopping message handler"
+                                );
+                                break;
+                            }
                         };
                         match dht_event {
                             DhtNetworkEvent::KClosestPeersChanged { old, new } => {
@@ -2507,7 +2515,7 @@ impl AuditResponderClass {
     }
 }
 
-fn handle_replication_event_recv_error(error: &RecvError) {
+fn handle_replication_event_recv_error(error: &RecvError) -> ControlFlow<()> {
     match error {
         RecvError::Lagged(missed) => {
             audit_metrics::record_replication_event_lagged(*missed);
@@ -2515,9 +2523,13 @@ fn handle_replication_event_recv_error(error: &RecvError) {
                 "Missed {missed} P2P events on replication branch (broadcast lag); \
                  replication messages may have been dropped before dispatch"
             );
+            ControlFlow::Continue(())
         }
         RecvError::Closed => {
-            warn!("P2P event stream closed on replication branch");
+            // A closed broadcast channel never yields again, so the branch
+            // would otherwise be immediately ready on every select! iteration.
+            warn!("P2P event stream closed on replication branch; stopping message handler");
+            ControlFlow::Break(())
         }
     }
 }
@@ -6146,7 +6158,7 @@ mod tests {
     fn bad_hint_penalty_requires_directly_absent_sole_replica_source() {
         let source = test_peer(0x91);
         let corroborator = test_peer(0x92);
-        let mut evidence = KeyVerificationEvidence {
+        let mut evidence = types::KeyVerificationEvidence {
             presence: HashMap::from([(source, PresenceEvidence::Absent)]),
             paid_list: HashMap::new(),
         };
@@ -6431,7 +6443,7 @@ mod tests {
         ));
         // Older than the window -> skipped (pin may have aged out).
         assert!(!quote_within_audit_window(
-            now - GOSSIP_ANSWERABILITY_TTL,
+            now - commitment_state::GOSSIP_ANSWERABILITY_TTL,
             now
         ));
     }
@@ -6439,9 +6451,19 @@ mod tests {
     #[tokio::test]
     async fn replication_branch_lagged_events_are_counted() {
         let before = audit_metrics::replication_event_lagged_total();
-        handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Lagged(3));
+        let flow = handle_replication_event_recv_error(
+            &tokio::sync::broadcast::error::RecvError::Lagged(3),
+        );
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
         let after = audit_metrics::replication_event_lagged_total();
         assert_eq!(after.saturating_sub(before), 3);
+    }
+
+    #[tokio::test]
+    async fn replication_branch_closed_events_stop_the_loop() {
+        let flow =
+            handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Closed);
+        assert_eq!(flow, std::ops::ControlFlow::Break(()));
     }
 
     #[tokio::test]
