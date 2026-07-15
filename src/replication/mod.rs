@@ -50,9 +50,10 @@ use std::pin::Pin;
 use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{future::join_all, Future, StreamExt};
+use parking_lot::Mutex;
 use rand::Rng;
 use tokio::sync::broadcast::error::RecvError;
-use tokio::sync::{mpsc, Mutex, Notify, RwLock, Semaphore};
+use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -193,20 +194,24 @@ const RR_PREFIX: &str = "/rr/";
 /// memory.
 const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 256;
 
-/// Maximum fresh-replication offers processed away from the serial
-/// non-audit loop.
+/// Maximum fresh-replication offers processed concurrently, away from the
+/// serial non-audit loop.
 ///
 /// Fresh offers can perform an on-chain payment verification and a 4 MiB LMDB
 /// write. Four workers keep that latency off the responder dispatch path while
 /// keeping concurrent EVM/storage pressure small and predictable.
 const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 
-/// Number of fixed keyed locks used to preserve fresh-offer ordering per key.
+/// Maximum fresh offers admitted at once, counting both those running on a
+/// worker and those queued for one.
 ///
-/// A fixed shard set avoids unbounded per-key lock state. Same-key offers map
-/// to the same shard and serialize; unrelated keys usually progress
-/// independently under the worker bound.
-const FRESH_OFFER_KEY_LOCK_SHARDS: usize = 64;
+/// An admitted offer holds its payload until it completes, so this bounds
+/// memory rather than latency: at 4 MiB each, sixteen is a 64 MiB ceiling.
+/// Offers past the bound are refused rather than queued or handled inline —
+/// handling one on the message loop stalls every other non-audit message
+/// behind a payment verification and a multi-MiB write, and the refusal is
+/// recovered by the sender's delayed possession check (ADR-0003).
+const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::FreshReplication
@@ -216,22 +221,48 @@ fn paid_notify_payment_context() -> VerificationContext {
     VerificationContext::PaidListAdmission
 }
 
-fn new_fresh_offer_key_locks() -> FreshOfferKeyLocks {
-    Arc::new(
-        (0..FRESH_OFFER_KEY_LOCK_SHARDS)
-            .map(|_| Arc::new(Mutex::new(())))
-            .collect(),
-    )
-}
-
-fn fresh_offer_key_lock_index(key: &XorName) -> usize {
-    usize::from(key[0]) % FRESH_OFFER_KEY_LOCK_SHARDS
-}
-
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
 
-type FreshOfferKeyLocks = Arc<Vec<Arc<Mutex<()>>>>;
+/// Fresh-offer keys currently claimed by a handler.
+///
+/// Concurrent duplicates are routine: a client PUT fans out through overlapping
+/// close groups, so one key commonly arrives from several senders at once, and
+/// each would repeat the on-chain verification before the verifier's cache is
+/// warm. A claim collapses that onto the first handler.
+///
+/// Entries are exact keys rather than hash shards. A node only receives offers
+/// for keys it is close to, so the accepted key set clusters tightly around its
+/// own ID — any index derived from the key would land nearly every offer on one
+/// shard and serialize unrelated keys behind each other. Exact keys keep them
+/// independent, and the set stays bounded by [`FRESH_OFFER_MAX_OUTSTANDING`].
+///
+/// The critical section is a set insert or remove and is never held across an
+/// await, so this is a blocking mutex rather than an async one.
+type FreshOfferInFlight = Arc<Mutex<HashSet<XorName>>>;
+
+/// RAII claim on one fresh-offer key: clears the entry on drop, so an early
+/// return, an error, or a panic cannot strand a key as permanently in-flight.
+struct FreshOfferInFlightGuard {
+    in_flight: FreshOfferInFlight,
+    key: XorName,
+}
+
+impl FreshOfferInFlightGuard {
+    /// Claim `key`, or return `None` if another handler already holds it.
+    fn try_claim(in_flight: &FreshOfferInFlight, key: XorName) -> Option<Self> {
+        in_flight.lock().insert(key).then(|| Self {
+            in_flight: Arc::clone(in_flight),
+            key,
+        })
+    }
+}
+
+impl Drop for FreshOfferInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight.lock().remove(&self.key);
+    }
+}
 
 /// Shared dependencies for one verification worker cycle.
 struct VerificationCycleContext<'a> {
@@ -504,8 +535,11 @@ pub struct ReplicationEngine {
     audit_challenge_coordinator: Arc<AuditChallengeCoordinator>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
-    /// Fixed shard locks preserving per-key fresh-offer ordering.
-    fresh_offer_key_locks: FreshOfferKeyLocks,
+    /// Admission permits bounding offers running on a worker or queued for one.
+    fresh_offer_admission_semaphore: Arc<Semaphore>,
+    /// Keys claimed by an in-flight fresh-offer handler, so concurrent
+    /// duplicates collapse onto one verification and one write.
+    fresh_offer_in_flight: FreshOfferInFlight,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -597,7 +631,8 @@ impl ReplicationEngine {
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
-            fresh_offer_key_locks: new_fresh_offer_key_locks(),
+            fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
+            fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -1316,7 +1351,8 @@ impl ReplicationEngine {
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
-        let fresh_offer_key_locks = Arc::clone(&self.fresh_offer_key_locks);
+        let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
+        let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
         let detached_task_tracker = self.detached_task_tracker.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
@@ -1350,7 +1386,8 @@ impl ReplicationEngine {
             audit_responder_semaphore,
             audit_responder_inflight,
             fresh_offer_worker_semaphore,
-            fresh_offer_key_locks,
+            fresh_offer_admission_semaphore,
+            fresh_offer_in_flight,
             detached_task_tracker,
         };
 
@@ -2507,7 +2544,8 @@ struct ReplicationMessageHandlerContext {
     audit_responder_semaphore: Arc<Semaphore>,
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
-    fresh_offer_key_locks: FreshOfferKeyLocks,
+    fresh_offer_admission_semaphore: Arc<Semaphore>,
+    fresh_offer_in_flight: FreshOfferInFlight,
     /// Shared tracker for detached work so `shutdown()` can await release of
     /// storage and P2P resources after all producer tasks have stopped.
     detached_task_tracker: TaskTracker,
@@ -3042,6 +3080,13 @@ async fn handle_replication_message(
 // Per-message-type handlers
 // ---------------------------------------------------------------------------
 
+/// Admit a fresh offer for handling on a worker, or refuse it.
+///
+/// This runs on the serial non-audit message loop, so it must stay cheap: every
+/// path here is a set insert, a permit try, or a small response send. The offer
+/// itself — an on-chain payment verification and a multi-MiB LMDB write — always
+/// runs on a tracked worker task, never inline, because stalling this loop backs
+/// up the inbound queue and ultimately drops replication messages wholesale.
 async fn dispatch_fresh_offer(
     source: PeerId,
     offer: protocol::FreshReplicationOffer,
@@ -3049,24 +3094,54 @@ async fn dispatch_fresh_offer(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-    let permit = Arc::clone(&ctx.fresh_offer_worker_semaphore).try_acquire_owned();
-    let Ok(permit) = permit else {
+    // Claim the key first, so a duplicate never consumes an admission permit.
+    // The first claimant does the verification and the write; a concurrent
+    // duplicate is refused rather than made to wait, since the key is a content
+    // address and both offers therefore carry identical bytes. If the claimant
+    // ends up not storing the record, the sender's delayed possession check
+    // (ADR-0003) re-offers it.
+    let Some(in_flight) = FreshOfferInFlightGuard::try_claim(&ctx.fresh_offer_in_flight, offer.key)
+    else {
         debug!(
-            "Fresh-offer worker pool saturated; handling offer for {} from {source} inline",
+            "Fresh offer for {} from {source} refused: already in flight",
             hex::encode(offer.key)
         );
-        return handle_fresh_offer_serialized(
+        send_replication_response(
             &source,
-            &offer,
-            ctx,
+            &ctx.p2p_node,
             request_id,
-            rr_message_id.as_deref(),
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: "Duplicate offer already in flight".to_string(),
+            }),
+            rr_message_id,
         )
         .await;
+        return Ok(());
     };
 
+    let Ok(admission) = Arc::clone(&ctx.fresh_offer_admission_semaphore).try_acquire_owned() else {
+        debug!(
+            "Fresh offer for {} from {source} refused: at capacity",
+            hex::encode(offer.key)
+        );
+        send_replication_response(
+            &source,
+            &ctx.p2p_node,
+            request_id,
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+                key: offer.key,
+                reason: "Receiver at fresh-offer capacity".to_string(),
+            }),
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    };
+
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
     let ctx = ctx.clone();
+    let worker_semaphore = Arc::clone(&ctx.fresh_offer_worker_semaphore);
     let tracker = ctx.detached_task_tracker.clone();
     // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
     // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
@@ -3074,11 +3149,25 @@ async fn dispatch_fresh_offer(
     // Do not cancel a started handler: `storage.put()` awaits `spawn_blocking`,
     // and dropping that awaiter would detach the live LMDB transaction.
     tracker.spawn(async move {
-        let _permit = permit;
-        if let Err(e) = handle_fresh_offer_serialized(
+        // Both guards released on completion: the claim frees the key for a
+        // later offer, the admission permit frees the payload's memory budget.
+        let _in_flight = in_flight;
+        let _admission = admission;
+        // Wait for a worker slot here rather than in the caller. The worker
+        // bound caps concurrent EVM and storage pressure; making the message
+        // loop wait on it is what put that pressure back on the loop.
+        let Ok(_worker) = worker_semaphore.acquire_owned().await else {
+            debug!("Fresh offer from {source} dropped: worker pool shut down");
+            return;
+        };
+        if let Err(e) = handle_fresh_offer(
             &source,
             &offer,
-            &ctx,
+            &ctx.storage,
+            &ctx.paid_list,
+            &ctx.payment_verifier,
+            &ctx.p2p_node,
+            &ctx.config,
             request_id,
             rr_message_id.as_deref(),
         )
@@ -3088,29 +3177,6 @@ async fn dispatch_fresh_offer(
         }
     });
     Ok(())
-}
-
-async fn handle_fresh_offer_serialized(
-    source: &PeerId,
-    offer: &protocol::FreshReplicationOffer,
-    ctx: &ReplicationMessageHandlerContext,
-    request_id: u64,
-    rr_message_id: Option<&str>,
-) -> Result<()> {
-    let lock_index = fresh_offer_key_lock_index(&offer.key);
-    let _key_guard = ctx.fresh_offer_key_locks[lock_index].lock().await;
-    handle_fresh_offer(
-        source,
-        offer,
-        &ctx.storage,
-        &ctx.paid_list,
-        &ctx.payment_verifier,
-        &ctx.p2p_node,
-        &ctx.config,
-        request_id,
-        rr_message_id,
-    )
-    .await
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -6152,6 +6218,44 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    #[test]
+    fn fresh_offer_claim_refuses_a_duplicate_then_frees_the_key_on_drop() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
+        let key = [7u8; 32];
+
+        let claim = FreshOfferInFlightGuard::try_claim(&in_flight, key);
+        assert!(claim.is_some(), "first offer for a key should claim it");
+        assert!(
+            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_none(),
+            "a concurrent duplicate should be refused rather than repeat the work"
+        );
+
+        // A claim that outlived its handler would bar the key forever.
+        drop(claim);
+        assert!(
+            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_some(),
+            "a released key should be claimable again"
+        );
+    }
+
+    #[test]
+    fn fresh_offer_claims_are_independent_across_keys_sharing_a_prefix() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
+        let mut first_key = [0u8; 32];
+        first_key[31] = 1;
+        let mut second_key = [0u8; 32];
+        second_key[31] = 2;
+
+        // A node only receives offers for keys close to its own ID, so accepted
+        // keys share a long prefix. Any prefix-derived shard index would have
+        // funnelled these two onto one lock and serialized them.
+        let _first = FreshOfferInFlightGuard::try_claim(&in_flight, first_key);
+        assert!(
+            FreshOfferInFlightGuard::try_claim(&in_flight, second_key).is_some(),
+            "distinct keys should never block each other"
+        );
     }
 
     #[test]
