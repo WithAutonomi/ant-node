@@ -454,10 +454,16 @@ impl FirstAuditScheduler {
         }
     }
 
+    /// Observability getter: used by the scheduler summary log and unit tests,
+    /// both absent from a release `--no-default-features` build, so it is dead
+    /// only in that configuration.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     fn pending_len(&self) -> usize {
         self.pending.len()
     }
 
+    /// Observability getter (see [`Self::pending_len`]).
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     fn tokens(&self) -> u32 {
         self.limiter.tokens
     }
@@ -6223,13 +6229,14 @@ mod tests {
         // ...but the horizon prefilter rejects it (age == C at now + H).
         assert!(!quote_answerable_through_nominal_jitter(boundary, now));
 
-        // One nanosecond newer stays answerable through the horizon; one older
-        // does not.
+        // A hair newer stays answerable through the horizon; a hair older does
+        // not. Use 1µs (not 1ns): Windows `SystemTime` has 100ns granularity, so
+        // a nanosecond step would round to the same instant there.
         let newer = boundary
-            .checked_add(Duration::from_nanos(1))
+            .checked_add(Duration::from_micros(1))
             .expect("newer");
         let older = boundary
-            .checked_sub(Duration::from_nanos(1))
+            .checked_sub(Duration::from_micros(1))
             .expect("older");
         assert!(quote_answerable_through_nominal_jitter(newer, now));
         assert!(!quote_answerable_through_nominal_jitter(older, now));
