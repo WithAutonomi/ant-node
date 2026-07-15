@@ -118,20 +118,49 @@ impl Default for PriceFloorConfig {
 
 impl PriceFloorConfig {
     /// Build from the environment (see [`PRICE_FLOOR_ENFORCE_ENV`] and
-    /// [`PRICE_FLOOR_TOLERANCE_ENV`]). Never fails: unset or invalid values
-    /// fall back to the shadow-mode default.
+    /// [`PRICE_FLOOR_TOLERANCE_ENV`]). Never panics.
+    ///
+    /// An unset tolerance uses the default. A tolerance that is *present but
+    /// invalid* (unparseable or `> 100`) is an operator error: rather than
+    /// silently enforce at the default, this **fails closed to shadow mode**
+    /// (`enforce = false`) and logs a prominent error, so a fat-fingered
+    /// tolerance can never enforce an unintended floor against real payments.
     #[must_use]
     pub fn from_env() -> Self {
-        let enforce = std::env::var(PRICE_FLOOR_ENFORCE_ENV)
+        let enforce_requested = std::env::var(PRICE_FLOOR_ENFORCE_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"));
-        let tolerance_percent = std::env::var(PRICE_FLOOR_TOLERANCE_ENV)
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|p| *p <= 100)
-            .unwrap_or(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT);
+
+        let tolerance_raw = std::env::var(PRICE_FLOOR_TOLERANCE_ENV).ok();
+        let valid_tolerance = tolerance_raw
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|percent| *percent <= 100);
+        // A tolerance that is set but does not parse to `0..=100` is an operator
+        // error. Fail CLOSED: never enforce a tolerance the operator did not
+        // actually specify.
+        let tolerance_present_but_invalid = tolerance_raw.is_some() && valid_tolerance.is_none();
+
+        if tolerance_present_but_invalid {
+            if enforce_requested {
+                crate::logging::error!(
+                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
+                     refusing to enforce the price floor with an unspecified tolerance. \
+                     Price-floor enforcement DISABLED (shadow mode). Fix the value and restart \
+                     to enable enforcement."
+                );
+            } else {
+                crate::logging::warn!(
+                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
+                     using the default {PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT}% for shadow-mode \
+                     telemetry."
+                );
+            }
+        }
+
         Self {
-            enforce,
-            tolerance_percent,
+            enforce: enforce_requested && !tolerance_present_but_invalid,
+            tolerance_percent: valid_tolerance.unwrap_or(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT),
         }
     }
 }
@@ -349,11 +378,15 @@ pub struct PaymentVerifier {
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
     /// live-DHT checks; production startup MUST call [`attach_p2p_node`].
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
-    /// LMDB storage handle, attached post-construction so the paid-quote
-    /// price-floor check can read the authoritative on-disk record count without
-    /// depending on a side counter that may drift from replication/repair/prune
-    /// paths. `None` in unit tests that pre-set [`Self::test_records_override`];
-    /// production startup MUST call [`attach_storage`].
+    /// LMDB storage handle, attached post-construction. Retained for
+    /// store-backed verifier checks that need the authoritative on-disk record
+    /// count without depending on a side counter that may drift from
+    /// replication/repair/prune paths. NOTE: the ADR-0006 price floor does NOT
+    /// read this — it is bound to the live storage commitment via
+    /// [`Self::local_commitment_source`], not the on-disk count (the old floor
+    /// compared unlike counts and false-rejected honest quotes). `None` in unit
+    /// tests that don't exercise store-backed checks; production wires it via
+    /// [`Self::attach_storage`].
     storage: RwLock<Option<Arc<LmdbStorage>>>,
     /// Test-only override for the paid-quote issuer K-closest check.
     ///
@@ -581,13 +614,15 @@ impl PaymentVerifier {
         self.config.close_group_size
     }
 
-    /// Attach the node's [`LmdbStorage`] handle so paid-quote price-floor
-    /// checks can query the authoritative on-disk record count.
+    /// Attach the node's [`LmdbStorage`] handle for store-backed verifier
+    /// checks that read the authoritative on-disk record count.
     ///
-    /// Production startup MUST call this once the storage exists; otherwise
-    /// client PUTs using paid-quote verification are rejected because
-    /// the local economic floor cannot be checked. Idempotent: calling twice
-    /// replaces the handle.
+    /// NOTE: the ADR-0006 price floor does NOT depend on this handle — it is
+    /// priced from the live storage commitment ([`Self::attach_local_commitment_source`]),
+    /// and a missing commitment prices the floor at baseline rather than
+    /// rejecting. So a node without storage attached still admits PUTs; this
+    /// attachment only feeds any current/future store-count-backed checks.
+    /// Idempotent: calling twice replaces the handle.
     pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
         *self.storage.write() = Some(storage);
         debug!("PaymentVerifier: LmdbStorage attached for paid-quote price-floor checks");
@@ -1084,7 +1119,13 @@ impl PaymentVerifier {
     ///
     /// No live current commitment — fresh node, retired commitment, restart
     /// window, or nothing attached — prices the floor at baseline
-    /// (`calculate_price(0)`), making it vacuous instead of an outage mode.
+    /// (`calculate_price(0)`). For any on-curve quote (`price ==
+    /// calculate_price(n)`, `n >= 0`) an honest 3× settlement then clears the
+    /// baseline floor, so a no-commitment receiver never rejects honest
+    /// traffic. (A settlement priced *below* baseline could still be rejected
+    /// against it — but that only arises from an off-curve quote, which the
+    /// ADR-0004 arithmetic gate rejects outright once enforced; economically it
+    /// is a decline, not an availability regression.)
     ///
     /// Always emits one telemetry line per evaluated admission (target
     /// `ant_node::payment::price_floor`) so shadow mode measures the exact
@@ -3426,6 +3467,42 @@ mod tests {
         );
     }
 
+    /// `from_env` must fail CLOSED: a present-but-invalid tolerance can never
+    /// leave enforcement on with a tolerance the operator did not specify.
+    /// (This test owns the `PRICE_FLOOR_*` env vars — no other test reads them.)
+    #[test]
+    fn price_floor_from_env_fails_closed_on_invalid_tolerance() {
+        // Defaults with nothing set.
+        std::env::remove_var(PRICE_FLOOR_ENFORCE_ENV);
+        std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
+        let cfg = PriceFloorConfig::from_env();
+        assert!(!cfg.enforce);
+        assert_eq!(cfg.tolerance_percent, PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT);
+
+        // Enforce on, valid tolerance: honoured.
+        std::env::set_var(PRICE_FLOOR_ENFORCE_ENV, "1");
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "80");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(cfg.enforce);
+        assert_eq!(cfg.tolerance_percent, 80);
+
+        // Enforce on, out-of-range tolerance: enforcement DISABLED (fail closed).
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "150");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(
+            !cfg.enforce,
+            "an out-of-range tolerance must not silently enforce a default"
+        );
+
+        // Enforce on, unparseable tolerance: also disabled.
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "loose");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(!cfg.enforce);
+
+        std::env::remove_var(PRICE_FLOOR_ENFORCE_ENV);
+        std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
+    }
+
     #[tokio::test]
     async fn test_legacy_single_quote_proof_requires_three_x_payment() {
         let verifier = create_test_verifier();
@@ -4187,6 +4264,7 @@ mod tests {
 
         for context in [
             VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
@@ -4226,6 +4304,7 @@ mod tests {
 
         for context in [
             VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier

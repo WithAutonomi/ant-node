@@ -407,11 +407,15 @@ impl AntProtocol {
             Ok(_) => {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
-                // Bump the in-memory fallback counter. Both pricing and the
-                // paid-quote floor now read LmdbStorage::current_chunks() directly,
-                // so this counter only matters when no storage is attached
-                // (unit tests / mis-configured startup). Kept warm so that
-                // fallback path stays roughly accurate.
+                // Bump the in-memory fallback record counter. Under ADR-0004
+                // neither pricing nor the receiver-side price floor reads this
+                // counter: both are bound to the live storage commitment
+                // (committed responsible key count), pricing via the quote
+                // generator's commitment source and the floor via the
+                // verifier's non-mutating snapshot of the same commitment. The
+                // counter only matters as a warm fallback surface when no
+                // commitment source is attached (unit tests / pre-replication
+                // startup).
                 self.quote_generator.record_store();
 
                 // 7. Notify replication engine for fresh fan-out.

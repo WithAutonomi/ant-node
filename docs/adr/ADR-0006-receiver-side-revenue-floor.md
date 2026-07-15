@@ -79,7 +79,11 @@ settled_amount >= 3 x tolerance% x calculate_price(receiver's current
 - **Settled amount, not quote price.** An honest client may overpay a cheap
   quote to clear stricter receivers.
 - **No commitment = baseline.** A fresh, retired, or restarting receiver
-  prices the floor at `calculate_price(0)` — vacuous, never an outage mode.
+  prices the floor at `calculate_price(0)`. Every on-curve honest quote clears
+  a baseline floor at a 3x settlement, so this is not an availability
+  regression. (Only an off-curve sub-baseline quote — which the ADR-0004
+  arithmetic gate rejects once enforced — could fall below it, an economic
+  decline rather than an outage.)
 - **Scope.** Applies to `ClientPut` and `FreshReplication` (a below-floor
   proof must not fan out through one cheap accepting node). Never applies to
   paid-list admission, later repair, cache hits, or merkle-batch proofs: no
