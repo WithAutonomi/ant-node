@@ -16,9 +16,7 @@ use ant_node::replication::bootstrap::{
     check_bootstrap_drained, clear_capacity_rejected, note_capacity_rejected, track_discovered_keys,
 };
 use ant_node::replication::scheduling::ReplicationQueues;
-use ant_node::replication::types::{
-    BootstrapState, HintPipeline, VerificationEntry, VerificationState,
-};
+use ant_node::replication::types::{BootstrapState, VerificationEntry, VerificationState};
 use saorsa_core::identity::PeerId;
 use tokio::sync::RwLock;
 
@@ -32,7 +30,6 @@ fn entry(sources: HashSet<PeerId>) -> VerificationEntry {
     let now = Instant::now();
     VerificationEntry {
         state: VerificationState::PendingVerify,
-        pipeline: HintPipeline::Replica,
         verified_sources: Vec::new(),
         tried_sources: HashSet::new(),
         created_at: now,

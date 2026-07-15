@@ -82,7 +82,7 @@ use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
 use crate::replication::scheduling::ReplicationQueues;
 use crate::replication::types::{
-    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
+    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
     VerificationState,
 };
@@ -4243,12 +4243,13 @@ fn queue_admitted_hints(
                 key,
                 VerificationEntry {
                     state: VerificationState::PendingVerify,
-                    pipeline: HintPipeline::Replica,
                     verified_sources: Vec::new(),
                     tried_sources: HashSet::new(),
                     created_at: now,
                     next_verify_at: now,
                     hint_sources: HashSet::from([*source_peer]),
+                    // Non-empty: this peer claimed possession, so it is a
+                    // fetch-source candidate. Derives HintPipeline::Replica.
                     replica_hint_sources: HashSet::from([*source_peer]),
                 },
             );
@@ -4269,12 +4270,13 @@ fn queue_admitted_hints(
             key,
             VerificationEntry {
                 state: VerificationState::PendingVerify,
-                pipeline: HintPipeline::PaidOnly,
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
                 next_verify_at: now,
                 hint_sources: HashSet::from([*source_peer]),
+                // Empty: a paid hint makes no possession claim, so this peer is
+                // not a fetch source. Derives HintPipeline::PaidOnly.
                 replica_hint_sources: HashSet::new(),
             },
         );
@@ -4371,34 +4373,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     let self_id = *p2p_node.peer_id();
 
     // Step 1: Check local PaidForList for fast-path authorization (Section 9,
-    // step 4).
-    let mut local_paid_presence_probe_keys = Vec::new();
-    let mut local_paid_paid_only_keys = Vec::new();
+    // step 4). Paid-list membership settles *validity* — the key is known-paid,
+    // so no quorum round is needed. It says nothing about whether we must hold
+    // the bytes; that is decided below.
+    let mut local_paid_keys = Vec::new();
     let mut keys_needing_network = Vec::new();
     let mut terminal_keys: Vec<XorName> = Vec::new();
     {
         let mut q = queues.write().await;
         for key in &pending_keys {
             if paid_list.contains(key).unwrap_or(false) {
-                if let Some(pipeline) =
-                    q.set_pending_state(key, VerificationState::PaidListVerified)
-                {
-                    match pipeline {
-                        HintPipeline::PaidOnly => {
-                            // Paid-only + local paid state needs one more
-                            // storage-admission check outside this lock: if we
-                            // are also in the close group plus storage margin,
-                            // the hint can repair a missing replica.
-                            local_paid_paid_only_keys.push(*key);
-                        }
-                        HintPipeline::Replica => {
-                            // Local paid-list membership authorizes the key.
-                            // We still need a presence probe to discover fetch
-                            // sources, but we must not require remote paid
-                            // majority or presence quorum.
-                            local_paid_presence_probe_keys.push(*key);
-                        }
-                    }
+                if q.set_pending_state(key, VerificationState::PaidListVerified) {
+                    local_paid_keys.push(*key);
                 }
             } else {
                 keys_needing_network.push(*key);
@@ -4406,11 +4392,17 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
     }
 
-    if !local_paid_paid_only_keys.is_empty() {
-        let mut terminal_paid_only = Vec::new();
-        for key in local_paid_paid_only_keys {
+    // Storage responsibility is a live routing question, decided identically
+    // for every known-paid key regardless of how the advertising peer labelled
+    // its hint — a replica hint is a possession *claim* by the sender, never
+    // permission for us to store. Held outside the queue lock: `is_responsible`
+    // awaits into the DHT manager.
+    let mut local_paid_presence_probe_keys = Vec::new();
+    if !local_paid_keys.is_empty() {
+        let mut terminal_paid = Vec::new();
+        for key in local_paid_keys {
             if storage.exists(&key).unwrap_or(false) {
-                terminal_paid_only.push(key);
+                terminal_paid.push(key);
             } else if admission::is_responsible(
                 &self_id,
                 &key,
@@ -4419,15 +4411,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             )
             .await
             {
+                // We carry storage responsibility and lack the bytes. The
+                // presence probe below discovers holders to fetch from; it is
+                // source discovery, not re-verification.
                 local_paid_presence_probe_keys.push(key);
             } else {
-                terminal_paid_only.push(key);
+                terminal_paid.push(key);
             }
         }
 
-        if !terminal_paid_only.is_empty() {
+        if !terminal_paid.is_empty() {
             let mut q = queues.write().await;
-            for key in terminal_paid_only {
+            for key in terminal_paid {
                 q.remove_pending(&key);
                 terminal_keys.push(key);
             }
@@ -4466,11 +4461,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             let mut sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
-            let replica_hint_sources = q.get_pending(&key).and_then(|entry| {
-                (entry.pipeline == HintPipeline::Replica).then_some(&entry.replica_hint_sources)
-            });
-            if let Some(hint_sources) = replica_hint_sources {
-                add_replica_hint_sources(&mut sources, HintPipeline::Replica, hint_sources);
+            if let Some(entry) = q.get_pending(&key) {
+                add_replica_hint_sources(&mut sources, &entry.replica_hint_sources);
             }
             if sources.is_empty() {
                 warn!(
@@ -4575,16 +4567,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             provers_snapshot.is_credited_holder(key, peer, hash)
         };
 
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
+        let mut evaluated: Vec<(XorName, KeyVerificationOutcome)> = Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
                 let Some(ev) = evidence.get(key) else {
                     continue;
                 };
-                let Some(entry) = q.get_pending(key) else {
+                if q.get_pending(key).is_none() {
                     continue;
-                };
+                }
                 let outcome = quorum::evaluate_key_evidence_with_holder_check(
                     key,
                     ev,
@@ -4592,13 +4584,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     config,
                     holder_credit,
                 );
-                evaluated.push((*key, outcome, entry.pipeline));
+                evaluated.push((*key, outcome));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _) in &evaluated {
+        for (key, outcome) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -4613,19 +4605,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         }
 
-        // Paid-only hints normally update PaidForList only. If this node is
-        // also within the storage-admission group for the key, a verified
-        // paid-only hint can safely repair a missing replica using sources
-        // from the same verification round.
-        let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline) in &evaluated {
-            if *pipeline == HintPipeline::PaidOnly
-                && matches!(
-                    outcome,
-                    KeyVerificationOutcome::QuorumVerified { .. }
-                        | KeyVerificationOutcome::PaidListVerified { .. }
-                )
-                && !storage.exists(key).unwrap_or(false)
+        // Verification established validity; the paid-list insert above records
+        // it. Downloading the bytes is a separate duty, owed only by the
+        // storage-admission group. Decide it here for every verified key on the
+        // same terms — the advertising peer's replica/paid labelling is a claim
+        // about itself and carries no authority over what we store.
+        let mut fetch_allowed_keys: HashSet<XorName> = HashSet::new();
+        for (key, outcome) in &evaluated {
+            if matches!(
+                outcome,
+                KeyVerificationOutcome::QuorumVerified { .. }
+                    | KeyVerificationOutcome::PaidListVerified { .. }
+            ) && !storage.exists(key).unwrap_or(false)
                 && admission::is_responsible(
                     &self_id,
                     key,
@@ -4634,25 +4625,22 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 )
                 .await
             {
-                paid_only_fetch_keys.insert(*key);
+                fetch_allowed_keys.insert(*key);
             }
         }
 
         // Step 5: Update queues with the evaluated outcomes.
         let mut bad_singleton_hints: HashMap<PeerId, usize> = HashMap::new();
         let mut q = queues.write().await;
-        for (key, outcome, pipeline) in evaluated {
+        for (key, outcome) in evaluated {
             let replica_hint_sources = q
                 .get_pending(&key)
                 .map(|entry| entry.replica_hint_sources.clone())
                 .unwrap_or_default();
             if let Some(ev) = evidence.get(&key) {
-                if let Some(source) = punishable_singleton_replica_hint_source(
-                    pipeline,
-                    &replica_hint_sources,
-                    &outcome,
-                    ev,
-                ) {
+                if let Some(source) =
+                    punishable_singleton_replica_hint_source(&replica_hint_sources, &outcome, ev)
+                {
                     *bad_singleton_hints.entry(source).or_insert(0) += 1;
                 }
             }
@@ -4660,9 +4648,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
                     let mut fetch_sources = sources;
-                    add_replica_hint_sources(&mut fetch_sources, pipeline, &replica_hint_sources);
-                    let fetch_eligible =
-                        pipeline == HintPipeline::Replica || paid_only_fetch_keys.contains(&key);
+                    add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
+                    let fetch_eligible = fetch_allowed_keys.contains(&key);
                     if fetch_eligible && !fetch_sources.is_empty() {
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
@@ -4748,14 +4735,11 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     }
 }
 
-fn add_replica_hint_sources(
-    sources: &mut Vec<PeerId>,
-    pipeline: HintPipeline,
-    replica_hint_sources: &HashSet<PeerId>,
-) {
-    if pipeline != HintPipeline::Replica {
-        return;
-    }
+/// Add peers that claimed possession as fallback fetch sources.
+///
+/// Paid-only advertisers make no possession claim and are absent from
+/// `replica_hint_sources` by construction, so they are never added.
+fn add_replica_hint_sources(sources: &mut Vec<PeerId>, replica_hint_sources: &HashSet<PeerId>) {
     for source in replica_hint_sources {
         if !sources.contains(source) {
             sources.push(*source);
@@ -4768,12 +4752,13 @@ fn add_replica_hint_sources(
 /// Paid-only advertisements, corroborated replica hints, and inconclusive
 /// rounds without that direct contradiction are deliberately non-penalizing.
 fn punishable_singleton_replica_hint_source(
-    pipeline: HintPipeline,
     replica_hint_sources: &HashSet<PeerId>,
     outcome: &KeyVerificationOutcome,
     evidence: &crate::replication::types::KeyVerificationEvidence,
 ) -> Option<PeerId> {
-    if pipeline != HintPipeline::Replica || replica_hint_sources.len() != 1 {
+    // A paid-only advertiser leaves this set empty, so the sole-source lane is
+    // reserved for peers that actually claimed possession.
+    if replica_hint_sources.len() != 1 {
         return None;
     }
     let source = *replica_hint_sources.iter().next()?;
@@ -6159,17 +6144,11 @@ mod tests {
         let failed = KeyVerificationOutcome::QuorumFailed;
 
         assert_eq!(
-            punishable_singleton_replica_hint_source(
-                HintPipeline::Replica,
-                &HashSet::from([source]),
-                &failed,
-                &evidence,
-            ),
+            punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
             Some(source)
         );
         assert_eq!(
             punishable_singleton_replica_hint_source(
-                HintPipeline::Replica,
                 &HashSet::from([source, corroborator]),
                 &failed,
                 &evidence,
@@ -6178,32 +6157,22 @@ mod tests {
             "corroborated hints must not use the sole-source penalty lane"
         );
         assert_eq!(
-            punishable_singleton_replica_hint_source(
-                HintPipeline::PaidOnly,
-                &HashSet::from([source]),
-                &failed,
-                &evidence,
-            ),
+            punishable_singleton_replica_hint_source(&HashSet::new(), &failed, &evidence),
             None,
-            "paid-list advertisements do not claim possession"
+            "paid-list advertisements do not claim possession, so they leave the \
+             replica-hint source set empty and cannot be penalized"
         );
 
         evidence
             .presence
             .insert(source, PresenceEvidence::Unresolved);
         assert_eq!(
-            punishable_singleton_replica_hint_source(
-                HintPipeline::Replica,
-                &HashSet::from([source]),
-                &failed,
-                &evidence,
-            ),
+            punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
             Some(source),
             "definitive close-group rejection is punishable without direct contradiction"
         );
         assert_eq!(
             punishable_singleton_replica_hint_source(
-                HintPipeline::Replica,
                 &HashSet::from([source]),
                 &KeyVerificationOutcome::QuorumInconclusive,
                 &evidence,
@@ -6215,7 +6184,6 @@ mod tests {
         evidence.presence.insert(source, PresenceEvidence::Absent);
         assert_eq!(
             punishable_singleton_replica_hint_source(
-                HintPipeline::Replica,
                 &HashSet::from([source]),
                 &KeyVerificationOutcome::QuorumVerified {
                     sources: vec![corroborator],
@@ -6241,7 +6209,6 @@ mod tests {
             key,
             VerificationEntry {
                 state: VerificationState::PendingVerify,
-                pipeline: HintPipeline::Replica,
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
@@ -6505,18 +6472,18 @@ mod tests {
     fn replica_hint_sources_are_added_as_fallback_fetch_sources() {
         const EXISTING_SOURCE_ID: u8 = 1;
         const HINT_SENDER_ID: u8 = 2;
-        const PAID_ONLY_SENDER_ID: u8 = 3;
 
         let existing_source = test_peer(EXISTING_SOURCE_ID);
         let hint_sender = test_peer(HINT_SENDER_ID);
-        let paid_only_sender = test_peer(PAID_ONLY_SENDER_ID);
         let mut sources = vec![existing_source];
 
         let hint_sources = HashSet::from([hint_sender]);
-        let paid_only_sources = HashSet::from([paid_only_sender]);
-        add_replica_hint_sources(&mut sources, HintPipeline::Replica, &hint_sources);
-        add_replica_hint_sources(&mut sources, HintPipeline::Replica, &hint_sources);
-        add_replica_hint_sources(&mut sources, HintPipeline::PaidOnly, &paid_only_sources);
+        add_replica_hint_sources(&mut sources, &hint_sources);
+        add_replica_hint_sources(&mut sources, &hint_sources);
+
+        // A paid-only advertiser leaves the claim set empty (see
+        // `queue_admitted_hints`), so it contributes no fetch source.
+        add_replica_hint_sources(&mut sources, &HashSet::new());
 
         assert_eq!(sources, vec![existing_source, hint_sender]);
     }

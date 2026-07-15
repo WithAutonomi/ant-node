@@ -235,9 +235,7 @@ mod tests {
 
     use super::*;
     use crate::replication::scheduling::ReplicationQueues;
-    use crate::replication::types::{
-        BootstrapState, HintPipeline, VerificationEntry, VerificationState,
-    };
+    use crate::replication::types::{BootstrapState, VerificationEntry, VerificationState};
 
     fn xor_name_from_byte(b: u8) -> XorName {
         [b; 32]
@@ -304,7 +302,6 @@ mod tests {
         let now = Instant::now();
         let entry = VerificationEntry {
             state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::Replica,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: now,
