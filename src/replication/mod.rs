@@ -1499,12 +1499,16 @@ impl ReplicationEngine {
                                 // and drop routing-table events — the moment
                                 // convergence matters most. A dropped
                                 // KClosestPeersChanged means its entrants were never
-                                // queued, so draining priority_order cannot recover
-                                // them. Resync from ground truth instead: snapshot the
-                                // current close-peer set and queue every member. Dedup
-                                // (queue_priority_peers) and per-peer cooldown
-                                // (select_next_sync_peer) drop peers already queued or
-                                // recently synced, so only genuine entrants surface.
+                                // queued and its departures were never pruned, so
+                                // draining priority_order cannot recover either.
+                                // Resync from ground truth instead: snapshot the
+                                // current close-peer set, prune pending peers that
+                                // left it during the lost window (retain_sync_peers,
+                                // as the normal topology-change path does), and queue
+                                // every member. Dedup (queue_priority_peers) and
+                                // per-peer cooldown (select_next_sync_peer) drop peers
+                                // already queued or recently synced, so only genuine
+                                // entrants surface.
                                 warn!(
                                     "Missed {missed} DHT routing events (broadcast lag); resynchronizing close-peer set for neighbor sync"
                                 );
@@ -1515,10 +1519,20 @@ impl ReplicationEngine {
                                     config.neighbor_sync_scope,
                                 )
                                 .await;
-                                let requeued = {
+                                let neighbor_set =
+                                    neighbors.iter().copied().collect::<HashSet<_>>();
+                                let (requeued, sync_removals) = {
                                     let mut state = sync_state.write().await;
-                                    state.queue_priority_peers(neighbors)
+                                    let sync_removals =
+                                        state.retain_sync_peers(&neighbor_set);
+                                    let requeued = state.queue_priority_peers(neighbors);
+                                    (requeued, sync_removals)
                                 };
+                                if sync_removals > 0 {
+                                    debug!(
+                                        "Resync after broadcast lag pruned {sync_removals} departed pending sync entries"
+                                    );
+                                }
                                 if requeued > 0 {
                                     debug!(
                                         "Resync after broadcast lag queued {requeued} close peers for priority neighbor sync"
