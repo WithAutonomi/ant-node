@@ -54,7 +54,6 @@ fn entry_from(sender: PeerId) -> VerificationEntry {
     let now = Instant::now();
     VerificationEntry {
         state: VerificationState::PendingVerify,
-        pipeline: HintPipeline::Replica,
         verified_sources: Vec::new(),
         tried_sources: HashSet::new(),
         created_at: now,
@@ -159,10 +158,18 @@ fn poc_d1_set_pending_state_preserves_entry() {
     assert_eq!(queues.pending_count(), 1);
 
     // Exactly what run_verification_cycle does: advance the FSM state.
-    let pipeline = queues
-        .set_pending_state(&key, VerificationState::QuorumVerified)
-        .expect("entry must be present");
-    assert_eq!(pipeline, HintPipeline::Replica, "pipeline preserved");
+    assert!(
+        queues.set_pending_state(&key, VerificationState::QuorumVerified),
+        "entry must be present"
+    );
+    assert_eq!(
+        queues
+            .get_pending(&key)
+            .expect("entry must be present")
+            .pipeline(),
+        HintPipeline::Replica,
+        "pipeline preserved"
+    );
 
     assert_eq!(queues.pending_count(), 1);
 

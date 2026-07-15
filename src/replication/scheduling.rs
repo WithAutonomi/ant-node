@@ -10,9 +10,7 @@ use std::time::{Duration, Instant};
 use crate::logging::debug;
 
 use crate::ant_protocol::XorName;
-use crate::replication::types::{
-    FetchCandidate, HintPipeline, VerificationEntry, VerificationState,
-};
+use crate::replication::types::{FetchCandidate, VerificationEntry, VerificationState};
 use saorsa_core::identity::PeerId;
 
 /// Global hard upper bound on the number of keys held in `pending_verify`.
@@ -185,20 +183,14 @@ impl ReplicationQueues {
                         .insert(key);
                 }
             }
-            if entry.pipeline == HintPipeline::Replica {
-                existing.pipeline = HintPipeline::Replica;
-            }
             return AdmissionResult::AlreadyPresent;
         }
         if self.fetch_queue_keys.contains(&key) {
-            let pipeline = entry.pipeline;
             let mut candidates = std::mem::take(&mut self.fetch_queue).into_vec();
             if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.key == key) {
-                if pipeline == HintPipeline::Replica {
-                    for source in &entry.replica_hint_sources {
-                        if !candidate.sources.contains(source) {
-                            candidate.sources.push(*source);
-                        }
+                for source in &entry.replica_hint_sources {
+                    if !candidate.sources.contains(source) {
+                        candidate.sources.push(*source);
                     }
                 }
                 if let Some(retry) = &mut candidate.retry_verification {
@@ -212,11 +204,9 @@ impl ReplicationQueues {
             return AdmissionResult::AlreadyPresent;
         }
         if let Some(in_flight) = self.in_flight_fetch.get_mut(&key) {
-            if entry.pipeline == HintPipeline::Replica {
-                for source in &entry.replica_hint_sources {
-                    if !in_flight.all_sources.contains(source) {
-                        in_flight.all_sources.push(*source);
-                    }
+            for source in &entry.replica_hint_sources {
+                if !in_flight.all_sources.contains(source) {
+                    in_flight.all_sources.push(*source);
                 }
             }
             if let Some(retry) = &mut in_flight.retry_verification {
@@ -293,18 +283,16 @@ impl ReplicationQueues {
         self.pending_verify.get(key)
     }
 
-    /// Advance a pending entry's verification `state`, returning the entry's
-    /// `pipeline` (so the caller can branch on it) when the key was found.
+    /// Advance a pending entry's verification `state`, reporting whether the
+    /// key was found.
     ///
     /// Narrow mutation API used by the verification state machine.
-    pub fn set_pending_state(
-        &mut self,
-        key: &XorName,
-        state: VerificationState,
-    ) -> Option<HintPipeline> {
-        let entry = self.pending_verify.get_mut(key)?;
+    pub fn set_pending_state(&mut self, key: &XorName, state: VerificationState) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
         entry.state = state;
-        Some(entry.pipeline)
+        true
     }
 
     /// Remove a key from pending verification.
@@ -370,9 +358,6 @@ impl ReplicationQueues {
             let became_orphaned = if let Some(entry) = self.pending_verify.get_mut(&key) {
                 entry.hint_sources.remove(source);
                 entry.replica_hint_sources.remove(source);
-                if entry.replica_hint_sources.is_empty() {
-                    entry.pipeline = HintPipeline::PaidOnly;
-                }
                 entry.hint_sources.is_empty()
             } else {
                 false
@@ -391,9 +376,6 @@ impl ReplicationQueues {
             if let Some(verification) = &mut candidate.retry_verification {
                 if verification.hint_sources.remove(source) {
                     verification.replica_hint_sources.remove(source);
-                    if verification.replica_hint_sources.is_empty() {
-                        verification.pipeline = HintPipeline::PaidOnly;
-                    }
                     if verification.hint_sources.is_empty() {
                         retry_releases += 1;
                         candidate.retry_verification = None;
@@ -414,9 +396,6 @@ impl ReplicationQueues {
             if let Some(verification) = &mut entry.retry_verification {
                 if verification.hint_sources.remove(source) {
                     verification.replica_hint_sources.remove(source);
-                    if verification.replica_hint_sources.is_empty() {
-                        verification.pipeline = HintPipeline::PaidOnly;
-                    }
                     if verification.hint_sources.is_empty() {
                         retry_releases += 1;
                         entry.retry_verification = None;
@@ -810,7 +789,6 @@ mod tests {
         let now = Instant::now();
         VerificationEntry {
             state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::Replica,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: now,
@@ -1404,10 +1382,9 @@ mod tests {
         let key = xor_name_from_byte(0xE1);
 
         // Simulate admission result: key was in both replica_hints and
-        // paid_hints, so admission gives it HintPipeline::Replica.
+        // paid_hints, so admission records a possession claim for it.
         let entry = VerificationEntry {
             state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::Replica, // Cross-set precedence result.
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
@@ -1420,15 +1397,14 @@ mod tests {
 
         let pending = queues.get_pending(&key).expect("should be pending");
         assert_eq!(
-            pending.pipeline,
-            HintPipeline::Replica,
+            pending.pipeline(),
+            crate::replication::types::HintPipeline::Replica,
             "key in both hint sets should be Replica pipeline"
         );
 
         // A second add (e.g. from paid hints arriving separately) is rejected.
         let paid_entry = VerificationEntry {
             state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::PaidOnly,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
@@ -1442,12 +1418,101 @@ mod tests {
             "duplicate key should be rejected regardless of pipeline"
         );
 
-        // Pipeline stays Replica.
+        // Pipeline stays Replica: merging a paid-only advertiser adds no
+        // possession claim, so it cannot demote the existing one.
         let pending = queues.get_pending(&key).expect("should still be pending");
         assert_eq!(
-            pending.pipeline,
-            HintPipeline::Replica,
+            pending.pipeline(),
+            crate::replication::types::HintPipeline::Replica,
             "pipeline should remain Replica after duplicate rejection"
+        );
+    }
+
+    /// A paid-only key cannot be escalated into the fetch-eligible pipeline by
+    /// a peer re-advertising it as a replica hint.
+    ///
+    /// The queue still records the possession claim — that is what the sender
+    /// asserted, and it makes the sender a fetch-source candidate. What it must
+    /// not do is turn that claim into permission to store: the storage-
+    /// admission check at download time is what decides, and it consults live
+    /// routing state rather than this tag.
+    #[test]
+    fn replica_hint_on_paid_only_key_does_not_grant_storage_admission() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xE2);
+        let paid_advertiser = peer_id_from_byte(1);
+        let replica_advertiser = peer_id_from_byte(2);
+
+        let paid_entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: Instant::now(),
+            next_verify_at: Instant::now(),
+            hint_sources: HashSet::from([paid_advertiser]),
+            replica_hint_sources: HashSet::new(),
+        };
+        assert!(queues.add_pending_verify(key, paid_entry).admitted());
+        assert_eq!(
+            queues
+                .get_pending(&key)
+                .expect("should be pending")
+                .pipeline(),
+            crate::replication::types::HintPipeline::PaidOnly,
+        );
+
+        // Second message re-advertises the same key as a replica hint.
+        let replica_entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: Instant::now(),
+            next_verify_at: Instant::now(),
+            hint_sources: HashSet::from([replica_advertiser]),
+            replica_hint_sources: HashSet::from([replica_advertiser]),
+        };
+        assert!(!queues.add_pending_verify(key, replica_entry).admitted());
+
+        let pending = queues.get_pending(&key).expect("should still be pending");
+        assert!(
+            pending.replica_hint_sources.contains(&replica_advertiser),
+            "the possession claim is recorded for fetch-source discovery"
+        );
+        assert!(
+            !pending.replica_hint_sources.contains(&paid_advertiser),
+            "a paid-only advertiser never becomes a fetch source"
+        );
+    }
+
+    /// Losing the only replica advertiser demotes the derived pipeline without
+    /// any explicit bookkeeping, because the tag *is* the possession-claim set.
+    #[test]
+    fn departing_sole_replica_advertiser_demotes_derived_pipeline() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xE3);
+        let replica_advertiser = peer_id_from_byte(1);
+        let paid_advertiser = peer_id_from_byte(2);
+
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: Instant::now(),
+            next_verify_at: Instant::now(),
+            hint_sources: HashSet::from([replica_advertiser, paid_advertiser]),
+            replica_hint_sources: HashSet::from([replica_advertiser]),
+        };
+        assert!(queues.add_pending_verify(key, entry).admitted());
+
+        queues.remove_hint_source(&replica_advertiser);
+
+        let pending = queues
+            .get_pending(&key)
+            .expect("paid advertiser still holds the entry open");
+        assert_eq!(
+            pending.pipeline(),
+            crate::replication::types::HintPipeline::PaidOnly,
+            "no possession claims remain, so the key is paid-only again"
         );
     }
 
@@ -1469,7 +1534,6 @@ mod tests {
         // Stage 1: Hint admitted → PendingVerify
         let entry = VerificationEntry {
             state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::Replica,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
             created_at: Instant::now(),
