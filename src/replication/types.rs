@@ -83,8 +83,6 @@ pub enum HintPipeline {
 pub struct VerificationEntry {
     /// Current state in the verification FSM.
     pub state: VerificationState,
-    /// Which pipeline admitted this key.
-    pub pipeline: HintPipeline,
     /// Peers that responded `Present` during verification (verified fetch
     /// sources).
     pub verified_sources: Vec<PeerId>,
@@ -101,6 +99,32 @@ pub struct VerificationEntry {
     /// Subset of [`Self::hint_sources`] that advertised a replica hint and
     /// therefore claimed chunk possession. Paid-only advertisers are excluded.
     pub replica_hint_sources: HashSet<PeerId>,
+}
+
+impl VerificationEntry {
+    /// Which pipeline this key arrived on.
+    ///
+    /// Derived from [`Self::replica_hint_sources`] rather than stored: the
+    /// pipeline *is* "did any peer claim to hold this key", so a stored copy
+    /// can only drift from its own definition as advertisers are merged in and
+    /// departed peers are pruned out.
+    ///
+    /// This describes hint *provenance*, not authorization. It selects fetch
+    /// sources (only a peer claiming possession is worth fetching from) and
+    /// scopes sole-source trust penalties. It must never gate storage:
+    /// possession claims come from the sender, so treating one as permission to
+    /// store lets a peer conscript a node that carries no responsibility for
+    /// the key. Storage responsibility is decided separately, against live
+    /// routing state, by `is_responsible(storage_admission_width)` at the point
+    /// of download.
+    #[must_use]
+    pub fn pipeline(&self) -> HintPipeline {
+        if self.replica_hint_sources.is_empty() {
+            HintPipeline::PaidOnly
+        } else {
+            HintPipeline::Replica
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
