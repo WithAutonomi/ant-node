@@ -4580,6 +4580,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 .get_pending(&key)
                 .map(|entry| entry.replica_hint_sources.clone())
                 .unwrap_or_default();
+            if let Some(ev) = evidence.get(&key) {
+                if let Some(source) = punishable_singleton_replica_hint_source(
+                    pipeline,
+                    &replica_hint_sources,
+                    &outcome,
+                    ev,
+                ) {
+                    *bad_singleton_hints.entry(source).or_insert(0) += 1;
+                }
+            }
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
@@ -4608,16 +4618,6 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     }
                 }
                 KeyVerificationOutcome::QuorumFailed => {
-                    if let Some(ev) = evidence.get(&key) {
-                        if let Some(source) = directly_contradicted_singleton_hint_source(
-                            pipeline,
-                            &replica_hint_sources,
-                            &KeyVerificationOutcome::QuorumFailed,
-                            ev,
-                        ) {
-                            *bad_singleton_hints.entry(source).or_insert(0) += 1;
-                        }
-                    }
                     q.remove_pending(&key);
                     terminal_keys.push(key);
                 }
@@ -4632,7 +4632,8 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         for (peer, bad_hint_count) in bad_singleton_hints {
             let reports = bad_hint_count.min(MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE);
             warn!(
-                "Peer {peer} directly contradicted {bad_hint_count} sole-source replica hints; \
+                "Peer {peer} submitted {bad_hint_count} rejected or self-contradicting \
+                 sole-source replica hints; \
                  reporting {reports} bounded trust failure(s)"
             );
             for _ in 0..reports {
@@ -4696,23 +4697,24 @@ fn add_replica_hint_sources(
     }
 }
 
-/// Return the sole advertiser only when the verification round directly
-/// contradicts its replica claim. Timeouts, inconclusive rounds, paid-only
-/// advertisements, and corroborated hints are deliberately non-penalizing.
-fn directly_contradicted_singleton_hint_source(
+/// Return the sole replica advertiser when either the close group definitively
+/// rejects the key or the advertiser explicitly denies possessing it.
+/// Paid-only advertisements, corroborated replica hints, and inconclusive
+/// rounds without that direct contradiction are deliberately non-penalizing.
+fn punishable_singleton_replica_hint_source(
     pipeline: HintPipeline,
     replica_hint_sources: &HashSet<PeerId>,
     outcome: &KeyVerificationOutcome,
     evidence: &crate::replication::types::KeyVerificationEvidence,
 ) -> Option<PeerId> {
-    if pipeline != HintPipeline::Replica
-        || !matches!(outcome, KeyVerificationOutcome::QuorumFailed)
-        || replica_hint_sources.len() != 1
-    {
+    if pipeline != HintPipeline::Replica || replica_hint_sources.len() != 1 {
         return None;
     }
     let source = *replica_hint_sources.iter().next()?;
-    (evidence.presence.get(&source) == Some(&PresenceEvidence::Absent)).then_some(source)
+    let rejected_by_close_group = matches!(outcome, KeyVerificationOutcome::QuorumFailed);
+    let denied_possession = evidence.presence.get(&source) == Some(&PresenceEvidence::Absent);
+
+    (rejected_by_close_group || denied_possession).then_some(source)
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -6043,7 +6045,7 @@ mod tests {
     }
 
     #[test]
-    fn bad_hint_penalty_requires_directly_absent_sole_replica_source() {
+    fn bad_hint_penalty_rejects_or_directly_contradicts_sole_replica_source() {
         let source = test_peer(0x91);
         let corroborator = test_peer(0x92);
         let mut evidence = types::KeyVerificationEvidence {
@@ -6053,7 +6055,7 @@ mod tests {
         let failed = KeyVerificationOutcome::QuorumFailed;
 
         assert_eq!(
-            directly_contradicted_singleton_hint_source(
+            punishable_singleton_replica_hint_source(
                 HintPipeline::Replica,
                 &HashSet::from([source]),
                 &failed,
@@ -6062,7 +6064,7 @@ mod tests {
             Some(source)
         );
         assert_eq!(
-            directly_contradicted_singleton_hint_source(
+            punishable_singleton_replica_hint_source(
                 HintPipeline::Replica,
                 &HashSet::from([source, corroborator]),
                 &failed,
@@ -6072,7 +6074,7 @@ mod tests {
             "corroborated hints must not use the sole-source penalty lane"
         );
         assert_eq!(
-            directly_contradicted_singleton_hint_source(
+            punishable_singleton_replica_hint_source(
                 HintPipeline::PaidOnly,
                 &HashSet::from([source]),
                 &failed,
@@ -6086,7 +6088,17 @@ mod tests {
             .presence
             .insert(source, PresenceEvidence::Unresolved);
         assert_eq!(
-            directly_contradicted_singleton_hint_source(
+            punishable_singleton_replica_hint_source(
+                HintPipeline::Replica,
+                &HashSet::from([source]),
+                &failed,
+                &evidence,
+            ),
+            Some(source),
+            "definitive close-group rejection is punishable without direct contradiction"
+        );
+        assert_eq!(
+            punishable_singleton_replica_hint_source(
                 HintPipeline::Replica,
                 &HashSet::from([source]),
                 &KeyVerificationOutcome::QuorumInconclusive,
@@ -6094,6 +6106,20 @@ mod tests {
             ),
             None,
             "timeouts and inconclusive evidence are neutral"
+        );
+
+        evidence.presence.insert(source, PresenceEvidence::Absent);
+        assert_eq!(
+            punishable_singleton_replica_hint_source(
+                HintPipeline::Replica,
+                &HashSet::from([source]),
+                &KeyVerificationOutcome::QuorumVerified {
+                    sources: vec![corroborator],
+                },
+                &evidence,
+            ),
+            Some(source),
+            "an explicit denial is punishable regardless of the overall outcome"
         );
     }
 
