@@ -15,7 +15,7 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{storage_admission_width, ReplicationConfig};
+use crate::replication::config::ReplicationConfig;
 use crate::replication::paid_list::PaidList;
 use crate::storage::LmdbStorage;
 
@@ -66,16 +66,44 @@ pub async fn is_in_paid_close_group(
     closest.iter().any(|n| n.peer_id == *self_id)
 }
 
+/// Is this key worth tracking at all?
+///
+/// One gate for every hint, whatever the sender labelled it. Admission asks
+/// only whether the key is relevant to us — whether we should learn that it
+/// exists and is paid for. That is the `PaidCloseGroup(K)` question, since
+/// `paid_list_close_group_size` is exactly the width across which nodes track
+/// payment validity.
+///
+/// Storage responsibility is a *different* question, asked later against live
+/// routing state at the point of download. Keeping the two apart is what makes
+/// the sender's replica/paid labelling unable to influence what we store.
+async fn is_relevant(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    storage: &Arc<LmdbStorage>,
+    paid_list: &Arc<PaidList>,
+    pending_keys: &HashSet<XorName>,
+) -> bool {
+    // Fast paths: we already hold the key, already track it, or already know it
+    // is paid for. Each means the relevance question is settled -- no
+    // routing-table lookup needed.
+    storage.exists(key).unwrap_or(false)
+        || pending_keys.contains(key)
+        || paid_list.contains(key).unwrap_or(false)
+        || is_in_paid_close_group(self_id, key, p2p_node, config.paid_list_close_group_size).await
+}
+
 /// Admit neighbor-sync hints per Section 7.1 rules.
 ///
-/// For each key in `replica_hints` and `paid_hints`:
-/// - **Cross-set precedence**: if a key appears in both sets, keep only the
-///   replica-hint entry.
-/// - **Replica hints**: admitted if `self` is in the storage-admission group
-///   (`close_group_size + STORAGE_ADMISSION_MARGIN`) or key already exists in
-///   local store / pending set.
-/// - **Paid hints**: admitted if `self` is in `PaidCloseGroup(K)` or key is
-///   already in `PaidForList`.
+/// Every key -- replica-hinted or paid-hinted -- passes the same [`is_relevant`]
+/// gate. The hint set a key arrived on decides only whether the sender is
+/// recorded as claiming possession, which makes it a candidate fetch source; it
+/// does not decide admission, and it does not decide storage.
+///
+/// - **Cross-set precedence**: a key in both sets is settled by the replica
+///   pass, so the paid pass skips it.
 ///
 /// Returns an [`AdmissionResult`] with keys sorted into pipelines.
 #[allow(clippy::too_many_arguments, clippy::implicit_hasher)]
@@ -95,82 +123,55 @@ pub async fn admit_hints(
         rejected_keys: Vec::new(),
     };
 
-    // Track replica outcomes separately. A replica hint wins over a duplicate
-    // paid hint only when it is actually admitted; if local routing churn
-    // rejects the replica side, the paid-list path still gets a chance.
     let mut seen_replica = HashSet::new();
-    let mut admitted_replica = HashSet::new();
-    let mut rejected_replica = Vec::new();
-
-    // Process replica hints.
     for &key in replica_hints {
         if !seen_replica.insert(key) {
             continue;
         }
-
-        // Fast path: already local or pending -- no routing-table lookup needed.
-        let already_local = storage.exists(&key).unwrap_or(false);
-        let already_pending = pending_keys.contains(&key);
-
-        if already_local || already_pending {
-            result.replica_keys.push(key);
-            admitted_replica.insert(key);
-            continue;
-        }
-
-        if is_responsible(
+        if is_relevant(
             self_id,
             &key,
             p2p_node,
-            storage_admission_width(config.close_group_size),
+            config,
+            storage,
+            paid_list,
+            pending_keys,
         )
         .await
         {
             result.replica_keys.push(key);
-            admitted_replica.insert(key);
         } else {
-            rejected_replica.push(key);
+            result.rejected_keys.push(key);
         }
     }
 
-    // Process paid hints. A key already admitted as a replica remains a
-    // replica-pipeline key. If the replica path rejected it, however, paid-list
-    // admission can still authorize metadata convergence for churned views.
     let mut seen_paid = HashSet::new();
-    let mut admitted_paid = HashSet::new();
-    let mut rejected_paid = Vec::new();
     for &key in paid_hints {
         if !seen_paid.insert(key) {
             continue;
         }
-        if admitted_replica.contains(&key) {
+        // Cross-set precedence: the replica pass already ruled on this key,
+        // under the same gate this pass would apply. Re-asking cannot change
+        // the answer, and re-recording it would double-count the rejection.
+        if seen_replica.contains(&key) {
             continue;
         }
-
-        // Fast path: already in PaidForList -- no routing-table lookup needed.
-        let already_paid = paid_list.contains(&key).unwrap_or(false);
-
-        if already_paid {
-            result.paid_only_keys.push(key);
-            admitted_paid.insert(key);
-            continue;
-        }
-
-        if is_in_paid_close_group(self_id, &key, p2p_node, config.paid_list_close_group_size).await
+        if is_relevant(
+            self_id,
+            &key,
+            p2p_node,
+            config,
+            storage,
+            paid_list,
+            pending_keys,
+        )
+        .await
         {
             result.paid_only_keys.push(key);
-            admitted_paid.insert(key);
-        } else if !seen_replica.contains(&key) {
-            rejected_paid.push(key);
-        }
-    }
-
-    for key in rejected_replica {
-        if !admitted_paid.contains(&key) {
+        } else {
             result.rejected_keys.push(key);
         }
     }
-    result.rejected_keys.extend(rejected_paid);
 
     result
 }
@@ -391,14 +392,13 @@ mod tests {
     ///     gate tested at the e2e level (scenario 17 tests the positive
     ///     case).
     /// (b) Even if a sender IS in `LocalRT`, the per-key relevance check
-    ///     (`is_responsible` with storage-admission width /
-    ///     `is_in_paid_close_group`) in `admit_hints` still applies. Sender
-    ///     identity does not grant key admission.
+    ///     (`is_relevant`, i.e. `is_in_paid_close_group`) in `admit_hints`
+    ///     still applies. Sender identity does not grant key admission.
     ///
     /// This test exercises layer (b): the admission pipeline's dedup,
     /// cross-set precedence, and relevance filtering using the same logic
     /// that `admit_hints` performs — without the `P2PNode` dependency
-    /// needed for the actual `is_responsible` DHT lookup.
+    /// needed for the actual `is_in_paid_close_group` DHT lookup.
     #[test]
     fn scenario_5_sender_does_not_grant_key_relevance() {
         let key_pending = xor_name_from_byte(0xB0);
@@ -427,10 +427,10 @@ mod tests {
                 admitted_replica.push(key);
                 continue;
             }
-            // key_not_pending: not pending, not local -> needs the
-            // storage-admission check. Simulate it returning false.
-            let is_responsible = false;
-            if is_responsible {
+            // key_not_pending: not pending, not local, not paid -> needs the
+            // paid-close-group relevance check. Simulate it returning false.
+            let is_relevant = false;
+            if is_relevant {
                 admitted_replica.push(key);
             } else {
                 rejected.push(key);
@@ -484,13 +484,13 @@ mod tests {
 
     /// Scenario 7: Out-of-range key hint rejected regardless of quorum.
     ///
-    /// A key whose XOR distance from self is much larger than the distance
-    /// of the storage-admission members fails the `is_responsible` check in
-    /// `admit_hints`. The key never enters the verification pipeline, so
-    /// quorum is irrelevant.
+    /// A key whose XOR distance from self is much larger than the distance of
+    /// the paid-close-group members fails the `is_relevant` check in
+    /// `admit_hints`. The key never enters the verification pipeline, so quorum
+    /// is irrelevant.
     ///
     /// This test exercises the distance-based reasoning that `admit_hints`
-    /// uses, tracing through the same logic path. Full `is_responsible`
+    /// uses, tracing through the same logic path. Full `is_in_paid_close_group`
     /// requires a `P2PNode` for DHT lookups; here we verify the distance
     /// comparison and admission outcome for both close and far keys.
     #[test]
@@ -510,8 +510,8 @@ mod tests {
 
         // -- Simulate admit_hints for these keys --
         //
-        // When the storage-admission peers are all closer to far_key than
-        // self, `is_responsible(self, far_key)` returns false. The key is
+        // When the paid-close-group peers are all closer to far_key than self,
+        // `is_in_paid_close_group(self, far_key)` returns false. The key is
         // rejected without entering verification or quorum.
 
         let pending: HashSet<XorName> = HashSet::new();
@@ -529,12 +529,12 @@ mod tests {
                 admitted.push(key);
                 continue;
             }
-            // Simulate is_responsible: self (0x00) has the full
-            // storage-admission group closer to far_key (0xFF) than itself.
-            // For close_key (0x01), self is very close -> responsible.
+            // Simulate is_in_paid_close_group: self (0x00) has the full
+            // paid close group closer to far_key (0xFF) than itself. For
+            // close_key (0x01), self is very close -> relevant.
             let distance = xor_distance(&self_xor, &key);
-            let simulated_responsible = distance[0] < 0x80;
-            if simulated_responsible {
+            let simulated_relevant = distance[0] < 0x80;
+            if simulated_relevant {
                 admitted.push(key);
             } else {
                 rejected.push(key);
