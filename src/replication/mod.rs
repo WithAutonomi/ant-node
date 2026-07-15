@@ -645,14 +645,20 @@ impl FirstAuditScheduler {
             return None; // cancelled; nothing stamped, nothing to roll back
         }
         // Authoritative shared-cooldown check-and-stamp. Losing this race to a
-        // concurrent gossip audit requeues the event (newest-per-peer coalesce)
-        // rather than dropping it.
+        // concurrent gossip audit requeues the reserved event rather than
+        // dropping it — BUT only if no same-peer successor is already pending: a
+        // successor necessarily arrived AFTER this reservation, so it is the
+        // newer nomination and must not be overwritten by the older reserved
+        // event (`queue_first_audit_event` would replace it). `contains` does
+        // not disturb LRU recency.
         if !cooldown_allows_audit(cooldown, &event.peer, mono_now) {
             self.limiter.refund_token();
             obs.cooldown_deferred_attempts
                 .fetch_add(1, Ordering::Relaxed);
             drop(inflight);
-            let _ = queue_first_audit_event(&mut self.pending, event);
+            if !self.pending.contains(&event.peer) {
+                let _ = queue_first_audit_event(&mut self.pending, event);
+            }
             return None;
         }
         // Promote: stamp durable suppression, flip the lane, count the launch.
@@ -6384,6 +6390,59 @@ mod tests {
             Some(peer),
             "the retained successor becomes the next reservation"
         );
+    }
+
+    /// ADR-0004 Amendment 2 (E'): when a promotion loses the shared-cooldown
+    /// race, the reserved event is requeued ONLY if no same-peer successor is
+    /// already pending. A successor arrived after the reservation, so it is the
+    /// newer nomination (e.g. a count jump) and must not be overwritten by the
+    /// older reserved event.
+    #[test]
+    fn first_audit_cooldown_race_requeue_preserves_newer_successor() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono);
+        let peer = test_peer(1);
+
+        // Reserve A.
+        let a = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(a, &obs);
+        let cooldown_reserve: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_reserve, &obs));
+
+        // A newer same-peer successor B (a count jump) arrives during the
+        // reservation and is retained.
+        let b = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 400,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(b, &obs);
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve A: answerability PASSES (fresh quote) but the shared cooldown
+        // is already stamped for the peer, so promotion loses the race.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(peer, mono); // freshly on cooldown
+        let promoted = scheduler.resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs);
+        assert!(promoted.is_none(), "cooldown race -> not promoted");
+
+        // B (newer) is preserved; A did NOT overwrite it.
+        assert_eq!(scheduler.pending_len(), 1, "still exactly one pending");
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([2; 32]),
+            "the newer successor B is retained, not the older reserved A"
+        );
+        assert!(scheduler.first_audited.is_empty());
+        assert!(scheduler.limiter.recent.peek(&peer).is_none());
     }
 
     /// ADR-0004 Amendment 2 (E'): consecutive PROMOTIONS strictly alternate the
