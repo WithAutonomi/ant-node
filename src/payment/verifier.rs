@@ -1028,6 +1028,12 @@ impl PaymentVerifier {
             {
                 Ok(settled_amount) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
+                    // First settlement-verified median candidate wins the paid
+                    // slot and the sole first-audit nomination. If a client
+                    // settled several TIED-median candidates, only this one is
+                    // first-audited; gossiped extras keep the ADR-0002 lottery,
+                    // sidecar-only extras are an accepted best-effort residual
+                    // (ADR-0004 Amendment 2). The honest client pays one.
                     paid_peer = Some(candidate_peer);
                     break;
                 }

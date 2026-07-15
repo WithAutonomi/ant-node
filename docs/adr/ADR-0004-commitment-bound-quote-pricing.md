@@ -371,8 +371,23 @@ the first hour), an in-flight cap (2), and a uniform
 payment at the same instant, do not challenge the paid peer simultaneously.
 Fleet-wide first-audit pressure is therefore `nodes x refill-rate`, independent
 of upload volume. Budget deferral is penalty-free: a deferred pin stays pending
-(newest-per-peer, bounded) and launches when tokens allow; only audits that
+(bounded, one entry per peer) and launches when tokens allow; only audits that
 actually launch have consequences.
+
+**Pending coalescing keeps the highest count per peer, not merely the newest.**
+The per-peer pending slot retains the pin that most needs auditing — the
+HIGHEST committed key count (newest on an equal-count tie). A strictly-lower-
+count nomination for a peer never displaces a higher-count pending pin, and a
+suppressed lower nomination does not disturb the retained pin's queue position.
+Without this rule a peer could erase an inflated (audit-worthy) commitment for
+the cost of one cheaper same-peer settlement, since the count-jump override
+only compares against the last AUDITED count and a sidecar-only inflated pin
+has no gossip-lottery backstop. The same rule governs the requeue of a
+reservation that loses the shared-cooldown race. Accepted residual: if the
+retained higher pin later ages out of the answerability window (un-auditable
+once aged, grace removed), the single per-peer slot has already discarded the
+lower fallback — a small coverage reduction versus keeping both, not a revival
+of the lower-count-displacement bypass.
 
 **Per-peer re-audit window survives pin rotation.** After a first audit
 launches at a peer, further nominations for that peer are dropped for 2 hours
@@ -399,11 +414,30 @@ measurable in production.
 
 **Every pipeline stage is bounded, and the invariants hold by construction.**
 The verifier-to-drainer nomination channel is bounded (producers `try_send`
-and drop on full — penalty-free, lottery-covered), the pending set is a
-bounded newest-per-peer LRU, and launches are token-bucketed. The A1
-answerability screen runs both before launch selection and again after the
-jitter sleep, so a pin can never be challenged outside its window regardless
-of how deferral time, jitter, and the skew margin compose.
+and drop on full — penalty-free), the pending set is a bounded
+highest-count-per-peer LRU, and launches are token-bucketed. Durable
+suppression (the first-audited pin dedup, the per-peer re-audit window, the
+shared cooldown stamp, the lane flip, and the launch count) is committed ONLY
+at promotion, after an authoritative answerability + cooldown check-and-stamp
+taken immediately before the wire challenge; a reservation cancelled during
+its jitter refunds its token, releases its in-flight slot, and leaves no
+suppression behind. The answerability screen runs both as a schedule-time
+prefilter (over the whole jitter horizon) and authoritatively at promotion, so
+a pin can never be challenged outside its window regardless of how deferral
+time, jitter, and the skew margin compose.
+
+**Nomination scope and known coverage limits (measured in staging).** (a) On
+the single-node path only the FIRST settlement-verified median candidate is
+nominated; if a client settles several tied-median candidates, gossiped extras
+retain the ADR-0002 lottery but sidecar-only extra settled pins do not and are
+an accepted best-effort residual. The merkle path nominates every
+contract-paid index. (b) The per-peer re-audit window is stamped at LAUNCH, not
+at a passing outcome: a peer that answers with a `Transient`/silence reaches
+the ADR-0002 timeout lane and is not automatically re-launched by this
+scheduler (automatic retries would change the load bound and need their own
+policy). Both effects reduce coverage without weakening the price ceiling and
+are to be quantified against the terminal-outcome counters in the matched
+staging run.
 
 **Accepted residuals.** (1) *Budget-exhaustion starvation, mitigated by
 alternating lanes:* an attacker can try to keep observers' launch budgets

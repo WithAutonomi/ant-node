@@ -160,22 +160,54 @@ fn first_audit_terminal_outcome(result: &AuditTickResult) -> FirstAuditTerminalO
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstAuditQueueOutcome {
+    /// New peer inserted with free capacity.
     Queued,
+    /// Collapsed with an existing same-peer entry; the incoming won (higher
+    /// count, or equal count and newer) and replaced it.
     Coalesced,
+    /// Collapsed with an existing same-peer entry; the incoming LOST (strictly
+    /// lower count) and was dropped, leaving the higher-count pin in place.
+    SuppressedLower,
+    /// A DIFFERENT peer's entry was evicted by the bounded LRU to make room.
     CapacityEvicted { peer: PeerId, pin: [u8; 32] },
 }
 
-/// Insert newest-per-peer work while exposing the bounded LRU's otherwise
-/// silent capacity eviction. This preserves `LruCache::put` semantics exactly.
-fn queue_first_audit_event(
+/// Coalesce a monetized nomination into the per-peer pending queue with a
+/// SECURITY-AWARE rule (ADR-0004 Amendment 2): keep the pin that most needs
+/// auditing — the HIGHEST committed key count for that peer, newest on a tie.
+///
+/// A strictly-lower-count incoming must NOT displace a higher-count pending pin,
+/// otherwise a peer can erase an inflated (audit-worthy) commitment by simply
+/// monetizing a cheaper one right after — and a sidecar-only inflated pin has no
+/// gossip-lottery backstop. When the incoming loses, the retained entry's LRU
+/// recency is left UNTOUCHED (via `peek`), so a flood of low-count nominations
+/// cannot promote the retained pin's lane position.
+///
+/// `incoming_is_newer` distinguishes ordinary enqueue (the incoming arrived
+/// last, so it wins an equal-count tie for freshness) from a cooldown-race
+/// requeue of an older reserved event (the pending successor is newer, so it
+/// wins the tie).
+fn coalesce_first_audit_event(
     pending: &mut LruCache<PeerId, MonetizedPinEvent>,
-    event: MonetizedPinEvent,
+    incoming: MonetizedPinEvent,
+    incoming_is_newer: bool,
 ) -> FirstAuditQueueOutcome {
-    match pending.push(event.peer, event) {
-        None => FirstAuditQueueOutcome::Queued,
-        Some((replaced_peer, _)) if replaced_peer == event.peer => {
-            FirstAuditQueueOutcome::Coalesced
+    if let Some(existing) = pending.peek(&incoming.peer) {
+        let incoming_wins = incoming.key_count > existing.key_count
+            || (incoming.key_count == existing.key_count && incoming_is_newer);
+        if !incoming_wins {
+            // Retain the higher/equal-newer existing pin; do NOT touch its
+            // recency.
+            return FirstAuditQueueOutcome::SuppressedLower;
         }
+        // Same-peer replace: `push` updates the value and bumps MRU. Replacing
+        // an existing key never evicts a different peer.
+        let _ = pending.push(incoming.peer, incoming);
+        return FirstAuditQueueOutcome::Coalesced;
+    }
+    // No same-peer entry: a `push` at capacity evicts the LRU (a DIFFERENT peer).
+    match pending.push(incoming.peer, incoming) {
+        None => FirstAuditQueueOutcome::Queued,
         Some((evicted_peer, evicted)) => FirstAuditQueueOutcome::CapacityEvicted {
             peer: evicted_peer,
             pin: evicted.pin,
@@ -483,9 +515,11 @@ impl FirstAuditScheduler {
     }
 
     /// Admit a monetized nomination into `pending`. Dropped as a duplicate if
-    /// already first-audited; queued unconditionally if it is for the currently
+    /// already first-audited; the window screen is bypassed for the currently
     /// reserved peer (so a successor is retained across the reservation, never
-    /// window-dropped); otherwise window-screened. Newest-per-peer coalescing.
+    /// window-dropped); otherwise window-screened. Coalescing is
+    /// highest-count-per-peer (newest on a tie) — a lower-count successor never
+    /// displaces a higher-count pending pin.
     fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
         if self.first_audited.contains(&event.pin) {
             obs.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -501,11 +535,13 @@ impl FirstAuditScheduler {
             obs.window_deduped.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        match queue_first_audit_event(&mut self.pending, event) {
+        // Ordinary enqueue: the incoming arrived last, so it wins an equal-count
+        // tie.
+        match coalesce_first_audit_event(&mut self.pending, event, true) {
             FirstAuditQueueOutcome::Queued => {
                 obs.queued.fetch_add(1, Ordering::Relaxed);
             }
-            FirstAuditQueueOutcome::Coalesced => {
+            FirstAuditQueueOutcome::Coalesced | FirstAuditQueueOutcome::SuppressedLower => {
                 obs.coalesced.fetch_add(1, Ordering::Relaxed);
             }
             FirstAuditQueueOutcome::CapacityEvicted { .. } => {
@@ -651,19 +687,23 @@ impl FirstAuditScheduler {
             return None; // cancelled; nothing stamped, nothing to roll back
         }
         // Authoritative shared-cooldown check-and-stamp. Losing this race to a
-        // concurrent gossip audit requeues the reserved event rather than
-        // dropping it — BUT only if no same-peer successor is already pending: a
-        // successor necessarily arrived AFTER this reservation, so it is the
-        // newer nomination and must not be overwritten by the older reserved
-        // event (`queue_first_audit_event` would replace it). `contains` does
-        // not disturb LRU recency.
+        // concurrent gossip audit requeues the reserved event through the SAME
+        // security-aware coalescing: the reserved event is OLDER than any
+        // same-peer successor (`incoming_is_newer = false`), so a higher-count
+        // reserved event still wins over a lower-count successor (the inflated
+        // pin must be audited), while an equal/higher successor is preserved.
         if !cooldown_allows_audit(cooldown, &event.peer, mono_now) {
             self.limiter.refund_token();
             obs.cooldown_deferred_attempts
                 .fetch_add(1, Ordering::Relaxed);
             drop(inflight);
-            if !self.pending.contains(&event.peer) {
-                let _ = queue_first_audit_event(&mut self.pending, event);
+            // Count a capacity eviction if the requeue pushed a different peer
+            // out of the full LRU (the ADR promises capacity loss is
+            // observable); the nomination itself was already counted at ingress.
+            if let FirstAuditQueueOutcome::CapacityEvicted { .. } =
+                coalesce_first_audit_event(&mut self.pending, event, false)
+            {
+                obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
             }
             return None;
         }
@@ -5898,9 +5938,9 @@ mod tests {
     use super::*;
     use super::{
         apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
-        audit_failure_revokes_holder_credit, audit_launch_decision, config, cooldown_allows_audit,
-        first_audit_count_jump, first_audit_terminal_outcome, first_failed_key_label,
-        fresh_offer_payment_context, paid_notify_payment_context, queue_first_audit_event,
+        audit_failure_revokes_holder_credit, audit_launch_decision, coalesce_first_audit_event,
+        config, cooldown_allows_audit, first_audit_count_jump, first_audit_terminal_outcome,
+        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
         quote_answerable_through_nominal_jitter, quote_within_audit_window, FirstAuditLimiter,
         FirstAuditObservability, FirstAuditQueueOutcome, FirstAuditScheduler,
         FirstAuditTerminalOutcome, LimiterVerdict, MonetizedPinEvent,
@@ -6029,44 +6069,89 @@ mod tests {
     }
 
     #[test]
-    fn first_audit_queue_exposes_coalescing_and_capacity_eviction() {
+    fn first_audit_coalescing_keeps_highest_count_and_exposes_eviction() {
         let mut pending = LruCache::new(NonZeroUsize::new(1).unwrap());
-        let first = MonetizedPinEvent {
-            peer: test_peer(1),
+        let peer = test_peer(1);
+        let base = MonetizedPinEvent {
+            peer,
             pin: [1; 32],
-            key_count: 1,
+            key_count: 100,
             quote_ts: SystemTime::now(),
         };
-        let replacement = MonetizedPinEvent {
-            pin: [2; 32],
-            ..first
-        };
-        let other_peer = MonetizedPinEvent {
-            peer: test_peer(2),
-            pin: [3; 32],
-            ..first
-        };
 
+        // First insert into an empty slot: Queued.
         assert_eq!(
-            queue_first_audit_event(&mut pending, first),
+            coalesce_first_audit_event(&mut pending, base, true),
             FirstAuditQueueOutcome::Queued
         );
+
+        // A strictly LOWER-count same-peer nomination must NOT displace it.
+        let lower = MonetizedPinEvent {
+            pin: [2; 32],
+            key_count: 50,
+            ..base
+        };
         assert_eq!(
-            queue_first_audit_event(&mut pending, replacement),
+            coalesce_first_audit_event(&mut pending, lower, true),
+            FirstAuditQueueOutcome::SuppressedLower
+        );
+        assert_eq!(
+            pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 100)),
+            "the higher-count pin is retained"
+        );
+
+        // A HIGHER-count same-peer nomination wins (the inflated pin to audit).
+        let higher = MonetizedPinEvent {
+            pin: [3; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, higher, true),
             FirstAuditQueueOutcome::Coalesced
         );
         assert_eq!(
-            queue_first_audit_event(&mut pending, other_peer),
-            FirstAuditQueueOutcome::CapacityEvicted {
-                peer: first.peer,
-                pin: replacement.pin,
-            }
+            pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([3; 32], 400))
+        );
+
+        // EQUAL count: an ordinary (newer) enqueue replaces for freshness...
+        let equal_newer = MonetizedPinEvent {
+            pin: [4; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, equal_newer, true),
+            FirstAuditQueueOutcome::Coalesced
+        );
+        assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
+        // ...but an equal-count OLDER requeue (incoming_is_newer=false) does not.
+        let equal_older = MonetizedPinEvent {
+            pin: [5; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, equal_older, false),
+            FirstAuditQueueOutcome::SuppressedLower
+        );
+        assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
+
+        // A different peer at capacity 1 evicts the LRU (a DIFFERENT peer).
+        let other_peer = MonetizedPinEvent {
+            peer: test_peer(2),
+            pin: [6; 32],
+            key_count: 100,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, other_peer, true),
+            FirstAuditQueueOutcome::CapacityEvicted { peer, pin: [4; 32] }
         );
         assert_eq!(pending.len(), 1);
-        assert_eq!(
-            pending.peek(&other_peer.peer).map(|event| event.pin),
-            Some([3; 32])
-        );
+        assert_eq!(pending.peek(&other_peer.peer).map(|e| e.pin), Some([6; 32]));
     }
 
     // -- ADR-0004 Amendment 2: first-audit launch limiter --------------------
@@ -6450,6 +6535,134 @@ mod tests {
         );
         assert!(scheduler.first_audited.is_empty());
         assert!(scheduler.limiter.recent.peek(&peer).is_none());
+    }
+
+    /// ADR-0004 Amendment 2 (reviewer blocker): a strictly-lower-count same-peer
+    /// nomination arriving while an inflated pin is PENDING must not displace it.
+    /// The inflated pin stays and is the one launched.
+    #[test]
+    fn first_audit_pending_lower_count_does_not_replace_higher() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono);
+        let peer = test_peer(1);
+
+        // Inflated (high-count) sidecar pin lands in pending.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        // A cheaper same-peer settlement arrives right after.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400)),
+            "the inflated pin must not be erased by the cheaper successor"
+        );
+
+        // It reserves and promotes as the inflated pin/count.
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        let (event, _slot) = scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .expect("promotes");
+        assert_eq!((event.pin, event.key_count), ([1; 32], 400));
+    }
+
+    /// ADR-0004 Amendment 2 (reviewer blocker): a RESERVED inflated pin that
+    /// loses the cooldown race must be requeued OVER a lower-count same-peer
+    /// successor that arrived during its jitter, and must remain launchable once
+    /// the shared cooldown expires — the cheaper successor cannot suppress it.
+    #[test]
+    fn first_audit_cooldown_race_requeues_reserved_higher_over_lower_successor() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono);
+        let peer = test_peer(1);
+
+        // Reserve the inflated pin.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+
+        // A cheaper successor arrives during the reservation (bypasses the
+        // window as the reserved peer) and sits in pending.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve: answerability passes but the shared cooldown is already
+        // stamped, so the reservation loses the race and requeues.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(peer, mono);
+        assert!(scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .is_none());
+
+        // The inflated pin (400) replaced the cheaper successor (100).
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400)),
+            "the inflated reserved pin must survive the requeue over the cheaper successor"
+        );
+        assert!(scheduler.first_audited.is_empty());
+        assert!(scheduler.limiter.recent.peek(&peer).is_none());
+
+        // Once the shared cooldown expires, the inflated pin reserves and
+        // promotes with its intended pin/count.
+        let later = mono
+            .checked_add(Duration::from_secs(
+                config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1,
+            ))
+            .expect("later");
+        let cooldown_read_later: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(later, 0, Duration::ZERO, &cooldown_read_later, &obs));
+        let reservation = scheduler.take_due_reservation(later).expect("due");
+        let mut cooldown_later: HashMap<PeerId, Instant> = HashMap::new();
+        let (event, _slot) = scheduler
+            .resolve(
+                reservation,
+                SystemTime::now(),
+                later,
+                &mut cooldown_later,
+                &obs,
+            )
+            .expect("promotes after cooldown");
+        assert_eq!((event.pin, event.key_count), ([1; 32], 400));
     }
 
     /// ADR-0004 Amendment 2 (E'): consecutive PROMOTIONS strictly alternate the
