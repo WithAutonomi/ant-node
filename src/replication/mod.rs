@@ -169,9 +169,14 @@ enum FirstAuditQueueOutcome {
     /// Collapsed with an existing same-peer entry; the incoming won (higher
     /// count, or equal count and newer) and replaced it.
     Coalesced,
-    /// Collapsed with an existing same-peer entry; the incoming LOST (strictly
-    /// lower count) and was dropped, leaving the higher-count pin in place.
+    /// Collapsed with an existing same-peer entry; the incoming LOST because it
+    /// had a STRICTLY LOWER count and was dropped, leaving the higher-count pin
+    /// in place. This is the attempted cheaper-pin self-erasure signal.
     SuppressedLower,
+    /// Collapsed with an existing same-peer entry of EQUAL count; the incoming
+    /// lost the freshness tie (it was not the newer of the two) and the
+    /// existing entry was retained. Benign, not an attack signal.
+    RetainedOnTie,
     /// A DIFFERENT peer's entry was evicted by the bounded LRU to make room.
     CapacityEvicted { peer: PeerId, pin: [u8; 32] },
 }
@@ -197,15 +202,18 @@ fn coalesce_first_audit_event(
     incoming_is_newer: bool,
 ) -> FirstAuditQueueOutcome {
     if let Some(existing) = pending.peek(&incoming.peer) {
-        let incoming_wins = incoming.key_count > existing.key_count
-            || (incoming.key_count == existing.key_count && incoming_is_newer);
-        if !incoming_wins {
-            // Retain the higher/equal-newer existing pin; do NOT touch its
-            // recency.
+        // Strictly lower -> the incoming loses and is dropped WITHOUT touching
+        // the retained pin's recency (the security-relevant self-erasure case).
+        if incoming.key_count < existing.key_count {
             return FirstAuditQueueOutcome::SuppressedLower;
         }
-        // Same-peer replace: `push` updates the value and bumps MRU. Replacing
-        // an existing key never evicts a different peer.
+        // Equal count -> keep the fresher; an older incoming loses a benign tie.
+        if incoming.key_count == existing.key_count && !incoming_is_newer {
+            return FirstAuditQueueOutcome::RetainedOnTie;
+        }
+        // Strictly higher, or equal-and-newer: the incoming wins. `push` updates
+        // the value and bumps MRU; replacing an existing key never evicts a
+        // different peer.
         let _ = pending.push(incoming.peer, incoming);
         return FirstAuditQueueOutcome::Coalesced;
     }
@@ -545,7 +553,7 @@ impl FirstAuditScheduler {
             FirstAuditQueueOutcome::Queued => {
                 obs.queued.fetch_add(1, Ordering::Relaxed);
             }
-            FirstAuditQueueOutcome::Coalesced => {
+            FirstAuditQueueOutcome::Coalesced | FirstAuditQueueOutcome::RetainedOnTie => {
                 obs.coalesced.fetch_add(1, Ordering::Relaxed);
             }
             FirstAuditQueueOutcome::SuppressedLower => {
@@ -715,7 +723,9 @@ impl FirstAuditScheduler {
                 FirstAuditQueueOutcome::SuppressedLower => {
                     obs.suppressed_lower.fetch_add(1, Ordering::Relaxed);
                 }
-                FirstAuditQueueOutcome::Queued | FirstAuditQueueOutcome::Coalesced => {}
+                FirstAuditQueueOutcome::Queued
+                | FirstAuditQueueOutcome::Coalesced
+                | FirstAuditQueueOutcome::RetainedOnTie => {}
             }
             return None;
         }
@@ -6148,7 +6158,7 @@ mod tests {
         };
         assert_eq!(
             coalesce_first_audit_event(&mut pending, equal_older, false),
-            FirstAuditQueueOutcome::SuppressedLower
+            FirstAuditQueueOutcome::RetainedOnTie
         );
         assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
 
@@ -6720,6 +6730,12 @@ mod tests {
             scheduler.pending.peek(&peer).map(|e| (e.pin, e.key_count)),
             Some(([1; 32], 400)),
             "the inflated pin must not be erased by the cheaper successor"
+        );
+        // The dropped cheaper nomination is counted through the enqueue path.
+        assert_eq!(
+            obs.suppressed_lower.load(Ordering::Relaxed),
+            1,
+            "the attempted cheaper-pin self-erasure is observable"
         );
 
         // It reserves and promotes as the inflated pin/count.
