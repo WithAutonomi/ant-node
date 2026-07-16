@@ -128,36 +128,38 @@ impl VerificationEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Fetch queue candidate
+// Fetch queue
 // ---------------------------------------------------------------------------
 
-/// A candidate queued for fetch, ordered by relevance (nearest-first).
+/// Heap-ordering key for the fetch queue, ordered by relevance
+/// (nearest-first).
+///
+/// Carries **only** the two fields the ordering reads, and both are fixed for
+/// as long as a key stays queued. The mutable half of a queued fetch lives in
+/// [`FetchPayload`], outside the heap, so that merging a newly-discovered
+/// source into an already-queued key cannot disturb heap order — and therefore
+/// needs no heap rebuild.
 ///
 /// Implements [`Ord`] with *reversed* distance comparison so that a
 /// [`BinaryHeap`](std::collections::BinaryHeap) (max-heap) dequeues the
 /// nearest key first.
-#[derive(Debug, Clone)]
-pub struct FetchCandidate {
+#[derive(Debug, Clone, Copy)]
+pub struct FetchOrder {
     /// The key to fetch.
     pub key: XorName,
     /// XOR distance from self to key (for priority ordering).
     pub distance: XorName,
-    /// Verified source peers that responded `Present`.
-    pub sources: Vec<PeerId>,
-    /// Pending-verification entry to restore if every fetch source is
-    /// exhausted before the chunk is recovered.
-    pub retry_verification: Option<VerificationEntry>,
 }
 
-impl Eq for FetchCandidate {}
+impl Eq for FetchOrder {}
 
-impl PartialEq for FetchCandidate {
+impl PartialEq for FetchOrder {
     fn eq(&self, other: &Self) -> bool {
         self.distance == other.distance && self.key == other.key
     }
 }
 
-impl Ord for FetchCandidate {
+impl Ord for FetchOrder {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering: smaller distance = higher priority (BinaryHeap is
         // max-heap).  Tie-break on key for consistency with PartialEq.
@@ -168,10 +170,40 @@ impl Ord for FetchCandidate {
     }
 }
 
-impl PartialOrd for FetchCandidate {
+impl PartialOrd for FetchOrder {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// The mutable half of a queued fetch, held outside the priority heap.
+///
+/// Neither field participates in [`FetchOrder`]'s ordering, and both are read
+/// only once the key is dequeued. Holding them in a key-indexed map is what
+/// lets a further source be merged into an already-queued key in O(1) instead
+/// of costing a full rebuild of the fetch heap.
+#[derive(Debug, Clone)]
+pub struct FetchPayload {
+    /// Verified source peers that responded `Present`.
+    pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
+}
+
+/// A candidate dequeued for fetch: a [`FetchOrder`] rejoined with its
+/// [`FetchPayload`].
+#[derive(Debug, Clone)]
+pub struct FetchCandidate {
+    /// The key to fetch.
+    pub key: XorName,
+    /// XOR distance from self to key.
+    pub distance: XorName,
+    /// Verified source peers that responded `Present`.
+    pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -778,8 +810,6 @@ impl Default for BootstrapState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BinaryHeap;
-
     use super::*;
 
     /// Helper: build a `PeerId` from a single byte (zero-padded to 32 bytes).
@@ -797,37 +827,33 @@ mod tests {
         (hinted_at, now)
     }
 
-    // -- FetchCandidate ordering -------------------------------------------
+    // -- FetchOrder ordering -----------------------------------------------
 
     #[test]
-    fn fetch_candidate_nearest_key_has_highest_priority() {
-        let near = FetchCandidate {
+    fn fetch_order_nearest_key_has_highest_priority() {
+        let near = FetchOrder {
             key: [1u8; 32],
             distance: [
                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ],
-            sources: vec![peer_id_from_byte(1)],
-            retry_verification: None,
         };
 
-        let far = FetchCandidate {
+        let far = FetchOrder {
             key: [2u8; 32],
             distance: [
                 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0,
             ],
-            sources: vec![peer_id_from_byte(2)],
-            retry_verification: None,
         };
 
         // In a max-heap the "greatest" element pops first.
         // Our reversed Ord makes smaller-distance candidates greater.
         assert!(near > far, "nearer candidate should compare greater");
 
-        let mut heap = BinaryHeap::new();
-        heap.push(far.clone());
-        heap.push(near.clone());
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(far);
+        heap.push(near);
 
         assert_eq!(heap.len(), 2, "heap should contain both candidates");
 
@@ -849,19 +875,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_candidate_same_distance_and_key_is_equal() {
-        let a = FetchCandidate {
+    fn fetch_order_same_distance_and_key_is_equal() {
+        let a = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
-            retry_verification: None,
         };
 
-        let b = FetchCandidate {
+        let b = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
-            retry_verification: None,
         };
 
         assert_eq!(
@@ -873,19 +895,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_candidate_same_distance_different_key_is_deterministic() {
-        let a = FetchCandidate {
+    fn fetch_order_same_distance_different_key_is_deterministic() {
+        let a = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
-            retry_verification: None,
         };
 
-        let b = FetchCandidate {
+        let b = FetchOrder {
             key: [2u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
-            retry_verification: None,
         };
 
         assert_ne!(
