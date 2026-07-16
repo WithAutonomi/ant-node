@@ -898,6 +898,14 @@ impl ReplicationEngine {
                         SHUTDOWN_TASK_DRAIN_TIMEOUT.as_secs()
                     );
                     handle.abort();
+                    // `abort` only requests cancellation. Await the handle so
+                    // synchronous sections finish and the task drops every
+                    // storage/P2P clone before we claim producer quiescence.
+                    match handle.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => warn!("Replication task {i} panicked after abort: {e}"),
+                    }
                 }
             }
         }
@@ -4495,7 +4503,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         queues,
         is_bootstrapping,
         bootstrap_complete_notify,
-        config::CAPACITY_REJECTED_MAX_AGE,
+        config.capacity_rejected_max_age(),
     )
     .await;
 
@@ -6629,7 +6637,7 @@ mod tests {
             &queues,
             &is_bootstrapping,
             &bootstrap_complete_notify,
-            config::CAPACITY_REJECTED_MAX_AGE,
+            ReplicationConfig::default().capacity_rejected_max_age(),
         )
         .await;
         assert!(!bootstrap_state.read().await.is_drained());

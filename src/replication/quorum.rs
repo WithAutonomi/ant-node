@@ -15,8 +15,8 @@ use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
-    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, PAID_LIST_CLOSE_GROUP_SIZE,
-    PAID_LIST_FLEX_EDGE_COUNT, REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, PAID_LIST_FLEX_EDGE_COUNT,
+    REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
@@ -300,7 +300,13 @@ pub fn evaluate_key_evidence_with_holder_check(
     let present_peers = collect_present_sources(evidence, quorum_peers, paid_peers);
 
     let quorum_needed = config.quorum_needed(quorum_peers.len());
-    let paid_votes = summarize_paid_list_votes(key, evidence, targets, paid_peers);
+    let paid_votes = summarize_paid_list_votes(
+        key,
+        evidence,
+        targets,
+        paid_peers,
+        config.paid_list_close_group_size,
+    );
     let confirm_needed = ReplicationConfig::confirm_needed(paid_votes.effective_group_size);
 
     // Step 10: Presence quorum reached.
@@ -341,13 +347,16 @@ fn summarize_paid_list_votes(
     evidence: &KeyVerificationEvidence,
     targets: &VerificationTargets,
     paid_peers: &[PeerId],
+    configured_group_size: usize,
 ) -> PaidListVoteSummary {
     let paid_group_size = targets
         .paid_group_sizes
         .get(key)
         .copied()
         .unwrap_or(paid_peers.len());
-    let paid_edge_count = if paid_group_size >= PAID_LIST_CLOSE_GROUP_SIZE {
+    let paid_edge_count = if paid_group_size >= configured_group_size
+        && configured_group_size > PAID_LIST_FLEX_EDGE_COUNT
+    {
         PAID_LIST_FLEX_EDGE_COUNT.min(paid_group_size)
     } else {
         0
@@ -1360,6 +1369,53 @@ mod tests {
         assert!(
             matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
             "{PAID_LIST_FULL_MAJORITY}/{PAID_LIST_CLOSE_GROUP_SIZE} paid confirmations should authorize when all edge peers are positive, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_edge_flex_waits_for_configured_full_width() {
+        let key = xor_name_from_byte(0x66);
+        let config = ReplicationConfig {
+            paid_list_close_group_size: 24,
+            ..ReplicationConfig::default()
+        };
+        let paid_peers: Vec<PeerId> = (1..=PAID_LIST_CLOSE_GROUP_SIZE)
+            .map(peer_id_from_usize)
+            .collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+        let evidence = build_evidence(
+            vec![],
+            paid_vote_evidence(&paid_peers, &(0..9).collect::<Vec<_>>()),
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::QuorumFailed),
+            "an undersized 20/24 group must use strict majority, got {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn paid_list_edge_flex_activates_at_configured_non_default_width() {
+        const CONFIGURED_WIDTH: usize = 16;
+        const INNER_MAJORITY: usize = 7; // majority of the 12-peer stable core
+
+        let key = xor_name_from_byte(0x67);
+        let config = ReplicationConfig {
+            paid_list_close_group_size: CONFIGURED_WIDTH,
+            ..ReplicationConfig::default()
+        };
+        let paid_peers: Vec<PeerId> = (1..=CONFIGURED_WIDTH).map(peer_id_from_usize).collect();
+        let targets = single_key_targets(&key, vec![], paid_peers.clone());
+        let evidence = build_evidence(
+            vec![],
+            paid_vote_evidence(&paid_peers, &(0..INNER_MAJORITY).collect::<Vec<_>>()),
+        );
+
+        let outcome = evaluate_key_evidence(&key, &evidence, &targets, &config);
+        assert!(
+            matches!(outcome, KeyVerificationOutcome::PaidListVerified { .. }),
+            "a full configured 16-peer group should flex its four edge voters, got {outcome:?}"
         );
     }
 

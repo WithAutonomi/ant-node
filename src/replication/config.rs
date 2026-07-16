@@ -415,21 +415,6 @@ const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
 /// Maximum age for pending-verification entries before stale eviction.
 pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
 
-/// Maximum age for a source's outstanding capacity-rejection record before
-/// the bootstrap drain check stops waiting for its re-delivery.
-///
-/// A live source re-hints on every neighbor-sync cycle, so one that has been
-/// silent for three full cycles at the slowest cadence — plus one minimum
-/// interval of slack — has abandoned re-delivery, or departed in a race with
-/// its own `PeerRemoved` cleanup and left a record no future event can clear.
-/// Expiry forfeits the keys that source still owed; the post-bootstrap
-/// neighbor-sync and audit/repair pipeline recover them.
-const CAPACITY_REJECTED_MAX_AGE_SECS: u64 =
-    3 * NEIGHBOR_SYNC_INTERVAL_MAX_SECS + NEIGHBOR_SYNC_INTERVAL_MIN_SECS;
-/// Maximum age for a source's outstanding capacity-rejection record before
-/// the bootstrap drain check stops waiting for its re-delivery.
-pub const CAPACITY_REJECTED_MAX_AGE: Duration = Duration::from_secs(CAPACITY_REJECTED_MAX_AGE_SECS);
-
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
@@ -671,6 +656,30 @@ impl ReplicationConfig {
             self.neighbor_sync_interval_min,
             self.neighbor_sync_interval_max,
         )
+    }
+
+    /// Maximum age of an outstanding bootstrap capacity-rejection record.
+    ///
+    /// A source is revisited only after the round-robin loop has advanced
+    /// through every neighbor batch. Size the window from that full configured
+    /// cycle (including one request deadline per peer), the peer cooldown, and
+    /// one slow-cadence interval of slack. This prevents a live source near the
+    /// end of a 20-peer cycle from being expired before it can legitimately
+    /// re-deliver its rejected hints.
+    #[must_use]
+    pub fn capacity_rejected_max_age(&self) -> Duration {
+        let batch_size = self.neighbor_sync_peer_count.max(1);
+        let batch_count = self.neighbor_sync_scope.saturating_add(batch_size - 1) / batch_size;
+        let batch_count = u32::try_from(batch_count).unwrap_or(u32::MAX);
+        let peer_count = u32::try_from(self.neighbor_sync_scope).unwrap_or(u32::MAX);
+        let full_cycle = self
+            .neighbor_sync_interval_max
+            .saturating_mul(batch_count)
+            .saturating_add(self.verification_request_timeout.saturating_mul(peer_count));
+
+        full_cycle
+            .max(self.neighbor_sync_cooldown)
+            .saturating_add(self.neighbor_sync_interval_max)
     }
 
     /// Compute the number of keys to sample for an audit round, scaled
@@ -1030,6 +1039,38 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn capacity_rejection_expiry_covers_full_configured_sync_cycle() {
+        let config = ReplicationConfig::default();
+        let batches = config.neighbor_sync_scope / config.neighbor_sync_peer_count;
+        let cycle_cadence = config.neighbor_sync_interval_max * u32::try_from(batches).unwrap();
+        let request_budget = config.verification_request_timeout
+            * u32::try_from(config.neighbor_sync_scope).unwrap();
+        let full_cycle = cycle_cadence + request_budget;
+
+        assert_eq!(
+            config.capacity_rejected_max_age(),
+            full_cycle + config.neighbor_sync_interval_max,
+        );
+        assert!(config.capacity_rejected_max_age() > Duration::from_secs(70 * 60));
+    }
+
+    #[test]
+    fn capacity_rejection_expiry_tracks_runtime_sync_configuration() {
+        let config = ReplicationConfig {
+            neighbor_sync_scope: 9,
+            neighbor_sync_peer_count: 2,
+            neighbor_sync_interval_max: Duration::from_secs(10),
+            neighbor_sync_cooldown: Duration::from_secs(100),
+            verification_request_timeout: Duration::from_secs(1),
+            ..ReplicationConfig::default()
+        };
+
+        // Five batches take 50s and their nine request budgets take 9s, so
+        // the 100s cooldown dominates; one 10s cadence interval is slack.
+        assert_eq!(config.capacity_rejected_max_age(), Duration::from_secs(110));
     }
 
     #[test]
