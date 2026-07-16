@@ -4480,6 +4480,19 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         recent_provers,
     } = ctx;
 
+    // Self-heal the bootstrap drain before any early-return below: abandoned
+    // capacity-rejection records must expire, and a drain condition that
+    // became true without a triggering event must still be observed. Pending
+    // peer requests legitimately block the drain check itself, but not this.
+    expire_and_recheck_bootstrap_drain(
+        bootstrap_state,
+        queues,
+        is_bootstrapping,
+        bootstrap_complete_notify,
+        config::CAPACITY_REJECTED_MAX_AGE,
+    )
+    .await;
+
     // Bootstrap admits one concurrent neighbor batch as an atomic source
     // aggregation unit. Do not select newly queued keys until that batch's
     // hints and drain accounting have both been published.
@@ -4969,6 +4982,34 @@ async fn update_bootstrap_after_peer_removed(
     if orphaned_keys.is_empty() && !cleared_rejection {
         return;
     }
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
+    }
+}
+
+/// Periodic bootstrap-drain self-healing, run on every verification worker
+/// tick until bootstrap drains.
+///
+/// Two liveness gaps make this necessary. A `PeerRemoved` that races the
+/// recording of a capacity rejection leaves an entry no future event can
+/// clear — `max_age` expiry is its only exit. And a clean-cycle
+/// `clear_capacity_rejected` never triggers its own drain re-check, so on a
+/// quiet node the drain condition can become true with nothing left to
+/// observe it. Expiry must run even while `pending_peer_requests` blocks the
+/// drain itself, so this is invoked before `run_verification_cycle`'s
+/// early-returns.
+async fn expire_and_recheck_bootstrap_drain(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+    max_age: Duration,
+) {
+    if bootstrap_state.read().await.is_drained() {
+        return;
+    }
+    bootstrap::expire_capacity_rejected(bootstrap_state, max_age).await;
     let q = queues.read().await;
     if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
         complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
@@ -6453,6 +6494,47 @@ mod tests {
         assert!(state.pending_keys.is_empty());
         assert!(state.is_drained());
         drop(state);
+        assert!(!*is_bootstrapping.read().await);
+    }
+
+    /// The verification-worker tick's self-heal path: a capacity rejection
+    /// recorded after the peer's `PeerRemoved` cleanup (the TOCTOU orphan)
+    /// blocks drain until the TTL expires it, at which point the same tick
+    /// completes bootstrap without any external event.
+    #[tokio::test]
+    async fn drain_self_heal_expires_orphaned_rejection_and_completes_bootstrap() {
+        let peer = test_peer(0xA6);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
+        let is_bootstrapping = Arc::new(RwLock::new(true));
+        let bootstrap_complete_notify = Arc::new(Notify::new());
+
+        // PeerRemoved was fully processed before the rejection landed, so no
+        // future event will ever clear this entry.
+        super::bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
+
+        // Within the TTL the tick keeps waiting for re-delivery.
+        expire_and_recheck_bootstrap_drain(
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+            config::CAPACITY_REJECTED_MAX_AGE,
+        )
+        .await;
+        assert!(!bootstrap_state.read().await.is_drained());
+        assert!(*is_bootstrapping.read().await);
+
+        // Past the TTL the tick expires the orphan and completes bootstrap.
+        expire_and_recheck_bootstrap_drain(
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(bootstrap_state.read().await.is_drained());
         assert!(!*is_bootstrapping.read().await);
     }
 
