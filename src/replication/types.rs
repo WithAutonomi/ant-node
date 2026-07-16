@@ -753,16 +753,29 @@ pub struct BootstrapState {
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
     /// Peers whose last bootstrap admission cycle had one or more hints
-    /// silently dropped at the `pending_verify` capacity bounds. Each entry
-    /// represents "this source still owes us at least one re-hinted key
-    /// after the queues drain". `check_bootstrap_drained` refuses to claim
-    /// the node fully drained while this set is non-empty: a source's
-    /// presence is cleared by its next admission cycle that completes with
-    /// zero capacity rejections (i.e. the source successfully re-delivered
-    /// everything that previously overflowed). Tracking per-source instead
-    /// of a global counter prevents one peer's rejection from being
-    /// "cleared" by an unrelated peer's clean cycle.
-    pub capacity_rejected_sources: HashSet<PeerId>,
+    /// silently dropped at the `pending_verify` capacity bounds, mapped to
+    /// the most recent rejection time. Each entry represents "this source
+    /// still owes us at least one re-hinted key after the queues drain".
+    /// `check_bootstrap_drained` refuses to claim the node fully drained
+    /// while this map is non-empty: a source's presence is cleared by its
+    /// next admission cycle that completes with zero capacity rejections
+    /// (i.e. the source successfully re-delivered everything that
+    /// previously overflowed). Tracking per-source instead of a global
+    /// counter prevents one peer's rejection from being "cleared" by an
+    /// unrelated peer's clean cycle.
+    ///
+    /// Entries also expire once their rejection time is older than
+    /// `CAPACITY_REJECTED_MAX_AGE` (see
+    /// `super::bootstrap::expire_capacity_rejected`): the source either
+    /// abandoned re-delivery, or its `PeerRemoved` cleanup raced the
+    /// recording of the rejection and left an entry no future event can
+    /// clear. Expiring an entry means bootstrap may drain without ever
+    /// admitting keys the departed source advertised. This is acceptable
+    /// and consistent with `update_bootstrap_after_peer_removed`, which
+    /// already forfeits a departed source's owed work wholesale —
+    /// post-bootstrap periodic neighbor sync and the audit/repair pipeline
+    /// are the recovery path for missed keys.
+    pub capacity_rejected_sources: HashMap<PeerId, Instant>,
 }
 
 impl BootstrapState {
@@ -773,7 +786,7 @@ impl BootstrapState {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
         }
     }
 

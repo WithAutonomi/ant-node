@@ -415,6 +415,21 @@ const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
 /// Maximum age for pending-verification entries before stale eviction.
 pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
 
+/// Maximum age for a source's outstanding capacity-rejection record before
+/// the bootstrap drain check stops waiting for its re-delivery.
+///
+/// A live source re-hints on every neighbor-sync cycle, so one that has been
+/// silent for three full cycles at the slowest cadence — plus one minimum
+/// interval of slack — has abandoned re-delivery, or departed in a race with
+/// its own `PeerRemoved` cleanup and left a record no future event can clear.
+/// Expiry forfeits the keys that source still owed; the post-bootstrap
+/// neighbor-sync and audit/repair pipeline recover them.
+const CAPACITY_REJECTED_MAX_AGE_SECS: u64 =
+    3 * NEIGHBOR_SYNC_INTERVAL_MAX_SECS + NEIGHBOR_SYNC_INTERVAL_MIN_SECS;
+/// Maximum age for a source's outstanding capacity-rejection record before
+/// the bootstrap drain check stops waiting for its re-delivery.
+pub const CAPACITY_REJECTED_MAX_AGE: Duration = Duration::from_secs(CAPACITY_REJECTED_MAX_AGE_SECS);
+
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 

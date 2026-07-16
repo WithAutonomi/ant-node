@@ -10,10 +10,11 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ant_node::replication::bootstrap::{
-    check_bootstrap_drained, clear_capacity_rejected, note_capacity_rejected, track_discovered_keys,
+    check_bootstrap_drained, clear_capacity_rejected, expire_capacity_rejected,
+    note_capacity_rejected, track_discovered_keys,
 };
 use ant_node::replication::scheduling::ReplicationQueues;
 use ant_node::replication::types::{BootstrapState, VerificationEntry, VerificationState};
@@ -69,6 +70,50 @@ async fn peer_removal_retires_rejection_and_orphaned_hint_then_drains() {
     let queues = queues.read().await;
     assert!(check_bootstrap_drained(&bootstrap_state, &queues).await);
     assert_eq!(orphaned, vec![key]);
+}
+
+/// The `PeerRemoved` race: the removal handler runs on the DHT event loop,
+/// the rejection recording on a sync task, with await points between the last
+/// "peer is live" observation and the insert. If removal cleanup completes
+/// inside that window, its `clear_capacity_rejected` is a no-op and the
+/// subsequent `note_capacity_rejected` records an entry that no later
+/// admission cycle or removal event can clear — permanently blocking drain.
+/// TTL expiry (driven from the verification worker tick) is the recovery
+/// path.
+#[tokio::test]
+async fn rejection_recorded_after_peer_removal_expires_instead_of_stalling() {
+    let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
+    let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+    let departed = peer(0xCC);
+
+    // Removal cleanup runs FIRST: nothing is recorded yet, so both halves
+    // are no-ops.
+    assert!(queues
+        .write()
+        .await
+        .remove_hint_source(&departed)
+        .is_empty());
+    assert!(!clear_capacity_rejected(&bootstrap_state, &departed).await);
+
+    // The racing admission cycle then records the rejection for the
+    // now-departed peer. The peer will never re-deliver and will never be
+    // removed again, so drain is blocked with no event left to unblock it.
+    note_capacity_rejected(&bootstrap_state, departed).await;
+    {
+        let queues = queues.read().await;
+        assert!(
+            !check_bootstrap_drained(&bootstrap_state, &queues).await,
+            "orphaned rejection must block drain until it expires"
+        );
+    }
+
+    // TTL expiry retires the orphaned record and drain completes.
+    assert_eq!(
+        expire_capacity_rejected(&bootstrap_state, Duration::ZERO).await,
+        1
+    );
+    let queues = queues.read().await;
+    assert!(check_bootstrap_drained(&bootstrap_state, &queues).await);
 }
 
 #[tokio::test]
