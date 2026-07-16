@@ -78,18 +78,19 @@ async fn send_replication_request(
     ReplicationMessage::decode(&response.data).expect("decode replication response")
 }
 
-/// Find a key whose storage-admission group either excludes (`want_responsible
-/// = false`) or includes (`true`) the target, from the target's own DHT view.
-async fn find_key_for_target(
+/// Find a key whose `width`-wide storage-admission group either excludes
+/// (`want_responsible = false`) or includes (`true`) the target, from the
+/// target's own DHT view. Shared with the fetch-recheck driver.
+pub async fn find_key_for_target(
     harness: &TestHarness,
     target_idx: usize,
+    width: usize,
     want_responsible: bool,
     label: &str,
 ) -> (Vec<u8>, [u8; 32]) {
     let target = harness.test_node(target_idx).expect("target node");
     let target_p2p = target.p2p_node.as_ref().expect("target p2p");
     let target_peer = *target_p2p.peer_id();
-    let width = storage_admission_width(GATE_CLOSE_GROUP_SIZE);
 
     for attempt in 0..HOLDER_SEARCH_LIMIT {
         let content = format!("gate-{label}-{attempt}").into_bytes();
@@ -222,12 +223,26 @@ async fn replica_hint_storage_gate_observed_on_live_network() {
 
     // -- Scenario A (the attack): target is NOT in the storage-admission
     //    group for this key, but a replica hint advertises it anyway.
-    let (content_out, key_out) = find_key_for_target(&harness, TARGET_INDEX, false, "out").await;
+    let (content_out, key_out) = find_key_for_target(
+        &harness,
+        TARGET_INDEX,
+        storage_admission_width(GATE_CLOSE_GROUP_SIZE),
+        false,
+        "out",
+    )
+    .await;
     let stored_out = drive_replica_hint(&harness, &content_out, key_out).await;
 
     // -- Scenario B (positive control): target IS in the storage-admission
     //    group. Legitimate replica repair must still happen.
-    let (content_in, key_in) = find_key_for_target(&harness, TARGET_INDEX, true, "in").await;
+    let (content_in, key_in) = find_key_for_target(
+        &harness,
+        TARGET_INDEX,
+        storage_admission_width(GATE_CLOSE_GROUP_SIZE),
+        true,
+        "in",
+    )
+    .await;
     let stored_in = drive_replica_hint(&harness, &content_in, key_in).await;
 
     println!("GATE-RESULT out_of_range_stored={stored_out} in_range_stored={stored_in}");
@@ -280,7 +295,14 @@ async fn far_key_rejected_under_either_label() {
     // A key the target is not responsible for and not in the (narrowed) paid
     // group for. Deliberately NOT seeded into the paid list: nothing should
     // make this key relevant.
-    let (content, address) = find_key_for_target(&harness, TARGET_INDEX, false, "far").await;
+    let (content, address) = find_key_for_target(
+        &harness,
+        TARGET_INDEX,
+        storage_admission_width(GATE_CLOSE_GROUP_SIZE),
+        false,
+        "far",
+    )
+    .await;
     for idx in 0..harness.node_count() {
         if idx == TARGET_INDEX {
             continue;

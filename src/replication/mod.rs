@@ -777,6 +777,32 @@ impl ReplicationEngine {
         .await;
     }
 
+    /// Test-only: place `key` directly into the fetch queue as though a
+    /// verification cycle had just promoted it, with `sources` as its
+    /// verified holders. Returns whether the key was enqueued.
+    ///
+    /// Bypasses admission, verification, and the promotion-time
+    /// responsibility pre-filter, modelling a promotion decision that has
+    /// since gone stale (topology churn between promotion and download).
+    /// The only guard left standing is the per-attempt recheck inside
+    /// `execute_single_fetch` — exactly the gate e2e tests use this seam to
+    /// exercise.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn enqueue_fetch_for_test(&self, key: XorName, sources: Vec<PeerId>) -> bool {
+        let distance = crate::client::xor_distance(&key, self.p2p_node.peer_id().as_bytes());
+        self.queues
+            .write()
+            .await
+            .enqueue_fetch(key, distance, sources)
+    }
+
+    /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
+    /// (pending verification, fetch queue, or in-flight fetch).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn fetch_pipeline_contains_for_test(&self, key: &XorName) -> bool {
+        self.queues.read().await.contains_key(key)
+    }
+
     /// Start all background tasks.
     ///
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
@@ -2107,52 +2133,48 @@ impl ReplicationEngine {
                     Some((key, maybe_outcome)) = in_flight.next() => {
                         let mut q = queues.write().await;
                         let terminal = if let Some(outcome) = maybe_outcome {
-                            match outcome.result {
-                                FetchResult::Stored => {
-                                    q.complete_fetch(&key);
-                                    true
-                                }
-                                FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
-                                    if let Some(next_peer) = q.retry_fetch(&key) {
-                                        // Spawn a new fetch task for the next source.
-                                        let p2p = Arc::clone(&p2p);
-                                        let storage = Arc::clone(&storage);
-                                        let config = Arc::clone(&config);
-                                        let token = shutdown.clone();
-                                        let tracker = detached_task_tracker.clone();
-                                        let fetch_key = key;
-                                        in_flight.push(Box::pin(async move {
-                                            // Tracked for the same reason as the
-                                            // initial fetch spawn above.
-                                            let handle = tracker.spawn(async move {
-                                                tokio::select! {
-                                                    () = token.cancelled() => FetchOutcome {
-                                                        key: fetch_key,
-                                                        result: FetchResult::SourceFailed,
-                                                    },
-                                                    outcome = execute_single_fetch(
-                                                        p2p, storage, config, fetch_key, next_peer,
-                                                    ) => outcome,
-                                                }
-                                            });
-                                            match handle.await {
-                                                Ok(outcome) => (outcome.key, Some(outcome)),
-                                                Err(e) => {
-                                                    error!(
-                                                        "Fetch task for {} panicked: {e}",
-                                                        hex::encode(fetch_key)
-                                                    );
-                                                    (fetch_key, None)
-                                                }
+                            match apply_fetch_result(
+                                &mut q,
+                                &key,
+                                &outcome.result,
+                                config.verification_request_timeout,
+                            ) {
+                                FetchFollowUp::Terminal => true,
+                                FetchFollowUp::RequeuedForVerification => false,
+                                FetchFollowUp::RetryFrom(next_peer) => {
+                                    // Spawn a new fetch task for the next source.
+                                    let p2p = Arc::clone(&p2p);
+                                    let storage = Arc::clone(&storage);
+                                    let config = Arc::clone(&config);
+                                    let token = shutdown.clone();
+                                    let tracker = detached_task_tracker.clone();
+                                    let fetch_key = key;
+                                    in_flight.push(Box::pin(async move {
+                                        // Tracked for the same reason as the
+                                        // initial fetch spawn above.
+                                        let handle = tracker.spawn(async move {
+                                            tokio::select! {
+                                                () = token.cancelled() => FetchOutcome {
+                                                    key: fetch_key,
+                                                    result: FetchResult::SourceFailed,
+                                                },
+                                                outcome = execute_single_fetch(
+                                                    p2p, storage, config, fetch_key, next_peer,
+                                                ) => outcome,
                                             }
-                                        }));
-                                        false
-                                    } else {
-                                        !q.requeue_fetch_for_verification(
-                                            &key,
-                                            config.verification_request_timeout,
-                                        )
-                                    }
+                                        });
+                                        match handle.await {
+                                            Ok(outcome) => (outcome.key, Some(outcome)),
+                                            Err(e) => {
+                                                error!(
+                                                    "Fetch task for {} panicked: {e}",
+                                                    hex::encode(fetch_key)
+                                                );
+                                                (fetch_key, None)
+                                            }
+                                        }
+                                    }));
+                                    false
                                 }
                             }
                         } else {
@@ -4554,14 +4576,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         for key in local_paid_keys {
             if storage.exists(&key).unwrap_or(false) {
                 terminal_paid.push(key);
-            } else if admission::is_responsible(
-                &self_id,
-                &key,
-                p2p_node,
-                storage_admission_width(config.close_group_size),
-            )
-            .await
-            {
+            } else if is_storage_admitted(&self_id, &key, p2p_node, config).await {
                 // We carry storage responsibility and lack the bytes. The
                 // presence probe below discovers holders to fetch from; it is
                 // source discovery, not re-verification.
@@ -4758,9 +4773,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
         // Verification established validity; the paid-list insert above records
         // it. Downloading the bytes is a separate duty, owed only by the
-        // storage-admission group. Decide it here for every verified key on the
-        // same terms — the advertising peer's replica/paid labelling is a claim
-        // about itself and carries no authority over what we store.
+        // storage-admission group, asked on the same terms for every verified
+        // key — the advertising peer's replica/paid labelling is a claim about
+        // itself and carries no authority over what we store. This check is a
+        // cheap pre-filter that keeps never-responsible keys out of the fetch
+        // queue entirely; the authoritative gate is the per-attempt recheck in
+        // `execute_single_fetch`, because a key can wait in the nearest-first
+        // fetch queue long enough for this promotion-time answer to go stale.
         let mut fetch_allowed_keys: HashSet<XorName> = HashSet::new();
         for (key, outcome) in &evaluated {
             if matches!(
@@ -4768,13 +4787,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 KeyVerificationOutcome::QuorumVerified { .. }
                     | KeyVerificationOutcome::PaidListVerified { .. }
             ) && !storage.exists(key).unwrap_or(false)
-                && admission::is_responsible(
-                    &self_id,
-                    key,
-                    p2p_node,
-                    storage_admission_width(config.close_group_size),
-                )
-                .await
+                && is_storage_admitted(&self_id, key, p2p_node, config).await
             {
                 fetch_allowed_keys.insert(*key);
             }
@@ -5022,6 +5035,11 @@ enum FetchResult {
     IntegrityFailed,
     /// Source failed (network error or non-success response) — retryable.
     SourceFailed,
+    /// Live routing state no longer places this node in the storage-admission
+    /// group for the key — terminal, exactly like [`Self::Stored`]. The duty
+    /// the fetch was serving has lapsed, so no alternate source is tried and
+    /// no trust event is reported: the source did nothing wrong.
+    NoLongerResponsible,
 }
 
 /// Outcome produced by [`execute_single_fetch`] and consumed by the fetch
@@ -5031,12 +5049,91 @@ struct FetchOutcome {
     result: FetchResult,
 }
 
+/// What the fetch worker must do next for a key whose fetch attempt resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFollowUp {
+    /// The key terminally left the fetch pipeline (its in-flight entry is
+    /// removed and any verification retry-slot reservation released); the
+    /// caller must run bootstrap accounting for it.
+    Terminal,
+    /// The key returned to `pending_verify` for a later verification round.
+    RequeuedForVerification,
+    /// Retry immediately from this next untried verified source.
+    RetryFrom(PeerId),
+}
+
+/// Apply a resolved [`FetchResult`] to the queues and report the follow-up.
+///
+/// Split out of the fetch-worker loop so the per-variant queue transitions
+/// are unit-testable without a live network. The caller holds the queues
+/// write lock. [`FetchResult::NoLongerResponsible`] deliberately shares
+/// [`FetchResult::Stored`]'s terminal path: `complete_fetch` releases the
+/// retry-slot reservation, and the caller's terminal handling shrinks the
+/// bootstrap pending set — dropping the key without that accounting would
+/// stall bootstrap drain forever.
+///
+/// The nursery `option_if_let_else` rewrite is impossible here: both
+/// `map_or_else` closures would need `&mut *q` simultaneously.
+#[allow(clippy::option_if_let_else)]
+fn apply_fetch_result(
+    q: &mut ReplicationQueues,
+    key: &XorName,
+    result: &FetchResult,
+    verification_retry_after: Duration,
+) -> FetchFollowUp {
+    match result {
+        FetchResult::Stored | FetchResult::NoLongerResponsible => {
+            q.complete_fetch(key);
+            FetchFollowUp::Terminal
+        }
+        FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
+            if let Some(next_peer) = q.retry_fetch(key) {
+                FetchFollowUp::RetryFrom(next_peer)
+            } else if q.requeue_fetch_for_verification(key, verification_retry_after) {
+                FetchFollowUp::RequeuedForVerification
+            } else {
+                FetchFollowUp::Terminal
+            }
+        }
+    }
+}
+
+/// Whether this node currently sits inside the storage-admission group for
+/// `key`, per live local routing state.
+///
+/// This is the one question every storage decision in this module asks; see
+/// [`admission::is_responsible`]. A purely local routing-table lookup — no
+/// network I/O — but it awaits into the DHT manager, so callers must not
+/// hold the queues lock across it.
+async fn is_storage_admitted(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> bool {
+    admission::is_responsible(
+        self_id,
+        key,
+        p2p_node,
+        storage_admission_width(config.close_group_size),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 /// Execute a single fetch request against `source` for `key`.
 ///
 /// Handles encoding, network I/O, integrity checking, storage, and trust
 /// event reporting.  Returns a [`FetchOutcome`] so the caller can update
 /// queue state without holding any locks during the network round-trip.
+///
+/// This is the authoritative storage-responsibility gate: each attempt —
+/// including every per-source retry, which re-enters here — rechecks live
+/// routing state before spending bandwidth, and once more before writing
+/// bytes that arrived after a round-trip. The verification-time check that
+/// promoted the key into the fetch queue is only a pre-filter; the queue is
+/// nearest-first and deep, so a promotion decision can go stale under
+/// topology churn before the key is ever dequeued.
 async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<LmdbStorage>,
@@ -5044,6 +5141,18 @@ async fn execute_single_fetch(
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
+    let self_id = *p2p_node.peer_id();
+    if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
+        debug!(
+            "Skipping fetch for {}: no longer in the storage-admission group",
+            hex::encode(key)
+        );
+        return FetchOutcome {
+            key,
+            result: FetchResult::NoLongerResponsible,
+        };
+    }
+
     let request = protocol::FetchRequest { key };
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
@@ -5151,6 +5260,23 @@ async fn execute_single_fetch(
                         return FetchOutcome {
                             key,
                             result: FetchResult::IntegrityFailed,
+                        };
+                    }
+
+                    // Responsibility can lapse during the network round-trip.
+                    // The bandwidth is already spent; declining the write is
+                    // what still avoids the disk write and the later
+                    // fetch→store→prune churn. Edge flapping is dampened by
+                    // the margin `storage_admission_width` adds over
+                    // `close_group_size`.
+                    if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
+                        debug!(
+                            "Fetched {} but responsibility lapsed in transit; not storing",
+                            hex::encode(key)
+                        );
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::NoLongerResponsible,
                         };
                     }
 
@@ -7027,5 +7153,145 @@ mod tests {
             first_failed_key_label(&[first, second]),
             format!("0x{}", hex::encode(&first[..8]))
         );
+    }
+
+    // -- apply_fetch_result --------------------------------------------------
+    //
+    // The worker's disposition of a fetch outcome. Note there is no trust
+    // handle in `apply_fetch_result`'s signature: the worker cannot report a
+    // trust event for ANY outcome, and `execute_single_fetch` returns
+    // `NoLongerResponsible` before its trust-reporting paths — the source did
+    // nothing wrong when this node's own responsibility lapsed.
+
+    /// Route `key` through the real pipeline stages (pending → promoted →
+    /// dequeued → in-flight) so it carries a verification retry-slot
+    /// reservation, exactly as a worker-dequeued key does. Returns the
+    /// in-flight source.
+    fn drive_key_in_flight(
+        q: &mut ReplicationQueues,
+        key: XorName,
+        sources: Vec<PeerId>,
+    ) -> PeerId {
+        let hinter = sources.first().copied().unwrap_or_else(|| test_peer(0x01));
+        let now = Instant::now();
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: now,
+            next_verify_at: now,
+            hint_sources: HashSet::from([hinter]),
+            replica_hint_sources: HashSet::from([hinter]),
+        };
+        assert!(q.add_pending_verify(key, entry).admitted());
+        assert!(q.promote_pending_to_fetch(key, key, sources));
+        let candidate = q.dequeue_fetch().expect("promoted key must dequeue");
+        let source = *candidate.sources.first().expect("candidate has a source");
+        q.start_dequeued_fetch(candidate, source);
+        source
+    }
+
+    #[test]
+    fn no_longer_responsible_is_terminal_and_releases_the_retry_slot() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xAB);
+        drive_key_in_flight(&mut q, key, vec![test_peer(0x01), test_peer(0x02)]);
+        assert_eq!(q.retry_reserved_slot_count(), 1);
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::NoLongerResponsible, RETRY_AFTER);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::Terminal,
+            "lapsed responsibility must run the caller's terminal bootstrap accounting"
+        );
+        assert!(
+            !q.contains_key(&key),
+            "the key must leave every pipeline stage — alternate sources included"
+        );
+        assert_eq!(
+            q.pending_count(),
+            0,
+            "a lapsed-responsibility key must not be requeued for verification"
+        );
+        assert_eq!(
+            q.retry_reserved_slot_count(),
+            0,
+            "terminal exit must release the verification retry-slot reservation"
+        );
+    }
+
+    #[test]
+    fn no_longer_responsible_shares_the_stored_terminal_path() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        // Both variants must walk the identical terminal gate so the
+        // battle-tested Stored accounting (retry-slot release + bootstrap
+        // pending-set shrink in the caller) covers lapsed responsibility too.
+        for result in [FetchResult::Stored, FetchResult::NoLongerResponsible] {
+            let mut q = ReplicationQueues::new();
+            let key = test_key(0xCD);
+            drive_key_in_flight(&mut q, key, vec![test_peer(0x03)]);
+
+            let follow_up = apply_fetch_result(&mut q, &key, &result, RETRY_AFTER);
+
+            assert_eq!(follow_up, FetchFollowUp::Terminal);
+            assert!(!q.contains_key(&key));
+            assert_eq!(q.retry_reserved_slot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn source_failure_walks_alternate_sources_then_requeues_for_verification() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xEF);
+        let first = test_peer(0x04);
+        let second = test_peer(0x05);
+        drive_key_in_flight(&mut q, key, vec![first, second]);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RetryFrom(second),
+            "a failed source must not abandon the remaining verified sources"
+        );
+        assert_eq!(q.in_flight_count(), 1, "retry keeps the key in flight");
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RequeuedForVerification,
+            "exhausted sources must restore the reserved verification entry"
+        );
+        assert_eq!(q.pending_count(), 1);
+        assert_eq!(
+            q.retry_reserved_slot_count(),
+            0,
+            "the reservation converts back into the pending entry itself"
+        );
+    }
+
+    #[test]
+    fn source_failure_without_retry_metadata_is_terminal() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        // Direct enqueue (no pending entry) models a fetch with no
+        // verification retry reservation to restore.
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x1F);
+        let source = test_peer(0x06);
+        assert!(q.enqueue_fetch(key, key, vec![source]));
+        let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
+        q.start_dequeued_fetch(candidate, source);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+
+        assert_eq!(follow_up, FetchFollowUp::Terminal);
+        assert!(!q.contains_key(&key));
     }
 }
