@@ -564,9 +564,10 @@ pub struct ReplicationEngine {
     task_handles: Vec<JoinHandle<()>>,
     /// Tracks detached, short-lived work spawned by background producers.
     ///
-    /// Fresh-offer workers, audit responders, audit launches, and delayed
-    /// possession checks may retain storage or P2P state after their producer
-    /// exits, so shutdown drains them before those resources may be reopened.
+    /// Fresh-offer workers, audit responders, audit launches, per-fetch
+    /// tasks, and delayed possession checks may retain storage or P2P state
+    /// after their producer exits, so shutdown drains them before those
+    /// resources may be reopened.
     detached_task_tracker: TaskTracker,
 }
 
@@ -850,6 +851,14 @@ impl ReplicationEngine {
     /// This must be awaited before dropping the engine when the caller needs
     /// the `Arc<LmdbStorage>` references held by background tasks to be
     /// released (e.g. before reopening the same LMDB environment).
+    ///
+    /// When this returns, no engine-spawned task still holds
+    /// `Arc<LmdbStorage>` or `Arc<PaidList>`, and no LMDB blocking operation
+    /// (read or write, on either the chunk store or the paid-list
+    /// environment) is still running.  Engine tasks race their work against
+    /// the shutdown token; a dropped future may leave a `spawn_blocking`
+    /// LMDB transaction running detached, so this method additionally waits
+    /// for both storage layers to go quiescent before returning.
     pub async fn shutdown(&mut self) {
         self.shutdown.cancel();
         for (i, mut handle) in self.task_handles.drain(..).enumerate() {
@@ -873,6 +882,16 @@ impl ReplicationEngine {
         // while an LMDB transaction still owns the environment.
         self.detached_task_tracker.close();
         self.detached_task_tracker.wait().await;
+
+        // Every producer is gone, but a select! racing the shutdown token may
+        // have dropped a future while it awaited an LMDB `spawn_blocking` op
+        // (fetch `storage.put`, prune `storage.delete` /
+        // `paid_list.remove_batch`, verification `paid_list.insert`).  The
+        // detached blocking closure owns a cloned `Env`; wait for both
+        // environments to go quiescent — bounded by one in-flight transaction
+        // per op — so the caller may reopen them.
+        self.storage.wait_idle().await;
+        self.paid_list.wait_idle().await;
     }
 
     /// Trigger an early neighbor sync round.
@@ -2004,6 +2023,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let detached_task_tracker = self.detached_task_tracker.clone();
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -2039,8 +2059,13 @@ impl ReplicationEngine {
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
                         let token = shutdown.clone();
+                        let tracker = detached_task_tracker.clone();
                         in_flight.push(Box::pin(async move {
-                            let handle = tokio::spawn(async move {
+                            // Tracked so shutdown() still awaits the task if
+                            // this awaiter is dropped (e.g. the worker is
+                            // aborted): it holds Arc<LmdbStorage> and must
+                            // not outlive the engine.
+                            let handle = tracker.spawn(async move {
                                 // Cancel-aware: abort when the engine shuts down.
                                 tokio::select! {
                                     () = token.cancelled() => FetchOutcome {
@@ -2094,9 +2119,12 @@ impl ReplicationEngine {
                                         let storage = Arc::clone(&storage);
                                         let config = Arc::clone(&config);
                                         let token = shutdown.clone();
+                                        let tracker = detached_task_tracker.clone();
                                         let fetch_key = key;
                                         in_flight.push(Box::pin(async move {
-                                            let handle = tokio::spawn(async move {
+                                            // Tracked for the same reason as the
+                                            // initial fetch spawn above.
+                                            let handle = tracker.spawn(async move {
                                                 tokio::select! {
                                                     () = token.cancelled() => FetchOutcome {
                                                         key: fetch_key,
