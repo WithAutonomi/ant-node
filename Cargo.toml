@@ -165,6 +165,14 @@ name = "poc_price_floor_live"
 path = "tests/poc_price_floor_live.rs"
 required-features = ["test-utils"]
 
+# Shutdown/LMDB-drain regression: `ReplicationEngine::shutdown()` must not
+# return while a detached LMDB blocking op is still running. Uses the
+# test-only storage put gate, so it requires the test-utils feature.
+[[test]]
+name = "poc_shutdown_lmdb_drain"
+path = "tests/poc_shutdown_lmdb_drain.rs"
+required-features = ["test-utils"]
+
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.
