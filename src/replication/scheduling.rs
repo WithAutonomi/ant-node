@@ -286,6 +286,14 @@ impl ReplicationQueues {
         }
     }
 
+    /// Test-only: number of live verification retry-slot reservations, so
+    /// tests can assert a terminal fetch outcome released its reservation.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn retry_reserved_slot_count(&self) -> usize {
+        self.retry_reserved_slots
+    }
+
     /// Get a reference to a pending verification entry.
     #[must_use]
     pub fn get_pending(&self, key: &XorName) -> Option<&VerificationEntry> {
