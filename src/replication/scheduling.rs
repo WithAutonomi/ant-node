@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use crate::logging::debug;
 
 use crate::ant_protocol::XorName;
-use crate::replication::types::{FetchCandidate, VerificationEntry, VerificationState};
+use crate::replication::types::{
+    FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
+};
 use saorsa_core::identity::PeerId;
 
 /// Global hard upper bound on the number of keys held in `pending_verify`.
@@ -114,13 +116,22 @@ pub struct ReplicationQueues {
     /// Capacity-bounded by [`MAX_PENDING_VERIFY`]: admissions are rejected
     /// once full, preventing unbounded growth under a network hint flood.
     pending_verify: HashMap<XorName, VerificationEntry>,
-    /// Presence-quorum-passed or paid-list-authorized keys waiting for fetch.
+    /// Nearest-first priority order over the keys in `fetch_payloads`.
+    ///
+    /// Holds ordering data only: every entry has exactly one matching
+    /// `fetch_payloads` entry, and vice versa. Splitting the mutable half of a
+    /// queued fetch out into `fetch_payloads` keeps this heap's ordering
+    /// immutable for as long as a key is queued, so a source merge never has
+    /// to rebuild it.
+    fetch_queue: BinaryHeap<FetchOrder>,
+    /// The mutable half of each queued fetch, keyed for O(1) lookup.
+    ///
+    /// Doubles as the `fetch_queue` membership index (Rule 8 cross-queue
+    /// dedup) and as the authoritative queue length.
     ///
     /// Capacity-bounded by [`MAX_FETCH_QUEUE`]: enqueues are dropped once
     /// full, preventing unbounded growth under a network hint flood.
-    fetch_queue: BinaryHeap<FetchCandidate>,
-    /// Keys present in `fetch_queue` for O(1) dedup.
-    fetch_queue_keys: HashSet<XorName>,
+    fetch_payloads: HashMap<XorName, FetchPayload>,
     /// Active downloads keyed by `XorName`.
     in_flight_fetch: HashMap<XorName, InFlightEntry>,
     /// Reverse index for removing a departed peer from every pending hint
@@ -144,7 +155,7 @@ impl ReplicationQueues {
         Self {
             pending_verify: HashMap::new(),
             fetch_queue: BinaryHeap::new(),
-            fetch_queue_keys: HashSet::new(),
+            fetch_payloads: HashMap::new(),
             in_flight_fetch: HashMap::new(),
             pending_keys_by_source: HashMap::new(),
             retry_reserved_slots: 0,
@@ -185,22 +196,20 @@ impl ReplicationQueues {
             }
             return AdmissionResult::AlreadyPresent;
         }
-        if self.fetch_queue_keys.contains(&key) {
-            let mut candidates = std::mem::take(&mut self.fetch_queue).into_vec();
-            if let Some(candidate) = candidates.iter_mut().find(|candidate| candidate.key == key) {
-                for source in &entry.replica_hint_sources {
-                    if !candidate.sources.contains(source) {
-                        candidate.sources.push(*source);
-                    }
-                }
-                if let Some(retry) = &mut candidate.retry_verification {
-                    retry
-                        .replica_hint_sources
-                        .extend(entry.replica_hint_sources);
-                    retry.hint_sources.extend(entry.hint_sources);
+        // Merging a source touches only `FetchPayload`, which no ordering
+        // reads, so the fetch heap is left completely untouched here.
+        if let Some(payload) = self.fetch_payloads.get_mut(&key) {
+            for source in &entry.replica_hint_sources {
+                if !payload.sources.contains(source) {
+                    payload.sources.push(*source);
                 }
             }
-            self.fetch_queue = BinaryHeap::from(candidates);
+            if let Some(retry) = &mut payload.retry_verification {
+                retry
+                    .replica_hint_sources
+                    .extend(entry.replica_hint_sources);
+                retry.hint_sources.extend(entry.hint_sources);
+            }
             return AdmissionResult::AlreadyPresent;
         }
         if let Some(in_flight) = self.in_flight_fetch.get_mut(&key) {
@@ -370,26 +379,32 @@ impl ReplicationQueues {
         }
 
         let mut retry_releases = 0usize;
-        let mut retained_candidates = Vec::new();
-        for mut candidate in std::mem::take(&mut self.fetch_queue).into_vec() {
-            candidate.sources.retain(|peer| peer != source);
-            if let Some(verification) = &mut candidate.retry_verification {
+        let mut orphaned_fetch_keys = HashSet::new();
+        for (key, payload) in &mut self.fetch_payloads {
+            payload.sources.retain(|peer| peer != source);
+            if let Some(verification) = &mut payload.retry_verification {
                 if verification.hint_sources.remove(source) {
                     verification.replica_hint_sources.remove(source);
                     if verification.hint_sources.is_empty() {
                         retry_releases += 1;
-                        candidate.retry_verification = None;
+                        payload.retry_verification = None;
                     }
                 }
             }
-            if candidate.sources.is_empty() && candidate.retry_verification.is_none() {
-                self.fetch_queue_keys.remove(&candidate.key);
-                orphaned.push(candidate.key);
-            } else {
-                retained_candidates.push(candidate);
+            if payload.sources.is_empty() && payload.retry_verification.is_none() {
+                orphaned_fetch_keys.insert(*key);
             }
         }
-        self.fetch_queue = BinaryHeap::from(retained_candidates);
+        // Only an orphaned key changes heap *membership*; the source edits
+        // above cannot, so the heap is rebuilt at most once per departed peer
+        // and not at all when the peer left nothing orphaned.
+        if !orphaned_fetch_keys.is_empty() {
+            self.fetch_payloads
+                .retain(|key, _| !orphaned_fetch_keys.contains(key));
+            self.fetch_queue
+                .retain(|order| !orphaned_fetch_keys.contains(&order.key));
+            orphaned.extend(orphaned_fetch_keys);
+        }
 
         for entry in self.in_flight_fetch.values_mut() {
             entry.all_sources.retain(|peer| peer != source);
@@ -442,19 +457,6 @@ impl ReplicationQueues {
     /// place when the fetch queue is full (so verified work is retried on
     /// the next cycle instead of being silently lost).
     pub fn enqueue_fetch(&mut self, key: XorName, distance: XorName, sources: Vec<PeerId>) -> bool {
-        if self.pending_verify.contains_key(&key)
-            || self.fetch_queue_keys.contains(&key)
-            || self.in_flight_fetch.contains_key(&key)
-        {
-            return false;
-        }
-        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
-            debug!(
-                "fetch_queue at capacity ({MAX_FETCH_QUEUE}); dropping new key {}",
-                hex::encode(key)
-            );
-            return false;
-        }
         self.enqueue_fetch_with_retry(key, distance, sources, None)
     }
 
@@ -466,25 +468,26 @@ impl ReplicationQueues {
         retry_verification: Option<VerificationEntry>,
     ) -> bool {
         if self.pending_verify.contains_key(&key)
-            || self.fetch_queue_keys.contains(&key)
+            || self.fetch_payloads.contains_key(&key)
             || self.in_flight_fetch.contains_key(&key)
         {
             return false;
         }
-        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
+        if self.fetch_payloads.len() >= MAX_FETCH_QUEUE {
             debug!(
                 "fetch_queue at capacity ({MAX_FETCH_QUEUE}); dropping new key {}",
                 hex::encode(key)
             );
             return false;
         }
-        self.fetch_queue_keys.insert(key);
-        self.fetch_queue.push(FetchCandidate {
+        self.fetch_payloads.insert(
             key,
-            distance,
-            sources,
-            retry_verification,
-        });
+            FetchPayload {
+                sources,
+                retry_verification,
+            },
+        );
+        self.fetch_queue.push(FetchOrder { key, distance });
         true
     }
 
@@ -505,7 +508,7 @@ impl ReplicationQueues {
         distance: XorName,
         sources: Vec<PeerId>,
     ) -> bool {
-        if self.fetch_queue.len() >= MAX_FETCH_QUEUE {
+        if self.fetch_payloads.len() >= MAX_FETCH_QUEUE {
             debug!(
                 "fetch_queue at capacity ({MAX_FETCH_QUEUE}); leaving {} pending \
                  for retry next cycle",
@@ -542,8 +545,21 @@ impl ReplicationQueues {
     /// [`Self::requeue_candidate_for_verification`] so that reservation is
     /// either transferred, released, or restored to `pending_verify`.
     pub fn dequeue_fetch(&mut self) -> Option<FetchCandidate> {
-        while let Some(candidate) = self.fetch_queue.pop() {
-            self.fetch_queue_keys.remove(&candidate.key);
+        while let Some(order) = self.fetch_queue.pop() {
+            let Some(payload) = self.fetch_payloads.remove(&order.key) else {
+                debug_assert!(
+                    false,
+                    "fetch order without payload for {}",
+                    hex::encode(order.key)
+                );
+                continue;
+            };
+            let candidate = FetchCandidate {
+                key: order.key,
+                distance: order.distance,
+                sources: payload.sources,
+                retry_verification: payload.retry_verification,
+            };
             if !self.in_flight_fetch.contains_key(&candidate.key) {
                 return Some(candidate);
             }
@@ -555,7 +571,7 @@ impl ReplicationQueues {
     /// Number of keys waiting in the fetch queue.
     #[must_use]
     pub fn fetch_queue_count(&self) -> usize {
-        self.fetch_queue.len()
+        self.fetch_payloads.len()
     }
 
     // -----------------------------------------------------------------------
@@ -716,7 +732,7 @@ impl ReplicationQueues {
     #[must_use]
     pub fn contains_key(&self, key: &XorName) -> bool {
         self.pending_verify.contains_key(key)
-            || self.fetch_queue_keys.contains(key)
+            || self.fetch_payloads.contains_key(key)
             || self.in_flight_fetch.contains_key(key)
     }
 
@@ -761,9 +777,6 @@ impl ReplicationQueues {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
-    use std::time::{Duration, Instant};
-
     use super::*;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
@@ -951,6 +964,88 @@ mod tests {
         assert!(
             !queues.add_pending_verify(key, test_entry(1)).admitted(),
             "should reject key already in fetch queue"
+        );
+    }
+
+    #[test]
+    fn add_pending_verify_merges_source_into_queued_candidate() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x02);
+        let queued_source = peer_id_from_byte(1);
+        let extra_source = peer_id_from_byte(2);
+
+        queues.enqueue_fetch(key, xor_name_from_byte(0x10), vec![queued_source]);
+
+        assert_eq!(
+            queues.add_pending_verify(key, test_entry(2)),
+            AdmissionResult::AlreadyPresent
+        );
+        // A repeat hint from an already-known advertiser must not duplicate it.
+        assert_eq!(
+            queues.add_pending_verify(key, test_entry(1)),
+            AdmissionResult::AlreadyPresent
+        );
+
+        let candidate = queues.dequeue_fetch().expect("queued candidate");
+        assert_eq!(
+            candidate.sources,
+            vec![queued_source, extra_source],
+            "a new advertiser is merged as a fetch source exactly once"
+        );
+        queues.discard_fetch_candidate(candidate);
+    }
+
+    #[test]
+    fn add_pending_verify_merge_preserves_fetch_priority_order() {
+        let mut queues = ReplicationQueues::new();
+        let near_key = xor_name_from_byte(0x01);
+        let far_key = xor_name_from_byte(0x02);
+        let near_dist = [0x00; 32]; // nearest
+        let far_dist = [0xFF; 32]; // farthest
+
+        queues.enqueue_fetch(far_key, far_dist, vec![peer_id_from_byte(1)]);
+        queues.enqueue_fetch(near_key, near_dist, vec![peer_id_from_byte(2)]);
+
+        // Merging a source into the farthest key must not reorder the queue:
+        // the merge touches no field the heap orders on.
+        assert_eq!(
+            queues.add_pending_verify(far_key, test_entry(3)),
+            AdmissionResult::AlreadyPresent
+        );
+
+        let first = queues.dequeue_fetch().expect("should dequeue");
+        assert_eq!(
+            first.key, near_key,
+            "nearest key still dequeues first after a merge"
+        );
+        queues.discard_fetch_candidate(first);
+
+        let second = queues.dequeue_fetch().expect("should dequeue");
+        assert_eq!(second.key, far_key, "farthest key dequeues second");
+        queues.discard_fetch_candidate(second);
+    }
+
+    #[test]
+    fn peer_removal_drops_orphaned_fetch_candidate() {
+        let mut queues = ReplicationQueues::new();
+        let source = peer_id_from_byte(1);
+        let key = xor_name_from_byte(0x43);
+
+        queues.enqueue_fetch(key, xor_name_from_byte(0x10), vec![source]);
+
+        assert_eq!(
+            queues.remove_hint_source(&source),
+            vec![key],
+            "a candidate whose last source departed is reported orphaned"
+        );
+        assert_eq!(queues.fetch_queue_count(), 0);
+        assert!(
+            !queues.contains_key(&key),
+            "orphaned key leaves the pipeline entirely"
+        );
+        assert!(
+            queues.dequeue_fetch().is_none(),
+            "orphaned candidate must not linger in the priority heap"
         );
     }
 
