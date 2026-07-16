@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
+use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XORNAME_LEN;
 
@@ -133,6 +134,21 @@ pub struct LmdbStorage {
     /// `None` means "never checked — check on next write".  Updated only
     /// after a passing check, so a low-space result is always rechecked.
     last_disk_ok: parking_lot::Mutex<Option<Instant>>,
+    /// Tracks every LMDB blocking task spawned by this storage.
+    ///
+    /// A `spawn_blocking` closure owns a cloned [`Env`] and keeps running
+    /// even when its async awaiter is dropped (e.g. by a `select!` losing to
+    /// a shutdown token).  Tracking the blocking task itself — not the async
+    /// wrapper — lets [`Self::wait_idle`] wait for true quiescence before
+    /// the environment may be reopened.
+    blocking_tracker: TaskTracker,
+    /// Test-only gate read-acquired at the top of the put blocking closure.
+    ///
+    /// Tests hold the write half to deterministically park an in-flight put
+    /// on the blocking pool (e.g. to prove [`Self::wait_idle`] waits for a
+    /// detached write).
+    #[cfg(any(test, feature = "test-utils"))]
+    test_put_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl LmdbStorage {
@@ -172,6 +188,9 @@ impl LmdbStorage {
         };
 
         let env_dir_clone = env_dir.clone();
+        // Constructor-only blocking task: it runs before `self` (and its
+        // `blocking_tracker`) exists, so it is deliberately untracked.  The
+        // constructor awaits it right here, so it cannot outlive this call.
         let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
             // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses memory-mapped
             // I/O and relies on OS file-locking to prevent corruption from concurrent
@@ -210,6 +229,9 @@ impl LmdbStorage {
             stats: parking_lot::RwLock::new(StorageStats::default()),
             env_lock: Arc::new(parking_lot::RwLock::new(())),
             last_disk_ok: parking_lot::Mutex::new(None),
+            blocking_tracker: TaskTracker::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_put_gate: Arc::new(parking_lot::RwLock::new(())),
         };
 
         debug!(
@@ -314,39 +336,45 @@ impl LmdbStorage {
         let env = self.env.clone();
         let db = self.db;
         let lock = Arc::clone(&self.env_lock);
+        #[cfg(any(test, feature = "test-utils"))]
+        let test_put_gate = Arc::clone(&self.test_put_gate);
 
-        spawn_blocking(move || -> Result<PutOutcome> {
-            let _guard = lock.read();
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<PutOutcome> {
+                // Test-only: parks here while a test holds the write half.
+                #[cfg(any(test, feature = "test-utils"))]
+                let _test_put_gate = test_put_gate.read();
+                let _guard = lock.read();
 
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
-            // Authoritative existence check inside the serialized write txn
-            if db
-                .get(&wtxn, &key)
-                .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
-                .is_some()
-            {
-                return Ok(PutOutcome::Duplicate);
-            }
-
-            match db.put(&mut wtxn, &key, &value) {
-                Ok(()) => {}
-                Err(heed::Error::Mdb(MdbError::MapFull)) => return Ok(PutOutcome::MapFull),
-                Err(e) => {
-                    return Err(Error::Storage(format!("Failed to put chunk: {e}")));
+                // Authoritative existence check inside the serialized write txn
+                if db
+                    .get(&wtxn, &key)
+                    .map_err(|e| Error::Storage(format!("Failed to check existence: {e}")))?
+                    .is_some()
+                {
+                    return Ok(PutOutcome::Duplicate);
                 }
-            }
 
-            match wtxn.commit() {
-                Ok(()) => Ok(PutOutcome::New),
-                Err(heed::Error::Mdb(MdbError::MapFull)) => Ok(PutOutcome::MapFull),
-                Err(e) => Err(Error::Storage(format!("Failed to commit put: {e}"))),
-            }
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))?
+                match db.put(&mut wtxn, &key, &value) {
+                    Ok(()) => {}
+                    Err(heed::Error::Mdb(MdbError::MapFull)) => return Ok(PutOutcome::MapFull),
+                    Err(e) => {
+                        return Err(Error::Storage(format!("Failed to put chunk: {e}")));
+                    }
+                }
+
+                match wtxn.commit() {
+                    Ok(()) => Ok(PutOutcome::New),
+                    Err(heed::Error::Mdb(MdbError::MapFull)) => Ok(PutOutcome::MapFull),
+                    Err(e) => Err(Error::Storage(format!("Failed to commit put: {e}"))),
+                }
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB put task failed: {e}")))?
     }
 
     /// Retrieve a chunk.
@@ -364,18 +392,20 @@ impl LmdbStorage {
         let db = self.db;
         let lock = Arc::clone(&self.env_lock);
 
-        let content = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-            let _guard = lock.read();
-            let rtxn = env
-                .read_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-            let value = db
-                .get(&rtxn, &key)
-                .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
-            Ok(value.map(Vec::from))
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("LMDB get task failed: {e}")))??;
+        let content = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                let _guard = lock.read();
+                let rtxn = env
+                    .read_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+                let value = db
+                    .get(&rtxn, &key)
+                    .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
+                Ok(value.map(Vec::from))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB get task failed: {e}")))??;
 
         let Some(content) = content else {
             trace!("Chunk {} not found", hex::encode(address));
@@ -444,20 +474,22 @@ impl LmdbStorage {
         let db = self.db;
         let lock = Arc::clone(&self.env_lock);
 
-        let deleted = spawn_blocking(move || -> Result<bool> {
-            let _guard = lock.read();
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-            let existed = db
-                .delete(&mut wtxn, &key)
-                .map_err(|e| Error::Storage(format!("Failed to delete chunk: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit delete: {e}")))?;
-            Ok(existed)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))??;
+        let deleted = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<bool> {
+                let _guard = lock.read();
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+                let existed = db
+                    .delete(&mut wtxn, &key)
+                    .map_err(|e| Error::Storage(format!("Failed to delete chunk: {e}")))?;
+                wtxn.commit()
+                    .map_err(|e| Error::Storage(format!("Failed to commit delete: {e}")))?;
+                Ok(existed)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))??;
 
         if deleted {
             debug!("Deleted chunk {}", hex::encode(address));
@@ -525,8 +557,10 @@ impl LmdbStorage {
         let env = self.env.clone();
         let db = self.db;
 
-        let keys = spawn_blocking(move || -> Result<Vec<XorName>> {
-            let rtxn = env
+        let keys = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Vec<XorName>> {
+                let rtxn = env
                 .read_txn()
                 .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
             let mut keys = Vec::new();
@@ -568,17 +602,19 @@ impl LmdbStorage {
         let env = self.env.clone();
         let db = self.db;
 
-        let value = spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-            let rtxn = env
-                .read_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-            let val = db
-                .get(&rtxn, key.as_ref())
-                .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
-            Ok(val.map(Vec::from))
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("get_raw task failed: {e}")))?;
+        let value = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                let rtxn = env
+                    .read_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+                let val = db
+                    .get(&rtxn, key.as_ref())
+                    .map_err(|e| Error::Storage(format!("Failed to get chunk: {e}")))?;
+                Ok(val.map(Vec::from))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("get_raw task failed: {e}")))?;
 
         value
     }
@@ -636,35 +672,65 @@ impl LmdbStorage {
         let env = self.env.clone();
         let lock = Arc::clone(&self.env_lock);
 
-        spawn_blocking(move || -> Result<()> {
-            // Exclusive lock guarantees no concurrent transactions.
-            let _guard = lock.write();
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<()> {
+                // Exclusive lock guarantees no concurrent transactions.
+                let _guard = lock.write();
 
-            // Never shrink below the current map — existing data must remain
-            // addressable regardless of what the disk-space calculation says.
-            let current_map = env.info().map_size;
-            let new_size = from_disk.max(current_map);
+                // Never shrink below the current map — existing data must remain
+                // addressable regardless of what the disk-space calculation says.
+                let current_map = env.info().map_size;
+                let new_size = from_disk.max(current_map);
 
-            if new_size <= current_map {
-                debug!("LMDB map resize skipped — no additional disk space available");
-                return Ok(());
-            }
+                if new_size <= current_map {
+                    debug!("LMDB map resize skipped — no additional disk space available");
+                    return Ok(());
+                }
 
-            // SAFETY: We hold an exclusive lock, so no transactions are active.
-            unsafe {
-                env.resize(new_size)
-                    .map_err(|e| Error::Storage(format!("Failed to resize LMDB map: {e}")))?;
-            }
+                // SAFETY: We hold an exclusive lock, so no transactions are active.
+                unsafe {
+                    env.resize(new_size)
+                        .map_err(|e| Error::Storage(format!("Failed to resize LMDB map: {e}")))?;
+                }
 
-            info!(
-                "Resized LMDB map to {:.2} GiB (was {:.2} GiB)",
-                bytes_to_gib(new_size as u64),
-                bytes_to_gib(current_map as u64),
-            );
-            Ok(())
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("LMDB resize task failed: {e}")))?
+                info!(
+                    "Resized LMDB map to {:.2} GiB (was {:.2} GiB)",
+                    bytes_to_gib(new_size as u64),
+                    bytes_to_gib(current_map as u64),
+                );
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB resize task failed: {e}")))?
+    }
+
+    /// Wait until every tracked LMDB blocking task has finished.
+    ///
+    /// Dropping an async caller (e.g. a `select!` losing to a shutdown token)
+    /// does not cancel an already-spawned blocking closure — the closure keeps
+    /// running on the blocking pool with a cloned [`Env`].  This method waits
+    /// for those detached closures too, so when it returns no blocking
+    /// operation still holds the environment.
+    ///
+    /// Quiescence is only meaningful once callers have stopped issuing new
+    /// operations; concurrent traffic can keep the tracker non-empty
+    /// indefinitely.  The storage remains fully usable afterwards (the
+    /// internal tracker is reopened before returning).
+    pub async fn wait_idle(&self) {
+        self.blocking_tracker.close();
+        self.blocking_tracker.wait().await;
+        self.blocking_tracker.reopen();
+    }
+
+    /// Test-only handle to the put gate.
+    ///
+    /// Hold the write half to deterministically park the next put inside its
+    /// blocking closure (e.g. to exercise [`Self::wait_idle`] with a write
+    /// still in flight).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_put_gate(&self) -> Arc<parking_lot::RwLock<()>> {
+        Arc::clone(&self.test_put_gate)
     }
 }
 
@@ -736,13 +802,17 @@ fn check_disk_space(db_dir: &Path, reserve: u64) -> Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
 
-    async fn create_test_storage() -> (LmdbStorage, TempDir) {
-        let temp_dir = TempDir::new().expect("create temp dir");
+    /// Short probe used to prove `wait_idle` is still blocked on a parked op.
+    const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Generous ceiling for `wait_idle` to complete once the op is released.
+    const WAIT_IDLE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn create_test_storage() -> (LmdbStorage, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let config = LmdbStorageConfig {
             root_dir: temp_dir.path().to_path_buf(),
             ..LmdbStorageConfig::test_default()
@@ -883,7 +953,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_across_reopen() {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let content = b"persistent data";
         let address = LmdbStorage::compute_address(content);
 
@@ -948,5 +1018,58 @@ mod tests {
         // Non-existent key
         let missing = storage.get_raw(&[0xFF; 32]).await.expect("get_raw missing");
         assert!(missing.is_none());
+    }
+
+    /// Dropping a put's awaiter does not cancel its `spawn_blocking` LMDB
+    /// transaction; `wait_idle` must wait for that detached write, and the
+    /// storage must remain usable afterwards.
+    // Holding the gate's write guard across awaits is the point of the test:
+    // it parks the blocking closure while we probe wait_idle.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn wait_idle_waits_for_detached_put_blocking_op() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let content = b"detached put survives its dropped awaiter";
+        let address = LmdbStorage::compute_address(content);
+
+        // Park the put's blocking closure on the test gate.
+        let gate = storage.test_put_gate();
+        let parked = gate.write();
+
+        // Drop the awaiting future mid-flight: the biased select! polls the
+        // put once — far enough to spawn the blocking task, which parks on
+        // the gate — then completes on the ready branch, dropping the put.
+        tokio::select! {
+            biased;
+            res = storage.put(&address, content) => {
+                panic!("put must be parked on the test gate, got {res:?}")
+            }
+            () = std::future::ready(()) => {}
+        }
+
+        // The blocking op is still running: wait_idle must not complete.
+        let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, storage.wait_idle()).await;
+        assert!(
+            blocked.is_err(),
+            "wait_idle returned while the blocking op was parked"
+        );
+
+        // Release the gate: the detached closure commits and exits.
+        drop(parked);
+        tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, storage.wait_idle())
+            .await
+            .expect("wait_idle after release");
+
+        // The dropped awaiter did not lose the write: it committed.
+        assert!(storage.exists(&address).expect("exists after release"));
+
+        // The storage remains usable after wait_idle (tracker reopened).
+        let more = b"storage still usable after wait_idle";
+        let more_addr = LmdbStorage::compute_address(more);
+        assert!(storage
+            .put(&more_addr, more)
+            .await
+            .expect("put after wait_idle"));
     }
 }

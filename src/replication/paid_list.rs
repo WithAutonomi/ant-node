@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
+use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XORNAME_LEN;
 
@@ -57,6 +58,13 @@ pub struct PaidList {
     /// Cursor used by paid-list pruning to rotate through expired entries when
     /// the per-pass remote confirmation cap is exhausted.
     paid_prune_cursor: RwLock<usize>,
+    /// Tracks every paid-list LMDB blocking task.
+    ///
+    /// Same rationale as `LmdbStorage::blocking_tracker`: a `spawn_blocking`
+    /// closure owns a cloned [`Env`] and keeps running when its async awaiter
+    /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
+    /// themselves before the environment may be reopened.
+    blocking_tracker: TaskTracker,
 }
 
 impl PaidList {
@@ -74,6 +82,9 @@ impl PaidList {
             .map_err(|e| Error::Storage(format!("Failed to create paid-list directory: {e}")))?;
 
         let env_dir_clone = env_dir.clone();
+        // Constructor-only blocking task: it runs before `self` (and its
+        // `blocking_tracker`) exists, so it is deliberately untracked.  The
+        // constructor awaits it right here, so it cannot outlive this call.
         let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
             // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
             // memory-mapped I/O and relies on OS file-locking to prevent
@@ -111,6 +122,7 @@ impl PaidList {
             paid_out_of_range: RwLock::new(HashMap::new()),
             record_out_of_range: RwLock::new(HashMap::new()),
             paid_prune_cursor: RwLock::new(0),
+            blocking_tracker: TaskTracker::new(),
         };
 
         let count = paid_list.count()?;
@@ -137,29 +149,34 @@ impl PaidList {
         let env = self.env.clone();
         let db = self.db;
 
-        let was_new = spawn_blocking(move || -> Result<bool> {
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+        let was_new = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<bool> {
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
-            // Authoritative existence check inside the serialized write txn.
-            if db
-                .get(&wtxn, &key_owned)
-                .map_err(|e| Error::Storage(format!("Failed to check paid-list existence: {e}")))?
-                .is_some()
-            {
-                return Ok(false);
-            }
+                // Authoritative existence check inside the serialized write txn.
+                if db
+                    .get(&wtxn, &key_owned)
+                    .map_err(|e| {
+                        Error::Storage(format!("Failed to check paid-list existence: {e}"))
+                    })?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
 
-            db.put(&mut wtxn, &key_owned, &[])
-                .map_err(|e| Error::Storage(format!("Failed to insert into paid-list: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit paid-list insert: {e}")))?;
+                db.put(&mut wtxn, &key_owned, &[])
+                    .map_err(|e| Error::Storage(format!("Failed to insert into paid-list: {e}")))?;
+                wtxn.commit().map_err(|e| {
+                    Error::Storage(format!("Failed to commit paid-list insert: {e}"))
+                })?;
 
-            Ok(true)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))??;
+                Ok(true)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list insert task failed: {e}")))??;
 
         if was_new {
             debug!("Added key {} to paid-list", hex::encode(key));
@@ -182,19 +199,22 @@ impl PaidList {
         let env = self.env.clone();
         let db = self.db;
 
-        let existed = spawn_blocking(move || -> Result<bool> {
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-            let deleted = db
-                .delete(&mut wtxn, &key_owned)
-                .map_err(|e| Error::Storage(format!("Failed to delete from paid-list: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit paid-list delete: {e}")))?;
-            Ok(deleted)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list remove task failed: {e}")))??;
+        let existed = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<bool> {
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+                let deleted = db
+                    .delete(&mut wtxn, &key_owned)
+                    .map_err(|e| Error::Storage(format!("Failed to delete from paid-list: {e}")))?;
+                wtxn.commit().map_err(|e| {
+                    Error::Storage(format!("Failed to commit paid-list delete: {e}"))
+                })?;
+                Ok(deleted)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list remove task failed: {e}")))??;
 
         if existed {
             self.paid_out_of_range.write().remove(key);
@@ -377,28 +397,30 @@ impl PaidList {
         let env = self.env.clone();
         let db = self.db;
 
-        let removed_keys = spawn_blocking(move || -> Result<Vec<XorName>> {
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+        let removed_keys = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Vec<XorName>> {
+                let mut wtxn = env
+                    .write_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
-            let mut removed = Vec::new();
-            for key in &keys_owned {
-                let deleted = db
-                    .delete(&mut wtxn, key.as_ref())
-                    .map_err(|e| Error::Storage(format!("Failed to delete from paid-list: {e}")))?;
-                if deleted {
-                    removed.push(*key);
+                let mut removed = Vec::new();
+                for key in &keys_owned {
+                    let deleted = db.delete(&mut wtxn, key.as_ref()).map_err(|e| {
+                        Error::Storage(format!("Failed to delete from paid-list: {e}"))
+                    })?;
+                    if deleted {
+                        removed.push(*key);
+                    }
                 }
-            }
 
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit batch remove: {e}")))?;
+                wtxn.commit()
+                    .map_err(|e| Error::Storage(format!("Failed to commit batch remove: {e}")))?;
 
-            Ok(removed)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))??;
+                Ok(removed)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Paid-list batch remove task failed: {e}")))??;
 
         // Clear in-memory timestamps for all removed keys.
         // Acquire and release each lock separately to minimize hold time.
@@ -421,21 +443,38 @@ impl PaidList {
         debug!("Batch-removed {count} keys from paid-list");
         Ok(count)
     }
+
+    /// Wait until every tracked paid-list LMDB blocking task has finished.
+    ///
+    /// Dropping an async caller (e.g. a `select!` losing to a shutdown token)
+    /// does not cancel an already-spawned blocking closure — the closure keeps
+    /// running on the blocking pool with a cloned [`Env`].  This method waits
+    /// for those detached closures too, so when it returns no blocking
+    /// operation still holds the environment.
+    ///
+    /// Quiescence is only meaningful once callers have stopped issuing new
+    /// operations; concurrent traffic can keep the tracker non-empty
+    /// indefinitely.  The paid list remains fully usable afterwards (the
+    /// internal tracker is reopened before returning).
+    pub async fn wait_idle(&self) {
+        self.blocking_tracker.close();
+        self.blocking_tracker.wait().await;
+        self.blocking_tracker.reopen();
+    }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::replication::config::{BOOTSTRAP_CLAIM_GRACE_PERIOD, PRUNE_HYSTERESIS_DURATION};
-    use crate::replication::types::{
-        BootstrapClaimObservation, FailureEvidence, NeighborSyncState,
-    };
-    use saorsa_core::identity::PeerId;
-    use tempfile::TempDir;
 
-    async fn create_test_paid_list() -> (PaidList, TempDir) {
-        let temp_dir = TempDir::new().expect("create temp dir");
+    /// Short probe used to prove `wait_idle` is still blocked on a parked op.
+    const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Generous ceiling for `wait_idle` to complete once the op is released.
+    const WAIT_IDLE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    async fn create_test_paid_list() -> (PaidList, tempfile::TempDir) {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let paid_list = PaidList::new(temp_dir.path())
             .await
             .expect("create paid list");
@@ -492,7 +531,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_persistence_across_reopen() {
-        let temp_dir = TempDir::new().expect("create temp dir");
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let key: XorName = [0xEE; 32];
 
         // Insert a key, then drop the PaidList.
@@ -676,6 +715,113 @@ mod tests {
         assert_eq!(removed, 0);
     }
 
+    /// Park the paid-list env's single LMDB writer slot on a test-held write
+    /// transaction, so the next tracked write blocks inside its closure.
+    ///
+    /// Returns once the transaction is open. Dropping the returned sender
+    /// releases the slot.
+    async fn hold_write_txn(
+        pl: &PaidList,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let env = pl.env.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _wtxn = env.write_txn().expect("open holder write txn");
+            let _ = opened_tx.send(());
+            let _ = release_rx.blocking_recv();
+        });
+        opened_rx.await.expect("holder txn opened");
+        (release_tx, holder)
+    }
+
+    /// Dropping an `insert` awaiter does not cancel its `spawn_blocking` LMDB
+    /// transaction; `wait_idle` must wait for that detached write, and the
+    /// paid list must remain usable afterwards.
+    #[tokio::test]
+    async fn wait_idle_waits_for_detached_insert_blocking_op() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key: XorName = [0x77; 32];
+
+        let (release, holder) = hold_write_txn(&pl).await;
+
+        // Drop the awaiting future mid-flight: the biased select! polls the
+        // insert once — far enough to spawn the blocking task, which parks on
+        // the held writer slot — then completes on the ready branch.
+        tokio::select! {
+            biased;
+            res = pl.insert(&key) => {
+                panic!("insert must be parked on the writer slot, got {res:?}")
+            }
+            () = std::future::ready(()) => {}
+        }
+
+        // The blocking op is still running: wait_idle must not complete.
+        let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, pl.wait_idle()).await;
+        assert!(
+            blocked.is_err(),
+            "wait_idle returned while the insert blocking op was parked"
+        );
+
+        // Release the writer slot: the detached closure commits and exits.
+        drop(release);
+        holder.await.expect("holder task");
+        tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, pl.wait_idle())
+            .await
+            .expect("wait_idle after release");
+
+        // The dropped awaiter did not lose the write: it committed.
+        assert!(pl.contains(&key).expect("contains after release"));
+
+        // The paid list remains usable after wait_idle (tracker reopened).
+        let key2: XorName = [0x78; 32];
+        assert!(pl.insert(&key2).await.expect("insert after wait_idle"));
+    }
+
+    /// Same shape as the insert test, for `remove_batch`: a detached batch
+    /// removal must hold `wait_idle` open until its transaction commits.
+    #[tokio::test]
+    async fn wait_idle_waits_for_detached_remove_batch_blocking_op() {
+        let (pl, _temp) = create_test_paid_list().await;
+        let key_a: XorName = [0x79; 32];
+        let key_b: XorName = [0x7A; 32];
+        pl.insert(&key_a).await.expect("insert a");
+        pl.insert(&key_b).await.expect("insert b");
+
+        let (release, holder) = hold_write_txn(&pl).await;
+
+        let batch = [key_a, key_b];
+        tokio::select! {
+            biased;
+            res = pl.remove_batch(&batch) => {
+                panic!("remove_batch must be parked on the writer slot, got {res:?}")
+            }
+            () = std::future::ready(()) => {}
+        }
+
+        let blocked = tokio::time::timeout(WAIT_IDLE_BLOCKED_PROBE, pl.wait_idle()).await;
+        assert!(
+            blocked.is_err(),
+            "wait_idle returned while the remove_batch blocking op was parked"
+        );
+
+        drop(release);
+        holder.await.expect("holder task");
+        tokio::time::timeout(WAIT_IDLE_COMPLETE_TIMEOUT, pl.wait_idle())
+            .await
+            .expect("wait_idle after release");
+
+        // The dropped awaiter did not lose the batch removal: it committed.
+        assert!(!pl.contains(&key_a).expect("key_a removed"));
+        assert!(!pl.contains(&key_b).expect("key_b removed"));
+
+        // The paid list remains usable after wait_idle (tracker reopened).
+        assert!(pl.insert(&key_a).await.expect("insert after wait_idle"));
+    }
+
     #[tokio::test]
     async fn paid_prune_cursor_advances_past_selected_window() {
         const PAID_KEY_COUNT: usize = 10;
@@ -730,6 +876,7 @@ mod tests {
     /// present but recent.
     #[tokio::test]
     async fn scenario_50_hysteresis_prevents_premature_deletion() {
+        let hysteresis = crate::replication::config::PRUNE_HYSTERESIS_DURATION;
         let (pl, _temp) = create_test_paid_list().await;
         let key: XorName = [0x50; 32];
 
@@ -744,8 +891,8 @@ mod tests {
         // Elapsed time is effectively zero — well below hysteresis threshold.
         let elapsed = since.elapsed();
         assert!(
-            elapsed < PRUNE_HYSTERESIS_DURATION,
-            "elapsed ({elapsed:?}) should be far below PRUNE_HYSTERESIS_DURATION ({PRUNE_HYSTERESIS_DURATION:?})",
+            elapsed < hysteresis,
+            "elapsed ({elapsed:?}) should be far below PRUNE_HYSTERESIS_DURATION ({hysteresis:?})",
         );
     }
 
@@ -848,6 +995,7 @@ mod tests {
     /// await expiry.
     #[tokio::test]
     async fn scenario_13_responsible_range_shrink() {
+        let hysteresis = crate::replication::config::PRUNE_HYSTERESIS_DURATION;
         let (pl, _temp) = create_test_paid_list().await;
 
         let out_of_range_key: XorName = [0x13; 32];
@@ -869,9 +1017,9 @@ mod tests {
         // Key must NOT be pruned yet — elapsed time is far below hysteresis.
         let elapsed = first_seen.elapsed();
         assert!(
-            elapsed < PRUNE_HYSTERESIS_DURATION,
+            elapsed < hysteresis,
             "elapsed {elapsed:?} should be below PRUNE_HYSTERESIS_DURATION \
-             ({PRUNE_HYSTERESIS_DURATION:?}) — key must not be pruned yet"
+             ({hysteresis:?}) — key must not be pruned yet"
         );
 
         // The key should still exist in the paid list (not deleted).
@@ -903,16 +1051,17 @@ mod tests {
     /// first-observation-wins semantics.
     #[test]
     fn scenario_46_bootstrap_claim_first_seen_recorded() {
-        let peer = PeerId::from_bytes([0x46; 32]);
-        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let grace_period = crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD;
+        let peer = saorsa_core::identity::PeerId::from_bytes([0x46; 32]);
+        let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
         let first_ts = Instant::now()
             .checked_sub(std::time::Duration::from_secs(3))
             .unwrap_or_else(Instant::now);
-        let observed = state.observe_bootstrap_claim(peer, first_ts, BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        let observed = state.observe_bootstrap_claim(peer, first_ts, grace_period);
         assert_eq!(
             observed,
-            BootstrapClaimObservation::WithinGrace {
+            crate::replication::types::BootstrapClaimObservation::WithinGrace {
                 first_seen: first_ts
             }
         );
@@ -932,10 +1081,10 @@ mod tests {
         // Observe again while still active — must NOT overwrite
         // (first-observation-wins).
         let later_ts = Instant::now();
-        let observed = state.observe_bootstrap_claim(peer, later_ts, BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        let observed = state.observe_bootstrap_claim(peer, later_ts, grace_period);
         assert_eq!(
             observed,
-            BootstrapClaimObservation::WithinGrace {
+            crate::replication::types::BootstrapClaimObservation::WithinGrace {
                 first_seen: first_ts
             }
         );
@@ -951,8 +1100,9 @@ mod tests {
     /// `BootstrapClaimAbuse` evidence.
     #[test]
     fn scenario_48_bootstrap_claim_abuse_after_grace_period() {
-        let peer = PeerId::from_bytes([0x48; 32]);
-        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let grace_period = crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD;
+        let peer = saorsa_core::identity::PeerId::from_bytes([0x48; 32]);
+        let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a first-seen timestamp >24 h ago.
         // `Instant::checked_sub` can fail on Windows where the epoch is
@@ -960,7 +1110,7 @@ mod tests {
         // cannot represent the backdated time (the claim-age assertion is
         // skipped in that case since the subtraction itself proves nothing
         // about production behaviour).
-        let grace_plus_margin = BOOTSTRAP_CLAIM_GRACE_PERIOD + std::time::Duration::from_secs(3600);
+        let grace_plus_margin = grace_period + std::time::Duration::from_secs(3600);
         let first_seen = Instant::now()
             .checked_sub(grace_plus_margin)
             .unwrap_or_else(Instant::now);
@@ -971,15 +1121,16 @@ mod tests {
         let claim_age = Instant::now().duration_since(first_seen);
         if claim_age > std::time::Duration::from_secs(1) {
             assert!(
-                claim_age > BOOTSTRAP_CLAIM_GRACE_PERIOD,
-                "claim age {claim_age:?} should exceed grace period {BOOTSTRAP_CLAIM_GRACE_PERIOD:?}",
+                claim_age > grace_period,
+                "claim age {claim_age:?} should exceed grace period {grace_period:?}",
             );
         }
 
         // Caller constructs BootstrapClaimAbuse evidence.
-        let evidence = FailureEvidence::BootstrapClaimAbuse { peer, first_seen };
+        let evidence =
+            crate::replication::types::FailureEvidence::BootstrapClaimAbuse { peer, first_seen };
 
-        let FailureEvidence::BootstrapClaimAbuse {
+        let crate::replication::types::FailureEvidence::BootstrapClaimAbuse {
             peer: p,
             first_seen: fs,
         } = evidence
@@ -993,12 +1144,13 @@ mod tests {
     /// #49: Bootstrap claim is cleared when a peer responds normally.
     #[test]
     fn scenario_49_bootstrap_claim_cleared() {
-        let peer = PeerId::from_bytes([0x49; 32]);
-        let mut state = NeighborSyncState::new_cycle(vec![peer]);
+        let grace_period = crate::replication::config::BOOTSTRAP_CLAIM_GRACE_PERIOD;
+        let peer = saorsa_core::identity::PeerId::from_bytes([0x49; 32]);
+        let mut state = crate::replication::types::NeighborSyncState::new_cycle(vec![peer]);
 
         // Record a bootstrap claim.
         let first_seen = Instant::now();
-        let _ = state.observe_bootstrap_claim(peer, first_seen, BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        let _ = state.observe_bootstrap_claim(peer, first_seen, grace_period);
         assert!(
             state.bootstrap_claims.contains_key(&peer),
             "claim should exist after insert"
@@ -1015,11 +1167,10 @@ mod tests {
             "claim history should remain so the peer cannot claim bootstrapping again"
         );
 
-        let repeated =
-            state.observe_bootstrap_claim(peer, Instant::now(), BOOTSTRAP_CLAIM_GRACE_PERIOD);
+        let repeated = state.observe_bootstrap_claim(peer, Instant::now(), grace_period);
         assert_eq!(
             repeated,
-            BootstrapClaimObservation::Repeated { first_seen },
+            crate::replication::types::BootstrapClaimObservation::Repeated { first_seen },
             "a second bootstrap claim should be classified as repeated abuse"
         );
     }
