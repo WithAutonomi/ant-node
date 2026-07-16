@@ -487,8 +487,8 @@ mod tests {
     async fn capacity_rejected_expiry_is_per_source() {
         let state = Arc::new(RwLock::new(BootstrapState::new()));
         let queues = ReplicationQueues::new();
-        let stale = saorsa_core::identity::PeerId::from_bytes([0xC3; 32]);
-        let fresh = saorsa_core::identity::PeerId::from_bytes([0xC4; 32]);
+        let stale_source = saorsa_core::identity::PeerId::from_bytes([0xC3; 32]);
+        let fresh_source = saorsa_core::identity::PeerId::from_bytes([0xC4; 32]);
         let max_age = Duration::from_secs(60);
         let stale_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
 
@@ -496,8 +496,8 @@ mod tests {
             .write()
             .await
             .capacity_rejected_sources
-            .insert(stale, stale_rejected_at);
-        note_capacity_rejected(&state, fresh).await;
+            .insert(stale_source, stale_rejected_at);
+        note_capacity_rejected(&state, fresh_source).await;
 
         assert_eq!(expire_capacity_rejected(&state, max_age).await, 1);
         assert!(
@@ -505,7 +505,7 @@ mod tests {
                 .read()
                 .await
                 .capacity_rejected_sources
-                .contains_key(&fresh),
+                .contains_key(&fresh_source),
             "the fresh source must survive another source's expiry"
         );
         assert!(

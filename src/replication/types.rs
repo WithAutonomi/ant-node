@@ -765,7 +765,7 @@ pub struct BootstrapState {
     /// unrelated peer's clean cycle.
     ///
     /// Entries also expire once their rejection time is older than
-    /// `CAPACITY_REJECTED_MAX_AGE` (see
+    /// `ReplicationConfig::capacity_rejected_max_age` (see
     /// `super::bootstrap::expire_capacity_rejected`): the source either
     /// abandoned re-delivery, or its `PeerRemoved` cleanup raced the
     /// recording of the rejection and left an entry no future event can
