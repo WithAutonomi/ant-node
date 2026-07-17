@@ -2196,6 +2196,7 @@ impl ReplicationEngine {
                     )) => {
                         protocol::log_traffic_summary();
                         protocol::log_served_peers_summary();
+                        protocol::log_audit_outcome_summary();
                     }
                 }
             }
@@ -2940,6 +2941,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Responsible);
                     warn!(
                         "Audit challenge reply not sent: kind=responsible response=dropped \
                          source={source} {failure}"
@@ -2997,6 +2999,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
                     warn!(
                         "Audit challenge reply not sent: kind=subtree response=dropped \
                          source={source} {failure}"
@@ -3065,6 +3068,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Byte);
                     warn!(
                         "Audit challenge reply not sent: kind=byte response=dropped \
                          source={source} {failure}"
@@ -5042,6 +5046,7 @@ async fn handle_subtree_audit_result(
             challenged_peer,
             keys_checked,
         } => {
+            protocol::record_audit_pass(protocol::AuditOutcomeKind::Subtree);
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
             // Peer responded normally — clear the active bootstrap claim while
             // retaining history so a later claim is treated as repeated abuse.
@@ -5065,6 +5070,7 @@ async fn handle_subtree_audit_result(
                 ..
             } = evidence
             {
+                protocol::record_audit_fail(protocol::AuditOutcomeKind::Subtree, reason);
                 // Rich diagnostics (from main's audit-failure logging) + the
                 // first-failed-key correlation handle.
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
@@ -5163,6 +5169,7 @@ async fn handle_audit_result(
             challenged_peer,
             keys_checked,
         } => {
+            protocol::record_audit_pass(protocol::AuditOutcomeKind::Responsible);
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
             {
                 let mut state = sync_state.write().await;
@@ -5184,6 +5191,7 @@ async fn handle_audit_result(
                 ..
             } = evidence
             {
+                protocol::record_audit_fail(protocol::AuditOutcomeKind::Responsible, reason);
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
                 error!(
                     "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",

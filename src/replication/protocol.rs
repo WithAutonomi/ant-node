@@ -11,6 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
 
+use super::types::AuditFailureReason;
+
 pub use super::config::MAX_REPLICATION_MESSAGE_SIZE;
 
 /// Sentinel digest value indicating the challenged key is absent from storage.
@@ -207,6 +209,106 @@ impl ReplicationMessageBody {
             Self::GetCommitmentByPinResponse(_) => 16,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cumulative audit outcome accounting (extends V2-623)
+// ---------------------------------------------------------------------------
+//
+// The per-variant traffic counters above already give audit *volume* (challenge
+// tx = launched, response tx = served). These tally the *outcomes*, which the
+// traffic counters cannot express: auditor-side pass/fail per failure reason,
+// and responder-side admission drops (challenges refused at the flood-fair
+// caps). Same conventions: process-global relaxed atomics, monotonic since
+// process start, emitted next to the traffic summary and diffed at query time.
+
+/// Auditor-side audit kinds with pass/fail outcome tallies.
+#[derive(Clone, Copy)]
+pub(crate) enum AuditOutcomeKind {
+    /// Responsible-chunk audit (audit #2, `AuditChallenge`).
+    Responsible = 0,
+    /// Storage-bound subtree audit (ADR-0002).
+    Subtree = 1,
+}
+
+/// Responder-side challenge kinds dropped at the admission caps.
+#[derive(Clone, Copy)]
+pub(crate) enum AuditDropKind {
+    /// Responsible-chunk / prune-confirmation `AuditChallenge`.
+    Responsible = 0,
+    /// Subtree audit round-1 challenge.
+    Subtree = 1,
+    /// Subtree audit round-2 byte challenge.
+    Byte = 2,
+}
+
+/// One slot per [`AuditFailureReason`] variant, per [`AuditOutcomeKind`].
+const N_FAIL_REASONS: usize = 5;
+const N_OUTCOME_KINDS: usize = 2;
+const N_DROP_KINDS: usize = 3;
+
+static AUDIT_PASS: [AtomicU64; N_OUTCOME_KINDS] = [const { AtomicU64::new(0) }; N_OUTCOME_KINDS];
+static AUDIT_FAIL: [AtomicU64; N_OUTCOME_KINDS * N_FAIL_REASONS] =
+    [const { AtomicU64::new(0) }; N_OUTCOME_KINDS * N_FAIL_REASONS];
+static AUDIT_DROPPED: [AtomicU64; N_DROP_KINDS] = [const { AtomicU64::new(0) }; N_DROP_KINDS];
+
+/// Stable counter index for a failure reason. Matches declaration order of
+/// [`AuditFailureReason`]; exhaustive so a new variant is a compile error here.
+fn fail_reason_index(reason: &AuditFailureReason) -> usize {
+    match reason {
+        AuditFailureReason::Timeout => 0,
+        AuditFailureReason::MalformedResponse => 1,
+        AuditFailureReason::DigestMismatch => 2,
+        AuditFailureReason::KeyAbsent => 3,
+        AuditFailureReason::Rejected => 4,
+    }
+}
+
+/// Record an auditor-side audit pass.
+pub(crate) fn record_audit_pass(kind: AuditOutcomeKind) {
+    AUDIT_PASS[kind as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record an auditor-side audit failure with its reason.
+pub(crate) fn record_audit_fail(kind: AuditOutcomeKind, reason: &AuditFailureReason) {
+    AUDIT_FAIL[kind as usize * N_FAIL_REASONS + fail_reason_index(reason)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a responder-side challenge dropped at the admission caps.
+pub(crate) fn record_audit_drop(kind: AuditDropKind) {
+    AUDIT_DROPPED[kind as usize].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Emit the cumulative audit outcome tallies as one INFO summary line, same
+/// target and cadence as [`log_traffic_summary`] (`group = 4`), so the
+/// telegraf→Elasticsearch pipeline lifts each key into a `tail.*` field and
+/// pass/fail/drop rates per hour fall out of max-per-hour deltas.
+pub(crate) fn log_audit_outcome_summary() {
+    let pass = |k: usize| AUDIT_PASS[k].load(Ordering::Relaxed);
+    let fail = |k: usize, r: usize| AUDIT_FAIL[k * N_FAIL_REASONS + r].load(Ordering::Relaxed);
+    let drop = |k: usize| AUDIT_DROPPED[k].load(Ordering::Relaxed);
+
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 4,
+        responsible_audit_pass = pass(0),
+        responsible_audit_fail_timeout = fail(0, 0),
+        responsible_audit_fail_malformed = fail(0, 1),
+        responsible_audit_fail_digest_mismatch = fail(0, 2),
+        responsible_audit_fail_key_absent = fail(0, 3),
+        responsible_audit_fail_rejected = fail(0, 4),
+        subtree_audit_pass = pass(1),
+        subtree_audit_fail_timeout = fail(1, 0),
+        subtree_audit_fail_malformed = fail(1, 1),
+        subtree_audit_fail_digest_mismatch = fail(1, 2),
+        subtree_audit_fail_key_absent = fail(1, 3),
+        subtree_audit_fail_rejected = fail(1, 4),
+        audit_dropped_responsible = drop(0),
+        audit_dropped_subtree = drop(1),
+        audit_dropped_byte = drop(2),
+        "audit outcome summary (cumulative)"
+    );
 }
 
 /// Record an encoded (tx) replication message against its variant.
@@ -990,6 +1092,54 @@ impl std::error::Error for ReplicationProtocolError {}
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // === Audit outcome counters ===
+
+    /// No other test mutates the audit outcome counters, so per-slot deltas are
+    /// stable even under parallel test execution.
+    #[test]
+    fn audit_outcome_counters_tally_by_kind_and_reason() {
+        let pass_slot = AuditOutcomeKind::Subtree as usize;
+        let before = AUDIT_PASS[pass_slot].load(Ordering::Relaxed);
+        record_audit_pass(AuditOutcomeKind::Subtree);
+        assert_eq!(AUDIT_PASS[pass_slot].load(Ordering::Relaxed), before + 1);
+
+        let reasons = [
+            AuditFailureReason::Timeout,
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::KeyAbsent,
+            AuditFailureReason::Rejected,
+        ];
+        for (kind, kind_index) in [
+            (AuditOutcomeKind::Responsible, 0usize),
+            (AuditOutcomeKind::Subtree, 1usize),
+        ] {
+            for (reason_index, reason) in reasons.iter().enumerate() {
+                let slot = kind_index * N_FAIL_REASONS + reason_index;
+                let before = AUDIT_FAIL[slot].load(Ordering::Relaxed);
+                record_audit_fail(kind, reason);
+                assert_eq!(
+                    AUDIT_FAIL[slot].load(Ordering::Relaxed),
+                    before + 1,
+                    "kind {kind_index} reason {reason:?} must land in its own slot",
+                );
+            }
+        }
+
+        for (kind, kind_index) in [
+            (AuditDropKind::Responsible, 0usize),
+            (AuditDropKind::Subtree, 1usize),
+            (AuditDropKind::Byte, 2usize),
+        ] {
+            let before = AUDIT_DROPPED[kind_index].load(Ordering::Relaxed);
+            record_audit_drop(kind);
+            assert_eq!(
+                AUDIT_DROPPED[kind_index].load(Ordering::Relaxed),
+                before + 1
+            );
+        }
+    }
 
     // === Round-2 byte response sizing ===
 
