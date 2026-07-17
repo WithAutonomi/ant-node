@@ -5,6 +5,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use parking_lot::RwLock;
+use saorsa_core::identity::PeerId;
 use serde::{Deserialize, Serialize};
 
 use crate::ant_protocol::XorName;
@@ -291,6 +293,178 @@ pub(crate) fn log_traffic_summary() {
         get_commitment_by_pin_response_rx_bytes = rb(16),
         get_commitment_by_pin_response_rx_count = rc(16),
         "replication traffic summary (cumulative)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Per-peer served-bytes accounting (V2-684)
+// ---------------------------------------------------------------------------
+//
+// Follow-up to V2-623: the per-variant table above says how many bytes each
+// message type served, but not WHICH peers pulled them. This adds per-peer
+// attribution for the heavy serve paths (`FetchResponse`, `SubtreeByteResponse`,
+// `NeighborSyncResponse` — ~99% of served bytes), emitted as a top-10-by-bytes
+// INFO line on the same cadence and target as `log_traffic_summary`.
+//
+// Design (mirrors V2-623's process-global-static choice for the same reason —
+// the serve choke point is a free function with no engine handle):
+//
+//   * A bounded, sharded table caps memory at `SERVED_SHARDS * SERVED_SHARD_CAP`
+//     peers total.
+//   * The serve hot path takes only a shared read lock on one shard plus two
+//     relaxed `fetch_add`s when the peer is already tracked — no global lock per
+//     response. A previously-unseen peer takes a one-shard write lock (rare).
+//   * Per-shard eviction of the smallest-bytes entry when a shard is full. The
+//     peers that matter are the largest accumulators and are never the minimum,
+//     so they cannot be evicted by transient noise.
+//   * Values are cumulative/monotonic since process start, so a dropped or
+//     delayed log line cannot corrupt query-time deltas.
+
+/// Number of shards in the served-peers table. Peers are assigned by the low
+/// nibble of their first ID byte; peer IDs are hash-random (BLAKE3), so the
+/// distribution across shards is uniform. Must be a power of two.
+const SERVED_SHARDS: usize = 16;
+
+/// Max peers tracked per shard. `SERVED_SHARDS * SERVED_SHARD_CAP` = 256 total.
+const SERVED_SHARD_CAP: usize = 16;
+
+/// Cumulative served counters for a single peer.
+struct PeerServeStats {
+    bytes: AtomicU64,
+    count: AtomicU64,
+}
+
+/// One shard of the served-peers table: a small, cap-bounded list of
+/// `(peer, counters)`. A `Vec` linear-scanned over at most `SERVED_SHARD_CAP`
+/// entries is cheaper than hashing and — unlike `HashMap` — is
+/// const-constructible, so the whole table is a plain `static` with no lazy
+/// initialisation.
+struct ServedShard {
+    entries: RwLock<Vec<(PeerId, PeerServeStats)>>,
+}
+
+impl ServedShard {
+    const fn new() -> Self {
+        Self {
+            entries: RwLock::new(Vec::new()),
+        }
+    }
+}
+
+static SERVED_PEERS: [ServedShard; SERVED_SHARDS] = [const { ServedShard::new() }; SERVED_SHARDS];
+
+/// Cumulative count of peers evicted from the table (bounded-map pressure
+/// indicator; emitted as `evictions`).
+static SERVED_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+/// Shard index for a peer: the low `log2(SERVED_SHARDS)` bits of the first ID
+/// byte.
+fn served_shard_index(peer: &PeerId) -> usize {
+    (peer.to_bytes()[0] as usize) & (SERVED_SHARDS - 1)
+}
+
+/// Record `bytes` served to `peer` (V2-684), called from the replication serve
+/// choke point for the heavy response variants.
+///
+/// Fast path (peer already tracked): a shared read lock on one shard plus two
+/// relaxed `fetch_add`s. Slow path (new peer): a one-shard write lock that
+/// inserts the peer and, if the shard is at capacity, first evicts its
+/// smallest-bytes entry.
+pub(crate) fn record_served(peer: &PeerId, bytes: usize) {
+    let shard = &SERVED_PEERS[served_shard_index(peer)];
+    let bytes = bytes as u64;
+
+    // Fast path: peer already present — no structural change, shared lock only.
+    {
+        let guard = shard.entries.read();
+        if let Some((_, stats)) = guard.iter().find(|(p, _)| p == peer) {
+            stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+            stats.count.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
+    // Slow path: insert the new peer. Re-check under the write lock in case a
+    // racing writer added it between our read and write.
+    let mut guard = shard.entries.write();
+    if let Some((_, stats)) = guard.iter().find(|(p, _)| p == peer) {
+        stats.bytes.fetch_add(bytes, Ordering::Relaxed);
+        stats.count.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if guard.len() >= SERVED_SHARD_CAP {
+        // Evict the smallest-bytes entry; the peers we care about are the
+        // largest accumulators and are never the per-shard minimum.
+        if let Some((min_idx, _)) = guard
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, (_, s))| s.bytes.load(Ordering::Relaxed))
+        {
+            guard.swap_remove(min_idx);
+            SERVED_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    guard.push((
+        *peer,
+        PeerServeStats {
+            bytes: AtomicU64::new(bytes),
+            count: AtomicU64::new(1),
+        },
+    ));
+}
+
+/// Emit the cumulative top-K per-peer served-bytes summary (V2-684) as one INFO
+/// line, target `ant_node::replication::traffic`, on the same cadence as
+/// [`log_traffic_summary`].
+///
+/// The top 10 peers × 3 fields + `tracked_peers` + `evictions` = 32 fields,
+/// exactly the `tracing` per-event field cap, so it fits on one line. Peer IDs
+/// are full hex ([`PeerId::to_hex`]), matching the `claiming bootstrap` /
+/// `per-source pending cap` log lines so the two can be joined in Elasticsearch.
+/// Empty slots (fewer than 10 tracked peers) emit an empty id and zero counters
+/// to keep the ES field schema stable.
+pub(crate) fn log_served_peers_summary() {
+    // Snapshot every shard, then rank. Reads are relaxed and short-lived; a
+    // slightly skewed snapshot is fine because values are cumulative and
+    // compared as deltas at query time.
+    let mut all: Vec<(PeerId, u64, u64)> = Vec::new();
+    for shard in &SERVED_PEERS {
+        let guard = shard.entries.read();
+        for (peer, stats) in guard.iter() {
+            all.push((
+                *peer,
+                stats.bytes.load(Ordering::Relaxed),
+                stats.count.load(Ordering::Relaxed),
+            ));
+        }
+    }
+    let tracked_peers = all.len() as u64;
+    let evictions = SERVED_EVICTIONS.load(Ordering::Relaxed);
+
+    // Top-K by bytes served, descending.
+    all.sort_unstable_by_key(|(_, bytes, _)| std::cmp::Reverse(*bytes));
+
+    // Fixed slots keep the emitted field set stable regardless of how many peers
+    // are currently tracked.
+    let id = |n: usize| all.get(n).map(|(p, _, _)| p.to_hex()).unwrap_or_default();
+    let by = |n: usize| all.get(n).map_or(0, |(_, b, _)| *b);
+    let ct = |n: usize| all.get(n).map_or(0, |(_, _, c)| *c);
+
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        peer_1_id = %id(0), peer_1_bytes = by(0), peer_1_count = ct(0),
+        peer_2_id = %id(1), peer_2_bytes = by(1), peer_2_count = ct(1),
+        peer_3_id = %id(2), peer_3_bytes = by(2), peer_3_count = ct(2),
+        peer_4_id = %id(3), peer_4_bytes = by(3), peer_4_count = ct(3),
+        peer_5_id = %id(4), peer_5_bytes = by(4), peer_5_count = ct(4),
+        peer_6_id = %id(5), peer_6_bytes = by(5), peer_6_count = ct(5),
+        peer_7_id = %id(6), peer_7_bytes = by(6), peer_7_count = ct(6),
+        peer_8_id = %id(7), peer_8_bytes = by(7), peer_8_count = ct(7),
+        peer_9_id = %id(8), peer_9_bytes = by(8), peer_9_count = ct(8),
+        peer_10_id = %id(9), peer_10_bytes = by(9), peer_10_count = ct(9),
+        tracked_peers = tracked_peers,
+        evictions = evictions,
+        "replication served-peers summary (cumulative)"
     );
 }
 

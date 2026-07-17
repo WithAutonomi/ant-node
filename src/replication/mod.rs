@@ -1657,9 +1657,11 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
-    /// Periodically emit the cumulative per-variant replication traffic
-    /// summary (V2-623). Reads the process-global counter table maintained by
-    /// [`protocol::ReplicationMessage::encode`]/`decode`; needs no engine state.
+    /// Periodically emit the cumulative replication traffic summaries: the
+    /// per-variant line (V2-623) and the per-peer top-10 served-bytes line
+    /// (V2-684). Both read process-global counter tables maintained by the
+    /// encode/decode and serve choke points in [`protocol`]; needs no engine
+    /// state.
     fn start_traffic_summary_loop(&mut self) {
         let shutdown = self.shutdown.clone();
         let handle = tokio::spawn(async move {
@@ -1670,6 +1672,7 @@ impl ReplicationEngine {
                         TRAFFIC_SUMMARY_INTERVAL_SECS,
                     )) => {
                         protocol::log_traffic_summary();
+                        protocol::log_served_peers_summary();
                     }
                 }
             }
@@ -3286,6 +3289,18 @@ async fn send_replication_response_checked(
             return false;
         }
     };
+    // V2-684: per-peer served-bytes attribution for the heavy serve paths.
+    // `FetchResponse` + `SubtreeByteResponse` carry ~99% of served bytes;
+    // `NeighborSyncResponse` is included for completeness. Other response
+    // variants (verification/audit/commitment) are intentionally excluded.
+    if matches!(
+        msg.body,
+        ReplicationMessageBody::FetchResponse(_)
+            | ReplicationMessageBody::SubtreeByteResponse(_)
+            | ReplicationMessageBody::NeighborSyncResponse(_)
+    ) {
+        protocol::record_served(peer, encoded.len());
+    }
     let result = if let Some(msg_id) = rr_message_id {
         p2p_node
             .send_response(peer, REPLICATION_PROTOCOL_ID, msg_id, encoded)
