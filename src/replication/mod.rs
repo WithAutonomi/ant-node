@@ -512,6 +512,23 @@ impl FirstAuditScheduler {
         self.limiter.tokens
     }
 
+    /// Observability getter (see [`Self::pending_len`]). Milliseconds since the
+    /// signed quote timestamp of the oldest pin still awaiting a first audit:
+    /// how close the longest-waiting pending pin is to aging out of the
+    /// answerability window. A value climbing toward the window means pending
+    /// work is expiring unaudited instead of launching; a small, steady value
+    /// means the queue is draining promptly. Returns `0` when `pending` is empty
+    /// and saturates to `0` for a future-dated quote (clock skew), never panics.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    fn oldest_pending_quote_age_ms(&self, now: SystemTime) -> u64 {
+        self.pending
+            .iter()
+            .map(|(_, e)| e.quote_ts)
+            .min()
+            .and_then(|oldest| now.duration_since(oldest).ok())
+            .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
+    }
+
     fn has_reservation(&self) -> bool {
         self.reserved.is_some()
     }
@@ -1664,7 +1681,7 @@ impl ReplicationEngine {
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
@@ -1684,6 +1701,7 @@ impl ReplicationEngine {
                         observability.insufficient_keys.load(Ordering::Relaxed),
                         observability.outside_answerability_window.load(Ordering::Relaxed),
                         scheduler.pending_len(),
+                        scheduler.oldest_pending_quote_age_ms(SystemTime::now()),
                         observability.inflight.load(Ordering::Relaxed),
                         scheduler.tokens(),
                     );
@@ -6558,6 +6576,58 @@ mod tests {
         );
         assert!(scheduler.first_audited.is_empty());
         assert!(scheduler.limiter.recent.peek(&peer).is_none());
+    }
+
+    /// The oldest-pending-quote-age gauge reports the age of the OLDEST quote
+    /// still awaiting a first audit (not the newest), is `0` on an empty queue,
+    /// and saturates to `0` for a future-dated quote (clock skew) without
+    /// panicking. A climbing value is the pending-work-aging-out signal.
+    #[test]
+    fn first_audit_oldest_pending_quote_age_tracks_the_oldest() {
+        let now = SystemTime::now();
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        assert_eq!(
+            scheduler.oldest_pending_quote_age_ms(now),
+            0,
+            "empty pending -> zero"
+        );
+
+        // Two peers: quotes 10s and 2s old. The gauge must track the older.
+        for (peer_id, pin, secs) in [(1u8, [1; 32], 10u64), (2, [2; 32], 2)] {
+            let _ = coalesce_first_audit_event(
+                &mut scheduler.pending,
+                MonetizedPinEvent {
+                    peer: test_peer(peer_id),
+                    pin,
+                    key_count: 100,
+                    quote_ts: now - Duration::from_secs(secs),
+                },
+                true,
+            );
+        }
+        assert_eq!(
+            scheduler.oldest_pending_quote_age_ms(now),
+            10_000,
+            "tracks the oldest (10s), not the newest (2s)"
+        );
+
+        // A future-dated quote (clock skew) saturates to zero, never panics.
+        let mut skewed = FirstAuditScheduler::new(Instant::now());
+        let _ = coalesce_first_audit_event(
+            &mut skewed.pending,
+            MonetizedPinEvent {
+                peer: test_peer(3),
+                pin: [3; 32],
+                key_count: 100,
+                quote_ts: now + Duration::from_secs(5),
+            },
+            true,
+        );
+        assert_eq!(
+            skewed.oldest_pending_quote_age_ms(now),
+            0,
+            "future quote_ts saturates to zero"
+        );
     }
 
     /// A flood of strictly-lower-count same-peer nominations must neither
