@@ -1,6 +1,6 @@
 [package]
 name = "ant-node"
-version = "0.14.4"
+version = "0.14.5"
 edition = "2021"
 authors = ["David Irvine <david.irvine@maidsafe.net>"]
 description = "Pure quantum-proof network node for the Autonomi decentralized network"
@@ -42,7 +42,7 @@ mimalloc = "0.1"
 ant-protocol = "2.3.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.26.2"
+saorsa-core = "0.26.3"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
