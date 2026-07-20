@@ -97,7 +97,7 @@ async fn is_relevant(
 
 /// Admit neighbor-sync hints per Section 7.1 rules.
 ///
-/// Every key -- replica-hinted or paid-hinted -- passes the same [`is_relevant`]
+/// Every key -- replica-hinted or paid-hinted -- passes the same `is_relevant`
 /// gate. The hint set a key arrived on decides only whether the sender is
 /// recorded as claiming possession, which makes it a candidate fetch source; it
 /// does not decide admission, and it does not decide storage.
