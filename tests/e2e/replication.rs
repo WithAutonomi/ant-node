@@ -25,6 +25,7 @@ use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -1004,6 +1005,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: false,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1391,6 +1393,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     };
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1424,6 +1427,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -1445,6 +1449,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -1469,6 +1474,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);

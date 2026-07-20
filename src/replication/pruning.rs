@@ -311,6 +311,16 @@ struct PruneAuditReportState {
     bootstrap_abuse: RwLock<HashSet<PeerId>>,
 }
 
+#[derive(Clone, Copy)]
+struct PruneAuditContext<'a> {
+    storage: &'a Arc<LmdbStorage>,
+    p2p_node: &'a Arc<P2PNode>,
+    config: &'a ReplicationConfig,
+    sync_state: &'a Arc<RwLock<NeighborSyncState>>,
+    audit_challenge_coordinator: &'a Arc<AuditChallengeCoordinator>,
+    report_state: &'a PruneAuditReportState,
+}
+
 // ---------------------------------------------------------------------------
 // Prune pass
 // ---------------------------------------------------------------------------
@@ -1111,22 +1121,19 @@ async fn collect_record_prune_proofs(
     let max_keys_per_challenge =
         ReplicationConfig::responsible_audit_key_limit(local_stored_key_count);
     let report_state = PruneAuditReportState::default();
+    let audit_context = PruneAuditContext {
+        storage,
+        p2p_node,
+        config,
+        sync_state,
+        audit_challenge_coordinator,
+        report_state: &report_state,
+    };
     let mut requests = stream::iter(build_peer_audit_challenges(
         candidates,
         max_keys_per_challenge,
     ))
-    .map(|(peer, keys)| {
-        peer_proves_records(
-            peer,
-            keys,
-            storage,
-            p2p_node,
-            config,
-            sync_state,
-            audit_challenge_coordinator,
-            &report_state,
-        )
-    })
+    .map(|(peer, keys)| peer_proves_records(peer, keys, audit_context))
     .buffer_unordered(MAX_CONCURRENT_PRUNE_AUDIT_CHALLENGES);
 
     let mut present_by_key = HashMap::<XorName, HashSet<PeerId>>::new();
@@ -1366,12 +1373,7 @@ fn target_peers_reported_present(
 async fn peer_proves_records(
     peer: PeerId,
     keys: Vec<XorName>,
-    storage: &Arc<LmdbStorage>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
-    report_state: &PruneAuditReportState,
+    context: PruneAuditContext<'_>,
 ) -> Vec<(PeerId, XorName)> {
     let (challenge_id, nonce) = {
         let mut rng = rand::thread_rng();
@@ -1379,7 +1381,9 @@ async fn peer_proves_records(
     };
     let mut challenge_material = Vec::new();
     for key in keys {
-        if let Some(expected_digest) = local_record_digest(&peer, &key, &nonce, storage).await {
+        if let Some(expected_digest) =
+            local_record_digest(&peer, &key, &nonce, context.storage).await
+        {
             challenge_material.push((key, expected_digest));
         }
     }
@@ -1393,48 +1397,10 @@ async fn peer_proves_records(
     else {
         return Vec::new();
     };
-    let decoded = match send_prune_audit_challenge(
-        &peer,
-        encoded,
-        key_count,
-        p2p_node,
-        config,
-        audit_challenge_coordinator,
-    )
-    .await
-    {
-        PruneAuditChallengeResult::Response(decoded) => *decoded,
-        PruneAuditChallengeResult::NoResponse(class) => {
-            // No response means an immediate audit failure, but keep the local
-            // class split so timeout metrics are not polluted by pre-delivery
-            // failures.
-            audit_metrics::record_audit_no_response(AuditType::Prune, class);
-            for key in &challenge_keys {
-                if report_prune_audit_failure_once(
-                    &peer,
-                    key,
-                    p2p_node,
-                    config,
-                    report_state,
-                    Some(class),
-                )
-                .await
-                {
-                    break;
-                }
-            }
-            return Vec::new();
-        }
-        PruneAuditChallengeResult::MalformedResponse => {
-            for key in &challenge_keys {
-                if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state, None)
-                    .await
-                {
-                    break;
-                }
-            }
-            return Vec::new();
-        }
+    let Some(decoded) =
+        receive_prune_audit_response(&peer, &challenge_keys, encoded, key_count, context).await
+    else {
+        return Vec::new();
     };
 
     let statuses = prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
@@ -1453,10 +1419,10 @@ async fn peer_proves_records(
                 report_prune_bootstrap_claim(
                     &peer,
                     &key,
-                    p2p_node,
-                    config,
-                    sync_state,
-                    report_state,
+                    context.p2p_node,
+                    context.config,
+                    context.sync_state,
+                    context.report_state,
                 )
                 .await;
             }
@@ -1465,9 +1431,9 @@ async fn peer_proves_records(
                     && report_prune_audit_failure_once(
                         &peer,
                         &key,
-                        p2p_node,
-                        config,
-                        report_state,
+                        context.p2p_node,
+                        context.config,
+                        context.report_state,
                         None,
                     )
                     .await
@@ -1479,10 +1445,54 @@ async fn peer_proves_records(
     }
 
     if clear_bootstrap_claim {
-        clear_prune_bootstrap_claim(&peer, sync_state).await;
+        clear_prune_bootstrap_claim(&peer, context.sync_state).await;
     }
 
     proven
+}
+
+async fn receive_prune_audit_response(
+    peer: &PeerId,
+    challenge_keys: &[XorName],
+    encoded: Vec<u8>,
+    key_count: usize,
+    context: PruneAuditContext<'_>,
+) -> Option<ReplicationMessage> {
+    let result = send_prune_audit_challenge(
+        peer,
+        encoded,
+        key_count,
+        context.p2p_node,
+        context.config,
+        context.audit_challenge_coordinator,
+    )
+    .await;
+    let failure_class = match result {
+        PruneAuditChallengeResult::Response(decoded) => return Some(*decoded),
+        PruneAuditChallengeResult::NoResponse(class) => {
+            // Keep the local class split so timeout metrics are not polluted
+            // by failures that happened before delivery.
+            audit_metrics::record_audit_no_response(AuditType::Prune, class);
+            Some(class)
+        }
+        PruneAuditChallengeResult::MalformedResponse => None,
+    };
+
+    for key in challenge_keys {
+        if report_prune_audit_failure_once(
+            peer,
+            key,
+            context.p2p_node,
+            context.config,
+            context.report_state,
+            failure_class,
+        )
+        .await
+        {
+            break;
+        }
+    }
+    None
 }
 
 fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool {
