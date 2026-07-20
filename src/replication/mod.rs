@@ -6400,7 +6400,6 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::replication::types::KeyVerificationEvidence;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
