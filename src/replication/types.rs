@@ -752,10 +752,11 @@ pub struct BootstrapState {
     /// Keys discovered during bootstrap that are still in the verification /
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
-    /// Peers whose last bootstrap admission cycle had one or more hints
-    /// silently dropped at the `pending_verify` capacity bounds, mapped to
-    /// the most recent rejection time. Each entry represents "this source
-    /// still owes us at least one re-hinted key after the queues drain".
+    /// Peers whose last bootstrap admission unit had one or more hints either
+    /// rejected at capacity or displaced when another sender reclaimed a
+    /// borrowed slot, mapped to the most recent event time. Each entry means
+    /// "this source still owes us at least one re-hinted key after the queues
+    /// drain".
     /// `check_bootstrap_drained` refuses to claim the node fully drained
     /// while this map is non-empty: a source's presence is cleared by its
     /// next admission cycle that completes with zero capacity rejections

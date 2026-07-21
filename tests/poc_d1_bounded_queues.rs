@@ -14,11 +14,10 @@
 //!
 //! ## The fix
 //!
-//! `add_pending_verify` / `enqueue_fetch` reject once
-//! `MAX_PENDING_VERIFY` / `MAX_FETCH_QUEUE` is reached. Pending verification
-//! intentionally has no per-peer cap: legitimate peers may advertise a full
-//! store, and corroborated hints are prioritised by source count. Source
-//! provenance is retained so routing-table removal can discard orphaned hints.
+//! `add_pending_verify` / `enqueue_fetch` stay globally bounded. Pending
+//! verification uses elastic max-min sender accounting: one legitimate peer
+//! may borrow the whole queue when uncontended, but borrowed slots are
+//! reclaimed when another authenticated sender has work.
 //!
 //! The global limit is an emergency memory backstop, not the normal flow-control
 //! mechanism.
@@ -63,6 +62,12 @@ fn entry_from(sender: PeerId) -> VerificationEntry {
     }
 }
 
+fn paid_entry_from(sender: PeerId) -> VerificationEntry {
+    let mut entry = entry_from(sender);
+    entry.replica_hint_sources.clear();
+    entry
+}
+
 /// D1a — `pending_verify` is globally memory-bounded.
 #[test]
 fn poc_d1_pending_verify_is_globally_bounded() {
@@ -86,7 +91,73 @@ fn poc_d1_pending_verify_is_globally_bounded() {
     );
 }
 
-/// D1b — `fetch_queue` global memory backstop holds.
+/// D1b — the critical starvation regression: a peer that arrived first and
+/// filled the global queue must yield borrowed slots to a second sender.
+#[test]
+fn poc_d1_flooding_peer_cannot_starve_honest_peer() {
+    const HONEST_KEYS: u32 = 10_000;
+    let mut queues = ReplicationQueues::new();
+    let attacker = peer_id_from_byte(0xAA);
+    let honest = peer_id_from_byte(0xBB);
+
+    for i in 0..MAX_PENDING_VERIFY as u32 {
+        assert!(queues
+            .add_pending_verify(unique_xorname(i), paid_entry_from(attacker))
+            .admitted());
+    }
+
+    let mut honest_admitted = 0usize;
+    for i in 0..HONEST_KEYS {
+        if queues
+            .add_pending_verify(unique_xorname(10_000_000 + i), entry_from(honest))
+            .admitted()
+        {
+            honest_admitted += 1;
+        }
+    }
+
+    assert_eq!(honest_admitted, HONEST_KEYS as usize);
+    assert_eq!(queues.pending_count(), MAX_PENDING_VERIFY);
+    assert_eq!(
+        queues.pending_count_for_owner(&honest),
+        HONEST_KEYS as usize
+    );
+    assert_eq!(
+        queues.pending_count_for_owner(&attacker),
+        MAX_PENDING_VERIFY - HONEST_KEYS as usize
+    );
+}
+
+/// The same fair allocation is reached when the legitimate large snapshot
+/// arrives before the flood; fairness must not depend on first arrival.
+#[test]
+fn poc_d1_honest_work_is_not_evicted_below_its_demand() {
+    const HONEST_KEYS: u32 = 50_000;
+    let mut queues = ReplicationQueues::new();
+    let honest = peer_id_from_byte(0xBB);
+    let attacker = peer_id_from_byte(0xAA);
+
+    for i in 0..HONEST_KEYS {
+        assert!(queues
+            .add_pending_verify(unique_xorname(i), entry_from(honest))
+            .admitted());
+    }
+    for i in 0..MAX_PENDING_VERIFY as u32 {
+        queues.add_pending_verify(unique_xorname(10_000_000 + i), entry_from(attacker));
+    }
+
+    assert_eq!(queues.pending_count(), MAX_PENDING_VERIFY);
+    assert_eq!(
+        queues.pending_count_for_owner(&honest),
+        HONEST_KEYS as usize
+    );
+    assert_eq!(
+        queues.pending_count_for_owner(&attacker),
+        MAX_PENDING_VERIFY - HONEST_KEYS as usize
+    );
+}
+
+/// D1c — `fetch_queue` global memory backstop holds.
 #[test]
 fn poc_d1_fetch_queue_is_capacity_bounded() {
     let mut queues = ReplicationQueues::new();
@@ -106,21 +177,21 @@ fn poc_d1_fetch_queue_is_capacity_bounded() {
     assert_eq!(queues.fetch_queue_count(), MAX_FETCH_QUEUE);
 }
 
-/// D1c — a legitimate peer can advertise a large store without hitting an
+/// D1d — a legitimate peer can advertise a large store without hitting an
 /// arbitrary per-peer quota.
 #[test]
 fn poc_d1_large_single_peer_working_set_is_admitted() {
     let mut queues = ReplicationQueues::new();
     let peer = peer_id_from_byte(0xBB);
-    for i in 0..10_000u32 {
+    for i in 0..50_000u32 {
         assert!(queues
             .add_pending_verify(unique_xorname(i), entry_from(peer))
             .admitted());
     }
-    assert_eq!(queues.pending_count(), 10_000);
+    assert_eq!(queues.pending_count(), 50_000);
 }
 
-/// D1d — the bounds do not break legitimate small working sets or dedup.
+/// D1e — the bounds do not break legitimate small working sets or dedup.
 #[test]
 fn poc_d1_bound_preserves_legitimate_entries() {
     let mut queues = ReplicationQueues::new();
@@ -147,7 +218,7 @@ fn poc_d1_bound_preserves_legitimate_entries() {
     );
 }
 
-/// D1e — advancing an entry's state preserves its pipeline and membership.
+/// D1f — advancing an entry's state preserves its pipeline and membership.
 #[test]
 fn poc_d1_set_pending_state_preserves_entry() {
     let mut queues = ReplicationQueues::new();

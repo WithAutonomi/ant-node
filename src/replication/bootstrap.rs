@@ -122,10 +122,10 @@ pub async fn check_bootstrap_drained(
         return false;
     }
 
-    // Hints capacity-rejected at the pending_verify bounds during bootstrap
-    // must be re-delivered by the originating source before drain can be
-    // claimed; otherwise we'd silently mark ourselves complete with
-    // outstanding work the source still owes us.
+    // Hints rejected at capacity, or displaced when another sender reclaims a
+    // borrowed slot, must be re-delivered by the originating source before
+    // drain can be claimed; otherwise we'd silently mark ourselves complete
+    // with outstanding work the source still owes us.
     // Entries retire per-source as each source's next admission cycle
     // completes with zero rejections — see `clear_capacity_rejected` — or
     // expire once the source has been silent past the re-delivery TTL — see
@@ -145,7 +145,7 @@ pub async fn check_bootstrap_drained(
     }
 }
 
-/// Record that `source` had one or more hints capacity-rejected this cycle.
+/// Record that `source` had one or more hints rejected or displaced this cycle.
 ///
 /// Tracks each source's most recent rejection time, not a counter: a repeat
 /// rejection refreshes the timestamp. Bootstrap cannot drain while this
