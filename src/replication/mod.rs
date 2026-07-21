@@ -174,7 +174,7 @@ fn queue_first_audit_event(
 const RR_PREFIX: &str = "/rr/";
 
 fn fresh_offer_payment_context() -> VerificationContext {
-    VerificationContext::ClientPut
+    VerificationContext::FreshReplication
 }
 
 fn paid_notify_payment_context() -> VerificationContext {
@@ -2804,10 +2804,11 @@ async fn handle_fresh_offer(
     // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
     // part of the immediate write fan-out: this receiver is about to store the
     // record as if the client had PUT it here directly. Storage admission
-    // was checked above before proof work. ClientPut verification applies
-    // store-strength cache semantics, paid-quote issuer K-closeness checks
-    // for single-node proofs, and merkle candidate closeness for merkle
-    // proofs.
+    // was checked above before proof work. FreshReplication verification is
+    // identical to ClientPut — store-strength cache semantics, paid-quote
+    // issuer K-closeness checks for single-node proofs, merkle candidate
+    // closeness for merkle proofs, and the same price-floor policy — the
+    // distinct context only labels price-floor telemetry.
     match payment_verifier
         .verify_payment(
             &offer.key,
@@ -5591,11 +5592,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_offer_runs_client_put_payment_checks() {
-        assert_eq!(
-            fresh_offer_payment_context(),
-            VerificationContext::ClientPut
-        );
+    fn fresh_offer_runs_store_admission_payment_checks() {
+        let context = fresh_offer_payment_context();
+        assert_eq!(context, VerificationContext::FreshReplication);
+        // Fresh replication must keep verifying exactly like a direct client
+        // PUT (store-strength cache, same live checks); the variant only
+        // exists so price-floor telemetry can tell the two paths apart.
+        assert!(context.is_store_admission());
     }
 
     #[test]

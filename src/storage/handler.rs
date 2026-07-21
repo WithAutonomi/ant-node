@@ -170,11 +170,17 @@ impl AntProtocol {
     /// (the engine owns the [`ResponderCommitmentState`](crate::replication::commitment_state::ResponderCommitmentState)).
     /// Until this is wired, the quote generator has no commitment source and
     /// falls back to baseline (no-pin) pricing.
+    ///
+    /// The same source is forwarded to the payment verifier's price-floor
+    /// policy (read-only snapshot), so this node's quotes and its floor are
+    /// priced from one commitment by construction.
     pub fn attach_commitment_source(
         &self,
         source: Arc<dyn crate::payment::quote::CommitmentSource>,
     ) {
-        self.quote_generator.attach_commitment_source(source);
+        self.quote_generator
+            .attach_commitment_source(Arc::clone(&source));
+        self.payment_verifier.attach_local_commitment_source(source);
     }
 
     /// ADR-0004: return the proof with any commitment sidecars stripped, so a
@@ -401,11 +407,15 @@ impl AntProtocol {
             Ok(_) => {
                 let content_len = request.content.len();
                 info!("Stored chunk {addr_hex} ({content_len} bytes)");
-                // Bump the in-memory fallback counter. Both pricing and the
-                // paid-quote floor now read LmdbStorage::current_chunks() directly,
-                // so this counter only matters when no storage is attached
-                // (unit tests / mis-configured startup). Kept warm so that
-                // fallback path stays roughly accurate.
+                // Bump the in-memory fallback record counter. Under ADR-0004
+                // neither pricing nor the receiver-side price floor reads this
+                // counter: both are bound to the live storage commitment
+                // (committed responsible key count), pricing via the quote
+                // generator's commitment source and the floor via the
+                // verifier's non-mutating snapshot of the same commitment. The
+                // counter only matters as a warm fallback surface when no
+                // commitment source is attached (unit tests / pre-replication
+                // startup).
                 self.quote_generator.record_store();
 
                 // 7. Notify replication engine for fresh fan-out.
@@ -753,6 +763,7 @@ mod tests {
             cache_capacity: 100_000,
             close_group_size: crate::ant_protocol::CLOSE_GROUP_SIZE,
             local_rewards_address: rewards_address,
+            price_floor: crate::payment::PriceFloorConfig::default(),
         };
         let payment_verifier = Arc::new(PaymentVerifier::new(payment_config));
         let metrics_tracker = QuotingMetricsTracker::new(100);

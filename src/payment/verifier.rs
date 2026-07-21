@@ -60,6 +60,111 @@ const PAYMENT_VERIFY_SLOW_LOG_MS: u128 = 500;
 /// This is the Kademlia K width, intentionally wider than `CLOSE_GROUP_SIZE`.
 const PAID_QUOTE_ISSUER_CLOSENESS_WIDTH: usize = K_BUCKET_SIZE;
 
+/// Default tolerance for the receiver-side price floor, as a percentage of
+/// this node's own commitment-bound price. 50% is deliberately loose: it
+/// blocks the egregious cheapest-of-K underpayment while leaving wide headroom
+/// for honest commitment divergence across a close group (rotation windows,
+/// churned responsibility sets, baseline-priced fresh nodes). Tighten only
+/// from observed shadow telemetry, never speculatively.
+const PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT: u64 = 50;
+
+/// Environment variable enabling price-floor ENFORCEMENT (`1`/`true`).
+///
+/// Absent or any other value means shadow mode: the floor is computed and
+/// logged, never enforced. Per-node so enforcement can roll out canary-first;
+/// unsetting it (and restarting) is the kill switch.
+pub const PRICE_FLOOR_ENFORCE_ENV: &str = "ANT_PRICE_FLOOR_ENFORCE";
+
+/// Environment variable overriding the price-floor tolerance percentage
+/// (`0..=100`). Invalid or absent values use the default.
+pub const PRICE_FLOOR_TOLERANCE_ENV: &str = "ANT_PRICE_FLOOR_TOLERANCE_PERCENT";
+
+/// Receiver-side price floor for single-node store admissions.
+///
+/// ADR-0004 gives every quote a price CEILING (`price ==
+/// calculate_price(committed_key_count)`), but a ceiling is not a revenue
+/// floor: a modified client can fetch quotes from the whole neighbourhood and
+/// settle only the cheapest valid one in a 1-quote proof. This policy is the
+/// floor half: the settled amount must also clear this receiver's own
+/// commitment-bound price, scaled by a tolerance.
+///
+/// The floor is computed from the SAME live commitment the local
+/// `QuoteGenerator` prices from (the committed responsible key count), never
+/// from the raw on-disk record count — comparing unlike counts is what made
+/// the pre-ADR-0004 floor false-reject honest quotes.
+///
+/// Rollout is shadow-first: with `enforce == false` (the default) the floor
+/// is evaluated and logged on every single-node store admission but never
+/// rejects. Enforcement is enabled per node via [`PRICE_FLOOR_ENFORCE_ENV`]
+/// for canary rollout. A floor rejection is an economic admission decision
+/// only — it must never feed trust/misbehaviour scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PriceFloorConfig {
+    /// When true, a below-floor settled payment is rejected. When false
+    /// (default), the verifier only logs would-reject telemetry.
+    pub enforce: bool,
+    /// Floor as a percentage of the local commitment-bound price (`0..=100`).
+    pub tolerance_percent: u64,
+}
+
+impl Default for PriceFloorConfig {
+    fn default() -> Self {
+        Self {
+            enforce: false,
+            tolerance_percent: PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT,
+        }
+    }
+}
+
+impl PriceFloorConfig {
+    /// Build from the environment (see [`PRICE_FLOOR_ENFORCE_ENV`] and
+    /// [`PRICE_FLOOR_TOLERANCE_ENV`]). Never panics.
+    ///
+    /// An unset tolerance uses the default. A tolerance that is *present but
+    /// invalid* (unparseable or `> 100`) is an operator error: rather than
+    /// silently enforce at the default, this **fails closed to shadow mode**
+    /// (`enforce = false`) and logs a prominent error, so a fat-fingered
+    /// tolerance can never enforce an unintended floor against real payments.
+    #[must_use]
+    pub fn from_env() -> Self {
+        let enforce_requested = std::env::var(PRICE_FLOOR_ENFORCE_ENV)
+            .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"));
+
+        let tolerance_raw = std::env::var(PRICE_FLOOR_TOLERANCE_ENV).ok();
+        let valid_tolerance = tolerance_raw
+            .as_deref()
+            .map(str::trim)
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|percent| *percent <= 100);
+        // A tolerance that is set but does not parse to `0..=100` is an operator
+        // error. Fail CLOSED: never enforce a tolerance the operator did not
+        // actually specify.
+        let tolerance_present_but_invalid = tolerance_raw.is_some() && valid_tolerance.is_none();
+
+        if tolerance_present_but_invalid {
+            if enforce_requested {
+                crate::logging::error!(
+                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
+                     refusing to enforce the price floor with an unspecified tolerance. \
+                     Price-floor enforcement DISABLED (shadow mode). Fix the value and restart \
+                     to enable enforcement."
+                );
+            } else {
+                crate::logging::warn!(
+                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
+                     using the default {PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT}% for shadow-mode \
+                     telemetry."
+                );
+            }
+        }
+
+        Self {
+            enforce: enforce_requested && !tolerance_present_but_invalid,
+            tolerance_percent: valid_tolerance.unwrap_or(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LegacyMedianCandidate<'a> {
     encoded_peer_id: &'a evmlib::EncodedPeerId,
@@ -116,15 +221,28 @@ pub struct PaymentVerifierConfig {
     /// Kept in the verifier config for payment policies that bind receipts to
     /// this node's payout address.
     pub local_rewards_address: RewardsAddress,
+    /// Receiver-side price floor policy (shadow mode by default).
+    pub price_floor: PriceFloorConfig,
 }
 
 /// The fresh admission path a payment proof is being verified for.
 ///
-/// - **`ClientPut`** — the node is admitting a chunk store. The verifier
-///   applies store-strength cache semantics and live payment checks.
+/// - **`ClientPut`** — the node is admitting a chunk store from a direct
+///   client PUT. The verifier applies store-strength cache semantics and live
+///   payment checks.
+/// - **`FreshReplication`** — the node is admitting a chunk store via the
+///   immediate fresh-write fan-out. The receiver is about to store the newly
+///   written chunk as if the client PUT it there directly, so this context is
+///   verified EXACTLY like `ClientPut` (store-strength cache semantics, same
+///   live checks, same price-floor policy). It exists as a separate variant so
+///   price-floor telemetry can distinguish direct ingress from fan-out — the
+///   two paths can legitimately diverge during commitment rotation, and the
+///   floor policy for fan-out must be tunable from observed data without
+///   touching direct-PUT behaviour.
 /// - **`PaidListAdmission`** — the node is admitting fresh paid-list metadata.
-///   It runs the same live payment checks as `ClientPut`, but writes a weaker
-///   cache entry that does not authorize future chunk stores.
+///   It runs the same live payment checks, but writes a weaker cache entry
+///   that does not authorize future chunk stores. The price floor never
+///   applies here: paid-list records reprice no fresh economic decision.
 ///
 /// The caller must check local receiver/admission membership before invoking
 /// the verifier for replication admission: fresh chunk replication requires
@@ -134,21 +252,33 @@ pub struct PaymentVerifierConfig {
 /// payment proof validity and that the paid quote's issuer is in the K closest
 /// peers for the quoted chunk address.
 ///
-/// Immediate fresh chunk replication is different: the receiver is about to
-/// store the newly written chunk as if the client PUT it there directly, so
-/// that call site deliberately uses `ClientPut`.
-///
 /// Later neighbour-sync repair does not include proof-of-payment bytes and
 /// does not call this verifier. It authorizes repair from network evidence:
 /// majority storage among the configured close group, or majority paid-list
 /// membership among the closest K.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerificationContext {
-    /// The node is admitting a chunk store with store-strength cache semantics.
+    /// The node is admitting a chunk store from a direct client PUT, with
+    /// store-strength cache semantics.
     ClientPut,
+    /// The node is admitting a chunk store via immediate fresh replication —
+    /// verified identically to `ClientPut`, split out for price-floor
+    /// telemetry and policy.
+    FreshReplication,
     /// The node is admitting fresh paid-list metadata with paid-list-strength
     /// cache semantics.
     PaidListAdmission,
+}
+
+impl VerificationContext {
+    /// True for contexts that admit chunk BYTES with store-strength cache
+    /// semantics: direct client PUT and immediate fresh replication. These two
+    /// are verified identically everywhere — the only policy that reads the
+    /// variant itself (rather than this predicate) is price-floor telemetry.
+    #[must_use]
+    pub fn is_store_admission(self) -> bool {
+        matches!(self, Self::ClientPut | Self::FreshReplication)
+    }
 }
 
 /// Status returned by payment verification.
@@ -248,11 +378,15 @@ pub struct PaymentVerifier {
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
     /// live-DHT checks; production startup MUST call [`attach_p2p_node`].
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
-    /// LMDB storage handle, attached post-construction so the paid-quote
-    /// price-floor check can read the authoritative on-disk record count without
-    /// depending on a side counter that may drift from replication/repair/prune
-    /// paths. `None` in unit tests that pre-set [`Self::test_records_override`];
-    /// production startup MUST call [`attach_storage`].
+    /// LMDB storage handle, attached post-construction. Retained for
+    /// store-backed verifier checks that need the authoritative on-disk record
+    /// count without depending on a side counter that may drift from
+    /// replication/repair/prune paths. NOTE: the ADR-0006 price floor does NOT
+    /// read this — it is bound to the live storage commitment via
+    /// [`Self::local_commitment_source`], not the on-disk count (the old floor
+    /// compared unlike counts and false-rejected honest quotes). `None` in unit
+    /// tests that don't exercise store-backed checks; production wires it via
+    /// [`Self::attach_storage`].
     storage: RwLock<Option<Arc<LmdbStorage>>>,
     /// Test-only override for the paid-quote issuer K-closest check.
     ///
@@ -290,6 +424,18 @@ pub struct PaymentVerifier {
     /// pre-replication startup), in which case no first audit is scheduled.
     monetized_pin_tx:
         RwLock<Option<tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>>>,
+    /// Price-floor input: the SAME live commitment source the local
+    /// `QuoteGenerator` prices from, read via the non-mutating snapshot so the
+    /// floor never extends commitment answerability. `None` until
+    /// [`Self::attach_local_commitment_source`] (unit tests, or storage
+    /// disabled / pre-replication startup) — the floor then evaluates against
+    /// the baseline price, which makes it vacuous rather than outage-inducing.
+    local_commitment_source: RwLock<Option<Arc<dyn crate::payment::quote::CommitmentSource>>>,
+    /// Live price-floor policy, initialized from
+    /// [`PaymentVerifierConfig::price_floor`]. Behind a lock so tests (and any
+    /// future ops surface) can flip enforcement without rebuilding the
+    /// verifier.
+    price_floor: RwLock<PriceFloorConfig>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -417,6 +563,8 @@ impl PaymentVerifier {
                     .unwrap_or(NonZeroUsize::MIN),
             ))),
             monetized_pin_tx: RwLock::new(None),
+            local_commitment_source: RwLock::new(None),
+            price_floor: RwLock::new(config.price_floor),
             config,
         }
     }
@@ -466,16 +614,45 @@ impl PaymentVerifier {
         self.config.close_group_size
     }
 
-    /// Attach the node's [`LmdbStorage`] handle so paid-quote price-floor
-    /// checks can query the authoritative on-disk record count.
+    /// Attach the node's [`LmdbStorage`] handle for store-backed verifier
+    /// checks that read the authoritative on-disk record count.
     ///
-    /// Production startup MUST call this once the storage exists; otherwise
-    /// client PUTs using paid-quote verification are rejected because
-    /// the local economic floor cannot be checked. Idempotent: calling twice
-    /// replaces the handle.
+    /// NOTE: the ADR-0006 price floor does NOT depend on this handle — it is
+    /// priced from the live storage commitment ([`Self::attach_local_commitment_source`]),
+    /// and a missing commitment prices the floor at baseline rather than
+    /// rejecting. So a node without storage attached still admits PUTs; this
+    /// attachment only feeds any current/future store-count-backed checks.
+    /// Idempotent: calling twice replaces the handle.
     pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
         *self.storage.write() = Some(storage);
         debug!("PaymentVerifier: LmdbStorage attached for paid-quote price-floor checks");
+    }
+
+    /// Attach the live commitment source for the price floor: the SAME
+    /// `ResponderCommitmentState` the local `QuoteGenerator` prices from, so
+    /// the floor and this node's own quotes read one pricing basis by
+    /// construction. Read via the non-mutating snapshot only. Idempotent.
+    /// Absent (unit tests, storage disabled, pre-replication startup), the
+    /// floor evaluates against the baseline price — vacuous, never an outage.
+    pub fn attach_local_commitment_source(
+        &self,
+        source: Arc<dyn crate::payment::quote::CommitmentSource>,
+    ) {
+        *self.local_commitment_source.write() = Some(source);
+        debug!("PaymentVerifier: local commitment source attached for price-floor checks");
+    }
+
+    /// The live price-floor policy this verifier applies.
+    #[must_use]
+    pub fn price_floor_config(&self) -> PriceFloorConfig {
+        *self.price_floor.read()
+    }
+
+    /// Test-only setter for the price-floor policy, so enforcement and
+    /// tolerance can be exercised without environment variables.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_price_floor_for_tests(&self, config: PriceFloorConfig) {
+        *self.price_floor.write() = config;
     }
 
     /// Test-only setter for local closest peers used by the paid-quote
@@ -514,9 +691,10 @@ impl PaymentVerifier {
     /// 1. Check LRU cache (fast path)
     /// 2. If not cached, payment is required
     ///
-    /// The fast path is context-aware. A `ClientPut` lookup is satisfied only
-    /// by a close-group store verification. A `PaidListAdmission` lookup is
-    /// satisfied by either a paid-list or client-PUT verification.
+    /// The fast path is context-aware. A store-admission lookup (`ClientPut` /
+    /// `FreshReplication`) is satisfied only by a close-group store
+    /// verification. A `PaidListAdmission` lookup is satisfied by either a
+    /// paid-list or client-PUT verification.
     ///
     /// # Arguments
     ///
@@ -533,11 +711,10 @@ impl PaymentVerifier {
         context: VerificationContext,
     ) -> PaymentStatus {
         // Check LRU cache (fast path)
-        let cached = match context {
-            VerificationContext::ClientPut => self.cache.contains_client_put_verified(xorname),
-            VerificationContext::PaidListAdmission => {
-                self.cache.contains_paid_list_verified(xorname)
-            }
+        let cached = if context.is_store_admission() {
+            self.cache.contains_client_put_verified(xorname)
+        } else {
+            self.cache.contains_paid_list_verified(xorname)
         };
         if cached {
             if crate::logging::enabled!(crate::logging::Level::DEBUG) {
@@ -695,11 +872,10 @@ impl PaymentVerifier {
                     // Cache the verified xorname at the context's verification
                     // strength. Stronger entries satisfy weaker future lookups,
                     // but not the reverse.
-                    match context {
-                        VerificationContext::ClientPut => self.cache.insert(*xorname),
-                        VerificationContext::PaidListAdmission => {
-                            self.cache.insert_paid_list_verified(*xorname);
-                        }
+                    if context.is_store_admission() {
+                        self.cache.insert(*xorname);
+                    } else {
+                        self.cache.insert_paid_list_verified(*xorname);
                     }
 
                     Ok(PaymentStatus::PaymentVerified)
@@ -796,22 +972,25 @@ impl PaymentVerifier {
         Self::validate_quote_arithmetic(payment)?;
         let candidates = Self::legacy_median_candidates(payment)?;
         let mut failures = Vec::with_capacity(candidates.len());
-        let mut verified_paid_quote = false;
+        // The paid (median) price and settled on-chain amount of the winning
+        // candidate, kept for the receiver-side price-floor policy below.
+        let mut verified_paid_quote: Option<(Amount, Amount)> = None;
 
         for candidate in candidates {
+            let paid_price = candidate.quote.price;
             match self
                 .verify_legacy_median_candidate(xorname, candidate)
                 .await
             {
-                Ok(()) => {
-                    verified_paid_quote = true;
+                Ok(settled_amount) => {
+                    verified_paid_quote = Some((paid_price, settled_amount));
                     break;
                 }
                 Err(err) => failures.push(err.to_string()),
             }
         }
 
-        if !verified_paid_quote {
+        let Some((paid_price, settled_amount)) = verified_paid_quote else {
             let xorname_hex = hex::encode(xorname);
             let details = if failures.is_empty() {
                 "no median-priced candidates were available".to_string()
@@ -821,7 +1000,14 @@ impl PaymentVerifier {
             return Err(Error::Payment(format!(
                 "Median quote payment verification failed for {xorname_hex}: {details}"
             )));
-        }
+        };
+
+        // Receiver-side price floor (single-node store admissions only). Runs
+        // AFTER the paid quote's signature and settlement verified above, so
+        // unauthenticated bundles can never poison floor telemetry. Shadow
+        // mode logs; enforcement rejects — an economic admission decision
+        // only, never trust/misbehaviour evidence.
+        self.enforce_price_floor(xorname, paid_price, settled_amount, context)?;
 
         // ADR-0004 observe-only telemetry: log off-curve quotes only AFTER the
         // paid (median) quote's ML-DSA-65 signature has verified above, so
@@ -829,11 +1015,13 @@ impl PaymentVerifier {
         // `validate_quote_arithmetic` already rejected; this is a no-op there.
         Self::log_off_curve_single_node(payment);
 
-        // ADR-0004 cross-check + first-audit enqueue (ClientPut only) runs ONLY
-        // after on-chain payment verification has SUCCEEDED above, so an unpaid
-        // (but signed) bundle can never enqueue audits or drive pin fetches —
-        // closing the free-amplification path. Fresh client-put bundles only.
-        if context == VerificationContext::ClientPut {
+        // ADR-0004 cross-check + first-audit enqueue (store admissions only —
+        // direct client PUT and immediate fresh replication, exactly the paths
+        // that previously verified under `ClientPut`) runs ONLY after on-chain
+        // payment verification has SUCCEEDED above, so an unpaid (but signed)
+        // bundle can never enqueue audits or drive pin fetches — closing the
+        // free-amplification path.
+        if context.is_store_admission() {
             self.cross_check_quotes(payment, commitment_sidecars).await;
         }
 
@@ -887,11 +1075,16 @@ impl PaymentVerifier {
             .collect())
     }
 
+    /// Fully validate one median-priced candidate. On success returns the
+    /// settled on-chain amount for the candidate's quote hash, which the
+    /// price-floor policy compares against the receiver's own commitment
+    /// price (the settled amount, not the quoted price, so an honest client
+    /// may overpay a cheap quote to clear stricter receivers).
     async fn verify_legacy_median_candidate(
         &self,
         xorname: &XorName,
         candidate: LegacyMedianCandidate<'_>,
-    ) -> Result<()> {
+    ) -> Result<Amount> {
         Self::validate_paid_quote_content(xorname, candidate)?;
         let issuer_peer_id =
             Self::validate_paid_quote_peer_binding(candidate.encoded_peer_id, candidate.quote)?;
@@ -905,13 +1098,86 @@ impl PaymentVerifier {
             .completed_payment_amount(candidate.quote.hash())
             .await?;
         if on_chain_amount >= candidate.expected_amount {
-            return Ok(());
+            return Ok(on_chain_amount);
         }
 
         Err(Error::Payment(format!(
             "Median-priced quote for peer {:?} was not paid enough: expected at least {}, got {on_chain_amount}",
             candidate.encoded_peer_id, candidate.expected_amount
         )))
+    }
+
+    /// Receiver-side price floor for single-node store admissions.
+    ///
+    /// Requires the settled on-chain amount to also clear
+    /// `PAID_QUOTE_PAYMENT_MULTIPLIER × tolerance% × calculate_price(local
+    /// committed responsible key count)` — the same pricing basis this node's
+    /// own quotes use, never the raw on-disk record count (whose divergence
+    /// from commitment counts is what false-rejected honest quotes under the
+    /// pre-ADR-0004 floor). Together with the per-quote check above, the
+    /// effective rule is `settled >= 3 × max(paid_price, tolerated_floor)`.
+    ///
+    /// No live current commitment — fresh node, retired commitment, restart
+    /// window, or nothing attached — prices the floor at baseline
+    /// (`calculate_price(0)`). For any on-curve quote (`price ==
+    /// calculate_price(n)`, `n >= 0`) an honest 3× settlement then clears the
+    /// baseline floor, so a no-commitment receiver never rejects honest
+    /// traffic. (A settlement priced *below* baseline could still be rejected
+    /// against it — but that only arises from an off-curve quote, which the
+    /// ADR-0004 arithmetic gate rejects outright once enforced; economically it
+    /// is a decline, not an availability regression.)
+    ///
+    /// Always emits one telemetry line per evaluated admission (target
+    /// `ant_node::payment::price_floor`) so shadow mode measures the exact
+    /// rejections enforcement would cause. Rejects only when
+    /// [`PriceFloorConfig::enforce`] is set.
+    fn enforce_price_floor(
+        &self,
+        xorname: &XorName,
+        paid_price: Amount,
+        settled_amount: Amount,
+        context: VerificationContext,
+    ) -> Result<()> {
+        if !context.is_store_admission() {
+            return Ok(());
+        }
+
+        let floor = *self.price_floor.read();
+        let source = self.local_commitment_source.read().as_ref().map(Arc::clone);
+        let local_key_count = source
+            .and_then(|s| s.current_binding_snapshot())
+            .map_or(0u32, |binding| binding.key_count);
+        let local_price = calculate_price(usize::try_from(local_key_count).unwrap_or(usize::MAX));
+
+        // Amount is a U256: local_price is bounded by the saturating pricing
+        // curve and the multipliers are <= 300, so this arithmetic cannot
+        // overflow; saturating keeps that a proof instead of an assumption.
+        let tolerance_percent = floor.tolerance_percent.min(100);
+        let tolerated_price =
+            local_price.saturating_mul(Amount::from(tolerance_percent)) / Amount::from(100u64);
+        let required_amount =
+            tolerated_price.saturating_mul(Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER));
+        let below_floor = settled_amount < required_amount;
+
+        info!(
+            target: "ant_node::payment::price_floor",
+            "Price floor: context={context:?}, xorname={}, paid_price={paid_price}, \
+             settled={settled_amount}, local_key_count={local_key_count}, \
+             local_price={local_price}, tolerance_percent={tolerance_percent}, \
+             required={required_amount}, below_floor={below_floor}, enforce={}",
+            hex::encode(xorname),
+            floor.enforce,
+        );
+
+        if below_floor && floor.enforce {
+            return Err(Error::Payment(format!(
+                "Settled payment {settled_amount} is below this node's price floor \
+                 {required_amount} ({PAID_QUOTE_PAYMENT_MULTIPLIER}x {tolerance_percent}% of \
+                 local commitment price {local_price}, committed key count {local_key_count})"
+            )));
+        }
+
+        Ok(())
     }
 
     fn validate_paid_quote_content(
@@ -2461,8 +2727,10 @@ impl PaymentVerifier {
         // ADR-0004: route the merkle-batch candidates through the SAME
         // cross-check + first-audit funnel as single-node quotes, AFTER on-chain
         // verification has succeeded (so an unpaid pool cannot drive audits or
-        // fetches). ClientPut only — a replication receipt's pins have aged out.
-        if context == VerificationContext::ClientPut {
+        // fetches). Store admissions only (direct PUT + immediate fresh
+        // replication, the paths that previously verified under `ClientPut`) —
+        // a paid-list receipt's pins have aged out.
+        if context.is_store_admission() {
             self.cross_check_merkle_candidates(
                 &merkle_proof.winner_pool,
                 &merkle_proof.commitment_sidecars,
@@ -2572,6 +2840,7 @@ mod tests {
             cache_capacity: 100,
             close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            price_floor: PriceFloorConfig::default(),
         };
         PaymentVerifier::new(config)
     }
@@ -2995,6 +3264,243 @@ mod tests {
             result.expect("single paid quote should verify"),
             PaymentStatus::PaymentVerified
         );
+    }
+
+    /// Fixed-count [`crate::payment::quote::CommitmentSource`] standing in for
+    /// the receiver's live commitment state in price-floor tests.
+    struct FixedFloorSource {
+        key_count: u32,
+    }
+
+    impl crate::payment::quote::CommitmentSource for FixedFloorSource {
+        fn current_binding_for_quote(&self) -> Option<crate::payment::quote::QuoteBinding> {
+            self.current_binding_snapshot()
+        }
+
+        fn current_binding_snapshot(&self) -> Option<crate::payment::quote::QuoteBinding> {
+            Some(crate::payment::quote::QuoteBinding {
+                key_count: self.key_count,
+                pin: [0u8; 32],
+            })
+        }
+
+        fn commitment_blob_for_pin(&self, _pin: [u8; 32]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    /// Receiver commitment count for floor tests, chosen so the local price is
+    /// comfortably more than double the baseline (the 50% floor then rejects a
+    /// baseline-priced settlement). Asserted in each test so a pricing-curve
+    /// change fails loudly instead of silently weakening the tests.
+    const FLOOR_TEST_LOCAL_KEY_COUNT: u32 = 1_000_000;
+
+    fn floor_test_verifier(enforce: bool) -> PaymentVerifier {
+        let verifier = create_test_verifier();
+        verifier.attach_local_commitment_source(Arc::new(FixedFloorSource {
+            key_count: FLOOR_TEST_LOCAL_KEY_COUNT,
+        }));
+        verifier.set_price_floor_for_tests(PriceFloorConfig {
+            enforce,
+            tolerance_percent: PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT,
+        });
+        let local_price = price_at_records(FLOOR_TEST_LOCAL_KEY_COUNT as usize);
+        assert!(
+            local_price > price_at_records(0) * Amount::from(2u64),
+            "floor tests need a local price above twice baseline, got {local_price}"
+        );
+        verifier
+    }
+
+    /// The settled amount the floor requires: 3x the tolerated fraction of the
+    /// receiver's own commitment-bound price.
+    fn floor_required_amount() -> Amount {
+        let tolerated = price_at_records(FLOOR_TEST_LOCAL_KEY_COUNT as usize)
+            * Amount::from(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT)
+            / Amount::from(100u64);
+        tolerated * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER)
+    }
+
+    /// One cheap (baseline-priced) quote paid `settled`: the cheapest-of-K
+    /// omission shape a modified client can always produce.
+    fn cheap_single_quote_proof(
+        verifier: &PaymentVerifier,
+        xorname: XorName,
+        settled: Amount,
+    ) -> Vec<u8> {
+        let (peer_id, quote) = make_signed_quote(xorname, price_at_records(0), 1);
+        let peer_quotes = vec![(peer_id, quote.clone())];
+        mark_k_closest_paid_candidates(verifier, &peer_quotes);
+        mark_candidate_paid(verifier, &quote, settled);
+        serialize_proof(peer_quotes)
+    }
+
+    #[test]
+    fn store_admission_contexts_cover_puts_and_fresh_replication_only() {
+        assert!(VerificationContext::ClientPut.is_store_admission());
+        assert!(VerificationContext::FreshReplication.is_store_admission());
+        assert!(!VerificationContext::PaidListAdmission.is_store_admission());
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_shadow_mode_accepts_below_floor_settlement() {
+        let verifier = floor_test_verifier(false);
+        let xorname = [0xC1u8; 32];
+        let settled = price_at_records(0) * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER);
+        assert!(settled < floor_required_amount());
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
+
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("shadow mode must never reject on the floor"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_enforced_rejects_cheapest_of_k_settlement() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xC2u8; 32];
+        let settled = price_at_records(0) * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER);
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err("a 3x-baseline settlement must not clear a fuller receiver's floor");
+
+        assert!(
+            format!("{err}").contains("below this node's price floor"),
+            "Error should name the price floor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_enforced_accepts_exactly_at_floor_overpayment() {
+        // An honest client may OVERPAY a cheap quote to clear stricter
+        // receivers: the floor compares the settled amount, not the quote
+        // price, and exactly-at-floor must pass.
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xC3u8; 32];
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, floor_required_amount());
+
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("an exactly-at-floor settlement must pass"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_enforced_applies_to_fresh_replication() {
+        // Fresh replication is the same fresh economic event as a direct PUT;
+        // exempting it would let one cheap accepting node fan the proof out
+        // around every other storer's floor.
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xC4u8; 32];
+        let settled = price_at_records(0) * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER);
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
+
+        let err = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::FreshReplication,
+            )
+            .await
+            .expect_err("fresh replication must enforce the same floor as direct PUTs");
+
+        assert!(
+            format!("{err}").contains("below this node's price floor"),
+            "Error should name the price floor: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_never_reprices_paid_list_admission() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xC5u8; 32];
+        let settled = price_at_records(0) * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER);
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&proof_bytes),
+                VerificationContext::PaidListAdmission,
+            )
+            .await;
+
+        assert_eq!(
+            result.expect("paid-list admission reprices no fresh economic decision"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    #[tokio::test]
+    async fn test_price_floor_enforced_without_commitment_prices_baseline() {
+        // No live commitment (fresh node, retired, restart window, or nothing
+        // attached) must price the floor at baseline — a vacuous floor, never
+        // an outage: an honest 3x-baseline settlement always clears it.
+        let verifier = create_test_verifier();
+        verifier.set_price_floor_for_tests(PriceFloorConfig {
+            enforce: true,
+            tolerance_percent: PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT,
+        });
+        let xorname = [0xC6u8; 32];
+        let settled = price_at_records(0) * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER);
+        let proof_bytes = cheap_single_quote_proof(&verifier, xorname, settled);
+
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect("a baseline floor must accept an honest baseline settlement"),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// `from_env` must fail CLOSED: a present-but-invalid tolerance can never
+    /// leave enforcement on with a tolerance the operator did not specify.
+    /// (This test owns the `PRICE_FLOOR_*` env vars — no other test reads them.)
+    #[test]
+    fn price_floor_from_env_fails_closed_on_invalid_tolerance() {
+        // Defaults with nothing set.
+        std::env::remove_var(PRICE_FLOOR_ENFORCE_ENV);
+        std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
+        let cfg = PriceFloorConfig::from_env();
+        assert!(!cfg.enforce);
+        assert_eq!(cfg.tolerance_percent, PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT);
+
+        // Enforce on, valid tolerance: honoured.
+        std::env::set_var(PRICE_FLOOR_ENFORCE_ENV, "1");
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "80");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(cfg.enforce);
+        assert_eq!(cfg.tolerance_percent, 80);
+
+        // Enforce on, out-of-range tolerance: enforcement DISABLED (fail closed).
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "150");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(
+            !cfg.enforce,
+            "an out-of-range tolerance must not silently enforce a default"
+        );
+
+        // Enforce on, unparseable tolerance: also disabled.
+        std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "loose");
+        let cfg = PriceFloorConfig::from_env();
+        assert!(!cfg.enforce);
+
+        std::env::remove_var(PRICE_FLOOR_ENFORCE_ENV);
+        std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
     }
 
     #[tokio::test]
@@ -3758,6 +4264,7 @@ mod tests {
 
         for context in [
             VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
@@ -3797,6 +4304,7 @@ mod tests {
 
         for context in [
             VerificationContext::ClientPut,
+            VerificationContext::FreshReplication,
             VerificationContext::PaidListAdmission,
         ] {
             let err = verifier
@@ -4316,6 +4824,7 @@ mod tests {
             cache_capacity: 100,
             close_group_size: CLOSE_GROUP_SIZE,
             local_rewards_address: RewardsAddress::new([1u8; 20]),
+            price_floor: PriceFloorConfig::default(),
         };
         let verifier = PaymentVerifier::new(config);
 

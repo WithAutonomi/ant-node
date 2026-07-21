@@ -158,6 +158,14 @@ name = "poc_bootstrap_stall"
 path = "tests/poc_bootstrap_stall.rs"
 required-features = ["test-utils"]
 
+# Live-Anvil verification of the ADR-0006 price floor against a real deployed
+# vault + real on-chain settlement. Needs the test-utils fail-open for the
+# issuer K-closest check so the floor is the isolated load-bearing check.
+[[test]]
+name = "poc_price_floor_live"
+path = "tests/poc_price_floor_live.rs"
+required-features = ["test-utils"]
+
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.

@@ -62,7 +62,8 @@ pub use ant_protocol::payment::verify::{
 };
 pub use single_node::SingleNodePayment;
 pub use verifier::{
-    EvmVerifierConfig, PaymentStatus, PaymentVerifier, PaymentVerifierConfig, VerificationContext,
-    MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
+    EvmVerifierConfig, PaymentStatus, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
+    VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES, MIN_PAYMENT_PROOF_SIZE_BYTES,
+    PRICE_FLOOR_ENFORCE_ENV, PRICE_FLOOR_TOLERANCE_ENV,
 };
 pub use wallet::{is_valid_address, parse_rewards_address, WalletConfig};
