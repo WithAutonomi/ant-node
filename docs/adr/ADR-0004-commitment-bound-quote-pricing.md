@@ -478,3 +478,26 @@ rewards-address binding. This griefing race predates this amendment and
 needs a vault-side fix (reject or accumulate on existing entries); it is
 tracked as follow-up work, not a property this ADR can enforce from the node
 side.
+
+## Amendment 3 (2026-07-21): expired pending entries are dropped eagerly
+
+A pending entry past the answerability horizon can never launch, but the
+reserve scan that collected such entries only runs when launch tokens are
+available — under sustained load, effectively never (2026-07-17 staging:
+median oldest-pending age 270 minutes against the 150-minute eligibility
+window). Dead entries squatted the per-peer LRU, skewed the
+`pending`/`oldest_pending_quote_age_ms` telemetry, and — because coalescing
+compares key counts only — a dead higher-count pin permanently vetoed every
+live lower-count nomination for its peer (realistic after a legitimate
+prune). Fixed: enqueue drops a dead incumbent before coalescing, and the
+summary tick sweeps expired entries regardless of tokens; both removals are
+accounted as `outside_answerability_window`.
+
+Coverage remains as Amendment 2 states — a budgeted probabilistic exam, not
+a per-payment guarantee. Quantitatively: round 1 is structural, so only the
+3-5 fresh-random round-2 byte openings prove possession; per-audit detection
+of a peer missing fraction `x` of committed bytes is ~`1-(1-x)^k` dispersed
+(`k` = opened leaves), degrading toward the subtree-selection rate when
+clustered, compounding across the fleet's per-peer audit rate. Proposed
+target, pending an adversarial staging run with hash-retaining deleters:
+at least 99% detection within 24 hours for at least 1% missing bytes.
