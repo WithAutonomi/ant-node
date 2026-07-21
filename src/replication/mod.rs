@@ -233,6 +233,27 @@ const FETCH_RESPONDER_MAX_OUTSTANDING: usize = FETCH_RESPONDER_WORKER_LIMIT * 4;
 /// of the three workers available to other peers under a single-source flood.
 const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
 
+/// Maximum verification batches served concurrently.
+///
+/// LMDB point lookups are fast, but a batch can contain 8,192 of them. Two
+/// workers isolate that synchronous work from message dispatch without turning
+/// large batches into an I/O fan-out throughput contest.
+const VERIFICATION_RESPONDER_WORKER_LIMIT: usize = 2;
+
+/// Maximum verification batches admitted across workers and bounded waiters.
+///
+/// Four worker waves absorb ordinary cross-peer bursts while the dequeue
+/// deadline prevents queued batches from consuming lookup capacity after their
+/// requesters have stopped waiting.
+const VERIFICATION_RESPONDER_MAX_OUTSTANDING: usize = VERIFICATION_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted verification batches from one source peer.
+///
+/// Senders already aggregate a peer's keys into one batch. One outstanding
+/// batch therefore preserves useful work while reserving the other worker and
+/// the bounded queue for different peers.
+const VERIFICATION_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
+
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::FreshReplication
 }
@@ -559,6 +580,12 @@ pub struct ReplicationEngine {
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     /// Per-source fetch responder counts for flood-fair admission.
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Worker permits for lookup-heavy verification batches.
+    verification_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding verification workers and queued waiters.
+    verification_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source verification responder counts for flood-fair admission.
+    verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
@@ -664,6 +691,13 @@ impl ReplicationEngine {
                 FETCH_RESPONDER_MAX_OUTSTANDING,
             )),
             fetch_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            verification_responder_worker_semaphore: Arc::new(Semaphore::new(
+                VERIFICATION_RESPONDER_WORKER_LIMIT,
+            )),
+            verification_responder_admission_semaphore: Arc::new(Semaphore::new(
+                VERIFICATION_RESPONDER_MAX_OUTSTANDING,
+            )),
+            verification_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -1440,6 +1474,11 @@ impl ReplicationEngine {
         let fetch_responder_admission_semaphore =
             Arc::clone(&self.fetch_responder_admission_semaphore);
         let fetch_responder_inflight = Arc::clone(&self.fetch_responder_inflight);
+        let verification_responder_worker_semaphore =
+            Arc::clone(&self.verification_responder_worker_semaphore);
+        let verification_responder_admission_semaphore =
+            Arc::clone(&self.verification_responder_admission_semaphore);
+        let verification_responder_inflight = Arc::clone(&self.verification_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
         let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
@@ -1478,6 +1517,9 @@ impl ReplicationEngine {
             fetch_responder_worker_semaphore,
             fetch_responder_admission_semaphore,
             fetch_responder_inflight,
+            verification_responder_worker_semaphore,
+            verification_responder_admission_semaphore,
+            verification_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
             fresh_offer_in_flight,
@@ -2655,6 +2697,9 @@ struct ReplicationMessageHandlerContext {
     fetch_responder_worker_semaphore: Arc<Semaphore>,
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    verification_responder_worker_semaphore: Arc<Semaphore>,
+    verification_responder_admission_semaphore: Arc<Semaphore>,
+    verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
     fresh_offer_in_flight: FreshOfferInFlight,
@@ -2893,14 +2938,13 @@ async fn handle_replication_message(
             )
             .await
         }
-        ReplicationMessageBody::VerificationRequest(ref request) => {
-            handle_verification_request(
-                source,
+        ReplicationMessageBody::VerificationRequest(request) => {
+            dispatch_verification_request(
+                *source,
                 request,
-                &ctx.storage,
-                &ctx.paid_list,
-                &ctx.p2p_node,
+                ctx,
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
@@ -3823,6 +3867,77 @@ async fn handle_verification_request(
     }
 
     send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
+
+    Ok(())
+}
+
+async fn dispatch_verification_request(
+    source: PeerId,
+    request: protocol::VerificationRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.verification_responder_admission_semaphore,
+        &ctx.verification_responder_inflight,
+        &source,
+        VERIFICATION_RESPONDER_MAX_OUTSTANDING,
+        VERIFICATION_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            warn!(
+                responder_class = "verification",
+                source = %source,
+                "Verification response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.verification_responder_worker_semaphore);
+    let storage = Arc::clone(&ctx.storage);
+    let paid_list = Arc::clone(&ctx.paid_list);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let request_timeout = ctx.config.verification_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "verification",
+                source = %source,
+                "Verification responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            debug!(
+                responder_class = "verification",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale verification request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_verification_request(
+            &source,
+            &request,
+            &storage,
+            &paid_list,
+            &p2p_node,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Verification request handling failed: {e}");
+        }
+    });
 
     Ok(())
 }
