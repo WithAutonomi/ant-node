@@ -2513,7 +2513,7 @@ impl ReplicationEngine {
 /// responsible (fast-path) challenge from the heavier subtree/byte ones. If a
 /// dedicated slow pool is later split out, add its variants here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditResponderRejectReason {
+enum ResponderRejectReason {
     /// The global [`MAX_CONCURRENT_AUDIT_RESPONSES`] semaphore had no permit
     /// free; the per-peer cap was not the binding constraint.
     GlobalPoolFull,
@@ -2522,7 +2522,7 @@ enum AuditResponderRejectReason {
     PerPeerCapFull,
 }
 
-impl AuditResponderRejectReason {
+impl ResponderRejectReason {
     /// Stable token emitted as `reason=<token>` in drop logs. Keep these values
     /// frozen — production log tooling greps for them.
     fn as_str(self) -> &'static str {
@@ -2541,8 +2541,8 @@ impl AuditResponderRejectReason {
 /// are not a single atomic view), but they are exact enough to tell a saturated
 /// node from a single self-throttling flooder.
 #[derive(Debug, Clone, Copy)]
-struct AuditResponderAdmissionFailure {
-    reason: AuditResponderRejectReason,
+struct ResponderAdmissionFailure {
+    reason: ResponderRejectReason,
     /// Global permits in use across the whole engine at decision time.
     global_inflight: usize,
     /// Configured global ceiling ([`MAX_CONCURRENT_AUDIT_RESPONSES`]).
@@ -2553,7 +2553,7 @@ struct AuditResponderAdmissionFailure {
     peer_limit: u32,
 }
 
-impl fmt::Display for AuditResponderAdmissionFailure {
+impl fmt::Display for ResponderAdmissionFailure {
     /// Renders the stable `reason=... global_inflight=... global_limit=...
     /// peer_inflight=... peer_limit=...` suffix appended to every drop log.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2573,8 +2573,22 @@ impl fmt::Display for AuditResponderAdmissionFailure {
 /// on drop, decrements the PER-PEER in-flight count. Moving this into the
 /// spawned task ties both bounds to the task's exact lifetime — no manual
 /// decrement to forget on an early return or panic.
-struct AuditResponderGuard {
+struct ResponderGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _peer_slot: PeerResponderSlot,
+}
+
+type AuditResponderGuard = ResponderGuard;
+type AuditResponderAdmissionFailure = ResponderAdmissionFailure;
+type AuditResponderRejectReason = ResponderRejectReason;
+
+/// Provisional or admitted per-peer responder slot.
+///
+/// The slot is claimed before the global permit is attempted. Keeping that
+/// claim under RAII means cancellation while rolling a failed admission back
+/// cannot strand a peer at its cap. Once admission succeeds this guard moves
+/// into [`ResponderGuard`] and remains held for the worker's exact lifetime.
+struct PeerResponderSlot {
     inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     peer: PeerId,
 }
@@ -2664,7 +2678,7 @@ fn replication_payload_from_event(event: P2PEvent) -> Option<(PeerId, Vec<u8>, O
     None
 }
 
-impl Drop for AuditResponderGuard {
+impl Drop for PeerResponderSlot {
     fn drop(&mut self) {
         // Decrement (and prune to keep the map bounded) without blocking the
         // async runtime: a short lock on a tiny map.
@@ -2699,6 +2713,56 @@ impl Drop for AuditResponderGuard {
     }
 }
 
+/// Try to admit one bounded responder task for `source`: claim a per-peer slot
+/// and then a global permit. The limits are parameters so independent responder
+/// classes can reuse the same flood-fair admission and cancellation semantics.
+async fn admit_bounded_responder(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    source: &PeerId,
+    global_limit: usize,
+    peer_limit: u32,
+) -> std::result::Result<ResponderGuard, ResponderAdmissionFailure> {
+    let global_inflight = |sem: &Semaphore| global_limit.saturating_sub(sem.available_permits());
+
+    let admitted_peer_inflight = {
+        let mut map = inflight.write().await;
+        let entry = map.entry(*source).or_insert(0);
+        if *entry >= peer_limit {
+            let peer_inflight = *entry;
+            drop(map);
+            return Err(ResponderAdmissionFailure {
+                reason: ResponderRejectReason::PerPeerCapFull,
+                global_inflight: global_inflight(semaphore),
+                global_limit,
+                peer_inflight,
+                peer_limit,
+            });
+        }
+        *entry += 1;
+        *entry
+    };
+
+    let peer_slot = PeerResponderSlot {
+        inflight: Arc::clone(inflight),
+        peer: *source,
+    };
+    let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
+        return Err(ResponderAdmissionFailure {
+            reason: ResponderRejectReason::GlobalPoolFull,
+            global_inflight: global_inflight(semaphore),
+            global_limit,
+            peer_inflight: admitted_peer_inflight.saturating_sub(1),
+            peer_limit,
+        });
+    };
+
+    Ok(ResponderGuard {
+        _permit: permit,
+        _peer_slot: peer_slot,
+    })
+}
+
 /// Try to admit one audit-responder task for `source`: take a global permit AND
 /// a per-peer slot (both bounded). Returns `Err` with the binding ceiling and
 /// its decision-time counters (caller drops the challenge, leaving the remote
@@ -2715,59 +2779,7 @@ async fn admit_audit_responder(
 ) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
     let global_limit = MAX_CONCURRENT_AUDIT_RESPONSES;
     let peer_limit = class.per_peer_limit();
-    // `available_permits()` is a cheap atomic load; `global_limit - available`
-    // is the best-effort in-flight count at decision time. Not synchronized with
-    // the per-peer lock, so it is a snapshot, not a single atomic view.
-    let global_inflight = |sem: &Semaphore| global_limit.saturating_sub(sem.available_permits());
-
-    // Per-peer cap first (cheap, and the fairness-critical bound), committed
-    // under the write lock so concurrent challenges from the same peer can't
-    // both slip past the cap.
-    {
-        let mut map = inflight.write().await;
-        let entry = map.entry(*source).or_insert(0);
-        if *entry >= peer_limit {
-            let peer_inflight = *entry;
-            drop(map); // release before the (unrelated) semaphore read
-            return Err(AuditResponderAdmissionFailure {
-                reason: AuditResponderRejectReason::PerPeerCapFull,
-                global_inflight: global_inflight(semaphore),
-                global_limit,
-                peer_inflight,
-                peer_limit,
-            });
-        }
-        *entry += 1;
-    }
-    // Then the global ceiling. If it's exhausted, give back the per-peer slot we
-    // just claimed so it isn't leaked.
-    let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
-        let peer_inflight = {
-            let mut map = inflight.write().await;
-            map.remove(source).map_or(0, |n| {
-                // Report the per-peer occupancy AFTER releasing our rolled-back
-                // slot: the share still held by this source's other in-flight
-                // tasks (below the cap, since the per-peer check passed).
-                let remaining = n.saturating_sub(1);
-                if remaining > 0 {
-                    map.insert(*source, remaining);
-                }
-                remaining
-            })
-        };
-        return Err(AuditResponderAdmissionFailure {
-            reason: AuditResponderRejectReason::GlobalPoolFull,
-            global_inflight: global_inflight(semaphore),
-            global_limit,
-            peer_inflight,
-            peer_limit,
-        });
-    };
-    Ok(AuditResponderGuard {
-        _permit: permit,
-        inflight: Arc::clone(inflight),
-        peer: *source,
-    })
+    admit_bounded_responder(semaphore, inflight, source, global_limit, peer_limit).await
 }
 
 /// Handle an incoming replication protocol message.
@@ -6611,6 +6623,43 @@ mod tests {
         assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
 
         drop(held_global_permits);
+    }
+
+    #[tokio::test]
+    async fn bounded_responder_guard_releases_global_and_peer_slots_on_drop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA3);
+
+        let guard = admit_bounded_responder(&semaphore, &inflight, &peer, 1, 1)
+            .await
+            .expect("first responder should be admitted");
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(inflight.read().await.get(&peer), Some(&1));
+
+        drop(guard);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(!inflight.read().await.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn cancelled_bounded_responder_wait_does_not_leak_a_peer_slot() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA4);
+        let held_map = inflight.write().await;
+
+        let waiting = admit_bounded_responder(&semaphore, &inflight, &peer, 1, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiting)
+                .await
+                .is_err(),
+            "admission should still be waiting for the peer map"
+        );
+
+        drop(held_map);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(!inflight.read().await.contains_key(&peer));
     }
 
     #[tokio::test]
