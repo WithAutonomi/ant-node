@@ -170,7 +170,7 @@ pub enum ReplicationMessageBody {
 // modules that do not carry any shared engine handle.
 
 /// Number of [`ReplicationMessageBody`] variants (the counter-table width).
-const N_REPLICATION_VARIANTS: usize = 17;
+pub(crate) const N_REPLICATION_VARIANTS: usize = 17;
 
 static REPL_TX_BYTES: [AtomicU64; N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; N_REPLICATION_VARIANTS];

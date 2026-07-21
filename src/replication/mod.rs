@@ -63,7 +63,7 @@ use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
-use crate::replication::audit_metrics::AuditResponderClass;
+use crate::replication::audit_metrics::{AuditResponderClass, ReplicationResponderClass};
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
@@ -2757,14 +2757,18 @@ fn try_enqueue_serial_message(
     let source = inbound.source;
     let message_class = replication_message_class(&inbound.msg.body);
     let queue_depth = sender.max_capacity().saturating_sub(sender.capacity());
-    sender.try_send(inbound).map_err(|error| SerialQueueDrop {
-        source,
-        message_class,
-        queue_depth,
-        reason: match error {
-            mpsc::error::TrySendError::Full(_) => SerialQueueDropReason::Full,
-            mpsc::error::TrySendError::Closed(_) => SerialQueueDropReason::Closed,
-        },
+    sender.try_send(inbound).map_err(|error| {
+        let (reason, dropped) = match error {
+            mpsc::error::TrySendError::Full(dropped) => (SerialQueueDropReason::Full, dropped),
+            mpsc::error::TrySendError::Closed(dropped) => (SerialQueueDropReason::Closed, dropped),
+        };
+        audit_metrics::record_serial_queue_overflow_drop(&dropped.msg.body);
+        SerialQueueDrop {
+            source,
+            message_class,
+            queue_depth,
+            reason,
+        }
     })
 }
 
@@ -3743,6 +3747,7 @@ async fn dispatch_neighbor_sync_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
+            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::NeighborSync);
             warn!(
                 responder_class = "neighbor_sync",
                 source = %source,
@@ -3775,6 +3780,7 @@ async fn dispatch_neighbor_sync_request(
             return;
         };
         if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
             debug!(
                 responder_class = "neighbor_sync",
                 source = %source,
@@ -4046,6 +4052,7 @@ async fn dispatch_verification_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
+            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::Verification);
             warn!(
                 responder_class = "verification",
                 source = %source,
@@ -4072,6 +4079,7 @@ async fn dispatch_verification_request(
             return;
         };
         if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::Verification);
             debug!(
                 responder_class = "verification",
                 source = %source,
@@ -4138,6 +4146,7 @@ async fn dispatch_fetch_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
+            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::Fetch);
             warn!(
                 responder_class = "fetch",
                 source = %source,
@@ -4163,6 +4172,7 @@ async fn dispatch_fetch_request(
             return;
         };
         if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::Fetch);
             debug!(
                 responder_class = "fetch",
                 source = %source,
@@ -7390,6 +7400,12 @@ mod tests {
     #[tokio::test]
     async fn full_serial_queue_drops_instead_of_running_the_message_inline() {
         let (sender, mut receiver) = mpsc::channel(1);
+        let dropped_body =
+            ReplicationMessageBody::VerificationRequest(protocol::VerificationRequest {
+                keys: Vec::new(),
+                paid_list_check_indices: Vec::new(),
+            });
+        let overflow_before = audit_metrics::serial_queue_overflow_drops_total(&dropped_body);
         let first = InboundReplicationMessage {
             source: test_peer(0xC1),
             msg: ReplicationMessage {
@@ -7405,10 +7421,7 @@ mod tests {
             source: test_peer(0xC2),
             msg: ReplicationMessage {
                 request_id: 2,
-                body: ReplicationMessageBody::VerificationRequest(protocol::VerificationRequest {
-                    keys: Vec::new(),
-                    paid_list_check_indices: Vec::new(),
-                }),
+                body: dropped_body.clone(),
             },
             rr_message_id: None,
             received_at: Instant::now(),
@@ -7420,6 +7433,8 @@ mod tests {
         assert_eq!(dropped.reason, SerialQueueDropReason::Full);
         assert_eq!(dropped.message_class, "verification_request");
         assert_eq!(dropped.queue_depth, 1);
+        let overflow_after = audit_metrics::serial_queue_overflow_drops_total(&dropped_body);
+        assert_eq!(overflow_after.saturating_sub(overflow_before), 1);
 
         let queued = receiver
             .recv()
