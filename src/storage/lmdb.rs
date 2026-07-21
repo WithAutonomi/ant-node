@@ -149,6 +149,15 @@ pub struct LmdbStorage {
     /// detached write).
     #[cfg(any(test, feature = "test-utils"))]
     test_put_gate: Arc<parking_lot::RwLock<()>>,
+    /// Test-only gate read-acquired inside the raw-read blocking closures,
+    /// immediately after the shared `env_lock` guard is taken.
+    ///
+    /// Tests hold the write half to deterministically park an in-flight raw
+    /// read while it still holds the shared environment lock (e.g. to prove
+    /// [`Self::try_resize`] waits for active raw reads before calling
+    /// `env.resize()`).
+    #[cfg(any(test, feature = "test-utils"))]
+    test_read_gate: Arc<parking_lot::RwLock<()>>,
 }
 
 impl LmdbStorage {
@@ -232,6 +241,8 @@ impl LmdbStorage {
             blocking_tracker: TaskTracker::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_read_gate: Arc::new(parking_lot::RwLock::new(())),
         };
 
         debug!(
@@ -556,35 +567,39 @@ impl LmdbStorage {
     pub async fn all_keys(&self) -> Result<Vec<XorName>> {
         let env = self.env.clone();
         let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
 
         let keys = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<Vec<XorName>> {
+                // Shared lock: blocks a concurrent map resize (which takes the
+                // exclusive lock) from running while this read txn is open.
+                let _guard = lock.read();
                 let rtxn = env
-                .read_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
-            let mut keys = Vec::new();
-            let iter = db
-                .iter(&rtxn)
-                .map_err(|e| Error::Storage(format!("Failed to iterate database: {e}")))?;
-            for result in iter {
-                let (key_bytes, _) =
-                    result.map_err(|e| Error::Storage(format!("Failed to read entry: {e}")))?;
-                if key_bytes.len() == XORNAME_LEN {
-                    let mut key = [0u8; XORNAME_LEN];
-                    key.copy_from_slice(key_bytes);
-                    keys.push(key);
-                } else {
-                    crate::logging::warn!(
-                        "LmdbStorage: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
-                        key_bytes.len()
-                    );
+                    .read_txn()
+                    .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
+                let mut keys = Vec::new();
+                let iter = db
+                    .iter(&rtxn)
+                    .map_err(|e| Error::Storage(format!("Failed to iterate database: {e}")))?;
+                for result in iter {
+                    let (key_bytes, _) =
+                        result.map_err(|e| Error::Storage(format!("Failed to read entry: {e}")))?;
+                    if key_bytes.len() == XORNAME_LEN {
+                        let mut key = [0u8; XORNAME_LEN];
+                        key.copy_from_slice(key_bytes);
+                        keys.push(key);
+                    } else {
+                        crate::logging::warn!(
+                            "LmdbStorage: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
+                            key_bytes.len()
+                        );
+                    }
                 }
-            }
-            Ok(keys)
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("all_keys task failed: {e}")))?;
+                Ok(keys)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("all_keys task failed: {e}")))?;
 
         keys
     }
@@ -601,10 +616,20 @@ impl LmdbStorage {
         let key = *address;
         let env = self.env.clone();
         let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
+        #[cfg(any(test, feature = "test-utils"))]
+        let test_read_gate = Arc::clone(&self.test_read_gate);
 
         let value = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                // Shared lock: blocks a concurrent map resize (which takes the
+                // exclusive lock) from running while this read txn is open.
+                let _guard = lock.read();
+                // Test-only: parks here, still holding the shared lock, while a
+                // test holds the write half — used to prove a resize waits.
+                #[cfg(any(test, feature = "test-utils"))]
+                let _test_read_gate = test_read_gate.read();
                 let rtxn = env
                     .read_txn()
                     .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
@@ -732,6 +757,18 @@ impl LmdbStorage {
     pub fn test_put_gate(&self) -> Arc<parking_lot::RwLock<()>> {
         Arc::clone(&self.test_put_gate)
     }
+
+    /// Test-only handle to the raw-read gate.
+    ///
+    /// Hold the write half to deterministically park the next raw read
+    /// (`get_raw`) inside its blocking closure while it still holds the shared
+    /// environment lock (e.g. to prove [`Self::try_resize`] waits for active
+    /// raw reads).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_read_gate(&self) -> Arc<parking_lot::RwLock<()>> {
+        Arc::clone(&self.test_read_gate)
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -810,6 +847,14 @@ mod tests {
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `wait_idle` to complete once the op is released.
     const WAIT_IDLE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Poll interval while waiting for a parked raw read to take the shared lock.
+    const RAW_READ_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+    /// Ceiling for a parked raw read to take the shared lock.
+    const RAW_READ_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Short probe used to prove `try_resize` is still blocked on the shared lock.
+    const RESIZE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
+    /// Generous ceiling for `try_resize` to complete once the raw read releases.
+    const RESIZE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
     async fn create_test_storage() -> (LmdbStorage, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
@@ -1071,5 +1116,71 @@ mod tests {
             .put(&more_addr, more)
             .await
             .expect("put after wait_idle"));
+    }
+
+    /// A map resize takes the environment's *exclusive* lock, so it must wait
+    /// for in-flight raw reads (which hold the *shared* lock) to finish before
+    /// calling `env.resize()`. This proves `get_raw` holds that shared lock for
+    /// the whole duration of its blocking closure; `all_keys` uses the same
+    /// guard.
+    // Holding the gate's write guard across awaits is the point of the test:
+    // it parks the raw read's blocking closure while we probe try_resize.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn resize_waits_for_in_flight_raw_read() {
+        let (storage, _temp) = create_test_storage().await;
+
+        let content = b"raw read holds the shared env lock";
+        let address = LmdbStorage::compute_address(content);
+        storage.put(&address, content).await.expect("put");
+
+        // Park the raw read's blocking closure on the test gate. It acquires
+        // the shared env_lock first, then parks here still holding it.
+        let gate = storage.test_read_gate();
+        let parked = gate.write();
+
+        // Drop the awaiting future mid-flight: the biased select! polls get_raw
+        // once — far enough to spawn the blocking task, which takes the shared
+        // lock and parks on the gate — then completes on the ready branch,
+        // dropping the awaiter. The detached closure keeps holding the lock.
+        tokio::select! {
+            biased;
+            res = storage.get_raw(&address) => {
+                panic!("get_raw must be parked on the test gate, got {res:?}")
+            }
+            () = std::future::ready(()) => {}
+        }
+
+        // Wait until the detached read has actually taken the shared lock,
+        // signalled by the exclusive half no longer being immediately available.
+        tokio::time::timeout(RAW_READ_LOCK_TIMEOUT, async {
+            loop {
+                let free = storage.env_lock.try_write().is_some();
+                if !free {
+                    break;
+                }
+                tokio::time::sleep(RAW_READ_LOCK_POLL).await;
+            }
+        })
+        .await
+        .expect("raw read did not take the shared env lock");
+
+        // A resize needs the exclusive lock, so it must block while the raw
+        // read holds the shared lock.
+        let resize = storage.try_resize();
+        tokio::pin!(resize);
+        let blocked = tokio::time::timeout(RESIZE_BLOCKED_PROBE, &mut resize).await;
+        assert!(
+            blocked.is_err(),
+            "try_resize completed while a raw read held the shared env lock"
+        );
+
+        // Release the read: it drops the shared lock, letting the resize take
+        // the exclusive lock and finish.
+        drop(parked);
+        tokio::time::timeout(RESIZE_COMPLETE_TIMEOUT, &mut resize)
+            .await
+            .expect("try_resize did not complete after the raw read released")
+            .expect("try_resize");
     }
 }
