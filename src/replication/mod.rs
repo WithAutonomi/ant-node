@@ -529,6 +529,33 @@ impl FirstAuditScheduler {
             .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
     }
 
+    /// Drop every pending nomination that has aged past the answerability
+    /// horizon. `try_reserve` collects expired entries only while it can scan —
+    /// under token starvation it returns at the budget gate first — so without
+    /// a periodic sweep dead entries squat the bounded LRU (evicting live peers
+    /// at capacity) and inflate the `pending`/`oldest_pending_quote_age_ms`
+    /// telemetry. Each removal is accounted as `outside_answerability_window`,
+    /// exactly like a scan-time expiry. Returns how many entries were dropped;
+    /// survivor recency is untouched.
+    fn sweep_expired(&mut self, wall_now: SystemTime, obs: &Arc<FirstAuditObservability>) -> usize {
+        let expired: Vec<PeerId> = self
+            .pending
+            .iter()
+            .filter(|(_, event)| !quote_answerable_through_nominal_jitter(event.quote_ts, wall_now))
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in &expired {
+            self.pending.pop(peer);
+        }
+        if !expired.is_empty() {
+            obs.outside_answerability_window.fetch_add(
+                u64::try_from(expired.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        expired.len()
+    }
+
     fn has_reservation(&self) -> bool {
         self.reserved.is_some()
     }
@@ -548,7 +575,9 @@ impl FirstAuditScheduler {
     /// reserved peer (so a successor is retained across the reservation, never
     /// window-dropped); otherwise window-screened. Coalescing is
     /// highest-count-per-peer (newest on a tie) — a lower-count successor never
-    /// displaces a higher-count pending pin.
+    /// displaces a higher-count pending pin. An incumbent that has aged past
+    /// the answerability horizon is dropped (and accounted as an expiry) before
+    /// coalescing, so a dead pin never vetoes a live nomination.
     fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
         if self.first_audited.contains(&event.pin) {
             obs.duplicates.fetch_add(1, Ordering::Relaxed);
@@ -563,6 +592,19 @@ impl FirstAuditScheduler {
         {
             obs.window_deduped.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        // A pending incumbent past the answerability horizon can never launch,
+        // yet its (possibly higher) key count would still win the coalesce
+        // against a live incoming — e.g. a fresh post-prune lower-count pin —
+        // and under token starvation no reserve scan runs to collect it. Drop
+        // it first so the incoming is judged on its own merits.
+        let stale_incumbent = self.pending.peek(&event.peer).is_some_and(|existing| {
+            !quote_answerable_through_nominal_jitter(existing.quote_ts, SystemTime::now())
+        });
+        if stale_incumbent {
+            self.pending.pop(&event.peer);
+            obs.outside_answerability_window
+                .fetch_add(1, Ordering::Relaxed);
         }
         // Ordinary enqueue: the incoming arrived last, so it wins an equal-count
         // tie.
@@ -1680,6 +1722,17 @@ impl ReplicationEngine {
                 }
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
+                    // Token-independent hygiene: collect entries that aged past
+                    // the answerability horizon while the budget gate kept the
+                    // reserve scan from running, so the summary below reports
+                    // only live work.
+                    let swept = scheduler.sweep_expired(SystemTime::now(), &observability);
+                    if swept > 0 {
+                        debug!(
+                            "First-audit scheduler: audit_trigger=first_monetized outcome=expired_swept count={swept} pending={}",
+                            scheduler.pending_len()
+                        );
+                    }
                     info!(
                         "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
@@ -6392,6 +6445,151 @@ mod tests {
     /// retained and becomes the next reservation after the cancel. This is the
     /// exact hole the reviewer flagged: suppression must never outlive a launch
     /// that did not send.
+    /// A pending pin that has aged past the answerability horizon must not
+    /// suppress a live lower-count nomination for the same peer: under token
+    /// starvation no reserve scan ever collects the dead entry, so without the
+    /// enqueue-time check the peer would stay unauditable through this path
+    /// indefinitely (e.g. after a prune legitimately lowered its key count).
+    #[test]
+    fn first_audit_stale_incumbent_does_not_suppress_live_lower_count() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let peer = test_peer(1);
+
+        let dead_quote = SystemTime::now()
+            .checked_sub(GOSSIP_ANSWERABILITY_TTL)
+            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .expect("past wall time");
+        let stale_high = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 400,
+            quote_ts: dead_quote,
+        };
+        scheduler.enqueue(stale_high, &obs);
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // A fresh, lower-count nomination (a post-prune commitment).
+        let fresh_lower = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(fresh_lower, &obs);
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([2; 32]),
+            "the live nomination replaced the dead incumbent"
+        );
+        assert_eq!(
+            obs.suppressed_lower.load(Ordering::Relaxed),
+            0,
+            "no self-erasure signal for displacing a dead pin"
+        );
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            obs.outside_answerability_window.load(Ordering::Relaxed),
+            1,
+            "the dead incumbent is accounted as an expiry"
+        );
+    }
+
+    /// The self-erasure defence is untouched for LIVE incumbents: a lower-count
+    /// nomination still loses to an answerable higher-count pending pin.
+    #[test]
+    fn first_audit_live_incumbent_still_suppresses_lower_count() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let peer = test_peer(1);
+
+        let live_high = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 400,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(live_high, &obs);
+        let cheaper = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(cheaper, &obs);
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([1; 32]),
+            "the higher-count live pin is retained"
+        );
+        assert_eq!(obs.suppressed_lower.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.outside_answerability_window.load(Ordering::Relaxed), 0);
+    }
+
+    /// The periodic sweep collects expired pending entries even when the token
+    /// bucket is empty — the reserve path returns at the budget gate and never
+    /// scans — keeping the bounded LRU and the pending/oldest-age telemetry
+    /// honest under fleet-wide starvation.
+    #[test]
+    fn first_audit_sweep_expired_collects_dead_entries_without_tokens() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono);
+
+        let dead_quote = SystemTime::now()
+            .checked_sub(GOSSIP_ANSWERABILITY_TTL)
+            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .expect("past wall time");
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: test_peer(1),
+                pin: [1; 32],
+                key_count: 100,
+                quote_ts: dead_quote,
+            },
+            &obs,
+        );
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: test_peer(2),
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 2);
+
+        // Empty the bucket so the reserve path is budget-gated (fleet-wide
+        // starvation) and cannot collect the dead entry itself.
+        scheduler.limiter.tokens = 0;
+        let cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(!scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown, &obs));
+        assert_eq!(
+            scheduler.pending_len(),
+            2,
+            "budget-gated reserve scans nothing"
+        );
+
+        let wall_now = SystemTime::now();
+        assert_eq!(scheduler.sweep_expired(wall_now, &obs), 1);
+        assert_eq!(scheduler.pending_len(), 1);
+        assert!(
+            scheduler.pending.peek(&test_peer(2)).is_some(),
+            "the live entry survives the sweep"
+        );
+        assert_eq!(obs.outside_answerability_window.load(Ordering::Relaxed), 1);
+        let age_ms = scheduler.oldest_pending_quote_age_ms(wall_now);
+        assert!(
+            Duration::from_millis(age_ms) < GOSSIP_ANSWERABILITY_TTL,
+            "the age gauge reflects only live work after the sweep"
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn first_audit_answerability_cancel_is_state_neutral_and_retains_successor() {
