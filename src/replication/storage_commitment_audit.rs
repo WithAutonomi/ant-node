@@ -154,82 +154,20 @@ struct AuditCtx<'a> {
 /// or a rejection of a recently gossiped commitment, is a confirmed failure
 /// acted on immediately. On a full pass, records the peer as a proven holder.
 pub async fn run_subtree_audit(
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    challenged_peer: &PeerId,
-    expected_commitment_hash: [u8; 32],
-    key_count: u32,
-    credit: Option<&AuditCredit<'_>>,
+    _p2p_node: &Arc<P2PNode>,
+    _config: &ReplicationConfig,
+    _challenged_peer: &PeerId,
+    _expected_commitment_hash: [u8; 32],
+    _key_count: u32,
+    _credit: Option<&AuditCredit<'_>>,
 ) -> AuditTickResult {
-    let (nonce, challenge_id) = {
-        let mut rng = rand::thread_rng();
-        (rng.gen::<[u8; 32]>(), rng.gen::<u64>())
-    };
-
-    let challenge = SubtreeAuditChallenge {
-        challenge_id,
-        nonce,
-        challenged_peer_id: *challenged_peer.as_bytes(),
-        expected_commitment_hash,
-    };
-    let msg = ReplicationMessage {
-        request_id: challenge_id,
-        body: ReplicationMessageBody::SubtreeAuditChallenge(challenge),
-    };
-    let encoded = match msg.encode() {
-        Ok(data) => data,
-        Err(e) => {
-            warn!("Audit: failed to encode subtree challenge for {challenged_peer}: {e}");
-            return AuditTickResult::Idle;
-        }
-    };
-
-    // Size the proof deadline from the ACTUAL selected subtree (its real-leaf
-    // count for this nonce + key_count), not a fixed worst-case hint. This keeps
-    // the deadline tight to "responder hashes ~sqrt(N) chunks at local-disk
-    // speed", so a relay that must fetch the subtree over the network blows it.
-    // The auditor and responder derive the same selection, so we know the leaf
-    // count before the response arrives.
-    let subtree_leaves = select_subtree_path(&nonce, key_count).map_or_else(
-        || config.subtree_audit_timeout_leaf_hint(),
-        |p| p.real_leaf_count() as usize,
-    );
-    let timeout = config.audit_response_timeout(subtree_leaves);
-
-    let response = match p2p_node
-        .send_request(challenged_peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            debug!("Audit: subtree challenge to {challenged_peer} timed out / failed: {e}");
-            return failed(challenged_peer, challenge_id, AuditFailureReason::Timeout);
-        }
-    };
-
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Audit: failed to decode subtree response from {challenged_peer}: {e}");
-            return failed(
-                challenged_peer,
-                challenge_id,
-                AuditFailureReason::MalformedResponse,
-            );
-        }
-    };
-
-    let ctx = AuditCtx {
-        p2p_node,
-        challenged_peer,
-        challenge_id,
-        nonce,
-        expected_commitment_hash,
-        config,
-        credit,
-    };
-    dispatch_subtree_response(resp_msg.body, &ctx).await
+    info!("run_subtree_audit: CONTROL-BUILD audits disabled, returning Idle");
+    AuditTickResult::Idle
 }
+
+// ---------------------------------------------------------------------------
+// handle_subtree_challenge stub (CONTROL-BUILD)
+// ---------------------------------------------------------------------------
 
 /// Outcome of the round-2 byte challenge round-trip (auditor side).
 enum ByteRound {
@@ -892,121 +830,23 @@ fn subtree_failure_summary(reason: &AuditFailureReason) -> AuditFailureSummary {
 /// grace removed, the auditor treats as a confirmed failure for an in-window pin).
 pub async fn handle_subtree_challenge(
     challenge: &SubtreeAuditChallenge,
-    storage: &LmdbStorage,
-    self_peer_id: &PeerId,
-    is_bootstrapping: bool,
-    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+    _storage: &LmdbStorage,
+    _self_peer_id: &PeerId,
+    _is_bootstrapping: bool,
+    _commitment_state: Option<&Arc<ResponderCommitmentState>>,
 ) -> SubtreeAuditResponse {
-    if is_bootstrapping {
-        return SubtreeAuditResponse::Bootstrapping {
-            challenge_id: challenge.challenge_id,
-        };
-    }
-
-    if challenge.challenged_peer_id != *self_peer_id.as_bytes() {
-        warn!(
-            "Subtree audit challenge targeted wrong peer: expected {}, got {}",
-            hex::encode(self_peer_id.as_bytes()),
-            hex::encode(challenge.challenged_peer_id),
-        );
-        return SubtreeAuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            kind: RejectKind::Protocol,
-            reason: "challenged_peer_id does not match this node".to_string(),
-        };
-    }
-
-    let Some(state) = commitment_state else {
-        return SubtreeAuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            kind: RejectKind::Protocol,
-            reason: "no commitment state".to_string(),
-        };
-    };
-
-    // Look up the pinned commitment among the in-window retained set (TTL-bounded
-    // answerability with a MAX_RETAINED_GOSSIPED_SLOTS backstop).
-    // A miss is `UnknownCommitment`. With audit grace removed (ADR-0004 A1) the
-    // auditor treats a responsive miss on an in-window pin as a CONFIRMED failure:
-    // answerability is restart-durable and pins are challenged only while in
-    // window, so failing to answer is a real repudiation, not benign rotation.
-    let Some(built) = state.lookup_by_hash(&challenge.expected_commitment_hash) else {
-        return SubtreeAuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            kind: RejectKind::UnknownCommitment,
-            reason: "unknown commitment hash".to_string(),
-        };
-    };
-
-    // Geometry first (no bytes touched): which leaves to prove + the sibling
-    // cut-hashes from the committed tree.
-    let plan = match subtree_plan(built.tree(), &challenge.nonce) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!("Subtree audit: failed to plan proof: {e:?}");
-            return SubtreeAuditResponse::Rejected {
-                challenge_id: challenge.challenge_id,
-                kind: RejectKind::Protocol,
-                reason: "could not build subtree proof".to_string(),
-            };
-        }
-    };
-
-    // Read chunk bytes one leaf at a time so peak memory is bounded regardless
-    // of subtree size, hashing each into its plain + nonced leaf.
-    let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
-    for key in &plan.leaf_keys {
-        let bytes = match get_raw_retrying(storage, key).await {
-            Ok(Some(bytes)) => bytes,
-            // Key is in our committed tree but definitively NOT stored — real
-            // storage loss / the classic deleter. For a recently gossiped pin
-            // the auditor counts this as a CONFIRMED failure.
-            Ok(None) => {
-                warn!(
-                    "Subtree audit: missing bytes for committed key {}",
-                    hex::encode(key)
-                );
-                return SubtreeAuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    kind: RejectKind::Protocol,
-                    reason: format!("missing bytes for committed key: {}", hex::encode(key)),
-                };
-            }
-            // Persistent transient read error after retries — NOT proof of missing
-            // data. Reject `Transient`; the auditor routes it to the timeout lane
-            // (no confirmed penalty) so a genuinely flaky disk is not branded a
-            // deleter, while gaining no positive standing.
-            Err(e) => {
-                warn!(
-                    "Subtree audit: storage read error for committed key {}: {e} \
-                     (rejecting as transient, not a confirmed failure)",
-                    hex::encode(key)
-                );
-                return SubtreeAuditResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    kind: RejectKind::Transient,
-                    reason: format!("transient storage read error: {e}"),
-                };
-            }
-        };
-        leaves.push(crate::replication::subtree::subtree_leaf(
-            &challenge.nonce,
-            &challenge.challenged_peer_id,
-            key,
-            &bytes,
-        ));
-        // bytes drops here.
-    }
-
-    SubtreeAuditResponse::Proof {
+    info!(
+        "handle_subtree_challenge: CONTROL-BUILD audits disabled, rejecting challenge {}",
+        challenge.challenge_id
+    );
+    SubtreeAuditResponse::Rejected {
         challenge_id: challenge.challenge_id,
-        commitment: built.commitment().clone(),
-        proof: SubtreeProof {
-            leaves,
-            sibling_cut_hashes: plan.sibling_cut_hashes,
-        },
+        kind: RejectKind::Protocol,
+        reason: "control-build: audits disabled".to_string(),
     }
 }
+
+// ---------------------------------------------------------------------------
 
 /// Handle a round-2 byte challenge (responder side), ADR-0002.
 ///

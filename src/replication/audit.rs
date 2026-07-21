@@ -119,286 +119,25 @@ pub async fn audit_tick(
 
 /// Execute one repair-proof-gated audit tick.
 ///
-/// This is the production path used by the replication engine. The
-/// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
-/// callers that have not adopted repair proofs remain conservative and do not
-/// audit peers for unproven keys.
+/// CONTROL-BUILD (throwaway): on `chris/disable-audits-0.14.4` for the DEV-02
+/// control comparison, this returns [`AuditTickResult::Idle`] immediately
+/// regardless of inputs. The surrounding audit samplers, sleep loops, and
+/// first-audit drainer keep running — they just no-op into Idle. Commitment
+/// gossip + paid-list admission + storage all keep working; nothing critical
+/// depends on audit results to bootstrap. To re-enable audits, revert this
+/// branch to v0.14.4.
 #[allow(clippy::implicit_hasher, clippy::too_many_lines)]
 pub async fn audit_tick_with_repair_proofs(
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    config: &ReplicationConfig,
-    sync_history: &HashMap<PeerId, PeerSyncRecord>,
-    repair_proofs: &Arc<RwLock<RepairProofs>>,
-    current_sync_epoch: u64,
-    is_bootstrapping: bool,
+    _p2p_node: &Arc<P2PNode>,
+    _storage: &Arc<LmdbStorage>,
+    _config: &ReplicationConfig,
+    _sync_history: &HashMap<PeerId, PeerSyncRecord>,
+    _repair_proofs: &Arc<RwLock<RepairProofs>>,
+    _current_sync_epoch: u64,
+    _is_bootstrapping: bool,
 ) -> AuditTickResult {
-    // Invariant 19: never audit while still bootstrapping.
-    if is_bootstrapping {
-        return AuditTickResult::Idle;
-    }
-
-    let dht = p2p_node.dht_manager();
-
-    // Step 2: Select one eligible peer (has RepairOpportunity) at random.
-    // Peers with active bootstrap claims remain eligible. A follow-up audit is
-    // how we observe a continued claim and apply past-grace abuse handling.
-    let eligible_peers = eligible_audit_peers(sync_history);
-
-    if eligible_peers.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    let (challenged_peer, nonce, challenge_id) = {
-        let mut rng = rand::thread_rng();
-        let selected = match eligible_peers.choose(&mut rng) {
-            Some(p) => *p,
-            None => return AuditTickResult::Idle,
-        };
-        let n: [u8; 32] = rng.gen();
-        let c: u64 = rng.gen();
-        (selected, n, c)
-    };
-
-    // Step 3: Sample keys from local store and keep those the peer is
-    // responsible for (appears in the close group via local RT lookup).
-    let all_keys = match storage.all_keys().await {
-        Ok(keys) => keys,
-        Err(e) => {
-            warn!("Audit: failed to read local keys: {e}");
-            return AuditTickResult::Idle;
-        }
-    };
-
-    if all_keys.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    let sample_count = ReplicationConfig::responsible_audit_key_limit(all_keys.len());
-    let sampled_keys: Vec<XorName> = {
-        let mut rng = rand::thread_rng();
-        all_keys
-            .choose_multiple(&mut rng, sample_count)
-            .copied()
-            .collect()
-    };
-
-    // Step 4: Filter to keys where the chosen peer is in the close group and
-    // this node has proof that it already sent the peer a repair hint for the
-    // specific key.
-    let mut sampled_key_groups = Vec::new();
-    for key in &sampled_keys {
-        let closest = dht
-            .find_closest_nodes_local_with_self(key, config.close_group_size)
-            .await;
-        let close_peers: HashSet<PeerId> = closest.iter().map(|node| node.peer_id).collect();
-        if close_peers.contains(&challenged_peer) {
-            sampled_key_groups.push((*key, close_peers));
-        }
-    }
-
-    let peer_keys = {
-        let mut proofs = repair_proofs.write().await;
-        let now = Instant::now();
-        mature_audit_keys_for_peer(
-            &challenged_peer,
-            sampled_key_groups,
-            &mut proofs,
-            current_sync_epoch,
-            now,
-        )
-    };
-
-    if peer_keys.is_empty() {
-        return AuditTickResult::Idle;
-    }
-
-    // peer_keys is naturally bounded by audit_sample_count (sqrt-scaled),
-    // so no explicit truncation needed.
-
-    // Step 6: Send challenge.
-
-    let challenge = AuditChallenge {
-        challenge_id,
-        nonce,
-        challenged_peer_id: *challenged_peer.as_bytes(),
-        keys: peer_keys.clone(),
-    };
-
-    let msg = ReplicationMessage {
-        request_id: challenge_id,
-        body: ReplicationMessageBody::AuditChallenge(challenge),
-    };
-
-    let encoded = match msg.encode() {
-        Ok(data) => data,
-        Err(e) => {
-            warn!("Audit: failed to encode challenge: {e}");
-            return AuditTickResult::Idle;
-        }
-    };
-
-    let encoded_len = encoded.len();
-    let audit_timeout = config.audit_response_timeout(peer_keys.len());
-    let audit_started = Instant::now();
-    let response = match p2p_node
-        .send_request(
-            &challenged_peer,
-            REPLICATION_PROTOCOL_ID,
-            encoded,
-            audit_timeout,
-        )
-        .await
-    {
-        Ok(resp) => resp,
-        Err(e) => {
-            if enabled!(crate::logging::Level::WARN) {
-                let elapsed = audit_started.elapsed();
-                let send_error = e.to_string();
-                let send_error_class = classify_audit_send_error(&send_error);
-                let first_key = first_challenged_key_label(&peer_keys);
-                warn!(
-                    audit_type = "responsible_chunk",
-                    audit_phase = "challenge_send",
-                    audit_outcome = "send_request_failed",
-                    challenged_peer = %challenged_peer,
-                    challenge_id,
-                    key_count = peer_keys.len(),
-                    timeout_ms = audit_timeout.as_millis(),
-                    elapsed_ms = elapsed.as_millis(),
-                    first_key = %first_key,
-                    encoded_len,
-                    send_error_class,
-                    "Audit challenge send_request failed: audit_type=responsible_chunk, audit_phase=challenge_send, audit_outcome=send_request_failed, challenged_peer={challenged_peer}, challenge_id={challenge_id}, key_count={}, timeout_ms={}, elapsed_ms={}, first_key={first_key}, encoded_len={encoded_len}, send_error_class={send_error_class}",
-                    peer_keys.len(),
-                    audit_timeout.as_millis(),
-                    elapsed.as_millis(),
-                );
-            }
-            debug!(
-                challenged_peer = %challenged_peer,
-                challenge_id,
-                send_error = %e,
-                "Audit challenge raw send_request error"
-            );
-            // Timeout — need responsibility confirmation before penalty.
-            return handle_audit_timeout(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                p2p_node,
-                config,
-            )
-            .await;
-        }
-    };
-
-    // Step 7: Parse response.
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
-        Ok(m) => m,
-        Err(e) => {
-            warn!("Audit: failed to decode response from {challenged_peer}: {e}");
-            return handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::MalformedResponse,
-                p2p_node,
-                config,
-            )
-            .await;
-        }
-    };
-
-    match resp_msg.body {
-        ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
-            challenge_id: resp_id,
-        }) => {
-            if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on Bootstrapping from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            // Step 7b: Bootstrapping claim.
-            AuditTickResult::BootstrapClaim {
-                peer: challenged_peer,
-            }
-        }
-        ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
-            challenge_id: resp_id,
-            digests,
-        }) => {
-            if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            verify_digests(
-                &challenged_peer,
-                challenge_id,
-                &nonce,
-                &peer_keys,
-                &digests,
-                storage,
-                p2p_node,
-                config,
-            )
-            .await
-        }
-        ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
-            challenge_id: resp_id,
-            reason,
-        }) => {
-            if resp_id != challenge_id {
-                warn!("Audit: challenge ID mismatch on Rejected from {challenged_peer}");
-                return handle_audit_failure(
-                    &challenged_peer,
-                    challenge_id,
-                    &peer_keys,
-                    AuditFailureReason::MalformedResponse,
-                    p2p_node,
-                    config,
-                )
-                .await;
-            }
-            warn!("Audit: challenge rejected by {challenged_peer}: {reason}");
-            handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::Rejected,
-                p2p_node,
-                config,
-            )
-            .await
-        }
-        _ => {
-            warn!("Audit: unexpected response type from {challenged_peer}");
-            handle_audit_failure(
-                &challenged_peer,
-                challenge_id,
-                &peer_keys,
-                AuditFailureReason::MalformedResponse,
-                p2p_node,
-                config,
-            )
-            .await
-        }
-    }
+    info!("audit_tick_with_repair_proofs: CONTROL-BUILD audits disabled, returning Idle");
+    AuditTickResult::Idle
 }
 
 fn eligible_audit_peers(sync_history: &HashMap<PeerId, PeerSyncRecord>) -> Vec<PeerId> {
@@ -707,82 +446,26 @@ async fn handle_audit_timeout(
 
 /// Handle an incoming audit challenge (responder side).
 ///
-/// Validates that the challenge targets this node, computes per-key digests,
-/// and returns the response.  Rejects challenges where
-/// `challenged_peer_id` does not match `self_peer_id` to prevent an oracle
-/// attack where a malicious challenger forges digests for a different peer.
+/// CONTROL-BUILD (throwaway): on `chris/disable-audits-0.14.4` this rejects
+/// every incoming challenge with a clear reason. To re-enable audits,
+/// revert this branch to v0.14.4.
 pub async fn handle_audit_challenge(
     challenge: &AuditChallenge,
-    storage: &LmdbStorage,
-    self_peer_id: &PeerId,
-    is_bootstrapping: bool,
-    stored_chunks: usize,
+    _storage: &LmdbStorage,
+    _self_peer_id: &PeerId,
+    _is_bootstrapping: bool,
+    _stored_chunks: usize,
 ) -> AuditResponse {
-    if is_bootstrapping {
-        return AuditResponse::Bootstrapping {
-            challenge_id: challenge.challenge_id,
-        };
-    }
-
-    if challenge.challenged_peer_id != *self_peer_id.as_bytes() {
-        warn!(
-            "Audit challenge targeted wrong peer: expected {}, got {}",
-            hex::encode(self_peer_id.as_bytes()),
-            hex::encode(challenge.challenged_peer_id),
-        );
-        return AuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            reason: "challenged_peer_id does not match this node".to_string(),
-        };
-    }
-
-    let max_keys = ReplicationConfig::max_incoming_audit_keys(stored_chunks);
-    if challenge.keys.len() > max_keys {
-        warn!(
-            "Audit challenge rejected: {} keys exceeds dynamic limit of {max_keys} \
-             (stored_chunks={stored_chunks})",
-            challenge.keys.len(),
-        );
-        return AuditResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            reason: format!(
-                "challenge contains {} keys, limit is {max_keys}",
-                challenge.keys.len()
-            ),
-        };
-    }
-
-    let mut digests = Vec::with_capacity(challenge.keys.len());
-
-    for key in &challenge.keys {
-        match storage.get_raw(key).await {
-            Ok(Some(data)) => {
-                let digest = compute_audit_digest(
-                    &challenge.nonce,
-                    &challenge.challenged_peer_id,
-                    key,
-                    &data,
-                );
-                digests.push(digest);
-            }
-            Ok(None) => {
-                digests.push(ABSENT_KEY_DIGEST);
-            }
-            Err(e) => {
-                warn!(
-                    "Audit responder: failed to read key {}: {e}",
-                    hex::encode(key)
-                );
-                digests.push(ABSENT_KEY_DIGEST);
-            }
-        }
-    }
-
-    AuditResponse::Digests {
+    info!(
+        "handle_audit_challenge: CONTROL-BUILD audits disabled, rejecting challenge {}",
+        challenge.challenge_id
+    );
+    AuditResponse::Rejected {
         challenge_id: challenge.challenge_id,
-        digests,
+        reason: "control-build: audits disabled".to_string(),
     }
 }
+
 
 // ---------------------------------------------------------------------------
 // Tests
