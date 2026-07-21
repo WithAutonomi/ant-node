@@ -4,7 +4,8 @@
 //! replication pipeline. Each key progresses through at most one queue at a
 //! time, with strict dedup across all three stages.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::logging::debug;
@@ -29,10 +30,11 @@ use saorsa_core::identity::PeerId;
 /// only from close-group-sized verification evidence, never from attacker
 /// hint volume).
 ///
-/// Source-aware scheduling processes corroborated hints first and trust
-/// penalties remove peers that submit directly contradicted singleton hints.
-/// This cap remains the final memory circuit breaker during the interval
-/// between admission, verification, trust eviction, and source cleanup.
+/// The global cap is paired with elastic max-min sender accounting: one peer
+/// may borrow otherwise-unused capacity for a large bootstrap snapshot, but a
+/// later under-represented sender reclaims slots from an over-represented one.
+/// Verification service is round-robin across capacity owners, so arrival
+/// order cannot turn this memory circuit breaker into sender starvation.
 pub const MAX_PENDING_VERIFY: usize = 131_072;
 
 /// Hard upper bound on the number of keys held in `fetch_queue`.
@@ -71,6 +73,47 @@ impl AdmissionResult {
     #[must_use]
     pub fn admitted(self) -> bool {
         matches!(self, Self::Admitted)
+    }
+}
+
+/// An existing pending hint displaced to restore sender fairness.
+///
+/// Bootstrap accounting uses this to keep the displaced source's work
+/// outstanding until that source re-advertises it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacityDisplacement {
+    /// Key removed from `pending_verify`.
+    pub(crate) key: XorName,
+    /// Authenticated source whose borrowed capacity slot was reclaimed.
+    pub(crate) owner: PeerId,
+}
+
+/// Lazy heap entry for choosing the least valuable reclaimable hint owned by
+/// an over-represented sender.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EvictionOrder {
+    key: XorName,
+    source_count: usize,
+    paid_only: bool,
+    created_at: Instant,
+}
+
+impl Ord for EvictionOrder {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // BinaryHeap pops the greatest item. Prefer singleton, paid-only,
+        // newest entries for eviction, with a deterministic key tie-break.
+        other
+            .source_count
+            .cmp(&self.source_count)
+            .then_with(|| self.paid_only.cmp(&other.paid_only))
+            .then_with(|| self.created_at.cmp(&other.created_at))
+            .then_with(|| self.key.cmp(&other.key))
+    }
+}
+
+impl PartialOrd for EvictionOrder {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -113,8 +156,8 @@ pub struct InFlightEntry {
 pub struct ReplicationQueues {
     /// Keys awaiting quorum result (dedup by key).
     ///
-    /// Capacity-bounded by [`MAX_PENDING_VERIFY`]: admissions are rejected
-    /// once full, preventing unbounded growth under a network hint flood.
+    /// Capacity-bounded by [`MAX_PENDING_VERIFY`]. At capacity, max-min sender
+    /// accounting reclaims borrowed entries before rejecting new work.
     pending_verify: HashMap<XorName, VerificationEntry>,
     /// Nearest-first priority order over the keys in `fetch_payloads`.
     ///
@@ -137,6 +180,24 @@ pub struct ReplicationQueues {
     /// Reverse index for removing a departed peer from every pending hint
     /// without scanning the entire pending table.
     pending_keys_by_source: HashMap<PeerId, HashSet<XorName>>,
+    /// Capacity owner for every retry-capable key, retained while the key
+    /// moves through pending, fetch-queued, and in-flight states.
+    capacity_owner_by_key: HashMap<XorName, PeerId>,
+    /// Pending keys charged to each authenticated source.
+    pending_keys_by_owner: HashMap<PeerId, HashSet<XorName>>,
+    /// Lazy per-owner victim heaps used when borrowed capacity is reclaimed.
+    eviction_candidates_by_owner: HashMap<PeerId, BinaryHeap<EvictionOrder>>,
+    /// Verified fetch retries restored to pending verification. These entries
+    /// are not eligible for fairness eviction.
+    protected_pending_keys: HashSet<XorName>,
+    /// Last owner selected by the fair verification scheduler.
+    last_served_owner: Option<PeerId>,
+    /// Fairness evictions accumulated since the caller last drained them.
+    capacity_displacements: Vec<CapacityDisplacement>,
+    /// Owners proven unable to reclaim a slot at the current queue state.
+    /// Cleared by every capacity-changing mutation, this avoids repeating the
+    /// max-min calculation for every key in an oversized rejected suffix.
+    fair_rejection_cache: HashSet<PeerId>,
     /// Pending-verification capacity slots reserved by retry-capable keys that
     /// have left `pending_verify` for `fetch_queue` / `in_flight_fetch`.
     retry_reserved_slots: usize,
@@ -158,6 +219,13 @@ impl ReplicationQueues {
             fetch_payloads: HashMap::new(),
             in_flight_fetch: HashMap::new(),
             pending_keys_by_source: HashMap::new(),
+            capacity_owner_by_key: HashMap::new(),
+            pending_keys_by_owner: HashMap::new(),
+            eviction_candidates_by_owner: HashMap::new(),
+            protected_pending_keys: HashSet::new(),
+            last_served_owner: None,
+            capacity_displacements: Vec::new(),
+            fair_rejection_cache: HashSet::new(),
             retry_reserved_slots: 0,
         }
     }
@@ -172,7 +240,8 @@ impl ReplicationQueues {
     /// * `Admitted` — newly inserted.
     /// * `AlreadyPresent` — Rule 8 cross-queue dedup. For a key still in
     ///   `pending_verify`, the new advertiser is merged into its source set.
-    /// * `CapacityRejected` — the global bound was hit; the work is
+    /// * `CapacityRejected` — the global bound was hit and no over-represented
+    ///   sender had reclaimable borrowed work; the incoming work is
     ///   genuinely lost and the caller (e.g. bootstrap drain accounting,
     ///   source-side retry) MUST treat this as still-outstanding work, not as
     ///   "done". Without this distinction a bootstrap snapshot whose hints
@@ -183,16 +252,22 @@ impl ReplicationQueues {
         entry: VerificationEntry,
     ) -> AdmissionResult {
         if let Some(existing) = self.pending_verify.get_mut(&key) {
+            let replica_source_count = existing.replica_hint_sources.len();
             existing
                 .replica_hint_sources
                 .extend(entry.replica_hint_sources.iter().copied());
+            let mut priority_changed = existing.replica_hint_sources.len() != replica_source_count;
             for source in entry.hint_sources {
                 if existing.hint_sources.insert(source) {
+                    priority_changed = true;
                     self.pending_keys_by_source
                         .entry(source)
                         .or_default()
                         .insert(key);
                 }
+            }
+            if priority_changed {
+                self.refresh_eviction_candidate(&key);
             }
             return AdmissionResult::AlreadyPresent;
         }
@@ -226,15 +301,38 @@ impl ReplicationQueues {
             }
             return AdmissionResult::AlreadyPresent;
         }
+        let Some(owner) = self.least_loaded_source(&entry.hint_sources) else {
+            debug_assert!(false, "pending hint admitted without a source");
+            return AdmissionResult::CapacityRejected;
+        };
+
         if self.pending_capacity_used() >= MAX_PENDING_VERIFY {
+            if self.fair_rejection_cache.contains(&owner) {
+                return AdmissionResult::CapacityRejected;
+            }
+            if let Some(displaced) = self.reclaim_borrowed_slot(owner) {
+                self.insert_pending_owned_unchecked(key, entry, owner, false);
+                self.capacity_displacements.push(displaced);
+                return AdmissionResult::Admitted;
+            }
             debug!(
-                "pending_verify at global capacity ({MAX_PENDING_VERIFY}); rejecting key {}",
-                hex::encode(key)
+                "pending_verify at capacity ({MAX_PENDING_VERIFY}); source {owner} has no fair \
+                 reclaimable slot for key {}",
+                hex::encode(key),
             );
+            self.fair_rejection_cache.insert(owner);
             return AdmissionResult::CapacityRejected;
         }
-        self.insert_pending_unchecked(key, entry);
+        self.insert_pending_owned_unchecked(key, entry, owner, false);
         AdmissionResult::Admitted
+    }
+
+    /// Drain fairness displacements produced by recent admissions.
+    ///
+    /// Neighbor-sync admission calls this while it still holds the queue lock
+    /// so bootstrap can attribute every displaced key to its former owner.
+    pub(crate) fn take_capacity_displacements(&mut self) -> Vec<CapacityDisplacement> {
+        std::mem::take(&mut self.capacity_displacements)
     }
 
     fn pending_capacity_used(&self) -> usize {
@@ -243,7 +341,134 @@ impl ReplicationQueues {
             .saturating_add(self.retry_reserved_slots)
     }
 
-    fn insert_pending_unchecked(&mut self, key: XorName, entry: VerificationEntry) {
+    fn pending_count_for_owner_internal(&self, owner: &PeerId) -> usize {
+        self.pending_keys_by_owner
+            .get(owner)
+            .map_or(0, HashSet::len)
+    }
+
+    fn least_loaded_source(&self, sources: &HashSet<PeerId>) -> Option<PeerId> {
+        sources.iter().copied().min_by(|a, b| {
+            self.pending_count_for_owner_internal(a)
+                .cmp(&self.pending_count_for_owner_internal(b))
+                .then_with(|| a.cmp(b))
+        })
+    }
+
+    fn reclaim_borrowed_slot(&mut self, incoming_owner: PeerId) -> Option<CapacityDisplacement> {
+        let available_pending = MAX_PENDING_VERIFY.saturating_sub(self.retry_reserved_slots);
+        let mut demands = self
+            .pending_keys_by_owner
+            .iter()
+            .map(|(owner, keys)| (*owner, keys.len()))
+            .collect::<BTreeMap<_, _>>();
+        *demands.entry(incoming_owner).or_default() += 1;
+
+        let targets = max_min_allocations(&demands, available_pending);
+        let incoming_count = self.pending_count_for_owner_internal(&incoming_owner);
+        if targets.get(&incoming_owner).copied().unwrap_or(0) <= incoming_count {
+            return None;
+        }
+
+        let mut over_represented = self
+            .pending_keys_by_owner
+            .iter()
+            .filter_map(|(owner, keys)| {
+                let target = targets.get(owner).copied().unwrap_or(0);
+                let excess = keys.len().saturating_sub(target);
+                (excess > 0).then_some((*owner, excess))
+            })
+            .collect::<Vec<_>>();
+        over_represented.sort_unstable_by(|(owner_a, excess_a), (owner_b, excess_b)| {
+            excess_b.cmp(excess_a).then_with(|| owner_a.cmp(owner_b))
+        });
+
+        for (owner, _) in over_represented {
+            if let Some(key) = self.pop_reclaimable_victim(owner) {
+                let removed = self.remove_pending(&key);
+                debug_assert!(removed.is_some(), "fairness victim vanished before removal");
+                return Some(CapacityDisplacement { key, owner });
+            }
+        }
+        None
+    }
+
+    fn pop_reclaimable_victim(&mut self, owner: PeerId) -> Option<XorName> {
+        loop {
+            let candidate = self
+                .eviction_candidates_by_owner
+                .get_mut(&owner)
+                .and_then(BinaryHeap::pop)?;
+            let Some(entry) = self.pending_verify.get(&candidate.key) else {
+                continue;
+            };
+            let valid = self.capacity_owner_by_key.get(&candidate.key) == Some(&owner)
+                && !self.protected_pending_keys.contains(&candidate.key)
+                && candidate.source_count == entry.hint_sources.len()
+                && candidate.paid_only == entry.replica_hint_sources.is_empty()
+                && candidate.created_at == entry.created_at;
+            if valid {
+                return Some(candidate.key);
+            }
+        }
+    }
+
+    fn refresh_eviction_candidate(&mut self, key: &XorName) {
+        if self.protected_pending_keys.contains(key) {
+            return;
+        }
+        let (Some(entry), Some(owner)) = (
+            self.pending_verify.get(key),
+            self.capacity_owner_by_key.get(key).copied(),
+        ) else {
+            return;
+        };
+        self.eviction_candidates_by_owner
+            .entry(owner)
+            .or_default()
+            .push(EvictionOrder {
+                key: *key,
+                source_count: entry.hint_sources.len(),
+                paid_only: entry.replica_hint_sources.is_empty(),
+                created_at: entry.created_at,
+            });
+
+        let owner_len = self.pending_count_for_owner_internal(&owner);
+        let heap_len = self
+            .eviction_candidates_by_owner
+            .get(&owner)
+            .map_or(0, BinaryHeap::len);
+        if heap_len > owner_len.saturating_mul(2).saturating_add(64) {
+            self.rebuild_eviction_heap(owner);
+        }
+    }
+
+    fn rebuild_eviction_heap(&mut self, owner: PeerId) {
+        let candidates = self
+            .pending_keys_by_owner
+            .get(&owner)
+            .into_iter()
+            .flatten()
+            .filter(|key| !self.protected_pending_keys.contains(*key))
+            .filter_map(|key| {
+                self.pending_verify.get(key).map(|entry| EvictionOrder {
+                    key: *key,
+                    source_count: entry.hint_sources.len(),
+                    paid_only: entry.replica_hint_sources.is_empty(),
+                    created_at: entry.created_at,
+                })
+            })
+            .collect::<BinaryHeap<_>>();
+        self.eviction_candidates_by_owner.insert(owner, candidates);
+    }
+
+    fn insert_pending_owned_unchecked(
+        &mut self,
+        key: XorName,
+        entry: VerificationEntry,
+        owner: PeerId,
+        protected_retry: bool,
+    ) {
         debug_assert!(
             !entry.hint_sources.is_empty(),
             "pending hint inserted without a live source"
@@ -251,6 +476,10 @@ impl ReplicationQueues {
         debug_assert!(
             entry.replica_hint_sources.is_subset(&entry.hint_sources),
             "replica advertisers must be included in all hint sources"
+        );
+        debug_assert!(
+            entry.hint_sources.contains(&owner),
+            "capacity owner must be a live hint source"
         );
         for source in &entry.hint_sources {
             self.pending_keys_by_source
@@ -264,14 +493,27 @@ impl ReplicationQueues {
             "pending entry inserted twice for {}",
             hex::encode(key)
         );
+        self.capacity_owner_by_key.insert(key, owner);
+        self.fair_rejection_cache.clear();
+        self.pending_keys_by_owner
+            .entry(owner)
+            .or_default()
+            .insert(key);
+        if protected_retry {
+            self.protected_pending_keys.insert(key);
+        } else {
+            self.refresh_eviction_candidate(&key);
+        }
     }
 
     fn reserve_retry_slot(&mut self) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_add(1);
+        self.fair_rejection_cache.clear();
     }
 
     fn release_retry_slot(&mut self) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_sub(1);
+        self.fair_rejection_cache.clear();
     }
 
     fn release_retry_slot_for_entry(&mut self, entry: &InFlightEntry) {
@@ -314,9 +556,25 @@ impl ReplicationQueues {
 
     /// Remove a key from pending verification.
     pub fn remove_pending(&mut self, key: &XorName) -> Option<VerificationEntry> {
+        self.take_pending(key, true)
+    }
+
+    fn take_pending(
+        &mut self,
+        key: &XorName,
+        forget_capacity_owner: bool,
+    ) -> Option<VerificationEntry> {
         let removed = self.pending_verify.remove(key);
         if let Some(entry) = &removed {
+            self.fair_rejection_cache.clear();
             self.remove_key_from_source_index(key, &entry.hint_sources);
+            if let Some(owner) = self.capacity_owner_by_key.get(key).copied() {
+                self.remove_key_from_owner_index(key, &owner);
+            }
+            self.protected_pending_keys.remove(key);
+            if forget_capacity_owner {
+                self.capacity_owner_by_key.remove(key);
+            }
         }
         removed
     }
@@ -328,6 +586,16 @@ impl ReplicationQueues {
                 if keys.is_empty() {
                     self.pending_keys_by_source.remove(source);
                 }
+            }
+        }
+    }
+
+    fn remove_key_from_owner_index(&mut self, key: &XorName, owner: &PeerId) {
+        if let Some(keys) = self.pending_keys_by_owner.get_mut(owner) {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.pending_keys_by_owner.remove(owner);
+                self.eviction_candidates_by_owner.remove(owner);
             }
         }
     }
@@ -359,6 +627,81 @@ impl ReplicationQueues {
         ready
     }
 
+    /// Select a bounded, sender-fair set of ready verification keys.
+    ///
+    /// Owners are served round-robin with persistent rotation between cycles;
+    /// unused service is immediately redistributed. Within an owner's share,
+    /// protected retries and corroborated/older hints retain priority.
+    pub fn select_ready_pending_keys(&mut self, now: Instant, limit: usize) -> Vec<XorName> {
+        if limit == 0 {
+            return Vec::new();
+        }
+
+        let mut grouped = BTreeMap::<PeerId, Vec<XorName>>::new();
+        for (key, entry) in &self.pending_verify {
+            if entry.next_verify_at > now {
+                continue;
+            }
+            let Some(owner) = self.capacity_owner_by_key.get(key).copied() else {
+                debug_assert!(false, "pending key has no capacity owner");
+                continue;
+            };
+            grouped.entry(owner).or_default().push(*key);
+        }
+
+        for keys in grouped.values_mut() {
+            keys.sort_unstable_by(|a, b| {
+                let entry_a = &self.pending_verify[a];
+                let entry_b = &self.pending_verify[b];
+                self.protected_pending_keys
+                    .contains(b)
+                    .cmp(&self.protected_pending_keys.contains(a))
+                    .then_with(|| entry_b.hint_sources.len().cmp(&entry_a.hint_sources.len()))
+                    .then_with(|| entry_a.created_at.cmp(&entry_b.created_at))
+                    .then_with(|| a.cmp(b))
+            });
+        }
+
+        let mut owners = grouped.keys().copied().collect::<Vec<_>>();
+        if owners.is_empty() {
+            return Vec::new();
+        }
+        if let Some(last) = self.last_served_owner {
+            let start = owners.iter().position(|owner| *owner > last).unwrap_or(0);
+            owners.rotate_left(start);
+        }
+
+        let mut queues = grouped
+            .into_iter()
+            .map(|(owner, keys)| (owner, VecDeque::from(keys)))
+            .collect::<HashMap<_, _>>();
+        let mut active = VecDeque::from(owners);
+        let mut selected = Vec::with_capacity(limit.min(self.pending_verify.len()));
+        let mut last_selected = None;
+
+        while selected.len() < limit {
+            let Some(owner) = active.pop_front() else {
+                break;
+            };
+            let Some(owner_queue) = queues.get_mut(&owner) else {
+                continue;
+            };
+            let Some(key) = owner_queue.pop_front() else {
+                continue;
+            };
+            selected.push(key);
+            last_selected = Some(owner);
+            if !owner_queue.is_empty() {
+                active.push_back(owner);
+            }
+        }
+
+        if let Some(owner) = last_selected {
+            self.last_served_owner = Some(owner);
+        }
+        selected
+    }
+
     /// Remove a departed routing-table peer from every pending hint it
     /// advertised. Entries with no remaining live advertisers are dropped.
     ///
@@ -372,21 +715,34 @@ impl ReplicationQueues {
         let mut orphaned = Vec::new();
 
         for key in keys {
-            let became_orphaned = if let Some(entry) = self.pending_verify.get_mut(&key) {
+            let remaining_sources = if let Some(entry) = self.pending_verify.get_mut(&key) {
                 entry.hint_sources.remove(source);
                 entry.replica_hint_sources.remove(source);
-                entry.hint_sources.is_empty()
+                Some(entry.hint_sources.clone())
             } else {
-                false
+                None
             };
 
-            if became_orphaned {
-                self.pending_verify.remove(&key);
+            let Some(remaining_sources) = remaining_sources else {
+                continue;
+            };
+            if remaining_sources.is_empty() {
+                self.remove_pending(&key);
                 orphaned.push(key);
+                continue;
+            }
+
+            if self.capacity_owner_by_key.get(&key) == Some(source) {
+                if let Some(new_owner) = self.least_loaded_source(&remaining_sources) {
+                    self.transfer_pending_owner(key, *source, new_owner);
+                }
+            } else {
+                self.refresh_eviction_candidate(&key);
             }
         }
 
         let mut retry_releases = 0usize;
+        let mut retry_owner_updates = Vec::new();
         let mut orphaned_fetch_keys = HashSet::new();
         for (key, payload) in &mut self.fetch_payloads {
             payload.sources.retain(|peer| peer != source);
@@ -396,6 +752,10 @@ impl ReplicationQueues {
                     if verification.hint_sources.is_empty() {
                         retry_releases += 1;
                         payload.retry_verification = None;
+                        retry_owner_updates.push((*key, None));
+                    } else if self.capacity_owner_by_key.get(key) == Some(source) {
+                        retry_owner_updates
+                            .push((*key, verification.hint_sources.iter().copied().min()));
                     }
                 }
             }
@@ -422,8 +782,20 @@ impl ReplicationQueues {
                     if verification.hint_sources.is_empty() {
                         retry_releases += 1;
                         entry.retry_verification = None;
+                        retry_owner_updates.push((entry.key, None));
+                    } else if self.capacity_owner_by_key.get(&entry.key) == Some(source) {
+                        retry_owner_updates
+                            .push((entry.key, verification.hint_sources.iter().copied().min()));
                     }
                 }
+            }
+        }
+
+        for (key, owner) in retry_owner_updates {
+            if let Some(owner) = owner {
+                self.capacity_owner_by_key.insert(key, owner);
+            } else {
+                self.capacity_owner_by_key.remove(&key);
             }
         }
 
@@ -432,6 +804,21 @@ impl ReplicationQueues {
         }
 
         orphaned
+    }
+
+    fn transfer_pending_owner(&mut self, key: XorName, old_owner: PeerId, new_owner: PeerId) {
+        if old_owner == new_owner {
+            self.refresh_eviction_candidate(&key);
+            return;
+        }
+        self.fair_rejection_cache.clear();
+        self.remove_key_from_owner_index(&key, &old_owner);
+        self.capacity_owner_by_key.insert(key, new_owner);
+        self.pending_keys_by_owner
+            .entry(new_owner)
+            .or_default()
+            .insert(key);
+        self.refresh_eviction_candidate(&key);
     }
 
     /// Defer a pending key before its next verification attempt.
@@ -447,6 +834,13 @@ impl ReplicationQueues {
     #[must_use]
     pub fn pending_count(&self) -> usize {
         self.pending_verify.len()
+    }
+
+    /// Number of pending entries currently charged to one capacity owner.
+    /// Useful for fairness observability and invariant tests.
+    #[must_use]
+    pub fn pending_count_for_owner(&self, owner: &PeerId) -> usize {
+        self.pending_count_for_owner_internal(owner)
     }
 
     // -----------------------------------------------------------------------
@@ -525,7 +919,7 @@ impl ReplicationQueues {
             return false;
         }
         // Capacity confirmed; safe to release the pending slot and enqueue.
-        let retry_verification = self.remove_pending(&key);
+        let retry_verification = self.take_pending(&key, false);
         let reserved_retry = retry_verification.is_some();
         if reserved_retry {
             self.reserve_retry_slot();
@@ -537,6 +931,7 @@ impl ReplicationQueues {
         let enqueued = self.enqueue_fetch_with_retry(key, distance, sources, retry_verification);
         if !enqueued && reserved_retry {
             self.release_retry_slot();
+            self.capacity_owner_by_key.remove(&key);
         }
         enqueued
     }
@@ -645,6 +1040,7 @@ impl ReplicationQueues {
         let removed = self.in_flight_fetch.remove(key);
         if let Some(entry) = &removed {
             self.release_retry_slot_for_entry(entry);
+            self.capacity_owner_by_key.remove(key);
         }
         removed
     }
@@ -652,10 +1048,13 @@ impl ReplicationQueues {
     /// Drop a dequeued fetch candidate without starting it.
     pub fn discard_fetch_candidate(&mut self, candidate: FetchCandidate) {
         let FetchCandidate {
-            retry_verification, ..
+            key,
+            retry_verification,
+            ..
         } = candidate;
         if retry_verification.is_some() {
             self.release_retry_slot();
+            self.capacity_owner_by_key.remove(&key);
         }
     }
 
@@ -702,7 +1101,16 @@ impl ReplicationQueues {
         verification.tried_sources.clear();
         verification.next_verify_at = Instant::now() + retry_after;
 
-        self.insert_pending_unchecked(key, verification);
+        let owner = self
+            .capacity_owner_by_key
+            .get(&key)
+            .copied()
+            .or_else(|| self.least_loaded_source(&verification.hint_sources));
+        let Some(owner) = owner else {
+            self.release_retry_slot();
+            return false;
+        };
+        self.insert_pending_owned_unchecked(key, verification, owner, true);
         self.release_retry_slot();
         true
     }
@@ -714,6 +1122,7 @@ impl ReplicationQueues {
             return false;
         };
         let Some(mut verification) = entry.retry_verification.take() else {
+            self.capacity_owner_by_key.remove(key);
             return false;
         };
         verification.state = VerificationState::PendingVerify;
@@ -721,7 +1130,16 @@ impl ReplicationQueues {
         verification.tried_sources.clear();
         verification.next_verify_at = Instant::now() + retry_after;
 
-        self.insert_pending_unchecked(*key, verification);
+        let owner = self
+            .capacity_owner_by_key
+            .get(key)
+            .copied()
+            .or_else(|| self.least_loaded_source(&verification.hint_sources));
+        let Some(owner) = owner else {
+            self.release_retry_slot();
+            return false;
+        };
+        self.insert_pending_owned_unchecked(*key, verification, owner, true);
         self.release_retry_slot();
         true
     }
@@ -778,6 +1196,57 @@ impl ReplicationQueues {
     }
 }
 
+/// Integer max-min allocation with deterministic remainder distribution.
+///
+/// Small demands are satisfied in full. Remaining capacity is divided evenly
+/// between saturated senders, so unused capacity is automatically borrowable.
+fn max_min_allocations(
+    demands: &BTreeMap<PeerId, usize>,
+    capacity: usize,
+) -> BTreeMap<PeerId, usize> {
+    if demands.values().copied().sum::<usize>() <= capacity {
+        return demands.clone();
+    }
+
+    let mut by_demand = demands
+        .iter()
+        .map(|(owner, demand)| (*owner, *demand))
+        .collect::<Vec<_>>();
+    by_demand.sort_unstable_by(|(owner_a, demand_a), (owner_b, demand_b)| {
+        demand_a.cmp(demand_b).then_with(|| owner_a.cmp(owner_b))
+    });
+
+    let mut allocations = BTreeMap::new();
+    let mut remaining_capacity = capacity;
+    let mut index = 0usize;
+
+    while index < by_demand.len() {
+        let remaining_senders = by_demand.len() - index;
+        let even_share = remaining_capacity / remaining_senders;
+        let (owner, demand) = by_demand[index];
+        if demand <= even_share {
+            allocations.insert(owner, demand);
+            remaining_capacity = remaining_capacity.saturating_sub(demand);
+            index += 1;
+            continue;
+        }
+
+        let base = even_share;
+        let remainder = remaining_capacity % remaining_senders;
+        let mut saturated = by_demand[index..]
+            .iter()
+            .map(|(owner, _)| *owner)
+            .collect::<Vec<_>>();
+        saturated.sort_unstable();
+        for (position, owner) in saturated.into_iter().enumerate() {
+            allocations.insert(owner, base + usize::from(position < remainder));
+        }
+        break;
+    }
+
+    allocations
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -817,6 +1286,99 @@ mod tests {
             hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
         }
+    }
+
+    #[test]
+    fn max_min_allocation_lends_unused_capacity() {
+        let attacker = peer_id_from_byte(1);
+        let honest = peer_id_from_byte(2);
+        let demands = BTreeMap::from([(attacker, MAX_PENDING_VERIFY), (honest, 50_000)]);
+
+        let allocated = max_min_allocations(&demands, MAX_PENDING_VERIFY);
+
+        assert_eq!(allocated[&honest], 50_000);
+        assert_eq!(allocated[&attacker], MAX_PENDING_VERIFY - 50_000);
+        assert_eq!(allocated.values().sum::<usize>(), MAX_PENDING_VERIFY);
+    }
+
+    #[test]
+    fn max_min_allocation_is_even_under_saturation() {
+        let demands = (0..20u8)
+            .map(|index| (peer_id_from_byte(index), MAX_PENDING_VERIFY))
+            .collect::<BTreeMap<_, _>>();
+
+        let allocated = max_min_allocations(&demands, MAX_PENDING_VERIFY);
+        let min = allocated.values().copied().min().unwrap();
+        let max = allocated.values().copied().max().unwrap();
+
+        assert!(max - min <= 1);
+        assert_eq!(allocated.values().sum::<usize>(), MAX_PENDING_VERIFY);
+    }
+
+    #[test]
+    fn fair_verification_selection_shares_service_and_redistributes_slack() {
+        let mut queues = ReplicationQueues::new();
+        let first = peer_id_from_byte(1);
+        let second = peer_id_from_byte(2);
+        for index in 0..12u32 {
+            assert!(queues
+                .add_pending_verify(xor_name_from_u32(index), test_entry(1))
+                .admitted());
+        }
+        for index in 100..104u32 {
+            assert!(queues
+                .add_pending_verify(xor_name_from_u32(index), test_entry(2))
+                .admitted());
+        }
+
+        let selected = queues.select_ready_pending_keys(Instant::now(), 12);
+        let first_count = selected
+            .iter()
+            .filter(|key| queues.capacity_owner_by_key.get(*key) == Some(&first))
+            .count();
+        let second_count = selected
+            .iter()
+            .filter(|key| queues.capacity_owner_by_key.get(*key) == Some(&second))
+            .count();
+
+        assert_eq!(
+            second_count, 4,
+            "small sender should receive all its ready work"
+        );
+        assert_eq!(
+            first_count, 8,
+            "unused service should return to the busy sender"
+        );
+    }
+
+    #[test]
+    fn fair_verification_selection_prevents_cycle_monopoly() {
+        const PER_OWNER: u32 = 10_000;
+        const CYCLE: usize = 8_192;
+        let mut queues = ReplicationQueues::new();
+        let first = peer_id_from_byte(1);
+        let second = peer_id_from_byte(2);
+        for index in 0..PER_OWNER {
+            assert!(queues
+                .add_pending_verify(xor_name_from_u32(index), test_entry(1))
+                .admitted());
+            assert!(queues
+                .add_pending_verify(xor_name_from_u32(1_000_000 + index), test_entry(2),)
+                .admitted());
+        }
+
+        let selected = queues.select_ready_pending_keys(Instant::now(), CYCLE);
+        let first_count = selected
+            .iter()
+            .filter(|key| queues.capacity_owner_by_key.get(*key) == Some(&first))
+            .count();
+        let second_count = selected
+            .iter()
+            .filter(|key| queues.capacity_owner_by_key.get(*key) == Some(&second))
+            .count();
+
+        assert_eq!(first_count, CYCLE / 2);
+        assert_eq!(second_count, CYCLE / 2);
     }
 
     // -- add_pending_verify dedup ------------------------------------------
@@ -867,6 +1429,29 @@ mod tests {
         assert!(
             queues.ready_pending_keys(Instant::now()).is_empty(),
             "a duplicate source must not bypass verification retry deferral"
+        );
+    }
+
+    #[test]
+    fn repeated_duplicate_from_same_source_does_not_grow_eviction_heap() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x77);
+        let owner = peer_id_from_byte(1);
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+
+        for _ in 0..1_000 {
+            assert_eq!(
+                queues.add_pending_verify(key, test_entry(1)),
+                AdmissionResult::AlreadyPresent
+            );
+        }
+
+        assert_eq!(
+            queues
+                .eviction_candidates_by_owner
+                .get(&owner)
+                .map_or(0, BinaryHeap::len),
+            1
         );
     }
 
@@ -925,6 +1510,8 @@ mod tests {
             .get_pending(&shared_key)
             .expect("shared hint retained");
         assert_eq!(shared.hint_sources, HashSet::from([source_b]));
+        assert_eq!(queues.pending_count_for_owner(&source_a), 0);
+        assert_eq!(queues.pending_count_for_owner(&source_b), 1);
 
         assert_eq!(queues.remove_hint_source(&source_b), vec![shared_key]);
         assert_eq!(queues.pending_count(), 0);
@@ -1197,6 +1784,15 @@ mod tests {
 
         let after_retry = Instant::now() + RETRY_DELAY + RETRY_DELAY_SLACK;
         assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
+        assert_eq!(
+            queues.pending_count_for_owner(&peer_id_from_byte(HINT_SENDER_BYTE)),
+            1
+        );
+        assert!(queues.protected_pending_keys.contains(&key));
+        assert_eq!(
+            queues.capacity_owner_by_key.get(&key),
+            Some(&peer_id_from_byte(HINT_SENDER_BYTE))
+        );
     }
 
     #[test]

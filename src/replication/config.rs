@@ -385,10 +385,11 @@ pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
 
 /// Maximum ready hints processed by one verification cycle.
 ///
-/// The pending queue may be much larger, but source-count ordering only has a
-/// practical effect when each cycle takes a bounded prefix. This value keeps
-/// today's roughly 6k-chunk average bootstrap within one cycle while preventing
-/// a full emergency-cap queue from creating one enormous verification round.
+/// The pending queue may be much larger. Each cycle takes a sender-fair bounded
+/// sample, retaining corroboration/age priority within each sender's share.
+/// This value keeps today's roughly 6k-chunk average bootstrap within one cycle
+/// while preventing a full emergency-cap queue from creating one enormous
+/// verification round.
 pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
 
 /// Maximum keys accepted in one incoming verification request.

@@ -268,9 +268,21 @@ rejection time) rather than a bare set (`types.rs`), and:
 ### 7. Source-aware, bounded verification
 
 - Retain **all live hint sources** per key (including the subset that explicitly
-  claimed replica possession) instead of a single sender, and prioritise ready
-  work by **corroborating source count** while preserving bounded global/per-sender
-  queue accounting (`types.rs`, `admission.rs`).
+  claimed replica possession) instead of a single sender. Capacity ownership is
+  tracked separately from evidence provenance: unique keys are charged to one
+  authenticated source, while duplicate advertisements merge evidence without
+  consuming another slot.
+- Enforce **elastic max-min sender accounting** under the 131,072-entry global
+  bound. A sole sender may borrow unused capacity for a large bootstrap snapshot;
+  once another sender has work, its fair allocation is restored by reclaiming
+  low-corroboration borrowed entries from an over-represented owner. Reclaimed
+  bootstrap work remains outstanding for its former owner, exactly like an
+  incoming capacity rejection.
+- Select each bounded verification cycle round-robin across capacity owners,
+  redistributing unused service immediately. Protected fetch retries and
+  corroborating-source count retain priority within an owner's share. Thus a
+  continuously refilling sender cannot monopolise either resident queue slots
+  or the 8,192-key verification budget.
 - Bound one verification cycle to **8,192 keys** (`MAX_VERIFICATION_KEYS_PER_CYCLE`)
   and cap simultaneous verification exchanges at **32**
   (`MAX_CONCURRENT_VERIFICATION_REQUESTS`). Aggregate each peer's keys into **one
@@ -412,9 +424,11 @@ How we will know this decision remains correct (coverage added in PR #165):
 - **Neighbor sync:** priority drain/termination contract and lag recovery (resnapshot
   + departed-peer prune); closed vs. lagged P2P event handling (terminal control flow
   vs. continuation with metric accounting).
-- **Verification and repair:** source aggregation and source-aware scheduling;
-  singleton replica-hint penalties for definitive rejection and explicit denial, with
-  neutral inconclusive/paid-only/corroborated cases; atomic bootstrap batch
+- **Verification and repair:** source aggregation, elastic max-min admission in
+  both arrival orders, a 50,000-key uncontended single-source bootstrap, and
+  sender-fair bounded-cycle selection; displacement-aware bootstrap accounting;
+  singleton replica-hint penalties for definitive rejection and explicit denial,
+  with neutral inconclusive/paid-only/corroborated cases; atomic bootstrap batch
   publication and full-cycle request bounds; retry reservation transfer, discard,
   exhaustion, and per-sender capacity; paid-list edge votes; e2e paid-list majority
   repair below storage quorum.

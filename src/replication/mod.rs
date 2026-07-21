@@ -81,7 +81,7 @@ use crate::replication::protocol::{
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::scheduling::ReplicationQueues;
+use crate::replication::scheduling::{CapacityDisplacement, ReplicationQueues};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -2448,9 +2448,9 @@ impl ReplicationEngine {
 
                 // Queue every peer's admitted hints under one write lock. Once
                 // released, source-count ordering sees the complete batch.
-                let batch_outcomes = {
+                let (batch_outcomes, batch_discovered) = {
                     let mut q = queues.write().await;
-                    completed
+                    let outcomes = completed
                         .iter()
                         .zip(admitted)
                         .filter_map(|((peer, _), admitted)| {
@@ -2461,23 +2461,21 @@ impl ReplicationEngine {
                                 )
                             })
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Vec<_>>();
+                    let live_discovered = outcomes
+                        .iter()
+                        .flat_map(|(_, outcome)| outcome.discovered.iter().copied())
+                        .filter(|key| q.contains_key(key))
+                        .collect::<HashSet<_>>();
+                    (outcomes, live_discovered)
                 };
 
-                let mut batch_discovered = HashSet::new();
-                for (_, outcome) in &batch_outcomes {
-                    batch_discovered.extend(outcome.discovered.iter().copied());
-                }
-                if !batch_discovered.is_empty() {
-                    bootstrap::track_discovered_keys(&bootstrap_state, &batch_discovered).await;
-                }
-                for (peer, outcome) in batch_outcomes {
-                    if outcome.capacity_rejected_count > 0 {
-                        bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
-                    } else {
-                        bootstrap::clear_capacity_rejected(&bootstrap_state, &peer).await;
-                    }
-                }
+                publish_bootstrap_admission_outcomes(
+                    &bootstrap_state,
+                    &batch_outcomes,
+                    &batch_discovered,
+                )
+                .await;
 
                 bootstrap::decrement_pending_requests(&bootstrap_state, batch.len()).await;
             }
@@ -3648,14 +3646,9 @@ async fn handle_neighbor_sync_request(
     // hints keep this source on the "not yet drained" list until its next
     // sync re-admits them; a clean cycle clears the source.
     if is_bootstrapping {
-        if !outcome.discovered.is_empty() {
-            bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
-        }
-        if outcome.capacity_rejected_count > 0 {
-            bootstrap::note_capacity_rejected(bootstrap_state, *source).await;
-        } else {
-            bootstrap::clear_capacity_rejected(bootstrap_state, source).await;
-        }
+        let live_discovered = outcome.discovered.clone();
+        let outcomes = [(*source, outcome)];
+        publish_bootstrap_admission_outcomes(bootstrap_state, &outcomes, &live_discovered).await;
     }
 
     Ok(())
@@ -4349,14 +4342,10 @@ async fn handle_sync_response(
         // rejected hints keep this source on the "not yet drained" list
         // until its next sync replays them; a clean cycle clears it.
         if bootstrapping {
-            if !outcome.discovered.is_empty() {
-                bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
-            }
-            if outcome.capacity_rejected_count > 0 {
-                bootstrap::note_capacity_rejected(bootstrap_state, *peer).await;
-            } else {
-                bootstrap::clear_capacity_rejected(bootstrap_state, peer).await;
-            }
+            let live_discovered = outcome.discovered.clone();
+            let outcomes = [(*peer, outcome)];
+            publish_bootstrap_admission_outcomes(bootstrap_state, &outcomes, &live_discovered)
+                .await;
         }
     }
 }
@@ -4368,14 +4357,55 @@ async fn handle_sync_response(
 #[allow(clippy::too_many_arguments)]
 /// Outcome of [`admit_and_queue_hints`].
 ///
-/// `capacity_rejected_count` is non-zero when one or more legitimately
-/// admissible hints were dropped because `pending_verify`'s global emergency
-/// bound was hit. Callers that care about completeness
-/// (bootstrap drain accounting) MUST NOT treat their work as complete while
-/// this is > 0 — the source will need to re-hint after capacity frees up.
+/// `capacity_rejected_count` tracks incoming hints for which no fair slot was
+/// available. `displaced` tracks older borrowed hints reclaimed for another
+/// sender. Bootstrap must keep both sources outstanding until they re-hint.
 struct AdmissionOutcome {
     discovered: HashSet<XorName>,
     capacity_rejected_count: usize,
+    displaced: Vec<CapacityDisplacement>,
+}
+
+/// Publish one atomic admission unit into bootstrap drain accounting.
+///
+/// A displaced entry is outstanding work for its former owner, just like an
+/// incoming capacity rejection. Clean sources are cleared only after every
+/// outcome in the unit is known, so peer iteration order cannot falsely clear
+/// a rejection recorded later in the same bootstrap batch.
+async fn publish_bootstrap_admission_outcomes(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    outcomes: &[(PeerId, AdmissionOutcome)],
+    live_discovered: &HashSet<XorName>,
+) {
+    let mut rejected_sources = HashSet::new();
+    let mut clean_sources = HashSet::new();
+    let mut displaced_keys = HashSet::new();
+
+    for (source, outcome) in outcomes {
+        if outcome.capacity_rejected_count > 0 {
+            rejected_sources.insert(*source);
+        } else {
+            clean_sources.insert(*source);
+        }
+        for displacement in &outcome.displaced {
+            rejected_sources.insert(displacement.owner);
+            displaced_keys.insert(displacement.key);
+        }
+    }
+    clean_sources.retain(|source| !rejected_sources.contains(source));
+
+    let now = Instant::now();
+    let mut state = bootstrap_state.write().await;
+    for key in displaced_keys {
+        state.remove_key(&key);
+    }
+    state.pending_keys.extend(live_discovered);
+    for source in clean_sources {
+        state.capacity_rejected_sources.remove(&source);
+    }
+    for source in rejected_sources {
+        state.capacity_rejected_sources.insert(source, now);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4419,6 +4449,7 @@ fn queue_admitted_hints(
 ) -> AdmissionOutcome {
     let mut discovered = HashSet::new();
     let mut capacity_rejected_count: usize = 0;
+    let mut displaced = Vec::new();
     let now = Instant::now();
 
     for key in admitted.replica_keys {
@@ -4482,9 +4513,12 @@ fn queue_admitted_hints(
         );
     }
 
+    displaced.extend(q.take_capacity_displacements());
+
     AdmissionOutcome {
         discovered,
         capacity_rejected_count,
+        displaced,
     }
 }
 
@@ -4548,18 +4582,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     }
 
     let pending_keys = {
-        let q = queues.read().await;
-        // Re-check while holding the queue read lock. This closes the race
+        let mut q = queues.write().await;
+        // Re-check while holding the queue write lock used by fair selection.
+        // This closes the race
         // where a bootstrap batch starts after the early check: the batch
         // cannot publish its hints under the queue write lock until this
         // selection either returns or declines to run.
         if bootstrap_state.read().await.pending_peer_requests > 0 {
             return;
         }
-        q.ready_pending_keys(Instant::now())
-            .into_iter()
-            .take(MAX_VERIFICATION_KEYS_PER_CYCLE)
-            .collect::<Vec<_>>()
+        q.select_ready_pending_keys(Instant::now(), MAX_VERIFICATION_KEYS_PER_CYCLE)
     };
 
     if pending_keys.is_empty() {
@@ -6628,6 +6660,50 @@ mod tests {
         assert!(state.is_drained());
         drop(state);
         assert!(!*is_bootstrapping.read().await);
+    }
+
+    #[tokio::test]
+    async fn fairness_displacement_remains_outstanding_during_bootstrap() {
+        let displaced_owner = test_peer(0xB1);
+        let incoming_source = test_peer(0xB2);
+        let displaced_key = test_key(0xB1);
+        let admitted_key = test_key(0xB2);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        {
+            let mut state = bootstrap_state.write().await;
+            state.pending_keys.insert(displaced_key);
+            state
+                .capacity_rejected_sources
+                .insert(incoming_source, Instant::now());
+        }
+        let outcomes = [(
+            incoming_source,
+            AdmissionOutcome {
+                discovered: HashSet::from([admitted_key]),
+                capacity_rejected_count: 0,
+                displaced: vec![CapacityDisplacement {
+                    key: displaced_key,
+                    owner: displaced_owner,
+                }],
+            },
+        )];
+
+        publish_bootstrap_admission_outcomes(
+            &bootstrap_state,
+            &outcomes,
+            &HashSet::from([admitted_key]),
+        )
+        .await;
+
+        let state = bootstrap_state.read().await;
+        assert!(!state.pending_keys.contains(&displaced_key));
+        assert!(state.pending_keys.contains(&admitted_key));
+        assert!(state
+            .capacity_rejected_sources
+            .contains_key(&displaced_owner));
+        assert!(!state
+            .capacity_rejected_sources
+            .contains_key(&incoming_source));
     }
 
     /// The verification-worker tick's self-heal path: a capacity rejection
