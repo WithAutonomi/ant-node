@@ -670,13 +670,16 @@ impl ReplicationEngine {
             return;
         }
         info!("Starting replication engine");
+        info!(
+            "CONTROL-BUILD: outbound responsible, first-monetized, and gossip subtree audit producers disabled; shared responders and ADR-0003 possession checks preserved"
+        );
 
         self.start_message_handler();
         self.start_neighbor_sync_loop();
         self.start_self_lookup_loop();
-        // Audit #2 (responsible-chunk): periodic tick auditing peers for the
-        // chunks they SHOULD store (responsibility + prior hint).
-        self.start_audit_loop();
+        // CONTROL-BUILD: do not start the periodic responsible-chunk audit
+        // producer. The responder remains production-identical because it is
+        // shared with ADR-0003 possession checks and prune confirmation.
         // Audit #1 (storage-commitment) is gossip-triggered in the message
         // handler when a peer's commitment is ingested, not on a periodic tick.
         self.start_commitment_rotation_loop();
@@ -686,9 +689,10 @@ impl ReplicationEngine {
         self.start_bootstrap_sync(dht_events);
         self.start_fresh_write_drainer();
         self.start_possession_check_scheduler();
-        // ADR-0004: deterministic first audit of commitments that backed a
-        // payment (surfaced by the verifier cross-check).
-        self.start_first_audit_drainer();
+        // CONTROL-BUILD: drain monetized-pin notifications without scheduling
+        // first audits. Keeping the receiver drained preserves payment-verifier
+        // behaviour without an unbounded channel backlog.
+        self.start_disabled_first_audit_drainer();
         // V2-623: periodic cumulative per-variant traffic accounting.
         self.start_traffic_summary_loop();
 
@@ -885,6 +889,30 @@ impl ReplicationEngine {
                 }
             }
             debug!("Possession-check scheduler shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// CONTROL-BUILD: keep the payment verifier's unbounded monetized-pin
+    /// channel drained without constructing the first-audit queue or launching
+    /// network work. This is deliberately silent; the process-wide marker is
+    /// emitted once from [`Self::start`].
+    fn start_disabled_first_audit_drainer(&mut self) {
+        let Some(mut rx) = self.monetized_pin_rx.take() else {
+            return;
+        };
+        let shutdown = self.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    event = rx.recv() => {
+                        if event.is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
         });
         self.task_handles.push(handle);
     }
@@ -4844,51 +4872,14 @@ fn audit_launch_decision(
     lottery_wins
 }
 
-/// On a peer's *changed* gossiped commitment, maybe launch a subtree audit
-/// (ADR-0002): fire with probability `AUDIT_ON_GOSSIP_PROBABILITY`, subject to a
-/// per-peer cooldown, pinned to the just-ingested root. Detached so gossip
-/// handling is never blocked on a network round-trip.
+/// CONTROL-BUILD: gossip commitments are still ingested, verified, retained and
+/// credited exactly as in v0.14.4, but they do not create outbound subtree audit
+/// work. Shared responders remain unchanged for protocol compatibility.
 async fn maybe_trigger_gossip_audit(
-    trigger: &GossipAuditTrigger,
-    peer: &PeerId,
-    target: AuditTarget,
+    _trigger: &GossipAuditTrigger,
+    _peer: &PeerId,
+    _target: AuditTarget,
 ) {
-    // The launch decision (cooldown-then-lottery ordering) lives in the pure
-    // `audit_launch_decision` so the ordering is shared with its test. Sample
-    // the lottery here, then let the helper apply it AFTER the cooldown stamp.
-    let now = Instant::now();
-    let lottery_wins = rand::thread_rng().gen_bool(config::AUDIT_ON_GOSSIP_PROBABILITY);
-    {
-        let mut map = trigger.cooldown.write().await;
-        if !audit_launch_decision(&mut map, peer, now, lottery_wins) {
-            return;
-        }
-    }
-
-    let trigger = trigger.clone();
-    let peer = *peer;
-    tokio::spawn(async move {
-        let credit = storage_commitment_audit::AuditCredit {
-            recent_provers: &trigger.recent_provers,
-        };
-        let result = storage_commitment_audit::run_subtree_audit(
-            &trigger.p2p_node,
-            &trigger.config,
-            &peer,
-            target.pin_hash,
-            target.key_count,
-            Some(&credit),
-        )
-        .await;
-        handle_subtree_audit_result(
-            &result,
-            &trigger.p2p_node,
-            &trigger.sync_state,
-            &trigger.recent_provers,
-            &trigger.config,
-        )
-        .await;
-    });
 }
 
 /// Atomic check-and-stamp of the per-peer commitment sig-verify rate limit.
