@@ -1650,50 +1650,19 @@ impl ReplicationEngine {
                             }
                             continue;
                         }
-                        match replication_tx.try_send(inbound) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(inbound)) => {
-                                warn!(
-                                    "Replication non-audit queue full; handling message from {} inline",
-                                    inbound.source
-                                );
-                                let source = inbound.source;
-                                match handle_replication_message(
-                                    &source,
-                                    inbound.msg,
-                                    &handler_context,
-                                    inbound.received_at,
-                                    inbound.rr_message_id.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        debug!("Replication message from {source} error: {e}");
-                                    }
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(inbound)) => {
-                                warn!(
-                                    "Replication non-audit queue closed; handling message from {} inline",
-                                    inbound.source
-                                );
-                                let source = inbound.source;
-                                match handle_replication_message(
-                                    &source,
-                                    inbound.msg,
-                                    &handler_context,
-                                    inbound.received_at,
-                                    inbound.rr_message_id.as_deref(),
-                                )
-                                .await
-                                {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        debug!("Replication message from {source} error: {e}");
-                                    }
-                                }
-                            }
+                        if let Err(dropped) = try_enqueue_serial_message(&replication_tx, inbound) {
+                            // Every serial-lane class has protocol recovery: syncs rerun,
+                            // fetches retry, verification re-asks, and fresh offers are
+                            // recovered by ADR-0003's delayed possession check. Responses
+                            // are covered by their requester's deadline/retry path. Never
+                            // run a bulk handler here: event receipt must remain non-blocking.
+                            warn!(
+                                message_class = dropped.message_class,
+                                source = %dropped.source,
+                                queue_depth = dropped.queue_depth,
+                                reason = dropped.reason.as_str(),
+                                "Replication serial-queue message dropped"
+                            );
                         }
                     }
                     // Gap 4: Topology churn handling (Section 13).
@@ -2753,6 +2722,69 @@ struct InboundReplicationMessage {
     msg: ReplicationMessage,
     rr_message_id: Option<String>,
     received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialQueueDropReason {
+    Full,
+    Closed,
+}
+
+impl SerialQueueDropReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SerialQueueDrop {
+    source: PeerId,
+    message_class: &'static str,
+    queue_depth: usize,
+    reason: SerialQueueDropReason,
+}
+
+fn try_enqueue_serial_message(
+    sender: &mpsc::Sender<InboundReplicationMessage>,
+    inbound: InboundReplicationMessage,
+) -> std::result::Result<(), SerialQueueDrop> {
+    let source = inbound.source;
+    let message_class = replication_message_class(&inbound.msg.body);
+    let queue_depth = sender.max_capacity().saturating_sub(sender.capacity());
+    sender.try_send(inbound).map_err(|error| SerialQueueDrop {
+        source,
+        message_class,
+        queue_depth,
+        reason: match error {
+            mpsc::error::TrySendError::Full(_) => SerialQueueDropReason::Full,
+            mpsc::error::TrySendError::Closed(_) => SerialQueueDropReason::Closed,
+        },
+    })
+}
+
+const fn replication_message_class(body: &ReplicationMessageBody) -> &'static str {
+    match body {
+        ReplicationMessageBody::FreshReplicationOffer(_) => "fresh_offer",
+        ReplicationMessageBody::FreshReplicationResponse(_) => "fresh_response",
+        ReplicationMessageBody::PaidNotify(_) => "paid_notify",
+        ReplicationMessageBody::NeighborSyncRequest(_) => "neighbor_sync_request",
+        ReplicationMessageBody::NeighborSyncResponse(_) => "neighbor_sync_response",
+        ReplicationMessageBody::VerificationRequest(_) => "verification_request",
+        ReplicationMessageBody::VerificationResponse(_) => "verification_response",
+        ReplicationMessageBody::FetchRequest(_) => "fetch_request",
+        ReplicationMessageBody::FetchResponse(_) => "fetch_response",
+        ReplicationMessageBody::AuditChallenge(_) => "audit_challenge",
+        ReplicationMessageBody::AuditResponse(_) => "audit_response",
+        ReplicationMessageBody::SubtreeAuditChallenge(_) => "subtree_audit_challenge",
+        ReplicationMessageBody::SubtreeAuditResponse(_) => "subtree_audit_response",
+        ReplicationMessageBody::SubtreeByteChallenge(_) => "subtree_byte_challenge",
+        ReplicationMessageBody::SubtreeByteResponse(_) => "subtree_byte_response",
+        ReplicationMessageBody::GetCommitmentByPin(_) => "commitment_pin_request",
+        ReplicationMessageBody::GetCommitmentByPinResponse(_) => "commitment_pin_response",
+    }
 }
 
 impl AuditResponderClass {
@@ -7335,6 +7367,48 @@ mod tests {
         let flow =
             handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Closed);
         assert_eq!(flow, std::ops::ControlFlow::Break(()));
+    }
+
+    #[tokio::test]
+    async fn full_serial_queue_drops_instead_of_running_the_message_inline() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let first = InboundReplicationMessage {
+            source: test_peer(0xC1),
+            msg: ReplicationMessage {
+                request_id: 1,
+                body: ReplicationMessageBody::FetchRequest(protocol::FetchRequest {
+                    key: test_key(1),
+                }),
+            },
+            rr_message_id: None,
+            received_at: Instant::now(),
+        };
+        let second = InboundReplicationMessage {
+            source: test_peer(0xC2),
+            msg: ReplicationMessage {
+                request_id: 2,
+                body: ReplicationMessageBody::VerificationRequest(protocol::VerificationRequest {
+                    keys: Vec::new(),
+                    paid_list_check_indices: Vec::new(),
+                }),
+            },
+            rr_message_id: None,
+            received_at: Instant::now(),
+        };
+
+        assert!(try_enqueue_serial_message(&sender, first).is_ok());
+        let dropped = try_enqueue_serial_message(&sender, second)
+            .expect_err("a full serial queue must refuse the second message");
+        assert_eq!(dropped.reason, SerialQueueDropReason::Full);
+        assert_eq!(dropped.message_class, "verification_request");
+        assert_eq!(dropped.queue_depth, 1);
+
+        let queued = receiver
+            .recv()
+            .await
+            .expect("first message should remain queued");
+        assert_eq!(queued.msg.request_id, 1);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
