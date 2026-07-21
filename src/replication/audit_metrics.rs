@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use super::protocol::{self, ReplicationMessageBody};
+
 /// In-scope audit issuer type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditType {
@@ -34,6 +36,17 @@ pub enum AuditResponderClass {
     Byte,
 }
 
+/// Bulk replication responder class isolated from the serial lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationResponderClass {
+    /// Chunk fetch responder.
+    Fetch,
+    /// Batched presence and paid-list verification responder.
+    Verification,
+    /// Neighbor-sync responder.
+    NeighborSync,
+}
+
 static RESPONSIBLE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static RESPONSIBLE_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
 static PRUNE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +58,16 @@ static REPLICATION_EVENT_LAGGED: AtomicU64 = AtomicU64::new(0);
 static DIGEST_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static SUBTREE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static BYTE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+static FETCH_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+static VERIFICATION_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+static NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+
+static FETCH_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
+static VERIFICATION_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
+static NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
+
+static SERIAL_QUEUE_OVERFLOW_DROPS: [AtomicU64; protocol::N_REPLICATION_VARIANTS] =
+    [const { AtomicU64::new(0) }; protocol::N_REPLICATION_VARIANTS];
 
 static DIGEST_DISPATCH_LATENCY_COUNT: AtomicU64 = AtomicU64::new(0);
 static DIGEST_DISPATCH_LATENCY_TOTAL_MS: AtomicU64 = AtomicU64::new(0);
@@ -155,6 +178,40 @@ pub fn record_admission_drop(class: AuditResponderClass) {
     }
 }
 
+pub fn record_responder_admission_drop(class: ReplicationResponderClass) {
+    match class {
+        ReplicationResponderClass::Fetch => {
+            FETCH_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        ReplicationResponderClass::Verification => {
+            VERIFICATION_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        ReplicationResponderClass::NeighborSync => {
+            NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn record_responder_staleness_shed(class: ReplicationResponderClass) {
+    match class {
+        ReplicationResponderClass::Fetch => {
+            FETCH_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
+        }
+        ReplicationResponderClass::Verification => {
+            VERIFICATION_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
+        }
+        ReplicationResponderClass::NeighborSync => {
+            NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+pub fn record_serial_queue_overflow_drop(body: &ReplicationMessageBody) {
+    if let Some(counter) = SERIAL_QUEUE_OVERFLOW_DROPS.get(body.variant_index()) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 pub fn record_digest_dispatch_latency(latency: Duration) {
     let latency_ms = u64::try_from(latency.as_millis()).unwrap_or(u64::MAX);
     DIGEST_DISPATCH_LATENCY_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -165,6 +222,39 @@ pub fn record_digest_dispatch_latency(latency: Duration) {
 #[cfg(test)]
 pub fn replication_event_lagged_total() -> u64 {
     REPLICATION_EVENT_LAGGED.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub fn responder_admission_drops_total(class: ReplicationResponderClass) -> u64 {
+    match class {
+        ReplicationResponderClass::Fetch => FETCH_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed),
+        ReplicationResponderClass::Verification => {
+            VERIFICATION_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed)
+        }
+        ReplicationResponderClass::NeighborSync => {
+            NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed)
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn responder_staleness_sheds_total(class: ReplicationResponderClass) -> u64 {
+    match class {
+        ReplicationResponderClass::Fetch => FETCH_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed),
+        ReplicationResponderClass::Verification => {
+            VERIFICATION_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed)
+        }
+        ReplicationResponderClass::NeighborSync => {
+            NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed)
+        }
+    }
+}
+
+#[cfg(test)]
+pub fn serial_queue_overflow_drops_total(body: &ReplicationMessageBody) -> u64 {
+    SERIAL_QUEUE_OVERFLOW_DROPS
+        .get(body.variant_index())
+        .map_or(0, |counter| counter.load(Ordering::Relaxed))
 }
 
 fn update_max(max: &AtomicU64, value: u64) {
@@ -198,6 +288,31 @@ mod tests {
         assert_eq!(
             classify_audit_send_error("operation timed out after 10s"),
             ("transport_timeout", AuditFailureClass::Unreachable)
+        );
+    }
+
+    #[test]
+    fn bulk_responder_counters_are_split_by_class_and_outcome() {
+        let class = ReplicationResponderClass::Fetch;
+        let admission_before = responder_admission_drops_total(class);
+        let staleness_before = responder_staleness_sheds_total(class);
+        let verification_before =
+            responder_admission_drops_total(ReplicationResponderClass::Verification);
+
+        record_responder_admission_drop(class);
+        record_responder_staleness_shed(class);
+
+        assert_eq!(
+            responder_admission_drops_total(class).saturating_sub(admission_before),
+            1
+        );
+        assert_eq!(
+            responder_staleness_sheds_total(class).saturating_sub(staleness_before),
+            1
+        );
+        assert_eq!(
+            responder_admission_drops_total(ReplicationResponderClass::Verification),
+            verification_before
         );
     }
 }
