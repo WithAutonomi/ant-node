@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rand::Rng;
 
-use crate::ant_protocol::{CLOSE_GROUP_SIZE, MAX_CHUNK_SIZE};
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 
 // ---------------------------------------------------------------------------
 // Static constants (compile-time reference profile)
@@ -135,15 +135,15 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// challenge handlers are all spawned off the serial replication message loop so
 /// their disk reads don't stall replication. This caps how many run at once
 /// across the engine, restoring backpressure: a peer flooding audit challenges
-/// cannot fan out unbounded `get_raw` reads or multi-MiB byte serves. When the
-/// cap is hit, the challenge is dropped and the caller's audit-specific timeout
-/// policy applies. The cap must therefore stay high enough for honest audit
-/// traffic while still throttling flooders.
+/// cannot fan out unbounded `get_raw` reads. When the cap is hit, the challenge
+/// is dropped and the caller's audit-specific timeout policy applies. The cap
+/// must therefore stay high enough for honest audit traffic while still
+/// throttling flooders.
 /// Sized to cover a handful of concurrent honest auditors (the per-peer
 /// gossip-audit cooldown is 30 min, so genuine concurrent audits are few) while
-/// bounding the byte round's worst-case resident bytes
-/// (`N × MAX_BYTE_CHALLENGE_KEYS × MAX_CHUNK_SIZE`).
-pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
+/// bounding the round-2 worst-case full-chunk disk reads
+/// (`N × MAX_SLICE_OPENINGS` chunks read to build slice proofs).
+pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
 ///
@@ -191,18 +191,15 @@ pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// for the round-1 proof, whose payload is hashes (KB-scale).
 const AUDIT_RESPONSE_FLOOR_SECS: u64 = 4;
 
-/// Floor on the round-2 BYTE-challenge deadline.
+/// Floor on the round-2 SLICE-challenge deadline.
 ///
-/// Unlike round 1 (KB of hashes), the byte challenge ships up to
-/// `MAX_BYTE_CHALLENGE_KEYS` full chunks (2 × 4 MiB = 8 MiB) back over the
-/// wire, so the envelope must also cover a cold QUIC handshake, the
-/// multi-MiB upload back to the auditor, and a busy honest peer's disk read.
-/// The round-1 4 s floor is still sized for a hashes-only reply; round 2 needs
-/// a larger base for the §4 byte-serving envelope. 5 s matches the
-/// cross-continent-RTT + handshake + 8 MiB transfer budget while keeping a relay
-/// that must fetch the bytes over a residential link outside it (the scaled
-/// term adds the per-byte estimate on top). Mirrors main's more generous
-/// byte-round base.
+/// The round-2 reply is only a few KB per opening (a 1 KiB block plus two short
+/// hash chains), but an honest responder still reads each opened chunk's full
+/// bytes from disk to build its Bao slice and nonced opening, so the floor must
+/// cover a cold QUIC handshake plus a busy honest peer's full-chunk disk read.
+/// The round-1 4 s floor is sized for a hashes-only reply; round 2 keeps a
+/// slightly larger 5 s base for the disk-read envelope, with the per-byte scaled
+/// term (one full chunk per opening) added on top.
 const BYTE_AUDIT_RESPONSE_FLOOR_SECS: u64 = 5;
 
 /// Conservative honest-responder read throughput, in bytes per second.
@@ -247,51 +244,43 @@ pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTER
 
 /// Protocol identifier for replication operations.
 ///
-/// Bumped to `v2` for the v12 storage-bound audit. That change extends the
-/// wire types (`NeighborSyncRequest`/`Response` carry an optional trailing
-/// `StorageCommitment`, and the gossip-triggered storage-commitment audit adds
-/// the `SubtreeAuditChallenge`/`SubtreeAuditResponse` and `SubtreeByteChallenge`/
-/// `SubtreeByteResponse` messages). The bump is for SEMANTIC interop, not
-/// decode failure: postcard tolerates the appended optional field (an old
-/// decoder reads the fields it knows and ignores the trailer — pinned by the
-/// `old_decoder_tolerates_new_neighbor_sync_*` tests in `protocol.rs`), but
-/// tolerating bytes is not interoperating. A v1 node cannot decode the NEW
-/// message variants at all (unknown enum discriminant) and never acts on a
-/// piggybacked commitment, so mixed-version replication would half-function —
-/// audit challenges unanswered, commitments silently dropped — and a v2 node
-/// could read that silence as misbehaviour. Rather than reason about each
-/// such case, we route v12 replication on a distinct protocol id: a node only
-/// delivers messages whose topic matches its own id (see the topic check in
-/// `mod.rs`), so v1 and v2 nodes simply do not exchange replication traffic
-/// during a mixed-version window. This is the rollout-safe behaviour: no
-/// half-interpreted exchange, no spurious eviction. Replication between
-/// matched-version peers is unaffected. (DHT routing/lookups are a separate
-/// protocol and continue to span both versions.)
-pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
+/// Bumped to `v3` for the V2-685 slice audit: round 1's `SubtreeLeaf` now
+/// carries a `content_len` + nonced block-tree `nonced_root` instead of a flat
+/// `nonced_hash`, and round 2 replaces `SubtreeByteChallenge`/`Response` (which
+/// returned full chunk bytes) with `SubtreeSliceChallenge`/`Response` (which
+/// return a few-KB Bao verified slice per opened block). Because `ChunkMessage`
+/// and the replication envelope are postcard-encoded (non-self-describing), a
+/// v2 node and a v3 node cannot interpret each other's audit messages — the leaf
+/// layout and the round-2 semantics differ. As with the v1→v2 cutover, we route
+/// the changed protocol on a distinct id: a node only delivers messages whose
+/// topic matches its own id (see the topic check in `mod.rs`), so v2 and v3
+/// nodes simply do not exchange replication traffic during a mixed-version
+/// window. With ~24 h auto-upgrade propagation that window is short, and the
+/// behaviour is rollout-safe: no half-interpreted exchange, no spurious
+/// eviction. Replication between matched-version peers is unaffected. (DHT
+/// routing/lookups are a separate protocol and continue to span both versions.)
+pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v3";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
 
-/// Headroom reserved for the envelope (enum tags, ids, length prefixes) when
-/// sizing a round-2 byte-challenge batch against the wire cap.
-const BYTE_CHALLENGE_RESPONSE_HEADROOM: usize = 64 * 1024;
-
-/// Maximum keys per round-2 [`SubtreeByteChallenge`] (per-batch cap).
+/// Maximum block openings per round-2 [`SubtreeSliceChallenge`].
 ///
-/// Sized so the WORST-CASE response (every requested chunk at
-/// `MAX_CHUNK_SIZE`) still encodes under [`MAX_REPLICATION_MESSAGE_SIZE`].
-/// The auditor splits its spot-check sample into batches of this size (one
-/// challenge per batch, same nonce/pin); the responder rejects any single
-/// challenge requesting more.
+/// Each opening is a Bao verified slice (a 1 KiB block plus O(log n) BLAKE3
+/// parent hashes) plus a nonced block-tree sibling chain — a few KB, so even
+/// this many openings encode far under [`MAX_REPLICATION_MESSAGE_SIZE`] with no
+/// batching. The auditor draws at most `BYTE_SPOTCHECK_MAX` openings (one block
+/// per sampled leaf); this cap sits just above that with headroom, and the
+/// responder rejects any challenge requesting more (a forged-auditor guard: each
+/// opening forces one full chunk read to build its proof).
 ///
-/// [`SubtreeByteChallenge`]: crate::replication::protocol::SubtreeByteChallenge
-pub const MAX_BYTE_CHALLENGE_KEYS: usize =
-    (MAX_REPLICATION_MESSAGE_SIZE - BYTE_CHALLENGE_RESPONSE_HEADROOM) / MAX_CHUNK_SIZE;
+/// [`SubtreeSliceChallenge`]: crate::replication::protocol::SubtreeSliceChallenge
+pub const MAX_SLICE_OPENINGS: usize = 8;
 const _: () = assert!(
-    MAX_BYTE_CHALLENGE_KEYS >= 1,
-    "wire cap must fit at least one max-size chunk per byte-challenge response"
+    MAX_SLICE_OPENINGS >= 1,
+    "at least one block opening must be allowed per slice challenge"
 );
 
 /// Rollout gate for ADR-0004 quote-arithmetic enforcement.
@@ -824,12 +813,11 @@ impl ReplicationConfig {
         // an honest HDD-backed peer at sqrt(N)=10 stored chunks could
         // miss the budget under load.
         let multiplied = total_bytes.saturating_mul(self.audit_response_honest_multiplier);
-        // Resolve the scaled term in MILLISECONDS, not seconds: at the
-        // byte-round sizes (MAX_BYTE_CHALLENGE_KEYS = 2 → 8 MiB) the per-second
-        // quotient `multiplied / bps` integer-truncates to 0, leaving only the
-        // floor. The §4 finding was that byte-serving challenges need the
-        // sub-second honest-read estimate (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms)
-        // instead of dropping it.
+        // Resolve the scaled term in MILLISECONDS, not seconds: at small
+        // sample sizes (e.g. a 2-key challenge → 8 MiB) the per-second quotient
+        // `multiplied / bps` integer-truncates to 0, leaving only the floor. The
+        // §4 finding was that small challenges need the sub-second honest-read
+        // estimate (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms) instead of dropping it.
         let scaled_ms = multiplied.saturating_mul(1000) / bps;
         // saturating_add avoids a panic if the floor plus the scaled term would
         // overflow `Duration::MAX`.
@@ -837,20 +825,26 @@ impl ReplicationConfig {
             .saturating_add(Duration::from_millis(scaled_ms))
     }
 
-    /// Deadline for the round-2 BYTE challenge serving `challenged_key_count`
-    /// full chunks back to the auditor.
+    /// Deadline for the round-2 SLICE challenge opening `openings` blocks.
     ///
-    /// Same per-byte scaling as [`Self::audit_response_timeout`] (so a relay
-    /// that must fetch the bytes over a residential link still blows it), but on
-    /// a higher floor (`BYTE_AUDIT_RESPONSE_FLOOR_SECS`) because the reply
-    /// carries up to
-    /// `MAX_BYTE_CHALLENGE_KEYS × MAX_CHUNK_SIZE` of chunk data — handshake +
-    /// multi-MiB upload + a busy honest disk read do not fit the hashes-only
-    /// round-1 floor (the §4 finding).
+    /// The reply itself is only a few KB per opening (a 1 KiB block plus two
+    /// short hash chains), but an honest responder still reads each opened
+    /// chunk's full bytes from disk to build its Bao slice and nonced opening. So
+    /// the deadline is sized to that honest full-chunk disk read (the same
+    /// per-byte scaling as [`Self::audit_response_timeout`], one full chunk per
+    /// opening), on the `BYTE_AUDIT_RESPONSE_FLOOR_SECS` floor to absorb the
+    /// handshake and a busy disk.
+    ///
+    /// Unlike the old full-byte round 2, security here does NOT rest on this
+    /// deadline being too tight for a relay to fetch bytes — the possession
+    /// guarantee is the round-1 `nonced_root` commitment (uncomputable without
+    /// all the bytes, under a fresh nonce), so the deadline can be generous
+    /// without weakening the audit. It exists only to bound how long the auditor
+    /// waits for an honest reply.
     #[must_use]
-    pub fn byte_audit_response_timeout(&self, challenged_key_count: usize) -> Duration {
+    pub fn slice_audit_response_timeout(&self, openings: usize) -> Duration {
         let scaled = self
-            .audit_response_timeout(challenged_key_count)
+            .audit_response_timeout(openings)
             .saturating_sub(self.audit_response_floor);
         Duration::from_secs(BYTE_AUDIT_RESPONSE_FLOOR_SECS).saturating_add(scaled)
     }
@@ -944,13 +938,13 @@ mod tests {
     }
 
     #[test]
-    fn replication_protocol_id_is_v2() {
-        // The v12 storage-bound audit changes replication SEMANTICS. The
-        // protocol id MUST advance past v1 so v1 and v2 nodes never exchange
-        // replication traffic they can only half-interpret (rollout safety —
-        // see the const's doc). If this regresses to v1, mixed-version nodes
+    fn replication_protocol_id_is_v3() {
+        // The V2-685 slice audit changes round-1 leaf layout and round-2
+        // semantics. The protocol id MUST advance to v3 so v2 and v3 nodes never
+        // exchange replication traffic they can only half-interpret (rollout
+        // safety — see the const's doc). If this regresses, mixed-version nodes
         // would talk past each other and risk spurious penalties.
-        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
+        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v3");
     }
 
     #[test]

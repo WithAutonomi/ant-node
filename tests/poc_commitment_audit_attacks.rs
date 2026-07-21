@@ -13,17 +13,17 @@
 //! The production auditor's `verify_subtree_response` (in
 //! `src/replication/storage_commitment_audit.rs`) is private, so this file
 //! reproduces the exact ordered gates it runs — pin, peer-id binding,
-//! signature, structural [`verify_subtree_proof`], then the **round-2 byte
-//! challenge**: the auditor demands the ORIGINAL chunk bytes for a
-//! nonce-selected sample of the just-proven leaves FROM THE RESPONDER and
-//! verifies the served content against each leaf's committed `bytes_hash`
-//! (content address) and `nonced_hash` (freshness). Possession is
-//! non-delegable: the auditor needs to hold NONE of the responder's chunks,
-//! and a committed key the responder cannot serve is a deterministic,
-//! confirmed failure (`DigestMismatch` in production — never inconclusive,
-//! never graced). The helper [`auditor_accepts`] runs these gates in the same
-//! order with the same failure semantics, so a reviewer can see each attack
-//! is caught at the same gate the network code would catch it.
+//! signature, structural [`verify_subtree_proof`], then the **round-2 slice
+//! challenge** (V2-685): the auditor opens one 1 KiB block of a fresh-random
+//! sample of the just-proven leaves FROM THE RESPONDER and verifies each opened
+//! block against the leaf's committed `bytes_hash` (a Bao verified slice against
+//! the chunk address) and `nonced_root` (a nonced block-tree opening proving
+//! round-1 possession). Possession is non-delegable: the auditor needs to hold
+//! NONE of the responder's chunks, and a committed key the responder cannot
+//! serve is a deterministic, confirmed failure (`DigestMismatch` in production —
+//! never inconclusive, never graced). The helper [`auditor_accepts`] runs these
+//! gates in the same order with the same failure semantics, so a reviewer can
+//! see each attack is caught at the same gate the network code would catch it.
 //!
 //! ## What changed from the old per-key audit (and why)
 //!
@@ -68,9 +68,13 @@ use ant_node::replication::commitment::{
 };
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::AUDIT_SPOTCHECK_COUNT;
+use ant_node::replication::slice::{
+    extract_block_slice, nonced_block_root, nonced_block_siblings, verify_block_slice,
+    verify_nonced_block,
+};
 use ant_node::replication::subtree::{
-    build_subtree_proof, nonced_leaf_hash, select_spotcheck_indices, select_subtree_path,
-    verify_subtree_proof, StructureVerdict, SubtreeProof,
+    build_subtree_proof, select_spotcheck_indices, select_subtree_path, verify_subtree_proof,
+    StructureVerdict, SubtreeLeaf, SubtreeProof,
 };
 use rand::Rng;
 use saorsa_pqc::api::sig::{ml_dsa_65, MlDsaPublicKey, MlDsaSecretKey};
@@ -145,7 +149,7 @@ impl Responder {
 }
 
 /// Bytes source for an HONEST responder: it really holds every chunk it
-/// committed to, so it can always produce a correct `nonced_hash`.
+/// committed to, so it can always open a real slice + nonced block opening.
 fn honest_bytes(k: &[u8; 32]) -> Option<Vec<u8>> {
     for i in 0..4096u32 {
         if &key(i) == k {
@@ -158,13 +162,15 @@ fn honest_bytes(k: &[u8; 32]) -> Option<Vec<u8>> {
 /// The auditor's full ordered verification, mirroring the production
 /// `verify_subtree_response` gates. Returns `Ok(byte_checked_count)` on accept.
 ///
-/// `responder_serves(k)` models round 2 (`SubtreeByteChallenge`): what the
-/// RESPONDER returns when the auditor demands the original bytes of sampled
-/// leaf `k`. `Some(bytes)` is a `SubtreeByteItem::Present`; `None` is an
-/// explicit `Absent` or an omitted key — a committed key the responder will
-/// not serve, which production `verify_byte_response` counts as a confirmed
-/// `DigestMismatch`. The auditor verifies the SERVED content, so it needs to
-/// hold none of the responder's chunks and no inconclusive lane exists.
+/// `responder_serves(k)` models round 2 (`SubtreeSliceChallenge`): the chunk
+/// content the RESPONDER can produce for sampled leaf `k`, from which it builds a
+/// Bao verified slice + nonced block opening exactly as
+/// `handle_subtree_slice_challenge` does. `Some(bytes)` is a
+/// `SubtreeSliceItem::Present`; `None` is an explicit `Absent` or an omitted key
+/// — a committed key the responder will not serve, which production
+/// `verify_slice_response` counts as a confirmed `DigestMismatch`. The auditor
+/// verifies the served block against the committed address and nonced root, so it
+/// needs to hold none of the responder's chunks and no inconclusive lane exists.
 fn auditor_accepts(
     challenged_peer_id: &[u8; 32],
     expected_commitment_hash: &[u8; 32],
@@ -194,13 +200,13 @@ fn auditor_accepts(
         return Err(AuditError::StructureInvalid(why));
     }
 
-    // -- Gate: round-2 byte challenge (responder-served possession) ----------
+    // -- Gate: round-2 slice challenge (responder-served possession) ----------
     // Mirrors `verify_subtree_response` round 2: the sample is chosen with FRESH
     // randomness over the RECEIVED proof leaves (NOT nonce-derived), AFTER round
-    // 1, so the responder cannot predict which leaves will be opened (§1
-    // cut-and-choose soundness). EVERY sampled leaf must verify from the bytes
-    // the responder serves. There is no skip and no inconclusive lane: a
-    // committed key the responder cannot serve is a provable lie.
+    // 1, so the responder cannot predict which leaves — or which block within —
+    // will be opened (§1 cut-and-choose soundness). EVERY sampled leaf must
+    // verify from the slice the responder serves. There is no skip and no
+    // inconclusive lane: a committed key the responder cannot serve is a lie.
     let spot = random_sample_indices(
         proof.leaves.len(),
         AUDIT_SPOTCHECK_COUNT.clamp(3, 5) as usize,
@@ -221,9 +227,39 @@ fn auditor_accepts(
             // maps this to `DigestMismatch`), NOT a skip.
             return Err(AuditError::CommittedKeyUnserved);
         };
-        let plain = *blake3::hash(&bytes).as_bytes();
-        let nonced = nonced_leaf_hash(nonce, &commitment.sender_peer_id, &leaf.key, &bytes);
-        if leaf.bytes_hash != plain || leaf.nonced_hash != nonced {
+        // The fixtures use short (single-block) chunks, so the only block is 0;
+        // production draws a fresh random index. The responder builds its slice
+        // and nonced opening from the content it serves.
+        let block_index = 0u32;
+        let bao_slice = extract_block_slice(&bytes, block_index).unwrap();
+        let nonced_siblings = nonced_block_siblings(
+            nonce,
+            &commitment.sender_peer_id,
+            &leaf.key,
+            &bytes,
+            block_index,
+        )
+        .unwrap_or_default();
+
+        // Auditor chain 1: authenticate the block against the committed address.
+        let Some(block) = verify_block_slice(
+            &bao_slice,
+            &leaf.bytes_hash,
+            u64::from(leaf.content_len),
+            block_index,
+        ) else {
+            return Err(AuditError::RealBytesMismatch);
+        };
+        // Auditor chain 2: fold the nonced opening to the committed nonced_root.
+        if !verify_nonced_block(
+            nonce,
+            &commitment.sender_peer_id,
+            &leaf.key,
+            block_index,
+            &block,
+            &nonced_siblings,
+            &leaf.nonced_root,
+        ) {
             return Err(AuditError::RealBytesMismatch);
         }
         checked += 1;
@@ -255,8 +291,9 @@ enum AuditError {
     CommitmentHashMismatch,
     SignatureInvalid,
     StructureInvalid(&'static str),
-    /// Round 2: the responder served content that does not hash to the
-    /// committed address / freshness hash (production: `DigestMismatch`).
+    /// Round 2: the responder's opened block failed a chain — the Bao slice did
+    /// not decode against the committed address, or the nonced opening did not
+    /// fold to the committed `nonced_root` (production: `DigestMismatch`).
     RealBytesMismatch,
     /// Round 2: the responder would not serve a committed, sampled key
     /// (production: `DigestMismatch` — a deterministic, confirmed failure).
@@ -310,15 +347,15 @@ fn honest_responder_passes_audit() {
 /// leaf's `bytes_hash` (that value IS the chunk's network address, which is
 /// public), but it DROPPED the actual bytes. It fabricates a proof: correct
 /// `key` and correct `bytes_hash` for every selected leaf (so the structural
-/// root rebuild passes), but it cannot compute the `nonced_hash`, which requires
-/// the real bytes under a fresh nonce. It fills in a forged `nonced_hash`.
+/// root rebuild passes), but it cannot compute the `nonced_root`, which requires
+/// the real bytes under a fresh nonce. It fills in a forged `nonced_root`.
 ///
 /// The structural gate PASSES (addresses alone rebuild the root), proving that
 /// structure is NOT sufficient — exactly the storage-binding hole. Round 2 is what
-/// catches it: the auditor demands the original bytes FROM THE RELAY, and the
-/// relay has nothing to serve. Refusing/omitting a sampled committed key is a
-/// confirmed failure, and serving fabricated bytes cannot hash to the
-/// committed content address (a preimage break) — both lanes are asserted.
+/// catches it: the auditor opens a block FROM THE RELAY, and the relay has nothing
+/// to serve. Refusing/omitting a sampled committed key is a confirmed failure, and
+/// serving a fabricated block cannot decode against the committed content address
+/// (a preimage break) — both lanes are asserted.
 #[test]
 fn relay_holding_only_addresses_caught_by_real_bytes_check() {
     let nonce = [0x77; 32];
@@ -328,18 +365,19 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
 
     // The lazy node fabricates the proof from PUBLIC data only: it knows each
     // leaf key and its bytes_hash (== address), but NOT the bytes, so it forges
-    // every nonced_hash.
+    // every nonced_root.
     let path = select_subtree_path(&nonce, built.commitment().key_count).unwrap();
     let mut leaves = Vec::new();
     for idx in path.leaf_start..path.leaf_end {
         let k = built.tree().key_at(idx as usize).unwrap();
         // bytes_hash is public (== the chunk address); the responder fakes the
-        // possession hash because it lacks the bytes.
-        let forged_nonced = *blake3::hash(b"i-do-not-have-the-bytes").as_bytes();
-        leaves.push(ant_node::replication::subtree::SubtreeLeaf {
+        // possession commitment because it lacks the bytes.
+        let forged_nonced_root = *blake3::hash(b"i-do-not-have-the-bytes").as_bytes();
+        leaves.push(SubtreeLeaf {
             key: k,
             bytes_hash: content_hash(idx),
-            nonced_hash: forged_nonced,
+            content_len: u32::try_from(content(idx).len()).unwrap(),
+            nonced_root: forged_nonced_root,
         });
     }
     // Real sibling cut-hashes from the committed tree (public, derivable).
@@ -394,17 +432,17 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
 /// the relay attack, and the one the §1 review found: a relay holds only public
 /// addresses, but it knows the round-1 nonce, so under the OLD nonce-derived
 /// sampling it could compute EXACTLY which 3..=5 leaves round 2 would open,
-/// fetch only those few chunks from neighbours, fill in correct `nonced_hash`
-/// for them, and fabricate `nonced_hash` for every other leaf — passing the
+/// fetch only those few chunks from neighbours, commit a correct `nonced_root`
+/// for them, and fabricate `nonced_root` for every other leaf — passing the
 /// audit while holding almost nothing.
 ///
 /// With the fix, the auditor draws the sample with fresh randomness AFTER the
 /// proof is committed, so the relay's bet on the nonce-derived indices is
-/// uncorrelated with what actually gets opened. We model the relay holding the
-/// nonce-derived prediction set and nothing else: the random sample lands on a
-/// leaf the relay did NOT fetch with overwhelming probability, and the audit
-/// fails. Repeated across many nonces to make the probabilistic catch a
-/// near-certainty in aggregate.
+/// uncorrelated with what actually gets opened. We model the relay committing a
+/// CORRECT `nonced_root` (and holding the bytes) only for the nonce-derived
+/// prediction set and forging the rest: the random sample lands on a leaf the
+/// relay did NOT prepare with overwhelming probability, and the audit fails.
+/// Repeated across many nonces to make the probabilistic catch a near-certainty.
 #[test]
 fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
     let r = Responder::new();
@@ -418,31 +456,39 @@ fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
         let mut nonce = [0u8; 32];
         nonce[..4].copy_from_slice(&t.to_le_bytes());
 
-        // The relay builds a structurally-valid proof from PUBLIC data, forging
-        // every leaf's nonced_hash (it holds no bytes).
         let plan = ant_node::replication::subtree::subtree_plan(built.tree(), &nonce).unwrap();
         let path = select_subtree_path(&nonce, n).unwrap();
+        // The relay PREDICTS the old nonce-derived sample: those are the only
+        // leaves it fetches and can commit a correct nonced_root for.
+        let predicted_local: std::collections::HashSet<u32> =
+            select_spotcheck_indices(&nonce, &path, AUDIT_SPOTCHECK_COUNT.clamp(3, 5))
+                .into_iter()
+                .collect();
+
+        // Build a structurally-valid proof: correct `nonced_root` for predicted
+        // leaves (it holds those bytes), forged for every other leaf.
         let mut leaves = Vec::new();
-        for idx in path.leaf_start..path.leaf_end {
+        let mut predicted_keys = std::collections::HashSet::new();
+        for (local, idx) in (path.leaf_start..path.leaf_end).enumerate() {
             let k = built.tree().key_at(idx as usize).unwrap();
-            leaves.push(ant_node::replication::subtree::SubtreeLeaf {
+            let is_predicted = predicted_local.contains(&u32::try_from(local).unwrap());
+            let nonced_root = if is_predicted {
+                predicted_keys.insert(k);
+                nonced_block_root(&nonce, &r.peer_id_bytes, &k, &content(idx))
+            } else {
+                *blake3::hash(b"forged").as_bytes()
+            };
+            leaves.push(SubtreeLeaf {
                 key: k,
                 bytes_hash: content_hash(idx),
-                nonced_hash: *blake3::hash(b"forged").as_bytes(),
+                content_len: u32::try_from(content(idx).len()).unwrap(),
+                nonced_root,
             });
         }
         let forged = SubtreeProof {
             leaves,
             sibling_cut_hashes: plan.sibling_cut_hashes,
         };
-
-        // The relay PREDICTS the old nonce-derived sample and fetches exactly
-        // those chunks (correct bytes for them only).
-        let predicted: std::collections::HashSet<[u8; 32]> =
-            select_spotcheck_indices(&nonce, &path, AUDIT_SPOTCHECK_COUNT.clamp(3, 5))
-                .into_iter()
-                .filter_map(|i| forged.leaves.get(i as usize).map(|l| l.key))
-                .collect();
 
         // Responder serves real bytes ONLY for the predicted set; everything
         // else it cannot serve (it holds no other bytes).
@@ -453,9 +499,7 @@ fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
             built.commitment(),
             &forged,
             |k| {
-                // The relay can only serve bytes for the chunks it fetched (the
-                // predicted set); for those it returns the real content.
-                if predicted.contains(k) {
+                if predicted_keys.contains(k) {
                     (0..n).find(|&i| &key(i) == k).map(content)
                 } else {
                     None
@@ -492,14 +536,14 @@ fn fabricated_fraction_is_caught_when_a_forged_leaf_is_sampled() {
     let pin = r.commit_to_range(400);
     let (mut proof, commitment) = honest_proof_and_commitment(&r, &nonce);
 
-    // Forge every leaf's nonced hash. Under fresh-random sampling the auditor
+    // Forge every leaf's nonced root. Under fresh-random sampling the auditor
     // is guaranteed to open a forged leaf, so the audit must fail.
     for leaf in &mut proof.leaves {
-        leaf.nonced_hash[0] ^= 0xFF;
+        leaf.nonced_root[0] ^= 0xFF;
     }
 
-    // Even if the responder serves the REAL bytes in round 2, the freshness
-    // hash recomputed from that served content exposes the forgery.
+    // Even if the responder serves the REAL bytes in round 2, the nonced opening
+    // recomputed from that served content cannot fold to the forged root.
     let res = auditor_accepts(
         &r.peer_id_bytes,
         &pin,
@@ -990,26 +1034,26 @@ fn signature_round_trips_correctly() {
     assert!(!verify_commitment_signature(&c2));
 }
 
-/// The per-leaf possession hash binds nonce, peer, key, and bytes — the
-/// foundation of the real-bytes spot-check. Changing any input changes it, so a
-/// responder cannot reuse a possession hash across nonces/peers/keys/chunks.
+/// The per-leaf nonced block-tree root binds nonce, peer, key, and bytes — the
+/// foundation of the possession opening. Changing any input changes it, so a
+/// responder cannot reuse a nonced root across nonces/peers/keys/chunks.
 #[test]
-fn nonced_leaf_hash_binds_all_inputs() {
-    let base = nonced_leaf_hash(&[1; 32], &[2; 32], &key(3), b"chunk");
+fn nonced_block_root_binds_all_inputs() {
+    let base = nonced_block_root(&[1; 32], &[2; 32], &key(3), b"chunk");
     assert_ne!(
         base,
-        nonced_leaf_hash(&[9; 32], &[2; 32], &key(3), b"chunk")
+        nonced_block_root(&[9; 32], &[2; 32], &key(3), b"chunk")
     );
     assert_ne!(
         base,
-        nonced_leaf_hash(&[1; 32], &[9; 32], &key(3), b"chunk")
+        nonced_block_root(&[1; 32], &[9; 32], &key(3), b"chunk")
     );
     assert_ne!(
         base,
-        nonced_leaf_hash(&[1; 32], &[2; 32], &key(9), b"chunk")
+        nonced_block_root(&[1; 32], &[2; 32], &key(9), b"chunk")
     );
     assert_ne!(
         base,
-        nonced_leaf_hash(&[1; 32], &[2; 32], &key(3), b"other")
+        nonced_block_root(&[1; 32], &[2; 32], &key(3), b"other")
     );
 }

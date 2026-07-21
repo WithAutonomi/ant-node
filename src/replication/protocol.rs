@@ -137,10 +137,10 @@ pub enum ReplicationMessageBody {
     SubtreeAuditChallenge(SubtreeAuditChallenge),
     /// Response to a contiguous-subtree storage audit challenge (round 1).
     SubtreeAuditResponse(SubtreeAuditResponse),
-    /// Surprise byte challenge for the spot-checked leaves (round 2).
-    SubtreeByteChallenge(SubtreeByteChallenge),
-    /// Response carrying the requested chunks' original bytes (round 2).
-    SubtreeByteResponse(SubtreeByteResponse),
+    /// Surprise slice challenge for the spot-checked leaves (round 2).
+    SubtreeSliceChallenge(SubtreeSliceChallenge),
+    /// Response carrying verified slices for the opened blocks (round 2).
+    SubtreeSliceResponse(SubtreeSliceResponse),
 
     // === Commitment fetch by pin (ADR-0004) ===
     // APPENDED at the end so postcard variant discriminants of all the
@@ -203,8 +203,8 @@ impl ReplicationMessageBody {
             Self::AuditResponse(_) => 10,
             Self::SubtreeAuditChallenge(_) => 11,
             Self::SubtreeAuditResponse(_) => 12,
-            Self::SubtreeByteChallenge(_) => 13,
-            Self::SubtreeByteResponse(_) => 14,
+            Self::SubtreeSliceChallenge(_) => 13,
+            Self::SubtreeSliceResponse(_) => 14,
             Self::GetCommitmentByPin(_) => 15,
             Self::GetCommitmentByPinResponse(_) => 16,
         }
@@ -404,9 +404,9 @@ pub(crate) fn log_traffic_summary() {
 //
 // Follow-up to V2-623: the per-variant table above says how many bytes each
 // message type served, but not WHICH peers pulled them. This adds per-peer
-// attribution for the heavy serve paths (`FetchResponse`, `SubtreeByteResponse`,
-// `NeighborSyncResponse` — ~99% of served bytes), emitted as a top-10-by-bytes
-// INFO line on the same cadence and target as `log_traffic_summary`.
+// attribution for the heavy serve paths (`FetchResponse`, `NeighborSyncResponse`
+// — ~99% of served bytes), emitted as a top-10-by-bytes INFO line on the same
+// cadence and target as `log_traffic_summary`.
 //
 // Design (mirrors V2-623's process-global-static choice for the same reason —
 // the serve choke point is a free function with no engine handle):
@@ -864,11 +864,12 @@ pub enum SubtreeAuditResponse {
     ///      the root from the proof, and requires it to equal the commitment
     ///      root (structure).
     ///
-    /// The leaves carry only hashes (`bytes_hash`, `nonced_hash`), so this round
+    /// The leaves carry only hashes (`bytes_hash`, `nonced_root`), so this round
     /// proves the tree SHAPE is committed — not that the bytes are still held.
     /// Real possession is proven in **round 2**: the auditor picks a few of the
-    /// just-verified leaves and sends a [`SubtreeByteChallenge`] requesting their
-    /// original chunk bytes FROM the responder (see that type).
+    /// just-verified leaves and sends a [`SubtreeSliceChallenge`] opening one
+    /// random 1 KiB block of each against both the chunk address and the round-1
+    /// `nonced_root` (see that type).
     Proof {
         /// The challenge this response answers.
         challenge_id: u64,
@@ -927,52 +928,74 @@ pub enum RejectKind {
     Protocol,
 }
 
-/// Round 2 of the storage audit (ADR-0002): the **surprise byte challenge**.
+/// A single block the round-2 slice challenge opens: which committed key, and
+/// which 1 KiB block within it.
 ///
-/// After the auditor has structurally verified a [`SubtreeAuditResponse::Proof`]
-/// it picks a small sample of that subtree's just-proven leaves with FRESH
-/// randomness (chosen now, after the proof is committed — NOT derived from the
-/// round-1 nonce, so the responder could not have predicted it at proof-build
-/// time) and asks the responder to return the ORIGINAL chunk bytes for exactly
-/// those keys. The auditor then checks each returned chunk against the committed
-/// leaf:
-///   - `BLAKE3(bytes) == leaf.bytes_hash` (the chunk's content address), AND
-///   - `compute_audit_digest(nonce, peer, key, bytes) == leaf.nonced_hash`.
+/// The `block_index` is drawn with FRESH auditor randomness after round 1 (never
+/// nonce-derived), so the responder cannot have prepared only the opened block.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubtreeSliceOpening {
+    /// The committed key whose block is opened.
+    pub key: XorName,
+    /// The 1 KiB block index within the chunk, in `0..block_count(content_len)`.
+    pub block_index: u32,
+}
+
+/// Round 2 of the storage audit (ADR-0002 / V2-685): the **surprise slice
+/// challenge**.
 ///
-/// This makes possession non-delegable to the auditor: the auditor needs to
-/// hold NONE of the responder's chunks. A responder that committed to a chunk it
-/// no longer holds cannot fabricate bytes that hash to the committed address (a
-/// preimage break), so it is caught regardless of who audits it.
+/// After structurally verifying a [`SubtreeAuditResponse::Proof`] the auditor
+/// picks a small sample of the just-proven leaves with FRESH randomness (chosen
+/// now, after the proof is committed — NOT derived from the round-1 nonce) and,
+/// for each, a fresh-random 1 KiB block index. It asks the responder to open
+/// exactly those blocks. For each opened block the responder returns a Bao
+/// verified slice plus a nonced block-tree opening; the auditor checks, over the
+/// same block bytes:
+///   - the Bao slice against `leaf.bytes_hash` (the chunk's content address), AND
+///   - the nonced opening against `leaf.nonced_root` (round-1 possession commit).
+///
+/// This makes possession non-delegable *and* cheap to prove: the response is a
+/// few KB, not up to two 4 MiB chunks. A responder that did not hold the bytes at
+/// round-1 commit time cannot have committed a correct `nonced_root`, and cannot
+/// fold an after-the-fact-fetched block to a foreign root without a preimage
+/// break — so it is caught regardless of who audits it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubtreeByteChallenge {
+pub struct SubtreeSliceChallenge {
     /// The same `challenge_id` as the round-1 [`SubtreeAuditChallenge`], so the
     /// responder/auditor correlate the two rounds.
     pub challenge_id: u64,
-    /// The same nonce as round 1 — needed for the freshness (`nonced_hash`)
-    /// check and to bind these bytes to this audit.
+    /// The same nonce as round 1 — binds each nonced block opening to this audit.
     pub nonce: [u8; 32],
-    /// The challenged peer ID (bound into each leaf's possession hash).
+    /// The challenged peer ID (bound into every nonced block leaf).
     pub challenged_peer_id: [u8; 32],
     /// The pinned commitment hash from round 1, so the responder resolves the
-    /// SAME tree it just proved and serves bytes only for keys it committed to.
+    /// SAME tree it just proved and opens blocks only for keys it committed to.
     pub expected_commitment_hash: [u8; 32],
-    /// The exact keys whose original bytes the responder must return. These are
-    /// the auditor's freshly-randomised spot-check sample of the round-1 subtree
-    /// (chosen after the proof was received; not nonce-derived).
-    pub keys: Vec<XorName>,
+    /// The exact blocks to open: the auditor's freshly-randomised spot-check
+    /// sample of the round-1 subtree (chosen after the proof was received; not
+    /// nonce-derived), one block per sampled leaf.
+    pub openings: Vec<SubtreeSliceOpening>,
 }
 
-/// One requested chunk in a [`SubtreeByteResponse`].
+/// One opened block in a [`SubtreeSliceResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SubtreeByteItem {
-    /// The responder holds this committed key and returns its original bytes.
+pub enum SubtreeSliceItem {
+    /// The responder holds this committed key and opens the requested block.
     Present {
         /// The requested key.
         key: XorName,
-        /// The original chunk bytes (the auditor re-hashes to verify).
-        bytes: Vec<u8>,
+        /// The 1 KiB block index that was opened.
+        block_index: u32,
+        /// Bao verified slice: the block bytes plus the BLAKE3 parent hashes that
+        /// authenticate them against the chunk address. The auditor decodes this
+        /// to recover the verified block bytes.
+        bao_slice: Vec<u8>,
+        /// Sibling hashes on the path from this block up to the committed
+        /// `nonced_root`, bottom-up. The auditor folds the block leaf with these
+        /// to prove the block was committed under round 1's fresh nonce.
+        nonced_siblings: Vec<[u8; 32]>,
     },
-    /// The responder committed to this key but cannot serve its bytes. This is a
+    /// The responder committed to this key but cannot serve its block. This is a
     /// PROVABLE cheat (it published a commitment over a chunk it does not hold),
     /// so the auditor counts it as a confirmed failure — NOT a graced timeout.
     /// Distinguishing this explicit signal from silence is what separates a
@@ -983,29 +1006,29 @@ pub enum SubtreeByteItem {
     },
 }
 
-/// Response to a [`SubtreeByteChallenge`] (round 2). One item per requested key,
-/// in the requested order.
+/// Response to a [`SubtreeSliceChallenge`] (round 2). One item per requested
+/// opening, in the requested order.
 ///
-/// Sizing rule: a challenge carries at most
-/// [`MAX_BYTE_CHALLENGE_KEYS`](super::config::MAX_BYTE_CHALLENGE_KEYS) keys —
-/// the auditor batches its sample, the responder rejects larger requests — so
-/// the WORST-CASE `Items` response (every chunk at `MAX_CHUNK_SIZE`) always
-/// encodes under [`MAX_REPLICATION_MESSAGE_SIZE`].
+/// Each item is a few KB (a 1 KiB block plus O(log n) hashes on two short
+/// chains), so even the worst-case sample fits far under
+/// [`MAX_REPLICATION_MESSAGE_SIZE`] with no batching — the auditor bounds the
+/// sample to [`MAX_SLICE_OPENINGS`](super::config::MAX_SLICE_OPENINGS) and the
+/// responder rejects larger requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SubtreeByteResponse {
-    /// The responder's per-key answers (bytes or an explicit absent signal).
+pub enum SubtreeSliceResponse {
+    /// The responder's per-opening answers (a verified slice or an absent signal).
     Items {
         /// The challenge this response answers.
         challenge_id: u64,
-        /// One entry per requested key.
-        items: Vec<SubtreeByteItem>,
+        /// One entry per requested opening.
+        items: Vec<SubtreeSliceItem>,
     },
     /// Peer is still bootstrapping (should not happen mid-audit, but handled).
     Bootstrapping {
         /// The challenge this response answers.
         challenge_id: u64,
     },
-    /// The responder rejects the byte challenge outright. `kind` drives the
+    /// The responder rejects the slice challenge outright. `kind` drives the
     /// auditor's accounting (ADR-0004 A1: grace removed): [`RejectKind::Transient`]
     /// routes to the timeout lane (no trust penalty, holder credit revoked); every
     /// other kind is a confirmed failure, like round 1.
@@ -1141,30 +1164,36 @@ mod tests {
         }
     }
 
-    // === Round-2 byte response sizing ===
+    // === Round-2 slice response sizing ===
 
     #[test]
-    fn max_batch_worst_case_byte_response_fits_wire_cap() {
-        // The auditor batches its round-2 sample to MAX_BYTE_CHALLENGE_KEYS per
-        // challenge precisely so this worst case — every requested chunk at
-        // MAX_CHUNK_SIZE — still encodes. If this fails, honest responders
-        // would hit encode errors and fail otherwise valid byte challenges.
-        let items: Vec<SubtreeByteItem> = (0..crate::replication::config::MAX_BYTE_CHALLENGE_KEYS)
-            .map(|i| SubtreeByteItem::Present {
+    fn max_slice_response_is_tiny_relative_to_wire_cap() {
+        // A worst-case round-2 slice response is MAX_SLICE_OPENINGS openings, each
+        // a 1 KiB block plus a Bao proof and a nonced sibling chain. For a 4 MiB
+        // chunk that is ~4096 BLAKE3 chunks → ~12 parent hashes per chain. We
+        // overestimate generously (16 KiB slice + 24 sibling hashes per opening)
+        // and assert it encodes far under the wire cap — the whole point of the
+        // change is that round 2 is now KB-scale, not up to 8 MiB.
+        let items: Vec<SubtreeSliceItem> = (0..crate::replication::config::MAX_SLICE_OPENINGS)
+            .map(|i| SubtreeSliceItem::Present {
                 key: [u8::try_from(i).unwrap_or(u8::MAX); 32],
-                bytes: vec![0xAB; crate::ant_protocol::MAX_CHUNK_SIZE],
+                block_index: u32::try_from(i).unwrap_or(u32::MAX),
+                bao_slice: vec![0xAB; 16 * 1024],
+                nonced_siblings: vec![[0x5A; 32]; 24],
             })
             .collect();
         let msg = ReplicationMessage {
             request_id: 7,
-            body: ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Items {
+            body: ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items {
                 challenge_id: 7,
                 items,
             }),
         };
         let encoded = msg
             .encode()
-            .expect("worst-case max-batch byte response must fit the wire cap");
+            .expect("worst-case slice response must fit the wire cap");
+        // Comfortably under 1 MiB, itself a fraction of the 10 MiB wire cap.
+        assert!(encoded.len() <= 1024 * 1024);
         assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
     }
 

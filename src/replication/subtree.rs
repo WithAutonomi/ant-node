@@ -31,7 +31,6 @@
 //! intersected with `0..N`.
 
 use super::commitment::{leaf_hash, node_hash, StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
-use super::protocol::compute_audit_digest;
 use crate::ant_protocol::XorName;
 use serde::{Deserialize, Serialize};
 
@@ -46,12 +45,20 @@ pub struct SubtreeLeaf {
     pub key: XorName,
     /// `BLAKE3(record_bytes)` — the plain content hash. This is also the
     /// chunk's network address, so it is public; possessing it does NOT prove
-    /// possession of the bytes (that is what `nonced_hash` is for).
+    /// possession of the bytes (that is what `nonced_root` is for). It is also
+    /// the BLAKE3/Bao root the round-2 slice verifies against.
     pub bytes_hash: [u8; 32],
-    /// `compute_audit_digest(nonce, peer_id, key, record_bytes)` — the
-    /// freshness hash. Only a holder of the actual bytes can produce it for a
-    /// fresh nonce, so a spot-check on it proves real possession.
-    pub nonced_hash: [u8; 32],
+    /// Length of the chunk's content, in bytes. Lets the auditor draw a random
+    /// 1 KiB block index in range and size the Bao slice for the final (short)
+    /// block. A lie here disagrees with the address-committed tree shape, so the
+    /// round-2 slice fails to decode — a lying responder only fails its own audit.
+    pub content_len: u32,
+    /// Root of the responder's fresh **nonced block tree** for this chunk (see
+    /// [`crate::replication::slice`]): a Merkle root over the chunk's 1 KiB
+    /// blocks whose leaves each bind the fresh nonce, peer, key and block bytes.
+    /// Building it requires every byte of the chunk under the fresh nonce, so it
+    /// commits real possession; round 2 opens one random block against it.
+    pub nonced_root: [u8; 32],
 }
 
 /// A responder's single-contiguous-subtree proof (ADR-0002 "The proof").
@@ -412,18 +419,6 @@ fn fold_levels(mut level: Vec<[u8; 32]>, levels: u32) -> [u8; 32] {
     level.first().copied().unwrap_or([0u8; 32])
 }
 
-/// Build the per-leaf nonced freshness hash for a subtree leaf (responder
-/// side), reusing the existing audit digest.
-#[must_use]
-pub fn nonced_leaf_hash(
-    nonce: &[u8; 32],
-    challenged_peer_id: &[u8; 32],
-    key: &XorName,
-    record_bytes: &[u8],
-) -> [u8; 32] {
-    compute_audit_digest(nonce, challenged_peer_id, key, record_bytes)
-}
-
 /// Why a responder could not build a subtree proof for a challenge.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildProofError {
@@ -542,6 +537,10 @@ pub fn subtree_plan(
 }
 
 /// Build one subtree leaf from its key and the chunk bytes the responder holds.
+///
+/// The plain `bytes_hash` is the chunk's content address; the `nonced_root` is
+/// the fresh per-audit nonced block-tree root over the same bytes, committing
+/// possession at round-1 time (see [`crate::replication::slice`]).
 #[must_use]
 pub fn subtree_leaf(
     nonce: &[u8; 32],
@@ -552,7 +551,13 @@ pub fn subtree_leaf(
     SubtreeLeaf {
         key: *key,
         bytes_hash: *blake3::hash(bytes).as_bytes(),
-        nonced_hash: nonced_leaf_hash(nonce, challenged_peer_id, key, bytes),
+        content_len: u32::try_from(bytes.len()).unwrap_or(u32::MAX),
+        nonced_root: crate::replication::slice::nonced_block_root(
+            nonce,
+            challenged_peer_id,
+            key,
+            bytes,
+        ),
     }
 }
 
@@ -980,25 +985,27 @@ mod tests {
     }
 
     #[test]
-    fn fabricated_nonced_hash_caught_by_spotcheck_probability() {
+    fn fabricated_nonced_root_caught_by_spotcheck_probability() {
         // Simulate the realness check: a responder fabricates a fraction x of
-        // nonced hashes. The auditor spot-checks k leaves; probability all k
-        // land on honest leaves is (1-x)^k. Here we just assert the auditor
-        // *would* catch a fabricated leaf when it samples that position.
+        // nonced roots. The auditor opens k leaves; probability all k land on
+        // honest leaves is (1-x)^k. Here we just assert the auditor *would* catch
+        // a fabricated leaf: its committed root differs from the honest root
+        // recomputed from the real chunk bytes under the audit nonce.
         let peer = [1u8; 32];
         let entries = entries_for(400);
         let nonce = nonce_of(9);
         let (mut proof, _commitment) = build_proof(&entries, &nonce, &peer);
-        // Fabricate the nonced hash on the first subtree leaf (wrong bytes).
-        proof.leaves[0].nonced_hash[0] ^= 0xFF;
-        // The realness check the caller runs: recompute from the real chunk
-        // bytes (the same fixture the honest tree was built from).
-        let leaf = &proof.leaves[0];
+        // Fabricate the nonced root on the first subtree leaf.
+        if let Some(first) = proof.leaves.first_mut() {
+            first.nonced_root[0] ^= 0xFF;
+        }
+        let leaf = proof.leaves.first().expect("proof has leaves");
         let real_bytes = chunk_bytes(&leaf.key);
-        let expected = nonced_leaf_hash(&nonce, &peer, &leaf.key, &real_bytes);
+        let expected =
+            crate::replication::slice::nonced_block_root(&nonce, &peer, &leaf.key, &real_bytes);
         assert_ne!(
-            leaf.nonced_hash, expected,
-            "fabricated nonced hash must differ from real"
+            leaf.nonced_root, expected,
+            "fabricated nonced root must differ from real"
         );
     }
 

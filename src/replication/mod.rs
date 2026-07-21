@@ -29,6 +29,7 @@ pub mod pruning;
 pub mod quorum;
 pub mod recent_provers;
 pub mod scheduling;
+pub mod slice;
 pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
@@ -3337,14 +3338,15 @@ async fn handle_replication_message(
             });
             Ok(())
         }
-        ReplicationMessageBody::SubtreeByteChallenge(challenge) => {
-            // Round 2 of the storage audit (ADR-0002): serve the original bytes
-            // for the auditor's spot-check keys, or signal `Absent` for a
-            // committed key we can no longer produce. Reads chunk bytes from
-            // disk, so likewise spawned off the serial loop (§5) under the same
-            // flood-fair admission (codex#1 + codex-r2 A).
+        ReplicationMessageBody::SubtreeSliceChallenge(challenge) => {
+            // Round 2 of the storage audit (ADR-0002 / V2-685): open one 1 KiB
+            // block of each of the auditor's spot-check keys with a Bao verified
+            // slice + nonced block-tree opening, or signal `Absent` for a
+            // committed key we can no longer produce. Reads chunk bytes from disk
+            // to build the proofs, so likewise spawned off the serial loop (§5)
+            // under the same flood-fair admission (codex#1 + codex-r2 A).
             info!(
-                "Audit challenge received: kind=byte source={source} request_response={}",
+                "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
             let guard = match admit_audit_responder(
@@ -3373,7 +3375,7 @@ async fn handle_replication_message(
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             tokio::spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
-                let response = storage_commitment_audit::handle_subtree_byte_challenge(
+                let response = storage_commitment_audit::handle_subtree_slice_challenge(
                     &challenge,
                     &storage,
                     p2p_node.peer_id(),
@@ -3381,24 +3383,24 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
-                let response_kind = subtree_byte_response_kind(&response);
+                let response_kind = subtree_slice_response_kind(&response);
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
                     request_id,
-                    ReplicationMessageBody::SubtreeByteResponse(response),
+                    ReplicationMessageBody::SubtreeSliceResponse(response),
                     rr_message_id.as_deref(),
                 )
                 .await;
                 if sent {
                     info!(
-                        "Audit challenge reply sent: kind=byte response={response_kind} \
+                        "Audit challenge reply sent: kind=slice response={response_kind} \
                          source={source} request_response={}",
                         rr_message_id.is_some(),
                     );
                 } else {
                     warn!(
-                        "Audit challenge reply not sent: kind=byte response={response_kind} \
+                        "Audit challenge reply not sent: kind=slice response={response_kind} \
                          source={source} request_response={}",
                         rr_message_id.is_some(),
                     );
@@ -3454,7 +3456,7 @@ async fn handle_replication_message(
         | ReplicationMessageBody::FetchResponse(_)
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
-        | ReplicationMessageBody::SubtreeByteResponse(_)
+        | ReplicationMessageBody::SubtreeSliceResponse(_)
         | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
     }
 }
@@ -4053,11 +4055,11 @@ fn subtree_audit_response_kind(response: &protocol::SubtreeAuditResponse) -> &'s
     }
 }
 
-fn subtree_byte_response_kind(response: &protocol::SubtreeByteResponse) -> &'static str {
+fn subtree_slice_response_kind(response: &protocol::SubtreeSliceResponse) -> &'static str {
     match response {
-        protocol::SubtreeByteResponse::Items { .. } => "items",
-        protocol::SubtreeByteResponse::Bootstrapping { .. } => "bootstrapping",
-        protocol::SubtreeByteResponse::Rejected { .. } => "rejected",
+        protocol::SubtreeSliceResponse::Items { .. } => "items",
+        protocol::SubtreeSliceResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::SubtreeSliceResponse::Rejected { .. } => "rejected",
     }
 }
 
@@ -4106,14 +4108,13 @@ async fn send_replication_response_checked(
         }
     };
     // V2-684: per-peer served-bytes attribution for the heavy serve paths.
-    // `FetchResponse` + `SubtreeByteResponse` carry ~99% of served bytes;
-    // `NeighborSyncResponse` is included for completeness. Other response
-    // variants (verification/audit/commitment) are intentionally excluded.
+    // `FetchResponse` carries ~99% of served bytes; `NeighborSyncResponse` is
+    // included for completeness. Other response variants (verification/audit/
+    // commitment) are intentionally excluded — the round-2 audit reply is now a
+    // few-KB verified slice (V2-685), not a full-chunk transfer, so it is light.
     if matches!(
         msg.body,
-        ReplicationMessageBody::FetchResponse(_)
-            | ReplicationMessageBody::SubtreeByteResponse(_)
-            | ReplicationMessageBody::NeighborSyncResponse(_)
+        ReplicationMessageBody::FetchResponse(_) | ReplicationMessageBody::NeighborSyncResponse(_)
     ) {
         protocol::record_served(peer, encoded.len());
     }
