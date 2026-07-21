@@ -254,6 +254,25 @@ const VERIFICATION_RESPONDER_MAX_OUTSTANDING: usize = VERIFICATION_RESPONDER_WOR
 /// the bounded queue for different peers.
 const VERIFICATION_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
 
+/// Maximum neighbor-sync requests served concurrently across source peers.
+///
+/// Building a response scans local keys and performs DHT lookups, so two
+/// workers allow cross-peer progress without multiplying that expensive scan
+/// into broad network and storage contention.
+const NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT: usize = 2;
+
+/// Maximum neighbor-sync requests admitted across workers and bounded waiters.
+///
+/// Four worker waves cover ordinary cadence overlap while keeping retained sync
+/// payloads bounded; expired waiters are shed before any key scan begins.
+const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING: usize = NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted neighbor-sync requests from one source peer.
+///
+/// Sync history must be updated before repair proofs for the same peer. A
+/// single slot preserves that ordering while independent peers remain parallel.
+const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
+
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::ClientPut
 }
@@ -586,6 +605,12 @@ pub struct ReplicationEngine {
     verification_responder_admission_semaphore: Arc<Semaphore>,
     /// Per-source verification responder counts for flood-fair admission.
     verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Worker permits for expensive inbound neighbor-sync requests.
+    neighbor_sync_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding sync workers and queued waiters together.
+    neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source sync responder counts; capped at one to preserve ordering.
+    neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
@@ -617,7 +642,7 @@ pub struct ReplicationEngine {
     task_handles: Vec<JoinHandle<()>>,
     /// Tracks detached, short-lived work spawned by background producers.
     ///
-    /// Fresh-offer workers, audit responders, audit launches, per-fetch
+    /// Fresh-offer and bounded responder workers, audit launches, per-fetch
     /// tasks, and delayed possession checks may retain storage or P2P state
     /// after their producer exits, so shutdown drains them before those
     /// resources may be reopened.
@@ -698,6 +723,13 @@ impl ReplicationEngine {
                 VERIFICATION_RESPONDER_MAX_OUTSTANDING,
             )),
             verification_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            neighbor_sync_responder_worker_semaphore: Arc::new(Semaphore::new(
+                NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT,
+            )),
+            neighbor_sync_responder_admission_semaphore: Arc::new(Semaphore::new(
+                NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            )),
+            neighbor_sync_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -1479,6 +1511,11 @@ impl ReplicationEngine {
         let verification_responder_admission_semaphore =
             Arc::clone(&self.verification_responder_admission_semaphore);
         let verification_responder_inflight = Arc::clone(&self.verification_responder_inflight);
+        let neighbor_sync_responder_worker_semaphore =
+            Arc::clone(&self.neighbor_sync_responder_worker_semaphore);
+        let neighbor_sync_responder_admission_semaphore =
+            Arc::clone(&self.neighbor_sync_responder_admission_semaphore);
+        let neighbor_sync_responder_inflight = Arc::clone(&self.neighbor_sync_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
         let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
@@ -1520,6 +1557,9 @@ impl ReplicationEngine {
             verification_responder_worker_semaphore,
             verification_responder_admission_semaphore,
             verification_responder_inflight,
+            neighbor_sync_responder_worker_semaphore,
+            neighbor_sync_responder_admission_semaphore,
+            neighbor_sync_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
             fresh_offer_in_flight,
@@ -2697,6 +2737,9 @@ struct ReplicationMessageHandlerContext {
     verification_responder_worker_semaphore: Arc<Semaphore>,
     verification_responder_admission_semaphore: Arc<Semaphore>,
     verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    neighbor_sync_responder_worker_semaphore: Arc<Semaphore>,
+    neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
+    neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
     fresh_offer_in_flight: FreshOfferInFlight,
@@ -2894,7 +2937,7 @@ async fn handle_replication_message(
             )
             .await
         }
-        ReplicationMessageBody::NeighborSyncRequest(ref request) => {
+        ReplicationMessageBody::NeighborSyncRequest(request) => {
             let bootstrapping = *ctx.is_bootstrapping.read().await;
             // Phase-3 storage-bound audit: store the sender's
             // commitment for use as `expected_commitment_hash` in
@@ -2912,25 +2955,18 @@ async fn handle_replication_message(
             {
                 maybe_trigger_gossip_audit(&ctx.gossip_audit, source, target).await;
             }
-            handle_neighbor_sync_request(
-                source,
+            dispatch_neighbor_sync_request(
+                *source,
                 request,
-                &ctx.p2p_node,
-                &ctx.storage,
-                &ctx.paid_list,
-                &ctx.queues,
-                &ctx.config,
+                ctx,
                 bootstrapping,
-                &ctx.bootstrap_state,
-                &ctx.sync_history,
-                &ctx.sync_cycle_epoch,
-                &ctx.repair_proofs,
                 // Atomically snapshot + mark-gossiped: emitted in the sync
                 // response, so we must stay answerable for it (ADR-0002).
                 ctx.my_commitment_state
                     .current_for_gossip()
                     .map(|b| b.commitment().clone()),
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
@@ -3645,6 +3681,94 @@ async fn handle_paid_notify(
     if let Err(e) = paid_list.insert(&notify.key).await {
         warn!("Failed to add paid notify key to PaidForList: {e}");
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_neighbor_sync_request(
+    source: PeerId,
+    request: protocol::NeighborSyncRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    is_bootstrapping: bool,
+    my_commitment: Option<StorageCommitment>,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.neighbor_sync_responder_admission_semaphore,
+        &ctx.neighbor_sync_responder_inflight,
+        &source,
+        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            warn!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                "Neighbor-sync response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let storage = Arc::clone(&ctx.storage);
+    let paid_list = Arc::clone(&ctx.paid_list);
+    let queues = Arc::clone(&ctx.queues);
+    let config = Arc::clone(&ctx.config);
+    let bootstrap_state = Arc::clone(&ctx.bootstrap_state);
+    let sync_history = Arc::clone(&ctx.sync_history);
+    let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
+    let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let request_timeout = ctx.config.verification_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                "Neighbor-sync responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            debug!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale neighbor-sync request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_neighbor_sync_request(
+            &source,
+            &request,
+            &p2p_node,
+            &storage,
+            &paid_list,
+            &queues,
+            &config,
+            is_bootstrapping,
+            &bootstrap_state,
+            &sync_history,
+            &sync_cycle_epoch,
+            &repair_proofs,
+            my_commitment,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Neighbor-sync request handling failed: {e}");
+        }
+    });
 
     Ok(())
 }
@@ -6885,6 +7009,51 @@ mod tests {
 
         assert!(request_is_stale(old_received_at, timeout));
         assert!(!request_is_stale(Instant::now(), timeout));
+    }
+
+    #[tokio::test]
+    async fn neighbor_sync_admission_serializes_each_peer_but_allows_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let first_peer = test_peer(0xB3);
+        let second_peer = test_peer(0xB4);
+
+        let first_guard = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &first_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await
+        .expect("first sync from a peer should be admitted");
+        let duplicate = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &first_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        let other_peer = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &second_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+
+        assert!(matches!(
+            duplicate,
+            Err(ResponderAdmissionFailure {
+                reason: ResponderRejectReason::PerPeerCapFull,
+                ..
+            })
+        ));
+        assert!(other_peer.is_ok());
+        drop(first_guard);
+        drop(other_peer);
     }
 
     #[tokio::test]
