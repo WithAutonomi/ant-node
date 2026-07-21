@@ -213,6 +213,26 @@ const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 /// recovered by the sender's delayed possession check (ADR-0003).
 const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
+/// Maximum fetch responses served concurrently.
+///
+/// Each successful response can upload a 4 MiB chunk. Matching
+/// [`MAX_CONCURRENT_REPLICATION_SENDS`] keeps fetch serving to about 12 MiB of
+/// simultaneous chunk data, which avoids saturating typical home upload links.
+const FETCH_RESPONDER_WORKER_LIMIT: usize = 3;
+
+/// Maximum fetch requests admitted across workers and their bounded waiters.
+///
+/// Four worker waves absorb short bursts without retaining chunk bytes—the
+/// request contains only a key—while the dequeue deadline sheds work before a
+/// sustained flood can keep the node serving requests whose callers timed out.
+const FETCH_RESPONDER_MAX_OUTSTANDING: usize = FETCH_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted fetch requests from one source peer.
+///
+/// Two requests let one peer pipeline useful reads while leaving at least one
+/// of the three workers available to other peers under a single-source flood.
+const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
+
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::ClientPut
 }
@@ -533,6 +553,12 @@ pub struct ReplicationEngine {
     /// all use this before sending so local bursts wait instead of breaching
     /// the responder's deployed per-source admission cap.
     audit_challenge_coordinator: Arc<AuditChallengeCoordinator>,
+    /// Worker permits for bandwidth-bound fetch responses.
+    fetch_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding fetch workers and queued waiters together.
+    fetch_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source fetch responder counts for flood-fair admission.
+    fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Bounded worker permits for expensive fresh-offer handling.
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
@@ -631,6 +657,13 @@ impl ReplicationEngine {
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
+            fetch_responder_worker_semaphore: Arc::new(Semaphore::new(
+                FETCH_RESPONDER_WORKER_LIMIT,
+            )),
+            fetch_responder_admission_semaphore: Arc::new(Semaphore::new(
+                FETCH_RESPONDER_MAX_OUTSTANDING,
+            )),
+            fetch_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
@@ -1403,6 +1436,10 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let fetch_responder_worker_semaphore = Arc::clone(&self.fetch_responder_worker_semaphore);
+        let fetch_responder_admission_semaphore =
+            Arc::clone(&self.fetch_responder_admission_semaphore);
+        let fetch_responder_inflight = Arc::clone(&self.fetch_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
         let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
@@ -1438,6 +1475,9 @@ impl ReplicationEngine {
             gossip_audit,
             audit_responder_semaphore,
             audit_responder_inflight,
+            fetch_responder_worker_semaphore,
+            fetch_responder_admission_semaphore,
+            fetch_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
             fresh_offer_in_flight,
@@ -2577,7 +2617,6 @@ struct ResponderGuard {
 
 type AuditResponderGuard = ResponderGuard;
 type AuditResponderAdmissionFailure = ResponderAdmissionFailure;
-type AuditResponderRejectReason = ResponderRejectReason;
 
 /// Provisional or admitted per-peer responder slot.
 ///
@@ -2610,6 +2649,9 @@ struct ReplicationMessageHandlerContext {
     gossip_audit: GossipAuditTrigger,
     audit_responder_semaphore: Arc<Semaphore>,
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    fetch_responder_worker_semaphore: Arc<Semaphore>,
+    fetch_responder_admission_semaphore: Arc<Semaphore>,
+    fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
     fresh_offer_in_flight: FreshOfferInFlight,
@@ -2860,13 +2902,13 @@ async fn handle_replication_message(
             )
             .await
         }
-        ReplicationMessageBody::FetchRequest(ref request) => {
-            handle_fetch_request(
-                source,
+        ReplicationMessageBody::FetchRequest(request) => {
+            dispatch_fetch_request(
+                *source,
                 request,
-                &ctx.storage,
-                &ctx.p2p_node,
+                ctx,
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
@@ -3800,6 +3842,79 @@ async fn send_verification_results(
         rr_message_id,
     )
     .await;
+}
+
+async fn dispatch_fetch_request(
+    source: PeerId,
+    request: protocol::FetchRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.fetch_responder_admission_semaphore,
+        &ctx.fetch_responder_inflight,
+        &source,
+        FETCH_RESPONDER_MAX_OUTSTANDING,
+        FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            warn!(
+                responder_class = "fetch",
+                source = %source,
+                "Fetch response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.fetch_responder_worker_semaphore);
+    let storage = Arc::clone(&ctx.storage);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let request_timeout = ctx.config.fetch_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "fetch",
+                source = %source,
+                "Fetch responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            debug!(
+                responder_class = "fetch",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale fetch request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_fetch_request(
+            &source,
+            &request,
+            &storage,
+            &p2p_node,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Fetch request handling failed: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
+    received_at.elapsed() >= timeout
 }
 
 async fn handle_fetch_request(
@@ -6572,7 +6687,7 @@ mod tests {
         else {
             panic!("admission should fail once per-peer cap is full");
         };
-        assert_eq!(err.reason, AuditResponderRejectReason::PerPeerCapFull);
+        assert_eq!(err.reason, ResponderRejectReason::PerPeerCapFull);
         assert_eq!(err.peer_inflight, MAX_AUDIT_RESPONSES_PER_PEER);
         assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
         assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
@@ -6600,7 +6715,7 @@ mod tests {
         else {
             panic!("admission should fail once global pool is full");
         };
-        assert_eq!(err.reason, AuditResponderRejectReason::GlobalPoolFull);
+        assert_eq!(err.reason, ResponderRejectReason::GlobalPoolFull);
         assert_eq!(err.global_inflight, MAX_CONCURRENT_AUDIT_RESPONSES);
         assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
         assert_eq!(err.peer_inflight, 0);
@@ -6644,6 +6759,17 @@ mod tests {
         drop(held_map);
         assert_eq!(semaphore.available_permits(), 1);
         assert!(!inflight.read().await.contains_key(&peer));
+    }
+
+    #[test]
+    fn responder_staleness_sheds_expired_requests_but_serves_fresh_ones() {
+        let timeout = Duration::from_secs(1);
+        let old_received_at = Instant::now()
+            .checked_sub(timeout)
+            .unwrap_or_else(Instant::now);
+
+        assert!(request_is_stale(old_received_at, timeout));
+        assert!(!request_is_stale(Instant::now(), timeout));
     }
 
     #[tokio::test]
