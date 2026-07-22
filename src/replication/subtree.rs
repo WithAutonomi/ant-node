@@ -50,8 +50,13 @@ pub struct SubtreeLeaf {
     pub bytes_hash: [u8; 32],
     /// Length of the chunk's content, in bytes. Lets the auditor draw a random
     /// 1 KiB block index in range and size the Bao slice for the final (short)
-    /// block. A lie here disagrees with the address-committed tree shape, so the
-    /// round-2 slice fails to decode — a lying responder only fails its own audit.
+    /// block. This field is NOT bound by the signed commitment (the Merkle leaf
+    /// hashes only `key ‖ bytes_hash`), so the round-2 verifier must not trust it
+    /// blind: `verify_block_slice` authenticates it against the Bao slice's own
+    /// length header (validated against the address), rejecting any claim that
+    /// disagrees with the true content length. Without that check a deflated
+    /// `content_len` would collapse the challenge to block 0 and forge possession
+    /// of a large chunk from a ~1 KiB prefix slice.
     pub content_len: u32,
     /// Root of the responder's fresh **nonced block tree** for this chunk (see
     /// [`crate::replication::slice`]): a Merkle root over the chunk's 1 KiB

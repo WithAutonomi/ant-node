@@ -271,13 +271,17 @@ pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1
 /// Each opening is a Bao verified slice (a 1 KiB block plus O(log n) BLAKE3
 /// parent hashes) plus a nonced block-tree sibling chain — a few KB, so even
 /// this many openings encode far under [`MAX_REPLICATION_MESSAGE_SIZE`] with no
-/// batching. The auditor draws at most `BYTE_SPOTCHECK_MAX` openings (one block
-/// per sampled leaf); this cap sits just above that with headroom, and the
-/// responder rejects any challenge requesting more (a forged-auditor guard: each
-/// opening forces one full chunk read to build its proof).
+/// batching. The auditor draws up to *two* openings per sampled leaf — one
+/// fresh-random block (possession) and one at the claimed final block (a length
+/// pin: opening the final block forces Bao's EOF validation, which authenticates
+/// the true content length and defeats a forged-short `content_len` that would
+/// otherwise shrink the challenge space). With at most `BYTE_SPOTCHECK_MAX`
+/// leaves that is `2 × BYTE_SPOTCHECK_MAX` openings; this cap sits just above
+/// that, and the responder rejects any challenge requesting more (a forged-
+/// auditor guard: each opening forces one full chunk read to build its proof).
 ///
 /// [`SubtreeSliceChallenge`]: crate::replication::protocol::SubtreeSliceChallenge
-pub const MAX_SLICE_OPENINGS: usize = 8;
+pub const MAX_SLICE_OPENINGS: usize = 10;
 const _: () = assert!(
     MAX_SLICE_OPENINGS >= 1,
     "at least one block opening must be allowed per slice challenge"

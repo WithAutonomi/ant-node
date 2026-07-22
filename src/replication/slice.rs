@@ -263,12 +263,28 @@ pub fn extract_block_slice(content: &[u8], index: u32) -> std::io::Result<Vec<u8
     Ok(slice)
 }
 
+/// Size of the Bao slice's leading length header (a little-endian `u64` giving
+/// the encoded content's total length, in bytes). This is the first field of
+/// every Bao slice; the decoder authenticates it against the tree root, so it
+/// cannot be forged to disagree with the `address` the slice verifies against.
+const BAO_LENGTH_HEADER_SIZE: usize = 8;
+
 /// Verify a Bao slice for block `index` against the chunk `address`
 /// (`BLAKE3(content)`), returning the verified block bytes (auditor, round 2).
 ///
-/// `content_len` is the responder's round-1 claim; a lie there makes the block
-/// range disagree with the address-committed tree shape, so the decode fails —
-/// a lying responder can only fail its own audit, never forge a pass.
+/// `content_len` is the responder's round-1 claim. It is NOT bound by the signed
+/// commitment (the Merkle leaf hashes only `key ‖ bytes_hash`), so a malicious
+/// responder can claim any length. Left unchecked, a **deflation** lie forges
+/// possession: claiming `content_len = 1024` for a 4 MiB chunk collapses
+/// `block_count` to 1, so the auditor can only ever open block 0, and a Bao
+/// slice for the prefix range `[0, 1024)` verifies fine against the true
+/// full-content address — a node storing ~1 KiB passes an audit for the whole
+/// chunk. To close this, the slice's own authenticated length header (which the
+/// decoder validates against `address`, so it equals the *true* content length)
+/// must match the claimed `content_len`. A responder that lies about the length
+/// then either fails the header check (claim ≠ true length) or is forced to
+/// report the true length — in which case the block index is drawn from the full
+/// range and possession of all blocks is required.
 #[must_use]
 pub fn verify_block_slice(
     slice: &[u8],
@@ -276,6 +292,18 @@ pub fn verify_block_slice(
     content_len: u64,
     index: u32,
 ) -> Option<Vec<u8>> {
+    // Authenticate the claimed length against the slice's own header before
+    // trusting `content_len` for the block range. The header is the first 8
+    // bytes of every Bao slice and is validated against `address` by the decode
+    // below (a forged header changes the tree shape and fails the root check),
+    // so requiring it to equal `content_len` forces the claim to be the true
+    // content length — defeating the deflation forgery described above.
+    let header = slice.get(..BAO_LENGTH_HEADER_SIZE)?;
+    let declared_len = u64::from_le_bytes(header.try_into().ok()?);
+    if declared_len != content_len {
+        return None;
+    }
+
     let (start, end) = block_range(content_len, index);
     let len = end - start;
     let hash = blake3::Hash::from_bytes(*address);
@@ -366,6 +394,100 @@ mod tests {
                 assert_eq!(verified.as_slice(), &content[s as usize..e as usize]);
             }
         }
+    }
+
+    // Regression: content_len deflation must NOT forge possession.
+    //
+    // `content_len` is not bound by the signed round-1 commitment (the Merkle
+    // leaf hashes only key+bytes_hash), so a malicious responder can claim
+    // content_len=1024 for a 1 MiB chunk. That would collapse block_count to 1,
+    // let the auditor only ever open block 0, and — before the fix — pass a Bao
+    // slice for the prefix [0,1024) against the true full-content address while
+    // storing ~1 KiB. verify_block_slice now authenticates the slice's own length
+    // header against the claim, so the deflation is rejected at chain 1.
+    #[test]
+    fn content_len_deflation_is_rejected() {
+        let full = content_of(1 << 20); // 1 MiB chunk, truly 1024 blocks.
+        let address = *blake3::hash(&full).as_bytes();
+
+        // Attacker keeps only the first block's Bao slice (extracted honestly for
+        // range [0,1024) of the real content), discarding the rest of the 1 MiB.
+        let stored_slice = extract_block_slice(&full, 0).expect("extract block 0");
+
+        // Round 1: attacker claims content_len = 1024 (one block).
+        let claimed_len = 1024u64;
+        assert_eq!(block_count(claimed_len), 1, "deflated claim = one block");
+
+        // Round 2: only block 0 could be drawn. Chain 1 must reject because the
+        // slice's authenticated length header (1 MiB) disagrees with the claim.
+        assert!(
+            verify_block_slice(&stored_slice, &address, claimed_len, 0).is_none(),
+            "deflated content_len must fail the slice length-header check"
+        );
+
+        // An honest responder reporting the true length still verifies block 0.
+        let honest = verify_block_slice(&stored_slice, &address, (1 << 20) as u64, 0);
+        assert_eq!(
+            honest.expect("honest full-length slice must verify").len(),
+            1024
+        );
+    }
+
+    /// Rewrite a Bao slice's 8-byte little-endian length header in place.
+    fn rewrite_slice_len(slice: &mut [u8], forged_len: u64) {
+        slice[..BAO_LENGTH_HEADER_SIZE].copy_from_slice(&forged_len.to_le_bytes());
+    }
+
+    // Regression for the header-rewrite length forgery (the residual attack the
+    // plain header==content_len check does NOT catch on its own).
+    //
+    // Bao does not cryptographically bind the length header for a PREFIX slice
+    // that never touches EOF: the unopened right subtree is an opaque hash. So an
+    // attacker can claim `content_len` just past a subtree boundary (e.g. 2 KiB+1
+    // for a 4 KiB / 4-block chunk), REWRITE each slice header to that forged
+    // length, supply the true right-subtree CV as the opaque root sibling, and
+    // pass any opening in the retained left half — storing only that half. The
+    // header check passes because header == forged content_len.
+    //
+    // The defence is to ALSO open the CLAIMED FINAL block: that decode reaches
+    // EOF, where Bao authenticates the encoded length against the address, so a
+    // forged-short length fails. This test shows both halves: a left-half opening
+    // slips past the header check, but the final-block opening rejects the forgery.
+    #[test]
+    fn header_rewrite_length_forgery_is_caught_at_the_final_block() {
+        // True chunk: 4 blocks. Root = parent(parent(b0,b1), parent(b2,b3)).
+        let full = content_of(4096);
+        let address = *blake3::hash(&full).as_bytes();
+
+        // Forged length: 2049 bytes → block_count 3 (b0, b1 full, b2' one byte).
+        // The claimed final block is index 2; blocks 0..2 are the retained half.
+        let forged_len = 2049u64;
+        assert_eq!(block_count(forged_len), 3);
+        let forged_final = block_count(forged_len) - 1;
+
+        // Left-half opening (block 0): the attacker rewrites an honest block-0
+        // slice's header to the forged length. The retained slice already carries
+        // the true right-subtree CV as the opaque root sibling, so it verifies
+        // against the real address AND passes the header==content_len check.
+        let mut left = extract_block_slice(&full, 0).expect("extract block 0");
+        rewrite_slice_len(&mut left, forged_len);
+        assert!(
+            verify_block_slice(&left, &address, forged_len, 0).is_some(),
+            "header rewrite lets a left-half opening slip past the header check — \
+             this is exactly why the final block must also be opened"
+        );
+
+        // Final-block opening (block 2 under the forged length): no slice the
+        // attacker can offer verifies, because reaching the forged EOF forces Bao
+        // to authenticate the length against the true address. The best attempt —
+        // an honest block-2 slice of the true content with a rewritten header —
+        // is rejected.
+        let mut fake_final = extract_block_slice(&full, 2).expect("extract block 2");
+        rewrite_slice_len(&mut fake_final, forged_len);
+        assert!(
+            verify_block_slice(&fake_final, &address, forged_len, forged_final).is_none(),
+            "final-block opening under a forged short length must fail (EOF length auth)"
+        );
     }
 
     #[test]

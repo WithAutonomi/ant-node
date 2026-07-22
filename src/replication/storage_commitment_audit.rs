@@ -51,6 +51,14 @@ use crate::replication::audit::AuditTickResult;
 const BYTE_SPOTCHECK_MIN: u32 = 3;
 const BYTE_SPOTCHECK_MAX: u32 = 5;
 
+// Each sampled leaf produces up to two openings (a fresh-random block plus the
+// claimed final block, deduplicated when they coincide), so the opening cap must
+// cover twice the leaf sample.
+const _: () = assert!(
+    2 * BYTE_SPOTCHECK_MAX as usize <= MAX_SLICE_OPENINGS,
+    "MAX_SLICE_OPENINGS must cover two openings per sampled leaf"
+);
+
 /// ADR-0004 A1: with grace removed, the responder retries a TRANSIENT chunk-read
 /// error a few times before rejecting `Transient` (which routes to the timeout
 /// lane). A momentary disk blip usually clears within these attempts; only a
@@ -565,6 +573,30 @@ fn random_block_index(content_len: u32) -> u32 {
     rand::thread_rng().gen_range(0..count)
 }
 
+/// The two block indices opened for one sampled leaf: a fresh-random block (the
+/// cut-and-choose possession check) and the claimed final block.
+///
+/// The final block is opened so the auditor's Bao decode reaches EOF, which is
+/// where Bao authenticates the encoded length against the address. Without it a
+/// responder can forge a *shorter* `content_len` (which is not signed by the
+/// round-1 commitment), collapse the challenge space, and pass while storing only
+/// the prefix — the length header alone is not bound for a prefix slice that
+/// never touches EOF. Opening the final block pins the true length: a forged
+/// short length fails the final-block decode against the real address.
+///
+/// Returns one index when the random draw already lands on the final block (or
+/// the chunk is a single block), two otherwise, never more than two.
+fn block_indices_for_leaf(content_len: u32) -> Vec<u32> {
+    let count = crate::replication::slice::block_count(u64::from(content_len));
+    let final_index = count.saturating_sub(1);
+    let random = random_block_index(content_len);
+    if random == final_index {
+        vec![final_index]
+    } else {
+        vec![random, final_index]
+    }
+}
+
 /// Round-2 verdict (ADR-0002 / V2-685): the responder opened one 1 KiB block per
 /// sampled leaf with a Bao verified slice plus a nonced block-tree opening;
 /// verify possession from those.
@@ -696,14 +728,21 @@ async fn verify_subtree_response(
             AuditFailureReason::DigestMismatch,
         );
     }
-    // Pair each sampled leaf with a fresh-random block index. Capped at
-    // MAX_SLICE_OPENINGS defensively (the sample is already <= BYTE_SPOTCHECK_MAX,
-    // itself <= MAX_SLICE_OPENINGS). Own the leaves so the borrow on `proof` ends
-    // before the await.
+    // Pair each sampled leaf with up to two block indices: a fresh-random block
+    // (possession) and the claimed final block (a length pin — see
+    // `block_indices_for_leaf`). Own the leaves so the borrow on `proof` ends
+    // before the await. The sample is <= BYTE_SPOTCHECK_MAX and each leaf yields
+    // <= 2 openings, so the total is <= 2 * BYTE_SPOTCHECK_MAX <= MAX_SLICE_OPENINGS
+    // (statically asserted); `take` is a defensive backstop.
     let openings_with_leaves: Vec<(crate::replication::subtree::SubtreeLeaf, u32)> = sampled
         .iter()
+        .flat_map(|leaf| {
+            let leaf = (*leaf).clone();
+            block_indices_for_leaf(leaf.content_len)
+                .into_iter()
+                .map(move |block_index| (leaf.clone(), block_index))
+        })
         .take(MAX_SLICE_OPENINGS)
-        .map(|leaf| ((*leaf).clone(), random_block_index(leaf.content_len)))
         .collect();
     let openings: Vec<SubtreeSliceOpening> = openings_with_leaves
         .iter()
