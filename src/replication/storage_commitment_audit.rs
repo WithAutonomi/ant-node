@@ -10,7 +10,7 @@
 //! [`crate::replication::subtree`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
 use rand::Rng;
@@ -120,6 +120,28 @@ pub struct AuditCredit<'a> {
     pub recent_provers: &'a Arc<RwLock<RecentProvers>>,
 }
 
+/// Local subsystem that launched a storage-commitment audit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtreeAuditOrigin {
+    /// Lottery-gated audit after commitment gossip.
+    Gossip,
+    /// Deterministic audit after a commitment-backed payment.
+    FirstMonetized,
+    /// Explicit test or diagnostic request.
+    Manual,
+}
+
+#[cfg(feature = "logging")]
+impl SubtreeAuditOrigin {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Gossip => "gossip",
+            Self::FirstMonetized => "first_monetized",
+            Self::Manual => "manual",
+        }
+    }
+}
+
 /// The cross-cutting context for verifying one audit response, bundled so the
 /// response-dispatch and verification functions stay readable.
 struct AuditCtx<'a> {
@@ -130,6 +152,8 @@ struct AuditCtx<'a> {
     expected_commitment_hash: [u8; 32],
     config: &'a ReplicationConfig,
     credit: Option<&'a AuditCredit<'a>>,
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    origin: SubtreeAuditOrigin,
 }
 
 /// Run one gossip-triggered subtree audit against `challenged_peer`, pinned to
@@ -160,6 +184,28 @@ pub async fn run_subtree_audit(
     expected_commitment_hash: [u8; 32],
     key_count: u32,
     credit: Option<&AuditCredit<'_>>,
+) -> AuditTickResult {
+    run_subtree_audit_with_origin(
+        p2p_node,
+        config,
+        challenged_peer,
+        expected_commitment_hash,
+        key_count,
+        credit,
+        SubtreeAuditOrigin::Manual,
+    )
+    .await
+}
+
+/// Run a subtree audit while retaining the local scheduler origin in logs.
+pub(crate) async fn run_subtree_audit_with_origin(
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+    challenged_peer: &PeerId,
+    expected_commitment_hash: [u8; 32],
+    key_count: u32,
+    credit: Option<&AuditCredit<'_>>,
+    origin: SubtreeAuditOrigin,
 ) -> AuditTickResult {
     let (nonce, challenge_id) = {
         let mut rng = rand::thread_rng();
@@ -196,13 +242,51 @@ pub async fn run_subtree_audit(
     );
     let timeout = config.audit_response_timeout(subtree_leaves);
 
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = origin.as_str(),
+        audit_round = "subtree",
+        challenged_peer = %challenged_peer,
+        challenge_id,
+        work_items = subtree_leaves,
+        timeout_ms = timeout.as_millis(),
+        "Outbound audit request started"
+    );
+    let request_started = Instant::now();
     let response = match p2p_node
         .send_request(challenged_peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = origin.as_str(),
+                audit_round = "subtree",
+                challenged_peer = %challenged_peer,
+                challenge_id,
+                work_items = subtree_leaves,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            resp
+        }
         Err(e) => {
-            debug!("Audit: subtree challenge to {challenged_peer} timed out / failed: {e}");
+            warn!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = origin.as_str(),
+                audit_round = "subtree",
+                challenged_peer = %challenged_peer,
+                challenge_id,
+                work_items = subtree_leaves,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "no_response",
+                error = %e,
+                "Outbound audit request completed without a response"
+            );
             return failed(challenged_peer, challenge_id, AuditFailureReason::Timeout);
         }
     };
@@ -227,6 +311,7 @@ pub async fn run_subtree_audit(
         expected_commitment_hash,
         config,
         credit,
+        origin,
     };
     dispatch_subtree_response(resp_msg.body, &ctx).await
 }
@@ -256,6 +341,7 @@ enum ByteRound {
 /// the worst-case response of max-size chunks fits the wire cap), sized to a
 /// possession-in-time deadline (honest local-disk read of `keys.len()` chunks).
 /// The responder cannot have predicted which keys are sampled.
+#[allow(clippy::too_many_lines)]
 async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
     let challenge = SubtreeByteChallenge {
         challenge_id: ctx.challenge_id,
@@ -283,6 +369,18 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
     // the multi-MiB reply (handshake + upload + busy disk) — the round-1
     // hashes-only floor would be too tight for 2 × 4 MiB (§4).
     let timeout = ctx.config.byte_audit_response_timeout(keys.len());
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = ctx.origin.as_str(),
+        audit_round = "byte",
+        challenged_peer = %ctx.challenged_peer,
+        challenge_id = ctx.challenge_id,
+        work_items = keys.len(),
+        timeout_ms = timeout.as_millis(),
+        "Outbound audit request started"
+    );
+    let request_started = Instant::now();
     let response = match ctx
         .p2p_node
         .send_request(
@@ -293,11 +391,34 @@ async fn request_byte_proof(ctx: &AuditCtx<'_>, keys: &[XorName]) -> ByteRound {
         )
         .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = ctx.origin.as_str(),
+                audit_round = "byte",
+                challenged_peer = %ctx.challenged_peer,
+                challenge_id = ctx.challenge_id,
+                work_items = keys.len(),
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            resp
+        }
         Err(e) => {
-            debug!(
-                "Audit: byte challenge to {} timed out / failed: {e}",
-                ctx.challenged_peer
+            warn!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = ctx.origin.as_str(),
+                audit_round = "byte",
+                challenged_peer = %ctx.challenged_peer,
+                challenge_id = ctx.challenge_id,
+                work_items = keys.len(),
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "no_response",
+                error = %e,
+                "Outbound audit request completed without a response"
             );
             return ByteRound::Timeout;
         }

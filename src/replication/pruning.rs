@@ -1397,8 +1397,15 @@ async fn peer_proves_records(
     else {
         return Vec::new();
     };
-    let Some(decoded) =
-        receive_prune_audit_response(&peer, &challenge_keys, encoded, key_count, context).await
+    let Some(decoded) = receive_prune_audit_response(
+        &peer,
+        &challenge_keys,
+        encoded,
+        key_count,
+        challenge_id,
+        context,
+    )
+    .await
     else {
         return Vec::new();
     };
@@ -1456,12 +1463,14 @@ async fn receive_prune_audit_response(
     challenge_keys: &[XorName],
     encoded: Vec<u8>,
     key_count: usize,
+    challenge_id: u64,
     context: PruneAuditContext<'_>,
 ) -> Option<ReplicationMessage> {
     let result = send_prune_audit_challenge(
         peer,
         encoded,
         key_count,
+        challenge_id,
         context.p2p_node,
         context.config,
         context.audit_challenge_coordinator,
@@ -1547,6 +1556,7 @@ async fn send_prune_audit_challenge(
     peer: &PeerId,
     encoded: Vec<u8>,
     key_count: usize,
+    challenge_id: u64,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
@@ -1558,16 +1568,51 @@ async fn send_prune_audit_challenge(
         return PruneAuditChallengeResult::MalformedResponse;
     };
     let timeout = prune_audit_response_timeout(config, key_count);
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = AuditType::Prune.as_str(),
+        audit_round = "digest",
+        challenged_peer = %peer,
+        challenge_id,
+        work_items = key_count,
+        timeout_ms = timeout.as_millis(),
+        "Outbound audit request started"
+    );
+    let request_started = Instant::now();
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Prune.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = key_count,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            response
+        }
         Err(e) => {
             let error = e.to_string();
             let (send_error_class, audit_failure_class) =
                 audit_metrics::classify_audit_send_error(&error);
-            debug!(
+            warn!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Prune.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = key_count,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "no_response",
                 audit_type = AuditType::Prune.as_str(),
                 audit_failure_class = audit_failure_class.as_str(),
                 send_error_class,

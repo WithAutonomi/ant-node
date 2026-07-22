@@ -63,7 +63,9 @@ use crate::error::{Error, Result};
 use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
-use crate::replication::audit_metrics::{AuditResponderClass, ReplicationResponderClass};
+use crate::replication::audit_metrics::{
+    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics, ReplicationResponderClass,
+};
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
@@ -587,6 +589,9 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Windowed per-origin capacity and processing-time telemetry for every
+    /// request sharing the audit responder pool.
+    audit_responder_metrics: Arc<AuditResponderMetrics>,
     /// Shared auditor-side limiter for outbound digest `AuditChallenge`s.
     ///
     /// Responsible-chunk audits, prune confirmations, and possession checks
@@ -708,6 +713,7 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
             audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
             fetch_responder_worker_semaphore: Arc::new(Semaphore::new(
                 FETCH_RESPONDER_WORKER_LIMIT,
@@ -934,6 +940,8 @@ impl ReplicationEngine {
         self.start_first_audit_drainer();
         // V2-623: periodic cumulative per-variant traffic accounting.
         self.start_traffic_summary_loop();
+        #[cfg(feature = "logging")]
+        self.start_audit_responder_summary_loop();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -1415,13 +1423,14 @@ impl ReplicationEngine {
                         let credit = storage_commitment_audit::AuditCredit {
                             recent_provers: &trigger.recent_provers,
                         };
-                        let result = storage_commitment_audit::run_subtree_audit(
+                        let result = storage_commitment_audit::run_subtree_audit_with_origin(
                             &trigger.p2p_node,
                             &trigger.config,
                             &event.peer,
                             event.pin,
                             event.key_count,
                             Some(&credit),
+                            storage_commitment_audit::SubtreeAuditOrigin::FirstMonetized,
                         )
                         .await;
                         let outcome = first_audit_terminal_outcome(&result);
@@ -1502,6 +1511,7 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let audit_responder_metrics = Arc::clone(&self.audit_responder_metrics);
         let fetch_responder_worker_semaphore = Arc::clone(&self.fetch_responder_worker_semaphore);
         let fetch_responder_admission_semaphore =
             Arc::clone(&self.fetch_responder_admission_semaphore);
@@ -1551,6 +1561,7 @@ impl ReplicationEngine {
             gossip_audit,
             audit_responder_semaphore,
             audit_responder_inflight,
+            audit_responder_metrics,
             fetch_responder_worker_semaphore,
             fetch_responder_admission_semaphore,
             fetch_responder_inflight,
@@ -1623,6 +1634,11 @@ impl ReplicationEngine {
                                 continue;
                             }
                         };
+                        if let Some(class) = audit_responder_class(&msg.body) {
+                            handler_context
+                                .audit_responder_metrics
+                                .record_received(source, class);
+                        }
                         let inbound = InboundReplicationMessage {
                             source,
                             msg,
@@ -1651,6 +1667,11 @@ impl ReplicationEngine {
                             continue;
                         }
                         if let Err(dropped) = try_enqueue_serial_message(&replication_tx, inbound) {
+                            if dropped.audit_responder_class.is_some() {
+                                handler_context
+                                    .audit_responder_metrics
+                                    .record_serial_queue_drop(dropped.source);
+                            }
                             // Every serial-lane class has protocol recovery: syncs rerun,
                             // fetches retry, verification re-asks, and fresh offers are
                             // recovered by ADR-0003's delayed possession check. Responses
@@ -2141,6 +2162,41 @@ impl ReplicationEngine {
         self.task_handles.push(handle);
     }
 
+    /// Periodically rank remote peers using the shared audit responder pool and
+    /// report handler-only versus end-to-end latency. Windowed values make a
+    /// burst visible even after a long-running node has accumulated traffic.
+    #[cfg(feature = "logging")]
+    fn start_audit_responder_summary_loop(&mut self) {
+        let shutdown = self.shutdown.clone();
+        let metrics = Arc::clone(&self.audit_responder_metrics);
+        let semaphore = Arc::clone(&self.audit_responder_semaphore);
+        let handle = tokio::spawn(async move {
+            let mut window_started = Instant::now();
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        log_audit_responder_summary(
+                            &metrics,
+                            &semaphore,
+                            window_started.elapsed(),
+                        );
+                        break;
+                    }
+                    () = tokio::time::sleep(config::AUDIT_RESPONDER_SUMMARY_INTERVAL) => {
+                        log_audit_responder_summary(
+                            &metrics,
+                            &semaphore,
+                            window_started.elapsed(),
+                        );
+                        window_started = Instant::now();
+                    }
+                }
+            }
+            debug!("Audit responder summary loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
     #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
     fn start_fetch_worker(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
@@ -2589,6 +2645,84 @@ impl ReplicationEngine {
 // Free functions for background tasks
 // ===========================================================================
 
+#[cfg(feature = "logging")]
+fn log_audit_responder_summary(
+    metrics: &AuditResponderMetrics,
+    semaphore: &Semaphore,
+    window: Duration,
+) {
+    let snapshot = metrics.take_snapshot();
+    if snapshot.origins.is_empty() {
+        return;
+    }
+
+    let total = snapshot.total;
+    let [digest_received, subtree_received, byte_received, commitment_pin_received] =
+        total.received_by_class;
+    let global_inflight =
+        MAX_CONCURRENT_AUDIT_RESPONSES.saturating_sub(semaphore.available_permits());
+    info!(
+        target: "ant_node::replication::audit_responder",
+        window_ms = window.as_millis(),
+        source_count = snapshot.origins.len(),
+        received = total.received(),
+        digest_received,
+        subtree_received,
+        byte_received,
+        commitment_pin_received,
+        admitted = total.admitted,
+        global_pool_drops = total.global_pool_drops,
+        per_peer_cap_drops = total.per_peer_cap_drops,
+        serial_queue_drops = total.serial_queue_drops,
+        completed = total.completed,
+        send_failures = total.send_failures,
+        processing_avg_ms = total.processing_avg_ms(),
+        processing_max_ms = total.processing_max_ms,
+        total_avg_ms = total.total_avg_ms(),
+        total_max_ms = total.total_max_ms,
+        global_inflight,
+        global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+        peak_global_inflight = total.peak_global_inflight,
+        "Audit responder summary"
+    );
+
+    for (index, origin) in snapshot
+        .origins
+        .iter()
+        .take(config::AUDIT_RESPONDER_TOP_ORIGINS)
+        .enumerate()
+    {
+        let Some(source) = origin.source else {
+            continue;
+        };
+        let [digest_received, subtree_received, byte_received, commitment_pin_received] =
+            origin.received_by_class;
+        info!(
+            target: "ant_node::replication::audit_responder",
+            rank = index + 1,
+            source = %source,
+            received = origin.received(),
+            digest_received,
+            subtree_received,
+            byte_received,
+            commitment_pin_received,
+            admitted = origin.admitted,
+            global_pool_drops = origin.global_pool_drops,
+            per_peer_cap_drops = origin.per_peer_cap_drops,
+            serial_queue_drops = origin.serial_queue_drops,
+            completed = origin.completed,
+            send_failures = origin.send_failures,
+            processing_avg_ms = origin.processing_avg_ms(),
+            processing_max_ms = origin.processing_max_ms,
+            total_avg_ms = origin.total_avg_ms(),
+            total_max_ms = origin.total_max_ms,
+            peak_global_inflight = origin.peak_global_inflight,
+            peak_peer_inflight = origin.peak_peer_inflight,
+            "Audit responder top origin"
+        );
+    }
+}
+
 /// Which ceiling rejected an audit-responder admission attempt.
 ///
 /// Stable, machine-readable so a production log-scrape can bucket drops by
@@ -2620,6 +2754,15 @@ impl ResponderRejectReason {
         match self {
             Self::GlobalPoolFull => "global_pool_full",
             Self::PerPeerCapFull => "per_peer_cap_full",
+        }
+    }
+}
+
+impl From<ResponderRejectReason> for AuditResponderDropReason {
+    fn from(reason: ResponderRejectReason) -> Self {
+        match reason {
+            ResponderRejectReason::GlobalPoolFull => Self::GlobalPoolFull,
+            ResponderRejectReason::PerPeerCapFull => Self::PerPeerCapFull,
         }
     }
 }
@@ -2667,6 +2810,8 @@ impl fmt::Display for ResponderAdmissionFailure {
 struct ResponderGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
     _peer_slot: PeerResponderSlot,
+    global_inflight: usize,
+    peer_inflight: u32,
 }
 
 type AuditResponderGuard = ResponderGuard;
@@ -2703,6 +2848,7 @@ struct ReplicationMessageHandlerContext {
     gossip_audit: GossipAuditTrigger,
     audit_responder_semaphore: Arc<Semaphore>,
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    audit_responder_metrics: Arc<AuditResponderMetrics>,
     fetch_responder_worker_semaphore: Arc<Semaphore>,
     fetch_responder_admission_semaphore: Arc<Semaphore>,
     fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
@@ -2746,6 +2892,7 @@ impl SerialQueueDropReason {
 struct SerialQueueDrop {
     source: PeerId,
     message_class: &'static str,
+    audit_responder_class: Option<AuditResponderClass>,
     queue_depth: usize,
     reason: SerialQueueDropReason,
 }
@@ -2756,6 +2903,7 @@ fn try_enqueue_serial_message(
 ) -> std::result::Result<(), SerialQueueDrop> {
     let source = inbound.source;
     let message_class = replication_message_class(&inbound.msg.body);
+    let audit_responder_class = audit_responder_class(&inbound.msg.body);
     let queue_depth = sender.max_capacity().saturating_sub(sender.capacity());
     sender.try_send(inbound).map_err(|error| {
         let (reason, dropped) = match error {
@@ -2766,6 +2914,7 @@ fn try_enqueue_serial_message(
         SerialQueueDrop {
             source,
             message_class,
+            audit_responder_class,
             queue_depth,
             reason,
         }
@@ -2794,11 +2943,21 @@ const fn replication_message_class(body: &ReplicationMessageBody) -> &'static st
     }
 }
 
+const fn audit_responder_class(body: &ReplicationMessageBody) -> Option<AuditResponderClass> {
+    match body {
+        ReplicationMessageBody::AuditChallenge(_) => Some(AuditResponderClass::Digest),
+        ReplicationMessageBody::SubtreeAuditChallenge(_) => Some(AuditResponderClass::Subtree),
+        ReplicationMessageBody::SubtreeByteChallenge(_) => Some(AuditResponderClass::Byte),
+        ReplicationMessageBody::GetCommitmentByPin(_) => Some(AuditResponderClass::CommitmentPin),
+        _ => None,
+    }
+}
+
 impl AuditResponderClass {
     const fn per_peer_limit(self) -> u32 {
         match self {
             Self::Digest => MAX_DIGEST_AUDIT_RESPONSES_PER_PEER,
-            Self::Subtree | Self::Byte => MAX_AUDIT_RESPONSES_PER_PEER,
+            Self::Subtree | Self::Byte | Self::CommitmentPin => MAX_AUDIT_RESPONSES_PER_PEER,
         }
     }
 }
@@ -2926,6 +3085,8 @@ async fn admit_bounded_responder(
     Ok(ResponderGuard {
         _permit: permit,
         _peer_slot: peer_slot,
+        global_inflight: global_inflight(semaphore),
+        peer_inflight: admitted_peer_inflight,
     })
 }
 
@@ -3047,25 +3208,63 @@ async fn handle_replication_message(
             // is hit. Responsible/prune audit timeouts are penalised by the
             // caller, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
+            let class = AuditResponderClass::Digest;
             let guard = match admit_audit_responder(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 source,
-                AuditResponderClass::Digest,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
-                    audit_metrics::record_admission_drop(AuditResponderClass::Digest);
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
                     warn!(
-                        "Audit challenge reply not sent: kind=responsible response=dropped \
-                         source={source} responder_class={} {failure}",
-                        AuditResponderClass::Digest.as_str(),
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "responsible",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = challenge.challenge_id,
+                        key_count = challenge.keys.len(),
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
                     );
                     return Ok(());
                 }
             };
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "responsible",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                key_count = challenge.keys.len(),
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
             let bootstrapping = *ctx.is_bootstrapping.read().await;
             let dispatch_latency = received_at.elapsed();
             audit_metrics::record_digest_dispatch_latency(dispatch_latency);
@@ -3080,9 +3279,11 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
             ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
-                if let Err(e) = handle_audit_challenge_msg(
+                let worker_started = Instant::now();
+                match handle_audit_challenge_msg(
                     &source,
                     &challenge,
                     &storage,
@@ -3093,7 +3294,21 @@ async fn handle_replication_message(
                 )
                 .await
                 {
-                    debug!("Audit challenge from {source} error: {e}");
+                    Ok(completion) => log_audit_responder_completion(
+                        &responder_metrics,
+                        source,
+                        class,
+                        "responsible",
+                        challenge.challenge_id,
+                        challenge.keys.len(),
+                        completion.response_kind,
+                        completion.sent,
+                        received_at,
+                        worker_started,
+                        completion.processing,
+                        completion.response_send,
+                    ),
+                    Err(e) => debug!("Audit challenge from {source} error: {e}"),
                 }
             });
             Ok(())
@@ -3111,29 +3326,61 @@ async fn handle_replication_message(
             // non-responses, so capacity drops throttle flooders without turning
             // into trust penalties (and one source cannot starve other peers,
             // since its share is capped per-peer).
-            info!(
-                "Audit challenge received: kind=subtree source={source} request_response={}",
-                rr_message_id.is_some(),
-            );
+            let class = AuditResponderClass::Subtree;
             let guard = match admit_audit_responder(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 source,
-                AuditResponderClass::Subtree,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
-                    audit_metrics::record_admission_drop(AuditResponderClass::Subtree);
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
                     warn!(
-                        "Audit challenge reply not sent: kind=subtree response=dropped \
-                         source={source} responder_class={} {failure}",
-                        AuditResponderClass::Subtree.as_str(),
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "subtree",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = challenge.challenge_id,
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
                     );
                     return Ok(());
                 }
             };
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "subtree",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
             let bootstrapping = *ctx.is_bootstrapping.read().await;
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
@@ -3141,8 +3388,11 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
             ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
+                let worker_started = Instant::now();
+                let processing_started = Instant::now();
                 let response = storage_commitment_audit::handle_subtree_challenge(
                     &challenge,
                     &storage,
@@ -3151,7 +3401,10 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                let processing = processing_started.elapsed();
                 let response_kind = subtree_audit_response_kind(&response);
+                let work_items = subtree_audit_response_work_items(&response);
+                let response_send_started = Instant::now();
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
@@ -3160,19 +3413,21 @@ async fn handle_replication_message(
                     rr_message_id.as_deref(),
                 )
                 .await;
-                if sent {
-                    info!(
-                        "Audit challenge reply sent: kind=subtree response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                } else {
-                    warn!(
-                        "Audit challenge reply not sent: kind=subtree response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                }
+                let response_send = response_send_started.elapsed();
+                log_audit_responder_completion(
+                    &responder_metrics,
+                    source,
+                    class,
+                    "subtree",
+                    challenge.challenge_id,
+                    work_items,
+                    response_kind,
+                    sent,
+                    received_at,
+                    worker_started,
+                    processing,
+                    response_send,
+                );
             });
             Ok(())
         }
@@ -3182,29 +3437,63 @@ async fn handle_replication_message(
             // committed key we can no longer produce. Reads chunk bytes from
             // disk, so likewise spawned off the serial loop (§5) under the same
             // flood-fair admission (codex#1 + codex-r2 A).
-            info!(
-                "Audit challenge received: kind=byte source={source} request_response={}",
-                rr_message_id.is_some(),
-            );
+            let class = AuditResponderClass::Byte;
             let guard = match admit_audit_responder(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 source,
-                AuditResponderClass::Byte,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
-                    audit_metrics::record_admission_drop(AuditResponderClass::Byte);
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
                     warn!(
-                        "Audit challenge reply not sent: kind=byte response=dropped \
-                         source={source} responder_class={} {failure}",
-                        AuditResponderClass::Byte.as_str(),
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "byte",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = challenge.challenge_id,
+                        key_count = challenge.keys.len(),
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
                     );
                     return Ok(());
                 }
             };
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "byte",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                key_count = challenge.keys.len(),
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
             let bootstrapping = *ctx.is_bootstrapping.read().await;
             let storage = Arc::clone(&ctx.storage);
             let p2p_node = Arc::clone(&ctx.p2p_node);
@@ -3212,8 +3501,11 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
             ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
+                let worker_started = Instant::now();
+                let processing_started = Instant::now();
                 let response = storage_commitment_audit::handle_subtree_byte_challenge(
                     &challenge,
                     &storage,
@@ -3222,7 +3514,9 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                let processing = processing_started.elapsed();
                 let response_kind = subtree_byte_response_kind(&response);
+                let response_send_started = Instant::now();
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
@@ -3231,19 +3525,21 @@ async fn handle_replication_message(
                     rr_message_id.as_deref(),
                 )
                 .await;
-                if sent {
-                    info!(
-                        "Audit challenge reply sent: kind=byte response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                } else {
-                    warn!(
-                        "Audit challenge reply not sent: kind=byte response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                }
+                let response_send = response_send_started.elapsed();
+                log_audit_responder_completion(
+                    &responder_metrics,
+                    source,
+                    class,
+                    "byte",
+                    challenge.challenge_id,
+                    challenge.keys.len(),
+                    response_kind,
+                    sent,
+                    received_at,
+                    worker_started,
+                    processing,
+                    response_send,
+                );
             });
             Ok(())
         }
@@ -3259,28 +3555,71 @@ async fn handle_replication_message(
             // cap) so a flood of fetches cannot drive unbounded commitment
             // clone/encode/send work; over-limit is dropped, which the fetching
             // peer graces exactly like a missed audit response.
-            let _guard = match admit_audit_responder(
+            let class = AuditResponderClass::CommitmentPin;
+            let guard = match admit_audit_responder(
                 &ctx.audit_responder_semaphore,
                 &ctx.audit_responder_inflight,
                 source,
-                AuditResponderClass::Byte,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
-                    audit_metrics::record_admission_drop(AuditResponderClass::Byte);
-                    debug!("GetCommitmentByPin from {source} dropped: {failure}");
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
+                    warn!(
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "commitment_pin",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = msg.request_id,
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
+                    );
                     return Ok(());
                 }
             };
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                guard.global_inflight,
+                guard.peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "commitment_pin",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = msg.request_id,
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = guard.global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = guard.peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
+            let worker_started = Instant::now();
+            let processing_started = Instant::now();
             let response = ctx.my_commitment_state.lookup_by_hash(&request.pin).map_or(
                 protocol::GetCommitmentByPinResponse::NotRetained { pin: request.pin },
                 |built| protocol::GetCommitmentByPinResponse::Found {
                     commitment: built.commitment().clone(),
                 },
             );
-            send_replication_response(
+            let processing = processing_started.elapsed();
+            let response_kind = commitment_pin_response_kind(&response);
+            let response_send_started = Instant::now();
+            let sent = send_replication_response_checked(
                 source,
                 &ctx.p2p_node,
                 msg.request_id,
@@ -3288,6 +3627,22 @@ async fn handle_replication_message(
                 rr_message_id,
             )
             .await;
+            let response_send = response_send_started.elapsed();
+            log_audit_responder_completion(
+                &ctx.audit_responder_metrics,
+                *source,
+                class,
+                "commitment_pin",
+                msg.request_id,
+                1,
+                response_kind,
+                sent,
+                received_at,
+                worker_started,
+                processing,
+                response_send,
+            );
+            drop(guard);
             Ok(())
         }
         // Response messages are handled by their respective request initiators.
@@ -4237,6 +4592,13 @@ async fn handle_fetch_request(
 /// Responder for an incoming `AuditChallenge` (responsible-chunk audit #2, and
 /// the prune-confirmation audit, which reuses the same wire message): reply with
 /// per-key possession digests.
+struct AuditResponderCompletion {
+    response_kind: &'static str,
+    sent: bool,
+    processing: Duration,
+    response_send: Duration,
+}
+
 async fn handle_audit_challenge_msg(
     source: &PeerId,
     challenge: &protocol::AuditChallenge,
@@ -4245,16 +4607,11 @@ async fn handle_audit_challenge_msg(
     is_bootstrapping: bool,
     request_id: u64,
     rr_message_id: Option<&str>,
-) -> Result<()> {
+) -> Result<AuditResponderCompletion> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
-    info!(
-        "Audit challenge received: kind=responsible keys={} bootstrapping={} request_response={}",
-        challenge.keys.len(),
-        is_bootstrapping,
-        rr_message_id.is_some(),
-    );
 
+    let processing_started = Instant::now();
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
@@ -4263,8 +4620,10 @@ async fn handle_audit_challenge_msg(
         stored_chunks,
     )
     .await;
+    let processing = processing_started.elapsed();
     let response_kind = audit_response_kind(&response);
 
+    let response_send_started = Instant::now();
     let sent = send_replication_response_checked(
         source,
         p2p_node,
@@ -4273,23 +4632,69 @@ async fn handle_audit_challenge_msg(
         rr_message_id,
     )
     .await;
+    let response_send = response_send_started.elapsed();
+
+    Ok(AuditResponderCompletion {
+        response_kind,
+        sent,
+        processing,
+        response_send,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_audit_responder_completion(
+    metrics: &AuditResponderMetrics,
+    source: PeerId,
+    class: AuditResponderClass,
+    kind: &'static str,
+    challenge_id: u64,
+    work_items: usize,
+    response_kind: &'static str,
+    sent: bool,
+    received_at: Instant,
+    worker_started: Instant,
+    processing: Duration,
+    response_send: Duration,
+) {
+    let dispatch = worker_started.saturating_duration_since(received_at);
+    let total = received_at.elapsed();
+    metrics.record_completed(source, processing, total, sent);
     if sent {
         info!(
-            "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
-            response_kind,
-            challenge.keys.len(),
-            rr_message_id.is_some(),
+            target: "ant_node::replication::audit_responder",
+            event = "completed",
+            kind,
+            responder_class = class.as_str(),
+            source = %source,
+            challenge_id,
+            work_items,
+            response = response_kind,
+            sent,
+            dispatch_ms = dispatch.as_millis(),
+            processing_ms = processing.as_millis(),
+            response_send_ms = response_send.as_millis(),
+            total_ms = total.as_millis(),
+            "Audit responder request completed"
         );
     } else {
         warn!(
-            "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
-            response_kind,
-            challenge.keys.len(),
-            rr_message_id.is_some(),
+            target: "ant_node::replication::audit_responder",
+            event = "completed",
+            kind,
+            responder_class = class.as_str(),
+            source = %source,
+            challenge_id,
+            work_items,
+            response = response_kind,
+            sent,
+            dispatch_ms = dispatch.as_millis(),
+            processing_ms = processing.as_millis(),
+            response_send_ms = response_send.as_millis(),
+            total_ms = total.as_millis(),
+            "Audit responder request completed without sending a reply"
         );
     }
-
-    Ok(())
 }
 
 fn audit_response_kind(response: &protocol::AuditResponse) -> &'static str {
@@ -4308,11 +4713,26 @@ fn subtree_audit_response_kind(response: &protocol::SubtreeAuditResponse) -> &'s
     }
 }
 
+fn subtree_audit_response_work_items(response: &protocol::SubtreeAuditResponse) -> usize {
+    match response {
+        protocol::SubtreeAuditResponse::Proof { proof, .. } => proof.leaves.len(),
+        protocol::SubtreeAuditResponse::Bootstrapping { .. }
+        | protocol::SubtreeAuditResponse::Rejected { .. } => 0,
+    }
+}
+
 fn subtree_byte_response_kind(response: &protocol::SubtreeByteResponse) -> &'static str {
     match response {
         protocol::SubtreeByteResponse::Items { .. } => "items",
         protocol::SubtreeByteResponse::Bootstrapping { .. } => "bootstrapping",
         protocol::SubtreeByteResponse::Rejected { .. } => "rejected",
+    }
+}
+
+fn commitment_pin_response_kind(response: &protocol::GetCommitmentByPinResponse) -> &'static str {
+    match response {
+        protocol::GetCommitmentByPinResponse::Found { .. } => "found",
+        protocol::GetCommitmentByPinResponse::NotRetained { .. } => "not_retained",
     }
 }
 
@@ -6285,13 +6705,14 @@ async fn maybe_trigger_gossip_audit(
         let credit = storage_commitment_audit::AuditCredit {
             recent_provers: &trigger.recent_provers,
         };
-        let result = storage_commitment_audit::run_subtree_audit(
+        let result = storage_commitment_audit::run_subtree_audit_with_origin(
             &trigger.p2p_node,
             &trigger.config,
             &peer,
             target.pin_hash,
             target.key_count,
             Some(&credit),
+            storage_commitment_audit::SubtreeAuditOrigin::Gossip,
         )
         .await;
         handle_subtree_audit_result(

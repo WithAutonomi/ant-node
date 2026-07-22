@@ -179,6 +179,15 @@ pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 4;
 /// [`MAX_AUDIT_RESPONSES_PER_PEER`] exactly unchanged.
 pub const MAX_DIGEST_AUDIT_RESPONSES_PER_PEER: u32 = 8;
 
+/// Cadence of audit-responder capacity and slow-processing summaries.
+///
+/// Each window is reset after logging, so the ranked origins describe current
+/// testnet load rather than being permanently dominated by an old burst.
+pub const AUDIT_RESPONDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Number of busiest source peers included in each responder summary window.
+pub const AUDIT_RESPONDER_TOP_ORIGINS: usize = 10;
+
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
 /// Uses `std::thread::available_parallelism()` so the node scales to the
