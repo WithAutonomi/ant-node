@@ -68,7 +68,7 @@ enum ProbeOutcome {
     Present,
     /// Peer failed the audit challenge: absent sentinel, digest mismatch,
     /// rejection, mismatched challenge ID, wrong digest count, or malformed reply.
-    Failed,
+    Failed(PossessionFailureReason),
     /// No response. Penalised immediately at audit-failure severity; the class
     /// is node-local observability only.
     NoResponse(AuditFailureClass),
@@ -77,6 +77,34 @@ enum ProbeOutcome {
     BootstrapClaim,
     /// The probe could not be sent locally. Graced: no penalty.
     Inconclusive,
+}
+
+/// Exact reason a responsive peer failed a possession proof check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PossessionFailureReason {
+    ResponseDecode,
+    UnexpectedResponseType,
+    DigestChallengeIdMismatch,
+    DigestCountMismatch,
+    AbsentKey,
+    DigestMismatch,
+    BootstrapChallengeIdMismatch,
+    Rejected,
+}
+
+impl PossessionFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseDecode => "response_decode",
+            Self::UnexpectedResponseType => "unexpected_response_type",
+            Self::DigestChallengeIdMismatch => "digest_challenge_id_mismatch",
+            Self::DigestCountMismatch => "digest_count_mismatch",
+            Self::AbsentKey => "absent_key",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::BootstrapChallengeIdMismatch => "bootstrap_challenge_id_mismatch",
+            Self::Rejected => "rejected",
+        }
+    }
 }
 
 /// Pick a randomised delay in `[min, max]` to wait before a possession check
@@ -155,9 +183,9 @@ pub(crate) async fn run_possession_check(
                 debug!("Possession check: {peer} proved possession of {key_hex}");
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
             }
-            ProbeOutcome::Failed => {
+            ProbeOutcome::Failed(reason) => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                report_possession_confirmed_failure(&peer, &key_hex, p2p_node).await;
+                report_possession_confirmed_failure(&peer, &key_hex, reason, p2p_node).await;
             }
             ProbeOutcome::NoResponse(class) => {
                 audit_metrics::record_audit_no_response(AuditType::Possession, class);
@@ -186,15 +214,18 @@ async fn clear_possession_bootstrap_claim(
 async fn report_possession_confirmed_failure(
     peer: &PeerId,
     key_hex: &str,
+    failure_reason: PossessionFailureReason,
     p2p_node: &Arc<P2PNode>,
 ) {
     warn!(
         audit_type = AuditType::Possession.as_str(),
         audit_failure_class = "confirmed",
+        possession_failure_reason = failure_reason.as_str(),
         peer = %peer,
         key = %key_hex,
         trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
-        "Possession check: {peer} failed to prove possession for {key_hex}; penalising at audit severity"
+        "Possession check: {peer} failed to prove possession for {key_hex} ({}); penalising at audit severity",
+        failure_reason.as_str()
     );
     p2p_node
         .report_trust_event(
@@ -385,13 +416,13 @@ async fn probe_once(
         Ok(decoded) => decoded,
         Err(e) => {
             debug!("Failed to decode possession response from {peer}: {e}");
-            return ProbeOutcome::Failed;
+            return ProbeOutcome::Failed(PossessionFailureReason::ResponseDecode);
         }
     };
 
     let ReplicationMessageBody::AuditResponse(resp) = decoded.body else {
         debug!("Unexpected possession response type from {peer}");
-        return ProbeOutcome::Failed;
+        return ProbeOutcome::Failed(PossessionFailureReason::UnexpectedResponseType);
     };
 
     interpret_audit_response(
@@ -419,12 +450,15 @@ fn interpret_audit_response(
             challenge_id: resp_id,
             digests,
         } => {
-            if resp_id != challenge_id || digests.len() != 1 {
-                return ProbeOutcome::Failed;
+            if resp_id != challenge_id {
+                return ProbeOutcome::Failed(PossessionFailureReason::DigestChallengeIdMismatch);
+            }
+            if digests.len() != 1 {
+                return ProbeOutcome::Failed(PossessionFailureReason::DigestCountMismatch);
             }
             let received = digests[0];
             if received == ABSENT_KEY_DIGEST {
-                return ProbeOutcome::Failed;
+                return ProbeOutcome::Failed(PossessionFailureReason::AbsentKey);
             }
             let expected = compute_audit_digest(nonce, challenged_peer_id, key, local_bytes);
             if received == expected {
@@ -433,7 +467,7 @@ fn interpret_audit_response(
                 // A non-sentinel digest that does not match our canonical bytes
                 // proves the peer cannot reproduce the content — treat as absent
                 // (matches the audit's DigestMismatch handling).
-                ProbeOutcome::Failed
+                ProbeOutcome::Failed(PossessionFailureReason::DigestMismatch)
             }
         }
         AuditResponse::Bootstrapping {
@@ -442,10 +476,10 @@ fn interpret_audit_response(
             if resp_id == challenge_id {
                 ProbeOutcome::BootstrapClaim
             } else {
-                ProbeOutcome::Failed
+                ProbeOutcome::Failed(PossessionFailureReason::BootstrapChallengeIdMismatch)
             }
         }
-        AuditResponse::Rejected { .. } => ProbeOutcome::Failed,
+        AuditResponse::Rejected { .. } => ProbeOutcome::Failed(PossessionFailureReason::Rejected),
     }
 }
 
@@ -464,6 +498,36 @@ mod tests {
         AuditResponse::Digests {
             challenge_id,
             digests,
+        }
+    }
+
+    #[test]
+    fn possession_failure_reasons_have_stable_log_labels() {
+        let cases = [
+            (PossessionFailureReason::ResponseDecode, "response_decode"),
+            (
+                PossessionFailureReason::UnexpectedResponseType,
+                "unexpected_response_type",
+            ),
+            (
+                PossessionFailureReason::DigestChallengeIdMismatch,
+                "digest_challenge_id_mismatch",
+            ),
+            (
+                PossessionFailureReason::DigestCountMismatch,
+                "digest_count_mismatch",
+            ),
+            (PossessionFailureReason::AbsentKey, "absent_key"),
+            (PossessionFailureReason::DigestMismatch, "digest_mismatch"),
+            (
+                PossessionFailureReason::BootstrapChallengeIdMismatch,
+                "bootstrap_challenge_id_mismatch",
+            ),
+            (PossessionFailureReason::Rejected, "rejected"),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
         }
     }
 
@@ -500,7 +564,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![ABSENT_KEY_DIGEST]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::AbsentKey)
+        );
     }
 
     #[test]
@@ -518,7 +585,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![forged]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestMismatch)
+        );
     }
 
     #[test]
@@ -532,7 +602,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID.wrapping_add(1), vec![valid]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestChallengeIdMismatch)
+        );
     }
 
     #[test]
@@ -546,7 +619,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![valid, ABSENT_KEY_DIGEST]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestCountMismatch)
+        );
     }
 
     #[test]
@@ -576,7 +652,10 @@ mod tests {
                 challenge_id: CHALLENGE_ID.wrapping_add(1),
             },
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::BootstrapChallengeIdMismatch)
+        );
     }
 
     #[tokio::test]
@@ -610,6 +689,9 @@ mod tests {
                 reason: "nope".to_string(),
             },
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::Rejected)
+        );
     }
 }
