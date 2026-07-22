@@ -251,6 +251,17 @@ pub async fn audit_tick_with_repair_proofs(
     };
     let encoded_len = encoded.len();
     let audit_timeout = responsible_audit_response_timeout(config, peer_keys.len());
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = AuditType::ResponsibleChunk.as_str(),
+        audit_round = "digest",
+        challenged_peer = %challenged_peer,
+        challenge_id,
+        work_items = peer_keys.len(),
+        timeout_ms = audit_timeout.as_millis(),
+        "Outbound audit request started"
+    );
     let audit_started = Instant::now();
     let response = match p2p_node
         .send_request(
@@ -261,7 +272,21 @@ pub async fn audit_tick_with_repair_proofs(
         )
         .await
     {
-        Ok(resp) => resp,
+        Ok(resp) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::ResponsibleChunk.as_str(),
+                audit_round = "digest",
+                challenged_peer = %challenged_peer,
+                challenge_id,
+                work_items = peer_keys.len(),
+                elapsed_ms = audit_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            resp
+        }
         Err(e) => {
             let send_error = e.to_string();
             let (send_error_class, audit_failure_class) = classify_audit_send_error(&send_error);
@@ -273,6 +298,11 @@ pub async fn audit_tick_with_repair_proofs(
                 let elapsed = audit_started.elapsed();
                 let first_key = first_challenged_key_label(&peer_keys);
                 warn!(
+                    target: "ant_node::replication::audit_requester",
+                    event = "completed",
+                    audit_origin = AuditType::ResponsibleChunk.as_str(),
+                    audit_round = "digest",
+                    outcome = "no_response",
                     audit_type = AuditType::ResponsibleChunk.as_str(),
                     audit_phase = "challenge_send",
                     audit_outcome = "send_request_failed",

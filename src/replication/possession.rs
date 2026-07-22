@@ -30,7 +30,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
@@ -288,6 +288,7 @@ async fn handle_possession_bootstrap_claim(
 /// matching bootstrap response is a `BootstrapClaim`; a local encode failure is
 /// `Inconclusive`; peer-side malformed, rejected, or mismatched replies are
 /// `Failed`.
+#[allow(clippy::too_many_lines)]
 async fn probe_once(
     key: &XorName,
     local_bytes: &[u8],
@@ -326,16 +327,51 @@ async fn probe_once(
         warn!("Failed to acquire possession audit coordinator slot for {peer}");
         return ProbeOutcome::Inconclusive;
     };
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = AuditType::Possession.as_str(),
+        audit_round = "digest",
+        challenged_peer = %peer,
+        challenge_id,
+        work_items = 1,
+        timeout_ms = probe_timeout.as_millis(),
+        "Outbound audit request started"
+    );
+    let request_started = Instant::now();
     let response = match p2p_node
         .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
         .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Possession.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = 1,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            response
+        }
         Err(e) => {
             let error = e.to_string();
             let (send_error_class, audit_failure_class) =
                 audit_metrics::classify_audit_send_error(&error);
-            debug!(
+            warn!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Possession.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = 1,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "no_response",
                 audit_type = AuditType::Possession.as_str(),
                 audit_failure_class = audit_failure_class.as_str(),
                 send_error_class,

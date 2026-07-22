@@ -1,7 +1,11 @@
 //! Lightweight node-local counters and labels for audit observability.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
+
+use saorsa_core::identity::PeerId;
 
 use super::protocol::{self, ReplicationMessageBody};
 
@@ -34,6 +38,283 @@ pub enum AuditResponderClass {
     Subtree,
     /// Subtree byte-serving challenge.
     Byte,
+    /// Commitment-pin lookup sharing the audit responder capacity pool.
+    CommitmentPin,
+}
+
+impl AuditResponderClass {
+    const COUNT: usize = 4;
+
+    #[cfg(any(feature = "logging", test))]
+    const fn index(self) -> usize {
+        match self {
+            Self::Digest => 0,
+            Self::Subtree => 1,
+            Self::Byte => 2,
+            Self::CommitmentPin => 3,
+        }
+    }
+}
+
+/// Capacity ceiling responsible for dropping an inbound audit-pool request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditResponderDropReason {
+    /// The node-wide responder pool was full.
+    GlobalPoolFull,
+    /// This source peer was already at its class-specific share.
+    PerPeerCapFull,
+}
+
+/// One origin's activity during an audit-responder summary window.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditOriginSnapshot {
+    /// Source peer.
+    pub source: Option<PeerId>,
+    /// Received requests, indexed by [`AuditResponderClass`].
+    pub received_by_class: [u64; AuditResponderClass::COUNT],
+    /// Successfully admitted requests.
+    pub admitted: u64,
+    /// Requests dropped because the global pool was full.
+    pub global_pool_drops: u64,
+    /// Requests dropped because the source hit its per-peer cap.
+    pub per_peer_cap_drops: u64,
+    /// Requests dropped before dispatch because the serial replication queue
+    /// was full or closed.
+    pub serial_queue_drops: u64,
+    /// Responses whose processing and send attempt completed.
+    pub completed: u64,
+    /// Completed response send attempts that failed.
+    pub send_failures: u64,
+    /// Sum of handler-only processing durations.
+    pub processing_total_ms: u64,
+    /// Slowest handler-only processing duration.
+    pub processing_max_ms: u64,
+    /// Sum of end-to-end durations from network receipt through send attempt.
+    pub total_total_ms: u64,
+    /// Slowest end-to-end duration.
+    pub total_max_ms: u64,
+    /// Highest node-wide in-flight value observed at this source's admission.
+    pub peak_global_inflight: usize,
+    /// Highest per-source in-flight value observed at admission.
+    pub peak_peer_inflight: u32,
+}
+
+impl AuditOriginSnapshot {
+    /// Total received requests across all audit-pool classes.
+    #[must_use]
+    #[cfg(any(feature = "logging", test))]
+    pub fn received(&self) -> u64 {
+        self.received_by_class.iter().sum()
+    }
+
+    /// Mean handler-only processing duration for completed requests.
+    #[must_use]
+    #[cfg(any(feature = "logging", test))]
+    pub fn processing_avg_ms(&self) -> u64 {
+        self.processing_total_ms
+            .checked_div(self.completed)
+            .unwrap_or(0)
+    }
+
+    /// Mean end-to-end duration for completed requests.
+    #[must_use]
+    #[cfg(any(feature = "logging", test))]
+    pub fn total_avg_ms(&self) -> u64 {
+        self.total_total_ms.checked_div(self.completed).unwrap_or(0)
+    }
+
+    #[cfg(any(feature = "logging", test))]
+    fn merge(&mut self, other: &Self) {
+        for (total, value) in self
+            .received_by_class
+            .iter_mut()
+            .zip(other.received_by_class)
+        {
+            *total = total.saturating_add(value);
+        }
+        self.admitted = self.admitted.saturating_add(other.admitted);
+        self.global_pool_drops = self
+            .global_pool_drops
+            .saturating_add(other.global_pool_drops);
+        self.per_peer_cap_drops = self
+            .per_peer_cap_drops
+            .saturating_add(other.per_peer_cap_drops);
+        self.serial_queue_drops = self
+            .serial_queue_drops
+            .saturating_add(other.serial_queue_drops);
+        self.completed = self.completed.saturating_add(other.completed);
+        self.send_failures = self.send_failures.saturating_add(other.send_failures);
+        self.processing_total_ms = self
+            .processing_total_ms
+            .saturating_add(other.processing_total_ms);
+        self.processing_max_ms = self.processing_max_ms.max(other.processing_max_ms);
+        self.total_total_ms = self.total_total_ms.saturating_add(other.total_total_ms);
+        self.total_max_ms = self.total_max_ms.max(other.total_max_ms);
+        self.peak_global_inflight = self.peak_global_inflight.max(other.peak_global_inflight);
+        self.peak_peer_inflight = self.peak_peer_inflight.max(other.peak_peer_inflight);
+    }
+}
+
+/// A completed audit-responder summary window.
+#[cfg(any(feature = "logging", test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AuditResponderSnapshot {
+    /// Totals across all sources seen during the window.
+    pub total: AuditOriginSnapshot,
+    /// Sources ordered by descending request count.
+    pub origins: Vec<AuditOriginSnapshot>,
+}
+
+#[derive(Debug, Default)]
+#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+struct AuditResponderWindow {
+    by_source: HashMap<PeerId, AuditOriginSnapshot>,
+}
+
+/// Windowed responder metrics used to identify dominant remote origins and
+/// distinguish capacity pressure from slow disk/proof work.
+#[derive(Debug, Default)]
+pub struct AuditResponderMetrics {
+    #[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+    window: Mutex<AuditResponderWindow>,
+}
+
+impl AuditResponderMetrics {
+    /// Record a request as soon as it reaches the replication handler.
+    #[cfg(any(feature = "logging", test))]
+    pub fn record_received(&self, source: PeerId, class: AuditResponderClass) {
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stats = window.by_source.entry(source).or_default();
+        stats.source = Some(source);
+        stats.received_by_class[class.index()] =
+            stats.received_by_class[class.index()].saturating_add(1);
+    }
+
+    /// No-op when responder logging is compiled out.
+    #[cfg(not(any(feature = "logging", test)))]
+    pub fn record_received(&self, _source: PeerId, _class: AuditResponderClass) {}
+
+    /// Record a successful capacity admission and its decision-time occupancy.
+    #[cfg(any(feature = "logging", test))]
+    pub fn record_admitted(&self, source: PeerId, global_inflight: usize, peer_inflight: u32) {
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stats = window.by_source.entry(source).or_default();
+        stats.source = Some(source);
+        stats.admitted = stats.admitted.saturating_add(1);
+        stats.peak_global_inflight = stats.peak_global_inflight.max(global_inflight);
+        stats.peak_peer_inflight = stats.peak_peer_inflight.max(peer_inflight);
+    }
+
+    /// No-op when responder logging is compiled out.
+    #[cfg(not(any(feature = "logging", test)))]
+    pub fn record_admitted(&self, _source: PeerId, _global_inflight: usize, _peer_inflight: u32) {}
+
+    /// Record a rejected capacity admission.
+    #[cfg(any(feature = "logging", test))]
+    pub fn record_drop(&self, source: PeerId, reason: AuditResponderDropReason) {
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stats = window.by_source.entry(source).or_default();
+        stats.source = Some(source);
+        match reason {
+            AuditResponderDropReason::GlobalPoolFull => {
+                stats.global_pool_drops = stats.global_pool_drops.saturating_add(1);
+            }
+            AuditResponderDropReason::PerPeerCapFull => {
+                stats.per_peer_cap_drops = stats.per_peer_cap_drops.saturating_add(1);
+            }
+        }
+    }
+
+    /// No-op when responder logging is compiled out.
+    #[cfg(not(any(feature = "logging", test)))]
+    pub fn record_drop(&self, _source: PeerId, _reason: AuditResponderDropReason) {}
+
+    /// Record a request lost before handler dispatch in the serial queue.
+    #[cfg(any(feature = "logging", test))]
+    pub fn record_serial_queue_drop(&self, source: PeerId) {
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stats = window.by_source.entry(source).or_default();
+        stats.source = Some(source);
+        stats.serial_queue_drops = stats.serial_queue_drops.saturating_add(1);
+    }
+
+    /// No-op when responder logging is compiled out.
+    #[cfg(not(any(feature = "logging", test)))]
+    pub fn record_serial_queue_drop(&self, _source: PeerId) {}
+
+    /// Record handler and end-to-end latency after the response send attempt.
+    #[cfg(any(feature = "logging", test))]
+    pub fn record_completed(
+        &self,
+        source: PeerId,
+        processing: Duration,
+        total: Duration,
+        sent: bool,
+    ) {
+        let processing_ms = duration_ms(processing);
+        let total_ms = duration_ms(total);
+        let mut window = self
+            .window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stats = window.by_source.entry(source).or_default();
+        stats.source = Some(source);
+        stats.completed = stats.completed.saturating_add(1);
+        if !sent {
+            stats.send_failures = stats.send_failures.saturating_add(1);
+        }
+        stats.processing_total_ms = stats.processing_total_ms.saturating_add(processing_ms);
+        stats.processing_max_ms = stats.processing_max_ms.max(processing_ms);
+        stats.total_total_ms = stats.total_total_ms.saturating_add(total_ms);
+        stats.total_max_ms = stats.total_max_ms.max(total_ms);
+    }
+
+    /// No-op when responder logging is compiled out.
+    #[cfg(not(any(feature = "logging", test)))]
+    pub fn record_completed(
+        &self,
+        _source: PeerId,
+        _processing: Duration,
+        _total: Duration,
+        _sent: bool,
+    ) {
+    }
+
+    /// Close the current window and return totals plus origins ordered by load.
+    #[cfg(any(feature = "logging", test))]
+    pub fn take_snapshot(&self) -> AuditResponderSnapshot {
+        let by_source = {
+            let mut window = self
+                .window
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::mem::take(&mut window.by_source)
+        };
+        let mut origins: Vec<_> = by_source.into_values().collect();
+        origins.sort_unstable_by_key(|origin| std::cmp::Reverse(origin.received()));
+        let mut total = AuditOriginSnapshot::default();
+        for origin in &origins {
+            total.merge(origin);
+        }
+        AuditResponderSnapshot { total, origins }
+    }
+}
+
+#[cfg(any(feature = "logging", test))]
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Bulk replication responder class isolated from the serial lane.
@@ -58,6 +339,7 @@ static REPLICATION_EVENT_LAGGED: AtomicU64 = AtomicU64::new(0);
 static DIGEST_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static SUBTREE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static BYTE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+static COMMITMENT_PIN_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static FETCH_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static VERIFICATION_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -106,6 +388,7 @@ impl AuditResponderClass {
             Self::Digest => "digest",
             Self::Subtree => "subtree",
             Self::Byte => "byte",
+            Self::CommitmentPin => "commitment_pin",
         }
     }
 }
@@ -174,6 +457,9 @@ pub fn record_admission_drop(class: AuditResponderClass) {
         }
         AuditResponderClass::Byte => {
             BYTE_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+        AuditResponderClass::CommitmentPin => {
+            COMMITMENT_PIN_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -314,5 +600,34 @@ mod tests {
             responder_admission_drops_total(ReplicationResponderClass::Verification),
             verification_before
         );
+    }
+
+    #[test]
+    fn responder_snapshot_orders_origins_and_keeps_stage_timings() {
+        let metrics = AuditResponderMetrics::default();
+        let busy = PeerId::from_bytes([1; 32]);
+        let quiet = PeerId::from_bytes([2; 32]);
+
+        for _ in 0..3 {
+            metrics.record_received(busy, AuditResponderClass::Digest);
+        }
+        metrics.record_admitted(busy, 31, 3);
+        metrics.record_completed(
+            busy,
+            Duration::from_millis(40),
+            Duration::from_millis(55),
+            true,
+        );
+        metrics.record_received(quiet, AuditResponderClass::Subtree);
+        metrics.record_drop(quiet, AuditResponderDropReason::GlobalPoolFull);
+
+        let snapshot = metrics.take_snapshot();
+        assert_eq!(snapshot.total.received(), 4);
+        assert_eq!(snapshot.origins[0].source, Some(busy));
+        assert_eq!(snapshot.origins[0].processing_avg_ms(), 40);
+        assert_eq!(snapshot.origins[0].total_avg_ms(), 55);
+        assert_eq!(snapshot.origins[0].peak_global_inflight, 31);
+        assert_eq!(snapshot.total.global_pool_drops, 1);
+        assert!(metrics.take_snapshot().origins.is_empty());
     }
 }
