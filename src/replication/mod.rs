@@ -741,6 +741,15 @@ impl FirstAuditScheduler {
     /// during jitter) or requeued (a concurrent gossip audit won the cooldown).
     /// On both `None` paths the token is refunded, the in-flight slot released,
     /// and NO suppression is recorded.
+    ///
+    /// Known operational residual: suppression is stamped here, at promotion,
+    /// while the wire challenge is sent by the detached task the caller spawns
+    /// with the returned event. A task-start or encoding failure between the
+    /// two therefore leaves a stamped-but-unsent window. No remote input can
+    /// force that failure (it requires local task-spawn/alloc failure), so it
+    /// is accepted rather than closed; closing it would require stamping from
+    /// inside the spawned task and re-introduce the cancel-leaves-suppression
+    /// race this design exists to prevent.
     fn resolve(
         &mut self,
         reservation: FirstAuditReservation,
@@ -987,6 +996,11 @@ pub struct ReplicationEngine {
     /// commitment changes cannot spawn back-to-back audits of the same peer.
     /// Bounded by routing-table membership and cleaned on `PeerRemoved`.
     audit_on_gossip_cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Gossip-private lottery attempt window (one roll per peer per window,
+    /// win or lose). Kept separate from `audit_on_gossip_cooldown` so a losing
+    /// ticket never stamps the shared map and thus never defers a monetized
+    /// first audit. Bounded like its sibling and cleaned on `PeerRemoved`.
+    gossip_lottery_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Completed local neighbor-sync cycle epoch for proof maturity.
     sync_cycle_epoch: Arc<RwLock<u64>>,
     /// Per-key repair proof tracking for audit eligibility.
@@ -1141,6 +1155,7 @@ impl ReplicationEngine {
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             audit_on_gossip_cooldown: Arc::new(RwLock::new(HashMap::new())),
+            gossip_lottery_attempts: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
@@ -1548,6 +1563,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&self.sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
         let shutdown = self.shutdown.clone();
         let observability = Arc::new(FirstAuditObservability::default());
@@ -1789,6 +1805,7 @@ impl ReplicationEngine {
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_on_gossip_cooldown = Arc::clone(&self.audit_on_gossip_cooldown);
+        let gossip_lottery_attempts = Arc::clone(&self.gossip_lottery_attempts);
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
@@ -1801,6 +1818,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&gossip_lottery_attempts),
         };
 
         let handle = tokio::spawn(async move {
@@ -1921,8 +1939,10 @@ impl ReplicationEngine {
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
-                                // Same for the gossip-audit cooldown (ADR-0002).
+                                // Same for the gossip-audit cooldown (ADR-0002)
+                                // and the lottery-attempt window.
                                 audit_on_gossip_cooldown.write().await.remove(&peer_id);
+                                gossip_lottery_attempts.write().await.remove(&peer_id);
                                 // The sticky `commitment_capable` flag is
                                 // preserved orthogonally via
                                 // `ever_capable_peers` — even after this
@@ -1968,6 +1988,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
 
         let handle = tokio::spawn(async move {
@@ -5352,7 +5373,15 @@ struct GossipAuditTrigger {
     config: Arc<ReplicationConfig>,
     recent_provers: Arc<RwLock<RecentProvers>>,
     sync_state: Arc<RwLock<NeighborSyncState>>,
+    /// Shared "an audit actually launched" cooldown, consulted by BOTH the
+    /// gossip-lottery path and the monetized first-audit scheduler. Stamped
+    /// only when a real audit is about to be sent — never by a losing lottery
+    /// ticket — so gossip traffic alone can never suppress a paid first audit.
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Gossip-private lottery attempt window: stamped on every roll (win or
+    /// lose) so a gossip flood cannot re-roll the lottery within the window.
+    /// The first-audit scheduler never reads this map.
+    lottery_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
 }
 
 /// What a gossip ingest yields for the audit trigger: the commitment hash to
@@ -5433,27 +5462,39 @@ fn cooldown_would_allow(map: &HashMap<PeerId, Instant>, peer: &PeerId, now: Inst
 /// The gossip-audit launch decision in ONE place so the ordering is shared
 /// between production and its test (ADR-0002 "occasional surprise exams").
 ///
-/// Order matters and is the security-relevant property: the per-peer cooldown is
-/// checked-and-stamped FIRST, THEN the probability lottery (`lottery_wins`) is
-/// applied. If the lottery were sampled first, a gossip flood would re-roll it on
-/// every message until one won, multiplying audits. Because the cooldown is
-/// stamped before the lottery is consulted, a LOSING ticket still consumes the
-/// window — so each peer gets at most one audit lottery per cooldown window
-/// regardless of how often it gossips. Production calls this with
-/// `lottery_wins = gen_bool(AUDIT_ON_GOSSIP_PROBABILITY)`; the test calls it with
-/// a deterministic `lottery_wins`, so a reorder regression here fails the test.
+/// Order matters and is the security-relevant property. Gate 1 checks-and-stamps
+/// the gossip-PRIVATE `attempts` window, win or lose: if the lottery were
+/// sampled first, a gossip flood would re-roll it on every message until one
+/// won, multiplying audits, so each peer gets at most one lottery roll per
+/// window regardless of how often it gossips. Gate 3 checks-and-stamps the
+/// SHARED `launched` cooldown — the map the monetized first-audit scheduler
+/// also consults — only after a WIN, i.e. only when a real audit is about to be
+/// sent. A losing ticket must never stamp `launched`: no challenge went on the
+/// wire, so it must not defer a paid first audit (repeatable losses could
+/// otherwise hold a monetized pin past its answerability window). Production
+/// calls this with `lottery_wins = gen_bool(AUDIT_ON_GOSSIP_PROBABILITY)`; the
+/// test calls it with a deterministic `lottery_wins`, so a reorder regression
+/// here fails the test.
 fn audit_launch_decision(
-    map: &mut HashMap<PeerId, Instant>,
+    attempts: &mut HashMap<PeerId, Instant>,
+    launched: &mut HashMap<PeerId, Instant>,
     peer: &PeerId,
     now: Instant,
     lottery_wins: bool,
 ) -> bool {
-    // Gate 1: cooldown check-and-stamp (consumes the window even on a loss).
-    if !cooldown_allows_audit(map, peer, now) {
+    // Gate 1: lottery-attempt window check-and-stamp (consumes the attempt
+    // window even on a loss; private to the gossip path).
+    if !cooldown_allows_audit(attempts, peer, now) {
         return false;
     }
-    // Gate 2: the probability lottery.
-    lottery_wins
+    // Gate 2: the probability lottery. A loss stops here and stamps nothing
+    // shared.
+    if !lottery_wins {
+        return false;
+    }
+    // Gate 3: the shared actual-audit cooldown (a recent real audit from
+    // either path still suppresses this launch), stamped only on launch.
+    cooldown_allows_audit(launched, peer, now)
 }
 
 /// On a peer's *changed* gossiped commitment, maybe launch a subtree audit
@@ -5465,14 +5506,17 @@ async fn maybe_trigger_gossip_audit(
     peer: &PeerId,
     target: AuditTarget,
 ) {
-    // The launch decision (cooldown-then-lottery ordering) lives in the pure
-    // `audit_launch_decision` so the ordering is shared with its test. Sample
-    // the lottery here, then let the helper apply it AFTER the cooldown stamp.
+    // The launch decision (attempt-window, lottery, shared-cooldown ordering)
+    // lives in the pure `audit_launch_decision` so the ordering is shared with
+    // its test. Sample the lottery here, then let the helper apply the gates.
     let now = Instant::now();
     let lottery_wins = rand::thread_rng().gen_bool(config::AUDIT_ON_GOSSIP_PROBABILITY);
     {
-        let mut map = trigger.cooldown.write().await;
-        if !audit_launch_decision(&mut map, peer, now, lottery_wins) {
+        // Lock order: attempts before the shared cooldown; this is the only
+        // place both are held together.
+        let mut attempts = trigger.lottery_attempts.write().await;
+        let mut launched = trigger.cooldown.write().await;
+        if !audit_launch_decision(&mut attempts, &mut launched, peer, now, lottery_wins) {
             return;
         }
     }
@@ -7265,58 +7309,111 @@ mod tests {
     // would still pass them while breaking flood-resistance: a flood would then
     // re-roll the lottery on EVERY message until one won, multiplying audits.
     //
-    // We model the exact production gate order (cooldown-then-lottery) with a
-    // lottery driven by a fixed outcome instead of `gen_bool(..)`. The first
-    // message LOSES the lottery; the remaining flood messages all WIN. With the
-    // production order, the losing first ticket burns the window and every later
-    // winner in the same window is blocked, so there are 0 audits this window. If
-    // the gates were flipped, the second message's winning ticket would slip
-    // through. The window only reopens after the cooldown elapses.
+    // We model the exact production gate order (attempt-window, lottery,
+    // shared cooldown) with a lottery driven by a fixed outcome instead of
+    // `gen_bool(..)`. The first message LOSES the lottery; the remaining flood
+    // messages all WIN. With the production order, the losing first ticket
+    // burns the ATTEMPT window and every later winner in the same window is
+    // blocked, so there are 0 audits this window. If the gates were flipped,
+    // the second message's winning ticket would slip through. The window only
+    // reopens after it elapses.
     //
-    // FLIPS IF: the lottery is sampled before `cooldown_allows_audit` (a losing
-    // ticket no longer consumes the window), re-enabling a flood-amplified audit
-    // storm.
+    // FLIPS IF: the lottery is sampled before the attempt-window
+    // check-and-stamp (a losing ticket no longer consumes the window),
+    // re-enabling a flood-amplified audit storm.
     #[test]
-    fn losing_lottery_still_consumes_cooldown_window() {
-        // Faithful re-implementation of the two gates in
-        // `maybe_trigger_gossip_audit`, with the lottery outcome made
-        // deterministic instead of `rand::thread_rng().gen_bool(..)`.
+    fn losing_lottery_still_consumes_attempt_window() {
         // Calls the SHIPPED `audit_launch_decision` (the same function
-        // `maybe_trigger_gossip_audit` uses), so a reorder of the two gates in
+        // `maybe_trigger_gossip_audit` uses), so a reorder of the gates in
         // production fails this test — not a local reimplementation.
         let peer = strike_peer(3);
-        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let mut attempts: HashMap<PeerId, Instant> = HashMap::new();
+        let mut launched: HashMap<PeerId, Instant> = HashMap::new();
         let t0 = Instant::now();
 
-        // First flooded message at t0 LOSES the lottery, but the cooldown is
-        // stamped BEFORE the lottery is consulted, so the window is now consumed.
+        // First flooded message at t0 LOSES the lottery, but the attempt window
+        // is stamped BEFORE the lottery is consulted, so the window is consumed.
         assert!(
-            !audit_launch_decision(&mut map, &peer, t0, false),
+            !audit_launch_decision(&mut attempts, &mut launched, &peer, t0, false),
             "a losing ticket launches no audit"
         );
 
         // 99 more flooded messages at the same instant would all WIN the lottery,
-        // yet every one must be blocked by the cooldown the loser already stamped.
+        // yet every one must be blocked by the attempt window the loser stamped.
         // (If production sampled the lottery FIRST, these would each get a fresh
         // roll and audits would multiply — this assertion catches that reorder.)
         let mut audits = 0;
         for _ in 0..99 {
-            if audit_launch_decision(&mut map, &peer, t0, true) {
+            if audit_launch_decision(&mut attempts, &mut launched, &peer, t0, true) {
                 audits += 1;
             }
         }
         assert_eq!(
             audits, 0,
-            "a losing first ticket must consume the window so no later flooded \
-             message in the same window can audit"
+            "a losing first ticket must consume the attempt window so no later \
+             flooded message in the same window can audit"
         );
 
-        // The window only reopens after the cooldown elapses; the next winning
-        // ticket then launches exactly one audit.
+        // The window only reopens after it elapses; the next winning ticket
+        // then launches exactly one audit and stamps the SHARED cooldown.
         let after = t0 + Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1);
         assert!(
-            audit_launch_decision(&mut map, &peer, after, true),
-            "after the cooldown a winning ticket audits again"
+            audit_launch_decision(&mut attempts, &mut launched, &peer, after, true),
+            "after the window a winning ticket audits again"
+        );
+        assert!(
+            launched.contains_key(&peer),
+            "a real launch stamps the shared cooldown"
+        );
+    }
+
+    /// The reviewer-flagged suppression route: a LOSING gossip lottery must not
+    /// stamp the SHARED audit cooldown, otherwise repeated losses (one per
+    /// 30-minute window, no challenge ever sent) keep a paid monetized pin's
+    /// first audit deferred until its answerability window expires.
+    ///
+    /// FLIPS IF: `audit_launch_decision` stamps the shared `launched` map on a
+    /// loss (the pre-split behavior, where both paths shared one map).
+    #[test]
+    fn losing_lottery_does_not_suppress_monetized_first_audit() {
+        let peer = strike_peer(4);
+        let mut attempts: HashMap<PeerId, Instant> = HashMap::new();
+        let mut launched: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+
+        // A losing ticket consumes the gossip attempt window...
+        assert!(!audit_launch_decision(
+            &mut attempts,
+            &mut launched,
+            &peer,
+            t0,
+            false
+        ));
+        // ...but leaves the shared map untouched, so the first-audit reserve
+        // gate (read-only) and the authoritative promotion check-and-stamp both
+        // still allow the paid audit to launch immediately.
+        assert!(
+            cooldown_would_allow(&launched, &peer, t0),
+            "reserve gate must not see a losing ticket as audit coverage"
+        );
+        assert!(
+            cooldown_allows_audit(&mut launched, &peer, t0),
+            "promotion must not be deferred by a losing ticket"
+        );
+
+        // Conversely a WINNING ticket (real audit sent) does suppress the
+        // first audit for the window, which is the intended shared semantics.
+        let peer_won = strike_peer(5);
+        assert!(audit_launch_decision(
+            &mut attempts,
+            &mut launched,
+            &peer_won,
+            t0,
+            true
+        ));
+        assert!(
+            !cooldown_would_allow(&launched, &peer_won, t0),
+            "a real gossip audit still covers the peer for the window"
         );
     }
 
