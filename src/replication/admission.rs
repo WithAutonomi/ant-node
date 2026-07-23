@@ -276,48 +276,6 @@ mod tests {
     }
 
     #[test]
-    fn paid_hint_survives_duplicate_replica_rejection() {
-        // With churned local views, a sender may believe we are in the storage
-        // close group while our own view rejects the replica hint. If the same
-        // key also arrives as a paid hint, paid-list admission must still run.
-        let key = xor_name_from_byte(0xEE);
-        let replica_hints = vec![key];
-        let paid_hints = vec![key];
-
-        let mut seen_replica = HashSet::new();
-        let admitted_replica: HashSet<XorName> = HashSet::new();
-        let mut rejected_replica = Vec::new();
-
-        for &k in &replica_hints {
-            if seen_replica.insert(k) {
-                rejected_replica.push(k);
-            }
-        }
-
-        let mut admitted_paid = HashSet::new();
-        for &k in &paid_hints {
-            if admitted_replica.contains(&k) {
-                continue;
-            }
-            let in_paid_close_group = true;
-            if in_paid_close_group {
-                admitted_paid.insert(k);
-            }
-        }
-
-        assert!(
-            admitted_paid.contains(&key),
-            "paid hint must be considered after duplicate replica rejection"
-        );
-        assert!(
-            rejected_replica
-                .into_iter()
-                .all(|k| admitted_paid.contains(&k)),
-            "replica rejection should not remain terminal after paid admission"
-        );
-    }
-
-    #[test]
     fn admission_result_empty_inputs() {
         let result = AdmissionResult {
             replica_keys: Vec::new(),

@@ -1053,8 +1053,16 @@ mod tests {
 
     #[test]
     fn capacity_rejection_expiry_covers_full_configured_sync_cycle() {
-        let config = ReplicationConfig::default();
-        let batches = config.neighbor_sync_scope / config.neighbor_sync_peer_count;
+        let config = ReplicationConfig {
+            // Keep the scope deliberately indivisible by the batch size so the
+            // expectation verifies that the final partial batch is included.
+            neighbor_sync_scope: 21,
+            neighbor_sync_peer_count: 4,
+            ..ReplicationConfig::default()
+        };
+        let batches = config
+            .neighbor_sync_scope
+            .div_ceil(config.neighbor_sync_peer_count);
         let cycle_cadence = config.neighbor_sync_interval_max * u32::try_from(batches).unwrap();
         let request_budget = config.verification_request_timeout
             * u32::try_from(config.neighbor_sync_scope).unwrap();
