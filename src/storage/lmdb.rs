@@ -762,7 +762,7 @@ impl LmdbStorage {
     ///
     /// Hold the write half to deterministically park the next raw read
     /// (`get_raw`) inside its blocking closure while it still holds the shared
-    /// environment lock (e.g. to prove [`Self::try_resize`] waits for active
+    /// environment lock (e.g. to prove `try_resize` waits for active
     /// raw reads).
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]

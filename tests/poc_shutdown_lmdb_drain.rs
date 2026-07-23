@@ -29,7 +29,9 @@
     clippy::missing_panics_doc
 )]
 
-use ant_node::payment::{EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig};
+use ant_node::payment::{
+    EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig,
+};
 use ant_node::replication::paid_list::PaidList;
 use ant_node::storage::{LmdbStorage, LmdbStorageConfig};
 use ant_node::{ReplicationConfig, ReplicationEngine};
@@ -110,6 +112,7 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
         cache_capacity: TEST_PAYMENT_CACHE_CAPACITY,
         close_group_size: replication_config.close_group_size,
         local_rewards_address: RewardsAddress::new(TEST_REWARDS_ADDRESS),
+        price_floor: PriceFloorConfig::default(),
     }));
 
     let p2p = start_p2p_node(&identity).await;
