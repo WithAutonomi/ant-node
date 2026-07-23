@@ -18,18 +18,22 @@
 //! public), so a node that stores nothing could pass it by fetching the block on
 //! demand from an honest holder. To bind **possession at commitment time** the
 //! responder also commits, per leaf in round 1, a fresh **nonced block tree**:
-//! a Merkle root over the same 1 KiB blocks whose leaves are
-//! `BLAKE3(nonce ‖ peer ‖ key ‖ block_index ‖ block_len ‖ block_bytes)`.
+//! a Merkle root over the same 1 KiB blocks whose leaves are **keyed** BLAKE3
+//! hashes, `keyed_BLAKE3(key=f(nonce ‖ peer ‖ key), block_index ‖ len ‖ block)`.
 //!
-//! Because the fresh per-audit nonce enters **every** block leaf, there is no
-//! nonce-independent state a responder can precompute across audits (this closes
-//! the BLAKE3-chaining-value preprocessing gap the old flat `nonced_hash` left
-//! open, where only the first BLAKE3 chunk saw the nonce). Building the correct
-//! `nonced_root` therefore requires *all* of a chunk's bytes at round-1 commit
-//! time, and the auditor picks which block to open with fresh randomness *after*
-//! the roots are committed (cut-and-choose): a responder cannot connect a real,
-//! after-the-fact-fetched block to a garbage committed root without a preimage
-//! break, and cannot commit a correct root without holding the bytes.
+//! The nonce is fed as the BLAKE3 **key**, not a message prefix, so it mixes
+//! into every chunk compression of every block leaf: there is no
+//! nonce-independent chaining value a responder can precompute across audits.
+//! (A plain `BLAKE3(nonce ‖ … ‖ block)` prefix would leave the block's tail in a
+//! second, nonce-free BLAKE3 chunk whose CV is precomputable, letting a node
+//! store ~10.7% less than each block and still reconstruct the leaf for any
+//! fresh nonce — a smaller version of the old flat-`nonced_hash` gap.) Building
+//! the correct `nonced_root` therefore requires *all* of a chunk's bytes at
+//! round-1 commit time, and the auditor picks which block to open with fresh
+//! randomness *after* the roots are committed (cut-and-choose): a responder
+//! cannot connect a real, after-the-fact-fetched block to a garbage committed
+//! root without a preimage break, and cannot commit a correct root without
+//! holding the bytes.
 //!
 //! In round 2 the auditor verifies both chains over the **same** block bytes:
 //! the Bao chain against the address (authenticity) and the nonced chain against
@@ -52,6 +56,31 @@ const DOMAIN_BLOCK_LEAF: &[u8] = b"autonomi.ant.audit.slice.block-leaf.v1";
 
 /// Domain tag for a nonced block-tree internal node.
 const DOMAIN_BLOCK_NODE: &[u8] = b"autonomi.ant.audit.slice.block-node.v1";
+
+/// Domain tag for deriving the per-audit BLAKE3 key of the nonced block tree.
+const DOMAIN_BLOCK_KEY: &[u8] = b"autonomi.ant.audit.slice.block-key.v1";
+
+/// Per-audit keying material for the nonced block tree, derived from the fresh
+/// nonce, the challenged peer and the chunk key. Constant across a chunk's blocks.
+///
+/// The nonce is fed in as a BLAKE3 **key**, not a message prefix. This is what
+/// forces every BLAKE3 chunk of a block leaf to depend on the nonce: keyed
+/// BLAKE3 mixes the key into the initial state of every chunk compression, so
+/// there is no nonce-independent chaining value. Prefixing the nonce instead
+/// leaves the block's tail in a second, nonce-free BLAKE3 chunk whose chaining
+/// value is precomputable (leaf input is `domain ‖ nonce ‖ … ‖ block`, ~1166
+/// bytes, so the last ~142 block bytes fall in chunk 1 with no nonce), letting a
+/// node store ~10.7% less than each block and still reconstruct the leaf for any
+/// fresh nonce.
+#[must_use]
+fn nonced_block_key(nonce: &[u8; 32], peer: &[u8; 32], key: &XorName) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(DOMAIN_BLOCK_KEY);
+    h.update(nonce);
+    h.update(peer);
+    h.update(key);
+    *h.finalize().as_bytes()
+}
 
 /// Number of 1 KiB blocks covering `content_len` bytes.
 ///
@@ -90,11 +119,11 @@ fn block_bytes(content: &[u8], index: u32) -> &[u8] {
     content.get(start..end).unwrap_or(&[])
 }
 
-/// Nonced block-leaf hash: binds the fresh nonce, challenged peer, key, block
-/// index, block length and block bytes.
+/// Nonced block-leaf hash: keyed by the per-audit key (nonce/peer/key) so every
+/// BLAKE3 chunk of the leaf depends on the nonce, binding the block index, block
+/// length and block bytes with no nonce-independent state to precompute.
 ///
-/// The nonce enters here, at every block, which is the whole point: no part of
-/// the tree can be precomputed before the audit's nonce is known.
+/// See [`nonced_block_key`] for why the nonce is a key, not a prefix.
 #[must_use]
 fn nonced_block_leaf(
     nonce: &[u8; 32],
@@ -103,11 +132,9 @@ fn nonced_block_leaf(
     index: u32,
     block: &[u8],
 ) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
+    let audit_key = nonced_block_key(nonce, peer, key);
+    let mut h = blake3::Hasher::new_keyed(&audit_key);
     h.update(DOMAIN_BLOCK_LEAF);
-    h.update(nonce);
-    h.update(peer);
-    h.update(key);
     h.update(&index.to_le_bytes());
     let block_len = u32::try_from(block.len()).unwrap_or(u32::MAX);
     h.update(&block_len.to_le_bytes());
@@ -185,10 +212,20 @@ pub fn nonced_block_siblings(
     content: &[u8],
     index: u32,
 ) -> Option<Vec<[u8; 32]>> {
-    let mut level = nonced_leaves(nonce, peer, key, content);
-    if usize::try_from(index).ok()? >= level.len() {
+    siblings_from_leaves(&nonced_leaves(nonce, peer, key, content), index)
+}
+
+/// Sibling chain for `index` from prebuilt nonced leaves (no per-leaf rehash).
+///
+/// Folding 32-byte CVs is cheap; the cost is computing the leaves, so callers
+/// that open several blocks of one chunk build the leaves once and fold here per
+/// block. `None` if `index` is out of range.
+#[must_use]
+fn siblings_from_leaves(leaves: &[[u8; 32]], index: u32) -> Option<Vec<[u8; 32]>> {
+    if usize::try_from(index).ok()? >= leaves.len() {
         return None;
     }
+    let mut level = leaves.to_vec();
     let mut node_index = index as usize;
     let mut siblings = Vec::new();
     while level.len() > 1 {
@@ -246,14 +283,33 @@ pub fn verify_nonced_block(
 /// which cannot happen for a well-formed in-memory chunk; surfaced as a
 /// `Result` rather than a panic so the responder degrades to a rejection.
 pub fn extract_block_slice(content: &[u8], index: u32) -> std::io::Result<Vec<u8>> {
-    let (start, end) = block_range(content.len() as u64, index);
-    let len = end - start;
     // The outboard carries the BLAKE3 tree hashes separately from the content, so
     // the extractor reads the real chunk bytes plus just the parent hashes on the
     // block's path — no need to materialise a full Bao encoding of the chunk.
     let (outboard, _hash) = bao::encode::outboard(content);
+    extract_block_slice_with_outboard(content, &outboard, index)
+}
+
+/// Extract a Bao verified slice for block `index` reusing a prebuilt `outboard`.
+///
+/// Building the outboard hashes the whole chunk, so when several blocks of the
+/// same chunk are opened in one challenge (round + final, plus any dedup), the
+/// caller builds the outboard once (see [`ChunkOpener`]) and calls this per
+/// block instead of re-hashing. Borrows `content` directly (no copy).
+///
+/// # Errors
+///
+/// Surfaces an in-memory Bao extraction error as a `Result` rather than a panic;
+/// it cannot happen for a well-formed in-memory chunk and outboard.
+pub fn extract_block_slice_with_outboard(
+    content: &[u8],
+    outboard: &[u8],
+    index: u32,
+) -> std::io::Result<Vec<u8>> {
+    let (start, end) = block_range(content.len() as u64, index);
+    let len = end - start;
     let mut extractor = bao::encode::SliceExtractor::new_outboard(
-        Cursor::new(content.to_vec()),
+        Cursor::new(content),
         Cursor::new(outboard),
         start,
         len,
@@ -261,6 +317,53 @@ pub fn extract_block_slice(content: &[u8], index: u32) -> std::io::Result<Vec<u8
     let mut slice = Vec::new();
     extractor.read_to_end(&mut slice)?;
     Ok(slice)
+}
+
+/// Reusable per-chunk responder state for building round-2 openings.
+///
+/// Building the Bao outboard and the nonced block-tree leaves each hash the full
+/// chunk. When one challenge opens several blocks of the same chunk (the normal
+/// random + final pair, plus any duplicates), doing that work once and serving
+/// every opening from it keeps a multi-opening challenge to a single hashing pass
+/// over the bytes instead of one per opening (V2-685 round-2 amplification fix).
+pub struct ChunkOpener<'a> {
+    content: &'a [u8],
+    outboard: Vec<u8>,
+    leaves: Vec<[u8; 32]>,
+}
+
+impl<'a> ChunkOpener<'a> {
+    /// Hash the chunk once: build its Bao outboard and its nonced block-leaves.
+    #[must_use]
+    pub fn new(nonce: &[u8; 32], peer: &[u8; 32], key: &XorName, content: &'a [u8]) -> Self {
+        let (outboard, _hash) = bao::encode::outboard(content);
+        let leaves = nonced_leaves(nonce, peer, key, content);
+        Self {
+            content,
+            outboard,
+            leaves,
+        }
+    }
+
+    /// Number of 1 KiB blocks in the chunk (always ≥ 1).
+    #[must_use]
+    pub fn block_count(&self) -> u32 {
+        u32::try_from(self.leaves.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Bao verified slice for `index`, reusing the prebuilt outboard.
+    ///
+    /// # Errors
+    /// Surfaces an in-memory Bao extraction error as a `Result` rather than a panic.
+    pub fn bao_slice(&self, index: u32) -> std::io::Result<Vec<u8>> {
+        extract_block_slice_with_outboard(self.content, &self.outboard, index)
+    }
+
+    /// Nonced-tree sibling chain for `index`, reusing the prebuilt leaves.
+    #[must_use]
+    pub fn nonced_siblings(&self, index: u32) -> Option<Vec<[u8; 32]>> {
+        siblings_from_leaves(&self.leaves, index)
+    }
 }
 
 /// Size of the Bao slice's leading length header (a little-endian `u64` giving
@@ -573,6 +676,48 @@ mod tests {
         assert!(!verify_nonced_block(
             &NONCE, &PEER, &other, 2, block, &siblings, &root
         ));
+    }
+
+    // Finding 1 regression: the nonce must KEY every BLAKE3 chunk of a block
+    // leaf, not merely prefix the message. A prefixed leaf (`BLAKE3(nonce ‖ … ‖
+    // block)`, ~1166 bytes) leaves the block's tail in a second, nonce-free
+    // BLAKE3 chunk whose chaining value is precomputable, letting a node store
+    // ~10.7% less than each block and rebuild the leaf for any fresh nonce. Lock
+    // in the keyed construction and prove it differs from the vulnerable one.
+    #[test]
+    fn leaf_is_keyed_by_the_nonce_not_prefixed() {
+        let block = content_of(1024);
+        let index = 3u32;
+        let block_len = block.len() as u32;
+        let got = nonced_block_leaf(&NONCE, &PEER, &KEY, index, &block);
+
+        // Required construction: keyed BLAKE3, nonce in the key.
+        let audit_key = nonced_block_key(&NONCE, &PEER, &KEY);
+        let mut keyed = blake3::Hasher::new_keyed(&audit_key);
+        keyed.update(DOMAIN_BLOCK_LEAF);
+        keyed.update(&index.to_le_bytes());
+        keyed.update(&block_len.to_le_bytes());
+        keyed.update(&block);
+        assert_eq!(
+            got,
+            *keyed.finalize().as_bytes(),
+            "leaf must be keyed BLAKE3 with the nonce-derived key"
+        );
+
+        // The old, vulnerable prefixed construction must NOT match.
+        let mut prefixed = blake3::Hasher::new();
+        prefixed.update(DOMAIN_BLOCK_LEAF);
+        prefixed.update(&NONCE);
+        prefixed.update(&PEER);
+        prefixed.update(&KEY);
+        prefixed.update(&index.to_le_bytes());
+        prefixed.update(&block_len.to_le_bytes());
+        prefixed.update(&block);
+        assert_ne!(
+            got,
+            *prefixed.finalize().as_bytes(),
+            "leaf must not use the precomputable prefixed-nonce construction"
+        );
     }
 
     #[test]

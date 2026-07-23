@@ -209,6 +209,26 @@ impl ReplicationMessageBody {
             Self::GetCommitmentByPinResponse(_) => 16,
         }
     }
+
+    /// Whether this body is a subtree storage-commitment audit message (both
+    /// rounds). These ride [`SUBTREE_AUDIT_PROTOCOL_ID`], not the core
+    /// [`REPLICATION_PROTOCOL_ID`]; the receive dispatch uses this to enforce
+    /// that audit bodies only arrive on the audit id and core bodies only on the
+    /// core id, so a mixed-version peer's message can never be honoured on the
+    /// wrong handler even if postcard misdecodes it into a valid-looking value.
+    ///
+    /// [`SUBTREE_AUDIT_PROTOCOL_ID`]: crate::replication::config::SUBTREE_AUDIT_PROTOCOL_ID
+    /// [`REPLICATION_PROTOCOL_ID`]: crate::replication::config::REPLICATION_PROTOCOL_ID
+    #[must_use]
+    pub fn is_subtree_audit(&self) -> bool {
+        matches!(
+            self,
+            Self::SubtreeAuditChallenge(_)
+                | Self::SubtreeAuditResponse(_)
+                | Self::SubtreeSliceChallenge(_)
+                | Self::SubtreeSliceResponse(_)
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,6 +1215,59 @@ mod tests {
         // Comfortably under 1 MiB, itself a fraction of the 10 MiB wire cap.
         assert!(encoded.len() <= 1024 * 1024);
         assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
+    }
+
+    // `is_subtree_audit()` classifies exactly the four subtree-audit variants
+    // (both rounds), and NOTHING else — crucially not the periodic possession
+    // `AuditResponse`, which stays on the core id. The receive guard and the
+    // response-routing both key off this one predicate, so it must be exact.
+    #[test]
+    fn is_subtree_audit_covers_both_rounds_only() {
+        let z = [0u8; 32];
+        let audit = [
+            ReplicationMessageBody::SubtreeAuditChallenge(SubtreeAuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+            }),
+            ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+                openings: vec![],
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+        ];
+        for body in &audit {
+            assert!(
+                body.is_subtree_audit(),
+                "variant {} must be subtree-audit",
+                body.variant_index()
+            );
+        }
+        let core = [
+            ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                key: z,
+                data: vec![],
+                proof_of_payment: vec![],
+            }),
+            // Periodic possession audit — NOT the subtree audit; stays on core id.
+            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 }),
+        ];
+        for body in &core {
+            assert!(
+                !body.is_subtree_audit(),
+                "variant {} must be core, not subtree-audit",
+                body.variant_index()
+            );
+        }
     }
 
     // === Fresh Replication roundtrip ===

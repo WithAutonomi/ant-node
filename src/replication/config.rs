@@ -242,24 +242,44 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
-/// Protocol identifier for replication operations.
+/// Protocol identifier for core replication operations (fresh replication,
+/// neighbour sync, verification, fetch, repair, periodic possession/prune
+/// audits, commitment fetch).
 ///
-/// Bumped to `v3` for the V2-685 slice audit: round 1's `SubtreeLeaf` now
-/// carries a `content_len` + nonced block-tree `nonced_root` instead of a flat
-/// `nonced_hash`, and round 2 replaces `SubtreeByteChallenge`/`Response` (which
-/// returned full chunk bytes) with `SubtreeSliceChallenge`/`Response` (which
-/// return a few-KB Bao verified slice per opened block). Because `ChunkMessage`
-/// and the replication envelope are postcard-encoded (non-self-describing), a
-/// v2 node and a v3 node cannot interpret each other's audit messages — the leaf
-/// layout and the round-2 semantics differ. As with the v1→v2 cutover, we route
-/// the changed protocol on a distinct id: a node only delivers messages whose
-/// topic matches its own id (see the topic check in `mod.rs`), so v2 and v3
-/// nodes simply do not exchange replication traffic during a mixed-version
-/// window. With ~24 h auto-upgrade propagation that window is short, and the
-/// behaviour is rollout-safe: no half-interpreted exchange, no spurious
-/// eviction. Replication between matched-version peers is unaffected. (DHT
-/// routing/lookups are a separate protocol and continue to span both versions.)
-pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v3";
+/// Kept at `v2`: none of these messages changed on the wire in the V2-685 slice
+/// audit, so v2 and v3 nodes interoperate on all of them. Only the *subtree*
+/// audit changed its wire format, and it rides a separate id
+/// ([`SUBTREE_AUDIT_PROTOCOL_ID`]) so a version bump there cannot partition core
+/// replication. A node filters inbound messages by exact topic match (see the
+/// dispatch in `mod.rs`).
+pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
+
+/// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
+/// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
+/// `SubtreeSliceChallenge`/`Response` (round 2).
+///
+/// These are the only replication messages whose wire format changed for the
+/// slice audit (round 1's `SubtreeLeaf` now carries `content_len` + `nonced_root`
+/// instead of a flat `nonced_hash`; round 2 replaced full-byte responses with Bao
+/// verified slices). Routing them on their own id — instead of bumping the whole
+/// [`REPLICATION_PROTOCOL_ID`] — means a mixed-version fleet keeps doing fresh
+/// replication, neighbour sync, fetch and repair across versions; only
+/// cross-version subtree *audits* pause during the ~24 h auto-upgrade window.
+///
+/// Rollout effect is bounded, not zero: `saorsa-core`'s `send_request` records a
+/// unit trust failure on any unanswered request (before ant-node's graced-timeout
+/// policy), so a v3 auditor's subtree challenge to a still-v2 peer (and the
+/// reverse, where a v2 subtree audit is dropped by the id/body guard) each ding
+/// that peer's EMA trust once per 30-minute audit cooldown. Trust decays back to
+/// neutral (a worst-case dip recovers above the 0.35 routing-swap threshold in
+/// ~1 online day, and a successful audit after upgrade adds a unit success), and
+/// crossing 0.35 only makes a peer replaceable in a full bucket — it does not
+/// delete data or ban the peer. This is strictly milder than bumping the shared
+/// id, which would fail every cross-version request path (sync/quorum/prune/
+/// possession/repair/commitment-fetch) with no per-peer limiter. A truly
+/// zero-penalty rollout needs an upstream `send_request` that does not
+/// auto-report trust; tracked as a saorsa-core follow-up.
+pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v1";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
@@ -942,13 +962,18 @@ mod tests {
     }
 
     #[test]
-    fn replication_protocol_id_is_v3() {
-        // The V2-685 slice audit changes round-1 leaf layout and round-2
-        // semantics. The protocol id MUST advance to v3 so v2 and v3 nodes never
-        // exchange replication traffic they can only half-interpret (rollout
-        // safety — see the const's doc). If this regresses, mixed-version nodes
-        // would talk past each other and risk spurious penalties.
-        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v3");
+    fn core_replication_id_stays_v2_audit_rides_own_id() {
+        // The V2-685 slice audit changes ONLY the subtree-audit wire format, so
+        // core replication stays on v2 (mixed-version fleets keep replicating),
+        // and the changed subtree audit rides its own id that can be bumped
+        // independently. Two distinct ids so a v2 subtree audit never lands on the
+        // core-id handler (and vice versa) — see the id/body guard in `mod.rs`.
+        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
+        assert_eq!(
+            SUBTREE_AUDIT_PROTOCOL_ID,
+            "autonomi.ant.replication.subtree-audit.v1"
+        );
+        assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
     }
 
     #[test]

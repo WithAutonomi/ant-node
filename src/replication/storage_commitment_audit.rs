@@ -9,6 +9,7 @@
 //! [`handle_subtree_challenge`]; the pure proof maths live in
 //! [`crate::replication::subtree`].
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,7 +19,9 @@ use rand::Rng;
 use crate::ant_protocol::XorName;
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::ResponderCommitmentState;
-use crate::replication::config::{ReplicationConfig, MAX_SLICE_OPENINGS, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{
+    ReplicationConfig, MAX_SLICE_OPENINGS, SUBTREE_AUDIT_PROTOCOL_ID,
+};
 use crate::replication::protocol::{
     RejectKind, ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge,
     SubtreeAuditResponse, SubtreeSliceChallenge, SubtreeSliceItem, SubtreeSliceOpening,
@@ -204,7 +207,7 @@ pub async fn run_subtree_audit(
     let timeout = config.audit_response_timeout(subtree_leaves);
 
     let response = match p2p_node
-        .send_request(challenged_peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .send_request(challenged_peer, SUBTREE_AUDIT_PROTOCOL_ID, encoded, timeout)
         .await
     {
         Ok(resp) => resp,
@@ -254,6 +257,12 @@ enum SliceRound {
     /// No response within the slice deadline, or a transport error (graced
     /// timeout). Keeps holder credit.
     Timeout,
+    /// The responder claimed `Bootstrapping` in round 2 after answering a valid
+    /// round-1 proof. A node that just produced a signed subtree proof is
+    /// provably not bootstrapping, so this responsive contradiction is a
+    /// confirmed failure (not a graced timeout): it revokes the pinned
+    /// commitment's holder credit and takes the trust penalty.
+    ResponsiveBootstrap,
     /// Malformed / unexpected round-2 response body.
     Malformed,
 }
@@ -292,7 +301,7 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
         .p2p_node
         .send_request(
             ctx.challenged_peer,
-            REPLICATION_PROTOCOL_ID,
+            SUBTREE_AUDIT_PROTOCOL_ID,
             encoded,
             timeout,
         )
@@ -348,13 +357,14 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
                 }
             }
         }
-        // A node claiming bootstrap MID-AUDIT (it answered round 1) is treated
-        // as a timeout: it didn't prove possession but the round-1 proof shows
-        // it isn't bootstrapping, so the bootstrap-claim-abuse detector (round 1)
-        // owns that lane; here we just don't credit it.
+        // A node claiming bootstrap MID-AUDIT (it just answered round 1 with a
+        // valid signed proof) is contradicting itself: a bootstrapping node has
+        // no committed data to prove. A graced timeout here would let it keep the
+        // holder credit it earned earlier while dodging every round-2 possession
+        // check, so this is a confirmed failure with credit revocation.
         ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
             challenge_id,
-        }) if challenge_id == ctx.challenge_id => SliceRound::Timeout,
+        }) if challenge_id == ctx.challenge_id => SliceRound::ResponsiveBootstrap,
         _ => SliceRound::Malformed,
     }
 }
@@ -783,6 +793,20 @@ async fn verify_subtree_response(
         // (graced by the caller's strike policy — could be honest slowness).
         // Keeps credit (a dropped packet is not evidence of loss).
         SliceRound::Timeout => AuditVerdict::Fail(AuditFailureReason::Timeout),
+        // Bootstrap claim after a valid round-1 proof: revoke the pinned
+        // commitment's credit (it cannot keep credit while refusing to prove
+        // possession) and confirm the failure — the round-1 proof already
+        // disproves the bootstrap claim.
+        SliceRound::ResponsiveBootstrap => {
+            if let Some(credit) = ctx.credit {
+                credit
+                    .recent_provers
+                    .write()
+                    .await
+                    .forget_commitment(&ctx.expected_commitment_hash);
+            }
+            AuditVerdict::Fail(AuditFailureReason::Rejected)
+        }
         // Malformed/unexpected round-2 body.
         SliceRound::Malformed => AuditVerdict::Fail(AuditFailureReason::MalformedResponse),
     };
@@ -805,7 +829,7 @@ async fn verify_subtree_response(
             }
             info!(
                 "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
-                 byte-checked)",
+                 block openings verified)",
                 proof.leaves.len()
             );
             AuditTickResult::Passed {
@@ -1052,60 +1076,59 @@ pub async fn handle_subtree_challenge(
     }
 }
 
-/// Build the `Present` slice item for one opened block: the Bao verified slice
-/// (authenticity against the chunk address) plus the nonced block-tree opening
-/// (possession against round 1's `nonced_root`).
+/// Build every requested opening for one committed key from a single hashing
+/// pass over its bytes: a Bao verified slice (authenticity against the chunk
+/// address) plus a nonced block-tree opening (possession against round 1's
+/// `nonced_root`) per block index.
 ///
-/// Returns `Err(Rejected)` for the terminal cases that abort the whole response:
-/// a block index out of range for the chunk (only a forged/buggy auditor sends
-/// one → `Protocol`), or a surprise in-memory Bao extraction error (treated as
-/// `Transient` rather than branding an honest holder).
-fn build_slice_item(
-    challenge: &SubtreeSliceChallenge,
+/// The Bao outboard and nonced tree each hash the full chunk, so this builds
+/// them once (via [`ChunkOpener`]) and serves all `indices` from them rather
+/// than re-hashing per opening (V2-685 round-2 amplification fix). `indices` is
+/// deduplicated by the caller. CPU-heavy, so callers run it on a blocking thread.
+///
+/// Returns `Err((kind, reason))` for the terminal cases that abort the whole
+/// response: a block index out of range (only a forged/buggy auditor sends one →
+/// `Protocol`), or a surprise in-memory Bao extraction error (`Transient`, so an
+/// honest holder is not branded a deleter).
+fn build_slice_items_for_key(
+    nonce: [u8; 32],
+    peer: [u8; 32],
     key: XorName,
-    block_index: u32,
     bytes: &[u8],
-) -> Result<SubtreeSliceItem, SubtreeSliceResponse> {
-    if u64::from(block_index)
-        >= u64::from(crate::replication::slice::block_count(bytes.len() as u64))
-    {
-        return Err(SubtreeSliceResponse::Rejected {
-            challenge_id: challenge.challenge_id,
-            kind: RejectKind::Protocol,
-            reason: format!(
-                "block index {block_index} out of range for key {}",
-                hex::encode(key)
-            ),
+    indices: &[u32],
+) -> Result<Vec<SubtreeSliceItem>, (RejectKind, String)> {
+    let opener = crate::replication::slice::ChunkOpener::new(&nonce, &peer, &key, bytes);
+    let count = opener.block_count();
+    let mut items = Vec::with_capacity(indices.len());
+    for &block_index in indices {
+        if block_index >= count {
+            return Err((
+                RejectKind::Protocol,
+                format!(
+                    "block index {block_index} out of range for key {}",
+                    hex::encode(key)
+                ),
+            ));
+        }
+        let bao_slice = match opener.bao_slice(block_index) {
+            Ok(slice) => slice,
+            Err(e) => {
+                warn!(
+                    "Subtree slice audit: bao extraction failed for key {}: {e}",
+                    hex::encode(key)
+                );
+                return Err((RejectKind::Transient, format!("bao extraction error: {e}")));
+            }
+        };
+        let nonced_siblings = opener.nonced_siblings(block_index).unwrap_or_default();
+        items.push(SubtreeSliceItem::Present {
+            key,
+            block_index,
+            bao_slice,
+            nonced_siblings,
         });
     }
-    let bao_slice = match crate::replication::slice::extract_block_slice(bytes, block_index) {
-        Ok(slice) => slice,
-        Err(e) => {
-            warn!(
-                "Subtree slice audit: bao extraction failed for key {}: {e}",
-                hex::encode(key)
-            );
-            return Err(SubtreeSliceResponse::Rejected {
-                challenge_id: challenge.challenge_id,
-                kind: RejectKind::Transient,
-                reason: format!("bao extraction error: {e}"),
-            });
-        }
-    };
-    let nonced_siblings = crate::replication::slice::nonced_block_siblings(
-        &challenge.nonce,
-        &challenge.challenged_peer_id,
-        &key,
-        bytes,
-        block_index,
-    )
-    .unwrap_or_default();
-    Ok(SubtreeSliceItem::Present {
-        key,
-        block_index,
-        bao_slice,
-        nonced_siblings,
-    })
+    Ok(items)
 }
 
 /// Handle a round-2 slice challenge (responder side), ADR-0002 / V2-685.
@@ -1181,9 +1204,26 @@ pub async fn handle_subtree_slice_challenge(
         };
     };
 
-    let mut items = Vec::with_capacity(challenge.openings.len());
+    // Coalesce openings by key, preserving first-seen order and deduplicating
+    // block indices per key, so each committed chunk is read from LMDB and hashed
+    // at most once even when the auditor opens several of its blocks (the normal
+    // random + final pair, or a forged duplicate). Without this a ten-opening
+    // request could re-read and re-hash the same chunk ten times (finding 2).
+    let mut key_order: Vec<XorName> = Vec::new();
+    let mut indices_by_key: HashMap<XorName, Vec<u32>> = HashMap::new();
     for opening in &challenge.openings {
-        let key = opening.key;
+        let entry = indices_by_key.entry(opening.key).or_default();
+        if entry.is_empty() {
+            key_order.push(opening.key);
+        }
+        if !entry.contains(&opening.block_index) {
+            entry.push(opening.block_index);
+        }
+    }
+
+    let mut items = Vec::with_capacity(challenge.openings.len());
+    for key in key_order {
+        let indices = indices_by_key.remove(&key).unwrap_or_default();
         // Open ONLY keys committed under this pin. A key not in the pinned tree
         // is `Absent` — never served from local storage just because we happen to
         // hold it (§15: serving an uncommitted-but-held key would let a forged
@@ -1192,46 +1232,95 @@ pub async fn handle_subtree_slice_challenge(
             items.push(SubtreeSliceItem::Absent { key });
             continue;
         }
-        match get_raw_retrying(storage, &key).await {
-            // Committed key, bytes present → build the two-chain opening (or a
-            // terminal reject for an out-of-range index / surprise extraction error).
-            Ok(Some(bytes)) => {
-                match build_slice_item(challenge, key, opening.block_index, &bytes) {
-                    Ok(item) => items.push(item),
-                    Err(reject) => return reject,
-                }
-            }
-            // Committed key, definitively absent → provable failure (§7: this is
-            // a real "I don't hold it" answer, distinct from a read error).
-            Ok(None) => {
-                warn!(
-                    "Subtree slice audit: committed key {} requested but bytes absent",
-                    hex::encode(key)
-                );
-                items.push(SubtreeSliceItem::Absent { key });
-            }
-            // Persistent transient read error after retries → do NOT brand the
-            // peer a deleter. Reject `Transient`; the auditor routes it to the
-            // timeout lane so a flaky LMDB read never manufactures a confirmed
-            // possession failure on an honest holder (which also gains no credit).
-            Err(e) => {
-                warn!(
-                    "Subtree slice audit: storage read error for committed key {}: {e} \
-                     (rejecting as transient, not a confirmed failure)",
-                    hex::encode(key)
-                );
-                return SubtreeSliceResponse::Rejected {
-                    challenge_id: challenge.challenge_id,
-                    kind: RejectKind::Transient,
-                    reason: format!("transient storage read error: {e}"),
-                };
-            }
+        match serve_committed_key_openings(challenge, storage, key, indices).await {
+            KeyServe::Items(mut built_items) => items.append(&mut built_items),
+            KeyServe::Absent => items.push(SubtreeSliceItem::Absent { key }),
+            KeyServe::Reject(reject) => return reject,
         }
     }
 
     SubtreeSliceResponse::Items {
         challenge_id: challenge.challenge_id,
         items,
+    }
+}
+
+/// Outcome of serving all requested openings for one committed key.
+enum KeyServe {
+    /// Openings built for this key; append to the response.
+    Items(Vec<SubtreeSliceItem>),
+    /// Committed but the bytes are gone → provable `Absent`.
+    Absent,
+    /// A terminal condition (out-of-range index, read/build error) that aborts
+    /// the whole response.
+    Reject(SubtreeSliceResponse),
+}
+
+/// Read a committed key's chunk once and build every requested opening from it.
+///
+/// The Bao outboard + nonced tree hash the whole chunk, so the CPU-heavy build
+/// runs on a blocking thread to keep an audit-responder flood off the Tokio pool
+/// (finding 2). `indices` is already deduplicated by the caller.
+async fn serve_committed_key_openings(
+    challenge: &SubtreeSliceChallenge,
+    storage: &LmdbStorage,
+    key: XorName,
+    indices: Vec<u32>,
+) -> KeyServe {
+    let reject = |kind, reason| {
+        KeyServe::Reject(SubtreeSliceResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            kind,
+            reason,
+        })
+    };
+    match get_raw_retrying(storage, &key).await {
+        Ok(Some(bytes)) => {
+            let nonce = challenge.nonce;
+            let peer = challenge.challenged_peer_id;
+            match tokio::task::spawn_blocking(move || {
+                build_slice_items_for_key(nonce, peer, key, &bytes, &indices)
+            })
+            .await
+            {
+                Ok(Ok(built_items)) => KeyServe::Items(built_items),
+                Ok(Err((kind, reason))) => reject(kind, reason),
+                Err(e) => {
+                    warn!(
+                        "Subtree slice audit: proof build task failed for key {}: {e}",
+                        hex::encode(key)
+                    );
+                    reject(
+                        RejectKind::Transient,
+                        format!("proof build task error: {e}"),
+                    )
+                }
+            }
+        }
+        // Committed key, definitively absent → provable failure (§7: a real "I
+        // don't hold it" answer, distinct from a read error).
+        Ok(None) => {
+            warn!(
+                "Subtree slice audit: committed key {} requested but bytes absent",
+                hex::encode(key)
+            );
+            KeyServe::Absent
+        }
+        // Persistent transient read error after retries → do NOT brand the peer a
+        // deleter. Reject `Transient`; the auditor routes it to the timeout lane
+        // so a flaky LMDB read never manufactures a confirmed possession failure
+        // on an honest holder (which also gains no credit).
+        Err(e) => {
+            warn!(
+                "Subtree slice audit: storage read error for committed key {}: {e} \
+                 (rejecting as transient, not a confirmed failure)",
+                hex::encode(key)
+            );
+            reject(
+                RejectKind::Transient,
+                format!("transient storage read error: {e}"),
+            )
+        }
     }
 }
 

@@ -65,6 +65,7 @@ use crate::replication::commitment_state::{
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+    SUBTREE_AUDIT_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -948,6 +949,38 @@ impl FirstAuditScheduler {
 
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
+
+/// Match an inbound topic against the replication protocol ids, in both the bare
+/// gossip form and the `/rr/<id>` request-response form.
+///
+/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`] or
+/// [`SUBTREE_AUDIT_PROTOCOL_ID`]) and whether it was the RR form. The matched id
+/// is carried into the handler so it can enforce that subtree-audit bodies only
+/// arrive on the audit id and core bodies only on the core id.
+fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
+    for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
+        if topic == id {
+            return Some((id, false));
+        }
+        if let Some(rest) = topic.strip_prefix(RR_PREFIX) {
+            if rest == id {
+                return Some((id, true));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a decoded body belongs on the protocol id it arrived on: subtree-audit
+/// bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], every other body on
+/// [`REPLICATION_PROTOCOL_ID`].
+///
+/// The receive guard drops any mismatch (a cross-version or misrouted message);
+/// sharing this one predicate between the guard and its regression test means a
+/// change to the rule cannot pass the test unnoticed.
+fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
+    body.is_subtree_audit() == (protocol == SUBTREE_AUDIT_PROTOCOL_ID)
+}
 
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::FreshReplication
@@ -2048,24 +2081,28 @@ impl ReplicationEngine {
                             data,
                             ..
                         } = event {
-                            // Determine if this is a replication message
-                            // and whether it arrived via the /rr/ request-response
-                            // path (which wraps payloads in RequestResponseEnvelope).
-                            let rr_info = if topic == REPLICATION_PROTOCOL_ID {
-                                Some((data.clone(), None))
-                            } else if topic.starts_with(RR_PREFIX)
-                                && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
-                            {
-                                P2PNode::parse_request_envelope(&data)
-                                    .filter(|(_, is_resp, _)| !is_resp)
-                                    .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
-                            } else {
-                                None
-                            };
-                            if let Some((payload, rr_message_id)) = rr_info {
+                            // Determine which replication protocol this message
+                            // rode (core or subtree-audit) and whether it arrived
+                            // via the /rr/ request-response path (which wraps
+                            // payloads in a RequestResponseEnvelope).
+                            let rr_info = match_replication_protocol(&topic).and_then(
+                                |(matched_id, is_rr)| {
+                                    if is_rr {
+                                        P2PNode::parse_request_envelope(&data)
+                                            .filter(|(_, is_resp, _)| !is_resp)
+                                            .map(|(msg_id, _, payload)| {
+                                                (matched_id, payload, Some(msg_id))
+                                            })
+                                    } else {
+                                        Some((matched_id, data.clone(), None))
+                                    }
+                                },
+                            );
+                            if let Some((matched_id, payload, rr_message_id)) = rr_info {
                                 match handle_replication_message(
                                     &source,
                                     &payload,
+                                    matched_id,
                                     &p2p,
                                     &storage,
                                     &paid_list,
@@ -3093,6 +3130,7 @@ async fn admit_audit_responder(
 async fn handle_replication_message(
     source: &PeerId,
     data: &[u8],
+    inbound_protocol: &str,
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
@@ -3115,6 +3153,22 @@ async fn handle_replication_message(
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
         .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
+
+    // Symmetric id/body guard: subtree-audit bodies are valid ONLY on the audit
+    // id, and core bodies ONLY on the core id. postcard::from_bytes ignores
+    // trailing bytes, so a mixed-version peer's message could otherwise decode
+    // into a valid-looking but wrong body (e.g. an old round-1 `Proof` on the
+    // core id misreading its bytes as the new `content_len`/`nonced_root`). The
+    // outer enum discriminants are unchanged across versions, so this drop by
+    // (id, is_subtree_audit) is exact.
+    if !body_matches_protocol(&msg.body, inbound_protocol) {
+        debug!(
+            "Dropping replication body (variant {}) on protocol {inbound_protocol}: \
+             wrong id for its family (cross-version or misrouted)",
+            msg.body.variant_index()
+        );
+        return Ok(());
+    }
 
     match msg.body {
         ReplicationMessageBody::FreshReplicationOffer(ref offer) => {
@@ -4118,14 +4172,23 @@ async fn send_replication_response_checked(
     ) {
         protocol::record_served(peer, encoded.len());
     }
+    // Reply on the id the request rode: subtree-audit responses go on the audit
+    // id, everything else on the core id. `is_subtree_audit()` is the same single
+    // predicate the receive guard uses, so the two can never disagree (an audit
+    // request only reaches a handler on the audit id, and it only produces an
+    // audit response). saorsa-core correlates RR responses by (peer, msg_id), not
+    // by protocol name, so a v3 auditor waiting on the audit id still matches.
+    let protocol = if msg.body.is_subtree_audit() {
+        SUBTREE_AUDIT_PROTOCOL_ID
+    } else {
+        REPLICATION_PROTOCOL_ID
+    };
     let result = if let Some(msg_id) = rr_message_id {
         p2p_node
-            .send_response(peer, REPLICATION_PROTOCOL_ID, msg_id, encoded)
+            .send_response(peer, protocol, msg_id, encoded)
             .await
     } else {
-        p2p_node
-            .send_message(peer, REPLICATION_PROTOCOL_ID, encoded, &[])
-            .await
+        p2p_node.send_message(peer, protocol, encoded, &[]).await
     };
     if let Err(e) = result {
         debug!("Failed to send replication response to {peer}: {e}");
@@ -6321,6 +6384,69 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
     use std::time::SystemTime;
+
+    #[test]
+    fn match_replication_protocol_accepts_both_ids_bare_and_rr() {
+        // Core id, bare gossip form and /rr/ request-response form.
+        assert_eq!(
+            match_replication_protocol(REPLICATION_PROTOCOL_ID),
+            Some((REPLICATION_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{REPLICATION_PROTOCOL_ID}")),
+            Some((REPLICATION_PROTOCOL_ID, true))
+        );
+        // Subtree-audit id, both forms.
+        assert_eq!(
+            match_replication_protocol(SUBTREE_AUDIT_PROTOCOL_ID),
+            Some((SUBTREE_AUDIT_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{SUBTREE_AUDIT_PROTOCOL_ID}")),
+            Some((SUBTREE_AUDIT_PROTOCOL_ID, true))
+        );
+        // Foreign topics (incl. a bare /rr/ and an unrelated protocol) don't match.
+        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
+        assert_eq!(match_replication_protocol(RR_PREFIX), None);
+        assert_eq!(
+            match_replication_protocol("autonomi.ant.replication.v3"),
+            None
+        );
+    }
+
+    // The receive guard drops a body whose family disagrees with the id it rode:
+    // subtree-audit bodies only on the audit id, core bodies only on the core id.
+    // This is what stops a mixed-version peer's message from being honoured on the
+    // wrong handler after a postcard misdecode. The test drives the SAME
+    // `body_matches_protocol` the production guard uses, over real bodies, so a
+    // regression in the rule fails here.
+    #[test]
+    fn body_matches_protocol_is_symmetric_over_real_bodies() {
+        use crate::replication::protocol::{
+            FreshReplicationOffer, ReplicationMessageBody, SubtreeSliceChallenge,
+        };
+        // A subtree-audit body (models a v2 SubtreeByteChallenge, which decodes to
+        // this variant 13 under the new enum) and a core body.
+        let audit = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+            challenge_id: 1,
+            nonce: [0u8; 32],
+            challenged_peer_id: [0u8; 32],
+            expected_commitment_hash: [0u8; 32],
+            openings: vec![],
+        });
+        let core = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+            key: [0u8; 32],
+            data: vec![],
+            proof_of_payment: vec![],
+        });
+        // Correct routing is kept.
+        assert!(body_matches_protocol(&audit, SUBTREE_AUDIT_PROTOCOL_ID));
+        assert!(body_matches_protocol(&core, REPLICATION_PROTOCOL_ID));
+        // Cross-routing is dropped, both directions (a v2 subtree audit landing on
+        // the core id, and any core body on the audit id).
+        assert!(!body_matches_protocol(&audit, REPLICATION_PROTOCOL_ID));
+        assert!(!body_matches_protocol(&core, SUBTREE_AUDIT_PROTOCOL_ID));
+    }
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
