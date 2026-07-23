@@ -6052,7 +6052,7 @@ mod tests {
     use crate::replication::audit::AuditTickResult;
     use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
     use crate::replication::recent_provers::RecentProvers;
-    use crate::replication::types::{AuditFailureReason, AuditFailureSummary, FailureEvidence};
+    use crate::replication::types::{AuditFailureReason, FailureEvidence};
     use lru::LruCache;
     use saorsa_core::identity::PeerId;
     use std::collections::HashMap;
