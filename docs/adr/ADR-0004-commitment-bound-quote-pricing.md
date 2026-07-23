@@ -507,7 +507,7 @@ at least 99% detection within 24 hours for at least 1% missing bytes.
 Amendment 3 stopped dead entries from squatting the queue, but admission
 itself was still unbounded relative to the budget: `pending` shared the
 4096-entry commitment-cache cap while the token bucket can launch at most
-~32 audits inside one effective answerability window (150 min of
+~31 audits inside one effective answerability window (150 min of
 eligibility at one token per 5 minutes, plus a burst of 2). At the
 2026-07-17 staging arrival rate (~113 admitted nominations per node-hour
 against ~12 launches) over 99% of admitted work could never launch: the
@@ -515,25 +515,44 @@ queue was an aging backlog whose entries mostly expired, and the
 `pending` / `oldest_pending_quote_age_ms` telemetry measured the backlog's
 age rather than schedulable work.
 
-`pending` is now capped at `FIRST_AUDIT_PENDING_CAP`, derived from the same
-constants that define the budget and the window
-(`(GOSSIP_ANSWERABILITY_TTL − MONETIZED_AUDIT_SKEW_MARGIN) /
-FIRST_AUDIT_LAUNCH_INTERVAL + FIRST_AUDIT_BUDGET_BURST`, currently 32), so
-retuning either side re-sizes admission automatically. At capacity the LRU
-displaces the least-recently-refreshed entry, accounted as
-`capacity_evicted` — now the steady overload signal — and the summary line
-reports `pending_cap` so occupancy is a first-class dashboard quantity.
+`pending` is now capped at `FIRST_AUDIT_PENDING_CAP`, the number of usable
+launches inside one window under the STRICT reserve-time predicate: burst
+tokens at age zero plus every refill that still leaves the quote answerable
+through the maximum launch jitter and send slack (currently 31). The unit
+test simulates the shipped predicate instant-by-instant and must agree with
+the derivation, so retuning the budget, window, or jitter re-sizes
+admission automatically. The summary line reports `pending_cap` and
+`reserved` (the one reservation held outside the queue), so schedulable
+occupancy is `pending + reserved`, a first-class dashboard quantity.
 
-Keep-newest displacement is deliberate. Under overload the queue degrades
-to a budget-sized rolling sample biased toward fresh nominations, so the
-newest-first lane keeps its prompt-audit deterrence: a cheater's fresh pin
-always enters the sample and retains an unpredictable chance of
-near-immediate audit. Refusing new admissions at capacity would invert
-that — a sustained payment flood would keep the queue full and guarantee
-every later pin (including the flooder's next target) is never admitted.
-Displacement stamps no suppression state, so a displaced peer's next
-nomination is judged like any newcomer. Under light load (arrivals below
-the drain rate) the cap is not reached and coverage remains exhaustive.
+Overflow follows two rules, in order. First, an arrival that would displace
+a different peer grants the queue a reservation opportunity before anything
+is evicted: if a token and in-flight slot are free, one pending entry moves
+into the reservation and the arrival is admitted with no eviction, so an
+ingress burst can never flush eligible work past a ready token. Second,
+when no launch is possible, admission displaces a uniformly RANDOM
+incumbent, accounted as `capacity_evicted` — the steady overload signal.
+Random selection is the security property: with deterministic retention
+(oldest-out or newest-kept), an ordered batch of `cap` distinct-peer paid
+nominations flushes a chosen target with certainty; with a random victim,
+each overflow evicts a specific target with probability `1/cap`, so
+suppressing it with confidence `1−e` costs about `cap · ln(1/e)`
+distinct-peer nominations (~95 paid pins for 95% at cap 31, ~140 for 99%)
+and is never certain, while the target may launch in the meantime. A fresh
+pin still always enters the sample with an unpredictable chance of prompt
+audit; refusing at the door would instead let a sustained flood guarantee
+every later pin is never admitted. Displacement stamps no suppression
+state, so a displaced peer's next nomination is judged like any newcomer.
+Under light load (arrivals below the drain rate) the cap is not reached
+and coverage remains exhaustive.
+
+For comparison, the pre-cap queue's 4,096-entry bound made targeted
+eviction expensive but protected work that mostly could not launch anyway:
+at observed staging rates, over 99% of those entries expired unaudited, so
+the practical suppression of any given pin was already the budget share,
+not the eviction threshold. The honest quantity to compare across designs
+is P(audited before answerability expiry), which the cap leaves at the
+budget share while making the skipped remainder visible at admission time.
 
 Coverage semantics are otherwise unchanged from Amendments 2-3: a budgeted
 probabilistic exam backstopped by the gossip-lottery path. What changes is

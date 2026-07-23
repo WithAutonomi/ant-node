@@ -244,9 +244,33 @@ fn coalesce_first_audit_event(
         let _ = pending.push(incoming.peer, incoming);
         return FirstAuditQueueOutcome::Coalesced;
     }
-    // No same-peer entry: a `push` at capacity evicts the LRU (a DIFFERENT peer).
+    // No same-peer entry. At capacity, displace a UNIFORMLY RANDOM incumbent,
+    // never the LRU: deterministic keep-newest would let an ordered batch of
+    // `cap` distinct-peer nominations flush a chosen target before any launch
+    // lane sees it, cutting the eviction cost from probabilistic to exact. A
+    // random victim caps an attacker's per-nomination eviction probability at
+    // `1/cap` regardless of arrival order or timing, so suppressing a specific
+    // target with confidence `1-e` costs ~`cap*ln(1/e)` distinct-peer paid
+    // nominations and is never certain (ADR-0004 Amendment 4).
+    if pending.len() >= pending.cap().get() {
+        let victim = {
+            let idx = rand::thread_rng().gen_range(0..pending.len());
+            pending.iter().nth(idx).map(|(p, _)| *p)
+        };
+        if let Some(victim_peer) = victim {
+            if let Some(evicted) = pending.pop(&victim_peer) {
+                let _ = pending.push(incoming.peer, incoming);
+                return FirstAuditQueueOutcome::CapacityEvicted {
+                    peer: victim_peer,
+                    pin: evicted.pin,
+                };
+            }
+        }
+    }
     match pending.push(incoming.peer, incoming) {
         None => FirstAuditQueueOutcome::Queued,
+        // Defensive: unreachable after the explicit random displacement above,
+        // but a racing cap change must still be accounted, never silent.
         Some((evicted_peer, evicted)) => FirstAuditQueueOutcome::CapacityEvicted {
             peer: evicted_peer,
             pin: evicted.pin,
@@ -469,6 +493,38 @@ fn quote_answerable_through_nominal_jitter(quote_ts: SystemTime, now: SystemTime
     quote_within_audit_window(quote_ts, now) && quote_within_audit_window(quote_ts, latest_send)
 }
 
+/// Open the single first-audit reservation from `pending` if none is
+/// outstanding: samples the launch jitter, snapshots the shared cooldown
+/// read-only, and delegates to [`FirstAuditScheduler::try_reserve`]. One
+/// shared implementation for both drainer call sites — the per-wake launch
+/// phase and the pre-overflow opportunity inside the ingress batch — so the
+/// two cannot drift.
+async fn open_first_audit_reservation(
+    scheduler: &mut FirstAuditScheduler,
+    cooldown: &RwLock<HashMap<PeerId, Instant>>,
+    observability: &Arc<FirstAuditObservability>,
+) {
+    if scheduler.has_reservation() {
+        return;
+    }
+    let jitter = Duration::from_millis(rand::thread_rng().gen_range(
+        0..=u64::try_from(config::FIRST_AUDIT_LAUNCH_JITTER_MAX.as_millis()).unwrap_or(u64::MAX),
+    ));
+    let inflight = observability.inflight.load(Ordering::Relaxed);
+    let reserved = {
+        let cooldown = cooldown.read().await;
+        scheduler.try_reserve(Instant::now(), inflight, jitter, &cooldown, observability)
+    };
+    if reserved {
+        if let Some(peer) = scheduler.reserved_peer() {
+            debug!(
+                "First-audit scheduler: audit_trigger=first_monetized outcome=reserved peer={peer} pending={}",
+                scheduler.pending_len()
+            );
+        }
+    }
+}
+
 /// A far-future `Instant` used to effectively DISABLE the promotion-timer
 /// select arm when no reservation is outstanding. The drainer still wakes at
 /// least every [`config::FIRST_AUDIT_RETRY_INTERVAL`] via its tick, so this only
@@ -501,10 +557,14 @@ struct FirstAuditScheduler {
     /// (a real send), never at reservation, so a cancelled reservation can be
     /// re-nominated.
     first_audited: LruCache<[u8; 32], ()>,
-    /// Newest-per-peer pending nominations not yet launched. Capped at
+    /// Highest-count-per-peer pending nominations not yet launched. Capped at
     /// [`FIRST_AUDIT_PENDING_CAP`] (what the token budget can launch within
-    /// one effective answerability window); at capacity the least-recently
-    /// refreshed entry is displaced and counted as `capacity_evicted`.
+    /// one effective answerability window); at capacity a uniformly RANDOM
+    /// incumbent is displaced and counted as `capacity_evicted`, so eviction
+    /// of a specific entry can never be forced deterministically. One further
+    /// entry may be held in `reserved` outside this queue; the summary line
+    /// reports both (`pending`/`reserved`) so schedulable occupancy is
+    /// `pending + reserved`.
     pending: LruCache<PeerId, MonetizedPinEvent>,
     /// Token bucket + per-peer re-audit window.
     limiter: FirstAuditLimiter,
@@ -602,6 +662,16 @@ impl FirstAuditScheduler {
         self.reserved.is_some()
     }
 
+    /// Whether admitting `event` would displace a DIFFERENT peer's pending
+    /// entry: the queue is at capacity and `event.peer` has no incumbent to
+    /// coalesce into. The drainer checks this before enqueueing so pending
+    /// work gets a reservation opportunity BEFORE destructive overflow
+    /// (ADR-0004 Amendment 4) — a successful reservation moves one entry out
+    /// of `pending`, freeing the slot without any eviction.
+    fn would_displace(&self, event: &MonetizedPinEvent) -> bool {
+        self.pending.len() >= self.pending.cap().get() && self.pending.peek(&event.peer).is_none()
+    }
+
     /// When the outstanding reservation becomes eligible for promotion.
     fn reserved_ready_at(&self) -> Option<Instant> {
         self.reserved.as_ref().map(|r| r.ready_at)
@@ -621,10 +691,13 @@ impl FirstAuditScheduler {
     /// displaces a higher-count pending pin. An incumbent that has aged past
     /// the answerability horizon is dropped (and accounted as an expiry) before
     /// coalescing, so a dead pin never vetoes a live nomination. Admission for
-    /// a NEW peer at capacity displaces the least-recently-refreshed entry
-    /// (see [`FIRST_AUDIT_PENDING_CAP`]): displacement is accounted as
-    /// `capacity_evicted` and stamps no suppression, so a displaced peer's
-    /// next nomination is judged like any newcomer.
+    /// a NEW peer at capacity displaces a uniformly RANDOM incumbent (see
+    /// [`FIRST_AUDIT_PENDING_CAP`] and [`coalesce_first_audit_event`]):
+    /// displacement is accounted as `capacity_evicted` and stamps no
+    /// suppression, so a displaced peer's next nomination is judged like any
+    /// newcomer. The drainer additionally offers a reservation opportunity
+    /// via [`Self::would_displace`] before calling this on an overflowing
+    /// arrival.
     fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
         if event.peer == self.self_peer {
             obs.self_target_skipped.fetch_add(1, Ordering::Relaxed);
@@ -1017,22 +1090,34 @@ const MAX_LAST_COMMITMENT_BY_PEER: usize = 4096;
 /// before it expires, so admitting it only builds an aging backlog whose
 /// telemetry measures the backlog instead of schedulable work.
 ///
-/// At capacity `LruCache::push` displaces the least-recently-refreshed entry
-/// (counted as `capacity_evicted`). Keep-newest is deliberate: under overload
-/// `pending` degrades to a budget-sized rolling sample biased toward fresh
-/// nominations, so the newest-first lane keeps its prompt-audit deterrence —
-/// a fresh pin always enters the sample with an unpredictable chance of
-/// near-immediate audit — whereas refusing at the door would let a sustained
-/// payment flood guarantee that every later pin is never admitted.
-#[allow(clippy::cast_possible_truncation)] // bounded by TTL-secs/interval-secs + burst (~32)
+/// At capacity, admission displaces a uniformly RANDOM incumbent (counted as
+/// `capacity_evicted`), so under overload `pending` degrades to a budget-sized
+/// rolling sample in which no arrival order lets an attacker deterministically
+/// flush a chosen target; a fresh pin always enters the sample with an
+/// unpredictable chance of near-immediate audit, whereas refusing at the door
+/// would let a sustained payment flood guarantee that every later pin is never
+/// admitted. See [`coalesce_first_audit_event`] for the displacement rule and
+/// ADR-0004 Amendment 4 for the eviction-cost math.
+///
+/// Derivation uses the STRICT reserve-time horizon: a launch at quote age `a`
+/// is usable only if the quote stays answerable through `a` plus the maximum
+/// launch jitter and send slack, so the last usable refill is the largest
+/// `k` with `k * interval < cutoff - jitter_max - slack`. The unit test
+/// simulates the shipped predicate instant-by-instant and must agree.
+#[allow(clippy::cast_possible_truncation)] // bounded by TTL-secs/interval-secs + burst (~31)
 const FIRST_AUDIT_PENDING_CAP: usize = {
-    let cutoff_secs = GOSSIP_ANSWERABILITY_TTL
+    let strict_horizon_secs = GOSSIP_ANSWERABILITY_TTL
         .as_secs()
-        .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN.as_secs());
-    // Compile-time division-by-zero if the launch interval is ever zeroed:
-    // a zero interval makes the budget (and this cap) meaningless.
-    let launchable = cutoff_secs / config::FIRST_AUDIT_LAUNCH_INTERVAL.as_secs();
-    (launchable + config::FIRST_AUDIT_BUDGET_BURST as u64) as usize
+        .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN.as_secs())
+        .saturating_sub(config::FIRST_AUDIT_LAUNCH_JITTER_MAX.as_secs())
+        .saturating_sub(FIRST_AUDIT_SEND_LATENCY_SLACK.as_secs());
+    // Strictly-inside count: a refill landing exactly ON the horizon is dead
+    // (`age >= cutoff` rejects), hence the `- 1`. Compile-time division-by-zero
+    // if the launch interval is ever zeroed: a zero interval makes the budget
+    // (and this cap) meaningless.
+    let refills =
+        strict_horizon_secs.saturating_sub(1) / config::FIRST_AUDIT_LAUNCH_INTERVAL.as_secs();
+    (refills + config::FIRST_AUDIT_BUDGET_BURST as u64) as usize
 };
 
 // Compile-time guardrails: the cap must be a usable `LruCache` capacity and
@@ -1706,6 +1791,20 @@ impl ReplicationEngine {
                     event = rx.recv() => match event {
                         Some(e) => {
                             observability.received.fetch_add(1, Ordering::Relaxed);
+                            // Pre-overflow reservation opportunity: before an
+                            // arrival may displace a DIFFERENT peer, let the
+                            // queue launch — a successful reservation frees the
+                            // slot without eviction, so a single ingress batch
+                            // can never flush eligible work past a ready token
+                            // (ADR-0004 Amendment 4).
+                            if scheduler.would_displace(&e) {
+                                open_first_audit_reservation(
+                                    &mut scheduler,
+                                    &gossip_audit.cooldown,
+                                    &observability,
+                                )
+                                .await;
+                            }
                             scheduler.enqueue(e, &observability);
                             // Drain a bounded burst so a flood cannot starve the
                             // launch phase.
@@ -1714,6 +1813,14 @@ impl ReplicationEngine {
                                 match rx.try_recv() {
                                     Ok(e) => {
                                         observability.received.fetch_add(1, Ordering::Relaxed);
+                                        if scheduler.would_displace(&e) {
+                                            open_first_audit_reservation(
+                                                &mut scheduler,
+                                                &gossip_audit.cooldown,
+                                                &observability,
+                                            )
+                                            .await;
+                                        }
                                         scheduler.enqueue(e, &observability);
                                         drained += 1;
                                     }
@@ -1821,33 +1928,12 @@ impl ReplicationEngine {
                 //    authoritative stamp is at promotion). Serializing
                 //    reservations preserves per-launch lane alternation and keeps
                 //    at most one jitter timer live.
-                if !scheduler.has_reservation() {
-                    let jitter = Duration::from_millis(
-                        rand::thread_rng().gen_range(
-                            0..=u64::try_from(config::FIRST_AUDIT_LAUNCH_JITTER_MAX.as_millis())
-                                .unwrap_or(u64::MAX),
-                        ),
-                    );
-                    let inflight = observability.inflight.load(Ordering::Relaxed);
-                    let reserved = {
-                        let cooldown = gossip_audit.cooldown.read().await;
-                        scheduler.try_reserve(
-                            Instant::now(),
-                            inflight,
-                            jitter,
-                            &cooldown,
-                            &observability,
-                        )
-                    };
-                    if reserved {
-                        if let Some(peer) = scheduler.reserved_peer() {
-                            debug!(
-                                "First-audit scheduler: audit_trigger=first_monetized outcome=reserved peer={peer} pending={}",
-                                scheduler.pending_len()
-                            );
-                        }
-                    }
-                }
+                open_first_audit_reservation(
+                    &mut scheduler,
+                    &gossip_audit.cooldown,
+                    &observability,
+                )
+                .await;
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     // Token-independent hygiene: collect entries that aged past
@@ -1862,7 +1948,7 @@ impl ReplicationEngine {
                         );
                     }
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} pending_cap={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} pending_cap={} reserved={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
@@ -1884,6 +1970,7 @@ impl ReplicationEngine {
                         observability.outside_answerability_window.load(Ordering::Relaxed),
                         scheduler.pending_len(),
                         FIRST_AUDIT_PENDING_CAP,
+                        u8::from(scheduler.has_reservation()),
                         scheduler.oldest_pending_quote_age_ms(SystemTime::now()),
                         observability.inflight.load(Ordering::Relaxed),
                         scheduler.tokens(),
@@ -6698,21 +6785,34 @@ mod tests {
         }
     }
 
-    /// The pending admission cap must equal what the token budget can launch
-    /// inside one effective answerability window (plus burst): any larger and
-    /// admitted work is guaranteed to expire unlaunched; any smaller and the
-    /// budget idles while nominations are refused.
+    /// The pending admission cap must equal the number of usable launches the
+    /// token budget can perform inside one answerability window, counted by
+    /// SIMULATING the shipped reserve-time predicate instant-by-instant (burst
+    /// tokens at age zero, one refill per launch interval), not by repeating
+    /// the derivation formula. Any larger and admitted work is guaranteed to
+    /// expire unlaunched; any smaller and the budget idles while nominations
+    /// are displaced.
     #[test]
-    fn first_audit_pending_cap_matches_window_budget() {
-        let cutoff_secs = GOSSIP_ANSWERABILITY_TTL
-            .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN)
-            .as_secs();
-        let expected = usize::try_from(
-            cutoff_secs / config::FIRST_AUDIT_LAUNCH_INTERVAL.as_secs()
-                + u64::from(config::FIRST_AUDIT_BUDGET_BURST),
-        )
-        .expect("cap fits usize");
-        assert_eq!(FIRST_AUDIT_PENDING_CAP, expected);
+    fn first_audit_pending_cap_matches_strict_launch_horizon() {
+        let quote_ts = SystemTime::now();
+        // Burst launches fire at age zero and must pass the reserve predicate.
+        assert!(quote_answerable_through_nominal_jitter(quote_ts, quote_ts));
+        let mut usable = usize::try_from(config::FIRST_AUDIT_BUDGET_BURST).expect("burst fits");
+        let mut refill = 1u32;
+        loop {
+            let age = config::FIRST_AUDIT_LAUNCH_INTERVAL * refill;
+            let at = quote_ts + age;
+            if !quote_answerable_through_nominal_jitter(quote_ts, at) {
+                break;
+            }
+            usable += 1;
+            refill += 1;
+            assert!(refill < 10_000, "runaway horizon simulation");
+        }
+        assert_eq!(
+            FIRST_AUDIT_PENDING_CAP, usable,
+            "cap must match the simulated strict launch horizon"
+        );
     }
 
     /// The pending queue is sized to the launch budget while the dedup set
@@ -6728,11 +6828,11 @@ mod tests {
         );
     }
 
-    /// Admission beyond the cap displaces the least-recently-refreshed entry
-    /// (keep-newest sampling) and is accounted as `capacity_evicted` — the
-    /// steady overload signal — never silent loss.
+    /// Admission beyond the cap displaces exactly one incumbent per overflow
+    /// and every displacement is accounted as `capacity_evicted` — the steady
+    /// overload signal — never silent loss, and never an admission refusal.
     #[test]
-    fn first_audit_admission_beyond_cap_displaces_oldest_and_counts() {
+    fn first_audit_admission_beyond_cap_displaces_and_counts() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mut scheduler = FirstAuditScheduler::new(Instant::now());
         let overflow: usize = 5;
@@ -6754,20 +6854,106 @@ mod tests {
             u64::try_from(total).expect("total fits u64"),
             "displacement is not an admission refusal"
         );
-        for i in 0..overflow {
-            let b = u8::try_from(i + 1).expect("test peer count fits u8");
-            assert!(
-                scheduler.pending.peek(&test_peer(b)).is_none(),
-                "oldest-admitted entries are the displaced ones"
+        // Every arrival was admitted (the newest always enters the sample).
+        let last = u8::try_from(total).expect("test peer count fits u8");
+        assert!(
+            scheduler.pending.peek(&test_peer(last)).is_some(),
+            "the newest arrival always enters the sample"
+        );
+    }
+
+    /// The reviewer-demonstrated suppression route: a target followed by an
+    /// ordered batch of distinct-peer nominations, all inside one ingress
+    /// drain batch (`pending_cap < batch <= FIRST_AUDIT_DRAIN_BATCH`), with
+    /// the token bucket EMPTY so no reservation can intervene. Under the old
+    /// keep-newest LRU the target was evicted with certainty; under random
+    /// displacement its per-overflow eviction probability is `1/cap`, so
+    /// across repeated trials the target must survive some runs and be
+    /// displaced in others — never deterministically flushed, and every
+    /// displacement accounted.
+    #[test]
+    fn first_audit_ordered_flood_cannot_deterministically_evict_target() {
+        let flood: usize = 60; // pending_cap < 60 <= FIRST_AUDIT_DRAIN_BATCH
+        assert!(FIRST_AUDIT_PENDING_CAP < flood);
+        assert!(flood <= config::FIRST_AUDIT_DRAIN_BATCH);
+
+        let trials = 100u32;
+        let mut survived = 0u32;
+        let mut evicted = 0u32;
+        for _ in 0..trials {
+            let obs = Arc::new(FirstAuditObservability::default());
+            let mut scheduler = FirstAuditScheduler::new(Instant::now());
+            // Drain the burst tokens so the pre-overflow reservation
+            // opportunity cannot fire: this isolates pure retention.
+            scheduler.limiter.reserve_token();
+            scheduler.limiter.reserve_token();
+
+            let target = test_peer(200);
+            scheduler.enqueue(live_nomination(200), &obs);
+            for i in 0..flood {
+                let b = u8::try_from(i + 1).expect("flood peer fits u8");
+                scheduler.enqueue(live_nomination(b), &obs);
+            }
+
+            assert_eq!(scheduler.pending_len(), FIRST_AUDIT_PENDING_CAP);
+            let overflows = u64::try_from(1 + flood - FIRST_AUDIT_PENDING_CAP)
+                .expect("overflow count fits u64");
+            assert_eq!(
+                obs.capacity_evicted.load(Ordering::Relaxed),
+                overflows,
+                "every overflow past the cap is accounted, none silent"
             );
+            if scheduler.pending.peek(&target).is_some() {
+                survived += 1;
+            } else {
+                evicted += 1;
+            }
         }
-        for i in overflow..total {
+        // With eviction probability 1/cap per overflow, P(target survives one
+        // trial) ~= (1 - 1/31)^30 ~= 0.37: both outcomes are overwhelmingly
+        // certain to appear across 100 trials (miss odds < 1e-20 each side).
+        assert!(
+            survived > 0,
+            "target must survive some ordered floods — deterministic eviction \
+             would mean keep-newest retention regressed"
+        );
+        assert!(
+            evicted > 0,
+            "target must also be displaceable — otherwise overflow is refusing \
+             admissions instead of sampling"
+        );
+    }
+
+    /// With a token AVAILABLE, an overflowing arrival must first give pending
+    /// work a launch opportunity: the drainer's pre-overflow reservation pulls
+    /// one entry out of the queue, so admission proceeds without any eviction.
+    #[test]
+    fn first_audit_overflow_reserves_before_destructive_eviction() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let cooldown: HashMap<PeerId, Instant> = HashMap::new();
+
+        for i in 0..FIRST_AUDIT_PENDING_CAP {
             let b = u8::try_from(i + 1).expect("test peer count fits u8");
-            assert!(
-                scheduler.pending.peek(&test_peer(b)).is_some(),
-                "newest entries survive as the budget-sized sample"
-            );
+            scheduler.enqueue(live_nomination(b), &obs);
         }
+        let overflowing = live_nomination(250);
+        assert!(scheduler.would_displace(&overflowing));
+
+        // The drainer's pre-overflow sequence: reserve, then enqueue.
+        assert!(scheduler.try_reserve(Instant::now(), 0, Duration::ZERO, &cooldown, &obs));
+        assert!(
+            !scheduler.would_displace(&overflowing),
+            "a successful reservation frees the slot"
+        );
+        scheduler.enqueue(overflowing, &obs);
+
+        assert_eq!(scheduler.pending_len(), FIRST_AUDIT_PENDING_CAP);
+        assert_eq!(
+            obs.capacity_evicted.load(Ordering::Relaxed),
+            0,
+            "no destructive eviction when a launch opportunity existed"
+        );
     }
 
     /// Displacement stamps no suppression state: a displaced peer's next
@@ -6784,13 +6970,17 @@ mod tests {
             let b = u8::try_from(i + 1).expect("test peer count fits u8");
             scheduler.enqueue(live_nomination(b), &obs);
         }
-        let displaced = test_peer(1);
-        assert!(scheduler.pending.peek(&displaced).is_none());
+        assert_eq!(obs.capacity_evicted.load(Ordering::Relaxed), 1);
+        // Find whichever peer the random displacement removed.
+        let displaced = (1..=total)
+            .map(|i| u8::try_from(i).expect("test peer count fits u8"))
+            .find(|b| scheduler.pending.peek(&test_peer(*b)).is_none())
+            .expect("exactly one admitted peer was displaced");
 
-        scheduler.enqueue(live_nomination(1), &obs);
+        scheduler.enqueue(live_nomination(displaced), &obs);
 
         assert!(
-            scheduler.pending.peek(&displaced).is_some(),
+            scheduler.pending.peek(&test_peer(displaced)).is_some(),
             "the displaced peer re-enters the sample"
         );
         assert_eq!(scheduler.pending_len(), FIRST_AUDIT_PENDING_CAP);
