@@ -474,8 +474,29 @@ pub const AUDIT_SPOTCHECK_COUNT: u32 = 5;
 /// finish well within it.
 pub const SUBTREE_AUDIT_TIMEOUT_LEAF_HINT: usize = 1000;
 
-/// Maximum number of prune-confirmation audit challenges sent per prune pass.
+/// Maximum mature records selected for prune-confirmation auditing per pass.
+///
+/// This bounds local digest/proof bookkeeping independently from the number
+/// of network requests. Keys for the same peer are batched below.
+pub const MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS: usize = 1024;
+
+/// Maximum initial prune-confirmation audit requests sent per pass.
+///
+/// A request may contain multiple keys. Keeping this separate from the
+/// candidate cap prevents the old candidate-to-peer-edge accounting from
+/// limiting a production pass to roughly nine records.
+pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;
+
+/// Legacy candidate-to-peer-edge budget retained for source compatibility.
+///
+/// Pruning no longer uses this value; request and candidate caps are tracked
+/// independently by [`MAX_PRUNE_AUDIT_REQUESTS_PER_PASS`] and
+/// [`MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS`].
 pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
+
+/// Maximum mature records deleted through the complete width-20 fast path per
+/// pass.
+pub const MAX_FAST_PRUNE_DELETIONS_PER_PASS: usize = 2048;
 
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
@@ -594,10 +615,10 @@ impl ReplicationConfig {
                 self.quorum_threshold, self.close_group_size,
             ));
         }
-        if self.close_group_size > MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS {
+        if self.close_group_size > MAX_PRUNE_AUDIT_REQUESTS_PER_PASS {
             return Err(format!(
-                "close_group_size ({}) must be <= MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS ({})",
-                self.close_group_size, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
+                "close_group_size ({}) must be <= MAX_PRUNE_AUDIT_REQUESTS_PER_PASS ({})",
+                self.close_group_size, MAX_PRUNE_AUDIT_REQUESTS_PER_PASS,
             ));
         }
         if self.paid_list_close_group_size == 0 {
@@ -1017,9 +1038,9 @@ mod tests {
     }
 
     #[test]
-    fn close_group_size_exceeding_prune_audit_budget_rejected() {
+    fn close_group_size_exceeding_prune_audit_request_budget_rejected() {
         let config = ReplicationConfig {
-            close_group_size: MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS + 1,
+            close_group_size: MAX_PRUNE_AUDIT_REQUESTS_PER_PASS + 1,
             quorum_threshold: QUORUM_THRESHOLD,
             ..ReplicationConfig::default()
         };
@@ -1027,7 +1048,7 @@ mod tests {
         let err = config.validate().unwrap_err();
 
         assert!(
-            err.contains("MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS"),
+            err.contains("MAX_PRUNE_AUDIT_REQUESTS_PER_PASS"),
             "error should mention prune audit budget: {err}"
         );
     }
@@ -1145,13 +1166,14 @@ mod tests {
         assert_eq!(ReplicationConfig::audit_sample_count(25), 5);
         assert_eq!(ReplicationConfig::audit_sample_count(100), 10);
         assert_eq!(ReplicationConfig::audit_sample_count(1_000), 31);
+        assert_eq!(ReplicationConfig::audit_sample_count(7_000), 83);
         assert_eq!(ReplicationConfig::audit_sample_count(10_000), 100);
         assert_eq!(ReplicationConfig::audit_sample_count(1_000_000), 1_000);
     }
 
     #[test]
     fn responsible_audit_key_limit_matches_audit_sample_count() {
-        for stored_keys in [0, 1, 3, 4, 25, 100, 1_000, 10_000, 1_000_000] {
+        for stored_keys in [0, 1, 3, 4, 25, 100, 1_000, 7_000, 10_000, 1_000_000] {
             assert_eq!(
                 ReplicationConfig::responsible_audit_key_limit(stored_keys),
                 ReplicationConfig::audit_sample_count(stored_keys),

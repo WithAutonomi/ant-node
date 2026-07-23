@@ -95,7 +95,9 @@ fn prune_test_config(close_group_size: usize) -> ReplicationConfig {
     ReplicationConfig {
         close_group_size,
         quorum_threshold: 1,
-        paid_list_close_group_size: 1,
+        // Keep the width-20 view incomplete in the five-node harness so these
+        // tests exercise the remote-audit path rather than the fast path.
+        paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     }
@@ -1258,7 +1260,9 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     let pruner_idx = 3;
     let config = ReplicationConfig {
         close_group_size: PROD_CLOSE_GROUP_SIZE,
-        paid_list_close_group_size: 1,
+        // The ten-node harness cannot complete width 20, so this test remains
+        // specifically about the 6-of-7 remote-proof path.
+        paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     };
