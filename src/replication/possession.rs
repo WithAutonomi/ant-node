@@ -92,6 +92,7 @@ enum PossessionFailureReason {
     Rejected,
 }
 
+#[cfg(any(feature = "logging", test))]
 impl PossessionFailureReason {
     const fn as_str(self) -> &'static str {
         match self {

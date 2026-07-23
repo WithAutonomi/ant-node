@@ -2879,6 +2879,7 @@ enum SerialQueueDropReason {
     Closed,
 }
 
+#[cfg(feature = "logging")]
 impl SerialQueueDropReason {
     const fn as_str(self) -> &'static str {
         match self {
@@ -2889,6 +2890,7 @@ impl SerialQueueDropReason {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
 struct SerialQueueDrop {
     source: PeerId,
     message_class: &'static str,
