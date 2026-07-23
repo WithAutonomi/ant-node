@@ -93,8 +93,11 @@ decision below:
 Constraints inherited from ADR-0002/ADR-0003 and the wider system:
 
 - Wire compatibility: all changes are patch-level; no protocol message shape
-  changes. Oversized requests get a bounded, wire-compatible empty response
-  rather than a new error.
+  changes. Prune confirmation continues using the deployed multi-key
+  `AuditChallenge` / `AuditResponse` variants, including the existing
+  wire-compatible `Rejected { challenge_id, reason }` response for an oversized
+  batch. A rolling upgrade MUST interoperate in both directions with 0.14.4
+  nodes at commit `571868a`.
 - Trust/eviction semantics (ADR-0002, ADR-0003) must not be widened: only
   directly-observed, attributable misbehaviour produces a penalty, and a peer
   that did nothing wrong (e.g. a source whose key we declined for our own churn)
@@ -102,7 +105,8 @@ Constraints inherited from ADR-0002/ADR-0003 and the wider system:
 - The two responsibility widths are fixed knobs shared with ADR-0003:
   `storage_admission_width = close_group_size + STORAGE_ADMISSION_MARGIN` (7 + 2 =
   9) for retention/pruning, and `paid_list_close_group_size` (20) for
-  payment-validity relevance.
+  payment-validity relevance and the widest legitimate client-PUT/fresh-offer
+  storage-admission neighbourhood.
 
 ## Considered Options
 
@@ -338,6 +342,62 @@ timeout / unreachable / send-failure are separated in observability while retain
 wire-compatible evidence semantics; responder admission drops and digest dispatch
 latency are recorded with logging-feature-safe metric labels.
 
+### 11. Drain mature prune backlogs with a wide fast path and request-bounded batching
+
+Prune classification remains attached to `NeighborSyncCycleComplete`: each pass
+scans the local store against a fresh routing-table view and maintains the
+process-local three-day out-of-range hysteresis. Audit execution is not moved to a
+new background worker.
+
+For each stored key, the pass derives three self-inclusive local groups:
+
+- the storage-retention group (`storage_admission_width`, 9);
+- the widest legitimate admission group (`paid_list_close_group_size`, 20); and
+- the strict replica group (`close_group_size`, 7).
+
+A key inside width 9 remains in range and clears its out-of-range timestamp. A key
+continuously outside width 9 for less than `PRUNE_HYSTERESIS_DURATION` remains
+hysteresis-pending. Once mature:
+
+- if a **complete** width-20 lookup contains 20 peers and excludes self, the key is
+  a fast-delete candidate and requires no remote possession audit;
+- otherwise it remains an audited candidate and deletion requires all-but-one
+  positive proofs from the current strict close group (6 of 7 at reference
+  parameters).
+
+The fast path deliberately accepts the durability risk that twenty locally-closer
+peers do not prove any of them actually hold the bytes. Hysteresis protects against
+short-lived responsibility churn, not under-replication. This trade-off is accepted
+to make the widest admission boundary an eventual hard storage boundary instead of
+retaining far-out copies indefinitely.
+
+Both paths require bootstrap to be drained and preserve the retained-commitment
+veto. Immediately before a fast deletion, the node rechecks the full width-20
+lookup, width-9 exclusion, hysteresis, bootstrap state, and commitment state.
+Immediately before an audited deletion, it rechecks width-9 exclusion, hysteresis,
+bootstrap and commitment state, and that the positive proofs still satisfy the
+current strict group. A key that moves outside width 20 during an audit may take the
+fast path after the fast-path revalidation; a key that moves back inside width 9 is
+retained and clears hysteresis.
+
+Remote work is bounded by **actual batched requests and candidates**, not by
+candidate-to-peer edges. A pass selects a rotating, bounded candidate window,
+inverts `candidate -> peers` into `peer -> keys`, deduplicates keys, and chunks each
+peer's list at the existing dynamic sender limit
+`responsible_audit_key_limit(local_stored_keys) =
+max(floor(sqrt(local_stored_keys)), 1)`. Requests retain the deployed key-count
+scaled timeout, global concurrency, and per-peer coordinator limits. A candidate is
+selected only when every request required for its complete proof set fits in the
+pass request budget; partial evidence is not carried across passes.
+
+An older responder may reject a batch because its independently calculated
+`max_incoming_audit_keys(stored_chunks)` is lower. The challenger recognizes the
+deployed size-rejection wording, splits the batch without changing the wire
+message, retries within the same request budget, and never emits a trust penalty
+for that capacity response. Other rejection reasons retain their existing failure
+semantics. No protocol identifier, enum discriminant, message field, digest, nonce,
+or challenge-ID rule changes.
+
 ## Consequences
 
 ### Positive
@@ -362,6 +422,9 @@ latency are recorded with logging-feature-safe metric labels.
 - Sole peers cannot advertise unacknowledged replicas to offload storage for free
   without incurring bounded trust penalties; local audit concurrency no longer
   manufactures false remote-timeout verdicts.
+- Mature records outside a complete width-20 local view are removed in bounded
+  local batches without generating remote audit traffic, while ranks 10-20 gain
+  substantially denser peer-batched audits per request.
 
 ### Negative / Trade-offs
 
@@ -378,6 +441,9 @@ latency are recorded with logging-feature-safe metric labels.
 - **More moving parts.** Task trackers, RAII in-flight guards, reservation
   bookkeeping, and the split heap add mechanism that must be kept correct; several
   new tunables now exist (see below).
+- **Accepted far-copy durability risk.** A complete local width-20 view is a
+  distance statement, not a possession proof. Fast deletion can remove the last
+  surviving copy after hysteresis if replication failed across all closer peers.
 
 ### Neutral / Operational
 
@@ -387,8 +453,12 @@ latency are recorded with logging-feature-safe metric labels.
   (16 permits / 64 MiB), and the four-peer paid-list edge. The two responsibility
   widths (`storage_admission_width` = 9, `paid_list_close_group_size` = 20) are
   unchanged and shared with ADR-0003.
+- Prune passes use bounded candidate, request, and local fast-delete counts. The
+  per-request key count remains dynamic (`floor(sqrt(local_stored_keys))`), and
+  timeouts continue to scale with the actual number of challenged keys.
 - **SemVer: patch.** No wire-format or public-API change; oversized verification
-  requests get a bounded empty response rather than a new error variant.
+  requests retain their deployed response and prune audits retain the deployed
+  multi-key challenge/response representation.
 - Runs alongside ADR-0002's gossip-triggered audit and ADR-0003's full-node
   detection, sharing the same trust/eviction path; the sole-source replica penalty
   is another attributable-misbehaviour source feeding it.
@@ -436,11 +506,18 @@ How we will know this decision remains correct (coverage added in PR #165):
   candidate orphaning.
 - **Audit:** coordinator per-target serialization, cross-peer parallelism, and
   cancellation cleanup.
+- **Pruning:** width-9 hysteresis classification; complete-width-20 fast deletion
+  and incomplete-width-20 audited fallback; bootstrap and commitment deferrals;
+  fast-path and audited TOCTOU revalidation; dynamic square-root peer batches;
+  request-budget admission of complete candidate proof sets; old-responder
+  oversize rejection splitting without trust penalty; rotating fairness; and
+  mixed-version golden wire fixtures against commit `571868a`.
 - **Re-open triggers:** revisit the fresh-offer admission bound if legitimate offers
   are refused under normal load; revisit `CAPACITY_REJECTED_MAX_AGE` if bootstrap
   drains too slowly under real neighbor-sync cadence; revisit the narrowed replica
   repair width if routing skew causes measurable coverage loss the repair path does
-  not heal.
+  not heal; disable or narrow the width-20 fast path if data-availability telemetry
+  shows that the accepted far-copy deletion risk is material.
 
 ## Notes for AI-assisted work
 
