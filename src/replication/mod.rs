@@ -88,6 +88,7 @@ struct FirstAuditObservability {
     coalesced: AtomicU64,
     duplicates: AtomicU64,
     capacity_evicted: AtomicU64,
+    self_target_skipped: AtomicU64,
     cooldown_deferred_attempts: AtomicU64,
     launched: AtomicU64,
     passed: AtomicU64,
@@ -145,15 +146,33 @@ fn first_audit_terminal_outcome(result: &AuditTickResult) -> FirstAuditTerminalO
 enum FirstAuditQueueOutcome {
     Queued,
     Coalesced,
-    CapacityEvicted { peer: PeerId, pin: [u8; 32] },
+    CapacityEvicted {
+        peer: PeerId,
+        pin: [u8; 32],
+    },
+    /// The event targets the local peer itself — dropped, never queued.
+    SelfTargetSkipped,
 }
 
 /// Insert newest-per-peer work while exposing the bounded LRU's otherwise
 /// silent capacity eviction. This preserves `LruCache::put` semantics exactly.
+///
+/// An event targeting the local peer is dropped instead of queued: the
+/// verifier walks every quote in a verified payment and the node's own quote
+/// is one of them, so each verified payment surfaces a self-targeting event.
+/// The node cannot audit itself over the network (there is no dialable address
+/// for the local peer, so the challenge fails instantly and is miscounted as a
+/// timeout), and the pin still receives its deterministic first audit from the
+/// payment's other payees. A self-target is therefore never queued — and hence
+/// never launched nor marked first-audited.
 fn queue_first_audit_event(
     pending: &mut LruCache<PeerId, MonetizedPinEvent>,
     event: MonetizedPinEvent,
+    self_peer: &PeerId,
 ) -> FirstAuditQueueOutcome {
+    if event.peer == *self_peer {
+        return FirstAuditQueueOutcome::SelfTargetSkipped;
+    }
     match pending.push(event.peer, event) {
         None => FirstAuditQueueOutcome::Queued,
         Some((replaced_peer, _)) if replaced_peer == event.peer => {
@@ -911,6 +930,7 @@ impl ReplicationEngine {
         };
         let shutdown = self.shutdown.clone();
         let observability = Arc::new(FirstAuditObservability::default());
+        let self_peer = *self.p2p_node.peer_id();
 
         let handle = tokio::spawn(async move {
             // Bounded dedup of pins that have ALREADY been given their
@@ -961,7 +981,7 @@ impl ReplicationEngine {
                                     e.peer, hex::encode(e.pin), e.key_count, pending.len()
                                 );
                             } else {
-                                match queue_first_audit_event(&mut pending, e) {
+                                match queue_first_audit_event(&mut pending, e, &self_peer) {
                                     FirstAuditQueueOutcome::Queued => {
                                         observability.queued.fetch_add(1, Ordering::Relaxed);
                                         debug!(
@@ -986,6 +1006,15 @@ impl ReplicationEngine {
                                             hex::encode(pin), e.peer, hex::encode(e.pin), pending.len()
                                         );
                                     }
+                                    FirstAuditQueueOutcome::SelfTargetSkipped => {
+                                        observability
+                                            .self_target_skipped
+                                            .fetch_add(1, Ordering::Relaxed);
+                                        debug!(
+                                            "First-audit scheduler: audit_trigger=first_monetized outcome=self_target_skipped peer={} pin={} key_count={} pending={}",
+                                            e.peer, hex::encode(e.pin), e.key_count, pending.len()
+                                        );
+                                    }
                                 }
                             }
                             let mut drained = 1usize;
@@ -998,7 +1027,7 @@ impl ReplicationEngine {
                                                 .duplicates
                                                 .fetch_add(1, Ordering::Relaxed);
                                         } else {
-                                            match queue_first_audit_event(&mut pending, e) {
+                                            match queue_first_audit_event(&mut pending, e, &self_peer) {
                                                 FirstAuditQueueOutcome::Queued => {
                                                     observability
                                                         .queued
@@ -1015,6 +1044,11 @@ impl ReplicationEngine {
                                                         .fetch_add(1, Ordering::Relaxed);
                                                     observability
                                                         .capacity_evicted
+                                                        .fetch_add(1, Ordering::Relaxed);
+                                                }
+                                                FirstAuditQueueOutcome::SelfTargetSkipped => {
+                                                    observability
+                                                        .self_target_skipped
                                                         .fetch_add(1, Ordering::Relaxed);
                                                 }
                                             }
@@ -1034,12 +1068,13 @@ impl ReplicationEngine {
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={}",
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
                         observability.coalesced.load(Ordering::Relaxed),
                         observability.duplicates.load(Ordering::Relaxed),
                         observability.capacity_evicted.load(Ordering::Relaxed),
+                        observability.self_target_skipped.load(Ordering::Relaxed),
                         observability.cooldown_deferred_attempts.load(Ordering::Relaxed),
                         observability.launched.load(Ordering::Relaxed),
                         observability.passed.load(Ordering::Relaxed),
@@ -5553,6 +5588,7 @@ mod tests {
     #[test]
     fn first_audit_queue_exposes_coalescing_and_capacity_eviction() {
         let mut pending = LruCache::new(NonZeroUsize::new(1).unwrap());
+        let self_peer = test_peer(9);
         let first = MonetizedPinEvent {
             peer: test_peer(1),
             pin: [1; 32],
@@ -5570,15 +5606,15 @@ mod tests {
         };
 
         assert_eq!(
-            queue_first_audit_event(&mut pending, first),
+            queue_first_audit_event(&mut pending, first, &self_peer),
             FirstAuditQueueOutcome::Queued
         );
         assert_eq!(
-            queue_first_audit_event(&mut pending, replacement),
+            queue_first_audit_event(&mut pending, replacement, &self_peer),
             FirstAuditQueueOutcome::Coalesced
         );
         assert_eq!(
-            queue_first_audit_event(&mut pending, other_peer),
+            queue_first_audit_event(&mut pending, other_peer, &self_peer),
             FirstAuditQueueOutcome::CapacityEvicted {
                 peer: first.peer,
                 pin: replacement.pin,
@@ -5589,6 +5625,42 @@ mod tests {
             pending.peek(&other_peer.peer).map(|event| event.pin),
             Some([3; 32])
         );
+    }
+
+    /// A verified payment's quote list includes the local node's own quote, so
+    /// the verifier emits a monetized-pin event for the local peer on every
+    /// payment it verifies. The node cannot network-audit itself, so the
+    /// scheduler must drop such an event at ingress: never queued, and hence
+    /// never launched nor marked first-audited.
+    #[test]
+    fn first_audit_queue_drops_self_targeting_events() {
+        let mut pending = LruCache::new(NonZeroUsize::new(4).unwrap());
+        let self_peer = test_peer(1);
+        let self_event = MonetizedPinEvent {
+            peer: self_peer,
+            pin: [7; 32],
+            key_count: 1,
+            quote_ts: SystemTime::now(),
+        };
+
+        assert_eq!(
+            queue_first_audit_event(&mut pending, self_event, &self_peer),
+            FirstAuditQueueOutcome::SelfTargetSkipped
+        );
+        assert!(pending.is_empty());
+
+        // A remote peer's event still queues normally under the same filter.
+        let remote_event = MonetizedPinEvent {
+            peer: test_peer(2),
+            pin: [8; 32],
+            ..self_event
+        };
+        assert_eq!(
+            queue_first_audit_event(&mut pending, remote_event, &self_peer),
+            FirstAuditQueueOutcome::Queued
+        );
+        assert_eq!(pending.len(), 1);
+        assert!(pending.peek(&self_peer).is_none());
     }
 
     #[test]
