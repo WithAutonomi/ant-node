@@ -501,3 +501,42 @@ of a peer missing fraction `x` of committed bytes is ~`1-(1-x)^k` dispersed
 clustered, compounding across the fleet's per-peer audit rate. Proposed
 target, pending an adversarial staging run with hash-retaining deleters:
 at least 99% detection within 24 hours for at least 1% missing bytes.
+
+## Amendment 4 (2026-07-23): pending admission is sized to the launch budget
+
+Amendment 3 stopped dead entries from squatting the queue, but admission
+itself was still unbounded relative to the budget: `pending` shared the
+4096-entry commitment-cache cap while the token bucket can launch at most
+~32 audits inside one effective answerability window (150 min of
+eligibility at one token per 5 minutes, plus a burst of 2). At the
+2026-07-17 staging arrival rate (~113 admitted nominations per node-hour
+against ~12 launches) over 99% of admitted work could never launch: the
+queue was an aging backlog whose entries mostly expired, and the
+`pending` / `oldest_pending_quote_age_ms` telemetry measured the backlog's
+age rather than schedulable work.
+
+`pending` is now capped at `FIRST_AUDIT_PENDING_CAP`, derived from the same
+constants that define the budget and the window
+(`(GOSSIP_ANSWERABILITY_TTL − MONETIZED_AUDIT_SKEW_MARGIN) /
+FIRST_AUDIT_LAUNCH_INTERVAL + FIRST_AUDIT_BUDGET_BURST`, currently 32), so
+retuning either side re-sizes admission automatically. At capacity the LRU
+displaces the least-recently-refreshed entry, accounted as
+`capacity_evicted` — now the steady overload signal — and the summary line
+reports `pending_cap` so occupancy is a first-class dashboard quantity.
+
+Keep-newest displacement is deliberate. Under overload the queue degrades
+to a budget-sized rolling sample biased toward fresh nominations, so the
+newest-first lane keeps its prompt-audit deterrence: a cheater's fresh pin
+always enters the sample and retains an unpredictable chance of
+near-immediate audit. Refusing new admissions at capacity would invert
+that — a sustained payment flood would keep the queue full and guarantee
+every later pin (including the flooder's next target) is never admitted.
+Displacement stamps no suppression state, so a displaced peer's next
+nomination is judged like any newcomer. Under light load (arrivals below
+the drain rate) the cap is not reached and coverage remains exhaustive.
+
+Coverage semantics are otherwise unchanged from Amendments 2-3: a budgeted
+probabilistic exam backstopped by the gossip-lottery path. What changes is
+the honesty of the funnel — admitted now approximates launchable, and
+overflow is explicit at admission time (`capacity_evicted`) instead of
+surfacing hours later as mass expiry (`outside_answerability_window`).

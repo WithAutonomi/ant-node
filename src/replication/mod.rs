@@ -501,7 +501,10 @@ struct FirstAuditScheduler {
     /// (a real send), never at reservation, so a cancelled reservation can be
     /// re-nominated.
     first_audited: LruCache<[u8; 32], ()>,
-    /// Newest-per-peer pending nominations not yet launched.
+    /// Newest-per-peer pending nominations not yet launched. Capped at
+    /// [`FIRST_AUDIT_PENDING_CAP`] (what the token budget can launch within
+    /// one effective answerability window); at capacity the least-recently
+    /// refreshed entry is displaced and counted as `capacity_evicted`.
     pending: LruCache<PeerId, MonetizedPinEvent>,
     /// Token bucket + per-peer re-audit window.
     limiter: FirstAuditLimiter,
@@ -525,10 +528,11 @@ struct FirstAuditScheduler {
 
 impl FirstAuditScheduler {
     fn new(now: Instant, self_peer: PeerId) -> Self {
-        let cap = NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN);
+        let dedup_cap = NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN);
+        let pending_cap = NonZeroUsize::new(FIRST_AUDIT_PENDING_CAP).unwrap_or(NonZeroUsize::MIN);
         Self {
-            first_audited: LruCache::new(cap),
-            pending: LruCache::new(cap),
+            first_audited: LruCache::new(dedup_cap),
+            pending: LruCache::new(pending_cap),
             limiter: FirstAuditLimiter::new(now),
             reserved: None,
             oldest_first_lane: false,
@@ -610,13 +614,17 @@ impl FirstAuditScheduler {
 
     /// Admit a monetized nomination into `pending`. Dropped at ingress if it
     /// targets the local peer (see [`Self::self_peer`]); dropped as a duplicate
-    /// if already first-audited; the window screen is bypassed for the
-    /// currently reserved peer (so a successor is retained across the
-    /// reservation, never window-dropped); otherwise window-screened.
-    /// Coalescing is highest-count-per-peer (newest on a tie) — a lower-count
-    /// successor never displaces a higher-count pending pin. An incumbent that
-    /// has aged past the answerability horizon is dropped (and accounted as an
-    /// expiry) before coalescing, so a dead pin never vetoes a live nomination.
+    /// if already first-audited; the window screen is bypassed for the currently
+    /// reserved peer (so a successor is retained across the reservation, never
+    /// window-dropped); otherwise window-screened. Coalescing is
+    /// highest-count-per-peer (newest on a tie) — a lower-count successor never
+    /// displaces a higher-count pending pin. An incumbent that has aged past
+    /// the answerability horizon is dropped (and accounted as an expiry) before
+    /// coalescing, so a dead pin never vetoes a live nomination. Admission for
+    /// a NEW peer at capacity displaces the least-recently-refreshed entry
+    /// (see [`FIRST_AUDIT_PENDING_CAP`]): displacement is accounted as
+    /// `capacity_evicted` and stamps no suppression, so a displaced peer's
+    /// next nomination is judged like any newcomer.
     fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
         if event.peer == self.self_peer {
             obs.self_target_skipped.fetch_add(1, Ordering::Relaxed);
@@ -996,6 +1004,43 @@ const COMMITMENT_SIG_VERIFY_MIN_INTERVAL: Duration = Duration::from_secs(60);
 /// commitments from peers currently in the routing table — together
 /// the cap is the third line of defence against sybil/churn flooding.
 const MAX_LAST_COMMITMENT_BY_PEER: usize = 4096;
+
+/// ADR-0004 Amendment 4: admission cap for the first-audit pending queue,
+/// sized to the launch budget instead of the commitment cache.
+///
+/// The token bucket can launch at most one audit per
+/// [`config::FIRST_AUDIT_LAUNCH_INTERVAL`] (plus the
+/// [`config::FIRST_AUDIT_BUDGET_BURST`] allowance), and a pending pin stays
+/// launchable for at most the effective answerability window
+/// ([`GOSSIP_ANSWERABILITY_TTL`] − [`MONETIZED_AUDIT_SKEW_MARGIN`]). Any
+/// occupancy beyond `window / interval + burst` is work that cannot launch
+/// before it expires, so admitting it only builds an aging backlog whose
+/// telemetry measures the backlog instead of schedulable work.
+///
+/// At capacity `LruCache::push` displaces the least-recently-refreshed entry
+/// (counted as `capacity_evicted`). Keep-newest is deliberate: under overload
+/// `pending` degrades to a budget-sized rolling sample biased toward fresh
+/// nominations, so the newest-first lane keeps its prompt-audit deterrence —
+/// a fresh pin always enters the sample with an unpredictable chance of
+/// near-immediate audit — whereas refusing at the door would let a sustained
+/// payment flood guarantee that every later pin is never admitted.
+#[allow(clippy::cast_possible_truncation)] // bounded by TTL-secs/interval-secs + burst (~32)
+const FIRST_AUDIT_PENDING_CAP: usize = {
+    let cutoff_secs = GOSSIP_ANSWERABILITY_TTL
+        .as_secs()
+        .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN.as_secs());
+    // Compile-time division-by-zero if the launch interval is ever zeroed:
+    // a zero interval makes the budget (and this cap) meaningless.
+    let launchable = cutoff_secs / config::FIRST_AUDIT_LAUNCH_INTERVAL.as_secs();
+    (launchable + config::FIRST_AUDIT_BUDGET_BURST as u64) as usize
+};
+
+// Compile-time guardrails: the cap must be a usable `LruCache` capacity and
+// strictly tighter than the commitment-cache bound it replaced.
+const _: () = {
+    assert!(FIRST_AUDIT_PENDING_CAP >= 1);
+    assert!(FIRST_AUDIT_PENDING_CAP < MAX_LAST_COMMITMENT_BY_PEER);
+};
 
 /// Cap on the sticky `ever_capable_peers` set. Bounds memory so a
 /// long-running bootstrap node cannot have the set grow without limit
@@ -1817,7 +1862,7 @@ impl ReplicationEngine {
                         );
                     }
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} pending_cap={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
@@ -1838,6 +1883,7 @@ impl ReplicationEngine {
                         observability.insufficient_keys.load(Ordering::Relaxed),
                         observability.outside_answerability_window.load(Ordering::Relaxed),
                         scheduler.pending_len(),
+                        FIRST_AUDIT_PENDING_CAP,
                         scheduler.oldest_pending_quote_age_ms(SystemTime::now()),
                         observability.inflight.load(Ordering::Relaxed),
                         scheduler.tokens(),
@@ -6640,6 +6686,117 @@ mod tests {
         );
         assert_eq!(obs.suppressed_lower.load(Ordering::Relaxed), 1);
         assert_eq!(obs.outside_answerability_window.load(Ordering::Relaxed), 0);
+    }
+
+    /// A fresh nomination for peer `b` (distinct pin per peer).
+    fn live_nomination(b: u8) -> MonetizedPinEvent {
+        MonetizedPinEvent {
+            peer: test_peer(b),
+            pin: [b; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        }
+    }
+
+    /// The pending admission cap must equal what the token budget can launch
+    /// inside one effective answerability window (plus burst): any larger and
+    /// admitted work is guaranteed to expire unlaunched; any smaller and the
+    /// budget idles while nominations are refused.
+    #[test]
+    fn first_audit_pending_cap_matches_window_budget() {
+        let cutoff_secs = GOSSIP_ANSWERABILITY_TTL
+            .saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN)
+            .as_secs();
+        let expected = usize::try_from(
+            cutoff_secs / config::FIRST_AUDIT_LAUNCH_INTERVAL.as_secs()
+                + u64::from(config::FIRST_AUDIT_BUDGET_BURST),
+        )
+        .expect("cap fits usize");
+        assert_eq!(FIRST_AUDIT_PENDING_CAP, expected);
+    }
+
+    /// The pending queue is sized to the launch budget while the dedup set
+    /// keeps the commitment-cache bound: shrinking `first_audited` would
+    /// forget audited pins and re-admit duplicates.
+    #[test]
+    fn first_audit_pending_cap_independent_of_dedup_cap() {
+        let scheduler = FirstAuditScheduler::new(Instant::now());
+        assert_eq!(scheduler.pending.cap().get(), FIRST_AUDIT_PENDING_CAP);
+        assert_eq!(
+            scheduler.first_audited.cap().get(),
+            MAX_LAST_COMMITMENT_BY_PEER
+        );
+    }
+
+    /// Admission beyond the cap displaces the least-recently-refreshed entry
+    /// (keep-newest sampling) and is accounted as `capacity_evicted` — the
+    /// steady overload signal — never silent loss.
+    #[test]
+    fn first_audit_admission_beyond_cap_displaces_oldest_and_counts() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let overflow: usize = 5;
+        let total = FIRST_AUDIT_PENDING_CAP + overflow;
+
+        for i in 0..total {
+            let b = u8::try_from(i + 1).expect("test peer count fits u8");
+            scheduler.enqueue(live_nomination(b), &obs);
+        }
+
+        assert_eq!(scheduler.pending_len(), FIRST_AUDIT_PENDING_CAP);
+        assert_eq!(
+            obs.capacity_evicted.load(Ordering::Relaxed),
+            u64::try_from(overflow).expect("overflow fits u64"),
+            "each admission past the cap displaces exactly one entry"
+        );
+        assert_eq!(
+            obs.queued.load(Ordering::Relaxed),
+            u64::try_from(total).expect("total fits u64"),
+            "displacement is not an admission refusal"
+        );
+        for i in 0..overflow {
+            let b = u8::try_from(i + 1).expect("test peer count fits u8");
+            assert!(
+                scheduler.pending.peek(&test_peer(b)).is_none(),
+                "oldest-admitted entries are the displaced ones"
+            );
+        }
+        for i in overflow..total {
+            let b = u8::try_from(i + 1).expect("test peer count fits u8");
+            assert!(
+                scheduler.pending.peek(&test_peer(b)).is_some(),
+                "newest entries survive as the budget-sized sample"
+            );
+        }
+    }
+
+    /// Displacement stamps no suppression state: a displaced peer's next
+    /// nomination re-enters like any newcomer (it is NOT window-deduped or
+    /// treated as a duplicate), so under overload every peer keeps an
+    /// unpredictable chance of prompt first audit.
+    #[test]
+    fn first_audit_displaced_peer_may_be_renominated() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let total = FIRST_AUDIT_PENDING_CAP + 1;
+
+        for i in 0..total {
+            let b = u8::try_from(i + 1).expect("test peer count fits u8");
+            scheduler.enqueue(live_nomination(b), &obs);
+        }
+        let displaced = test_peer(1);
+        assert!(scheduler.pending.peek(&displaced).is_none());
+
+        scheduler.enqueue(live_nomination(1), &obs);
+
+        assert!(
+            scheduler.pending.peek(&displaced).is_some(),
+            "the displaced peer re-enters the sample"
+        );
+        assert_eq!(scheduler.pending_len(), FIRST_AUDIT_PENDING_CAP);
+        assert_eq!(obs.capacity_evicted.load(Ordering::Relaxed), 2);
+        assert_eq!(obs.duplicates.load(Ordering::Relaxed), 0);
+        assert_eq!(obs.window_deduped.load(Ordering::Relaxed), 0);
     }
 
     /// The periodic sweep collects expired pending entries even when the token
