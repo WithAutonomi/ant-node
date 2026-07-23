@@ -15,9 +15,32 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::time::{Duration, SystemTime};
+
 use super::TestHarness;
 use ant_node::replication::audit::AuditTickResult;
+use ant_node::replication::{FirstAuditStats, MonetizedPinEvent, ReplicationEngine};
 use serial_test::serial;
+use tokio::time::sleep;
+
+/// Poll `engine`'s first-audit scheduler counters until `done(stats)` holds or
+/// `deadline` elapses; returns the last snapshot either way. The drainer is a
+/// live background task, so tests observe it converge instead of sleeping a
+/// fixed amount.
+async fn wait_for_first_audit_stats(
+    engine: &ReplicationEngine,
+    deadline: Duration,
+    done: impl Fn(&FirstAuditStats) -> bool,
+) -> FirstAuditStats {
+    let start = std::time::Instant::now();
+    loop {
+        let stats = engine.first_audit_stats();
+        if done(&stats) || start.elapsed() >= deadline {
+            return stats;
+        }
+        sleep(Duration::from_millis(200)).await;
+    }
+}
 
 /// Store the same `n` chunks on both `a` (the audited holder) and `b` (the
 /// auditor — NOT because verification needs them: round 2 demands the bytes
@@ -154,6 +177,125 @@ async fn data_deleting_node_fails_subtree_audit() {
     assert!(
         matches!(result, AuditTickResult::Failed { .. }),
         "a node that deleted its committed data must FAIL the audit, got {result:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// SELF FILTER: a monetized-pin event targeting the node's own peer ID (the
+/// payment verifier emits one for every payment it verifies, because the
+/// node's own quote is in the payment's quote list) must be dropped by the
+/// live first-audit drainer at ingress — never queued, never launched — and
+/// counted as `self_target_skipped`.
+///
+/// Without the filter this exact scenario launches an audit the node addresses
+/// to itself; the dial fails instantly with `Peer not found` and is miscounted
+/// as a subtree audit timeout.
+#[tokio::test]
+#[serial]
+async fn first_audit_drainer_drops_self_targeting_monetized_pin() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+
+    let node = harness.test_node(4).expect("node");
+    let engine = node.replication_engine.as_ref().expect("engine");
+    let self_peer = *node.p2p_node.as_ref().expect("p2p").peer_id();
+
+    let before = engine.first_audit_stats();
+    assert_eq!(before.received, 0, "no events expected before injection");
+
+    engine
+        .monetized_pin_sender()
+        .send(MonetizedPinEvent {
+            peer: self_peer,
+            pin: [0x42; 32],
+            key_count: 8,
+            quote_ts: SystemTime::now(),
+        })
+        .expect("drainer alive");
+
+    let stats = wait_for_first_audit_stats(engine, Duration::from_secs(10), |s| {
+        s.received >= 1 && s.self_target_skipped >= 1
+    })
+    .await;
+
+    assert_eq!(stats.received, 1, "drainer must have ingested the event");
+    assert_eq!(
+        stats.self_target_skipped, 1,
+        "a self-targeting event must be counted as skipped, got {stats:?}"
+    );
+    assert_eq!(
+        stats.queued, 0,
+        "a self-targeting event must never enter the pending queue, got {stats:?}"
+    );
+    assert_eq!(
+        stats.launched, 0,
+        "the scheduler must never launch an audit against the local peer, got {stats:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// REMOTE STILL AUDITED: the same injection for a REMOTE peer's real
+/// commitment passes through the self filter, gets queued, launches over the
+/// live wire, and completes as a passed first audit — proving the filter does
+/// not suppress the deterministic first audit of legitimate monetized pins.
+#[tokio::test]
+#[serial]
+async fn first_audit_drainer_launches_and_passes_remote_monetized_pin() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (a_idx, b_idx) = (1, 2);
+    commit_and_seed(&harness, a_idx, b_idx, 64).await;
+
+    let a = harness.test_node(a_idx).expect("a");
+    let a_peer = *a.p2p_node.as_ref().expect("a p2p").peer_id();
+    let a_built = a
+        .replication_engine
+        .as_ref()
+        .expect("a engine")
+        .commitment_state()
+        .current()
+        .expect("a has a commitment");
+    let (a_pin, a_key_count) = (a_built.hash(), a_built.commitment().key_count);
+
+    let b_engine = harness
+        .test_node(b_idx)
+        .expect("b")
+        .replication_engine
+        .as_ref()
+        .expect("b engine");
+
+    b_engine
+        .monetized_pin_sender()
+        .send(MonetizedPinEvent {
+            peer: a_peer,
+            pin: a_pin,
+            key_count: a_key_count,
+            quote_ts: SystemTime::now(),
+        })
+        .expect("drainer alive");
+
+    let stats = wait_for_first_audit_stats(b_engine, Duration::from_secs(120), |s| {
+        s.passed >= 1 || s.timed_out >= 1 || s.failed >= 1
+    })
+    .await;
+
+    assert_eq!(
+        stats.self_target_skipped, 0,
+        "a remote event must not be misfiltered, got {stats:?}"
+    );
+    assert_eq!(
+        stats.queued, 1,
+        "remote event must be queued, got {stats:?}"
+    );
+    assert_eq!(
+        stats.launched, 1,
+        "remote event must launch an audit, got {stats:?}"
+    );
+    assert_eq!(
+        stats.passed, 1,
+        "the live-wire first audit of an honest holder must pass, got {stats:?}"
     );
 
     harness.teardown().await.expect("teardown");

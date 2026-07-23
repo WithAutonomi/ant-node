@@ -101,6 +101,30 @@ struct FirstAuditObservability {
     inflight: AtomicU64,
 }
 
+/// Test-only snapshot of the first-audit scheduler counters.
+///
+/// Lets e2e tests assert on the scheduler's decisions (e.g. that a
+/// self-targeting monetized pin was dropped and never launched) instead of
+/// scraping log lines.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy)]
+pub struct FirstAuditStats {
+    /// Events ingested from the monetized-pin channel.
+    pub received: u64,
+    /// Events accepted into the pending first-audit queue.
+    pub queued: u64,
+    /// Events dropped because they targeted the local peer.
+    pub self_target_skipped: u64,
+    /// Audits launched.
+    pub launched: u64,
+    /// Launched audits that passed.
+    pub passed: u64,
+    /// Launched audits that timed out (non-response lane).
+    pub timed_out: u64,
+    /// Launched audits that ended in a confirmed failure.
+    pub failed: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstAuditTerminalOutcome {
     Passed,
@@ -162,8 +186,9 @@ enum FirstAuditQueueOutcome {
 /// is one of them, so each verified payment surfaces a self-targeting event.
 /// The node cannot audit itself over the network (there is no dialable address
 /// for the local peer, so the challenge fails instantly and is miscounted as a
-/// timeout), and the pin still receives its deterministic first audit from the
-/// payment's other payees. A self-target is therefore never queued — and hence
+/// timeout), while any other payee that verifies the same payment schedules its
+/// own deterministic first audit of this node's pin — a self-dial adds no
+/// coverage either way. A self-target is therefore never queued — and hence
 /// never launched nor marked first-audited.
 fn queue_first_audit_event(
     pending: &mut LruCache<PeerId, MonetizedPinEvent>,
@@ -472,6 +497,10 @@ pub struct ReplicationEngine {
     /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
     monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
+    /// Counters shared with the first-audit drainer task, so the scheduler's
+    /// decisions (queued / launched / self-target skipped / outcome) stay
+    /// observable from the engine after the drainer takes the receiver.
+    first_audit_observability: Arc<FirstAuditObservability>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -542,6 +571,7 @@ impl ReplicationEngine {
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
             monetized_pin_rx: Some(monetized_pin_rx),
+            first_audit_observability: Arc::new(FirstAuditObservability::default()),
             shutdown,
             task_handles: Vec::new(),
         };
@@ -656,6 +686,24 @@ impl ReplicationEngine {
             Some(&credit),
         )
         .await
+    }
+
+    /// Test-only: snapshot the first-audit scheduler's counters. Lets e2e
+    /// tests assert what the live drainer decided for an injected
+    /// [`MonetizedPinEvent`] (dropped as self-target vs queued and launched).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn first_audit_stats(&self) -> FirstAuditStats {
+        let o = &self.first_audit_observability;
+        FirstAuditStats {
+            received: o.received.load(Ordering::Relaxed),
+            queued: o.queued.load(Ordering::Relaxed),
+            self_target_skipped: o.self_target_skipped.load(Ordering::Relaxed),
+            launched: o.launched.load(Ordering::Relaxed),
+            passed: o.passed.load(Ordering::Relaxed),
+            timed_out: o.timed_out.load(Ordering::Relaxed),
+            failed: o.failed.load(Ordering::Relaxed),
+        }
     }
 
     /// Test-only: run the possession check immediately for `key` against
@@ -929,7 +977,7 @@ impl ReplicationEngine {
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
         };
         let shutdown = self.shutdown.clone();
-        let observability = Arc::new(FirstAuditObservability::default());
+        let observability = Arc::clone(&self.first_audit_observability);
         let self_peer = *self.p2p_node.peer_id();
 
         let handle = tokio::spawn(async move {
