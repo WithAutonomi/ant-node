@@ -6496,14 +6496,16 @@ async fn rebuild_and_rotate_commitment(
     // the Merkle root commits to the SET OF KEYS, not to the bytes. The
     // commitment therefore binds "which keys I claim to hold"; it does NOT
     // by itself prove byte possession. Byte possession is enforced by the
-    // audit-verify path, which recomputes `bytes_hash == BLAKE3(local_bytes)`
-    // and the per-key digest against the AUDITOR'S OWN local copy of the
-    // bytes — so a responder that holds the key list but dropped the bytes
-    // still fails (`missing bytes for committed key` / digest mismatch).
-    // This is sound ONLY while keys are content addresses. If this module
-    // is ever reused for non-content-addressed records (`bytes_hash != key`),
-    // the `(k, k)` shortcut would let a byte-less node forge a valid root and
-    // MUST be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
+    // round-2 slice audit: a Bao verified slice decoded against the chunk
+    // ADDRESS plus a keyed nonced block-tree opening under a fresh per-audit
+    // nonce, so a responder that holds the key list but dropped the bytes
+    // cannot answer. This is sound ONLY while keys are content addresses;
+    // the round-1 verifier enforces `bytes_hash == key` on every audited leaf
+    // (`evaluate_subtree_structure`), so a non-content-addressed
+    // `(key, bytes_hash)` leaf is rejected rather than letting a byte-less node
+    // earn credit for `key`. If this module is ever reused for
+    // non-content-addressed records, that `(k, k)` shortcut AND the verifier
+    // gate must be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
     let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
 
     // No-op-rotation guard: compute just the Merkle root from `entries`

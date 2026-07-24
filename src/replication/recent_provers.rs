@@ -313,6 +313,36 @@ mod tests {
     }
 
     #[test]
+    fn forget_peer_drops_credit_across_all_commitments() {
+        // A confirmed audit failure (e.g. a `ResponsiveBootstrap` on a stale pin
+        // H1) revokes ALL of the peer's holder credit, INCLUDING credit earned
+        // under a newer commitment H2: the contradiction is identity-level, not
+        // scoped to one key set. Another peer's credit is untouched.
+        let mut cache = RecentProvers::new();
+        let now = Instant::now();
+        let h1 = hash(0x11);
+        let h2 = hash(0x22);
+        cache.record_proof(key(1), peer(1), h1, now);
+        cache.record_proof(key(2), peer(1), h2, now);
+        cache.record_proof(key(1), peer(2), h1, now);
+
+        cache.forget_peer(&peer(1));
+
+        assert!(
+            !cache.is_credited_holder(&key(1), &peer(1), &h1),
+            "H1 credit dropped"
+        );
+        assert!(
+            !cache.is_credited_holder(&key(2), &peer(1), &h2),
+            "H2 credit dropped too (peer-wide, not pin-scoped)"
+        );
+        assert!(
+            cache.is_credited_holder(&key(1), &peer(2), &h1),
+            "another peer's credit is preserved"
+        );
+    }
+
+    #[test]
     fn forget_commitment_drops_only_matching_entries() {
         let mut cache = RecentProvers::new();
         let now = Instant::now();

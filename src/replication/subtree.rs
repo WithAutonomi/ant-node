@@ -44,10 +44,12 @@ pub const SMALL_TREE_FULL_AUDIT_FLOOR: u32 = 4;
 pub struct SubtreeLeaf {
     /// The committed key (chunk address) at this leaf position.
     pub key: XorName,
-    /// `BLAKE3(record_bytes)` — the plain content hash. This is also the
-    /// chunk's network address, so it is public; possessing it does NOT prove
-    /// possession of the bytes (that is what `nonced_root` is for). It is also
-    /// the BLAKE3/Bao root the round-2 slice verifies against.
+    /// `BLAKE3(record_bytes)` — the plain content hash. For a content-addressed
+    /// chunk this EQUALS `key` (the address IS the content hash), and the round-1
+    /// verifier enforces `bytes_hash == key` so credit for `key` cannot be earned
+    /// by proving possession of unrelated bytes. It is public; possessing it does
+    /// NOT prove possession of the bytes (that is what `nonced_root` is for). It is
+    /// also the BLAKE3/Bao root the round-2 slice verifies against.
     pub bytes_hash: [u8; 32],
     /// Length of the chunk's content, in bytes. Lets the auditor draw a random
     /// 1 KiB block index in range and size the Bao slice for the final (short)
@@ -121,7 +123,8 @@ fn tree_depth(key_count: u32) -> Option<u32> {
 /// leaves. Pure function of geometry — identical on auditor and responder.
 ///
 /// `span = 2^(total_depth - depth)`; the node covers `[slot*span, (slot+1)*span)`
-/// clamped to `0..key_count`.
+/// clamped to `0..key_count`. Test-only geometry helper.
+#[cfg(test)]
 #[must_use]
 fn real_leaves_under(depth: u32, slot: u64, key_count: u32, total_depth: u32) -> u32 {
     let levels_below = total_depth - depth;
@@ -157,27 +160,44 @@ fn sqrt_floor(key_count: u32) -> u32 {
     u32::try_from(ceil.max(1)).unwrap_or(u32::MAX)
 }
 
-/// Read bit `index` of the nonce (bit 0 = MSB of byte 0), `index` 0-based.
-///
-/// `1 → left child, 0 → right child` (ADR). With a 256-bit nonce and a tree
-/// depth ≤ 20 we never run out of bits.
+/// A stable `u64` drawn from the first 8 bytes of the nonce, used to pick the
+/// subtree slot uniformly. The nonce is fresh CSPRNG per audit, so modulo bias
+/// over the small slot count (≤ ~1000) is negligible.
 #[must_use]
-fn nonce_bit(nonce: &[u8; 32], index: u32) -> bool {
-    let byte = (index / 8) as usize;
-    let bit = 7 - (index % 8);
-    // byte < 32 because index < 256 for any reachable depth; guard anyway.
-    nonce.get(byte).is_some_and(|b| (b >> bit) & 1 == 1)
+fn nonce_u64(nonce: &[u8; 32]) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&nonce[..8]);
+    u64::from_le_bytes(b)
+}
+
+/// The largest real-leaf count any selected subtree can have for `key_count`.
+///
+/// A full fixed-depth block of `next_power_of_two(ceil(sqrt(key_count)))` leaves.
+/// Bounds a single round-1 request's read/hash work (≤ 1024 leaves at the
+/// `MAX_COMMITMENT_KEY_COUNT` cap). Used both to size selection and as a
+/// pre-read defense-in-depth ceiling in [`subtree_plan`].
+#[must_use]
+pub fn max_subtree_leaves(key_count: u32) -> u32 {
+    if key_count <= SMALL_TREE_FULL_AUDIT_FLOOR {
+        return key_count;
+    }
+    sqrt_floor(key_count).next_power_of_two()
 }
 
 /// Deterministically select one contiguous subtree from `(nonce, key_count)`.
 ///
-/// Walks the nonce bits from the root, descending into the child the bit picks,
-/// and **stops at the smallest branch whose real-leaf count is still ≥
-/// `ceil(sqrt(key_count))`**. Because an all-padding child has zero real leaves
-/// (< the floor), the walk never descends into one — so the selection always
-/// covers ≥ `sqrt` real leaves and is never empty (ADR dead-block fix).
+/// Picks one **fixed-depth block** of `span = next_power_of_two(ceil(sqrt(N)))`
+/// leaves, choosing the block uniformly by `nonce_u64 % slot_count`. Every block
+/// (including the short tail) is selectable with roughly equal probability, so
+/// the whole tree is covered over many audits, and a single request always reads
+/// at most `span` (≤ ~sqrt(N), ≤ 1024 at the cap) leaves — regardless of the
+/// nonce. This replaces the old nonce-bit descent, whose stop-at-parent rule let
+/// an adversarial nonce select a subtree far larger than `sqrt(N)` (up to the
+/// whole tree at `2^k + 1`), an unbounded round-1 work amplification.
 ///
-/// For `key_count <= SMALL_TREE_FULL_AUDIT_FLOOR` the whole tree is selected.
+/// Unpredictability is preserved: the responder cannot know the selected slot
+/// until it receives the fresh nonce. For `key_count <= SMALL_TREE_FULL_AUDIT_FLOOR`
+/// the whole tree is selected.
 ///
 /// Returns `None` only for an out-of-protocol `key_count` (caller rejects).
 #[must_use]
@@ -194,36 +214,28 @@ pub fn select_subtree_path(nonce: &[u8; 32], key_count: u32) -> Option<SubtreePa
         });
     }
 
-    let floor = sqrt_floor(key_count);
-    let mut depth = 0u32;
-    let mut slot = 0u64; // slot within the current level
+    // Fixed block size >= sqrt(N), aligned to a tree level so the block IS a
+    // single subtree node at `depth = total_depth - log2(span)`.
+    let span = sqrt_floor(key_count).next_power_of_two();
+    let span_log2 = span.trailing_zeros();
+    // span <= next_power_of_two(key_count) == 2^total_depth, so span_log2 <=
+    // total_depth and depth is non-negative.
+    let depth = total_depth.saturating_sub(span_log2);
+    let slot_count = key_count.div_ceil(span);
+    let slot = u32::try_from(nonce_u64(nonce) % u64::from(slot_count)).unwrap_or(0);
 
-    // Descend while the chosen child still meets the floor.
-    while depth < total_depth {
-        let go_left = nonce_bit(nonce, depth);
-        // 1 = left child (bit set), 0 = right child. Right child is the odd slot.
-        let child_slot = slot * 2 + u64::from(!go_left);
-        let child_real = real_leaves_under(depth + 1, child_slot, key_count, total_depth);
-        if child_real < floor {
-            break; // descending would drop below the floor → stay here
-        }
-        depth += 1;
-        slot = child_slot;
-    }
-
-    let span = 1u64 << (total_depth - depth);
-    let leaf_start =
-        u32::try_from(slot.saturating_mul(span).min(u64::from(key_count))).unwrap_or(key_count);
-    let leaf_end = u32::try_from(
-        slot.saturating_add(1)
-            .saturating_mul(span)
+    let span64 = u64::from(span);
+    let leaf_start = u32::try_from(
+        u64::from(slot)
+            .saturating_mul(span64)
             .min(u64::from(key_count)),
     )
     .unwrap_or(key_count);
+    let leaf_end = leaf_start.saturating_add(span).min(key_count);
 
     Some(SubtreePath {
         depth,
-        slot: u32::try_from(slot).unwrap_or(u32::MAX),
+        slot,
         leaf_start,
         leaf_end,
     })
@@ -507,6 +519,14 @@ pub fn subtree_plan(
     let key_count = tree.key_count();
     let path = select_subtree_path(nonce, key_count).ok_or(BuildProofError::BadKeyCount)?;
 
+    // Defense-in-depth: the fixed-depth selection already bounds this to one
+    // block of `max_subtree_leaves` leaves, but reject BEFORE any leaf read if a
+    // future selection change ever produced an oversized subtree, so one request
+    // can never force unbounded round-1 read/hash work.
+    if path.real_leaf_count() > max_subtree_leaves(key_count) {
+        return Err(BuildProofError::BadKeyCount);
+    }
+
     let mut leaf_keys = Vec::with_capacity(path.real_leaf_count() as usize);
     for idx in path.leaf_start..path.leaf_end {
         let key = tree
@@ -515,17 +535,16 @@ pub fn subtree_plan(
         leaf_keys.push(key);
     }
 
-    // Sibling cut-hashes, root-first. At descent step `d` (0-based from the
-    // root), the chosen child is on the side the nonce bit picks; the sibling
-    // is the other child at level `total_depth - (d + 1)` (counting up from
-    // leaves). On an odd-length level the missing sibling self-pairs, i.e. the
-    // sibling hash is the chosen node itself.
+    // Sibling cut-hashes, root-first. The fixed-depth slot selection no longer
+    // follows a per-level nonce walk, so derive the on-path node at each level
+    // from `path.slot`'s prefix bits: the top `d + 1` bits give the node index at
+    // level `d + 1` below the root. The sibling is the other child at level
+    // `total_depth - (d + 1)` (counting up from leaves); on an odd level the
+    // missing sibling self-pairs (the chosen node is its own sibling).
     let total_depth = u32::try_from(tree.levels_count().saturating_sub(1)).unwrap_or(0);
     let mut sibling_cut_hashes = Vec::with_capacity(path.depth as usize);
-    let mut slot = 0u64;
     for d in 0..path.depth {
-        let go_left = nonce_bit(nonce, d);
-        let child = slot * 2 + u64::from(!go_left);
+        let child = u64::from(path.slot) >> (path.depth - (d + 1));
         let sibling = child ^ 1;
         let level_from_leaves = (total_depth - (d + 1)) as usize;
         let chosen_hash = tree.node_at(level_from_leaves, child);
@@ -534,7 +553,6 @@ pub fn subtree_plan(
             .or(chosen_hash)
             .ok_or(BuildProofError::BadKeyCount)?;
         sibling_cut_hashes.push(sib_hash);
-        slot = child;
     }
 
     Ok(SubtreePlan {
@@ -621,25 +639,80 @@ mod tests {
     // ---- select_subtree_path: dead-block regression -----------------------
 
     #[test]
-    fn selection_never_empty_across_many_sizes_and_nonces() {
+    fn selection_never_empty_and_within_ceiling_across_sizes_and_nonces() {
         for n in [
             5u32, 6, 7, 9, 13, 17, 33, 65, 100, 129, 333, 1000, 1024, 1025,
         ] {
-            let floor = sqrt_floor(n);
+            let ceiling = max_subtree_leaves(n);
             for seed in 0u8..=255 {
                 let path = select_subtree_path(&nonce_of(seed), n).unwrap();
-                assert!(
-                    path.real_leaf_count() >= floor.min(n),
-                    "n={n} seed={seed}: real={} < floor={floor}",
-                    path.real_leaf_count()
-                );
+                // Never empty (ADR dead-block fix).
                 assert!(
                     path.real_leaf_count() >= 1,
                     "n={n} seed={seed}: empty selection"
                 );
+                // Bounded (DoS fix): one request reads at most one fixed-depth
+                // block, regardless of the (possibly adversarial) nonce.
+                assert!(
+                    path.real_leaf_count() <= ceiling,
+                    "n={n} seed={seed}: real={} > ceiling={ceiling}",
+                    path.real_leaf_count()
+                );
                 assert!(path.leaf_end <= n);
                 assert!(path.leaf_start < path.leaf_end);
             }
+        }
+    }
+
+    /// The denial-of-service the fixed-depth selection closes: under the OLD
+    /// nonce-bit descent, `key_count = 2^19 + 1` with a nonce steering to the
+    /// sparse side selected the WHOLE tree (~2 TiB of reads). Now every nonce
+    /// selects at most one `max_subtree_leaves`-sized block, and the tail slot is
+    /// a single leaf — not
+    /// the root.
+    #[test]
+    fn adversarial_nonce_cannot_amplify_round1_work() {
+        for &n in &[513u32, 1025, 524_289, 1_000_000, MAX_COMMITMENT_KEY_COUNT] {
+            let ceiling = max_subtree_leaves(n);
+            // A generous cap: sqrt-scale, never the whole tree for a large N.
+            assert!(
+                u64::from(ceiling) <= 1024.max(u64::from(n)),
+                "n={n}: ceiling {ceiling} not sqrt-scale"
+            );
+            for nonce in [[0x00u8; 32], [0xFFu8; 32], [0xAAu8; 32], [0x55u8; 32]] {
+                let path = select_subtree_path(&nonce, n).unwrap();
+                assert!(
+                    path.real_leaf_count() <= ceiling && path.real_leaf_count() >= 1,
+                    "n={n}: real={} outside 1..={ceiling}",
+                    path.real_leaf_count()
+                );
+                if n >= 512 {
+                    assert!(
+                        u64::from(path.real_leaf_count()) < u64::from(n),
+                        "n={n}: a single request must not cover the whole tree"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every slot is selectable and the slots partition `0..key_count` with no
+    /// gaps, so the tail leaf is never permanently unauditable (coverage is
+    /// uniform over many audits).
+    #[test]
+    fn slots_partition_all_leaves_with_no_gaps() {
+        for &n in &[5u32, 17, 100, 1025, 524_289] {
+            let span = max_subtree_leaves(n);
+            let slot_count = n.div_ceil(span);
+            let mut covered = 0u32;
+            for slot in 0..slot_count {
+                let start = slot.saturating_mul(span);
+                let end = start.saturating_add(span).min(n);
+                assert_eq!(start, covered, "n={n} slot={slot}: gap before this slot");
+                assert!(end > start, "n={n} slot={slot}: empty slot");
+                covered = end;
+            }
+            assert_eq!(covered, n, "n={n}: slots do not cover all leaves");
         }
     }
 

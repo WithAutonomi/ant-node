@@ -90,8 +90,10 @@ tree is a clean binary shape when N is not a power of two.
 ## Decision
 
 We will make the audit **gossip-triggered** and replace its proof shape with a
-**single contiguous-subtree storage proof**, reusing the existing tree,
-commitment, and freshness-hash primitives.
+**single contiguous-subtree storage proof**, reusing the existing tree and
+signed commitment. Possession is proven by a keyed nonced block-tree opened by
+Bao verified slices (per the V2-685 amendment above), not by per-leaf freshness
+hashes.
 
 - **Trigger.** When a node ingests a neighbour's commitment during normal
   (steady-state) operation, it may start an audit of that neighbour — not every
@@ -233,7 +235,7 @@ commitment, and freshness-hash primitives.
 - **Big-block deletion is caught only proportionally.** An attacker who deletes data in large contiguous blocks is caught, per audit, with probability roughly equal to the fraction deleted — independent of N and of subtree size. We accept this: there is no economic reason to delete a *small* fraction (you save almost nothing and are still eventually caught), and a node that deletes a large fraction to actually save resources is caught within one or two audits. If ever needed, the lever is auditing *more often*, not bigger subtrees.
 - **Inflating the claimed size is not fully prevented.** Only the selected subtree and the path summaries are verified each audit, so filler leaves elsewhere could inflate the claimed chunk count. Both the regular audits and the closeness check mitigates this over time. Fully auditing the entire claimed set would be too much effort. We accept this probabilistic approach in which over time cheaters are detected. 
 - **Retention has a storage cost.** A node must keep the chunk data behind its recently published commitments for a bounded TTL window (with a slot backstop). This is an accepted cost.
-- **The audit format change is breaking.** The whole network must upgrade before the new audit can be relied on and before eviction is enabled.
+- **The audit format change is contained, not whole-network breaking.** Only the subtree-audit messages move to a dedicated protocol id; core replication stays on v2, so mixed-version nodes still interoperate for everything else. During rollout a cross-version subtree audit may go unanswered — a bounded, self-healing trust effect (see the `SUBTREE_AUDIT_PROTOCOL_ID` note), strictly milder than a global protocol bump. Eviction can be relied on once the fleet has upgraded.
 
 ### Neutral / Operational
 

@@ -87,12 +87,12 @@ fn keypair() -> (MlDsaPublicKey, MlDsaSecretKey) {
     ml_dsa_65().generate_keypair().unwrap()
 }
 
-/// Deterministic chunk bytes for key index `i`. The committed tree is built
-/// from `BLAKE3(content(i))`, so an honest proof — which hashes the same bytes —
-/// reconstructs the committed root and passes the real-bytes spot-check.
+/// Deterministic chunk bytes for fixture index `i`. Keys are CONTENT-ADDRESSED
+/// (`key(i) == BLAKE3(content(i)) == content_hash(i)`), so a committed leaf is
+/// `(key, key)` exactly as production, and an honest proof — which hashes the
+/// same bytes — reconstructs the committed root and passes the real-bytes check.
 fn content(i: u32) -> Vec<u8> {
-    let mut v = key(i).to_vec();
-    v.extend_from_slice(b"subtree-audit-chunk-body");
+    let mut v = b"subtree-audit-chunk-body".to_vec();
     v.extend_from_slice(&i.to_le_bytes());
     v
 }
@@ -101,12 +101,12 @@ fn content_hash(i: u32) -> [u8; 32] {
     *blake3::hash(&content(i)).as_bytes()
 }
 
-/// Big-endian key so numeric order matches the MerkleTree sort order; this lets
-/// us reason about leaf positions when we tamper with them.
+/// The content-addressed key for index `i`: `key(i) == content_hash(i)`, so
+/// `bytes_hash == key` on every committed leaf. Leaf positions in the committed
+/// tree therefore follow the hash order, not `i`; the attack tests below read the
+/// actual key at each position via `key_at` rather than assuming `key(i)`.
 fn key(i: u32) -> [u8; 32] {
-    let mut k = [0u8; 32];
-    k[..4].copy_from_slice(&i.to_be_bytes());
-    k
+    content_hash(i)
 }
 
 /// A responder identity (real ML-DSA keypair) plus its retention state. Peer
@@ -198,6 +198,14 @@ fn auditor_accepts(
     // -- Gate: structure ----------------------------------------------------
     if let StructureVerdict::Invalid(why) = verify_subtree_proof(proof, nonce, commitment) {
         return Err(AuditError::StructureInvalid(why));
+    }
+
+    // -- Gate: content-address binding (possession-forgery guard) -----------
+    // Mirrors production `evaluate_subtree_structure`: a leaf whose `bytes_hash`
+    // is decoupled from its credited `key` is rejected at round 1 (content-
+    // addressed chunks always have `bytes_hash == key`).
+    if proof.leaves.iter().any(|l| l.bytes_hash != l.key) {
+        return Err(AuditError::StructureInvalid("leaf bytes_hash != key"));
     }
 
     // -- Gate: round-2 slice challenge (responder-served possession) ----------
@@ -371,13 +379,15 @@ fn relay_holding_only_addresses_caught_by_real_bytes_check() {
     let mut leaves = Vec::new();
     for idx in path.leaf_start..path.leaf_end {
         let k = built.tree().key_at(idx as usize).unwrap();
-        // bytes_hash is public (== the chunk address); the responder fakes the
-        // possession commitment because it lacks the bytes.
+        let c = honest_bytes(&k).unwrap();
+        // For a content-addressed chunk bytes_hash == key (both public), so the
+        // relay can present a structurally valid leaf; it fakes the possession
+        // commitment because it lacks the bytes.
         let forged_nonced_root = *blake3::hash(b"i-do-not-have-the-bytes").as_bytes();
         leaves.push(SubtreeLeaf {
             key: k,
-            bytes_hash: content_hash(idx),
-            content_len: u32::try_from(content(idx).len()).unwrap(),
+            bytes_hash: k,
+            content_len: u32::try_from(c.len()).unwrap(),
             nonced_root: forged_nonced_root,
         });
     }
@@ -472,17 +482,18 @@ fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
         let mut predicted_keys = std::collections::HashSet::new();
         for (local, idx) in (path.leaf_start..path.leaf_end).enumerate() {
             let k = built.tree().key_at(idx as usize).unwrap();
+            let c = honest_bytes(&k).unwrap();
             let is_predicted = predicted_local.contains(&u32::try_from(local).unwrap());
             let nonced_root = if is_predicted {
                 predicted_keys.insert(k);
-                nonced_block_root(&nonce, &r.peer_id_bytes, &k, &content(idx))
+                nonced_block_root(&nonce, &r.peer_id_bytes, &k, &c)
             } else {
                 *blake3::hash(b"forged").as_bytes()
             };
             leaves.push(SubtreeLeaf {
                 key: k,
-                bytes_hash: content_hash(idx),
-                content_len: u32::try_from(content(idx).len()).unwrap(),
+                bytes_hash: k,
+                content_len: u32::try_from(c.len()).unwrap(),
                 nonced_root,
             });
         }

@@ -262,8 +262,17 @@ enum SliceRound {
     /// The responder claimed `Bootstrapping` in round 2 after answering a valid
     /// round-1 proof. A node that just produced a signed subtree proof is
     /// provably not bootstrapping, so this responsive contradiction is a
-    /// confirmed failure (not a graced timeout): it revokes the pinned
-    /// commitment's holder credit and takes the trust penalty.
+    /// confirmed failure (not a graced timeout): it revokes the peer's holder
+    /// credit and takes the trust penalty.
+    ///
+    /// This classification relies on `is_bootstrapping` being ONE-WAY (true →
+    /// false; see `mod.rs`): a round-1 proof implies the snapshot was already
+    /// `false`, and a restart drops the single-use round-1 session so round 2 is
+    /// answered `Transient` before this branch is ever reached. An honest running
+    /// node therefore cannot produce this response; only a malicious, incompatible,
+    /// or future broken-state peer can. If a "re-bootstrap" (false → true)
+    /// transition is ever added, it MUST clear live sessions or this policy must
+    /// be revisited.
     ResponsiveBootstrap,
     /// Malformed / unexpected round-2 response body.
     Malformed,
@@ -516,6 +525,22 @@ pub(crate) fn evaluate_subtree_structure(
 
     // -- Structure --
     if let StructureVerdict::Invalid(_) = verify_subtree_proof(proof, nonce, commitment) {
+        return Err(AuditFailureReason::DigestMismatch);
+    }
+
+    // -- Content-address binding (possession-forgery guard) --
+    // The commitment is only sound for CONTENT-ADDRESSED chunks, where the key IS
+    // the content hash (`key == BLAKE3(content)`), so an honest leaf is always
+    // `(key, key)` (see the commitment builder's `(k, k)` shortcut). The signed
+    // Merkle leaf hashes `key ‖ bytes_hash` WITHOUT forcing them equal, yet round 2
+    // authenticates the served slice against `bytes_hash` while holder credit is
+    // recorded for `key`. A leaf with `bytes_hash != key` would therefore let a peer
+    // earn credit for an expensive address `key` by proving possession of an
+    // unrelated (e.g. one-byte) chunk hashing to `bytes_hash`. Reject any such leaf:
+    // for honest content-addressed data the two are identical, so this never fails
+    // an honest holder, and it re-binds Chain 1's `bytes_hash` check to the credited
+    // `key`.
+    if proof.leaves.iter().any(|l| l.bytes_hash != l.key) {
         return Err(AuditFailureReason::DigestMismatch);
     }
     Ok(())
@@ -1204,12 +1229,13 @@ fn build_slice_items_for_key(
 /// Handle a round-2 slice challenge (responder side), ADR-0002 / V2-685.
 ///
 /// The auditor has already structurally verified this node's round-1 subtree
-/// proof and now opens one 1 KiB block of a small freshly-random sample of those
-/// leaves. For each opening the responder reads the committed chunk and builds a
-/// two-chain opening via `build_slice_item` (a Bao verified slice for
-/// authenticity against the chunk address, and a nonced block-tree opening for
-/// possession against round 1's `nonced_root`), returning
-/// [`SubtreeSliceItem::Present`]. If it committed to the key but can no longer
+/// proof and now opens up to two 1 KiB blocks (a fresh-random block plus the
+/// final block) of a small freshly-random sample of those leaves. For each
+/// opening the responder reads the committed chunk and builds a two-chain
+/// opening (a Bao verified slice for authenticity against the chunk address, and
+/// a nonced block-tree opening for possession against round 1's `nonced_root`),
+/// returning [`SubtreeSliceItem::Present`]. If it committed to the key but can no
+/// longer
 /// produce the bytes it returns [`SubtreeSliceItem::Absent`], which the auditor
 /// counts as a provable failure.
 ///
@@ -1521,13 +1547,27 @@ mod tests {
             &openings, &nonce, &peer, &ok
         )));
     }
-    /// The "chunk content" for a key in these fixtures. The committed tree's leaf
-    /// `bytes_hash` is `BLAKE3(chunk_bytes(key))`, mirroring the general
-    /// `(key, BLAKE3(content))` commitment; round 2 serves exactly this content.
-    fn chunk_bytes(k: &XorName) -> Vec<u8> {
-        let mut v = k.to_vec();
-        v.extend_from_slice(b"chunk-body");
+    /// Deterministic chunk content for fixture index `i`. Fixture keys are
+    /// CONTENT-ADDRESSED (`ckey(i) == BLAKE3(chunk_bytes(i))`), so a committed
+    /// leaf is `(key, key)` exactly as production, and round 2 serves this content.
+    fn chunk_bytes(i: u32) -> Vec<u8> {
+        let mut v = b"chunk-body".to_vec();
+        v.extend_from_slice(&i.to_le_bytes());
         v
+    }
+
+    /// Content-addressed key for fixture index `i` (so `bytes_hash == key`).
+    fn ckey(i: u32) -> XorName {
+        *blake3::hash(&chunk_bytes(i)).as_bytes()
+    }
+
+    /// The content behind a committed fixture key (reverse of `ckey`), so round-2
+    /// fixtures can serve the real bytes for any sampled leaf.
+    fn content_for_key(k: &XorName) -> Vec<u8> {
+        (0..16_384u32)
+            .find(|&i| &ckey(i) == k)
+            .map(chunk_bytes)
+            .expect("fixture content for committed key")
     }
 
     /// Build an honest committed tree of `n` keys + a valid round-1 proof for
@@ -1536,15 +1576,12 @@ mod tests {
         let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
         let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
         let pk_b = pk.to_bytes();
-        let entries: Vec<_> = (0..n)
-            .map(|i| {
-                let k = key(i);
-                (k, *blake3::hash(&chunk_bytes(&k)).as_bytes())
-            })
-            .collect();
+        // Content-addressed: bytes_hash == key, exactly as production commits.
+        let entries: Vec<_> = (0..n).map(|i| (ckey(i), ckey(i))).collect();
         let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_b).unwrap();
         let proof =
-            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(chunk_bytes(k))).unwrap();
+            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(content_for_key(k)))
+                .unwrap();
         (built, proof, peer_id)
     }
 
@@ -1587,7 +1624,7 @@ mod tests {
         openings
             .iter()
             .map(|(leaf, block_index)| {
-                let content = chunk_bytes(&leaf.key);
+                let content = content_for_key(&leaf.key);
                 let bao_slice =
                     crate::replication::slice::extract_block_slice(&content, *block_index).unwrap();
                 let nonced_siblings = crate::replication::slice::nonced_block_siblings(
@@ -1625,6 +1662,33 @@ mod tests {
             AuditVerdict::Pass { checked } => assert!(checked >= 1, "must verify >=1 leaf"),
             other @ AuditVerdict::Fail(_) => panic!("expected Pass, got {other:?}"),
         }
+    }
+
+    /// Possession-forgery guard: a peer that signs a commitment whose leaves
+    /// decouple the credited `key` from the authenticated content hash
+    /// (`bytes_hash != key`) is rejected at round 1 — even though the structural
+    /// root still rebuilds from `(key, bytes_hash)`. Without the guard such a peer
+    /// could earn holder credit for an expensive address `key` while only proving
+    /// possession of an unrelated (e.g. one-byte) chunk hashing to `bytes_hash`.
+    #[test]
+    fn leaf_with_bytes_hash_decoupled_from_key_is_rejected() {
+        let nonce = [5u8; 32];
+        let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
+        let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
+        let pk_b = pk.to_bytes();
+        // Every leaf commits (key, bytes_hash) with bytes_hash != key.
+        let entries: Vec<_> = (0..64u32).map(|i| (ckey(i), ckey(i + 10_000))).collect();
+        let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_b).unwrap();
+        let proof =
+            build_subtree_proof(built.tree(), &nonce, &peer_id, |k| Some(content_for_key(k)))
+                .unwrap();
+        // The structural root rebuilds (it is a genuinely signed tree), so the
+        // decoupled-address gate is what must reject it.
+        assert_eq!(
+            structure(&built, &proof, &nonce, &peer_id),
+            Err(AuditFailureReason::DigestMismatch),
+            "a leaf whose bytes_hash != key must be rejected at round 1"
+        );
     }
 
     #[test]
@@ -1762,7 +1826,7 @@ mod tests {
                 &other_nonce,
                 &peer,
                 &leaf.key,
-                &chunk_bytes(&leaf.key),
+                &content_for_key(&leaf.key),
             );
         }
         let s = sample(&proof, &nonce, built.commitment().key_count);
@@ -1836,23 +1900,27 @@ mod tests {
         assert!(structure(&built, &proof, &nonce, &peer).is_err());
     }
 
-    /// Build an honest committed tree whose keys are deliberately "FAR": their
-    /// addresses live at the high end of the XOR space (top bytes = 0xFF). On the
-    /// auditor side these are the leaves `observe_closeness` counts toward `far`.
+    /// Build an honest committed tree whose keys are content-addressed but biased
+    /// to the FAR half of the XOR space (top bit set), so `observe_closeness`
+    /// counts them toward `far`. Keys stay content-addressed (`bytes_hash == key`)
+    /// so round 2 serves real bytes.
     fn honest_far(n: u32, nonce: &[u8; 32]) -> (BuiltCommitment, SubtreeProof, [u8; 32]) {
         let (pk, sk) = ml_dsa_65().generate_keypair().unwrap();
         let peer_id = *blake3::hash(&pk.to_bytes()).as_bytes();
         let pk_b = pk.to_bytes();
-        let entries: Vec<_> = (0..n)
-            .map(|i| {
-                let mut k = [0xFFu8; 32];
-                k[28..].copy_from_slice(&i.to_be_bytes());
-                (k, *blake3::hash(&chunk_bytes(&k)).as_bytes())
-            })
-            .collect();
+        let mut entries: Vec<(XorName, [u8; 32])> = Vec::new();
+        let mut i = 0u32;
+        while entries.len() < n as usize {
+            let k = ckey(i);
+            if k[0] >= 0x80 {
+                entries.push((k, k));
+            }
+            i = i.saturating_add(1);
+        }
         let built = BuiltCommitment::build(entries, &peer_id, &sk, &pk_b).unwrap();
         let proof =
-            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(chunk_bytes(k))).unwrap();
+            build_subtree_proof(built.tree(), nonce, &peer_id, |k| Some(content_for_key(k)))
+                .unwrap();
         (built, proof, peer_id)
     }
 

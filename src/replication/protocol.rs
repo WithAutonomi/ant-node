@@ -994,7 +994,8 @@ pub struct SubtreeSliceChallenge {
     pub expected_commitment_hash: [u8; 32],
     /// The exact blocks to open: the auditor's freshly-randomised spot-check
     /// sample of the round-1 subtree (chosen after the proof was received; not
-    /// nonce-derived), one block per sampled leaf.
+    /// nonce-derived), up to two blocks per sampled leaf (a fresh-random block
+    /// plus the final block, for the content-length pin).
     pub openings: Vec<SubtreeSliceOpening>,
 }
 
@@ -1052,7 +1053,10 @@ pub enum SubtreeSliceResponse {
     Items {
         /// The challenge this response answers.
         challenge_id: u64,
-        /// One entry per requested opening.
+        /// One item per DISTINCT requested opening, coalesced and
+        /// order-independent (see the type-level contract above): duplicate
+        /// openings do not multiply items, and one `Absent` covers all of a
+        /// key's openings.
         items: Vec<SubtreeSliceItem>,
     },
     /// Peer is still bootstrapping (should not happen mid-audit, but handled).

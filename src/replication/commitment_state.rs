@@ -3,8 +3,9 @@
 //! Phase 2b of the v12 storage-bound audit design. Builds, signs, and
 //! caches a [`StorageCommitment`] over the responder's currently-stored
 //! key set; serves audit lookups by `expected_commitment_hash`; retains
-//! the previous commitment across one rotation so an audit pinned to it
-//! does not false-fail at the rotation boundary (v5/v12 §4 retention).
+//! recently-gossiped commitments for a bounded TTL window (with a slot
+//! backstop) so an audit pinned to a still-answerable commitment does not
+//! false-fail across rotations.
 //!
 //! Rotation strategy:
 //!
