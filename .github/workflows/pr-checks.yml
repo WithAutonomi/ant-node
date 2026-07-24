@@ -1,0 +1,42 @@
+# Release-process PR checks (Linear link + PR template).
+# Issues: V2-720 (linear-link) and V2-719 (pr-template).
+# This file is intentionally duplicated verbatim across the six crate repos;
+# keep them identical when updating.
+name: pr-checks
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+    branches:
+      - main
+      - 'rc-*'
+
+permissions:
+  contents: read
+
+jobs:
+  linear-link:
+    name: linear-link
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require a linked Linear issue
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.base_ref }}
+        run: python3 .github/scripts/check_pr.py linear
+
+  pr-template:
+    name: pr-template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require the PR template fields
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_BASE: ${{ github.base_ref }}
+        run: python3 .github/scripts/check_pr.py template
