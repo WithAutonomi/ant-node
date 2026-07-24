@@ -351,6 +351,11 @@ type CommitmentCache = Arc<
 /// handle without borrowing the verifier.
 type PinFetchNegativeCache = Arc<Mutex<LruCache<(PeerId, [u8; 32]), ()>>>;
 
+/// Test-override shape for one on-chain settlement: the settled amount and
+/// the recorded `bytes16` rewards-address prefix (`None` = matches the quote).
+#[cfg(any(test, feature = "test-utils"))]
+type TestSettlementOverride = (Amount, Option<[u8; 16]>);
+
 /// Main payment verifier for ant-node.
 ///
 /// Uses:
@@ -396,9 +401,13 @@ pub struct PaymentVerifier {
     /// Test-only override for `completedPayments(quote_hash)`.
     ///
     /// Production always queries the payment vault; unit tests use this to
-    /// exercise the full verifier path without starting an EVM chain.
+    /// exercise the full verifier path without starting an EVM chain. Maps a
+    /// quote hash to the settled amount plus the recorded rewards-address
+    /// prefix (`None` means "matches the quote", the honest-settlement
+    /// default). The prefix is 16 bytes because the vault packs the address
+    /// as `bytes16` in the `completedPayments` slot.
     #[cfg(any(test, feature = "test-utils"))]
-    test_completed_payments_override: RwLock<HashMap<QuoteHash, Amount>>,
+    test_completed_payments_override: RwLock<HashMap<QuoteHash, TestSettlementOverride>>,
     // NOTE: the test-only own-peer-id override was removed with the ADR-retired
     // quote-freshness/staleness gate (ADR-0004 binds price to the committed
     // count instead), so it no longer has any reader.
@@ -423,7 +432,7 @@ pub struct PaymentVerifier {
     /// `None` until [`Self::attach_monetized_pin_sender`] (unit tests, or
     /// pre-replication startup), in which case no first audit is scheduled.
     monetized_pin_tx:
-        RwLock<Option<tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>>>,
+        RwLock<Option<tokio::sync::mpsc::Sender<crate::replication::MonetizedPinEvent>>>,
     /// Price-floor input: the SAME live commitment source the local
     /// `QuoteGenerator` prices from, read via the non-mutating snapshot so the
     /// floor never extends commitment answerability. `None` until
@@ -575,7 +584,7 @@ impl PaymentVerifier {
     /// absent (unit tests / pre-replication) no first audit is scheduled.
     pub fn attach_monetized_pin_sender(
         &self,
-        tx: tokio::sync::mpsc::UnboundedSender<crate::replication::MonetizedPinEvent>,
+        tx: tokio::sync::mpsc::Sender<crate::replication::MonetizedPinEvent>,
     ) {
         *self.monetized_pin_tx.write() = Some(tx);
         debug!("PaymentVerifier: ADR-0004 monetized-pin sender attached");
@@ -677,12 +686,40 @@ impl PaymentVerifier {
         self.set_paid_quote_k_closest_for_tests(peer_ids);
     }
 
-    /// Test-only setter for an on-chain completed payment amount.
+    /// Test-only setter for an on-chain completed payment amount. The recorded
+    /// rewards address is treated as matching the quote (honest settlement).
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_completed_payment_for_tests(&self, quote_hash: QuoteHash, amount: Amount) {
         self.test_completed_payments_override
             .write()
-            .insert(quote_hash, amount);
+            .insert(quote_hash, (amount, None));
+    }
+
+    /// Test-only setter for an on-chain completed payment with an explicit
+    /// recorded rewards address, to exercise the settlement-redirect rejection.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_completed_payment_with_address_for_tests(
+        &self,
+        quote_hash: QuoteHash,
+        amount: Amount,
+        rewards_address: evmlib::RewardsAddress,
+    ) {
+        self.test_completed_payments_override.write().insert(
+            quote_hash,
+            (amount, Some(Self::rewards_address_prefix(&rewards_address))),
+        );
+    }
+
+    /// The vault's `completedPayments` slot packs the payee as
+    /// `bytes16(bytes20(rewardsAddress))` — the leading 16 bytes of the
+    /// address (Solidity `bytesN` conversions truncate on the right). This is
+    /// the form the on-chain record is compared in.
+    fn rewards_address_prefix(rewards_address: &evmlib::RewardsAddress) -> [u8; 16] {
+        let mut prefix = [0u8; 16];
+        if let Some(head) = rewards_address.as_slice().get(..16) {
+            prefix.copy_from_slice(head);
+        }
+        prefix
     }
 
     /// Check if payment is required for the given `XorName`.
@@ -975,15 +1012,29 @@ impl PaymentVerifier {
         // The paid (median) price and settled on-chain amount of the winning
         // candidate, kept for the receiver-side price-floor policy below.
         let mut verified_paid_quote: Option<(Amount, Amount)> = None;
+        // ADR-0004 Amendment 2: remember WHICH candidate's on-chain settlement
+        // verified — only that peer's commitment actually earned money, so only
+        // its pin is nominated for a deterministic first audit below. The
+        // non-median quotes merely locate the median and stay covered by the
+        // gossip-lottery audit path.
+        let mut paid_peer: Option<[u8; 32]> = None;
 
         for candidate in candidates {
             let paid_price = candidate.quote.price;
+            let candidate_peer = *candidate.encoded_peer_id.as_bytes();
             match self
                 .verify_legacy_median_candidate(xorname, candidate)
                 .await
             {
                 Ok(settled_amount) => {
                     verified_paid_quote = Some((paid_price, settled_amount));
+                    // First settlement-verified median candidate wins the paid
+                    // slot and the sole first-audit nomination. If a client
+                    // settled several TIED-median candidates, only this one is
+                    // first-audited; gossiped extras keep the ADR-0002 lottery,
+                    // sidecar-only extras are an accepted best-effort residual
+                    // (ADR-0004 Amendment 2). The honest client pays one.
+                    paid_peer = Some(candidate_peer);
                     break;
                 }
                 Err(err) => failures.push(err.to_string()),
@@ -1022,7 +1073,8 @@ impl PaymentVerifier {
         // bundle can never enqueue audits or drive pin fetches — closing the
         // free-amplification path.
         if context.is_store_admission() {
-            self.cross_check_quotes(payment, commitment_sidecars).await;
+            self.cross_check_quotes(payment, commitment_sidecars, paid_peer)
+                .await;
         }
 
         if crate::logging::enabled!(crate::logging::Level::INFO) {
@@ -1094,9 +1146,29 @@ impl PaymentVerifier {
 
         Self::validate_paid_quote_signature(candidate).await?;
 
-        let on_chain_amount = self
-            .completed_payment_amount(candidate.quote.hash())
+        let (on_chain_amount, recorded_rewards_prefix) = self
+            .completed_payment_settlement(candidate.quote.hash())
             .await?;
+        // ADR-0004 Amendment 2: the settlement must be RECORDED FOR THE QUOTE'S
+        // rewards address, not merely under its quote hash. The vault stores
+        // whatever `(rewardsAddress, amount)` the payer supplied for the hash,
+        // so an amount-only check would accept a payment the client redirected
+        // to its own wallet — the issuer would be treated (and first-audited)
+        // as "paid" without ever being compensated. Honest clients build the
+        // payment from the quote itself, so this never rejects a legit upload.
+        // The vault packs the payee as `bytes16`, so the comparison is on the
+        // leading 16 bytes (128 bits — far beyond grinding range).
+        if let Some(recorded) = recorded_rewards_prefix {
+            let expected = Self::rewards_address_prefix(&candidate.quote.rewards_address);
+            if recorded != expected {
+                return Err(Error::Payment(format!(
+                    "Median-priced quote settlement for peer {:?} was redirected: recorded rewards address prefix {} does not match the quote's {}",
+                    candidate.encoded_peer_id,
+                    hex::encode(recorded),
+                    hex::encode(expected)
+                )));
+            }
+        }
         if on_chain_amount >= candidate.expected_amount {
             return Ok(on_chain_amount);
         }
@@ -1211,7 +1283,15 @@ impl PaymentVerifier {
         .map_err(|e| Error::Payment(format!("Signature verification task failed: {e}")))?
     }
 
-    async fn completed_payment_amount(&self, quote_hash: QuoteHash) -> Result<Amount> {
+    /// Look up the on-chain settlement recorded for `quote_hash`: the settled
+    /// amount and the `bytes16` rewards-address prefix it was recorded for.
+    /// The prefix is `None` only on the test-override path (meaning "matches
+    /// the quote"); the production contract read always returns the recorded
+    /// prefix so the caller's redirect check always applies.
+    async fn completed_payment_settlement(
+        &self,
+        quote_hash: QuoteHash,
+    ) -> Result<(Amount, Option<[u8; 16]>)> {
         #[cfg(any(test, feature = "test-utils"))]
         {
             let completed_payment_override = {
@@ -1220,8 +1300,8 @@ impl PaymentVerifier {
                     .get(&quote_hash)
                     .copied()
             };
-            if let Some(amount) = completed_payment_override {
-                return Ok(amount);
+            if let Some((amount, recorded)) = completed_payment_override {
+                return Ok((amount, recorded));
             }
         }
 
@@ -1235,7 +1315,7 @@ impl PaymentVerifier {
             .await
             .map_err(|e| Error::Payment(format!("completedPayments lookup failed: {e}")))?;
 
-        Ok(Amount::from(result.amount))
+        Ok((Amount::from(result.amount), Some(result.rewardsAddress.0)))
     }
 
     fn validate_paid_quote_peer_binding(
@@ -1635,7 +1715,12 @@ impl PaymentVerifier {
     /// missing cache or absent `P2PNode` degrades to "resolve nothing", never an
     /// error on the payment path — the synchronous arithmetic gate and the
     /// later audit remain the load-bearing checks.
-    async fn cross_check_quotes(&self, payment: &ProofOfPayment, commitment_sidecars: &[Vec<u8>]) {
+    async fn cross_check_quotes(
+        &self,
+        payment: &ProofOfPayment,
+        commitment_sidecars: &[Vec<u8>],
+        paid_peer: Option<[u8; 32]>,
+    ) {
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
         let p2p = self.p2p_node.read().as_ref().map(Arc::clone);
@@ -1659,17 +1744,32 @@ impl PaymentVerifier {
             };
             let peer_id = PeerId::from_bytes(*encoded_peer_id.as_bytes());
 
-            // ADR-0004: this commitment backed a payment — route it for a
-            // deterministic first audit (the drainer dedups by pin and respects
-            // the cooldown). Best-effort: a closed channel just means no first
-            // audit is scheduled, never an error on the payment path.
-            if let Some(ref tx) = monetized_pin_tx {
-                let _ = tx.send(crate::replication::MonetizedPinEvent {
-                    peer: peer_id,
-                    pin,
-                    key_count: quote.committed_key_count,
-                    quote_ts: quote.timestamp,
-                });
+            // ADR-0004 Amendment 2: only the PAID candidate's commitment earned
+            // money, so only its pin is routed for a deterministic first audit
+            // (the drainer dedups, rate-budgets, and respects the cooldown).
+            // Pre-amendment this fired for every pinned quote in the bundle —
+            // up to CLOSE_GROUP_SIZE audits per proof for peers that were never
+            // paid — a 7x term in the fleet-wide amplification that degraded
+            // v0.14.3. Best-effort: a closed channel just means no first audit
+            // is scheduled, never an error on the payment path.
+            let is_paid = paid_peer.is_some_and(|paid| paid == *encoded_peer_id.as_bytes());
+            if is_paid {
+                if let Some(ref tx) = monetized_pin_tx {
+                    // Bounded queue: drop on full (best-effort, penalty-free;
+                    // the peer's next settled payment re-nominates it). Count a
+                    // Full drop so ingress saturation is observable; a Closed
+                    // channel just means the engine is shutting down.
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(crate::replication::MonetizedPinEvent {
+                            peer: peer_id,
+                            pin,
+                            key_count: quote.committed_key_count,
+                            quote_ts: quote.timestamp,
+                        })
+                    {
+                        crate::replication::note_monetized_ingress_drop();
+                    }
+                }
             }
             // Resolution order: sidecar (synchronous, no state) -> gossip cache
             // (fresh within TTL) -> fetch fallback (collected as unresolved).
@@ -2730,10 +2830,19 @@ impl PaymentVerifier {
         // fetches). Store admissions only (direct PUT + immediate fresh
         // replication, the paths that previously verified under `ClientPut`) —
         // a paid-list receipt's pins have aged out.
+        // Amendment 2: only the candidates the contract actually PAID
+        // (`paid_node_addresses` indices, verified above) are nominated for
+        // first audits; the rest of the pool merely established the median.
         if context.is_store_admission() {
+            let paid_indices: std::collections::HashSet<usize> = payment_info
+                .paid_node_addresses
+                .iter()
+                .map(|(_, idx, _)| *idx)
+                .collect();
             self.cross_check_merkle_candidates(
                 &merkle_proof.winner_pool,
                 &merkle_proof.commitment_sidecars,
+                &paid_indices,
             )
             .await;
         }
@@ -2752,6 +2861,7 @@ impl PaymentVerifier {
         &self,
         pool: &evmlib::merkle_payments::MerklePaymentCandidatePool,
         commitment_sidecars: &[Vec<u8>],
+        paid_indices: &std::collections::HashSet<usize>,
     ) {
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
@@ -2763,23 +2873,37 @@ impl PaymentVerifier {
         let sidecar_map = Self::index_valid_sidecars(commitment_sidecars);
 
         let mut unresolved: Vec<(PeerId, [u8; 32], u32, Vec<u8>)> = Vec::new();
-        for candidate in &pool.candidate_nodes {
+        for (idx, candidate) in pool.candidate_nodes.iter().enumerate() {
             let Some(pin) = candidate.commitment_pin else {
                 continue; // baseline candidate pins nothing
             };
             let peer_id = PeerId::from_bytes(*blake3::hash(&candidate.pub_key).as_bytes());
 
-            if let Some(ref tx) = monetized_pin_tx {
-                let _ = tx.send(crate::replication::MonetizedPinEvent {
-                    peer: peer_id,
-                    pin,
-                    key_count: candidate.committed_key_count,
-                    quote_ts: std::time::UNIX_EPOCH
-                        .checked_add(std::time::Duration::from_secs(
-                            candidate.merkle_payment_timestamp,
-                        ))
-                        .unwrap_or(std::time::UNIX_EPOCH),
-                });
+            // ADR-0004 Amendment 2: nominate only the candidates the contract
+            // actually paid — the unpaid pool members earned nothing and stay
+            // covered by the gossip-lottery audit path. Pre-amendment every
+            // pool candidate (16) was nominated per verified proof.
+            if paid_indices.contains(&idx) {
+                if let Some(ref tx) = monetized_pin_tx {
+                    // Bounded queue: drop on full (best-effort, penalty-free;
+                    // the peer's next settled payment re-nominates it). Count a
+                    // Full drop so ingress saturation is observable; a Closed
+                    // channel just means the engine is shutting down.
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(crate::replication::MonetizedPinEvent {
+                            peer: peer_id,
+                            pin,
+                            key_count: candidate.committed_key_count,
+                            quote_ts: std::time::UNIX_EPOCH
+                                .checked_add(std::time::Duration::from_secs(
+                                    candidate.merkle_payment_timestamp,
+                                ))
+                                .unwrap_or(std::time::UNIX_EPOCH),
+                        })
+                    {
+                        crate::replication::note_monetized_ingress_drop();
+                    }
+                }
             }
 
             let resolved = match sidecar_map.get(&(peer_id, pin)) {
@@ -3243,6 +3367,43 @@ mod tests {
         assert_eq!(
             result.expect("paid median should verify"),
             PaymentStatus::PaymentVerified
+        );
+    }
+
+    /// ADR-0004 Amendment 2: a settlement recorded under the median quote's
+    /// hash but redirected to a DIFFERENT rewards address must be rejected —
+    /// otherwise a client could "pay" its own wallet while the issuer is
+    /// treated (and first-audited) as paid without ever being compensated.
+    #[tokio::test]
+    async fn test_legacy_paid_median_redirected_settlement_rejected() {
+        let verifier = create_test_verifier();
+        let xorname = [0xA2u8; 32];
+        let peer_quotes = make_signed_legacy_bundle(xorname, unique_test_prices());
+        mark_k_closest_paid_candidates(&verifier, &peer_quotes);
+        let expected_amount = expected_median_payment(&peer_quotes);
+        let paid_quote = median_test_candidates(&peer_quotes)
+            .first()
+            .expect("median candidate")
+            .1
+            .clone();
+        // Full amount, but recorded for an address that is not the quote's.
+        let attacker_address = RewardsAddress::new([0xEEu8; 20]);
+        assert_ne!(attacker_address, paid_quote.rewards_address);
+        verifier.set_completed_payment_with_address_for_tests(
+            paid_quote.hash(),
+            expected_amount,
+            attacker_address,
+        );
+
+        let proof_bytes = serialize_proof(peer_quotes);
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        let err = result.expect_err("redirected settlement must be rejected");
+        assert!(
+            format!("{err}").contains("redirected"),
+            "Error should mention the settlement redirect: {err}"
         );
     }
 
@@ -4712,6 +4873,130 @@ mod tests {
         let xorname = first_address.0;
 
         (merkle_proof, pool_hash, xorname, timestamp)
+    }
+
+    /// ADR-0004 Amendment 2: only the PAID (settlement-verified) quote's pin is
+    /// nominated for a deterministic first audit; the unpaid bundle quotes are
+    /// cross-checked but never enqueue audits.
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_only_paid_single_node_quote() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        verifier.attach_monetized_pin_sender(tx);
+
+        let ids: Vec<[u8; 32]> = (1..=3u8).map(|b| [b; 32]).collect();
+        let payment = ProofOfPayment {
+            peer_quotes: ids
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    let pin_byte = u8::try_from(i).expect("small bundle") + 1;
+                    let mut quote = make_fake_quote(
+                        [0xD0; 32],
+                        SystemTime::now(),
+                        RewardsAddress::new([pin_byte; 20]),
+                    );
+                    quote.commitment_pin = Some([pin_byte; 32]);
+                    quote.committed_key_count = 100;
+                    (EncodedPeerId::new(*id), quote)
+                })
+                .collect(),
+        };
+
+        // The middle quote is the candidate whose on-chain settlement verified.
+        let paid = ids.get(1).copied().expect("paid id");
+        verifier.cross_check_quotes(&payment, &[], Some(paid)).await;
+
+        let event = rx.try_recv().expect("the paid quote must be nominated");
+        assert_eq!(event.peer, PeerId::from_bytes(paid));
+        assert_eq!(event.pin, [2u8; 32]);
+        assert!(
+            rx.try_recv().is_err(),
+            "unpaid bundle quotes must not be nominated for first audits"
+        );
+    }
+
+    /// ADR-0004 Amendment 2: with no verified paid candidate, nothing is
+    /// nominated (defensive: the caller never reaches the cross-check on a
+    /// failed verification, but the emission itself must also fail closed).
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_nothing_without_paid_peer() {
+        use evmlib::{EncodedPeerId, RewardsAddress};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        verifier.attach_monetized_pin_sender(tx);
+
+        let mut quote =
+            make_fake_quote([0xD1; 32], SystemTime::now(), RewardsAddress::new([1; 20]));
+        quote.commitment_pin = Some([1u8; 32]);
+        let payment = ProofOfPayment {
+            peer_quotes: vec![(EncodedPeerId::new([1u8; 32]), quote)],
+        };
+
+        verifier.cross_check_quotes(&payment, &[], None).await;
+        assert!(rx.try_recv().is_err(), "no paid peer, no nomination");
+    }
+
+    /// ADR-0004 Amendment 2, merkle path: only the candidates at the
+    /// contract-verified PAID indices are nominated; the rest of the pool
+    /// merely established the median and must not enqueue audits.
+    #[tokio::test]
+    async fn adr0004_first_audit_nominates_only_paid_merkle_candidates() {
+        use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerkleTree};
+
+        let verifier = create_test_verifier();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        verifier.attach_monetized_pin_sender(tx);
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+        let mut candidate_nodes = make_candidate_nodes(timestamp);
+        for (i, candidate) in candidate_nodes.iter_mut().enumerate() {
+            candidate.commitment_pin = Some([u8::try_from(i & 0xFF).expect("byte"); 32]);
+            candidate.committed_key_count = 50;
+        }
+        let addresses: Vec<xor_name::XorName> = (0..4u8)
+            .map(|i| xor_name::XorName::from_content(&[i]))
+            .collect();
+        let tree = MerkleTree::from_xornames(addresses).expect("tree");
+        let midpoint_proof = tree
+            .reward_candidates(timestamp)
+            .expect("reward candidates")
+            .first()
+            .expect("at least one candidate")
+            .clone();
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof,
+            candidate_nodes,
+        };
+
+        let paid_indices: std::collections::HashSet<usize> = [1usize, 3].into_iter().collect();
+        verifier
+            .cross_check_merkle_candidates(&pool, &[], &paid_indices)
+            .await;
+
+        let mut nominated = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            nominated.push(event);
+        }
+        assert_eq!(
+            nominated.len(),
+            2,
+            "only the PAID candidates are nominated, not the whole pool"
+        );
+        for (event, idx) in nominated.iter().zip([1usize, 3]) {
+            let candidate = pool.candidate_nodes.get(idx).expect("paid candidate");
+            assert_eq!(
+                event.peer,
+                PeerId::from_bytes(*blake3::hash(&candidate.pub_key).as_bytes())
+            );
+            assert_eq!(event.pin, [u8::try_from(idx).expect("byte"); 32]);
+        }
     }
 
     /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65

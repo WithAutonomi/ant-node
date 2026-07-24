@@ -81,6 +81,21 @@ use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
 
+/// Count of monetized-pin nominations DROPPED at the bounded ingress channel
+/// because it was full (Amendment 2). Process-global because the producer is
+/// the payment verifier (a different module) and the drop happens before the
+/// per-drainer `received` counter. A non-zero value is the rollout signal that
+/// nomination ingress is saturating — benign (penalty-free, lottery/next-
+/// payment covered) but worth watching. `Closed` (engine shut down) is not
+/// counted: it is not a saturation signal.
+static FIRST_AUDIT_INGRESS_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Record one ingress-full drop. Called by the payment verifier's `try_send`
+/// sites; read by the drainer's periodic summary.
+pub(crate) fn note_monetized_ingress_drop() {
+    FIRST_AUDIT_INGRESS_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
 #[derive(Default)]
 struct FirstAuditObservability {
     received: AtomicU64,
@@ -88,8 +103,16 @@ struct FirstAuditObservability {
     coalesced: AtomicU64,
     duplicates: AtomicU64,
     capacity_evicted: AtomicU64,
+    /// An event targeting the local peer itself, dropped at ingress: the node
+    /// cannot network-audit itself (no dialable address for the local peer).
     self_target_skipped: AtomicU64,
+    /// A strictly-lower-count same-peer nomination that was dropped so a
+    /// higher-count pending pin survived. A sustained rise is the signal of an
+    /// attempted "erase the inflated pin with a cheaper one" self-suppression.
+    suppressed_lower: AtomicU64,
     cooldown_deferred_attempts: AtomicU64,
+    rate_deferred_attempts: AtomicU64,
+    window_deduped: AtomicU64,
     launched: AtomicU64,
     passed: AtomicU64,
     timed_out: AtomicU64,
@@ -168,45 +191,661 @@ fn first_audit_terminal_outcome(result: &AuditTickResult) -> FirstAuditTerminalO
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FirstAuditQueueOutcome {
+    /// New peer inserted with free capacity.
     Queued,
+    /// Collapsed with an existing same-peer entry; the incoming won (higher
+    /// count, or equal count and newer) and replaced it.
     Coalesced,
-    CapacityEvicted {
-        peer: PeerId,
-        pin: [u8; 32],
-    },
-    /// The event targets the local peer itself — dropped, never queued.
-    SelfTargetSkipped,
+    /// Collapsed with an existing same-peer entry; the incoming LOST because it
+    /// had a STRICTLY LOWER count and was dropped, leaving the higher-count pin
+    /// in place. This is the attempted cheaper-pin self-erasure signal.
+    SuppressedLower,
+    /// Collapsed with an existing same-peer entry of EQUAL count; the incoming
+    /// lost the freshness tie (it was not the newer of the two) and the
+    /// existing entry was retained. Benign, not an attack signal.
+    RetainedOnTie,
+    /// A DIFFERENT peer's entry was evicted by the bounded LRU to make room.
+    CapacityEvicted { peer: PeerId, pin: [u8; 32] },
 }
 
-/// Insert newest-per-peer work while exposing the bounded LRU's otherwise
-/// silent capacity eviction. This preserves `LruCache::put` semantics exactly.
+/// Coalesce a monetized nomination into the per-peer pending queue with a
+/// SECURITY-AWARE rule (ADR-0004 Amendment 2): keep the pin that most needs
+/// auditing — the HIGHEST committed key count for that peer, newest on a tie.
 ///
-/// An event targeting the local peer is dropped instead of queued: the
-/// verifier walks every quote in a verified payment and the node's own quote
-/// is one of them, so each verified payment surfaces a self-targeting event.
-/// The node cannot audit itself over the network (there is no dialable address
-/// for the local peer, so the challenge fails instantly and is miscounted as a
-/// timeout), while any other payee that verifies the same payment schedules its
-/// own deterministic first audit of this node's pin — a self-dial adds no
-/// coverage either way. A self-target is therefore never queued — and hence
-/// never launched nor marked first-audited.
-fn queue_first_audit_event(
+/// A strictly-lower-count incoming must NOT displace a higher-count pending pin,
+/// otherwise a peer can erase an inflated (audit-worthy) commitment by simply
+/// monetizing a cheaper one right after — and a sidecar-only inflated pin has no
+/// gossip-lottery backstop. When the incoming loses, the retained entry's LRU
+/// recency is left UNTOUCHED (via `peek`), so a flood of low-count nominations
+/// cannot promote the retained pin's lane position.
+///
+/// `incoming_is_newer` distinguishes ordinary enqueue (the incoming arrived
+/// last, so it wins an equal-count tie for freshness) from a cooldown-race
+/// requeue of an older reserved event (the pending successor is newer, so it
+/// wins the tie).
+fn coalesce_first_audit_event(
     pending: &mut LruCache<PeerId, MonetizedPinEvent>,
-    event: MonetizedPinEvent,
-    self_peer: &PeerId,
+    incoming: MonetizedPinEvent,
+    incoming_is_newer: bool,
 ) -> FirstAuditQueueOutcome {
-    if event.peer == *self_peer {
-        return FirstAuditQueueOutcome::SelfTargetSkipped;
-    }
-    match pending.push(event.peer, event) {
-        None => FirstAuditQueueOutcome::Queued,
-        Some((replaced_peer, _)) if replaced_peer == event.peer => {
-            FirstAuditQueueOutcome::Coalesced
+    if let Some(existing) = pending.peek(&incoming.peer) {
+        // Strictly lower -> the incoming loses and is dropped WITHOUT touching
+        // the retained pin's recency (the security-relevant self-erasure case).
+        if incoming.key_count < existing.key_count {
+            return FirstAuditQueueOutcome::SuppressedLower;
         }
+        // Equal count -> keep the fresher; an older incoming loses a benign tie.
+        if incoming.key_count == existing.key_count && !incoming_is_newer {
+            return FirstAuditQueueOutcome::RetainedOnTie;
+        }
+        // Strictly higher, or equal-and-newer: the incoming wins. `push` updates
+        // the value and bumps MRU; replacing an existing key never evicts a
+        // different peer.
+        let _ = pending.push(incoming.peer, incoming);
+        return FirstAuditQueueOutcome::Coalesced;
+    }
+    // No same-peer entry: a `push` at capacity evicts the LRU (a DIFFERENT peer).
+    match pending.push(incoming.peer, incoming) {
+        None => FirstAuditQueueOutcome::Queued,
         Some((evicted_peer, evicted)) => FirstAuditQueueOutcome::CapacityEvicted {
             peer: evicted_peer,
             pin: evicted.pin,
         },
+    }
+}
+
+/// ADR-0004 Amendment 2 (E′): slack added to the max launch jitter when
+/// prefiltering a nomination's answerability at schedule time, covering the
+/// spawn/dispatch latency between the timer firing and the wire challenge so a
+/// jitter==MAX pin is not admitted only to fail the authoritative check by a
+/// few milliseconds. Tiny against the multi-hour answerability window.
+const FIRST_AUDIT_SEND_LATENCY_SLACK: Duration = Duration::from_secs(1);
+
+/// A first audit the limiter recently launched at a peer: when, and the
+/// committed key count that was audited (for the count-jump override).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecentFirstAudit {
+    launched_at: Instant,
+    key_count: u32,
+}
+
+/// Holds one first-audit in-flight slot; decrements the gauge on drop so a
+/// panicking or cancelled audit task can never leak a slot and wedge the
+/// [`config::FIRST_AUDIT_MAX_INFLIGHT`] cap shut.
+struct FirstAuditInflightSlot(Arc<FirstAuditObservability>);
+
+impl FirstAuditInflightSlot {
+    fn acquire(observability: &Arc<FirstAuditObservability>) -> Self {
+        observability.inflight.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(observability))
+    }
+}
+
+impl Drop for FirstAuditInflightSlot {
+    fn drop(&mut self) {
+        self.0.inflight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// ADR-0004 Amendment 2: whether `new_count` exceeds `audited_count` by more
+/// than the [`config::FIRST_AUDIT_COUNT_JUMP_NUM`]/
+/// [`config::FIRST_AUDIT_COUNT_JUMP_DEN`] ratio (`new > old * NUM / DEN`,
+/// overflow-free integer math). A jump re-nominates a peer despite a recent
+/// first audit: an inflated SIDECAR-ONLY pin is visible to payment verifiers
+/// only, so no gossip-lottery audit can ever cover it.
+const fn first_audit_count_jump(audited_count: u32, new_count: u32) -> bool {
+    (new_count as u64) * config::FIRST_AUDIT_COUNT_JUMP_DEN
+        > (audited_count as u64) * config::FIRST_AUDIT_COUNT_JUMP_NUM
+}
+
+/// The launch limiter's verdict for one pending monetized pin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LimiterVerdict {
+    /// Within budget and window: the caller may reserve a launch (and consumes
+    /// a token via [`FirstAuditLimiter::reserve_token`] only if it does).
+    Admit,
+    /// Launch-rate budget or in-flight cap exhausted. Penalty-free: keep the
+    /// pin pending and retry on a later tick.
+    RateDeferred,
+    /// The peer had a first audit within
+    /// [`config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL`] and the new pin's count
+    /// shows no [`first_audit_count_jump`]. Drop the nomination (the
+    /// gossip-lottery re-audit path is unaffected).
+    WindowDeduped,
+}
+
+/// ADR-0004 Amendment 2: the first-audit launch limiter — a token bucket
+/// (launch rate), an in-flight cap, and a per-peer re-audit window that
+/// survives pin rotation.
+///
+/// This is the load-bearing aggregate bound the original scheduler lacked:
+/// fleet-wide first-audit pressure becomes `nodes x refill-rate` instead of
+/// `uploads x pinned-quotes-per-proof x verifying-storers`. Pure over passed
+/// `now`/`inflight` values so every decision is unit-testable without a
+/// runtime.
+struct FirstAuditLimiter {
+    /// Launch tokens available, at most [`config::FIRST_AUDIT_BUDGET_BURST`].
+    tokens: u32,
+    /// Refill anchor. While the bucket is full this tracks `now` (a full
+    /// bucket accrues nothing); while below capacity it advances only by
+    /// whole refill intervals so fractional elapsed time is never lost.
+    last_refill: Instant,
+    /// Peers given a first audit recently, with the audited key count.
+    /// Bounded like the drainer's other per-peer maps.
+    recent: LruCache<PeerId, RecentFirstAudit>,
+}
+
+impl FirstAuditLimiter {
+    fn new(now: Instant) -> Self {
+        Self {
+            tokens: config::FIRST_AUDIT_BUDGET_BURST,
+            last_refill: now,
+            recent: LruCache::new(
+                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
+            ),
+        }
+    }
+
+    /// Whether the per-peer re-audit window admits a nomination for `peer`
+    /// carrying `key_count` at `now`. Read-only (`peek`), so it is safe to
+    /// call at ENQUEUE time — suppressed nominations never occupy pending
+    /// slots — without disturbing LRU recency.
+    fn window_allows(&self, peer: &PeerId, key_count: u32, now: Instant) -> bool {
+        self.recent.peek(peer).map_or(true, |prev| {
+            now.saturating_duration_since(prev.launched_at)
+                >= config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL
+                || first_audit_count_jump(prev.key_count, key_count)
+        })
+    }
+
+    /// Refill the token bucket for the time elapsed up to `now`.
+    fn refill(&mut self, now: Instant) {
+        if self.tokens >= config::FIRST_AUDIT_BUDGET_BURST {
+            // Full bucket accrues nothing; keep the anchor current so the
+            // next consumption starts its interval from here.
+            self.last_refill = now;
+            return;
+        }
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        let earned = elapsed.as_nanos() / interval.as_nanos().max(1);
+        if earned == 0 {
+            return;
+        }
+        let capacity_gap = u128::from(config::FIRST_AUDIT_BUDGET_BURST - self.tokens);
+        if earned >= capacity_gap {
+            self.tokens = config::FIRST_AUDIT_BUDGET_BURST;
+            self.last_refill = now;
+        } else {
+            // earned < capacity_gap <= u32::MAX, so both casts are lossless.
+            self.tokens = self
+                .tokens
+                .saturating_add(u32::try_from(earned).unwrap_or(u32::MAX));
+            let advance = interval.saturating_mul(u32::try_from(earned).unwrap_or(u32::MAX));
+            self.last_refill = self.last_refill.checked_add(advance).unwrap_or(now);
+        }
+    }
+
+    /// Decide whether a pending pin may launch now. Consumes NOTHING: the
+    /// caller runs the remaining (per-peer cooldown) gate and calls
+    /// [`Self::commit_launch`] only for a launch that actually happens, so a
+    /// deferral elsewhere never burns budget or stamps the window.
+    fn assess(
+        &mut self,
+        peer: &PeerId,
+        key_count: u32,
+        now: Instant,
+        inflight: u64,
+    ) -> LimiterVerdict {
+        if !self.window_allows(peer, key_count, now) {
+            return LimiterVerdict::WindowDeduped;
+        }
+        self.refill(now);
+        if inflight >= config::FIRST_AUDIT_MAX_INFLIGHT || self.tokens == 0 {
+            return LimiterVerdict::RateDeferred;
+        }
+        LimiterVerdict::Admit
+    }
+
+    /// Consume one launch token for a RESERVATION (ADR-0004 Amendment 2 E′).
+    /// Does NOT stamp the per-peer window: the durable `recent` stamp happens
+    /// only at [`Self::promote`], after the authoritative post-jitter
+    /// answerability check, so a reservation that is later cancelled leaves no
+    /// suppression behind.
+    fn reserve_token(&mut self) {
+        self.tokens = self.tokens.saturating_sub(1);
+    }
+
+    /// Return a token consumed by a reservation that was cancelled before it
+    /// launched (answerability lapsed or a concurrent gossip audit won the
+    /// cooldown). Capped at the burst so a spurious double-refund cannot exceed
+    /// the bucket.
+    fn refund_token(&mut self) {
+        self.tokens = (self.tokens + 1).min(config::FIRST_AUDIT_BUDGET_BURST);
+    }
+
+    /// Stamp the per-peer re-audit window for a launch that is ACTUALLY firing
+    /// (promotion). Separated from token consumption so suppression is only
+    /// ever recorded for a real send.
+    fn promote(&mut self, peer: PeerId, key_count: u32, now: Instant) {
+        self.recent.put(
+            peer,
+            RecentFirstAudit {
+                launched_at: now,
+                key_count,
+            },
+        );
+    }
+
+    /// Test convenience: the pre-E′ atomic "a launch happened" — consume a token
+    /// and stamp the window in one call. Production splits these across
+    /// reservation and promotion; the limiter's own budget/window unit tests do
+    /// not model the jitter reservation and use this shorthand.
+    #[cfg(test)]
+    fn commit_launch(&mut self, peer: PeerId, key_count: u32, now: Instant) {
+        self.reserve_token();
+        self.promote(peer, key_count, now);
+    }
+}
+
+/// ADR-0004 Amendment 2 (E′ B-prefilter): whether a monetized pin is answerable
+/// across the ENTIRE launch-jitter window ending at
+/// `now + FIRST_AUDIT_LAUNCH_JITTER_MAX + slack`, so committing scheduling state
+/// for it cannot later require aborting an out-of-window challenge. The
+/// too-future bound is enforced at `now` (a jitter delay only ages a pin
+/// forward, never toward the future); the too-old bound is enforced at the
+/// latest possible send time. This is a conservative admission prefilter; the
+/// authoritative answerability check still runs at promotion against the real
+/// send-time wall clock, so A1 (no false conviction) holds regardless of how
+/// jitter and the answerability margin are sized. `checked_add` overflow fails
+/// closed (skip the pin).
+fn quote_answerable_through_nominal_jitter(quote_ts: SystemTime, now: SystemTime) -> bool {
+    let Some(latest_send) = now
+        .checked_add(config::FIRST_AUDIT_LAUNCH_JITTER_MAX)
+        .and_then(|t| t.checked_add(FIRST_AUDIT_SEND_LATENCY_SLACK))
+    else {
+        return false;
+    };
+    quote_within_audit_window(quote_ts, now) && quote_within_audit_window(quote_ts, latest_send)
+}
+
+/// A far-future `Instant` used to effectively DISABLE the promotion-timer
+/// select arm when no reservation is outstanding. The drainer still wakes at
+/// least every [`config::FIRST_AUDIT_RETRY_INTERVAL`] via its tick, so this only
+/// needs to be comfortably past the next tick.
+fn first_audit_far_future() -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_secs(3600))
+        .unwrap_or_else(Instant::now)
+}
+
+/// ADR-0004 Amendment 2 (E′): one outstanding first-audit reservation. Holds
+/// its in-flight slot and launch token from schedule time until the jitter
+/// timer fires; the durable suppression (`recent` + `first_audited`) is stamped
+/// only if the authoritative post-jitter answerability + cooldown checks pass at
+/// promotion, so a cancelled reservation leaves NO suppression behind.
+struct FirstAuditReservation {
+    event: MonetizedPinEvent,
+    ready_at: Instant,
+    inflight: FirstAuditInflightSlot,
+}
+
+/// ADR-0004 Amendment 2 (E′): the drainer-owned first-audit scheduler. Owns the
+/// pending queue, the dedup set, the launch limiter, the alternating lane, and
+/// the single outstanding reservation. All mutation is single-threaded in the
+/// drainer task; the only asynchrony is the spawned audit I/O (which just holds
+/// the moved-in in-flight slot). Kept as a struct so the reserve/promote/cancel
+/// state machine is unit-testable with injected clocks.
+struct FirstAuditScheduler {
+    /// Pins already given a first audit (dedup). A pin enters only at PROMOTION
+    /// (a real send), never at reservation, so a cancelled reservation can be
+    /// re-nominated.
+    first_audited: LruCache<[u8; 32], ()>,
+    /// Newest-per-peer pending nominations not yet launched.
+    pending: LruCache<PeerId, MonetizedPinEvent>,
+    /// Token bucket + per-peer re-audit window.
+    limiter: FirstAuditLimiter,
+    /// The single outstanding reservation (E′ serializes reservations so the
+    /// per-launch lane alternation is preserved and at most one jitter timer is
+    /// live).
+    reserved: Option<FirstAuditReservation>,
+    /// Alternating launch lane, flipped on every PROMOTION (real launch).
+    oldest_first_lane: bool,
+    /// The local node's own peer ID. A verified payment's quote list includes
+    /// the node's own quote, so the verifier emits a monetized-pin event for
+    /// the local peer on every payment it verifies. The node cannot
+    /// network-audit itself (there is no dialable address for the local peer,
+    /// so the challenge fails instantly and is miscounted as a timeout), while
+    /// any other payee that verifies the same payment schedules its own first
+    /// audit of this node's pin — a self-dial adds no coverage either way.
+    /// Such an event is dropped at ingress: never queued, and hence never
+    /// launched nor marked first-audited.
+    self_peer: PeerId,
+}
+
+impl FirstAuditScheduler {
+    fn new(now: Instant, self_peer: PeerId) -> Self {
+        let cap = NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            first_audited: LruCache::new(cap),
+            pending: LruCache::new(cap),
+            limiter: FirstAuditLimiter::new(now),
+            reserved: None,
+            oldest_first_lane: false,
+            self_peer,
+        }
+    }
+
+    /// Observability getter: used by the scheduler summary log and unit tests,
+    /// both absent from a release `--no-default-features` build, so it is dead
+    /// only in that configuration.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Observability getter (see [`Self::pending_len`]).
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    fn tokens(&self) -> u32 {
+        self.limiter.tokens
+    }
+
+    /// Observability getter (see [`Self::pending_len`]). Milliseconds since the
+    /// signed quote timestamp of the oldest pin still awaiting a first audit:
+    /// how close the longest-waiting pending pin is to aging out of the
+    /// answerability window. A value climbing toward the window means pending
+    /// work is expiring unaudited instead of launching; a small, steady value
+    /// means the queue is draining promptly. Returns `0` when `pending` is empty
+    /// and saturates to `0` for a future-dated quote (clock skew), never panics.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
+    fn oldest_pending_quote_age_ms(&self, now: SystemTime) -> u64 {
+        self.pending
+            .iter()
+            .map(|(_, e)| e.quote_ts)
+            .min()
+            .and_then(|oldest| now.duration_since(oldest).ok())
+            .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    /// Drop every pending nomination that has aged past the answerability
+    /// horizon. `try_reserve` collects expired entries only while it can scan —
+    /// under token starvation it returns at the budget gate first — so without
+    /// a periodic sweep dead entries squat the bounded LRU (evicting live peers
+    /// at capacity) and inflate the `pending`/`oldest_pending_quote_age_ms`
+    /// telemetry. Each removal is accounted as `outside_answerability_window`,
+    /// exactly like a scan-time expiry. Returns how many entries were dropped;
+    /// survivor recency is untouched.
+    fn sweep_expired(&mut self, wall_now: SystemTime, obs: &Arc<FirstAuditObservability>) -> usize {
+        let expired: Vec<PeerId> = self
+            .pending
+            .iter()
+            .filter(|(_, event)| !quote_answerable_through_nominal_jitter(event.quote_ts, wall_now))
+            .map(|(peer, _)| *peer)
+            .collect();
+        for peer in &expired {
+            self.pending.pop(peer);
+        }
+        if !expired.is_empty() {
+            obs.outside_answerability_window.fetch_add(
+                u64::try_from(expired.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        expired.len()
+    }
+
+    fn has_reservation(&self) -> bool {
+        self.reserved.is_some()
+    }
+
+    /// When the outstanding reservation becomes eligible for promotion.
+    fn reserved_ready_at(&self) -> Option<Instant> {
+        self.reserved.as_ref().map(|r| r.ready_at)
+    }
+
+    /// The peer of the outstanding reservation, if any.
+    fn reserved_peer(&self) -> Option<PeerId> {
+        self.reserved.as_ref().map(|r| r.event.peer)
+    }
+
+    /// Admit a monetized nomination into `pending`. Dropped at ingress if it
+    /// targets the local peer (see [`Self::self_peer`]); dropped as a duplicate
+    /// if already first-audited; the window screen is bypassed for the
+    /// currently reserved peer (so a successor is retained across the
+    /// reservation, never window-dropped); otherwise window-screened.
+    /// Coalescing is highest-count-per-peer (newest on a tie) — a lower-count
+    /// successor never displaces a higher-count pending pin. An incumbent that
+    /// has aged past the answerability horizon is dropped (and accounted as an
+    /// expiry) before coalescing, so a dead pin never vetoes a live nomination.
+    fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
+        if event.peer == self.self_peer {
+            obs.self_target_skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if self.first_audited.contains(&event.pin) {
+            obs.duplicates.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let reserved_peer = self.reserved_peer();
+        let is_reserved_peer = reserved_peer == Some(event.peer);
+        if !is_reserved_peer
+            && !self
+                .limiter
+                .window_allows(&event.peer, event.key_count, Instant::now())
+        {
+            obs.window_deduped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        // A pending incumbent past the answerability horizon can never launch,
+        // yet its (possibly higher) key count would still win the coalesce
+        // against a live incoming — e.g. a fresh post-prune lower-count pin —
+        // and under token starvation no reserve scan runs to collect it. Drop
+        // it first so the incoming is judged on its own merits.
+        let stale_incumbent = self.pending.peek(&event.peer).is_some_and(|existing| {
+            !quote_answerable_through_nominal_jitter(existing.quote_ts, SystemTime::now())
+        });
+        if stale_incumbent {
+            self.pending.pop(&event.peer);
+            obs.outside_answerability_window
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        // Ordinary enqueue: the incoming arrived last, so it wins an equal-count
+        // tie.
+        match coalesce_first_audit_event(&mut self.pending, event, true) {
+            FirstAuditQueueOutcome::Queued => {
+                obs.queued.fetch_add(1, Ordering::Relaxed);
+            }
+            FirstAuditQueueOutcome::Coalesced | FirstAuditQueueOutcome::RetainedOnTie => {
+                obs.coalesced.fetch_add(1, Ordering::Relaxed);
+            }
+            FirstAuditQueueOutcome::SuppressedLower => {
+                obs.suppressed_lower.fetch_add(1, Ordering::Relaxed);
+            }
+            FirstAuditQueueOutcome::CapacityEvicted { .. } => {
+                obs.queued.fetch_add(1, Ordering::Relaxed);
+                obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Attempt to create the single reservation from `pending` (E′ reserve).
+    /// Scans in the current lane order and reserves the FIRST eligible pin:
+    /// consumes one token, acquires one in-flight slot, and sets `ready_at =
+    /// mono_now + jitter`. Does NOT stamp `recent`/`first_audited` and does NOT
+    /// flip the lane — those happen only at promotion. Returns whether a
+    /// reservation was made. `cooldown` is a read-only snapshot (the
+    /// authoritative check-and-stamp is at promotion).
+    fn try_reserve(
+        &mut self,
+        mono_now: Instant,
+        inflight: u64,
+        jitter: Duration,
+        cooldown: &HashMap<PeerId, Instant>,
+        obs: &Arc<FirstAuditObservability>,
+    ) -> bool {
+        if self.reserved.is_some() || self.pending.is_empty() {
+            return false;
+        }
+        self.limiter.refill(mono_now);
+        if inflight >= config::FIRST_AUDIT_MAX_INFLIGHT || self.limiter.tokens == 0 {
+            obs.rate_deferred_attempts.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        // MRU->LRU order; reverse for the oldest-first lane so the preferred
+        // end is at the front.
+        let mut ordered: Vec<(usize, PeerId, MonetizedPinEvent)> = self
+            .pending
+            .iter()
+            .enumerate()
+            .map(|(i, (p, e))| (i, *p, *e))
+            .collect();
+        self.pending.clear();
+        if self.oldest_first_lane {
+            ordered.reverse();
+        }
+        let mut chosen: Option<MonetizedPinEvent> = None;
+        let mut kept: Vec<(usize, PeerId, MonetizedPinEvent)> = Vec::new();
+        for (idx, peer, event) in ordered {
+            if chosen.is_some() {
+                kept.push((idx, peer, event));
+                continue;
+            }
+            if self.first_audited.contains(&event.pin) {
+                obs.duplicates.fetch_add(1, Ordering::Relaxed);
+                continue; // drop: already audited
+            }
+            if !quote_answerable_through_nominal_jitter(event.quote_ts, SystemTime::now()) {
+                obs.outside_answerability_window
+                    .fetch_add(1, Ordering::Relaxed);
+                continue; // drop: cannot stay answerable through the jitter
+            }
+            // Window + budget + inflight. Tokens do not decrease during the
+            // scan (reserve happens after the loop) and `inflight` is fixed, so
+            // after the upfront budget gate `assess` never returns RateDeferred
+            // here; a defensive RateDeferred keeps the pin.
+            match self
+                .limiter
+                .assess(&peer, event.key_count, mono_now, inflight)
+            {
+                LimiterVerdict::WindowDeduped => {
+                    obs.window_deduped.fetch_add(1, Ordering::Relaxed);
+                    continue; // drop: recently first-audited, no count jump
+                }
+                LimiterVerdict::RateDeferred => {
+                    kept.push((idx, peer, event));
+                    continue; // keep (defensive; unreachable after upfront gate)
+                }
+                LimiterVerdict::Admit => {}
+            }
+            if !cooldown_would_allow(cooldown, &peer, mono_now) {
+                obs.cooldown_deferred_attempts
+                    .fetch_add(1, Ordering::Relaxed);
+                kept.push((idx, peer, event));
+                continue; // keep: on shared cooldown, retry later
+            }
+            chosen = Some(event);
+        }
+        // Restore relative recency (oldest re-put first -> newest stays MRU).
+        kept.sort_unstable_by_key(|(idx, _, _)| std::cmp::Reverse(*idx));
+        for (_, peer, event) in kept {
+            self.pending.put(peer, event);
+        }
+        let Some(event) = chosen else {
+            return false;
+        };
+        self.limiter.reserve_token();
+        let inflight_slot = FirstAuditInflightSlot::acquire(obs);
+        let ready_at = mono_now.checked_add(jitter).unwrap_or(mono_now);
+        self.reserved = Some(FirstAuditReservation {
+            event,
+            ready_at,
+            inflight: inflight_slot,
+        });
+        true
+    }
+
+    /// Take the outstanding reservation if its jitter has elapsed at `mono_now`.
+    fn take_due_reservation(&mut self, mono_now: Instant) -> Option<FirstAuditReservation> {
+        if self
+            .reserved
+            .as_ref()
+            .is_some_and(|r| mono_now >= r.ready_at)
+        {
+            self.reserved.take()
+        } else {
+            None
+        }
+    }
+
+    /// Authoritative promotion of a due reservation (E′). The caller holds the
+    /// shared cooldown write lock and passes the real send-time `wall_now` and
+    /// `mono_now`. Returns `Some((event, slot))` to spawn the audit on a real
+    /// launch, or `None` when the launch was cancelled (answerability lapsed
+    /// during jitter) or requeued (a concurrent gossip audit won the cooldown).
+    /// On both `None` paths the token is refunded, the in-flight slot released,
+    /// and NO suppression is recorded.
+    ///
+    /// Known operational residual: suppression is stamped here, at promotion,
+    /// while the wire challenge is sent by the detached task the caller spawns
+    /// with the returned event. A task-start or encoding failure between the
+    /// two therefore leaves a stamped-but-unsent window. No remote input can
+    /// force that failure (it requires local task-spawn/alloc failure), so it
+    /// is accepted rather than closed; closing it would require stamping from
+    /// inside the spawned task and re-introduce the cancel-leaves-suppression
+    /// race this design exists to prevent.
+    fn resolve(
+        &mut self,
+        reservation: FirstAuditReservation,
+        wall_now: SystemTime,
+        mono_now: Instant,
+        cooldown: &mut HashMap<PeerId, Instant>,
+        obs: &Arc<FirstAuditObservability>,
+    ) -> Option<(MonetizedPinEvent, FirstAuditInflightSlot)> {
+        let FirstAuditReservation {
+            event, inflight, ..
+        } = reservation;
+        // Authoritative answerability at the REAL send time.
+        if !quote_within_audit_window(event.quote_ts, wall_now) {
+            self.limiter.refund_token();
+            obs.outside_answerability_window
+                .fetch_add(1, Ordering::Relaxed);
+            drop(inflight);
+            return None; // cancelled; nothing stamped, nothing to roll back
+        }
+        // Authoritative shared-cooldown check-and-stamp. Losing this race to a
+        // concurrent gossip audit requeues the reserved event through the SAME
+        // security-aware coalescing: the reserved event is OLDER than any
+        // same-peer successor (`incoming_is_newer = false`), so a higher-count
+        // reserved event still wins over a lower-count successor (the inflated
+        // pin must be audited), while an equal/higher successor is preserved.
+        if !cooldown_allows_audit(cooldown, &event.peer, mono_now) {
+            self.limiter.refund_token();
+            obs.cooldown_deferred_attempts
+                .fetch_add(1, Ordering::Relaxed);
+            drop(inflight);
+            // Account for the requeue outcome (the nomination itself was already
+            // counted at ingress, so `queued` is not re-incremented): a capacity
+            // eviction of a DIFFERENT peer and a suppressed reserved event are
+            // both observable per the ADR funnel.
+            match coalesce_first_audit_event(&mut self.pending, event, false) {
+                FirstAuditQueueOutcome::CapacityEvicted { .. } => {
+                    obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
+                }
+                FirstAuditQueueOutcome::SuppressedLower => {
+                    obs.suppressed_lower.fetch_add(1, Ordering::Relaxed);
+                }
+                FirstAuditQueueOutcome::Queued
+                | FirstAuditQueueOutcome::Coalesced
+                | FirstAuditQueueOutcome::RetainedOnTie => {}
+            }
+            return None;
+        }
+        // Promote: stamp durable suppression, flip the lane, count the launch.
+        self.limiter.promote(event.peer, event.key_count, mono_now);
+        self.first_audited.put(event.pin, ());
+        self.oldest_first_lane = !self.oldest_first_lane;
+        obs.launched.fetch_add(1, Ordering::Relaxed);
+        Some((event, inflight))
     }
 }
 
@@ -400,6 +1039,11 @@ pub struct ReplicationEngine {
     /// commitment changes cannot spawn back-to-back audits of the same peer.
     /// Bounded by routing-table membership and cleaned on `PeerRemoved`.
     audit_on_gossip_cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Gossip-private lottery attempt window (one roll per peer per window,
+    /// win or lose). Kept separate from `audit_on_gossip_cooldown` so a losing
+    /// ticket never stamps the shared map and thus never defers a monetized
+    /// first audit. Bounded like its sibling and cleaned on `PeerRemoved`.
+    gossip_lottery_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Completed local neighbor-sync cycle epoch for proof maturity.
     sync_cycle_epoch: Arc<RwLock<u64>>,
     /// Per-key repair proof tracking for audit eligibility.
@@ -492,11 +1136,15 @@ pub struct ReplicationEngine {
     possession_check_rx: Option<mpsc::UnboundedReceiver<possession::PossessionCheckEvent>>,
     /// ADR-0004: sender the payment verifier clones to surface monetized pins
     /// for a deterministic first audit. The matching receiver is drained by
-    /// `start_first_audit_drainer`.
-    monetized_pin_tx: mpsc::UnboundedSender<MonetizedPinEvent>,
+    /// `start_first_audit_drainer`. BOUNDED (Amendment 2): the producer
+    /// `try_send`s and drops on a full queue, so ingress memory is capped just
+    /// like launches; a dropped nomination is penalty-free — the peer's
+    /// gossiped commitments stay lottery-covered and its next settled payment
+    /// re-nominates the paid pin.
+    monetized_pin_tx: mpsc::Sender<MonetizedPinEvent>,
     /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
-    monetized_pin_rx: Option<mpsc::UnboundedReceiver<MonetizedPinEvent>>,
+    monetized_pin_rx: Option<mpsc::Receiver<MonetizedPinEvent>>,
     /// Counters shared with the first-audit drainer task, so the scheduler's
     /// decisions (queued / launched / self-target skipped / outcome) stay
     /// observable from the engine after the drainer takes the receiver.
@@ -538,7 +1186,11 @@ impl ReplicationEngine {
         let (possession_check_tx, possession_check_rx) = mpsc::unbounded_channel();
 
         // ADR-0004: monetized-pin channel (verifier -> first-audit drainer).
-        let (monetized_pin_tx, monetized_pin_rx) = mpsc::unbounded_channel();
+        // Bounded (Amendment 2): every stage of the first-audit pipeline is
+        // now capacity-limited — ingress queue here, pending set (LRU), and
+        // launch rate (token bucket).
+        let (monetized_pin_tx, monetized_pin_rx) =
+            mpsc::channel(config::FIRST_AUDIT_INGRESS_CAPACITY);
 
         let engine = Self {
             config: Arc::clone(&config),
@@ -550,6 +1202,7 @@ impl ReplicationEngine {
             sync_state: Arc::new(RwLock::new(initial_neighbors)),
             sync_history: Arc::new(RwLock::new(HashMap::new())),
             audit_on_gossip_cooldown: Arc::new(RwLock::new(HashMap::new())),
+            gossip_lottery_attempts: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
             bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
@@ -584,10 +1237,11 @@ impl ReplicationEngine {
     }
 
     /// ADR-0004: a sender the payment verifier uses to surface monetized pins
-    /// (commitments that backed a payment) for a deterministic first audit.
-    /// Cloneable; the engine drains the matching receiver.
+    /// (commitments that backed a payment) for a first audit. Cloneable; the
+    /// engine drains the matching receiver. Bounded: senders must `try_send`
+    /// and treat a full queue as a benign drop (Amendment 2 best-effort).
     #[must_use]
-    pub fn monetized_pin_sender(&self) -> mpsc::UnboundedSender<MonetizedPinEvent> {
+    pub fn monetized_pin_sender(&self) -> mpsc::Sender<MonetizedPinEvent> {
         self.monetized_pin_tx.clone()
     }
 
@@ -975,155 +1629,206 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&self.sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
         let shutdown = self.shutdown.clone();
         let observability = Arc::clone(&self.first_audit_observability);
         let self_peer = *self.p2p_node.peer_id();
 
         let handle = tokio::spawn(async move {
-            // Bounded dedup of pins that have ALREADY been given their
-            // deterministic first audit. A pin is inserted ONLY when an audit is
-            // actually launched (never on a cooldown skip), so a pin skipped now
-            // can still be first-audited later.
-            let mut first_audited: LruCache<[u8; 32], ()> = LruCache::new(
-                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
-            );
-            // PERSISTENT pending queue: the most-recently-monetized pin per peer
-            // that has NOT yet been first-audited. A pin stays here until it is
-            // ACTUALLY first-audited (enters `first_audited`) — never removed for
-            // any weaker reason (e.g. a cooldown stamp), so an unaudited monetized
-            // pin is never silently forgotten. Newest-per-peer: a fresher pin for
-            // the same peer replaces the older one. Memory is bounded by an LRU:
-            // each entry needs a SETTLED on-chain payment, so the realistic count
-            // is tiny; the LRU is a pure DoS backstop that, only under an absurd
-            // flood, evicts the LEAST-RECENTLY-MONETIZED peer (the one most likely
-            // already superseded) — never the newest.
-            let mut pending: LruCache<PeerId, MonetizedPinEvent> = LruCache::new(
-                NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN),
-            );
-            // Periodic retry tick for pending (cooldown-blocked) pins. Created
-            // once; `Skip` so a backlog of missed ticks collapses to one.
+            // ADR-0004 Amendment 2 (E'): the drainer-owned first-audit
+            // scheduler. Payments only NOMINATE pins; the token bucket launches
+            // them at a fixed per-node rate, and durable suppression is stamped
+            // only at PROMOTION (after an authoritative post-jitter answerability
+            // + cooldown check), so a cancelled reservation leaves nothing behind.
+            let mut scheduler = FirstAuditScheduler::new(Instant::now(), self_peer);
+            // Periodic retry tick so budget/cooldown-deferred pins get retried
+            // even when no new nomination arrives. `Skip` collapses a backlog.
             let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_summary = Instant::now();
             loop {
-                // Wake on: shutdown, a new monetized pin, OR a periodic tick so
-                // pending (cooldown-blocked) pins get retried once their window
-                // reopens even if no new pin arrives.
-                let drained_new = tokio::select! {
+                // The reservation's jitter deadline is a wake source: if a
+                // reservation is outstanding, sleep until it is due; otherwise
+                // a far-future deadline effectively disables that arm and only
+                // shutdown/rx/tick wake the loop. Recreated each iteration so a
+                // newly reserved (earlier) deadline is honoured next turn.
+                let promotion_due = scheduler
+                    .reserved_ready_at()
+                    .unwrap_or_else(first_audit_far_future);
+                tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = rx.recv() => match event {
                         Some(e) => {
                             observability.received.fetch_add(1, Ordering::Relaxed);
-                            // Newest-per-peer: a fresher pin replaces the older one,
-                            // BUT only if it is not already first-audited — an
-                            // already-audited duplicate must never overwrite an
-                            // unaudited pending pin for the same peer (it would then
-                            // be dropped as "done" and the unaudited pin lost). Cap
-                            // the per-wake batch drain (FIRST_AUDIT_DRAIN_BATCH) so a
-                            // sustained flood can't starve the audit-launch phase.
-                            if first_audited.contains(&e.pin) {
-                                observability.duplicates.fetch_add(1, Ordering::Relaxed);
-                                debug!(
-                                    "First-audit scheduler: audit_trigger=first_monetized outcome=duplicate peer={} pin={} key_count={} pending={}",
-                                    e.peer, hex::encode(e.pin), e.key_count, pending.len()
-                                );
-                            } else {
-                                match queue_first_audit_event(&mut pending, e, &self_peer) {
-                                    FirstAuditQueueOutcome::Queued => {
-                                        observability.queued.fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            "First-audit scheduler: audit_trigger=first_monetized outcome=queued peer={} pin={} key_count={} pending={}",
-                                            e.peer, hex::encode(e.pin), e.key_count, pending.len()
-                                        );
-                                    }
-                                    FirstAuditQueueOutcome::Coalesced => {
-                                        observability.coalesced.fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            "First-audit scheduler: audit_trigger=first_monetized outcome=coalesced peer={} pin={} key_count={} pending={}",
-                                            e.peer, hex::encode(e.pin), e.key_count, pending.len()
-                                        );
-                                    }
-                                    FirstAuditQueueOutcome::CapacityEvicted { peer, pin } => {
-                                        observability.queued.fetch_add(1, Ordering::Relaxed);
-                                        observability
-                                            .capacity_evicted
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            "First-audit scheduler: audit_trigger=first_monetized outcome=queued capacity_evicted=true evicted_peer={peer} evicted_pin={} replacement_peer={} replacement_pin={} pending={}",
-                                            hex::encode(pin), e.peer, hex::encode(e.pin), pending.len()
-                                        );
-                                    }
-                                    FirstAuditQueueOutcome::SelfTargetSkipped => {
-                                        observability
-                                            .self_target_skipped
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        debug!(
-                                            "First-audit scheduler: audit_trigger=first_monetized outcome=self_target_skipped peer={} pin={} key_count={} pending={}",
-                                            e.peer, hex::encode(e.pin), e.key_count, pending.len()
-                                        );
-                                    }
-                                }
-                            }
+                            scheduler.enqueue(e, &observability);
+                            // Drain a bounded burst so a flood cannot starve the
+                            // launch phase.
                             let mut drained = 1usize;
                             while drained < config::FIRST_AUDIT_DRAIN_BATCH {
                                 match rx.try_recv() {
                                     Ok(e) => {
                                         observability.received.fetch_add(1, Ordering::Relaxed);
-                                        if first_audited.contains(&e.pin) {
-                                            observability
-                                                .duplicates
-                                                .fetch_add(1, Ordering::Relaxed);
-                                        } else {
-                                            match queue_first_audit_event(&mut pending, e, &self_peer) {
-                                                FirstAuditQueueOutcome::Queued => {
-                                                    observability
-                                                        .queued
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
-                                                FirstAuditQueueOutcome::Coalesced => {
-                                                    observability
-                                                        .coalesced
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
-                                                FirstAuditQueueOutcome::CapacityEvicted { .. } => {
-                                                    observability
-                                                        .queued
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                    observability
-                                                        .capacity_evicted
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
-                                                FirstAuditQueueOutcome::SelfTargetSkipped => {
-                                                    observability
-                                                        .self_target_skipped
-                                                        .fetch_add(1, Ordering::Relaxed);
-                                                }
-                                            }
-                                        }
+                                        scheduler.enqueue(e, &observability);
                                         drained += 1;
                                     }
                                     Err(_) => break,
                                 }
                             }
-                            true
                         }
                         None => break,
                     },
-                    _ = tick.tick() => false,
-                };
-                let _ = drained_new;
+                    _ = tick.tick() => {}
+                    () = tokio::time::sleep_until(promotion_due.into()) => {}
+                }
+
+                // 1) Promote a due reservation. Resolved after EVERY wake (not
+                //    only when the timer arm wins) so a continuously-ready `rx`
+                //    cannot indefinitely delay a due promotion. The authoritative
+                //    answerability + cooldown check-and-stamp happens here under
+                //    the shared cooldown write lock, immediately before the send.
+                if let Some(reservation) = scheduler.take_due_reservation(Instant::now()) {
+                    let promoted = {
+                        let mut cooldown = gossip_audit.cooldown.write().await;
+                        scheduler.resolve(
+                            reservation,
+                            SystemTime::now(),
+                            Instant::now(),
+                            &mut cooldown,
+                            &observability,
+                        )
+                    };
+                    if let Some((event, inflight_slot)) = promoted {
+                        debug!(
+                            "First-audit scheduler: audit_trigger=first_monetized outcome=launched peer={} pin={} key_count={} inflight={}",
+                            event.peer, hex::encode(event.pin), event.key_count,
+                            observability.inflight.load(Ordering::Relaxed)
+                        );
+                        let trigger = gossip_audit.clone();
+                        let audit_observability = Arc::clone(&observability);
+                        tokio::spawn(async move {
+                            // The jitter already elapsed as the reservation's
+                            // timer; the slot is held for the audit's duration
+                            // and released on drop (panic-safe).
+                            let inflight_slot = inflight_slot;
+                            let started = Instant::now();
+                            let credit = storage_commitment_audit::AuditCredit {
+                                recent_provers: &trigger.recent_provers,
+                            };
+                            let result = storage_commitment_audit::run_subtree_audit(
+                                &trigger.p2p_node,
+                                &trigger.config,
+                                &event.peer,
+                                event.pin,
+                                event.key_count,
+                                Some(&credit),
+                            )
+                            .await;
+                            let outcome = first_audit_terminal_outcome(&result);
+                            match outcome {
+                                FirstAuditTerminalOutcome::Passed => {
+                                    audit_observability.passed.fetch_add(1, Ordering::Relaxed);
+                                }
+                                FirstAuditTerminalOutcome::Timeout => {
+                                    audit_observability
+                                        .timed_out
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                FirstAuditTerminalOutcome::Failed => {
+                                    audit_observability.failed.fetch_add(1, Ordering::Relaxed);
+                                }
+                                FirstAuditTerminalOutcome::BootstrapClaim => {
+                                    audit_observability
+                                        .bootstrap_claims
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                FirstAuditTerminalOutcome::Idle => {
+                                    audit_observability.idle.fetch_add(1, Ordering::Relaxed);
+                                }
+                                FirstAuditTerminalOutcome::InsufficientKeys => {
+                                    audit_observability
+                                        .insufficient_keys
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            drop(inflight_slot);
+                            debug!(
+                                "First-audit scheduler: audit_trigger=first_monetized outcome={} peer={} pin={} key_count={} elapsed_ms={} inflight={}",
+                                outcome.as_str(),
+                                event.peer, hex::encode(event.pin), event.key_count,
+                                started.elapsed().as_millis(),
+                                audit_observability.inflight.load(Ordering::Relaxed)
+                            );
+                            handle_subtree_audit_result(
+                                &result,
+                                &trigger.p2p_node,
+                                &trigger.sync_state,
+                                &trigger.recent_provers,
+                                &trigger.config,
+                            )
+                            .await;
+                        });
+                    }
+                }
+
+                // 2) Open the single reservation from the pending queue if none
+                //    is outstanding (read-only cooldown snapshot; the
+                //    authoritative stamp is at promotion). Serializing
+                //    reservations preserves per-launch lane alternation and keeps
+                //    at most one jitter timer live.
+                if !scheduler.has_reservation() {
+                    let jitter = Duration::from_millis(
+                        rand::thread_rng().gen_range(
+                            0..=u64::try_from(config::FIRST_AUDIT_LAUNCH_JITTER_MAX.as_millis())
+                                .unwrap_or(u64::MAX),
+                        ),
+                    );
+                    let inflight = observability.inflight.load(Ordering::Relaxed);
+                    let reserved = {
+                        let cooldown = gossip_audit.cooldown.read().await;
+                        scheduler.try_reserve(
+                            Instant::now(),
+                            inflight,
+                            jitter,
+                            &cooldown,
+                            &observability,
+                        )
+                    };
+                    if reserved {
+                        if let Some(peer) = scheduler.reserved_peer() {
+                            debug!(
+                                "First-audit scheduler: audit_trigger=first_monetized outcome=reserved peer={peer} pending={}",
+                                scheduler.pending_len()
+                            );
+                        }
+                    }
+                }
 
                 if last_summary.elapsed() >= config::FIRST_AUDIT_SUMMARY_INTERVAL {
+                    // Token-independent hygiene: collect entries that aged past
+                    // the answerability horizon while the budget gate kept the
+                    // reserve scan from running, so the summary below reports
+                    // only live work.
+                    let swept = scheduler.sweep_expired(SystemTime::now(), &observability);
+                    if swept > 0 {
+                        debug!(
+                            "First-audit scheduler: audit_trigger=first_monetized outcome=expired_swept count={swept} pending={}",
+                            scheduler.pending_len()
+                        );
+                    }
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized received={} queued={} coalesced={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} inflight={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
+                        FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
                         observability.coalesced.load(Ordering::Relaxed),
+                        observability.suppressed_lower.load(Ordering::Relaxed),
                         observability.duplicates.load(Ordering::Relaxed),
                         observability.capacity_evicted.load(Ordering::Relaxed),
                         observability.self_target_skipped.load(Ordering::Relaxed),
                         observability.cooldown_deferred_attempts.load(Ordering::Relaxed),
+                        observability.rate_deferred_attempts.load(Ordering::Relaxed),
+                        observability.window_deduped.load(Ordering::Relaxed),
                         observability.launched.load(Ordering::Relaxed),
                         observability.passed.load(Ordering::Relaxed),
                         observability.timed_out.load(Ordering::Relaxed),
@@ -1132,140 +1837,12 @@ impl ReplicationEngine {
                         observability.idle.load(Ordering::Relaxed),
                         observability.insufficient_keys.load(Ordering::Relaxed),
                         observability.outside_answerability_window.load(Ordering::Relaxed),
-                        pending.len(),
+                        scheduler.pending_len(),
+                        scheduler.oldest_pending_quote_age_ms(SystemTime::now()),
                         observability.inflight.load(Ordering::Relaxed),
+                        scheduler.tokens(),
                     );
                     last_summary = Instant::now();
-                }
-
-                if pending.is_empty() {
-                    continue;
-                }
-
-                // Try to launch an audit for each pending peer; keep the ones
-                // still blocked by cooldown for the next tick. Drain into a vec
-                // first so we can re-insert the still-blocked ones afterwards
-                // (LruCache has no drain). `iter()` yields most- to least-recently-
-                // used; we reverse so re-inserting blocked entries below restores
-                // their relative recency (oldest re-put first → stays the eviction
-                // victim, newest stays most-recently-used).
-                let snapshot: Vec<(PeerId, MonetizedPinEvent)> =
-                    pending.iter().rev().map(|(p, e)| (*p, *e)).collect();
-                pending.clear();
-                for (peer, event) in snapshot {
-                    // Dedup: a pin already first-audited is dropped (done).
-                    if first_audited.contains(&event.pin) {
-                        observability.duplicates.fetch_add(1, Ordering::Relaxed);
-                        continue;
-                    }
-                    // ADR-0004 A1 (guardrail A): only first-audit a pin whose SIGNED
-                    // quote_ts lands inside the answerability window. With grace
-                    // removed, auditing an out-of-window pin the responder may have
-                    // aged out would false-convict, so a stale OR far-future/skewed
-                    // quote is skipped. Legit first-audits fire moments after
-                    // payment (quote_ts ≈ now); a skipped pin can still be
-                    // gossip-lottery audited.
-                    if !quote_within_audit_window(event.quote_ts, SystemTime::now()) {
-                        observability
-                            .outside_answerability_window
-                            .fetch_add(1, Ordering::Relaxed);
-                        debug!(
-                            "First-audit scheduler: audit_trigger=first_monetized outcome=outside_answerability_window peer={peer} pin={} key_count={} pending={}",
-                            hex::encode(event.pin), event.key_count, pending.len()
-                        );
-                        continue;
-                    }
-                    // Cooldown: if the peer's per-peer audit window is closed, keep
-                    // this pin pending and retry on a later tick once it reopens.
-                    // We do NOT treat "cooldown closed" as "already audited" (a
-                    // losing gossip lottery can stamp the window without auditing),
-                    // so the pin stays pending until it gets a REAL first audit; it
-                    // is only ever evicted by the LRU memory backstop above, which
-                    // drops the least-recently-monetized peer, not this newest one.
-                    {
-                        let now = Instant::now();
-                        let mut map = gossip_audit.cooldown.write().await;
-                        if !cooldown_allows_audit(&mut map, &peer, now) {
-                            pending.put(peer, event);
-                            observability
-                                .cooldown_deferred_attempts
-                                .fetch_add(1, Ordering::Relaxed);
-                            debug!(
-                                "First-audit scheduler: audit_trigger=first_monetized outcome=cooldown_deferred peer={peer} pin={} key_count={} pending={}",
-                                hex::encode(event.pin), event.key_count, pending.len()
-                            );
-                            continue;
-                        }
-                    }
-                    // Audit is launching: now mark the pin first-audited.
-                    first_audited.put(event.pin, ());
-                    observability.launched.fetch_add(1, Ordering::Relaxed);
-                    observability.inflight.fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        "First-audit scheduler: audit_trigger=first_monetized outcome=launched peer={peer} pin={} key_count={} pending={} inflight={}",
-                        hex::encode(event.pin), event.key_count, pending.len(),
-                        observability.inflight.load(Ordering::Relaxed)
-                    );
-                    let trigger = gossip_audit.clone();
-                    let audit_observability = Arc::clone(&observability);
-                    tokio::spawn(async move {
-                        let started = Instant::now();
-                        let credit = storage_commitment_audit::AuditCredit {
-                            recent_provers: &trigger.recent_provers,
-                        };
-                        let result = storage_commitment_audit::run_subtree_audit(
-                            &trigger.p2p_node,
-                            &trigger.config,
-                            &event.peer,
-                            event.pin,
-                            event.key_count,
-                            Some(&credit),
-                        )
-                        .await;
-                        let outcome = first_audit_terminal_outcome(&result);
-                        match outcome {
-                            FirstAuditTerminalOutcome::Passed => {
-                                audit_observability.passed.fetch_add(1, Ordering::Relaxed);
-                            }
-                            FirstAuditTerminalOutcome::Timeout => {
-                                audit_observability
-                                    .timed_out
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            FirstAuditTerminalOutcome::Failed => {
-                                audit_observability.failed.fetch_add(1, Ordering::Relaxed);
-                            }
-                            FirstAuditTerminalOutcome::BootstrapClaim => {
-                                audit_observability
-                                    .bootstrap_claims
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                            FirstAuditTerminalOutcome::Idle => {
-                                audit_observability.idle.fetch_add(1, Ordering::Relaxed);
-                            }
-                            FirstAuditTerminalOutcome::InsufficientKeys => {
-                                audit_observability
-                                    .insufficient_keys
-                                    .fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        audit_observability.inflight.fetch_sub(1, Ordering::Relaxed);
-                        debug!(
-                            "First-audit scheduler: audit_trigger=first_monetized outcome={} peer={} pin={} key_count={} elapsed_ms={} inflight={}",
-                            outcome.as_str(),
-                            event.peer, hex::encode(event.pin), event.key_count,
-                            started.elapsed().as_millis(),
-                            audit_observability.inflight.load(Ordering::Relaxed)
-                        );
-                        handle_subtree_audit_result(
-                            &result,
-                            &trigger.p2p_node,
-                            &trigger.sync_state,
-                            &trigger.recent_provers,
-                            &trigger.config,
-                        )
-                        .await;
-                    });
                 }
             }
             debug!("First-audit drainer shut down");
@@ -1296,6 +1873,7 @@ impl ReplicationEngine {
         let recent_provers = Arc::clone(&self.recent_provers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_on_gossip_cooldown = Arc::clone(&self.audit_on_gossip_cooldown);
+        let gossip_lottery_attempts = Arc::clone(&self.gossip_lottery_attempts);
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
@@ -1308,6 +1886,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&gossip_lottery_attempts),
         };
 
         let handle = tokio::spawn(async move {
@@ -1428,8 +2007,10 @@ impl ReplicationEngine {
                                 last_commitment_by_peer.write().await.remove(&peer_id);
                                 recent_provers.write().await.forget_peer(&peer_id);
                                 sig_verify_attempts.write().await.remove(&peer_id);
-                                // Same for the gossip-audit cooldown (ADR-0002).
+                                // Same for the gossip-audit cooldown (ADR-0002)
+                                // and the lottery-attempt window.
                                 audit_on_gossip_cooldown.write().await.remove(&peer_id);
+                                gossip_lottery_attempts.write().await.remove(&peer_id);
                                 // The sticky `commitment_capable` flag is
                                 // preserved orthogonally via
                                 // `ever_capable_peers` — even after this
@@ -1475,6 +2056,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
 
         let handle = tokio::spawn(async move {
@@ -1756,6 +2338,7 @@ impl ReplicationEngine {
                     )) => {
                         protocol::log_traffic_summary();
                         protocol::log_served_peers_summary();
+                        protocol::log_audit_outcome_summary();
                     }
                 }
             }
@@ -2500,6 +3083,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Responsible);
                     warn!(
                         "Audit challenge reply not sent: kind=responsible response=dropped \
                          source={source} {failure}"
@@ -2557,6 +3141,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
                     warn!(
                         "Audit challenge reply not sent: kind=subtree response=dropped \
                          source={source} {failure}"
@@ -2625,6 +3210,7 @@ async fn handle_replication_message(
             {
                 Ok(guard) => guard,
                 Err(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Byte);
                     warn!(
                         "Audit challenge reply not sent: kind=byte response=dropped \
                          source={source} {failure}"
@@ -4602,6 +5188,7 @@ async fn handle_subtree_audit_result(
             challenged_peer,
             keys_checked,
         } => {
+            protocol::record_audit_pass(protocol::AuditOutcomeKind::Subtree);
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
             // Peer responded normally — clear the active bootstrap claim while
             // retaining history so a later claim is treated as repeated abuse.
@@ -4625,6 +5212,7 @@ async fn handle_subtree_audit_result(
                 ..
             } = evidence
             {
+                protocol::record_audit_fail(protocol::AuditOutcomeKind::Subtree, reason);
                 // Rich diagnostics (from main's audit-failure logging) + the
                 // first-failed-key correlation handle.
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
@@ -4723,6 +5311,7 @@ async fn handle_audit_result(
             challenged_peer,
             keys_checked,
         } => {
+            protocol::record_audit_pass(protocol::AuditOutcomeKind::Responsible);
             debug!("Audit passed for {challenged_peer} ({keys_checked} keys)");
             {
                 let mut state = sync_state.write().await;
@@ -4744,6 +5333,7 @@ async fn handle_audit_result(
                 ..
             } = evidence
             {
+                protocol::record_audit_fail(protocol::AuditOutcomeKind::Responsible, reason);
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
                 error!(
                     "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
@@ -4851,7 +5441,15 @@ struct GossipAuditTrigger {
     config: Arc<ReplicationConfig>,
     recent_provers: Arc<RwLock<RecentProvers>>,
     sync_state: Arc<RwLock<NeighborSyncState>>,
+    /// Shared "an audit actually launched" cooldown, consulted by BOTH the
+    /// gossip-lottery path and the monetized first-audit scheduler. Stamped
+    /// only when a real audit is about to be sent — never by a losing lottery
+    /// ticket — so gossip traffic alone can never suppress a paid first audit.
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Gossip-private lottery attempt window: stamped on every roll (win or
+    /// lose) so a gossip flood cannot re-roll the lottery within the window.
+    /// The first-audit scheduler never reads this map.
+    lottery_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
 }
 
 /// What a gossip ingest yields for the audit trigger: the commitment hash to
@@ -4917,30 +5515,54 @@ fn cooldown_allows_audit(map: &mut HashMap<PeerId, Instant>, peer: &PeerId, now:
     true
 }
 
+/// Read-only companion to [`cooldown_allows_audit`]: whether `peer` is OUTSIDE
+/// its cooldown at `now`, WITHOUT stamping. Used by the first-audit reserve gate
+/// (ADR-0004 Amendment 2 E′) to avoid reserving a peer that a recent audit
+/// already covered; the authoritative check-and-stamp still runs at promotion,
+/// so this is only an optimization and never the security boundary.
+fn cooldown_would_allow(map: &HashMap<PeerId, Instant>, peer: &PeerId, now: Instant) -> bool {
+    let cooldown = Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS);
+    map.get(peer).map_or(true, |&last| {
+        now.saturating_duration_since(last) >= cooldown
+    })
+}
+
 /// The gossip-audit launch decision in ONE place so the ordering is shared
 /// between production and its test (ADR-0002 "occasional surprise exams").
 ///
-/// Order matters and is the security-relevant property: the per-peer cooldown is
-/// checked-and-stamped FIRST, THEN the probability lottery (`lottery_wins`) is
-/// applied. If the lottery were sampled first, a gossip flood would re-roll it on
-/// every message until one won, multiplying audits. Because the cooldown is
-/// stamped before the lottery is consulted, a LOSING ticket still consumes the
-/// window — so each peer gets at most one audit lottery per cooldown window
-/// regardless of how often it gossips. Production calls this with
-/// `lottery_wins = gen_bool(AUDIT_ON_GOSSIP_PROBABILITY)`; the test calls it with
-/// a deterministic `lottery_wins`, so a reorder regression here fails the test.
+/// Order matters and is the security-relevant property. Gate 1 checks-and-stamps
+/// the gossip-PRIVATE `attempts` window, win or lose: if the lottery were
+/// sampled first, a gossip flood would re-roll it on every message until one
+/// won, multiplying audits, so each peer gets at most one lottery roll per
+/// window regardless of how often it gossips. Gate 3 checks-and-stamps the
+/// SHARED `launched` cooldown — the map the monetized first-audit scheduler
+/// also consults — only after a WIN, i.e. only when a real audit is about to be
+/// sent. A losing ticket must never stamp `launched`: no challenge went on the
+/// wire, so it must not defer a paid first audit (repeatable losses could
+/// otherwise hold a monetized pin past its answerability window). Production
+/// calls this with `lottery_wins = gen_bool(AUDIT_ON_GOSSIP_PROBABILITY)`; the
+/// test calls it with a deterministic `lottery_wins`, so a reorder regression
+/// here fails the test.
 fn audit_launch_decision(
-    map: &mut HashMap<PeerId, Instant>,
+    attempts: &mut HashMap<PeerId, Instant>,
+    launched: &mut HashMap<PeerId, Instant>,
     peer: &PeerId,
     now: Instant,
     lottery_wins: bool,
 ) -> bool {
-    // Gate 1: cooldown check-and-stamp (consumes the window even on a loss).
-    if !cooldown_allows_audit(map, peer, now) {
+    // Gate 1: lottery-attempt window check-and-stamp (consumes the attempt
+    // window even on a loss; private to the gossip path).
+    if !cooldown_allows_audit(attempts, peer, now) {
         return false;
     }
-    // Gate 2: the probability lottery.
-    lottery_wins
+    // Gate 2: the probability lottery. A loss stops here and stamps nothing
+    // shared.
+    if !lottery_wins {
+        return false;
+    }
+    // Gate 3: the shared actual-audit cooldown (a recent real audit from
+    // either path still suppresses this launch), stamped only on launch.
+    cooldown_allows_audit(launched, peer, now)
 }
 
 /// On a peer's *changed* gossiped commitment, maybe launch a subtree audit
@@ -4952,14 +5574,17 @@ async fn maybe_trigger_gossip_audit(
     peer: &PeerId,
     target: AuditTarget,
 ) {
-    // The launch decision (cooldown-then-lottery ordering) lives in the pure
-    // `audit_launch_decision` so the ordering is shared with its test. Sample
-    // the lottery here, then let the helper apply it AFTER the cooldown stamp.
+    // The launch decision (attempt-window, lottery, shared-cooldown ordering)
+    // lives in the pure `audit_launch_decision` so the ordering is shared with
+    // its test. Sample the lottery here, then let the helper apply the gates.
     let now = Instant::now();
     let lottery_wins = rand::thread_rng().gen_bool(config::AUDIT_ON_GOSSIP_PROBABILITY);
     {
-        let mut map = trigger.cooldown.write().await;
-        if !audit_launch_decision(&mut map, peer, now, lottery_wins) {
+        // Lock order: attempts before the shared cooldown; this is the only
+        // place both are held together.
+        let mut attempts = trigger.lottery_attempts.write().await;
+        let mut launched = trigger.cooldown.write().await;
+        if !audit_launch_decision(&mut attempts, &mut launched, peer, now, lottery_wins) {
             return;
         }
     }
@@ -5525,6 +6150,30 @@ async fn rebuild_and_rotate_commitment(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use super::{
+        apply_audit_failure_credit_revocation, audit_failure_clears_bootstrap_claim,
+        audit_failure_revokes_holder_credit, audit_launch_decision, coalesce_first_audit_event,
+        config, cooldown_allows_audit, first_audit_count_jump, first_audit_terminal_outcome,
+        first_failed_key_label, fresh_offer_payment_context, paid_notify_payment_context,
+        quote_answerable_through_nominal_jitter, quote_within_audit_window, FirstAuditLimiter,
+        FirstAuditObservability, FirstAuditQueueOutcome, FirstAuditScheduler,
+        FirstAuditTerminalOutcome, LimiterVerdict, MonetizedPinEvent,
+        FIRST_AUDIT_SEND_LATENCY_SLACK, MONETIZED_AUDIT_SKEW_MARGIN,
+    };
+    use crate::payment::VerificationContext;
+    use crate::replication::audit::AuditTickResult;
+    use crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
+    use crate::replication::recent_provers::RecentProvers;
+    use crate::replication::types::{AuditFailureReason, FailureEvidence};
+    use lru::LruCache;
+    use saorsa_core::identity::PeerId;
+    use std::collections::HashMap;
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+    use std::time::SystemTime;
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
@@ -5634,45 +6283,1008 @@ mod tests {
     }
 
     #[test]
-    fn first_audit_queue_exposes_coalescing_and_capacity_eviction() {
+    fn first_audit_coalescing_keeps_highest_count_and_exposes_eviction() {
         let mut pending = LruCache::new(NonZeroUsize::new(1).unwrap());
-        let self_peer = test_peer(9);
-        let first = MonetizedPinEvent {
-            peer: test_peer(1),
+        let peer = test_peer(1);
+        let base = MonetizedPinEvent {
+            peer,
             pin: [1; 32],
-            key_count: 1,
+            key_count: 100,
             quote_ts: SystemTime::now(),
         };
-        let replacement = MonetizedPinEvent {
-            pin: [2; 32],
-            ..first
-        };
-        let other_peer = MonetizedPinEvent {
-            peer: test_peer(2),
-            pin: [3; 32],
-            ..first
-        };
 
+        // First insert into an empty slot: Queued.
         assert_eq!(
-            queue_first_audit_event(&mut pending, first, &self_peer),
+            coalesce_first_audit_event(&mut pending, base, true),
             FirstAuditQueueOutcome::Queued
         );
+
+        // A strictly LOWER-count same-peer nomination must NOT displace it.
+        let lower = MonetizedPinEvent {
+            pin: [2; 32],
+            key_count: 50,
+            ..base
+        };
         assert_eq!(
-            queue_first_audit_event(&mut pending, replacement, &self_peer),
+            coalesce_first_audit_event(&mut pending, lower, true),
+            FirstAuditQueueOutcome::SuppressedLower
+        );
+        assert_eq!(
+            pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 100)),
+            "the higher-count pin is retained"
+        );
+
+        // A HIGHER-count same-peer nomination wins (the inflated pin to audit).
+        let higher = MonetizedPinEvent {
+            pin: [3; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, higher, true),
             FirstAuditQueueOutcome::Coalesced
         );
         assert_eq!(
-            queue_first_audit_event(&mut pending, other_peer, &self_peer),
-            FirstAuditQueueOutcome::CapacityEvicted {
-                peer: first.peer,
-                pin: replacement.pin,
-            }
+            pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([3; 32], 400))
+        );
+
+        // EQUAL count: an ordinary (newer) enqueue replaces for freshness...
+        let equal_newer = MonetizedPinEvent {
+            pin: [4; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, equal_newer, true),
+            FirstAuditQueueOutcome::Coalesced
+        );
+        assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
+        // ...but an equal-count OLDER requeue (incoming_is_newer=false) does not.
+        let equal_older = MonetizedPinEvent {
+            pin: [5; 32],
+            key_count: 400,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, equal_older, false),
+            FirstAuditQueueOutcome::RetainedOnTie
+        );
+        assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
+
+        // A different peer at capacity 1 evicts the LRU (a DIFFERENT peer).
+        let other_peer = MonetizedPinEvent {
+            peer: test_peer(2),
+            pin: [6; 32],
+            key_count: 100,
+            ..base
+        };
+        assert_eq!(
+            coalesce_first_audit_event(&mut pending, other_peer, true),
+            FirstAuditQueueOutcome::CapacityEvicted { peer, pin: [4; 32] }
         );
         assert_eq!(pending.len(), 1);
+        assert_eq!(pending.peek(&other_peer.peer).map(|e| e.pin), Some([6; 32]));
+    }
+
+    // -- ADR-0004 Amendment 2: first-audit launch limiter --------------------
+
+    #[test]
+    fn first_audit_limiter_enforces_burst_then_refills() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+
+        // The full burst is admitted back-to-back (distinct peers).
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let peer = test_peer(u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&peer, 10, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(peer, 10, base);
+        }
+        // Bucket empty: the next distinct peer is deferred, never dropped.
+        let extra = test_peer(0xEE);
         assert_eq!(
-            pending.peek(&other_peer.peer).map(|event| event.pin),
-            Some([3; 32])
+            limiter.assess(&extra, 10, base, 0),
+            LimiterVerdict::RateDeferred
         );
+
+        // One full interval later exactly one token is available again.
+        let later = base + interval;
+        assert_eq!(limiter.assess(&extra, 10, later, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(extra, 10, later);
+        let extra2 = test_peer(0xEF);
+        assert_eq!(
+            limiter.assess(&extra2, 10, later, 0),
+            LimiterVerdict::RateDeferred
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_refill_keeps_fractional_remainder() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let interval = config::FIRST_AUDIT_LAUNCH_INTERVAL;
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let peer = test_peer(u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&peer, 1, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(peer, 1, base);
+        }
+        // 1.5 intervals later one token is earned and the half interval is
+        // NOT lost to drift...
+        let at_1_5 = base + interval + interval / 2;
+        let p = test_peer(0xAA);
+        assert_eq!(limiter.assess(&p, 1, at_1_5, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(p, 1, at_1_5);
+        // ...so the next token arrives at 2.0 intervals, not 2.5.
+        let at_2_0 = base + interval * 2;
+        let q = test_peer(0xAB);
+        assert_eq!(limiter.assess(&q, 1, at_2_0, 0), LimiterVerdict::Admit);
+    }
+
+    #[test]
+    fn first_audit_limiter_inflight_cap_defers_until_slot_frees() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(1);
+        assert_eq!(
+            limiter.assess(&peer, 1, base, config::FIRST_AUDIT_MAX_INFLIGHT),
+            LimiterVerdict::RateDeferred
+        );
+        // A freed slot admits without any clock movement.
+        assert_eq!(
+            limiter.assess(&peer, 1, base, config::FIRST_AUDIT_MAX_INFLIGHT - 1),
+            LimiterVerdict::Admit
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_assess_consumes_nothing() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(3);
+        // Repeated assessment must not burn budget or stamp the window: only
+        // `commit_launch` consumes (the cooldown gate between assess and
+        // commit can defer, and that deferral must be free).
+        for _ in 0..10 {
+            assert_eq!(limiter.assess(&peer, 5, base, 0), LimiterVerdict::Admit);
+        }
+        for i in 0..config::FIRST_AUDIT_BUDGET_BURST {
+            let p = test_peer(0x20 + u8::try_from(i).expect("small burst"));
+            assert_eq!(limiter.assess(&p, 5, base, 0), LimiterVerdict::Admit);
+            limiter.commit_launch(p, 5, base);
+        }
+    }
+
+    #[test]
+    fn first_audit_limiter_window_dedups_rotated_pins_and_count_jump_overrides() {
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(7);
+        assert_eq!(limiter.assess(&peer, 100, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(peer, 100, base);
+
+        // A rotated pin with a similar count inside the window is dropped...
+        let soon = base + Duration::from_secs(60);
+        assert_eq!(
+            limiter.assess(&peer, 100, soon, 0),
+            LimiterVerdict::WindowDeduped
+        );
+        // ...even at the exact jump boundary (new*DEN == old*NUM is no jump)...
+        assert_eq!(
+            limiter.assess(&peer, 150, soon, 0),
+            LimiterVerdict::WindowDeduped
+        );
+        // ...but a >1.5x committed-count jump re-nominates immediately (an
+        // inflated sidecar-only pin is invisible to the gossip lottery, so
+        // the window must not shield it).
+        assert_eq!(limiter.assess(&peer, 151, soon, 0), LimiterVerdict::Admit);
+
+        // Window expiry re-admits an unchanged count.
+        let expired = base + config::FIRST_AUDIT_PEER_REAUDIT_INTERVAL;
+        assert_eq!(
+            limiter.assess(&peer, 100, expired, 0),
+            LimiterVerdict::Admit
+        );
+    }
+
+    #[test]
+    fn first_audit_limiter_window_verdict_outranks_empty_budget() {
+        // A window-deduped nomination must be DROPPED, not kept pending as
+        // rate-deferred, even when the bucket is also empty: re-queuing a
+        // suppressed rotation would hold a pending slot for two hours.
+        let base = Instant::now();
+        let mut limiter = FirstAuditLimiter::new(base);
+        let peer = test_peer(9);
+        assert_eq!(limiter.assess(&peer, 10, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(peer, 10, base);
+        let other = test_peer(10);
+        assert_eq!(limiter.assess(&other, 10, base, 0), LimiterVerdict::Admit);
+        limiter.commit_launch(other, 10, base);
+        assert_eq!(
+            limiter.assess(&peer, 10, base, 0),
+            LimiterVerdict::WindowDeduped
+        );
+    }
+
+    /// ADR-0004 Amendment 2 (E'): the B horizon prefilter rejects a quote that
+    /// is answerable now but would age out of the answerability window during
+    /// the launch jitter, so scheduling state is only ever committed for a pin
+    /// that can still be challenged when it actually sends.
+    #[test]
+    fn first_audit_horizon_prefilter_boundary() {
+        let now = SystemTime::now();
+        // C = the too-old cutoff; H = the worst-case send horizon.
+        let c = GOSSIP_ANSWERABILITY_TTL.saturating_sub(MONETIZED_AUDIT_SKEW_MARGIN);
+        let h = config::FIRST_AUDIT_LAUNCH_JITTER_MAX + FIRST_AUDIT_SEND_LATENCY_SLACK;
+        // A quote whose age is exactly C at `now + H` (in the past, since C > H).
+        let boundary = now
+            .checked_add(h)
+            .and_then(|t| t.checked_sub(c))
+            .expect("boundary time");
+
+        // In window at `now` (age = C - H < C)...
+        assert!(quote_within_audit_window(boundary, now));
+        // ...but the horizon prefilter rejects it (age == C at now + H).
+        assert!(!quote_answerable_through_nominal_jitter(boundary, now));
+
+        // A hair newer stays answerable through the horizon; a hair older does
+        // not. Use 1µs (not 1ns): Windows `SystemTime` has 100ns granularity, so
+        // a nanosecond step would round to the same instant there.
+        let newer = boundary
+            .checked_add(Duration::from_micros(1))
+            .expect("newer");
+        let older = boundary
+            .checked_sub(Duration::from_micros(1))
+            .expect("older");
+        assert!(quote_answerable_through_nominal_jitter(newer, now));
+        assert!(!quote_answerable_through_nominal_jitter(older, now));
+
+        // A quote too far in the FUTURE is rejected at `now`, independent of the
+        // horizon.
+        let future = now
+            .checked_add(MONETIZED_AUDIT_SKEW_MARGIN)
+            .and_then(|t| t.checked_add(Duration::from_secs(60)))
+            .expect("future");
+        assert!(!quote_answerable_through_nominal_jitter(future, now));
+    }
+
+    /// ADR-0004 Amendment 2 (E'): a reservation whose AUTHORITATIVE post-jitter
+    /// answerability check fails at promotion is fully state-neutral — it stamps
+    /// no `first_audited`, no per-peer window, refunds its token, releases its
+    /// in-flight slot, does not flip the lane, and does not count a launch — and
+    /// a same-peer, same-count successor enqueued DURING the reservation is
+    /// retained and becomes the next reservation after the cancel. This is the
+    /// exact hole the reviewer flagged: suppression must never outlive a launch
+    /// that did not send.
+    /// A pending pin that has aged past the answerability horizon must not
+    /// suppress a live lower-count nomination for the same peer: under token
+    /// starvation no reserve scan ever collects the dead entry, so without the
+    /// enqueue-time check the peer would stay unauditable through this path
+    /// indefinitely (e.g. after a prune legitimately lowered its key count).
+    #[test]
+    fn first_audit_stale_incumbent_does_not_suppress_live_lower_count() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
+        let peer = test_peer(1);
+
+        let dead_quote = SystemTime::now()
+            .checked_sub(GOSSIP_ANSWERABILITY_TTL)
+            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .expect("past wall time");
+        let stale_high = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 400,
+            quote_ts: dead_quote,
+        };
+        scheduler.enqueue(stale_high, &obs);
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // A fresh, lower-count nomination (a post-prune commitment).
+        let fresh_lower = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(fresh_lower, &obs);
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([2; 32]),
+            "the live nomination replaced the dead incumbent"
+        );
+        assert_eq!(
+            obs.suppressed_lower.load(Ordering::Relaxed),
+            0,
+            "no self-erasure signal for displacing a dead pin"
+        );
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            obs.outside_answerability_window.load(Ordering::Relaxed),
+            1,
+            "the dead incumbent is accounted as an expiry"
+        );
+    }
+
+    /// The self-erasure defence is untouched for LIVE incumbents: a lower-count
+    /// nomination still loses to an answerable higher-count pending pin.
+    #[test]
+    fn first_audit_live_incumbent_still_suppresses_lower_count() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
+        let peer = test_peer(1);
+
+        let live_high = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 400,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(live_high, &obs);
+        let cheaper = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(cheaper, &obs);
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([1; 32]),
+            "the higher-count live pin is retained"
+        );
+        assert_eq!(obs.suppressed_lower.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.outside_answerability_window.load(Ordering::Relaxed), 0);
+    }
+
+    /// The periodic sweep collects expired pending entries even when the token
+    /// bucket is empty — the reserve path returns at the budget gate and never
+    /// scans — keeping the bounded LRU and the pending/oldest-age telemetry
+    /// honest under fleet-wide starvation.
+    #[test]
+    fn first_audit_sweep_expired_collects_dead_entries_without_tokens() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+
+        let dead_quote = SystemTime::now()
+            .checked_sub(GOSSIP_ANSWERABILITY_TTL)
+            .and_then(|t| t.checked_sub(Duration::from_secs(60)))
+            .expect("past wall time");
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: test_peer(1),
+                pin: [1; 32],
+                key_count: 100,
+                quote_ts: dead_quote,
+            },
+            &obs,
+        );
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: test_peer(2),
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 2);
+
+        // Empty the bucket so the reserve path is budget-gated (fleet-wide
+        // starvation) and cannot collect the dead entry itself.
+        scheduler.limiter.tokens = 0;
+        let cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(!scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown, &obs));
+        assert_eq!(
+            scheduler.pending_len(),
+            2,
+            "budget-gated reserve scans nothing"
+        );
+
+        let wall_now = SystemTime::now();
+        assert_eq!(scheduler.sweep_expired(wall_now, &obs), 1);
+        assert_eq!(scheduler.pending_len(), 1);
+        assert!(
+            scheduler.pending.peek(&test_peer(2)).is_some(),
+            "the live entry survives the sweep"
+        );
+        assert_eq!(obs.outside_answerability_window.load(Ordering::Relaxed), 1);
+        let age_ms = scheduler.oldest_pending_quote_age_ms(wall_now);
+        assert!(
+            Duration::from_millis(age_ms) < GOSSIP_ANSWERABILITY_TTL,
+            "the age gauge reflects only live work after the sweep"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn first_audit_answerability_cancel_is_state_neutral_and_retains_successor() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+
+        // A pre-existing window sentinel for an UNRELATED peer must survive the
+        // cancel byte-for-byte (cancel never touches `recent`).
+        let sentinel_peer = test_peer(0xAA);
+        scheduler.limiter.promote(sentinel_peer, 500, mono);
+        let sentinel_before = scheduler
+            .limiter
+            .recent
+            .peek(&sentinel_peer)
+            .copied()
+            .expect("sentinel present");
+
+        let peer = test_peer(1);
+        let a = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(), // fresh: passes the horizon prefilter now
+        };
+        scheduler.enqueue(a, &obs);
+
+        let tokens_before = scheduler.tokens();
+        let lane_before = scheduler.oldest_first_lane;
+        let launched_before = obs.launched.load(Ordering::Relaxed);
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+
+        // Reserve A (jitter 0 so it is immediately due).
+        let inflight0 = obs.inflight.load(Ordering::Relaxed);
+        assert!(scheduler.try_reserve(mono, inflight0, Duration::ZERO, &cooldown, &obs));
+        assert_eq!(scheduler.reserved_peer(), Some(peer));
+        assert_eq!(
+            scheduler.tokens(),
+            tokens_before - 1,
+            "reserve consumes a token"
+        );
+        assert_eq!(
+            obs.inflight.load(Ordering::Relaxed),
+            1,
+            "reserve holds a slot"
+        );
+
+        // A same-peer, same-count successor arrives DURING the reservation. It
+        // must be retained (bypasses the window for the reserved peer) and must
+        // NOT create a second reservation.
+        let b = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(b, &obs);
+        assert_eq!(scheduler.pending_len(), 1, "successor retained in pending");
+        assert!(
+            !scheduler.try_reserve(
+                mono,
+                obs.inflight.load(Ordering::Relaxed),
+                Duration::ZERO,
+                &cooldown,
+                &obs
+            ),
+            "no second reservation while one is outstanding"
+        );
+
+        // Resolve A with an injected wall time PAST A's answerability cutoff.
+        let reservation = scheduler
+            .take_due_reservation(mono)
+            .expect("A is due at jitter 0");
+        let wall_fail = a
+            .quote_ts
+            .checked_add(GOSSIP_ANSWERABILITY_TTL)
+            .and_then(|t| t.checked_add(Duration::from_secs(1)))
+            .expect("past-cutoff wall time");
+        let promoted = scheduler.resolve(reservation, wall_fail, mono, &mut cooldown, &obs);
+        assert!(
+            promoted.is_none(),
+            "answerability lapsed -> cancelled, not promoted"
+        );
+
+        // State-neutral cancel.
+        assert!(scheduler.first_audited.is_empty(), "no pin marked audited");
+        assert!(
+            scheduler.limiter.recent.peek(&peer).is_none(),
+            "cancel stamps no per-peer window"
+        );
+        assert_eq!(
+            scheduler.limiter.recent.peek(&sentinel_peer).copied(),
+            Some(sentinel_before),
+            "unrelated window sentinel untouched"
+        );
+        assert!(!cooldown.contains_key(&peer), "cancel stamps no cooldown");
+        assert_eq!(
+            scheduler.tokens(),
+            tokens_before,
+            "token refunded on cancel"
+        );
+        assert_eq!(
+            obs.inflight.load(Ordering::Relaxed),
+            0,
+            "in-flight slot released"
+        );
+        assert_eq!(scheduler.oldest_first_lane, lane_before, "lane not flipped");
+        assert_eq!(
+            obs.launched.load(Ordering::Relaxed),
+            launched_before,
+            "no launch counted"
+        );
+        assert_eq!(
+            obs.outside_answerability_window.load(Ordering::Relaxed),
+            1,
+            "the cancel reason is recorded"
+        );
+
+        // The successor is still pending and is now fully schedulable: a fresh
+        // reserve makes B the next reservation (proving eligibility, not merely
+        // that the limiter would admit it).
+        assert_eq!(
+            scheduler.pending_len(),
+            1,
+            "successor still pending after cancel"
+        );
+        assert!(scheduler.reserved.is_none());
+        assert!(scheduler.try_reserve(
+            mono,
+            obs.inflight.load(Ordering::Relaxed),
+            Duration::ZERO,
+            &cooldown,
+            &obs
+        ));
+        assert_eq!(
+            scheduler.reserved_peer(),
+            Some(peer),
+            "the retained successor becomes the next reservation"
+        );
+    }
+
+    /// ADR-0004 Amendment 2 (E'): when a promotion loses the shared-cooldown
+    /// race, the reserved event is requeued ONLY if no same-peer successor is
+    /// already pending. A successor arrived after the reservation, so it is the
+    /// newer nomination (e.g. a count jump) and must not be overwritten by the
+    /// older reserved event.
+    #[test]
+    fn first_audit_cooldown_race_requeue_preserves_newer_successor() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+        let peer = test_peer(1);
+
+        // Reserve A.
+        let a = MonetizedPinEvent {
+            peer,
+            pin: [1; 32],
+            key_count: 100,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(a, &obs);
+        let cooldown_reserve: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_reserve, &obs));
+
+        // A newer same-peer successor B (a count jump) arrives during the
+        // reservation and is retained.
+        let b = MonetizedPinEvent {
+            peer,
+            pin: [2; 32],
+            key_count: 400,
+            quote_ts: SystemTime::now(),
+        };
+        scheduler.enqueue(b, &obs);
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve A: answerability PASSES (fresh quote) but the shared cooldown
+        // is already stamped for the peer, so promotion loses the race.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(peer, mono); // freshly on cooldown
+        let promoted = scheduler.resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs);
+        assert!(promoted.is_none(), "cooldown race -> not promoted");
+
+        // B (newer) is preserved; A did NOT overwrite it.
+        assert_eq!(scheduler.pending_len(), 1, "still exactly one pending");
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| e.pin),
+            Some([2; 32]),
+            "the newer successor B is retained, not the older reserved A"
+        );
+        assert!(scheduler.first_audited.is_empty());
+        assert!(scheduler.limiter.recent.peek(&peer).is_none());
+    }
+
+    /// The oldest-pending-quote-age gauge reports the age of the OLDEST quote
+    /// still awaiting a first audit (not the newest), is `0` on an empty queue,
+    /// and saturates to `0` for a future-dated quote (clock skew) without
+    /// panicking. A climbing value is the pending-work-aging-out signal.
+    #[test]
+    fn first_audit_oldest_pending_quote_age_tracks_the_oldest() {
+        let now = SystemTime::now();
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
+        assert_eq!(
+            scheduler.oldest_pending_quote_age_ms(now),
+            0,
+            "empty pending -> zero"
+        );
+
+        // Two peers: quotes 10s and 2s old. The gauge must track the older.
+        for (peer_id, pin, secs) in [(1u8, [1; 32], 10u64), (2, [2; 32], 2)] {
+            let _ = coalesce_first_audit_event(
+                &mut scheduler.pending,
+                MonetizedPinEvent {
+                    peer: test_peer(peer_id),
+                    pin,
+                    key_count: 100,
+                    quote_ts: now - Duration::from_secs(secs),
+                },
+                true,
+            );
+        }
+        assert_eq!(
+            scheduler.oldest_pending_quote_age_ms(now),
+            10_000,
+            "tracks the oldest (10s), not the newest (2s)"
+        );
+
+        // A future-dated quote (clock skew) saturates to zero, never panics.
+        let mut skewed = FirstAuditScheduler::new(Instant::now(), test_peer(99));
+        let _ = coalesce_first_audit_event(
+            &mut skewed.pending,
+            MonetizedPinEvent {
+                peer: test_peer(3),
+                pin: [3; 32],
+                key_count: 100,
+                quote_ts: now + Duration::from_secs(5),
+            },
+            true,
+        );
+        assert_eq!(
+            skewed.oldest_pending_quote_age_ms(now),
+            0,
+            "future quote_ts saturates to zero"
+        );
+    }
+
+    /// A flood of strictly-lower-count same-peer nominations must neither
+    /// displace the retained higher pin NOR disturb its LRU position (each is
+    /// suppressed via `peek`, no `push`), and each must be counted as
+    /// `suppressed_lower` — the attempted cheaper-pin self-erasure signal.
+    #[test]
+    fn first_audit_suppressed_lower_flood_leaves_recency_and_counts() {
+        let mut pending: LruCache<PeerId, MonetizedPinEvent> =
+            LruCache::new(NonZeroUsize::new(2).unwrap());
+        let victim = test_peer(1);
+        let other = test_peer(2);
+        // Victim (high count) inserted first (older), then `other` (newer/MRU).
+        let _ = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: victim,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+        let _ = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: other,
+                pin: [9; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+
+        // Flood the victim with cheaper nominations.
+        let mut suppressed = 0u64;
+        for i in 0..8u8 {
+            let out = coalesce_first_audit_event(
+                &mut pending,
+                MonetizedPinEvent {
+                    peer: victim,
+                    pin: [i; 32],
+                    key_count: 50,
+                    quote_ts: SystemTime::now(),
+                },
+                true,
+            );
+            assert_eq!(out, FirstAuditQueueOutcome::SuppressedLower);
+            suppressed += 1;
+        }
+        assert_eq!(suppressed, 8);
+        // Victim pin/count unchanged.
+        assert_eq!(
+            pending.peek(&victim).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400))
+        );
+        // Recency unchanged: `other` is still MRU (a new distinct peer at cap 2
+        // would evict the LRU; the victim must be the LRU, so `third` evicts the
+        // victim, not `other`).
+        let third = test_peer(3);
+        let out = coalesce_first_audit_event(
+            &mut pending,
+            MonetizedPinEvent {
+                peer: third,
+                pin: [7; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            true,
+        );
+        assert_eq!(
+            out,
+            FirstAuditQueueOutcome::CapacityEvicted {
+                peer: victim,
+                pin: [1; 32]
+            },
+            "the suppressed-lower flood must not have promoted the victim above `other`"
+        );
+    }
+
+    /// The cooldown-race requeue counts a genuine different-peer capacity
+    /// eviction (the ADR promises capacity loss is observable).
+    #[test]
+    fn first_audit_cooldown_race_requeue_counts_capacity_eviction() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+        // Pending capacity 1 so a requeue of a different peer must evict.
+        scheduler.pending = LruCache::new(NonZeroUsize::new(1).unwrap());
+        let reserved_peer = test_peer(1);
+        let other_peer = test_peer(2);
+
+        // Reserve peer 1.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: reserved_peer,
+                pin: [1; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+
+        // A DIFFERENT peer fills the single pending slot during the reservation.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: other_peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve peer 1: cooldown race -> requeue peer 1, evicting peer 2.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(reserved_peer, mono);
+        let cap_before = obs.capacity_evicted.load(Ordering::Relaxed);
+        assert!(scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .is_none());
+        assert_eq!(
+            obs.capacity_evicted.load(Ordering::Relaxed),
+            cap_before + 1,
+            "the requeue eviction of a different peer is counted"
+        );
+        assert_eq!(
+            scheduler.pending.peek(&reserved_peer).map(|e| e.pin),
+            Some([1; 32])
+        );
+    }
+
+    /// ADR-0004 Amendment 2 (reviewer blocker): a strictly-lower-count same-peer
+    /// nomination arriving while an inflated pin is PENDING must not displace it.
+    /// The inflated pin stays and is the one launched.
+    #[test]
+    fn first_audit_pending_lower_count_does_not_replace_higher() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+        let peer = test_peer(1);
+
+        // Inflated (high-count) sidecar pin lands in pending.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        // A cheaper same-peer settlement arrives right after.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400)),
+            "the inflated pin must not be erased by the cheaper successor"
+        );
+        // The dropped cheaper nomination is counted through the enqueue path.
+        assert_eq!(
+            obs.suppressed_lower.load(Ordering::Relaxed),
+            1,
+            "the attempted cheaper-pin self-erasure is observable"
+        );
+
+        // It reserves and promotes as the inflated pin/count.
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        let (event, _slot) = scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .expect("promotes");
+        assert_eq!((event.pin, event.key_count), ([1; 32], 400));
+    }
+
+    /// ADR-0004 Amendment 2 (reviewer blocker): a RESERVED inflated pin that
+    /// loses the cooldown race must be requeued OVER a lower-count same-peer
+    /// successor that arrived during its jitter, and must remain launchable once
+    /// the shared cooldown expires — the cheaper successor cannot suppress it.
+    #[test]
+    fn first_audit_cooldown_race_requeues_reserved_higher_over_lower_successor() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+        let peer = test_peer(1);
+
+        // Reserve the inflated pin.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [1; 32],
+                key_count: 400,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        let cooldown_read: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(mono, 0, Duration::ZERO, &cooldown_read, &obs));
+
+        // A cheaper successor arrives during the reservation (bypasses the
+        // window as the reserved peer) and sits in pending.
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        assert_eq!(scheduler.pending_len(), 1);
+
+        // Resolve: answerability passes but the shared cooldown is already
+        // stamped, so the reservation loses the race and requeues.
+        let reservation = scheduler.take_due_reservation(mono).expect("due");
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+        cooldown.insert(peer, mono);
+        assert!(scheduler
+            .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+            .is_none());
+
+        // The inflated pin (400) replaced the cheaper successor (100).
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            scheduler.pending.peek(&peer).map(|e| (e.pin, e.key_count)),
+            Some(([1; 32], 400)),
+            "the inflated reserved pin must survive the requeue over the cheaper successor"
+        );
+        assert!(scheduler.first_audited.is_empty());
+        assert!(scheduler.limiter.recent.peek(&peer).is_none());
+
+        // Once the shared cooldown expires, the inflated pin reserves and
+        // promotes with its intended pin/count.
+        let later = mono
+            .checked_add(Duration::from_secs(
+                config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1,
+            ))
+            .expect("later");
+        let cooldown_read_later: HashMap<PeerId, Instant> = HashMap::new();
+        assert!(scheduler.try_reserve(later, 0, Duration::ZERO, &cooldown_read_later, &obs));
+        let reservation = scheduler.take_due_reservation(later).expect("due");
+        let mut cooldown_later: HashMap<PeerId, Instant> = HashMap::new();
+        let (event, _slot) = scheduler
+            .resolve(
+                reservation,
+                SystemTime::now(),
+                later,
+                &mut cooldown_later,
+                &obs,
+            )
+            .expect("promotes after cooldown");
+        assert_eq!((event.pin, event.key_count), ([1; 32], 400));
+    }
+
+    /// ADR-0004 Amendment 2 (E'): consecutive PROMOTIONS strictly alternate the
+    /// launch lane, driven through the real scheduler (reserve -> resolve ->
+    /// promote), so a stream of fresh nominations cannot keep every launch on
+    /// the newest lane and starve the oldest.
+    #[test]
+    fn first_audit_lane_alternates_across_promotions() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let mono = Instant::now();
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
+        let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
+
+        // Two distinct peers; the newest-inserted is the MRU (newest lane end).
+        let oldest_peer = test_peer(1);
+        let newest_peer = test_peer(2);
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: oldest_peer,
+                pin: [1; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+        scheduler.enqueue(
+            MonetizedPinEvent {
+                peer: newest_peer,
+                pin: [2; 32],
+                key_count: 100,
+                quote_ts: SystemTime::now(),
+            },
+            &obs,
+        );
+
+        let mut launched_peers = Vec::new();
+        for _ in 0..2 {
+            assert!(scheduler.try_reserve(
+                mono,
+                obs.inflight.load(Ordering::Relaxed),
+                Duration::ZERO,
+                &cooldown,
+                &obs
+            ));
+            let reservation = scheduler.take_due_reservation(mono).expect("due");
+            // Answerable wall time == the quote's own time (age 0).
+            let (event, _slot) = scheduler
+                .resolve(reservation, SystemTime::now(), mono, &mut cooldown, &obs)
+                .expect("fresh in-window quote promotes");
+            launched_peers.push(event.peer);
+        }
+
+        // First launch takes the newest lane (lane starts false = newest), the
+        // second takes the oldest lane: strict alternation.
+        assert_eq!(
+            launched_peers,
+            vec![newest_peer, oldest_peer],
+            "consecutive promotions alternate newest-then-oldest lane"
+        );
+    }
+
+    #[test]
+    fn first_audit_count_jump_boundaries() {
+        // Exactly 1.5x is NOT a jump; strictly above is.
+        assert!(!first_audit_count_jump(100, 150));
+        assert!(first_audit_count_jump(100, 151));
+        // Anything beats an audited zero; zero never jumps.
+        assert!(first_audit_count_jump(0, 1));
+        assert!(!first_audit_count_jump(0, 0));
+        // Equal max counts must not jump (and must not overflow).
+        assert!(!first_audit_count_jump(u32::MAX, u32::MAX));
     }
 
     /// A verified payment's quote list includes the local node's own quote, so
@@ -5682,8 +7294,9 @@ mod tests {
     /// never launched nor marked first-audited.
     #[test]
     fn first_audit_queue_drops_self_targeting_events() {
-        let mut pending = LruCache::new(NonZeroUsize::new(4).unwrap());
+        let obs = Arc::new(FirstAuditObservability::default());
         let self_peer = test_peer(1);
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), self_peer);
         let self_event = MonetizedPinEvent {
             peer: self_peer,
             pin: [7; 32],
@@ -5691,11 +7304,10 @@ mod tests {
             quote_ts: SystemTime::now(),
         };
 
-        assert_eq!(
-            queue_first_audit_event(&mut pending, self_event, &self_peer),
-            FirstAuditQueueOutcome::SelfTargetSkipped
-        );
-        assert!(pending.is_empty());
+        scheduler.enqueue(self_event, &obs);
+        assert_eq!(obs.self_target_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.pending_len(), 0, "self-target must never queue");
 
         // A remote peer's event still queues normally under the same filter.
         let remote_event = MonetizedPinEvent {
@@ -5703,12 +7315,14 @@ mod tests {
             pin: [8; 32],
             ..self_event
         };
+        scheduler.enqueue(remote_event, &obs);
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.pending_len(), 1);
         assert_eq!(
-            queue_first_audit_event(&mut pending, remote_event, &self_peer),
-            FirstAuditQueueOutcome::Queued
+            obs.self_target_skipped.load(Ordering::Relaxed),
+            1,
+            "remote event must not count as a self-target skip"
         );
-        assert_eq!(pending.len(), 1);
-        assert!(pending.peek(&self_peer).is_none());
     }
 
     #[test]
@@ -5801,58 +7415,111 @@ mod tests {
     // would still pass them while breaking flood-resistance: a flood would then
     // re-roll the lottery on EVERY message until one won, multiplying audits.
     //
-    // We model the exact production gate order (cooldown-then-lottery) with a
-    // lottery driven by a fixed outcome instead of `gen_bool(..)`. The first
-    // message LOSES the lottery; the remaining flood messages all WIN. With the
-    // production order, the losing first ticket burns the window and every later
-    // winner in the same window is blocked, so there are 0 audits this window. If
-    // the gates were flipped, the second message's winning ticket would slip
-    // through. The window only reopens after the cooldown elapses.
+    // We model the exact production gate order (attempt-window, lottery,
+    // shared cooldown) with a lottery driven by a fixed outcome instead of
+    // `gen_bool(..)`. The first message LOSES the lottery; the remaining flood
+    // messages all WIN. With the production order, the losing first ticket
+    // burns the ATTEMPT window and every later winner in the same window is
+    // blocked, so there are 0 audits this window. If the gates were flipped,
+    // the second message's winning ticket would slip through. The window only
+    // reopens after it elapses.
     //
-    // FLIPS IF: the lottery is sampled before `cooldown_allows_audit` (a losing
-    // ticket no longer consumes the window), re-enabling a flood-amplified audit
-    // storm.
+    // FLIPS IF: the lottery is sampled before the attempt-window
+    // check-and-stamp (a losing ticket no longer consumes the window),
+    // re-enabling a flood-amplified audit storm.
     #[test]
-    fn losing_lottery_still_consumes_cooldown_window() {
-        // Faithful re-implementation of the two gates in
-        // `maybe_trigger_gossip_audit`, with the lottery outcome made
-        // deterministic instead of `rand::thread_rng().gen_bool(..)`.
+    fn losing_lottery_still_consumes_attempt_window() {
         // Calls the SHIPPED `audit_launch_decision` (the same function
-        // `maybe_trigger_gossip_audit` uses), so a reorder of the two gates in
+        // `maybe_trigger_gossip_audit` uses), so a reorder of the gates in
         // production fails this test — not a local reimplementation.
         let peer = strike_peer(3);
-        let mut map: HashMap<PeerId, Instant> = HashMap::new();
+        let mut attempts: HashMap<PeerId, Instant> = HashMap::new();
+        let mut launched: HashMap<PeerId, Instant> = HashMap::new();
         let t0 = Instant::now();
 
-        // First flooded message at t0 LOSES the lottery, but the cooldown is
-        // stamped BEFORE the lottery is consulted, so the window is now consumed.
+        // First flooded message at t0 LOSES the lottery, but the attempt window
+        // is stamped BEFORE the lottery is consulted, so the window is consumed.
         assert!(
-            !audit_launch_decision(&mut map, &peer, t0, false),
+            !audit_launch_decision(&mut attempts, &mut launched, &peer, t0, false),
             "a losing ticket launches no audit"
         );
 
         // 99 more flooded messages at the same instant would all WIN the lottery,
-        // yet every one must be blocked by the cooldown the loser already stamped.
+        // yet every one must be blocked by the attempt window the loser stamped.
         // (If production sampled the lottery FIRST, these would each get a fresh
         // roll and audits would multiply — this assertion catches that reorder.)
         let mut audits = 0;
         for _ in 0..99 {
-            if audit_launch_decision(&mut map, &peer, t0, true) {
+            if audit_launch_decision(&mut attempts, &mut launched, &peer, t0, true) {
                 audits += 1;
             }
         }
         assert_eq!(
             audits, 0,
-            "a losing first ticket must consume the window so no later flooded \
-             message in the same window can audit"
+            "a losing first ticket must consume the attempt window so no later \
+             flooded message in the same window can audit"
         );
 
-        // The window only reopens after the cooldown elapses; the next winning
-        // ticket then launches exactly one audit.
+        // The window only reopens after it elapses; the next winning ticket
+        // then launches exactly one audit and stamps the SHARED cooldown.
         let after = t0 + Duration::from_secs(config::AUDIT_ON_GOSSIP_COOLDOWN_SECS + 1);
         assert!(
-            audit_launch_decision(&mut map, &peer, after, true),
-            "after the cooldown a winning ticket audits again"
+            audit_launch_decision(&mut attempts, &mut launched, &peer, after, true),
+            "after the window a winning ticket audits again"
+        );
+        assert!(
+            launched.contains_key(&peer),
+            "a real launch stamps the shared cooldown"
+        );
+    }
+
+    /// The reviewer-flagged suppression route: a LOSING gossip lottery must not
+    /// stamp the SHARED audit cooldown, otherwise repeated losses (one per
+    /// 30-minute window, no challenge ever sent) keep a paid monetized pin's
+    /// first audit deferred until its answerability window expires.
+    ///
+    /// FLIPS IF: `audit_launch_decision` stamps the shared `launched` map on a
+    /// loss (the pre-split behavior, where both paths shared one map).
+    #[test]
+    fn losing_lottery_does_not_suppress_monetized_first_audit() {
+        let peer = strike_peer(4);
+        let mut attempts: HashMap<PeerId, Instant> = HashMap::new();
+        let mut launched: HashMap<PeerId, Instant> = HashMap::new();
+        let t0 = Instant::now();
+
+        // A losing ticket consumes the gossip attempt window...
+        assert!(!audit_launch_decision(
+            &mut attempts,
+            &mut launched,
+            &peer,
+            t0,
+            false
+        ));
+        // ...but leaves the shared map untouched, so the first-audit reserve
+        // gate (read-only) and the authoritative promotion check-and-stamp both
+        // still allow the paid audit to launch immediately.
+        assert!(
+            cooldown_would_allow(&launched, &peer, t0),
+            "reserve gate must not see a losing ticket as audit coverage"
+        );
+        assert!(
+            cooldown_allows_audit(&mut launched, &peer, t0),
+            "promotion must not be deferred by a losing ticket"
+        );
+
+        // Conversely a WINNING ticket (real audit sent) does suppress the
+        // first audit for the window, which is the intended shared semantics.
+        let peer_won = strike_peer(5);
+        assert!(audit_launch_decision(
+            &mut attempts,
+            &mut launched,
+            &peer_won,
+            t0,
+            true
+        ));
+        assert!(
+            !cooldown_would_allow(&launched, &peer_won, t0),
+            "a real gossip audit still covers the peer for the window"
         );
     }
 

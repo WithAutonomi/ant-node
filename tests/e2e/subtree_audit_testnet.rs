@@ -205,7 +205,7 @@ async fn first_audit_drainer_drops_self_targeting_monetized_pin() {
 
     engine
         .monetized_pin_sender()
-        .send(MonetizedPinEvent {
+        .try_send(MonetizedPinEvent {
             peer: self_peer,
             pin: [0x42; 32],
             key_count: 8,
@@ -268,7 +268,7 @@ async fn first_audit_drainer_launches_and_passes_remote_monetized_pin() {
 
     b_engine
         .monetized_pin_sender()
-        .send(MonetizedPinEvent {
+        .try_send(MonetizedPinEvent {
             peer: a_peer,
             pin: a_pin,
             key_count: a_key_count,
