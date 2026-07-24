@@ -66,6 +66,9 @@ mod security_attacks;
 #[cfg(test)]
 mod subtree_audit_testnet;
 
+#[cfg(test)]
+mod first_audit_ab;
+
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;
 pub use testnet::{NetworkState, NodeState, TestNetwork, TestNetworkConfig, TestNode};
