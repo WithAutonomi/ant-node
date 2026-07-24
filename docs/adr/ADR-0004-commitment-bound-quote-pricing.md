@@ -527,11 +527,17 @@ occupancy is `pending + reserved`, a first-class dashboard quantity.
 
 Overflow follows two rules, in order. First, an arrival that would displace
 a different peer grants the queue a reservation opportunity before anything
-is evicted: if a token and in-flight slot are free, one pending entry moves
-into the reservation and the arrival is admitted with no eviction, so an
-ingress burst can never flush eligible work past a ready token. Second,
-when no launch is possible, admission displaces a uniformly RANDOM
-incumbent, accounted as `capacity_evicted` — the steady overload signal.
+is evicted: if no reservation is outstanding and a token and in-flight slot
+are free, one pending entry moves into the reservation and the arrival is
+admitted with no eviction. The scheduler holds at most ONE outstanding
+jitter reservation — a deliberate one-entry guard slot outside the queue,
+so total schedulable occupancy is at most `cap + 1`, reported as
+`pending` plus `reserved` — which means an ingress burst consumes at most
+one launch opportunity per jitter window, even while a second burst token
+remains. Second, if an otherwise-admissible distinct-peer arrival still
+finds the queue at capacity after that opportunity, it displaces a
+uniformly RANDOM incumbent, accounted as `capacity_evicted` — the steady
+overload signal.
 Random selection is the security property: with deterministic retention
 (oldest-out or newest-kept), an ordered batch of `cap` distinct-peer paid
 nominations flushes a chosen target with certainty; with a random victim,

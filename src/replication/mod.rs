@@ -47,7 +47,8 @@ use std::pin::Pin;
 use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
 use futures::{Future, StreamExt};
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -204,7 +205,8 @@ enum FirstAuditQueueOutcome {
     /// lost the freshness tie (it was not the newer of the two) and the
     /// existing entry was retained. Benign, not an attack signal.
     RetainedOnTie,
-    /// A DIFFERENT peer's entry was evicted by the bounded LRU to make room.
+    /// A DIFFERENT peer's entry was displaced from the capped pending queue
+    /// (random victim) to make room.
     CapacityEvicted { peer: PeerId, pin: [u8; 32] },
 }
 
@@ -227,6 +229,7 @@ fn coalesce_first_audit_event(
     pending: &mut LruCache<PeerId, MonetizedPinEvent>,
     incoming: MonetizedPinEvent,
     incoming_is_newer: bool,
+    rng: &mut StdRng,
 ) -> FirstAuditQueueOutcome {
     if let Some(existing) = pending.peek(&incoming.peer) {
         // Strictly lower -> the incoming loses and is dropped WITHOUT touching
@@ -254,7 +257,7 @@ fn coalesce_first_audit_event(
     // nominations and is never certain (ADR-0004 Amendment 4).
     if pending.len() >= pending.cap().get() {
         let victim = {
-            let idx = rand::thread_rng().gen_range(0..pending.len());
+            let idx = rng.gen_range(0..pending.len());
             pending.iter().nth(idx).map(|(p, _)| *p)
         };
         if let Some(victim_peer) = victim {
@@ -269,8 +272,11 @@ fn coalesce_first_audit_event(
     }
     match pending.push(incoming.peer, incoming) {
         None => FirstAuditQueueOutcome::Queued,
-        // Defensive: unreachable after the explicit random displacement above,
-        // but a racing cap change must still be accounted, never silent.
+        // Unreachable: the random-displacement branch above guarantees
+        // `len < cap` here (the caller holds `&mut`, so no concurrent insert
+        // exists). Kept so any future logic error surfaces as an ACCOUNTED
+        // eviction rather than silent loss — but note this arm would be
+        // LRU-order, not random, so it must stay unreachable.
         Some((evicted_peer, evicted)) => FirstAuditQueueOutcome::CapacityEvicted {
             peer: evicted_peer,
             pin: evicted.pin,
@@ -562,9 +568,9 @@ struct FirstAuditScheduler {
     /// one effective answerability window); at capacity a uniformly RANDOM
     /// incumbent is displaced and counted as `capacity_evicted`, so eviction
     /// of a specific entry can never be forced deterministically. One further
-    /// entry may be held in `reserved` outside this queue; the summary line
-    /// reports both (`pending`/`reserved`) so schedulable occupancy is
-    /// `pending + reserved`.
+    /// entry may be held in `reserved` outside this queue — a deliberate
+    /// one-entry guard slot, so total schedulable occupancy is at most
+    /// `cap + 1`; the summary line reports both (`pending`/`reserved`).
     pending: LruCache<PeerId, MonetizedPinEvent>,
     /// Token bucket + per-peer re-audit window.
     limiter: FirstAuditLimiter,
@@ -584,6 +590,10 @@ struct FirstAuditScheduler {
     /// Such an event is dropped at ingress: never queued, and hence never
     /// launched nor marked first-audited.
     self_peer: PeerId,
+    /// RNG for random-victim displacement (ADR-0004 Amendment 4). Owned by the
+    /// scheduler so tests can seed it and reproduce eviction sequences exactly;
+    /// production seeds from OS entropy at construction.
+    rng: StdRng,
 }
 
 impl FirstAuditScheduler {
@@ -597,6 +607,7 @@ impl FirstAuditScheduler {
             reserved: None,
             oldest_first_lane: false,
             self_peer,
+            rng: StdRng::from_entropy(),
         }
     }
 
@@ -634,7 +645,7 @@ impl FirstAuditScheduler {
     /// Drop every pending nomination that has aged past the answerability
     /// horizon. `try_reserve` collects expired entries only while it can scan —
     /// under token starvation it returns at the budget gate first — so without
-    /// a periodic sweep dead entries squat the bounded LRU (evicting live peers
+    /// a periodic sweep dead entries squat the capped pending queue (displacing
     /// at capacity) and inflate the `pending`/`oldest_pending_quote_age_ms`
     /// telemetry. Each removal is accounted as `outside_answerability_window`,
     /// exactly like a scan-time expiry. Returns how many entries were dropped;
@@ -732,7 +743,7 @@ impl FirstAuditScheduler {
         }
         // Ordinary enqueue: the incoming arrived last, so it wins an equal-count
         // tie.
-        match coalesce_first_audit_event(&mut self.pending, event, true) {
+        match coalesce_first_audit_event(&mut self.pending, event, true, &mut self.rng) {
             FirstAuditQueueOutcome::Queued => {
                 obs.queued.fetch_add(1, Ordering::Relaxed);
             }
@@ -908,7 +919,7 @@ impl FirstAuditScheduler {
             // counted at ingress, so `queued` is not re-incremented): a capacity
             // eviction of a DIFFERENT peer and a suppressed reserved event are
             // both observable per the ADR funnel.
-            match coalesce_first_audit_event(&mut self.pending, event, false) {
+            match coalesce_first_audit_event(&mut self.pending, event, false, &mut self.rng) {
                 FirstAuditQueueOutcome::CapacityEvicted { .. } => {
                     obs.capacity_evicted.fetch_add(1, Ordering::Relaxed);
                 }
@@ -1794,9 +1805,11 @@ impl ReplicationEngine {
                             // Pre-overflow reservation opportunity: before an
                             // arrival may displace a DIFFERENT peer, let the
                             // queue launch — a successful reservation frees the
-                            // slot without eviction, so a single ingress batch
-                            // can never flush eligible work past a ready token
-                            // (ADR-0004 Amendment 4).
+                            // slot without eviction. One reservation can be
+                            // outstanding at a time, so this consumes at most
+                            // one slot per jitter window; arrivals beyond it
+                            // fall through to random displacement (ADR-0004
+                            // Amendment 4).
                             if scheduler.would_displace(&e) {
                                 open_first_audit_reservation(
                                     &mut scheduler,
@@ -6418,6 +6431,7 @@ mod tests {
     #[test]
     fn first_audit_coalescing_keeps_highest_count_and_exposes_eviction() {
         let mut pending = LruCache::new(NonZeroUsize::new(1).unwrap());
+        let mut rng = StdRng::seed_from_u64(7);
         let peer = test_peer(1);
         let base = MonetizedPinEvent {
             peer,
@@ -6428,7 +6442,7 @@ mod tests {
 
         // First insert into an empty slot: Queued.
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, base, true),
+            coalesce_first_audit_event(&mut pending, base, true, &mut rng),
             FirstAuditQueueOutcome::Queued
         );
 
@@ -6439,7 +6453,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, lower, true),
+            coalesce_first_audit_event(&mut pending, lower, true, &mut rng),
             FirstAuditQueueOutcome::SuppressedLower
         );
         assert_eq!(
@@ -6455,7 +6469,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, higher, true),
+            coalesce_first_audit_event(&mut pending, higher, true, &mut rng),
             FirstAuditQueueOutcome::Coalesced
         );
         assert_eq!(
@@ -6470,7 +6484,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, equal_newer, true),
+            coalesce_first_audit_event(&mut pending, equal_newer, true, &mut rng),
             FirstAuditQueueOutcome::Coalesced
         );
         assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
@@ -6481,7 +6495,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, equal_older, false),
+            coalesce_first_audit_event(&mut pending, equal_older, false, &mut rng),
             FirstAuditQueueOutcome::RetainedOnTie
         );
         assert_eq!(pending.peek(&peer).map(|e| e.pin), Some([4; 32]));
@@ -6494,7 +6508,7 @@ mod tests {
             ..base
         };
         assert_eq!(
-            coalesce_first_audit_event(&mut pending, other_peer, true),
+            coalesce_first_audit_event(&mut pending, other_peer, true, &mut rng),
             FirstAuditQueueOutcome::CapacityEvicted { peer, pin: [4; 32] }
         );
         assert_eq!(pending.len(), 1);
@@ -6820,7 +6834,7 @@ mod tests {
     /// forget audited pins and re-admit duplicates.
     #[test]
     fn first_audit_pending_cap_independent_of_dedup_cap() {
-        let scheduler = FirstAuditScheduler::new(Instant::now());
+        let scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         assert_eq!(scheduler.pending.cap().get(), FIRST_AUDIT_PENDING_CAP);
         assert_eq!(
             scheduler.first_audited.cap().get(),
@@ -6834,7 +6848,7 @@ mod tests {
     #[test]
     fn first_audit_admission_beyond_cap_displaces_and_counts() {
         let obs = Arc::new(FirstAuditObservability::default());
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let overflow: usize = 5;
         let total = FIRST_AUDIT_PENDING_CAP + overflow;
 
@@ -6877,12 +6891,16 @@ mod tests {
         assert!(FIRST_AUDIT_PENDING_CAP < flood);
         assert!(flood <= config::FIRST_AUDIT_DRAIN_BATCH);
 
-        let trials = 100u32;
+        let trials = 100u64;
         let mut survived = 0u32;
         let mut evicted = 0u32;
-        for _ in 0..trials {
+        for trial in 0..trials {
             let obs = Arc::new(FirstAuditObservability::default());
-            let mut scheduler = FirstAuditScheduler::new(Instant::now());
+            let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
+            // Deterministic per-trial seed: the run is fully reproducible (no
+            // flake budget at all) while still exercising 100 distinct
+            // eviction sequences.
+            scheduler.rng = StdRng::seed_from_u64(trial);
             // Drain the burst tokens so the pre-overflow reservation
             // opportunity cannot fire: this isolates pure retention.
             scheduler.limiter.reserve_token();
@@ -6910,8 +6928,9 @@ mod tests {
             }
         }
         // With eviction probability 1/cap per overflow, P(target survives one
-        // trial) ~= (1 - 1/31)^30 ~= 0.37: both outcomes are overwhelmingly
-        // certain to appear across 100 trials (miss odds < 1e-20 each side).
+        // trial) ~= (1 - 1/31)^30 ~= 0.37, so both outcomes appear across the
+        // 100 seeded trials — and the seeds make the split exactly
+        // reproducible rather than a (vanishingly small) flake budget.
         assert!(
             survived > 0,
             "target must survive some ordered floods — deterministic eviction \
@@ -6930,7 +6949,7 @@ mod tests {
     #[test]
     fn first_audit_overflow_reserves_before_destructive_eviction() {
         let obs = Arc::new(FirstAuditObservability::default());
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let cooldown: HashMap<PeerId, Instant> = HashMap::new();
 
         for i in 0..FIRST_AUDIT_PENDING_CAP {
@@ -6963,7 +6982,7 @@ mod tests {
     #[test]
     fn first_audit_displaced_peer_may_be_renominated() {
         let obs = Arc::new(FirstAuditObservability::default());
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let total = FIRST_AUDIT_PENDING_CAP + 1;
 
         for i in 0..total {
@@ -6991,7 +7010,7 @@ mod tests {
 
     /// The periodic sweep collects expired pending entries even when the token
     /// bucket is empty — the reserve path returns at the budget gate and never
-    /// scans — keeping the bounded LRU and the pending/oldest-age telemetry
+    /// scans — keeping the capped pending queue and the pending/oldest-age telemetry
     /// honest under fleet-wide starvation.
     #[test]
     fn first_audit_sweep_expired_collects_dead_entries_without_tokens() {
@@ -7268,6 +7287,7 @@ mod tests {
                     quote_ts: now - Duration::from_secs(secs),
                 },
                 true,
+                &mut scheduler.rng,
             );
         }
         assert_eq!(
@@ -7287,6 +7307,7 @@ mod tests {
                 quote_ts: now + Duration::from_secs(5),
             },
             true,
+            &mut skewed.rng,
         );
         assert_eq!(
             skewed.oldest_pending_quote_age_ms(now),
@@ -7296,13 +7317,19 @@ mod tests {
     }
 
     /// A flood of strictly-lower-count same-peer nominations must neither
-    /// displace the retained higher pin NOR disturb its LRU position (each is
-    /// suppressed via `peek`, no `push`), and each must be counted as
+    /// displace the retained higher pin NOR disturb its recency position (each
+    /// is suppressed via `peek`, no `push`), and each must be counted as
     /// `suppressed_lower` — the attempted cheaper-pin self-erasure signal.
+    /// Recency is asserted DIRECTLY via the queue's MRU-to-LRU iteration order
+    /// (the documented `lru` contract that also drives the reserve scan's lane
+    /// ordering), deliberately independent of the overflow policy: eviction is
+    /// random-victim, so no assertion may require a particular peer to be
+    /// displaced.
     #[test]
     fn first_audit_suppressed_lower_flood_leaves_recency_and_counts() {
         let mut pending: LruCache<PeerId, MonetizedPinEvent> =
             LruCache::new(NonZeroUsize::new(2).unwrap());
+        let mut rng = StdRng::seed_from_u64(11);
         let victim = test_peer(1);
         let other = test_peer(2);
         // Victim (high count) inserted first (older), then `other` (newer/MRU).
@@ -7315,6 +7342,7 @@ mod tests {
                 quote_ts: SystemTime::now(),
             },
             true,
+            &mut rng,
         );
         let _ = coalesce_first_audit_event(
             &mut pending,
@@ -7325,6 +7353,13 @@ mod tests {
                 quote_ts: SystemTime::now(),
             },
             true,
+            &mut rng,
+        );
+        let order_before: Vec<PeerId> = pending.iter().map(|(p, _)| *p).collect();
+        assert_eq!(
+            order_before,
+            vec![other, victim],
+            "sanity: `other` is MRU, the victim is LRU"
         );
 
         // Flood the victim with cheaper nominations.
@@ -7339,6 +7374,7 @@ mod tests {
                     quote_ts: SystemTime::now(),
                 },
                 true,
+                &mut rng,
             );
             assert_eq!(out, FirstAuditQueueOutcome::SuppressedLower);
             suppressed += 1;
@@ -7349,27 +7385,12 @@ mod tests {
             pending.peek(&victim).map(|e| (e.pin, e.key_count)),
             Some(([1; 32], 400))
         );
-        // Recency unchanged: `other` is still MRU (a new distinct peer at cap 2
-        // would evict the LRU; the victim must be the LRU, so `third` evicts the
-        // victim, not `other`).
-        let third = test_peer(3);
-        let out = coalesce_first_audit_event(
-            &mut pending,
-            MonetizedPinEvent {
-                peer: third,
-                pin: [7; 32],
-                key_count: 100,
-                quote_ts: SystemTime::now(),
-            },
-            true,
-        );
+        // Recency untouched: the iteration order (which the reserve lanes
+        // consume) is byte-for-byte what it was before the flood.
+        let order_after: Vec<PeerId> = pending.iter().map(|(p, _)| *p).collect();
         assert_eq!(
-            out,
-            FirstAuditQueueOutcome::CapacityEvicted {
-                peer: victim,
-                pin: [1; 32]
-            },
-            "the suppressed-lower flood must not have promoted the victim above `other`"
+            order_after, order_before,
+            "the suppressed-lower flood must not have changed any recency position"
         );
     }
 
