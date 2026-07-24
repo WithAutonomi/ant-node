@@ -258,7 +258,7 @@ pub(crate) enum AuditDropKind {
     Responsible = 0,
     /// Subtree audit round-1 challenge.
     Subtree = 1,
-    /// Subtree audit round-2 byte challenge.
+    /// Subtree audit round-2 slice challenge.
     Byte = 2,
 }
 
@@ -852,7 +852,8 @@ pub enum AuditResponse {
 /// [`SubtreeAuditResponse::Proof`] for that selected subtree against the pinned
 /// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
 /// (for a recently gossiped pinned commitment a rejection is a confirmed
-/// failure, since the responder retains its last two gossiped commitments).
+/// failure, since the responder retains its recently gossiped commitments for a
+/// bounded TTL window).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtreeAuditChallenge {
     /// Unique challenge identifier.
@@ -944,7 +945,7 @@ pub enum RejectKind {
     /// timeout lane (holder credit revoked, no trust penalty).
     Transient,
     /// Any other rejection (wrong target peer, no commitment state, malformed
-    /// proof plan, oversized byte challenge, …). CONFIRMED failure.
+    /// proof plan, oversized slice challenge, …). CONFIRMED failure.
     Protocol,
 }
 
@@ -1026,8 +1027,19 @@ pub enum SubtreeSliceItem {
     },
 }
 
-/// Response to a [`SubtreeSliceChallenge`] (round 2). One item per requested
-/// opening, in the requested order.
+/// Response to a [`SubtreeSliceChallenge`] (round 2).
+///
+/// The contract is **coalesced and order-independent**: the responder groups the
+/// requested openings by key (reading and hashing each chunk once), so
+/// - a `Present` item is unique per distinct `(key, block_index)`;
+/// - an `Absent` item is at most one per key and covers ALL of that key's
+///   requested openings (it has no `block_index`);
+/// - duplicate requested openings do not multiply work or response items;
+/// - item order is unspecified — the auditor matches by identity, not position.
+///
+/// The auditor rejects a response whose identities collide (a duplicate
+/// `(key, block_index)`, or a key that is both `Present` and `Absent`) as
+/// malformed, so first-match ambiguity cannot decide a verdict.
 ///
 /// Each item is a few KB (a 1 KiB block plus O(log n) hashes on two short
 /// chains), so even the worst-case sample fits far under

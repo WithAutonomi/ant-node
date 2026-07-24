@@ -64,8 +64,9 @@ use crate::replication::commitment_state::{
 };
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
-    SUBTREE_AUDIT_PROTOCOL_ID,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_CONCURRENT_SUBTREE_ROUND1, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
+    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1284,8 +1285,10 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
-    /// Bounds concurrent IN-FLIGHT audit-responder tasks (subtree round 1 +
-    /// byte round 2). Those are spawned off the serial message loop so disk
+    /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
+    /// audits + subtree slice round 2). The heavy subtree round 1 has its own
+    /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
+    /// message loop so disk
     /// reads don't block replication; the semaphore restores a global
     /// backpressure ceiling so the node can't fan out unbounded `get_raw` reads
     /// / multi-MiB byte serves.
@@ -1298,6 +1301,11 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Resource controls for the HEAVY subtree-audit round 1 (Blocker 1): its own
+    /// tight admission pool (so a burst of full-subtree hashing can't starve the
+    /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
+    /// sessions binding a slice challenge to a matching round 1.
+    subtree_round1: SubtreeRound1Limiter,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -1394,6 +1402,7 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            subtree_round1: SubtreeRound1Limiter::new(config.subtree_round1_responder_cooldown),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -2057,6 +2066,7 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let subtree_round1 = self.subtree_round1.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
         // commitment can spawn a probabilistic, cooldown-gated subtree audit.
@@ -2121,6 +2131,7 @@ impl ReplicationEngine {
                                     &gossip_audit,
                                     &audit_responder_semaphore,
                                     &audit_responder_inflight,
+                                    &subtree_round1,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -3051,6 +3062,127 @@ impl Drop for AuditResponderGuard {
     }
 }
 
+/// A live round-1 → round-2 subtree-audit session: proof of a matching round 1.
+struct SubtreeSession {
+    commitment_hash: [u8; 32],
+    nonce: [u8; 32],
+    inserted: Instant,
+}
+
+/// Resource controls for the HEAVY subtree-audit round 1 (Blocker 1): a tight
+/// admission pool separate from the light responsible/slice audits, a per-peer
+/// rate cooldown, and single-use round-1 → round-2 sessions so a round-2 slice
+/// challenge is only served after a matching round 1.
+#[derive(Clone)]
+struct SubtreeRound1Limiter {
+    semaphore: Arc<Semaphore>,
+    inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Per-peer minimum spacing between served round-1 proofs (config-driven;
+    /// [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`] in production, near-zero in tests).
+    cooldown_interval: Duration,
+    sessions: Arc<RwLock<HashMap<(PeerId, u64), SubtreeSession>>>,
+}
+
+impl SubtreeRound1Limiter {
+    fn new(cooldown_interval: Duration) -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBTREE_ROUND1)),
+            inflight: Arc::new(RwLock::new(HashMap::new())),
+            cooldown: Arc::new(RwLock::new(HashMap::new())),
+            cooldown_interval,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Admit one heavy round-1 proof for `source`: take a concurrency permit
+    /// FIRST (so a full pool never wastes the peer's cooldown allowance), then
+    /// enforce the per-peer rate cooldown. `None` drops the challenge (the remote
+    /// auditor applies its own graced-timeout policy).
+    async fn admit(&self, source: &PeerId) -> Option<AuditResponderGuard> {
+        let guard = admit_audit_responder_with_limits(
+            &self.semaphore,
+            &self.inflight,
+            source,
+            MAX_CONCURRENT_SUBTREE_ROUND1,
+            MAX_SUBTREE_ROUND1_PER_PEER,
+        )
+        .await
+        .ok()?;
+        let now = Instant::now();
+        let mut cooldown = self.cooldown.write().await;
+        if let Some(&last) = cooldown.get(source) {
+            if now.duration_since(last) < self.cooldown_interval {
+                return None; // guard drops here, releasing the permit + slot
+            }
+        }
+        // Evict lapsed entries (their cooldown has expired, so they no longer
+        // limit) and cap capacity, so peer-id churn can't grow this map unbounded.
+        cooldown.retain(|_, &mut last| now.duration_since(last) < self.cooldown_interval);
+        if cooldown.len() >= MAX_SUBTREE_SESSIONS {
+            if let Some(oldest) = cooldown.iter().min_by_key(|(_, &t)| t).map(|(k, _)| *k) {
+                cooldown.remove(&oldest);
+            }
+        }
+        cooldown.insert(*source, now);
+        Some(guard)
+    }
+
+    /// Record a single-use session once a round-1 proof is built and about to be
+    /// sent, so the matching round 2 is admitted exactly once.
+    async fn open_session(
+        &self,
+        source: PeerId,
+        challenge_id: u64,
+        commitment_hash: [u8; 32],
+        nonce: [u8; 32],
+    ) {
+        let now = Instant::now();
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, e| now.duration_since(e.inserted) < SUBTREE_SESSION_TTL);
+        if sessions.len() >= MAX_SUBTREE_SESSIONS {
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, e)| e.inserted)
+                .map(|(k, _)| *k)
+            {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(
+            (source, challenge_id),
+            SubtreeSession {
+                commitment_hash,
+                nonce,
+                inserted: now,
+            },
+        );
+    }
+
+    /// Atomically consume the round-2 session for this exchange. `true` iff a
+    /// live session matching `(source, challenge_id, commitment_hash, nonce)`
+    /// existed (and is now removed); a miss silently drops round 2 to the graced
+    /// timeout lane (sessions are ephemeral and can be lost across a restart).
+    async fn consume_session(
+        &self,
+        source: &PeerId,
+        challenge_id: u64,
+        commitment_hash: &[u8; 32],
+        nonce: &[u8; 32],
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let matches = sessions.get(&(*source, challenge_id)).is_some_and(|e| {
+            Instant::now().duration_since(e.inserted) < SUBTREE_SESSION_TTL
+                && &e.commitment_hash == commitment_hash
+                && &e.nonce == nonce
+        });
+        if matches {
+            sessions.remove(&(*source, challenge_id));
+        }
+        matches
+    }
+}
+
 /// Try to admit one audit-responder task for `source`: take a global permit AND
 /// a per-peer slot (both bounded). Returns `Err` with the binding ceiling and
 /// its decision-time counters (caller drops the challenge, leaving the remote
@@ -3064,8 +3196,26 @@ async fn admit_audit_responder(
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
     source: &PeerId,
 ) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
-    let global_limit = MAX_CONCURRENT_AUDIT_RESPONSES;
-    let peer_limit = MAX_AUDIT_RESPONSES_PER_PEER;
+    admit_audit_responder_with_limits(
+        semaphore,
+        inflight,
+        source,
+        MAX_CONCURRENT_AUDIT_RESPONSES,
+        MAX_AUDIT_RESPONSES_PER_PEER,
+    )
+    .await
+}
+
+/// Admission core shared by the light audit pool ([`admit_audit_responder`]) and
+/// the tight heavy subtree round-1 pool: take a global permit AND a per-peer slot
+/// under the given limits.
+async fn admit_audit_responder_with_limits(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    source: &PeerId,
+    global_limit: usize,
+    peer_limit: u32,
+) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
     // `available_permits()` is a cheap atomic load; `global_limit - available`
     // is the best-effort in-flight count at decision time. Not synchronized with
     // the per-peer lock, so it is a snapshot, not a single atomic view.
@@ -3149,6 +3299,7 @@ async fn handle_replication_message(
     gossip_audit: &GossipAuditTrigger,
     audit_responder_semaphore: &Arc<Semaphore>,
     audit_responder_inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    subtree_round1: &SubtreeRound1Limiter,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
     let msg = ReplicationMessage::decode(data)
@@ -3333,32 +3484,28 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let guard = match admit_audit_responder(
-                audit_responder_semaphore,
-                audit_responder_inflight,
-                source,
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
-                    warn!(
-                        "Audit challenge reply not sent: kind=subtree response=dropped \
-                         source={source} {failure}"
-                    );
-                    return Ok(());
-                }
+            // Round 1 is the HEAVY path (rebuilds + hashes the whole sqrt-subtree),
+            // so it uses its own tight admission pool + per-peer rate cooldown,
+            // separate from the light responsible/slice audits, and a miss silently
+            // drops (subtree auditors grace timeouts).
+            let Some(guard) = subtree_round1.admit(source).await else {
+                protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
+                warn!(
+                    "Audit challenge reply not sent: kind=subtree response=dropped \
+                     source={source} (heavy round-1 pool full or per-peer cooldown)"
+                );
+                return Ok(());
             };
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
             let p2p_node = Arc::clone(p2p_node);
             let my_commitment_state = Arc::clone(my_commitment_state);
+            let subtree_round1 = subtree_round1.clone();
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             tokio::spawn(async move {
-                let _guard = guard; // global permit + per-peer slot, held until done
+                let _guard = guard; // heavy permit + per-peer slot, held until done
                 let response = storage_commitment_audit::handle_subtree_challenge(
                     &challenge,
                     &storage,
@@ -3367,6 +3514,22 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                // A round-1 proof authorizes exactly one matching round 2: open a
+                // single-use session so a slice challenge cannot be served without
+                // a live round-1 exchange.
+                if matches!(
+                    &response,
+                    crate::replication::protocol::SubtreeAuditResponse::Proof { .. }
+                ) {
+                    subtree_round1
+                        .open_session(
+                            source,
+                            challenge.challenge_id,
+                            challenge.expected_commitment_hash,
+                            challenge.nonce,
+                        )
+                        .await;
+                }
                 let response_kind = subtree_audit_response_kind(&response);
                 let sent = send_replication_response_checked(
                     &source,
@@ -3403,6 +3566,47 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
+            // Round 2 must follow a live round-1 exchange from THIS peer: consume
+            // the single-use session (bound to challenge_id/commitment/nonce). On a
+            // miss, reply with a cheap `Transient` rejection rather than dropping
+            // silently. Sessions are ephemeral (an honest responder that restarts
+            // between rounds loses its session), and an unanswered `send_request`
+            // would make saorsa-core record a transport trust failure against that
+            // honest responder — an ongoing effect, not just a rollout-window one.
+            // A `Transient` reply routes the auditor to the graced timeout lane
+            // (no trust penalty; the responder re-earns pinned credit on the next
+            // audit) and does no chunk work, so it is not a DoS lever.
+            if !subtree_round1
+                .consume_session(
+                    source,
+                    challenge.challenge_id,
+                    &challenge.expected_commitment_hash,
+                    &challenge.nonce,
+                )
+                .await
+            {
+                protocol::record_audit_drop(protocol::AuditDropKind::Byte);
+                debug!(
+                    "Slice challenge without a live round-1 session source={source} \
+                     challenge_id={} → Transient reject",
+                    challenge.challenge_id
+                );
+                send_replication_response_checked(
+                    source,
+                    p2p_node,
+                    msg.request_id,
+                    ReplicationMessageBody::SubtreeSliceResponse(
+                        protocol::SubtreeSliceResponse::Rejected {
+                            challenge_id: challenge.challenge_id,
+                            kind: protocol::RejectKind::Transient,
+                            reason: "no live round-1 session".to_string(),
+                        },
+                    ),
+                    rr_message_id,
+                )
+                .await;
+                return Ok(());
+            }
             let guard = match admit_audit_responder(
                 audit_responder_semaphore,
                 audit_responder_inflight,
@@ -6452,6 +6656,40 @@ mod tests {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    // Blocker 1: the heavy round-1 limiter enforces the per-peer rate cooldown
+    // and single-use round-1 → round-2 sessions.
+    #[tokio::test]
+    async fn subtree_round1_limiter_cooldown_and_single_use_session() {
+        let limiter = SubtreeRound1Limiter::new(Duration::from_secs(3600));
+        let peer = test_peer(1);
+
+        // First round-1 is admitted; drop the guard so concurrency is free again.
+        let guard = limiter.admit(&peer).await;
+        assert!(guard.is_some(), "first round-1 admitted");
+        drop(guard);
+        // A second round-1 within the cooldown is dropped even though the heavy
+        // pool now has a free slot — the rate cooldown, not concurrency, blocks it.
+        assert!(
+            limiter.admit(&peer).await.is_none(),
+            "second round-1 within cooldown is rate-dropped"
+        );
+        // A different peer has its own cooldown.
+        assert!(limiter.admit(&test_peer(2)).await.is_some());
+
+        // Session: opened by round 1, consumed exactly once by the matching round 2.
+        let hash = [7u8; 32];
+        let nonce = [9u8; 32];
+        limiter.open_session(peer, 42, hash, nonce).await;
+        // Wrong nonce / commitment does not match.
+        assert!(!limiter.consume_session(&peer, 42, &hash, &[0u8; 32]).await);
+        assert!(!limiter.consume_session(&peer, 42, &[0u8; 32], &nonce).await);
+        // A round 2 with no prior round 1 (wrong challenge_id) misses.
+        assert!(!limiter.consume_session(&peer, 99, &hash, &nonce).await);
+        // The matching round 2 consumes it — and only once (single-use).
+        assert!(limiter.consume_session(&peer, 42, &hash, &nonce).await);
+        assert!(!limiter.consume_session(&peer, 42, &hash, &nonce).await);
     }
 
     fn test_key(b: u8) -> crate::ant_protocol::XorName {

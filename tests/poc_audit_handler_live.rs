@@ -419,6 +419,7 @@ async fn slice_challenge_opens_valid_blocks_for_committed_keys() {
                                 &block,
                                 nonced_siblings,
                                 &root,
+                                ant_node::replication::slice::block_count(content.len() as u64),
                             ),
                             "nonced opening must fold to the honest nonced root"
                         );
@@ -525,7 +526,8 @@ async fn slice_challenge_opens_a_deep_block_of_a_large_chunk() {
             block_index,
             &block,
             nonced_siblings,
-            &root
+            &root,
+            ant_node::replication::slice::block_count(content.len() as u64)
         ),
         "deep-block nonced opening must fold to the honest root"
     );
@@ -578,5 +580,49 @@ async fn oversize_slice_challenge_is_rejected() {
             );
         }
         other => panic!("expected Rejected(oversize), got {other:?}"),
+    }
+}
+
+/// A slice challenge spanning more DISTINCT keys than the honest spot-check sample
+/// is rejected even when it stays under the total-openings cap. Coalescing saves
+/// work only when keys repeat, so a forged auditor could otherwise force a full
+/// chunk read per distinct key (up to ~40 MiB) without exceeding `MAX_SLICE_OPENINGS`.
+///
+/// FLIPS IF: the distinct-key cap is removed from the responder.
+#[tokio::test]
+async fn slice_challenge_with_too_many_distinct_keys_is_rejected() {
+    let (storage, _t) = test_storage().await;
+    let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
+    let pin = r.current_hash();
+
+    // 6 distinct keys × 1 opening = 6 openings: under MAX_SLICE_OPENINGS (10) but
+    // over the honest BYTE_SPOTCHECK_MAX (5) distinct-key sample.
+    let openings: Vec<SubtreeSliceOpening> = (0..6u8)
+        .map(|i| SubtreeSliceOpening {
+            key: [i + 1; 32],
+            block_index: 0,
+        })
+        .collect();
+    assert!(openings.len() <= MAX_SLICE_OPENINGS);
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 45,
+        nonce: [0x44u8; 32],
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings,
+    };
+
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match resp {
+        SubtreeSliceResponse::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("distinct keys"),
+                "expected distinct-key rejection, got: {reason}"
+            );
+        }
+        other => panic!("expected Rejected(distinct keys), got {other:?}"),
     }
 }

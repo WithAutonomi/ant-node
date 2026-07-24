@@ -259,6 +259,7 @@ fn auditor_accepts(
             &block,
             &nonced_siblings,
             &leaf.nonced_root,
+            ant_node::replication::slice::block_count(u64::from(leaf.content_len)),
         ) {
             return Err(AuditError::RealBytesMismatch);
         }
@@ -527,7 +528,7 @@ fn predict_and_fetch_relay_is_caught_by_fresh_random_sample() {
 /// the auditor now picks the sample with FRESH randomness after the proof is in
 /// hand (§1), the attacker cannot aim its forgeries away from the sample. We
 /// model the worst case for the attacker — every leaf's freshness forged — so
-/// any random sample is fatal; round 2 re-derives the freshness hash from the
+/// any random sample is fatal; round 2 re-derives the nonced opening from the
 /// served bytes and exposes it.
 #[test]
 fn fabricated_fraction_is_caught_when_a_forged_leaf_is_sampled() {
@@ -555,7 +556,7 @@ fn fabricated_fraction_is_caught_when_a_forged_leaf_is_sampled() {
     assert_eq!(
         res,
         Err(AuditError::RealBytesMismatch),
-        "a forged leaf landing under the byte challenge must fail, got {res:?}"
+        "a forged leaf landing under the slice challenge must fail, got {res:?}"
     );
 }
 

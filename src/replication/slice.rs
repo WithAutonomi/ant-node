@@ -251,6 +251,7 @@ fn siblings_from_leaves(leaves: &[[u8; 32]], index: u32) -> Option<Vec<[u8; 32]>
 /// `block` must be the Bao-verified block bytes for `index`, so this proves the
 /// responder committed a nonced root over the *real* content at round-1 time.
 #[must_use]
+#[allow(clippy::too_many_arguments)]
 pub fn verify_nonced_block(
     nonce: &[u8; 32],
     peer: &[u8; 32],
@@ -259,7 +260,17 @@ pub fn verify_nonced_block(
     block: &[u8],
     siblings: &[[u8; 32]],
     nonced_root: &[u8; 32],
+    block_count: u32,
 ) -> bool {
+    // Enforce the canonical tree geometry: the sibling chain MUST be exactly the
+    // depth of a `block_count`-leaf tree. `nonced_root` is responder-chosen in
+    // round 1, so without this a partial holder could set `nonced_root` to a
+    // single block's leaf and pass with zero siblings whenever the fresh draw
+    // happens to land on that block. Pinning the depth binds the claimed
+    // left-packed geometry and rejects such degraded proofs.
+    if siblings.len() != nonced_tree_depth(block_count) {
+        return false;
+    }
     let mut node_index = index as usize;
     let mut cur = nonced_block_leaf(nonce, peer, key, index, block);
     for sibling in siblings {
@@ -271,6 +282,21 @@ pub fn verify_nonced_block(
         node_index /= 2;
     }
     &cur == nonced_root
+}
+
+/// Canonical sibling-chain length for a `block_count`-leaf nonced tree.
+///
+/// The number of `div_ceil(2)` folds from the leaf level down to a single root
+/// (0 for a single-block chunk). Matches [`nonced_block_siblings`]'s output.
+#[must_use]
+pub fn nonced_tree_depth(block_count: u32) -> usize {
+    let mut n = block_count.max(1) as usize;
+    let mut depth = 0;
+    while n > 1 {
+        n = n.div_ceil(2);
+        depth += 1;
+    }
+    depth
 }
 
 /// Extract a Bao verified slice for block `index` of `content` (responder, round
@@ -636,7 +662,7 @@ mod tests {
                     nonced_block_siblings(&NONCE, &PEER, &KEY, &content, i).expect("siblings");
                 let block = block_bytes(&content, i);
                 assert!(
-                    verify_nonced_block(&NONCE, &PEER, &KEY, i, block, &siblings, &root),
+                    verify_nonced_block(&NONCE, &PEER, &KEY, i, block, &siblings, &root, count),
                     "len {len} block {i} must verify"
                 );
             }
@@ -650,8 +676,9 @@ mod tests {
         let siblings = nonced_block_siblings(&NONCE, &PEER, &KEY, &content, 1).expect("siblings");
         let mut wrong = block_bytes(&content, 1).to_vec();
         wrong[0] ^= 0x01;
+        let bc = block_count(content.len() as u64);
         assert!(!verify_nonced_block(
-            &NONCE, &PEER, &KEY, 1, &wrong, &siblings, &root
+            &NONCE, &PEER, &KEY, 1, &wrong, &siblings, &root, bc
         ));
     }
 
@@ -661,20 +688,21 @@ mod tests {
         let root = nonced_block_root(&NONCE, &PEER, &KEY, &content);
         let siblings = nonced_block_siblings(&NONCE, &PEER, &KEY, &content, 2).expect("siblings");
         let block = block_bytes(&content, 2);
+        let bc = block_count(content.len() as u64);
         // Correct binding verifies.
         assert!(verify_nonced_block(
-            &NONCE, &PEER, &KEY, 2, block, &siblings, &root
+            &NONCE, &PEER, &KEY, 2, block, &siblings, &root, bc
         ));
         // A different nonce, peer, or key must not verify against the same root.
         let other = [0xAB; 32];
         assert!(!verify_nonced_block(
-            &other, &PEER, &KEY, 2, block, &siblings, &root
+            &other, &PEER, &KEY, 2, block, &siblings, &root, bc
         ));
         assert!(!verify_nonced_block(
-            &NONCE, &other, &KEY, 2, block, &siblings, &root
+            &NONCE, &other, &KEY, 2, block, &siblings, &root, bc
         ));
         assert!(!verify_nonced_block(
-            &NONCE, &PEER, &other, 2, block, &siblings, &root
+            &NONCE, &PEER, &other, 2, block, &siblings, &root, bc
         ));
     }
 
@@ -761,7 +789,50 @@ mod tests {
             0,
             block,
             &siblings,
-            &foreign_root
+            &foreign_root,
+            block_count(real.len() as u64)
+        ));
+    }
+
+    // Canonical-depth regression: `nonced_root` is responder-chosen in round 1,
+    // so a partial holder could set it to a single block's leaf and pass with
+    // zero siblings whenever the fresh draw lands on that block. Pinning the
+    // sibling-chain length to the tree depth rejects that (and any wrong-depth
+    // chain) even when it would fold to the supplied root.
+    #[test]
+    fn canonical_depth_rejects_wrong_sibling_count() {
+        let content = content_of(4096); // 4 blocks → canonical depth 2
+        let bc = block_count(content.len() as u64);
+        assert_eq!(nonced_tree_depth(bc), 2);
+        let block0 = block_bytes(&content, 0);
+
+        // Degraded escape: claim root = block 0's own leaf, supply zero siblings.
+        // Folds to that root, but depth 0 != 2, so rejected.
+        let leaf0 = nonced_block_leaf(&NONCE, &PEER, &KEY, 0, block0);
+        assert!(!verify_nonced_block(
+            &NONCE,
+            &PEER,
+            &KEY,
+            0,
+            block0,
+            &[],
+            &leaf0,
+            bc
+        ));
+
+        // The honest, correct-depth opening still verifies.
+        let root = nonced_block_root(&NONCE, &PEER, &KEY, &content);
+        let siblings = nonced_block_siblings(&NONCE, &PEER, &KEY, &content, 0).expect("siblings");
+        assert_eq!(siblings.len(), 2);
+        assert!(verify_nonced_block(
+            &NONCE, &PEER, &KEY, 0, block0, &siblings, &root, bc
+        ));
+
+        // A too-long chain (extra sibling) is rejected on depth alone.
+        let mut too_long = siblings;
+        too_long.push([0u8; 32]);
+        assert!(!verify_nonced_block(
+            &NONCE, &PEER, &KEY, 0, block0, &too_long, &root, bc
         ));
     }
 }

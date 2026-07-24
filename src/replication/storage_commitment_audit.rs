@@ -9,7 +9,7 @@
 //! [`handle_subtree_challenge`]; the pure proof maths live in
 //! [`crate::replication::subtree`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,9 +46,9 @@ use crate::replication::audit::AuditTickResult;
 // Auditor side
 // ---------------------------------------------------------------------------
 
-/// ADR-0002 round-2 byte challenge samples a SMALL surprise set of the proven
+/// ADR-0002 round-2 slice challenge samples a SMALL surprise set of the proven
 /// leaves (3..=5). Small enough that the responder's honest local-disk read of
-/// the original chunks stays well inside the possession-in-time deadline, while
+/// the original chunks stays well inside the response deadline (a liveness bound), while
 /// a relay forced to fetch them over the network blows it; large enough that
 /// faking a fraction `x` of leaves survives only `(1 - x)^k`.
 const BYTE_SPOTCHECK_MIN: u32 = 3;
@@ -149,14 +149,16 @@ struct AuditCtx<'a> {
 ///
 /// 1. **Structure** (round 1) — the returned subtree rebuilds to the pinned
 ///    root, within a size-scaled deadline.
-/// 2. **Real bytes** (round 2) — the auditor demands the ORIGINAL chunk content
-///    for a 3..=5 FRESHLY-RANDOM sample of the proven leaves (chosen after the
-///    proof arrives, not nonce-derived — see `random_spotcheck_leaves`) FROM the
-///    responder, and recomputes both the content-address hash and the nonce
-///    freshness hash from that served content. The auditor holds none of the
-///    peer's chunks.
-/// 3. **Timing** — each round's deadline is sized to an honest local-disk read,
-///    so a relay forced to fetch over the network blows it.
+/// 2. **Verified slice** (round 2) — for a 3..=5 FRESHLY-RANDOM sample of the
+///    proven leaves (chosen after the proof arrives, not nonce-derived — see
+///    `random_spotcheck_leaves`), the auditor opens one random 1 KiB block per
+///    leaf (plus its final block) and verifies a Bao slice against the chunk
+///    address and a nonced-tree opening against the round-1 `nonced_root`, over
+///    the bytes the responder serves. The auditor holds none of the peer's
+///    chunks, and possession is the round-1 commitment, not a full-chunk transfer.
+/// 3. **Timing** — a response deadline still bounds liveness, but (unlike the old
+///    full-byte round 2) it is no longer the possession proof; that is the
+///    round-1 `nonced_root` commitment.
 ///
 /// A timeout (either round) is reported as [`AuditFailureReason::Timeout`] (the
 /// caller applies the strike/grace policy). Any structural failure, served
@@ -480,11 +482,12 @@ pub(crate) enum AuditVerdict {
 /// Runs the cheap gates in fail-fast order: pin / identity / signature →
 /// structure (the returned subtree rebuilds to the pinned root). It does **not**
 /// prove byte possession — the leaves carry only the public `bytes_hash` (the
-/// chunk address) and a `nonced_hash` the responder computed itself. Possession
-/// is proven in round 2 ([`verify_byte_response`]), where the auditor demands
-/// the original chunk bytes for a freshly-random (post-proof) sample and
-/// recomputes both hashes from the SERVED content. This removes any dependency
-/// on the auditor holding the peer's chunks.
+/// chunk address), a `content_len`, and a `nonced_root` the responder computed
+/// itself. Possession is proven in round 2 ([`verify_slice_response`]), where the
+/// auditor opens a freshly-random (post-proof) block per sampled leaf and
+/// verifies a Bao slice against the address plus a nonced-tree opening against
+/// the round-1 `nonced_root` — over the SERVED bytes, so the auditor never holds
+/// the peer's chunks.
 ///
 /// Returns [`StructureVerdict::Valid`] (proceed to round 2) or a confirmed
 /// [`AuditFailureReason`] mapped from the failing gate.
@@ -634,6 +637,42 @@ pub(crate) fn verify_slice_response(
     challenged_peer_bytes: &[u8; 32],
     items: &[SubtreeSliceItem],
 ) -> AuditVerdict {
+    // Validate the response shape before matching. A well-formed response has at
+    // most one item per SOLICITED identity; the per-opening `find_map` below
+    // returns the FIRST match, so a duplicate `(key, block_index)` `Present`, a
+    // key that is both `Present` and `Absent`, a repeated `Absent`, or an
+    // UNSOLICITED item would let the responder's item order (or padding) decide
+    // the verdict. Bounding `items.len()` to the request count also keeps this
+    // check (and the matching below) at O(openings) — a peer cannot pad the
+    // response with thousands of unique items to force quadratic validation work.
+    if items.len() > openings.len() {
+        return AuditVerdict::Fail(AuditFailureReason::MalformedResponse);
+    }
+    let requested_blocks: HashSet<(XorName, u32)> =
+        openings.iter().map(|(leaf, i)| (leaf.key, *i)).collect();
+    let requested_keys: HashSet<XorName> = openings.iter().map(|(leaf, _)| leaf.key).collect();
+    let mut present: HashSet<(XorName, u32)> = HashSet::new();
+    let mut absent: HashSet<XorName> = HashSet::new();
+    for it in items {
+        let ok = match it {
+            SubtreeSliceItem::Present {
+                key, block_index, ..
+            } => {
+                requested_blocks.contains(&(*key, *block_index))
+                    && present.insert((*key, *block_index))
+                    && !absent.contains(key)
+            }
+            SubtreeSliceItem::Absent { key } => {
+                requested_keys.contains(key)
+                    && absent.insert(*key)
+                    && !present.iter().any(|(k, _)| k == key)
+            }
+        };
+        if !ok {
+            return AuditVerdict::Fail(AuditFailureReason::MalformedResponse);
+        }
+    }
+
     let mut checked = 0usize;
     for (leaf, block_index) in openings {
         let block_index = *block_index;
@@ -665,7 +704,9 @@ pub(crate) fn verify_slice_response(
             return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
         };
 
-        // Chain 2: prove the block was committed under round 1's fresh nonce.
+        // Chain 2: prove the block was committed under round 1's fresh nonce,
+        // with the sibling chain pinned to the canonical depth for the chunk's
+        // block count (bound the claimed tree geometry).
         if !crate::replication::slice::verify_nonced_block(
             nonce,
             challenged_peer_bytes,
@@ -674,6 +715,7 @@ pub(crate) fn verify_slice_response(
             &block,
             nonced_siblings,
             &leaf.nonced_root,
+            crate::replication::slice::block_count(u64::from(leaf.content_len)),
         ) {
             return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
         }
@@ -771,9 +813,16 @@ async fn verify_subtree_response(
             challenged_peer.as_bytes(),
             &items,
         ),
-        // The responder rejected the slice challenge for a recently pinned
-        // commitment → confirmed failure, same as round 1.
-        SliceRound::Rejected => AuditVerdict::Fail(AuditFailureReason::Rejected),
+        // Confirmed round-2 failures. `Rejected`: the responder repudiated the
+        // slice challenge for a recently pinned commitment. `ResponsiveBootstrap`:
+        // it claimed bootstrap AFTER producing a valid round-1 proof, which is a
+        // self-contradiction (a bootstrapping node has no committed data to
+        // prove). Both are classified as any other confirmed `Rejected`, which
+        // revokes the peer's holder credit and takes the trust penalty downstream
+        // (`apply_audit_failure_credit_revocation` → `forget_peer`).
+        SliceRound::Rejected | SliceRound::ResponsiveBootstrap => {
+            AuditVerdict::Fail(AuditFailureReason::Rejected)
+        }
         // Transient reject (a local read error): ADR-0004 A1 routes it to the
         // timeout lane — no trust penalty, but revoke the holder credit for THIS
         // pinned commitment (the peer answered and could not prove possession).
@@ -793,20 +842,6 @@ async fn verify_subtree_response(
         // (graced by the caller's strike policy — could be honest slowness).
         // Keeps credit (a dropped packet is not evidence of loss).
         SliceRound::Timeout => AuditVerdict::Fail(AuditFailureReason::Timeout),
-        // Bootstrap claim after a valid round-1 proof: revoke the pinned
-        // commitment's credit (it cannot keep credit while refusing to prove
-        // possession) and confirm the failure — the round-1 proof already
-        // disproves the bootstrap claim.
-        SliceRound::ResponsiveBootstrap => {
-            if let Some(credit) = ctx.credit {
-                credit
-                    .recent_provers
-                    .write()
-                    .await
-                    .forget_commitment(&ctx.expected_commitment_hash);
-            }
-            AuditVerdict::Fail(AuditFailureReason::Rejected)
-        }
         // Malformed/unexpected round-2 body.
         SliceRound::Malformed => AuditVerdict::Fail(AuditFailureReason::MalformedResponse),
     };
@@ -958,6 +993,7 @@ fn subtree_failure_summary(reason: &AuditFailureReason) -> AuditFailureSummary {
 /// nonce-selected branch. If this node is bootstrapping it says so; if it
 /// genuinely does not retain the pinned commitment it rejects (which, with audit
 /// grace removed, the auditor treats as a confirmed failure for an in-window pin).
+#[allow(clippy::too_many_lines)]
 pub async fn handle_subtree_challenge(
     challenge: &SubtreeAuditChallenge,
     storage: &LmdbStorage,
@@ -1057,13 +1093,33 @@ pub async fn handle_subtree_challenge(
                 };
             }
         };
-        leaves.push(crate::replication::subtree::subtree_leaf(
-            &challenge.nonce,
-            &challenge.challenged_peer_id,
-            key,
-            &bytes,
-        ));
-        // bytes drops here.
+        // Hash the leaf (a full keyed-BLAKE3 pass over the chunk) on a blocking
+        // thread, not the async worker: a maximal subtree is ~sqrt(N) leaves of up
+        // to MAX_CHUNK_SIZE each, so doing this inline would tie up a Tokio worker
+        // for the whole proof and let a few round-1 requests starve the runtime
+        // (Blocker 1). One chunk is resident at a time, so peak memory is bounded.
+        let nonce = challenge.nonce;
+        let peer = challenge.challenged_peer_id;
+        let leaf_key = *key;
+        let leaf = match tokio::task::spawn_blocking(move || {
+            crate::replication::subtree::subtree_leaf(&nonce, &peer, &leaf_key, &bytes)
+        })
+        .await
+        {
+            Ok(leaf) => leaf,
+            Err(e) => {
+                warn!(
+                    "Subtree audit: leaf hashing task failed for key {}: {e}",
+                    hex::encode(key)
+                );
+                return SubtreeAuditResponse::Rejected {
+                    challenge_id: challenge.challenge_id,
+                    kind: RejectKind::Transient,
+                    reason: format!("leaf hashing task error: {e}"),
+                };
+            }
+        };
+        leaves.push(leaf);
     }
 
     SubtreeAuditResponse::Proof {
@@ -1120,7 +1176,21 @@ fn build_slice_items_for_key(
                 return Err((RejectKind::Transient, format!("bao extraction error: {e}")));
             }
         };
-        let nonced_siblings = opener.nonced_siblings(block_index).unwrap_or_default();
+        // `block_index < count` was just checked, so siblings must exist. A
+        // `None` here is an internal proof-building inconsistency, not an honest
+        // condition: abort the whole response as `Transient` (routes to the
+        // timeout lane) rather than emit an empty-siblings `Present` that would
+        // make an honest holder fail its own audit.
+        let Some(nonced_siblings) = opener.nonced_siblings(block_index) else {
+            warn!(
+                "Subtree slice audit: no nonced siblings for in-range block {block_index} of key {}",
+                hex::encode(key)
+            );
+            return Err((
+                RejectKind::Transient,
+                format!("nonced sibling build inconsistency for block {block_index}"),
+            ));
+        };
         items.push(SubtreeSliceItem::Present {
             key,
             block_index,
@@ -1219,6 +1289,21 @@ pub async fn handle_subtree_slice_challenge(
         if !entry.contains(&opening.block_index) {
             entry.push(opening.block_index);
         }
+    }
+
+    // Coalescing only saves work when keys REPEAT. A forged auditor could still
+    // spread its MAX_SLICE_OPENINGS across that many DISTINCT keys to force a
+    // full-chunk read each (up to ~40 MiB). An honest auditor samples at most
+    // BYTE_SPOTCHECK_MAX leaves, so cap distinct keys to that.
+    if key_order.len() > BYTE_SPOTCHECK_MAX as usize {
+        let distinct = key_order.len();
+        return SubtreeSliceResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            kind: RejectKind::Protocol,
+            reason: format!(
+                "slice challenge spans {distinct} distinct keys; max {BYTE_SPOTCHECK_MAX}"
+            ),
+        };
     }
 
     let mut items = Vec::with_capacity(challenge.openings.len());
@@ -1366,6 +1451,75 @@ mod tests {
         let mut k = [0u8; 32];
         k[..4].copy_from_slice(&i.to_be_bytes());
         k
+    }
+
+    // The auditor's per-opening matcher returns the FIRST item with a matching
+    // identity, so an oversized, unsolicited, or colliding response must be
+    // rejected as malformed BEFORE matching — otherwise item order (or padding)
+    // could decide the verdict or force quadratic validation work.
+    #[test]
+    fn verify_slice_response_rejects_malformed_item_sets() {
+        let leaf = |k: XorName| SubtreeLeaf {
+            key: k,
+            bytes_hash: [0u8; 32],
+            content_len: 0,
+            nonced_root: [0u8; 32],
+        };
+        let present = |k: XorName, i: u32| SubtreeSliceItem::Present {
+            key: k,
+            block_index: i,
+            bao_slice: vec![],
+            nonced_siblings: vec![],
+        };
+        let malformed = |verdict| {
+            matches!(
+                verdict,
+                AuditVerdict::Fail(AuditFailureReason::MalformedResponse)
+            )
+        };
+        let nonce = [0u8; 32];
+        let peer = [0u8; 32];
+        // The auditor requested (key1, block 0), (key1, block 1), (key2, block 0).
+        let openings = vec![(leaf(key(1)), 0u32), (leaf(key(1)), 1), (leaf(key(2)), 0)];
+
+        // More items than requested openings.
+        let oversized = vec![
+            present(key(1), 0),
+            present(key(1), 1),
+            present(key(2), 0),
+            present(key(2), 0),
+        ];
+        assert!(malformed(verify_slice_response(
+            &openings, &nonce, &peer, &oversized
+        )));
+
+        // An item that was not requested.
+        let unsolicited = vec![present(key(9), 0)];
+        assert!(malformed(verify_slice_response(
+            &openings,
+            &nonce,
+            &peer,
+            &unsolicited
+        )));
+
+        // Duplicate (key, block_index).
+        let dup = vec![present(key(1), 0), present(key(1), 0)];
+        assert!(malformed(verify_slice_response(
+            &openings, &nonce, &peer, &dup
+        )));
+
+        // A key that is both Present and Absent.
+        let conflict = vec![present(key(1), 0), SubtreeSliceItem::Absent { key: key(1) }];
+        assert!(malformed(verify_slice_response(
+            &openings, &nonce, &peer, &conflict
+        )));
+
+        // A well-formed, unique, solicited response passes the identity guard (the
+        // empty proofs then fail verification as DigestMismatch, NOT malformed).
+        let ok = vec![present(key(1), 0), present(key(1), 1), present(key(2), 0)];
+        assert!(!malformed(verify_slice_response(
+            &openings, &nonce, &peer, &ok
+        )));
     }
     /// The "chunk content" for a key in these fixtures. The committed tree's leaf
     /// `bytes_hash` is `BLAKE3(chunk_bytes(key))`, mirroring the general

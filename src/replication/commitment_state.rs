@@ -341,7 +341,7 @@ pub(crate) const GOSSIP_ANSWERABILITY_TTL: Duration = Duration::from_secs(3 * 36
 /// be slightly early. Adding this margin on reload guarantees an honest node
 /// never *under*-retains across a restart (it may over-retain by the margin,
 /// which is harmless — it only makes the responder answer a little longer, and a
-/// data-deleter still fails the round-2 byte challenge). Sized well above the
+/// data-deleter still fails the round-2 slice challenge). Sized well above the
 /// persist interval + gossip cadence, far below the TTL.
 const RESTART_STAMP_GRACE: Duration = Duration::from_secs(5 * 60);
 
@@ -588,11 +588,11 @@ impl ResponderCommitmentState {
 
     /// Whether `key` is committed under any retained slot (the current
     /// commitment plus any still-in-window gossiped ones) — i.e. whether a peer
-    /// could still pin a recently gossiped root and demand this key's bytes in a
-    /// round-2 byte challenge.
+    /// could still pin a recently gossiped root and open this key's blocks in a
+    /// round-2 slice challenge.
     ///
     /// This is the SAME predicate the round-2 responder uses to decide a key is
-    /// "committed" (`handle_subtree_byte_challenge` calls `built.proof_for(key)`
+    /// "committed" (`handle_subtree_slice_challenge` calls `built.proof_for(key)`
     /// on the pinned slot, which is committed iff `contains_key`), folded over
     /// every retained slot. The pruner consults it before deleting an
     /// out-of-range key, so "the pruner will not delete it" and "the responder

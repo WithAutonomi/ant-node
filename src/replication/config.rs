@@ -131,9 +131,10 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 
 /// Maximum number of concurrent in-flight audit-responder tasks.
 ///
-/// The responsible-chunk (audit #2), subtree (round 1), and byte (round 2)
-/// challenge handlers are all spawned off the serial replication message loop so
-/// their disk reads don't stall replication. This caps how many run at once
+/// The LIGHT audit-responder handlers — responsible-chunk audits and subtree
+/// slice (round 2) — are spawned off the serial replication message loop so their
+/// disk reads don't stall replication. (The HEAVY subtree round 1 has its own
+/// tighter pool, [`MAX_CONCURRENT_SUBTREE_ROUND1`].) This caps how many run at once
 /// across the engine, restoring backpressure: a peer flooding audit challenges
 /// cannot fan out unbounded `get_raw` reads. When the cap is hit, the challenge
 /// is dropped and the caller's audit-specific timeout policy applies. The cap
@@ -141,8 +142,9 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// throttling flooders.
 /// Sized to cover a handful of concurrent honest auditors (the per-peer
 /// gossip-audit cooldown is 30 min, so genuine concurrent audits are few) while
-/// bounding the round-2 worst-case full-chunk disk reads
-/// (`N × MAX_SLICE_OPENINGS` chunks read to build slice proofs).
+/// bounding the round-2 worst-case disk reads (each request reads at most
+/// `BYTE_SPOTCHECK_MAX` distinct chunks — the openings are coalesced and the
+/// distinct-key count is capped — to build its slice proofs).
 pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
@@ -156,6 +158,43 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 /// gossip-triggered audit per peer per 30 min), so 4 in-flight per peer leaves
 /// headroom beyond the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 4;
+
+/// Dedicated global concurrency cap for the HEAVY subtree-audit round 1.
+///
+/// Round 1 hashes every leaf of the selected `sqrt(key_count)` subtree (up to
+/// ~1000 chunks × `MAX_CHUNK_SIZE` for a maximal commitment), far heavier than a
+/// responsible-chunk or slice (round-2) response. Giving it its own tiny pool —
+/// rather than sharing [`MAX_CONCURRENT_AUDIT_RESPONSES`] — keeps a burst of
+/// round-1 proofs from starving the light audits, and bounds concurrent
+/// multi-gigabyte hashing to this many at once. Two allows overlap without
+/// admitting many simultaneous full-subtree hashes; there is little benefit in
+/// more concurrent large LMDB scans against one disk.
+pub const MAX_CONCURRENT_SUBTREE_ROUND1: usize = 2;
+
+/// Per-peer concurrency cap for the heavy subtree-audit round 1. One in-flight
+/// round-1 proof per source at a time (an honest auditor never needs more).
+pub const MAX_SUBTREE_ROUND1_PER_PEER: u32 = 1;
+
+/// Per-peer responder-side cooldown between heavy subtree round-1 proofs.
+///
+/// An honest auditor already self-limits to one gossip-triggered subtree audit
+/// per peer per 30 min, so matching that as a responder-side floor costs honest
+/// traffic nothing while bounding the sustained round-1 work a single identity
+/// can extract (a concurrency cap alone lets a peer refill its slot forever).
+pub const SUBTREE_ROUND1_RESPONDER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// Lifetime of a single-use round-1 → round-2 session.
+///
+/// A round-2 slice challenge is only served if the same peer completed a matching
+/// round 1 within this window. Long enough for the auditor to verify round 1 and
+/// send round 2, far shorter than commitment retention; ephemeral, so a loss
+/// across a restart just
+/// drops that round to the (graced) timeout lane.
+pub const SUBTREE_SESSION_TTL: Duration = Duration::from_secs(2 * 60);
+
+/// Capacity backstop on the live round-1 session map (bounds memory if many
+/// peers open sessions; oldest are evicted past this).
+pub const MAX_SUBTREE_SESSIONS: usize = 4 * MAX_CONCURRENT_SUBTREE_ROUND1 * 256;
 
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
@@ -631,6 +670,10 @@ pub struct ReplicationConfig {
     /// Upper bound of the possession-check delay window (ADR-0003). Defaults
     /// to [`POSSESSION_CHECK_DELAY_MAX`].
     pub possession_check_delay_max: Duration,
+    /// Per-peer responder-side cooldown between heavy subtree round-1 proofs
+    /// (Blocker 1). Defaults to [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`]; tests set
+    /// it low so rapid back-to-back audits of one holder are not rate-dropped.
+    pub subtree_round1_responder_cooldown: Duration,
 }
 
 impl Default for ReplicationConfig {
@@ -658,6 +701,7 @@ impl Default for ReplicationConfig {
             bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
             possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
             possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
+            subtree_round1_responder_cooldown: SUBTREE_ROUND1_RESPONDER_COOLDOWN,
         }
     }
 }

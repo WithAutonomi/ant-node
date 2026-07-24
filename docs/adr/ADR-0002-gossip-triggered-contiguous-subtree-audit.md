@@ -1,12 +1,21 @@
 # ADR-0002: Gossip-triggered contiguous-subtree storage audit
 
 - **Status:** Proposed
-- **Date:** 2026-06-04
+- **Date:** 2026-06-04 (round-2 proof shape updated 2026-07 for the V2-685 verified-slice audit)
 - **Decision owners:** Anselme (@grumbach)
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** none
+- **Related:** ADR-0004 (audit grace / Amendment 1)
+
+> **Amendment (V2-685, 2026-07).** Round 2 no longer returns full chunk bytes: it
+> returns a few-KB **BLAKE3/Bao verified slice** per opened block, checked against
+> the chunk address (authenticity) and a keyed **nonced block-tree root** committed
+> in round 1 (possession). Possession is now a round-1 cryptographic commitment
+> rather than a deadline property; per-leaf "freshness hashes" become keyed nonced
+> roots; retention is TTL-bounded (not "last two"); the subtree audit rides a
+> dedicated protocol id; and round 1 gains responder rate/session/heavy-pool
+> controls. The Decision and Consequences below reflect this.
 
 ## Context
 
@@ -46,7 +55,7 @@ tree is a clean binary shape when N is not a power of two.
 - Ensure all nodes actually store the data they claim they are storing
 - Keep each proof small and keep steady-state audit traffic low.
 - Catch the three real cheating strategies: storing nothing and fetching on demand; deleting some fraction of data; and keeping only chunk *addresses* (which are public) while never holding the actual bytes, then fabricating proofs.
-- Reuse the existing cryptographic building blocks (the Merkle tree, the signed commitment, the freshness hash) without inventing new ones.
+- Reuse the existing cryptographic building blocks (the Merkle tree, the signed commitment, and a per-leaf keyed nonced block-tree root) without inventing new ones.
 - Never wrongly penalise honest nodes, even in extreme cases like on small or dense networks where every node legitimately holds almost all of the data.
 
 ## Considered Options
@@ -115,53 +124,67 @@ commitment, and freshness-hash primitives.
   branch is exactly the one the random value selects and that it contains at least
   the square root of the claimed held chunks in real leaves.
 
-- **The proof.** The audited node returns every leaf of the selected subtree —
-  each given both as the plain content hash and as a freshness hash (the content
-  mixed with the auditor's random value) — plus one summary hash per level for the
-  unselected siblings along the path to the root. Everything outside the selected
-  branch costs a single hash; nothing there is touched.
+- **The proof (round 1).** The audited node returns every leaf of the selected
+  subtree — each given as the plain content hash (the chunk address), its content
+  length, and a fresh **nonced block-tree root**: a Merkle root over the chunk's
+  1 KiB blocks whose leaves are *keyed* BLAKE3 over each block, keyed by the fresh
+  audit nonce (plus peer and key). It also returns one summary hash per level for
+  the unselected siblings along the path to the root. Everything outside the
+  selected branch costs a single hash; nothing there is touched. (This replaces
+  the earlier flat per-leaf "freshness hash": keying every block by the nonce
+  leaves no nonce-independent chaining value to precompute, so building a correct
+  root requires *all* of a chunk's bytes under that nonce.)
 
 - **Verification, three independent checks.**
   - *Structure:* rebuild the root from the returned subtree and the sibling
     summaries; it must equal the freshly-published root the audit was started
     against. This proves the subtree genuinely belongs to the committed tree.
-  - *Real bytes:* after the full subtree proof is in hand, pick a small fixed
-    number of its leaves and demand the original chunk bytes for exactly those
-    keys from the audited node itself (a second-round surprise challenge), then
-    confirm both the plain hash (the chunk's content address) and the freshness
-    hash match the served bytes. The sample is drawn with **fresh randomness
-    chosen by the auditor after round 1 — NOT derived from the round-1 nonce**.
-    This is essential: the structural root check binds only `(key, bytes_hash)`,
-    both of which are public (the `bytes_hash` *is* the chunk's network address),
-    not the per-leaf freshness hash. If the sample were predictable at
-    proof-build time, a relay could fabricate the freshness hash on every leaf,
-    fetch only the few leaves it knew would be opened, and pass while holding
-    almost nothing. Drawing the sample after the proof commits turns this into a
-    cut-and-choose: the node must have produced a correct freshness hash — which
-    needs the real bytes — for essentially every leaf, or be caught. Possession
-    is non-delegable: the auditor needs to hold none of the node's chunks, and a
-    committed key the node cannot serve is a deterministic failure, never bad
-    luck. So a node that rebuilt the tree from public chunk addresses but never
-    held the bytes cannot serve content that hashes to the committed address;
-    faking a fraction of leaves survives only with probability (1 − fraction)
-    raised to the number of spot-checks.
-  - *Possession in time:* the whole response must arrive within a deadline sized
-    to hashing the subtree from local disk. A node that doesn't hold the data must
-    fetch it across the network first and misses the deadline.
+  - *Possession by verified slice (round 2):* after the full subtree proof is in
+    hand, pick a small fixed number of its leaves and, for each, a **freshly-random
+    1 KiB block index** (plus the claimed final block, which pins the true content
+    length via Bao's EOF check). Demand a **verified slice** per opened block, not
+    the whole chunk: a Bao slice proving the block against the chunk address
+    (authenticity, ~KB not MB), plus a nonced-tree opening proving it against the
+    round-1 `nonced_root` (possession), both over the same served bytes. The sample
+    is drawn with **fresh randomness chosen by the auditor after round 1 — NOT
+    derived from the round-1 nonce**: the structural root binds only
+    `(key, bytes_hash)`, both public, so a predictable sample would let a relay
+    fabricate a `nonced_root` on every leaf and hold only the few it knew would be
+    opened. Drawing the sample after the proof commits makes this a cut-and-choose;
+    a node that never held the bytes cannot have committed a correct nonced root,
+    and faking a fraction of blocks survives only with probability (1 − fraction)
+    raised to the number of spot-checks. Possession is non-delegable and the
+    auditor holds none of the node's chunks.
+  - *Deadline (liveness, not the possession proof):* the response must still
+    arrive within a deadline, but — unlike the earlier full-byte round 2 — the
+    deadline is no longer load-bearing for possession (that is now the round-1
+    `nonced_root` commitment). It bounds liveness and how long the auditor waits;
+    a missed deadline is graced (see Accounting).
 
 - **Retention — "you stay answerable for what you publish."** A node keeps the
-  chunk data behind its **last two published commitments**. Two, not one, absorbs
-  the normal race where an auditor is asking about the commitment a node published
-  just before its newest one. Because of this, an honest node can always answer an
-  audit about a commitment it published recently — so "I don't recognise that
-  commitment" about a recently-published root is now provably misbehaviour, not
-  lag.
+  chunk data behind its recently published commitments for a **bounded TTL
+  window** (with a slot backstop), so an honest node can always answer an audit
+  about a commitment it published recently — meaning "I don't recognise that
+  commitment" about a recently-published root is provably misbehaviour, not lag.
+
+- **Responder resource controls.** The heavy round 1 (which hashes the whole
+  `sqrt(N)` subtree, up to gigabytes for a maximal commitment) runs on a blocking
+  thread pool with its own tight admission (a small global + one per peer),
+  separate from the light responsible/slice audits, plus a per-peer rate cooldown;
+  a round-2 slice challenge is served only after a matching single-use round-1
+  session. This keeps a burst of audit requests from starving honest audits or the
+  async runtime, without changing the audit's security properties.
+
+- **Rollout.** Only the subtree-audit messages changed wire format, so they ride a
+  dedicated protocol id while core replication stays on its existing id; a
+  mixed-version fleet keeps replicating, syncing, fetching and repairing across
+  versions, and only cross-version subtree audits pause during the upgrade window.
 
 - **Accounting and False Positives** "That chunk isn't in my commitment" 
   can never occur, because the auditor only ever challenges leaves of the node's
   *own* committed tree, so every challenged leaf is in the commitment by
   construction. Failures that are deterministic and cannot be caused by bad luck — a
-  rebuilt root that doesn't match, a content or freshness hash that doesn't match,
+  rebuilt root that doesn't match, a content-address or nonced-root check that doesn't match,
   or repudiating a recently-published commitment — are acted on **the first time
   they occur**, because re-asking cannot turn a genuine failure into a pass.
   Failures that *can* be caused by transient bad luck — a missed response deadline
@@ -202,19 +225,19 @@ commitment, and freshness-hash primitives.
 - The probabilistic approach to verification ensures that verification is cheap but over time efficient. 
 - Each proof is small and contiguous (about the square root of N leaves plus a handful of summary hashes) instead of many scattered inclusion paths.
 - Audits are surprise exams pinned to the *freshly published* commitment, so there is no stale-data ambiguity unlike in the previous audit design
-- Three independent defences cover the three cheating strategies: structure (belongs to the committed tree), real bytes (actually held, not fabricated from public addresses), and timeliness (held locally, not fetched on demand).
+- Independent defences cover the cheating strategies: structure (belongs to the committed tree), possession (a keyed nonced-root commitment in round 1, opened by verified slices in round 2, so it cannot be fabricated from public addresses), with the response deadline bounding liveness rather than carrying the possession proof.
 - Acting on the first deterministic failure roughly cuts time-to-detection compared with requiring several strikes, with no added risk of false positives.
 
 ### Negative / Trade-offs
 
 - **Big-block deletion is caught only proportionally.** An attacker who deletes data in large contiguous blocks is caught, per audit, with probability roughly equal to the fraction deleted — independent of N and of subtree size. We accept this: there is no economic reason to delete a *small* fraction (you save almost nothing and are still eventually caught), and a node that deletes a large fraction to actually save resources is caught within one or two audits. If ever needed, the lever is auditing *more often*, not bigger subtrees.
 - **Inflating the claimed size is not fully prevented.** Only the selected subtree and the path summaries are verified each audit, so filler leaves elsewhere could inflate the claimed chunk count. Both the regular audits and the closeness check mitigates this over time. Fully auditing the entire claimed set would be too much effort. We accept this probabilistic approach in which over time cheaters are detected. 
-- **Retention has a storage cost.** A node must keep the chunk data behind its last two published commitments. This is an accepted cost. 
+- **Retention has a storage cost.** A node must keep the chunk data behind its recently published commitments for a bounded TTL window (with a slot backstop). This is an accepted cost.
 - **The audit format change is breaking.** The whole network must upgrade before the new audit can be relied on and before eviction is enabled.
 
 ### Neutral / Operational
 
-- Introduces a few tunable settings: the per-gossip audit probability, the per-neighbour cooldown, the number of real-byte spot-checks, and the retention count (two). The grace allowance for missed deadlines reuses the existing strike threshold and applies to deadline misses only.
+- Introduces a few tunable settings: the per-gossip audit probability, the per-neighbour cooldown, the number of block spot-checks per audit, the retention TTL window, and the heavy round-1 responder pool / rate cooldown / session TTL. The grace allowance for missed deadlines reuses the existing strike threshold and applies to deadline misses only.
 - The storage-commitment audit needs no periodic timer of its own — it is driven by gossip. (The separate responsible-chunk audit keeps its periodic tick; the two run side by side.) The related "node is capable but has no current commitment" special case is unnecessary on the gossip-triggered path, since that path always has a freshly-published commitment to pin. A silent node needs no special handling for this audit — it simply stops earning storage credit, so all nodes are naturally motivated to gossip. 
 - At the chosen settings, steady-state audit load is on the order of a handful of small audits per node per hour.
 
@@ -234,15 +257,16 @@ How we will know this decision remains correct:
   and identical on the auditor and the audited node; selection never lands on an
   all-padding branch across many awkward sizes (a regression test for the
   fixed-depth flaw this ADR fixes); the root rebuilds correctly from a single-branch
-  proof; possession verifies from the bytes the audited node itself serves in the
-  second-round byte challenge (the auditor holding none of them); a committed key
-  the node cannot serve is a deterministic failure; the real-byte spot-check catches a node that fabricated
-  freshness hashes, at the expected probability; deterministic failures are acted on
+  proof; possession verifies from the verified slices the audited node itself
+  serves in round 2 (the auditor holding none of the bytes); a committed key
+  the node cannot serve is a deterministic failure; the slice spot-check catches a
+  node that fabricated a `nonced_root` or under-stored, at the expected
+  probability; deterministic failures are acted on
   the first time while deadline misses honour the grace allowance; the adaptive
   timeout grace responds to widespread timeouts but never to deterministic failures;
-  repudiating a recently-published commitment fails; the last two published
-  commitments stay answerable; the response deadline is sized correctly; and a flood
-  of gossip does not multiply audits.
+  repudiating a recently-published commitment fails; recently published
+  commitments stay answerable within the TTL window; the response deadline is sized
+  correctly; and a flood of gossip does not multiply audits.
 
 - **Operational signals and re-open triggers.** Audits per node per hour stay within
   budget; false-positive penalties on a small, dense test network stay at zero

@@ -14,10 +14,11 @@
 //! 1. **Structure** — [`verify_subtree_proof`] re-derives the selected branch
 //!    from `(nonce, key_count)`, rebuilds the root from the returned leaves and
 //!    cut-hashes, and requires it to equal the pinned root.
-//! 2. **Real bytes** — [`select_spotcheck_indices`] picks a few leaves within
-//!    the subtree; the caller fetches their bytes and checks both the plain
-//!    content hash and the nonce freshness hash. Faking a fraction `x` of
-//!    leaves survives only `(1 - x)^k`.
+//! 2. **Verified slice** — [`select_spotcheck_indices`] picks a few leaves
+//!    within the subtree; the caller opens one random block per leaf and checks
+//!    a Bao slice against the chunk address plus a nonced-tree opening against
+//!    the round-1 keyed `nonced_root`. Faking a fraction `x` of leaves survives
+//!    only `(1 - x)^k`.
 //!
 //! ## Tree geometry (must match [`super::commitment::MerkleTree`])
 //!
@@ -233,13 +234,14 @@ pub fn select_subtree_path(nonce: &[u8; 32], key_count: u32) -> Option<SubtreePa
 /// Returned as indices into `path.real_leaf_count()` (0-based within the
 /// subtree). DETERMINISTIC from the nonce.
 ///
-/// **NOT used for the live round-2 sample.** Deriving the byte-challenge sample
+/// **NOT used for the live round-2 sample.** Deriving the slice-challenge sample
 /// from the round-1 nonce is unsound: the structural root check binds only
-/// `(key, bytes_hash)` (both public), not `nonced_hash`, so a responder that
-/// knows the nonce at proof-build time could fabricate `nonced_hash` on every
-/// un-sampled leaf and fetch only the predictable sample. The auditor therefore
-/// chooses the round-2 sample with fresh CSPRNG randomness *after* receiving the
-/// proof (`storage_commitment_audit::random_spotcheck_leaves`). This
+/// `(key, bytes_hash)` (both public), not the per-leaf `nonced_root`, so a
+/// responder that knows the nonce at proof-build time could fabricate a
+/// `nonced_root` on every un-sampled leaf and hold only the predictable sample.
+/// The auditor therefore chooses the round-2 sample with fresh CSPRNG randomness
+/// *after* receiving the proof
+/// (`storage_commitment_audit::random_spotcheck_leaves`). This
 /// deterministic helper is retained only for tests/observers that need a
 /// reproducible selection.
 #[must_use]
