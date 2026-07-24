@@ -103,6 +103,9 @@ struct FirstAuditObservability {
     coalesced: AtomicU64,
     duplicates: AtomicU64,
     capacity_evicted: AtomicU64,
+    /// An event targeting the local peer itself, dropped at ingress: the node
+    /// cannot network-audit itself (no dialable address for the local peer).
+    self_target_skipped: AtomicU64,
     /// A strictly-lower-count same-peer nomination that was dropped so a
     /// higher-count pending pin survived. A sustained rise is the signal of an
     /// attempted "erase the inflated pin with a cheaper one" self-suppression.
@@ -119,6 +122,30 @@ struct FirstAuditObservability {
     insufficient_keys: AtomicU64,
     outside_answerability_window: AtomicU64,
     inflight: AtomicU64,
+}
+
+/// Test-only snapshot of the first-audit scheduler counters.
+///
+/// Lets e2e tests assert on the scheduler's decisions (e.g. that a
+/// self-targeting monetized pin was dropped and never launched) instead of
+/// scraping log lines.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone, Copy)]
+pub struct FirstAuditStats {
+    /// Events ingested from the monetized-pin channel.
+    pub received: u64,
+    /// Events accepted into the pending first-audit queue.
+    pub queued: u64,
+    /// Events dropped because they targeted the local peer.
+    pub self_target_skipped: u64,
+    /// Audits launched.
+    pub launched: u64,
+    /// Launched audits that passed.
+    pub passed: u64,
+    /// Launched audits that timed out (non-response lane).
+    pub timed_out: u64,
+    /// Launched audits that ended in a confirmed failure.
+    pub failed: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,10 +511,20 @@ struct FirstAuditScheduler {
     reserved: Option<FirstAuditReservation>,
     /// Alternating launch lane, flipped on every PROMOTION (real launch).
     oldest_first_lane: bool,
+    /// The local node's own peer ID. A verified payment's quote list includes
+    /// the node's own quote, so the verifier emits a monetized-pin event for
+    /// the local peer on every payment it verifies. The node cannot
+    /// network-audit itself (there is no dialable address for the local peer,
+    /// so the challenge fails instantly and is miscounted as a timeout), while
+    /// any other payee that verifies the same payment schedules its own first
+    /// audit of this node's pin — a self-dial adds no coverage either way.
+    /// Such an event is dropped at ingress: never queued, and hence never
+    /// launched nor marked first-audited.
+    self_peer: PeerId,
 }
 
 impl FirstAuditScheduler {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, self_peer: PeerId) -> Self {
         let cap = NonZeroUsize::new(MAX_LAST_COMMITMENT_BY_PEER).unwrap_or(NonZeroUsize::MIN);
         Self {
             first_audited: LruCache::new(cap),
@@ -495,6 +532,7 @@ impl FirstAuditScheduler {
             limiter: FirstAuditLimiter::new(now),
             reserved: None,
             oldest_first_lane: false,
+            self_peer,
         }
     }
 
@@ -570,15 +608,20 @@ impl FirstAuditScheduler {
         self.reserved.as_ref().map(|r| r.event.peer)
     }
 
-    /// Admit a monetized nomination into `pending`. Dropped as a duplicate if
-    /// already first-audited; the window screen is bypassed for the currently
-    /// reserved peer (so a successor is retained across the reservation, never
-    /// window-dropped); otherwise window-screened. Coalescing is
-    /// highest-count-per-peer (newest on a tie) — a lower-count successor never
-    /// displaces a higher-count pending pin. An incumbent that has aged past
-    /// the answerability horizon is dropped (and accounted as an expiry) before
-    /// coalescing, so a dead pin never vetoes a live nomination.
+    /// Admit a monetized nomination into `pending`. Dropped at ingress if it
+    /// targets the local peer (see [`Self::self_peer`]); dropped as a duplicate
+    /// if already first-audited; the window screen is bypassed for the
+    /// currently reserved peer (so a successor is retained across the
+    /// reservation, never window-dropped); otherwise window-screened.
+    /// Coalescing is highest-count-per-peer (newest on a tie) — a lower-count
+    /// successor never displaces a higher-count pending pin. An incumbent that
+    /// has aged past the answerability horizon is dropped (and accounted as an
+    /// expiry) before coalescing, so a dead pin never vetoes a live nomination.
     fn enqueue(&mut self, event: MonetizedPinEvent, obs: &Arc<FirstAuditObservability>) {
+        if event.peer == self.self_peer {
+            obs.self_target_skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if self.first_audited.contains(&event.pin) {
             obs.duplicates.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1102,6 +1145,10 @@ pub struct ReplicationEngine {
     /// ADR-0004: receiver half of the monetized-pin channel, taken by
     /// `start_first_audit_drainer`.
     monetized_pin_rx: Option<mpsc::Receiver<MonetizedPinEvent>>,
+    /// Counters shared with the first-audit drainer task, so the scheduler's
+    /// decisions (queued / launched / self-target skipped / outcome) stay
+    /// observable from the engine after the drainer takes the receiver.
+    first_audit_observability: Arc<FirstAuditObservability>,
     /// Shutdown token.
     shutdown: CancellationToken,
     /// Background task handles.
@@ -1177,6 +1224,7 @@ impl ReplicationEngine {
             possession_check_rx: Some(possession_check_rx),
             monetized_pin_tx,
             monetized_pin_rx: Some(monetized_pin_rx),
+            first_audit_observability: Arc::new(FirstAuditObservability::default()),
             shutdown,
             task_handles: Vec::new(),
         };
@@ -1292,6 +1340,24 @@ impl ReplicationEngine {
             Some(&credit),
         )
         .await
+    }
+
+    /// Test-only: snapshot the first-audit scheduler's counters. Lets e2e
+    /// tests assert what the live drainer decided for an injected
+    /// [`MonetizedPinEvent`] (dropped as self-target vs queued and launched).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn first_audit_stats(&self) -> FirstAuditStats {
+        let o = &self.first_audit_observability;
+        FirstAuditStats {
+            received: o.received.load(Ordering::Relaxed),
+            queued: o.queued.load(Ordering::Relaxed),
+            self_target_skipped: o.self_target_skipped.load(Ordering::Relaxed),
+            launched: o.launched.load(Ordering::Relaxed),
+            passed: o.passed.load(Ordering::Relaxed),
+            timed_out: o.timed_out.load(Ordering::Relaxed),
+            failed: o.failed.load(Ordering::Relaxed),
+        }
     }
 
     /// Test-only: run the possession check immediately for `key` against
@@ -1566,7 +1632,8 @@ impl ReplicationEngine {
             lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
         let shutdown = self.shutdown.clone();
-        let observability = Arc::new(FirstAuditObservability::default());
+        let observability = Arc::clone(&self.first_audit_observability);
+        let self_peer = *self.p2p_node.peer_id();
 
         let handle = tokio::spawn(async move {
             // ADR-0004 Amendment 2 (E'): the drainer-owned first-audit
@@ -1574,7 +1641,7 @@ impl ReplicationEngine {
             // them at a fixed per-node rate, and durable suppression is stamped
             // only at PROMOTION (after an authoritative post-jitter answerability
             // + cooldown check), so a cancelled reservation leaves nothing behind.
-            let mut scheduler = FirstAuditScheduler::new(Instant::now());
+            let mut scheduler = FirstAuditScheduler::new(Instant::now(), self_peer);
             // Periodic retry tick so budget/cooldown-deferred pins get retried
             // even when no new nomination arrives. `Skip` collapses a backlog.
             let mut tick = tokio::time::interval(config::FIRST_AUDIT_RETRY_INTERVAL);
@@ -1750,7 +1817,7 @@ impl ReplicationEngine {
                         );
                     }
                     info!(
-                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
+                        "First-audit scheduler summary: audit_trigger=first_monetized ingress_dropped={} received={} queued={} coalesced={} suppressed_lower={} duplicates={} capacity_evicted={} self_target_skipped={} cooldown_deferred_attempts={} rate_deferred_attempts={} window_deduped={} launched={} passed={} timeout={} failed={} bootstrap_claims={} idle={} insufficient_keys={} outside_answerability_window={} pending={} oldest_pending_quote_age_ms={} inflight={} tokens={}",
                         FIRST_AUDIT_INGRESS_DROPPED.load(Ordering::Relaxed),
                         observability.received.load(Ordering::Relaxed),
                         observability.queued.load(Ordering::Relaxed),
@@ -1758,6 +1825,7 @@ impl ReplicationEngine {
                         observability.suppressed_lower.load(Ordering::Relaxed),
                         observability.duplicates.load(Ordering::Relaxed),
                         observability.capacity_evicted.load(Ordering::Relaxed),
+                        observability.self_target_skipped.load(Ordering::Relaxed),
                         observability.cooldown_deferred_attempts.load(Ordering::Relaxed),
                         observability.rate_deferred_attempts.load(Ordering::Relaxed),
                         observability.window_deduped.load(Ordering::Relaxed),
@@ -6497,7 +6565,7 @@ mod tests {
     #[test]
     fn first_audit_stale_incumbent_does_not_suppress_live_lower_count() {
         let obs = Arc::new(FirstAuditObservability::default());
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let peer = test_peer(1);
 
         let dead_quote = SystemTime::now()
@@ -6546,7 +6614,7 @@ mod tests {
     #[test]
     fn first_audit_live_incumbent_still_suppresses_lower_count() {
         let obs = Arc::new(FirstAuditObservability::default());
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let peer = test_peer(1);
 
         let live_high = MonetizedPinEvent {
@@ -6582,7 +6650,7 @@ mod tests {
     fn first_audit_sweep_expired_collects_dead_entries_without_tokens() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
 
         let dead_quote = SystemTime::now()
             .checked_sub(GOSSIP_ANSWERABILITY_TTL)
@@ -6639,7 +6707,7 @@ mod tests {
     fn first_audit_answerability_cancel_is_state_neutral_and_retains_successor() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
 
         // A pre-existing window sentinel for an UNRELATED peer must survive the
         // cancel byte-for-byte (cancel never touches `recent`).
@@ -6784,7 +6852,7 @@ mod tests {
     fn first_audit_cooldown_race_requeue_preserves_newer_successor() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
         let peer = test_peer(1);
 
         // Reserve A.
@@ -6835,7 +6903,7 @@ mod tests {
     #[test]
     fn first_audit_oldest_pending_quote_age_tracks_the_oldest() {
         let now = SystemTime::now();
-        let mut scheduler = FirstAuditScheduler::new(Instant::now());
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         assert_eq!(
             scheduler.oldest_pending_quote_age_ms(now),
             0,
@@ -6862,7 +6930,7 @@ mod tests {
         );
 
         // A future-dated quote (clock skew) saturates to zero, never panics.
-        let mut skewed = FirstAuditScheduler::new(Instant::now());
+        let mut skewed = FirstAuditScheduler::new(Instant::now(), test_peer(99));
         let _ = coalesce_first_audit_event(
             &mut skewed.pending,
             MonetizedPinEvent {
@@ -6964,7 +7032,7 @@ mod tests {
     fn first_audit_cooldown_race_requeue_counts_capacity_eviction() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
         // Pending capacity 1 so a requeue of a different peer must evict.
         scheduler.pending = LruCache::new(NonZeroUsize::new(1).unwrap());
         let reserved_peer = test_peer(1);
@@ -7021,7 +7089,7 @@ mod tests {
     fn first_audit_pending_lower_count_does_not_replace_higher() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
         let peer = test_peer(1);
 
         // Inflated (high-count) sidecar pin lands in pending.
@@ -7077,7 +7145,7 @@ mod tests {
     fn first_audit_cooldown_race_requeues_reserved_higher_over_lower_successor() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
         let peer = test_peer(1);
 
         // Reserve the inflated pin.
@@ -7156,7 +7224,7 @@ mod tests {
     fn first_audit_lane_alternates_across_promotions() {
         let obs = Arc::new(FirstAuditObservability::default());
         let mono = Instant::now();
-        let mut scheduler = FirstAuditScheduler::new(mono);
+        let mut scheduler = FirstAuditScheduler::new(mono, test_peer(99));
         let mut cooldown: HashMap<PeerId, Instant> = HashMap::new();
 
         // Two distinct peers; the newest-inserted is the MRU (newest lane end).
@@ -7217,6 +7285,44 @@ mod tests {
         assert!(!first_audit_count_jump(0, 0));
         // Equal max counts must not jump (and must not overflow).
         assert!(!first_audit_count_jump(u32::MAX, u32::MAX));
+    }
+
+    /// A verified payment's quote list includes the local node's own quote, so
+    /// the verifier emits a monetized-pin event for the local peer on every
+    /// payment it verifies. The node cannot network-audit itself, so the
+    /// scheduler must drop such an event at ingress: never queued, and hence
+    /// never launched nor marked first-audited.
+    #[test]
+    fn first_audit_queue_drops_self_targeting_events() {
+        let obs = Arc::new(FirstAuditObservability::default());
+        let self_peer = test_peer(1);
+        let mut scheduler = FirstAuditScheduler::new(Instant::now(), self_peer);
+        let self_event = MonetizedPinEvent {
+            peer: self_peer,
+            pin: [7; 32],
+            key_count: 1,
+            quote_ts: SystemTime::now(),
+        };
+
+        scheduler.enqueue(self_event, &obs);
+        assert_eq!(obs.self_target_skipped.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(scheduler.pending_len(), 0, "self-target must never queue");
+
+        // A remote peer's event still queues normally under the same filter.
+        let remote_event = MonetizedPinEvent {
+            peer: test_peer(2),
+            pin: [8; 32],
+            ..self_event
+        };
+        scheduler.enqueue(remote_event, &obs);
+        assert_eq!(obs.queued.load(Ordering::Relaxed), 1);
+        assert_eq!(scheduler.pending_len(), 1);
+        assert_eq!(
+            obs.self_target_skipped.load(Ordering::Relaxed),
+            1,
+            "remote event must not count as a self-target skip"
+        );
     }
 
     #[test]
