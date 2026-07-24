@@ -434,6 +434,102 @@ async fn slice_challenge_opens_valid_blocks_for_committed_keys() {
     }
 }
 
+/// Coalescing at the live responder boundary: a challenge carrying DUPLICATE and
+/// interleaved openings for the same `(key, block_index)` returns one `Present`
+/// item per DISTINCT opening, not one per raw opening. This is the contract that
+/// lets `serve_committed_key_openings` (via `ChunkOpener`) read and hash each
+/// committed chunk once instead of re-reading it per repeated opening, so a
+/// forged auditor cannot amplify responder disk/CPU work by repeating openings
+/// while staying under the total-openings cap.
+///
+/// FLIPS IF: the responder stops deduplicating openings (item count would grow
+/// with the raw request) or drops/duplicates a distinct identity.
+#[tokio::test]
+async fn slice_challenge_coalesces_duplicate_and_interleaved_openings() {
+    let (storage, _t) = test_storage().await;
+    let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
+    let pin = r.current_hash();
+    let nonce = [0x55u8; 32];
+
+    let k1 = Responder::address(1);
+    let k2 = Responder::address(2);
+    // Five raw openings, interleaved, over only TWO distinct (key, block) pairs.
+    let openings = vec![
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k2,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k2,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+    ];
+    assert!(openings.len() <= MAX_SLICE_OPENINGS);
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 46,
+        nonce,
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings,
+    };
+
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match resp {
+        SubtreeSliceResponse::Items {
+            challenge_id,
+            items,
+        } => {
+            assert_eq!(challenge_id, 46);
+            // Coalesced: one item per DISTINCT (key, block_index), not per raw opening.
+            assert_eq!(
+                items.len(),
+                2,
+                "duplicate openings must not multiply response items"
+            );
+            let mut seen: Vec<([u8; 32], u32)> = Vec::new();
+            for item in &items {
+                match item {
+                    SubtreeSliceItem::Present {
+                        key, block_index, ..
+                    } => {
+                        assert!(
+                            !seen.contains(&(*key, *block_index)),
+                            "each (key, block) identity must appear at most once"
+                        );
+                        seen.push((*key, *block_index));
+                    }
+                    other @ SubtreeSliceItem::Absent { .. } => {
+                        panic!("expected Present for a stored committed key, got {other:?}")
+                    }
+                }
+            }
+            seen.sort_unstable();
+            let mut want = vec![(k1, 0u32), (k2, 0u32)];
+            want.sort_unstable();
+            assert_eq!(
+                seen, want,
+                "both distinct openings must be served exactly once, order-independent"
+            );
+        }
+        other => panic!("expected Items, got {other:?}"),
+    }
+}
+
 /// Multi-block coverage: open a DEEP block of a genuinely large (multi-block)
 /// chunk end-to-end through the live handler. The single-block happy-path test
 /// above cannot exercise the Bao parent-hash chain or the multi-level nonced

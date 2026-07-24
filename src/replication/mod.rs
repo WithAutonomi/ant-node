@@ -1301,7 +1301,7 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
-    /// Resource controls for the HEAVY subtree-audit round 1 (Blocker 1): its own
+    /// Resource controls for the HEAVY subtree-audit round 1: its own
     /// tight admission pool (so a burst of full-subtree hashing can't starve the
     /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
     /// sessions binding a slice challenge to a matching round 1.
@@ -3069,7 +3069,7 @@ struct SubtreeSession {
     inserted: Instant,
 }
 
-/// Resource controls for the HEAVY subtree-audit round 1 (Blocker 1): a tight
+/// Resource controls for the HEAVY subtree-audit round 1: a tight
 /// admission pool separate from the light responsible/slice audits, a per-peer
 /// rate cooldown, and single-use round-1 → round-2 sessions so a round-2 slice
 /// challenge is only served after a matching round 1.
@@ -3560,8 +3560,9 @@ async fn handle_replication_message(
             // block of each of the auditor's spot-check keys with a Bao verified
             // slice + nonced block-tree opening, or signal `Absent` for a
             // committed key we can no longer produce. Reads chunk bytes from disk
-            // to build the proofs, so likewise spawned off the serial loop (§5)
-            // under the same flood-fair admission (codex#1 + codex-r2 A).
+            // to build the proofs, so likewise spawned off the serial loop
+            // under the same flood-fair admission (a global ceiling plus a
+            // per-peer cap).
             info!(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
@@ -6658,7 +6659,7 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
-    // Blocker 1: the heavy round-1 limiter enforces the per-peer rate cooldown
+    // The heavy round-1 limiter enforces the per-peer rate cooldown
     // and single-use round-1 → round-2 sessions.
     #[tokio::test]
     async fn subtree_round1_limiter_cooldown_and_single_use_session() {

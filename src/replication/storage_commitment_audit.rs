@@ -1096,8 +1096,8 @@ pub async fn handle_subtree_challenge(
         // Hash the leaf (a full keyed-BLAKE3 pass over the chunk) on a blocking
         // thread, not the async worker: a maximal subtree is ~sqrt(N) leaves of up
         // to MAX_CHUNK_SIZE each, so doing this inline would tie up a Tokio worker
-        // for the whole proof and let a few round-1 requests starve the runtime
-        // (Blocker 1). One chunk is resident at a time, so peak memory is bounded.
+        // for the whole proof and let a few round-1 requests starve the runtime.
+        // One chunk is resident at a time, so peak memory is bounded.
         let nonce = challenge.nonce;
         let peer = challenge.challenged_peer_id;
         let leaf_key = *key;
@@ -1278,7 +1278,7 @@ pub async fn handle_subtree_slice_challenge(
     // block indices per key, so each committed chunk is read from LMDB and hashed
     // at most once even when the auditor opens several of its blocks (the normal
     // random + final pair, or a forged duplicate). Without this a ten-opening
-    // request could re-read and re-hash the same chunk ten times (finding 2).
+    // request could re-read and re-hash the same chunk ten times.
     let mut key_order: Vec<XorName> = Vec::new();
     let mut indices_by_key: HashMap<XorName, Vec<u32>> = HashMap::new();
     for opening in &challenge.openings {
@@ -1344,8 +1344,8 @@ enum KeyServe {
 /// Read a committed key's chunk once and build every requested opening from it.
 ///
 /// The Bao outboard + nonced tree hash the whole chunk, so the CPU-heavy build
-/// runs on a blocking thread to keep an audit-responder flood off the Tokio pool
-/// (finding 2). `indices` is already deduplicated by the caller.
+/// runs on a blocking thread to keep an audit-responder flood off the Tokio pool.
+/// `indices` is already deduplicated by the caller.
 async fn serve_committed_key_openings(
     challenge: &SubtreeSliceChallenge,
     storage: &LmdbStorage,

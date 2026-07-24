@@ -359,7 +359,9 @@ pub struct ChunkOpener<'a> {
 }
 
 impl<'a> ChunkOpener<'a> {
-    /// Hash the chunk once: build its Bao outboard and its nonced block-leaves.
+    /// Build the chunk's reusable opening state once: its Bao outboard and its
+    /// nonced block-leaves (two hash passes over the resident chunk). Repeated
+    /// openings of the same chunk reuse this state instead of rehashing per opening.
     #[must_use]
     pub fn new(nonce: &[u8; 32], peer: &[u8; 32], key: &XorName, content: &'a [u8]) -> Self {
         let (outboard, _hash) = bao::encode::outboard(content);
@@ -706,7 +708,7 @@ mod tests {
         ));
     }
 
-    // Finding 1 regression: the nonce must KEY every BLAKE3 chunk of a block
+    // Regression: the nonce must KEY every BLAKE3 chunk of a block
     // leaf, not merely prefix the message. A prefixed leaf (`BLAKE3(nonce ‖ … ‖
     // block)`, ~1166 bytes) leaves the block's tail in a second, nonce-free
     // BLAKE3 chunk whose chaining value is precomputable, letting a node store

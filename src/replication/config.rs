@@ -670,8 +670,8 @@ pub struct ReplicationConfig {
     /// Upper bound of the possession-check delay window (ADR-0003). Defaults
     /// to [`POSSESSION_CHECK_DELAY_MAX`].
     pub possession_check_delay_max: Duration,
-    /// Per-peer responder-side cooldown between heavy subtree round-1 proofs
-    /// (Blocker 1). Defaults to [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`]; tests set
+    /// Per-peer responder-side cooldown between heavy subtree round-1 proofs.
+    /// Defaults to [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`]; tests set
     /// it low so rapid back-to-back audits of one holder are not rate-dropped.
     pub subtree_round1_responder_cooldown: Duration,
 }
@@ -883,9 +883,9 @@ impl ReplicationConfig {
         let multiplied = total_bytes.saturating_mul(self.audit_response_honest_multiplier);
         // Resolve the scaled term in MILLISECONDS, not seconds: at small
         // sample sizes (e.g. a 2-key challenge → 8 MiB) the per-second quotient
-        // `multiplied / bps` integer-truncates to 0, leaving only the floor. The
-        // §4 finding was that small challenges need the sub-second honest-read
-        // estimate (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms) instead of dropping it.
+        // `multiplied / bps` integer-truncates to 0, leaving only the floor.
+        // Small challenges still need the sub-second honest-read estimate
+        // (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms) instead of dropping it.
         let scaled_ms = multiplied.saturating_mul(1000) / bps;
         // saturating_add avoids a panic if the floor plus the scaled term would
         // overflow `Duration::MAX`.
