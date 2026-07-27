@@ -385,6 +385,25 @@ impl PaidList {
     ///
     /// Returns the number of keys that were actually present and removed.
     ///
+    /// # Cancellation
+    ///
+    /// The delete commits inside `spawn_blocking`, which cancellation cannot
+    /// reach; the timestamp clear below happens only after that await resumes.
+    /// Dropping this future in between therefore leaves keys deleted on disk
+    /// with their `paid_out_of_range` entries still set.
+    ///
+    /// That window is deliberately left open. The only caller is the prune pass
+    /// (`pruning::prune_paid_entries`), reached from `run_neighbor_sync_round`,
+    /// which is awaited inside a `select!` racing the engine's shutdown token —
+    /// so shutdown is the only way to hit it. `paid_out_of_range` is in-memory
+    /// only (never persisted), so the stale entries die with the process that
+    /// cancelled the prune, and a reopened `PaidList` starts with an empty map.
+    ///
+    /// Do NOT "fix" this by clearing the timestamps before the commit: a failed
+    /// commit would then leave a live key with a cleared hysteresis clock,
+    /// restarting its prune countdown from zero. That is a real correctness
+    /// regression in exchange for a window with no observable effect.
+    ///
     /// # Errors
     ///
     /// Returns an error if the LMDB write transaction fails.
