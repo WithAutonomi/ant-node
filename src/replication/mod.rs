@@ -2244,7 +2244,15 @@ impl ReplicationEngine {
                         );
                         let trigger = gossip_audit.clone();
                         let audit_observability = Arc::clone(&observability);
-                        tokio::spawn(async move {
+                        // Track the launch so `shutdown()`'s detached drain
+                        // covers it. This task outlives the drainer loop that
+                        // spawned it — the loop breaks on the shutdown token
+                        // while the audit is still awaiting its response — so a
+                        // bare spawn would let an in-flight subtree audit keep
+                        // running, and keep its `Arc<P2PNode>`, past the point
+                        // `shutdown()` claims every engine task has stopped.
+                        let tracker = trigger.detached_task_tracker.clone();
+                        tracker.spawn(async move {
                             // The jitter already elapsed as the reservation's
                             // timer; the slot is held for the audit's duration
                             // and released on drop (panic-safe).
