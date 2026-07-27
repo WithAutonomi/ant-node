@@ -145,25 +145,23 @@ pub async fn check_bootstrap_drained(
     }
 }
 
-/// Record that `source` had one or more hints rejected or displaced this cycle.
+/// Record that `source` had one or more hints rejected at capacity this cycle.
 ///
-/// Tracks each source's most recent rejection time, not a counter: a repeat
-/// rejection refreshes the timestamp. Bootstrap cannot drain while this
-/// source has an entry; cleared by [`clear_capacity_rejected`] when the same
-/// source's next admission cycle completes with zero rejections (i.e. the
-/// source successfully re-delivered everything that previously overflowed),
-/// or expired by [`expire_capacity_rejected`] once the source has been
-/// silent past the re-delivery TTL.
+/// Tracks each source's **first** rejection time, not a counter and not the
+/// most recent time: a repeat rejection re-asserts the debt but does not
+/// restart the expiry clock (see
+/// [`BootstrapState::capacity_rejected_sources`]). Bootstrap cannot drain
+/// while this source has an entry; cleared by [`clear_capacity_rejected`] when
+/// the same source's next admission cycle completes with zero rejections (i.e.
+/// the source successfully re-delivered everything that previously
+/// overflowed), or expired by [`expire_capacity_rejected`] once the debt has
+/// stood past the re-delivery TTL.
 pub async fn note_capacity_rejected(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     source: saorsa_core::identity::PeerId,
 ) {
     let mut state = bootstrap_state.write().await;
-    if state
-        .capacity_rejected_sources
-        .insert(source, Instant::now())
-        .is_none()
-    {
+    if state.note_capacity_rejected(source, Instant::now()) {
         let n = state.capacity_rejected_sources.len();
         debug!(
             "Bootstrap: source {source} now has outstanding capacity-rejected hints \
@@ -514,37 +512,83 @@ mod tests {
         );
     }
 
-    /// A repeat rejection refreshes the source's timestamp, restarting its
-    /// re-delivery window.
+    /// A repeat rejection re-asserts the debt but must NOT restart the expiry
+    /// clock.
+    ///
+    /// Refreshing on every rejection is what wedged bootstrap open: a source
+    /// that keeps overflowing the queue keeps its own record permanently
+    /// fresh, `check_bootstrap_drained` never returns true, and auditing stays
+    /// off for the lifetime of the pressure (Invariant 19).
     #[tokio::test]
-    async fn note_capacity_rejected_refreshes_timestamp() {
+    async fn repeat_capacity_rejection_does_not_refresh_timestamp() {
         let state = Arc::new(RwLock::new(BootstrapState::new()));
         let source = saorsa_core::identity::PeerId::from_bytes([0xC5; 32]);
         let max_age = Duration::from_secs(60);
-        let stale_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
+        let first_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
 
         state
             .write()
             .await
             .capacity_rejected_sources
-            .insert(source, stale_rejected_at);
+            .insert(source, first_rejected_at);
         note_capacity_rejected(&state, source).await;
 
-        let refreshed_at = state
+        let recorded_at = state
             .read()
             .await
             .capacity_rejected_sources
             .get(&source)
             .copied()
             .unwrap();
-        assert!(
-            refreshed_at > stale_rejected_at,
-            "a repeat rejection must refresh the recorded time"
+        assert_eq!(
+            recorded_at, first_rejected_at,
+            "a repeat rejection must leave the first-seen time alone"
         );
         assert_eq!(
             expire_capacity_rejected(&state, max_age).await,
-            0,
-            "a refreshed entry must not expire on the stale timestamp"
+            1,
+            "an aged debt must still expire even though the source keeps \
+             re-overflowing the queue"
+        );
+    }
+
+    /// Sustained pressure cannot hold bootstrap open past the TTL.
+    ///
+    /// Drives the production accounting shape — repeated rejections arriving
+    /// faster than the TTL — and asserts the node still drains.
+    #[tokio::test]
+    async fn sustained_capacity_rejection_still_drains_after_ttl() {
+        const REJECTION_ROUNDS: usize = 8;
+
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let source = saorsa_core::identity::PeerId::from_bytes([0xC6; 32]);
+        let max_age = Duration::from_secs(60);
+
+        for _ in 0..REJECTION_ROUNDS {
+            note_capacity_rejected(&state, source).await;
+            assert!(
+                !check_bootstrap_drained(&state, &queues).await,
+                "an outstanding debt must block drain while it is inside the TTL"
+            );
+        }
+
+        // Age the (unrefreshed) first-seen stamp past the TTL.
+        let aged = Instant::now().checked_sub(max_age * 2).unwrap();
+        state
+            .write()
+            .await
+            .capacity_rejected_sources
+            .insert(source, aged);
+
+        assert_eq!(
+            expire_capacity_rejected(&state, max_age).await,
+            1,
+            "the debt must expire once the FIRST rejection is older than the TTL"
+        );
+        assert!(
+            check_bootstrap_drained(&state, &queues).await,
+            "bootstrap must drain once the expired debt is forfeited"
         );
     }
 }

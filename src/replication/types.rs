@@ -752,11 +752,10 @@ pub struct BootstrapState {
     /// Keys discovered during bootstrap that are still in the verification /
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
-    /// Peers whose last bootstrap admission unit had one or more hints either
-    /// rejected at capacity or displaced when another sender reclaimed a
-    /// borrowed slot, mapped to the most recent event time. Each entry means
-    /// "this source still owes us at least one re-hinted key after the queues
-    /// drain".
+    /// Peers whose bootstrap admission unit had one or more hints rejected at
+    /// capacity, mapped to the time of their **first** such rejection. Each
+    /// entry means "this source still owes us at least one re-hinted key after
+    /// the queues drain".
     /// `check_bootstrap_drained` refuses to claim the node fully drained
     /// while this map is non-empty: a source's presence is cleared by its
     /// next admission cycle that completes with zero capacity rejections
@@ -765,17 +764,34 @@ pub struct BootstrapState {
     /// counter prevents one peer's rejection from being "cleared" by an
     /// unrelated peer's clean cycle.
     ///
-    /// Entries also expire once their rejection time is older than
-    /// `ReplicationConfig::capacity_rejected_max_age` (see
+    /// The recorded time is **first-seen and never refreshed** (see
+    /// [`Self::note_capacity_rejected`]). A repeat rejection re-asserts that
+    /// the source still owes work, but it must not restart the expiry clock:
+    /// a source that keeps overflowing the queue would otherwise keep its own
+    /// record permanently fresh and wedge bootstrap open forever, which
+    /// disables auditing (Invariant 19) for the lifetime of the pressure.
+    /// First-seen semantics bound the wedge at
+    /// `ReplicationConfig::capacity_rejected_max_age` regardless of how a
+    /// source behaves.
+    ///
+    /// Entries expire once that first-rejection time is older than
+    /// `capacity_rejected_max_age` (see
     /// `super::bootstrap::expire_capacity_rejected`): the source either
-    /// abandoned re-delivery, or its `PeerRemoved` cleanup raced the
-    /// recording of the rejection and left an entry no future event can
-    /// clear. Expiring an entry means bootstrap may drain without ever
-    /// admitting keys the departed source advertised. This is acceptable
-    /// and consistent with `update_bootstrap_after_peer_removed`, which
-    /// already forfeits a departed source's owed work wholesale —
-    /// post-bootstrap periodic neighbor sync and the audit/repair pipeline
-    /// are the recovery path for missed keys.
+    /// abandoned re-delivery, is overflowing us faster than it can re-deliver,
+    /// or its `PeerRemoved` cleanup raced the recording of the rejection and
+    /// left an entry no future event can clear. Expiring an entry means
+    /// bootstrap may drain without ever admitting keys that source
+    /// advertised. This is acceptable and consistent with
+    /// `update_bootstrap_after_peer_removed`, which already forfeits a
+    /// departed source's owed work wholesale — post-bootstrap periodic
+    /// neighbor sync and the audit/repair pipeline are the recovery path for
+    /// missed keys.
+    ///
+    /// Sources whose key was *displaced* by another sender reclaiming a
+    /// borrowed slot are deliberately NOT recorded here: fairness reclamation
+    /// is our decision, not a failure of theirs, and stamping the victim lets
+    /// a third party block our drain through an unrelated honest peer. The
+    /// displaced key is forfeited to the same post-bootstrap recovery path.
     pub capacity_rejected_sources: HashMap<PeerId, Instant>,
 }
 
@@ -789,6 +805,22 @@ impl BootstrapState {
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashMap::new(),
         }
+    }
+
+    /// Record that `source` had one or more hints rejected at capacity.
+    ///
+    /// First-seen semantics: a repeat rejection re-asserts the debt but leaves
+    /// the original timestamp alone, so the expiry clock in
+    /// `super::bootstrap::expire_capacity_rejected` measures how long the
+    /// source has owed us work rather than how recently it last overflowed us.
+    /// See [`Self::capacity_rejected_sources`] for why refreshing wedges
+    /// bootstrap open.
+    ///
+    /// Returns whether this was the source's first outstanding rejection.
+    pub fn note_capacity_rejected(&mut self, source: PeerId, now: Instant) -> bool {
+        let first = !self.capacity_rejected_sources.contains_key(&source);
+        self.capacity_rejected_sources.entry(source).or_insert(now);
+        first
     }
 
     /// Check if bootstrap is drained.

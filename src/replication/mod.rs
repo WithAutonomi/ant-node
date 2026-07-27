@@ -5188,8 +5188,10 @@ async fn handle_sync_response(
 /// Outcome of [`admit_and_queue_hints`].
 ///
 /// `capacity_rejected_count` tracks incoming hints for which no fair slot was
-/// available. `displaced` tracks older borrowed hints reclaimed for another
-/// sender. Bootstrap must keep both sources outstanding until they re-hint.
+/// available; that source is kept outstanding until it re-hints. `displaced`
+/// tracks older borrowed hints reclaimed for another sender; only the key is
+/// dropped from bootstrap tracking — the former owner's standing is untouched
+/// (see [`publish_bootstrap_admission_outcomes`]).
 struct AdmissionOutcome {
     discovered: HashSet<XorName>,
     capacity_rejected_count: usize,
@@ -5198,10 +5200,14 @@ struct AdmissionOutcome {
 
 /// Publish one atomic admission unit into bootstrap drain accounting.
 ///
-/// A displaced entry is outstanding work for its former owner, just like an
-/// incoming capacity rejection. Clean sources are cleared only after every
-/// outcome in the unit is known, so peer iteration order cannot falsely clear
-/// a rejection recorded later in the same bootstrap batch.
+/// Only sources that were themselves capacity-rejected are kept outstanding.
+/// A fairness displacement forfeits the displaced *key* but never stamps its
+/// former owner: reclaiming a borrowed slot is this node's own fairness
+/// decision, so charging it to the victim would let a sustained flooder wedge
+/// our bootstrap drain open through an unrelated honest peer. Clean sources
+/// are cleared only after every outcome in the unit is known, so peer
+/// iteration order cannot falsely clear a rejection recorded later in the same
+/// bootstrap batch.
 async fn publish_bootstrap_admission_outcomes(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     outcomes: &[(PeerId, AdmissionOutcome)],
@@ -5217,8 +5223,14 @@ async fn publish_bootstrap_admission_outcomes(
         } else {
             clean_sources.insert(*source);
         }
+        // Only the *key* of a fairness displacement is forfeited here, never
+        // its owner's standing. Reclaiming a borrowed slot is our own fairness
+        // decision, not a failure by the peer that held it: stamping the victim
+        // would let a sustained flooder block our bootstrap drain through an
+        // unrelated honest peer that never overflowed us. The displaced key
+        // falls to the same post-bootstrap neighbor-sync and audit/repair
+        // recovery path that TTL expiry already relies on.
         for displacement in &outcome.displaced {
-            rejected_sources.insert(displacement.owner);
             displaced_keys.insert(displacement.key);
         }
     }
@@ -5234,7 +5246,9 @@ async fn publish_bootstrap_admission_outcomes(
         state.capacity_rejected_sources.remove(&source);
     }
     for source in rejected_sources {
-        state.capacity_rejected_sources.insert(source, now);
+        // First-seen: a source that keeps overflowing us must not keep its own
+        // record fresh, or bootstrap never drains and auditing stays off.
+        state.note_capacity_rejected(source, now);
     }
 }
 
@@ -7586,8 +7600,11 @@ mod tests {
         assert!(!*is_bootstrapping.read().await);
     }
 
+    /// A fairness displacement forfeits the key but must not stamp its former
+    /// owner: the owner did nothing wrong, and stamping it lets a flooding
+    /// source block bootstrap drain through an unrelated honest peer.
     #[tokio::test]
-    async fn fairness_displacement_remains_outstanding_during_bootstrap() {
+    async fn fairness_displacement_does_not_stamp_its_victim() {
         let displaced_owner = test_peer(0xB1);
         let incoming_source = test_peer(0xB2);
         let displaced_key = test_key(0xB1);
@@ -7622,12 +7639,78 @@ mod tests {
         let state = bootstrap_state.read().await;
         assert!(!state.pending_keys.contains(&displaced_key));
         assert!(state.pending_keys.contains(&admitted_key));
-        assert!(state
-            .capacity_rejected_sources
-            .contains_key(&displaced_owner));
+        assert!(
+            !state
+                .capacity_rejected_sources
+                .contains_key(&displaced_owner),
+            "the displaced owner must not be charged for our own fairness reclaim"
+        );
         assert!(!state
             .capacity_rejected_sources
             .contains_key(&incoming_source));
+    }
+
+    /// A source that keeps overflowing us must not keep its own record fresh.
+    ///
+    /// This is the wedge the first-seen stamp closes: with refresh-on-every-
+    /// rejection the debt could never age out, so `check_bootstrap_drained`
+    /// stayed false forever and auditing never started (Invariant 19).
+    #[tokio::test]
+    async fn repeat_capacity_rejection_keeps_the_first_seen_stamp() {
+        const REJECTION_ROUNDS: usize = 5;
+
+        let source = test_peer(0xB3);
+        let key = test_key(0xB3);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+
+        let first_seen = {
+            let outcomes = [(
+                source,
+                AdmissionOutcome {
+                    discovered: HashSet::new(),
+                    capacity_rejected_count: 1,
+                    displaced: Vec::new(),
+                },
+            )];
+            publish_bootstrap_admission_outcomes(&bootstrap_state, &outcomes, &HashSet::new())
+                .await;
+            bootstrap_state
+                .read()
+                .await
+                .capacity_rejected_sources
+                .get(&source)
+                .copied()
+                .expect("first rejection recorded")
+        };
+
+        for _ in 0..REJECTION_ROUNDS {
+            let outcomes = [(
+                source,
+                AdmissionOutcome {
+                    discovered: HashSet::from([key]),
+                    capacity_rejected_count: 1,
+                    displaced: Vec::new(),
+                },
+            )];
+            publish_bootstrap_admission_outcomes(
+                &bootstrap_state,
+                &outcomes,
+                &HashSet::from([key]),
+            )
+            .await;
+        }
+
+        let recorded = bootstrap_state
+            .read()
+            .await
+            .capacity_rejected_sources
+            .get(&source)
+            .copied()
+            .expect("debt still outstanding");
+        assert_eq!(
+            recorded, first_seen,
+            "repeat rejections must not restart the expiry clock"
+        );
     }
 
     /// The verification-worker tick's self-heal path: a capacity rejection
