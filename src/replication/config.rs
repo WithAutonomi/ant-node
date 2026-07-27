@@ -487,13 +487,6 @@ pub const MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS: usize = 1024;
 /// limiting a production pass to roughly nine records.
 pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;
 
-/// Legacy candidate-to-peer-edge budget retained for source compatibility.
-///
-/// Pruning no longer uses this value; request and candidate caps are tracked
-/// independently by [`MAX_PRUNE_AUDIT_REQUESTS_PER_PASS`] and
-/// [`MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS`].
-pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
-
 /// Maximum mature records deleted through the complete width-20 fast path per
 /// pass.
 pub const MAX_FAST_PRUNE_DELETIONS_PER_PASS: usize = 2048;

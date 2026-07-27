@@ -20,10 +20,11 @@
 //! - `Candidate`: continuously outside the retention width for the full
 //!   hysteresis. Candidacy is unconditional: it never depends on repair-hint
 //!   proofs, bootstrap state, audit budget, or prior neighbor-sync contact.
-//! - `HeldByCommitment` / `BootstrapDeferred` / `BudgetDeferred`: candidate
+//! - `HeldByCommitment` / `BootstrapDeferred` / `Unauditable`: candidate
 //!   deferrals. They defer deletion, but never remove candidacy or restart
-//!   the hysteresis clock. The request/candidate budget is applied after
-//!   classification so whole proof sets are either scheduled or deferred.
+//!   the hysteresis clock. The request/candidate budget is a separate, later
+//!   deferral applied after classification (not a disposition variant) so
+//!   whole proof sets are either scheduled or deferred as a unit.
 //! - `FastDelete`: after hysteresis, a complete self-inclusive width-20
 //!   lookup that excludes self permits deletion without a remote audit.
 //! - `AuditFailed`: an audited candidate whose current strict close group
@@ -42,7 +43,6 @@
 //! different threat model.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -164,6 +164,10 @@ pub struct PrunePassContext<'a> {
 enum PruneAuditStatus {
     Proven,
     Failed,
+    /// The responder refused the challenge (capacity or routing). Never a
+    /// possession signal; treated as an attributable failure under the
+    /// assumed close-group store spread (see [`peer_proves_records`]).
+    Rejected,
     Bootstrapping,
 }
 
@@ -343,8 +347,6 @@ struct PruneAuditContext<'a> {
     sync_state: &'a Arc<RwLock<NeighborSyncState>>,
     audit_challenge_coordinator: &'a Arc<AuditChallengeCoordinator>,
     report_state: &'a PruneAuditReportState,
-    split_request_budget: &'a AtomicUsize,
-    request_attempts: &'a AtomicUsize,
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +555,7 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
     )
     .await;
 
-    let (present_by_key, actual_audit_requests) = collect_record_prune_proofs(
+    let present_by_key = collect_record_prune_proofs(
         &audit_selection.candidates,
         stored_keys.len(),
         ctx.storage,
@@ -563,7 +565,6 @@ async fn prune_stored_records(ctx: &PrunePassContext<'_>) -> (usize, RecordPrune
         ctx.audit_challenge_coordinator,
     )
     .await;
-    stats.audit_requests = actual_audit_requests;
     let (keys_to_delete, revalidated_cleared, audit_below_threshold) =
         revalidated_record_prune_keys(&audit_selection.candidates, &present_by_key, ctx).await;
     stats.cleared += revalidated_cleared;
@@ -1256,18 +1257,15 @@ async fn collect_record_prune_proofs(
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
-) -> (HashMap<XorName, HashSet<PeerId>>, usize) {
+) -> HashMap<XorName, HashSet<PeerId>> {
     if candidates.is_empty() {
-        return (HashMap::new(), 0);
+        return HashMap::new();
     }
 
     let max_keys_per_challenge =
         ReplicationConfig::responsible_audit_key_limit(local_stored_key_count);
     let challenges = build_peer_audit_challenges(candidates, max_keys_per_challenge);
     let report_state = PruneAuditReportState::default();
-    let split_request_budget =
-        AtomicUsize::new(MAX_PRUNE_AUDIT_REQUESTS_PER_PASS.saturating_sub(challenges.len()));
-    let request_attempts = AtomicUsize::new(0);
     let audit_context = PruneAuditContext {
         storage,
         p2p_node,
@@ -1275,8 +1273,6 @@ async fn collect_record_prune_proofs(
         sync_state,
         audit_challenge_coordinator,
         report_state: &report_state,
-        split_request_budget: &split_request_budget,
-        request_attempts: &request_attempts,
     };
     let mut requests = stream::iter(challenges)
         .map(|(peer, keys)| peer_proves_records(peer, keys, audit_context))
@@ -1289,8 +1285,7 @@ async fn collect_record_prune_proofs(
         }
     }
 
-    let request_count = request_attempts.load(Ordering::Relaxed);
-    (present_by_key, request_count)
+    present_by_key
 }
 
 async fn revalidated_fast_prune_keys(
@@ -1592,116 +1587,95 @@ fn target_peers_reported_present(
 /// `AuditChallenge`s at the same target. The responder already supports
 /// multi-key challenges, so we preserve per-key proof accounting while reducing
 /// per-peer request bursts.
-#[allow(clippy::too_many_lines)]
+///
+/// A size rejection is not accommodated: the responder's
+/// `max_incoming_audit_keys` already grants a 2x margin over its own sender
+/// limit, so an honestly-sized peer only rejects our batch once the close-group
+/// store spread exceeds 4x. Under the assumed spread that is attributable
+/// misbehaviour, so a `Rejected` response flows through the normal failure path
+/// (labelled `size_reject` for observability) rather than triggering a
+/// wire-compatible split-and-retry.
 async fn peer_proves_records(
     peer: PeerId,
     keys: Vec<XorName>,
     context: PruneAuditContext<'_>,
 ) -> Vec<(PeerId, XorName)> {
+    let (challenge_id, nonce) = {
+        let mut rng = rand::thread_rng();
+        (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
+    };
+    let mut challenge_material = Vec::new();
+    for key in keys {
+        if let Some(expected_digest) =
+            local_record_digest(&peer, &key, &nonce, context.storage).await
+        {
+            challenge_material.push((key, expected_digest));
+        }
+    }
+    if challenge_material.is_empty() {
+        return Vec::new();
+    }
+
+    let challenge_keys: Vec<XorName> = challenge_material.iter().map(|(key, _)| *key).collect();
+    let Some((encoded, key_count)) =
+        encode_prune_audit_challenge(&peer, &challenge_keys, challenge_id, nonce)
+    else {
+        return Vec::new();
+    };
+    let Some(decoded) = receive_prune_audit_response(
+        &peer,
+        &challenge_keys,
+        encoded,
+        key_count,
+        challenge_id,
+        context,
+    )
+    .await
+    else {
+        return Vec::new();
+    };
+
+    let statuses = prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
     let mut clear_bootstrap_claim = false;
     let mut audit_failure_reported = false;
     let mut proven = Vec::new();
-    let mut pending_batches = vec![keys];
 
-    while let Some(keys) = pending_batches.pop() {
-        let (challenge_id, nonce) = {
-            let mut rng = rand::thread_rng();
-            (rng.gen::<u64>(), rng.gen::<[u8; 32]>())
-        };
-        let mut challenge_material = Vec::new();
-        for key in keys {
-            if let Some(expected_digest) =
-                local_record_digest(&peer, &key, &nonce, context.storage).await
-            {
-                challenge_material.push((key, expected_digest));
-            }
-        }
-        if challenge_material.is_empty() {
-            continue;
+    for (key, status) in statuses {
+        if prune_audit_response_clears_bootstrap_claim(status) {
+            clear_bootstrap_claim = true;
         }
 
-        let challenge_keys: Vec<XorName> = challenge_material.iter().map(|(key, _)| *key).collect();
-        let Some((encoded, key_count)) =
-            encode_prune_audit_challenge(&peer, &challenge_keys, challenge_id, nonce)
-        else {
-            continue;
-        };
-        context.request_attempts.fetch_add(1, Ordering::Relaxed);
-        let Some(decoded) = receive_prune_audit_response(
-            &peer,
-            &challenge_keys,
-            encoded,
-            key_count,
-            challenge_id,
-            context,
-        )
-        .await
-        else {
-            continue;
-        };
-
-        if let Some(peer_limit) =
-            prune_audit_rejected_key_limit(&decoded, challenge_id, challenge_keys.len())
-        {
-            let retry_batches: Vec<Vec<XorName>> = challenge_keys
-                .chunks(peer_limit)
-                .map(<[XorName]>::to_vec)
-                .collect();
-            if retry_batches.len() > 1
-                && reserve_split_request_budget(context.split_request_budget, retry_batches.len())
-            {
-                info!(
-                    "Prune audit peer {peer} accepts at most {peer_limit} keys; retrying {} \
-                     smaller backward-compatible challenges",
-                    retry_batches.len()
-                );
-                pending_batches.extend(retry_batches.into_iter().rev());
-            } else {
-                warn!(
-                    "Prune audit key-limit rejection from {peer} deferred {} keys because the \
-                     per-pass request budget cannot fit the compatible retry",
-                    challenge_keys.len()
-                );
+        match status {
+            PruneAuditStatus::Proven => proven.push((peer, key)),
+            PruneAuditStatus::Bootstrapping => {
+                report_prune_bootstrap_claim(
+                    &peer,
+                    &key,
+                    context.p2p_node,
+                    context.config,
+                    context.sync_state,
+                    context.report_state,
+                )
+                .await;
             }
-            // A deployed older node rejecting only the request size is not an
-            // audit failure and must not receive a trust penalty.
-            continue;
-        }
-
-        let statuses =
-            prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
-        for (key, status) in statuses {
-            if prune_audit_response_clears_bootstrap_claim(status) {
-                clear_bootstrap_claim = true;
-            }
-
-            match status {
-                PruneAuditStatus::Proven => proven.push((peer, key)),
-                PruneAuditStatus::Bootstrapping => {
-                    report_prune_bootstrap_claim(
+            PruneAuditStatus::Failed | PruneAuditStatus::Rejected => {
+                let failure_class = if matches!(status, PruneAuditStatus::Rejected) {
+                    "size_reject"
+                } else {
+                    "failed"
+                };
+                if !audit_failure_reported
+                    && report_prune_audit_failure_once(
                         &peer,
                         &key,
                         context.p2p_node,
                         context.config,
-                        context.sync_state,
                         context.report_state,
+                        failure_class,
                     )
-                    .await;
-                }
-                PruneAuditStatus::Failed => {
-                    if !audit_failure_reported
-                        && report_prune_audit_failure_once(
-                            &peer,
-                            &key,
-                            context.p2p_node,
-                            context.config,
-                            context.report_state,
-                            None,
-                        )
-                        .await
-                    {
-                        audit_failure_reported = true;
-                    }
+                    .await
+                {
+                    audit_failure_reported = true;
                 }
             }
         }
@@ -1712,43 +1686,6 @@ async fn peer_proves_records(
     }
 
     proven
-}
-
-fn reserve_split_request_budget(budget: &AtomicUsize, requests: usize) -> bool {
-    budget
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-            remaining.checked_sub(requests)
-        })
-        .is_ok()
-}
-
-/// Parse the rejection emitted by deployed multi-key audit responders.
-///
-/// This exact legacy shape is deliberately recognized without changing any
-/// protocol enum or field. Other rejections retain their existing audit
-/// failure treatment.
-fn prune_audit_rejected_key_limit(
-    decoded: &ReplicationMessage,
-    challenge_id: u64,
-    challenged_key_count: usize,
-) -> Option<usize> {
-    let ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
-        challenge_id: response_id,
-        reason,
-    }) = &decoded.body
-    else {
-        return None;
-    };
-    if *response_id != challenge_id {
-        return None;
-    }
-
-    let rest = reason.strip_prefix("challenge contains ")?;
-    let (reported_count, limit) = rest.split_once(" keys, limit is ")?;
-    let reported_count = reported_count.parse::<usize>().ok()?;
-    let limit = limit.parse::<usize>().ok()?;
-    (reported_count == challenged_key_count && limit > 0 && limit < challenged_key_count)
-        .then_some(limit)
 }
 
 async fn receive_prune_audit_response(
@@ -1775,9 +1712,9 @@ async fn receive_prune_audit_response(
             // Keep the local class split so timeout metrics are not polluted
             // by failures that happened before delivery.
             audit_metrics::record_audit_no_response(AuditType::Prune, class);
-            Some(class)
+            class.as_str()
         }
-        PruneAuditChallengeResult::MalformedResponse => None,
+        PruneAuditChallengeResult::MalformedResponse => "malformed",
     };
 
     for key in challenge_keys {
@@ -1798,7 +1735,10 @@ async fn receive_prune_audit_response(
 }
 
 fn prune_audit_response_clears_bootstrap_claim(status: PruneAuditStatus) -> bool {
-    matches!(status, PruneAuditStatus::Proven | PruneAuditStatus::Failed)
+    matches!(
+        status,
+        PruneAuditStatus::Proven | PruneAuditStatus::Failed | PruneAuditStatus::Rejected
+    )
 }
 
 // The responder for an incoming `AuditChallenge` (including prune-confirmation
@@ -2002,17 +1942,16 @@ fn prune_audit_response_statuses(
             challenge_id: resp_id,
             reason,
         }) => {
-            if resp_id == challenge_id {
-                warn!(
-                    "Prune audit proof batch for {} keys rejected by {peer}: {reason}",
-                    challenge_material.len()
-                );
-            } else {
-                warn!("Prune audit challenge ID mismatch on Rejected from {peer}");
+            if resp_id != challenge_id {
+                return failed_all("challenge id mismatch on Rejected");
             }
+            warn!(
+                "Prune audit proof batch for {} keys rejected by {peer}: {reason}",
+                challenge_material.len()
+            );
             challenge_material
                 .iter()
-                .map(|(key, _)| (*key, PruneAuditStatus::Failed))
+                .map(|(key, _)| (*key, PruneAuditStatus::Rejected))
                 .collect()
         }
         _ => failed_all("unexpected response type"),
@@ -2071,7 +2010,7 @@ async fn report_prune_audit_failure_once(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
     report_state: &PruneAuditReportState,
-    failure_class: Option<AuditFailureClass>,
+    audit_failure_class: &'static str,
 ) -> bool {
     let should_report = peer_is_currently_responsible(peer, key, p2p_node, config).await
         && reserve_prune_audit_failure_report(report_state, peer).await;
@@ -2079,7 +2018,6 @@ async fn report_prune_audit_failure_once(
         return false;
     }
 
-    let audit_failure_class = failure_class.map_or("failed", AuditFailureClass::as_str);
     warn!(
         audit_type = AuditType::Prune.as_str(),
         audit_failure_class,
@@ -3265,7 +3203,8 @@ mod tests {
             PruneAuditStatus::Failed
         );
 
-        // An explicit rejection never counts.
+        // An explicit rejection never counts as a positive proof; it grades to
+        // the distinct `Rejected` status (a non-recovering, labelled failure).
         let rejected = ReplicationMessage {
             request_id: TEST_CHALLENGE_ID,
             body: ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
@@ -3275,7 +3214,7 @@ mod tests {
         };
         assert_eq!(
             graded_status(&peer, &key, rejected),
-            PruneAuditStatus::Failed
+            PruneAuditStatus::Rejected
         );
 
         // An unexpected message type never counts.
@@ -3294,43 +3233,45 @@ mod tests {
         );
     }
 
+    /// A rejection is never a possession signal, so it maps to the distinct
+    /// `Rejected` status (which drives a labelled, non-recovering penalty), and
+    /// its `reason` text is never parsed. A challenge-id mismatch stays a plain
+    /// `Failed`.
     #[test]
-    fn deployed_key_limit_rejection_is_recognized_for_compatible_retry() {
-        let rejected = ReplicationMessage {
+    fn any_rejection_reason_maps_to_the_rejected_status_without_parsing() {
+        let peer = peer_id_from_byte(1);
+        let key = key_from_byte(0xC3);
+
+        for reason in [
+            "challenge contains 83 keys, limit is 60",
+            "challenged_peer_id does not match this node",
+            "some future reason we have never seen",
+        ] {
+            let rejected = ReplicationMessage {
+                request_id: TEST_CHALLENGE_ID,
+                body: ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
+                    challenge_id: TEST_CHALLENGE_ID,
+                    reason: reason.to_string(),
+                }),
+            };
+            assert_eq!(
+                graded_status(&peer, &key, rejected),
+                PruneAuditStatus::Rejected,
+                "reason {reason:?} should map to Rejected regardless of wording"
+            );
+        }
+
+        let mismatched = ReplicationMessage {
             request_id: TEST_CHALLENGE_ID,
             body: ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
-                challenge_id: TEST_CHALLENGE_ID,
+                challenge_id: TEST_CHALLENGE_ID + 1,
                 reason: "challenge contains 83 keys, limit is 60".to_string(),
             }),
         };
-
         assert_eq!(
-            prune_audit_rejected_key_limit(&rejected, TEST_CHALLENGE_ID, 83),
-            Some(60)
-        );
-        assert_eq!(
-            prune_audit_rejected_key_limit(&rejected, TEST_CHALLENGE_ID + 1, 83),
-            None
-        );
-        assert_eq!(
-            prune_audit_rejected_key_limit(&rejected, TEST_CHALLENGE_ID, 82),
-            None
-        );
-    }
-
-    #[test]
-    fn unrelated_rejection_is_not_treated_as_a_size_compatibility_signal() {
-        let rejected = ReplicationMessage {
-            request_id: TEST_CHALLENGE_ID,
-            body: ReplicationMessageBody::AuditResponse(AuditResponse::Rejected {
-                challenge_id: TEST_CHALLENGE_ID,
-                reason: "challenge addressed to wrong peer".to_string(),
-            }),
-        };
-
-        assert_eq!(
-            prune_audit_rejected_key_limit(&rejected, TEST_CHALLENGE_ID, 83),
-            None
+            graded_status(&peer, &key, mismatched),
+            PruneAuditStatus::Failed,
+            "a challenge-id mismatch is a plain failure, not a capacity signal"
         );
     }
 

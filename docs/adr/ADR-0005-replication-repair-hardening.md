@@ -94,10 +94,12 @@ Constraints inherited from ADR-0002/ADR-0003 and the wider system:
 
 - Wire compatibility: all changes are patch-level; no protocol message shape
   changes. Prune confirmation continues using the deployed multi-key
-  `AuditChallenge` / `AuditResponse` variants, including the existing
-  wire-compatible `Rejected { challenge_id, reason }` response for an oversized
-  batch. A rolling upgrade MUST interoperate in both directions with 0.14.4
-  nodes at commit `571868a`.
+  `AuditChallenge` / `AuditResponse` variants. A rolling upgrade interoperates
+  in both directions with 0.14.4 nodes at commit `571868a`: every message is
+  understood on the wire. The only behavioural difference is that an oversized-
+  batch `Rejected` is now treated as an attributable failure (see option 11)
+  rather than recovered in-band, which under the store-spread assumption below
+  does not occur for honestly-sized peers.
 - Trust/eviction semantics (ADR-0002, ADR-0003) must not be widened: only
   directly-observed, attributable misbehaviour produces a penalty, and a peer
   that did nothing wrong (e.g. a source whose key we declined for our own churn)
@@ -390,13 +392,23 @@ scaled timeout, global concurrency, and per-peer coordinator limits. A candidate
 selected only when every request required for its complete proof set fits in the
 pass request budget; partial evidence is not carried across passes.
 
-An older responder may reject a batch because its independently calculated
-`max_incoming_audit_keys(stored_chunks)` is lower. The challenger recognizes the
-deployed size-rejection wording, splits the batch without changing the wire
-message, retries within the same request budget, and never emits a trust penalty
-for that capacity response. Other rejection reasons retain their existing failure
-semantics. No protocol identifier, enum discriminant, message field, digest, nonce,
-or challenge-ID rule changes.
+A responder rejects a batch when its independently calculated
+`max_incoming_audit_keys(stored_chunks) = 2 * responsible_audit_key_limit(stored_chunks)`
+is below the batch size. Because that limit already carries a 2x margin over the
+challenger's own `sqrt`-scaled sender size, an honestly-sized peer only rejects
+once the close-group store spread exceeds **4x** (`sqrt(cc) > 2*sqrt(rc)`). We
+assume close-group store spread stays within ~2x — half the rejection threshold —
+so a size rejection is treated as attributable misbehaviour (a mis-sized or lying
+responder), not accommodated with in-band renegotiation. This deliberately drops
+the earlier split-and-retry that parsed the responder's rejection wording: a
+`Rejected` response is never a possession signal (a peer that lacks a key answers
+`Digests` with `ABSENT_KEY_DIGEST`), so it flows through the normal failure path
+under a distinct `size_reject` metric label, subject to the same
+fresh-responsibility-confirmation gate and per-peer-per-pass dedup as any other
+prune-audit failure. The `size_reject` label is the re-open trigger: if it fires
+in the field, the store-spread assumption is being violated and the accommodation
+should be reconsidered. No protocol identifier, enum discriminant, message field,
+digest, nonce, or challenge-ID rule changes; the wire representation is untouched.
 
 ## Consequences
 
@@ -509,15 +521,18 @@ How we will know this decision remains correct (coverage added in PR #165):
 - **Pruning:** width-9 hysteresis classification; complete-width-20 fast deletion
   and incomplete-width-20 audited fallback; bootstrap and commitment deferrals;
   fast-path and audited TOCTOU revalidation; dynamic square-root peer batches;
-  request-budget admission of complete candidate proof sets; old-responder
-  oversize rejection splitting without trust penalty; rotating fairness; and
-  mixed-version golden wire fixtures against commit `571868a`.
+  request-budget admission of complete candidate proof sets; every `Rejected`
+  reason grading to the non-recovering `Rejected` status without parsing its
+  wording; and rotating fairness.
 - **Re-open triggers:** revisit the fresh-offer admission bound if legitimate offers
   are refused under normal load; revisit `CAPACITY_REJECTED_MAX_AGE` if bootstrap
   drains too slowly under real neighbor-sync cadence; revisit the narrowed replica
   repair width if routing skew causes measurable coverage loss the repair path does
   not heal; disable or narrow the width-20 fast path if data-availability telemetry
-  shows that the accepted far-copy deletion risk is material.
+  shows that the accepted far-copy deletion risk is material; reconsider the
+  size-rejection-as-misbehaviour treatment if the `size_reject` audit-failure label
+  fires under normal load (the close-group store spread is exceeding the assumed
+  ~2x and honest peers are being penalised).
 
 ## Notes for AI-assisted work
 
