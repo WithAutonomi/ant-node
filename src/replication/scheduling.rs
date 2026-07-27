@@ -48,6 +48,23 @@ pub const MAX_PENDING_VERIFY: usize = 131_072;
 /// `enqueue_fetch`) when full.
 pub const MAX_FETCH_QUEUE: usize = 131_072;
 
+/// Maximum distinct hint sources retained per pending key.
+///
+/// [`MAX_PENDING_VERIFY`] bounds unique *keys*, not the peers remembered
+/// against each one. Duplicate advertisements take the `AlreadyPresent` path,
+/// which merges the advertiser into two per-key sets plus the reverse index at
+/// no capacity cost — and re-advertising an already-pending key is the cheapest
+/// path through admission, since `is_relevant` short-circuits on it without
+/// even a routing-table lookup. Left unbounded, N routing-table peers
+/// re-advertising a full queue costs `N * MAX_PENDING_VERIFY` associations
+/// against a cap that only ever counted keys.
+///
+/// Sized at the close-group width: source diversity is only useful as fetch
+/// candidates and corroboration weight, and both saturate well before this.
+/// See [`ReplicationQueues::add_pending_verify`] for the retention policy that
+/// decides *which* sources survive the cap.
+pub const MAX_HINT_SOURCES_PER_KEY: usize = 8;
+
 /// Outcome of [`ReplicationQueues::add_pending_verify`].
 ///
 /// Distinguishes "the key is already being handled" from "the key was
@@ -201,6 +218,15 @@ pub struct ReplicationQueues {
     /// Pending-verification capacity slots reserved by retry-capable keys that
     /// have left `pending_verify` for `fetch_queue` / `in_flight_fetch`.
     retry_reserved_slots: usize,
+    /// The same reservations, attributed to the capacity owner that holds them.
+    ///
+    /// A promoted key leaves `pending_keys_by_owner` but keeps its reservation
+    /// against the global pool. Without this attribution the reservation is
+    /// subtracted from everyone's share while being charged to no one, so an
+    /// owner with many in-flight retries reads as under-loaded to
+    /// [`Self::reclaim_borrowed_slot`] and wins a larger allocation than it has
+    /// earned — a skew that grows with exactly how much work it already holds.
+    retry_reserved_by_owner: HashMap<PeerId, usize>,
 }
 
 impl Default for ReplicationQueues {
@@ -227,6 +253,7 @@ impl ReplicationQueues {
             capacity_displacements: Vec::new(),
             fair_rejection_cache: HashSet::new(),
             retry_reserved_slots: 0,
+            retry_reserved_by_owner: HashMap::new(),
         }
     }
 
@@ -251,22 +278,67 @@ impl ReplicationQueues {
         key: XorName,
         entry: VerificationEntry,
     ) -> AdmissionResult {
-        if let Some(existing) = self.pending_verify.get_mut(&key) {
-            let replica_source_count = existing.replica_hint_sources.len();
-            existing
-                .replica_hint_sources
-                .extend(entry.replica_hint_sources.iter().copied());
-            let mut priority_changed = existing.replica_hint_sources.len() != replica_source_count;
+        if self.pending_verify.contains_key(&key) {
+            // Read before the mutable borrow: the capacity owner must survive
+            // any displacement, since `insert_pending_owned_unchecked` requires
+            // it to remain a live hint source.
+            let owner = self.capacity_owner_by_key.get(&key).copied();
+            let Some(existing) = self.pending_verify.get_mut(&key) else {
+                debug_assert!(false, "pending entry vanished between lookups");
+                return AdmissionResult::AlreadyPresent;
+            };
+            let mut changed = false;
+
+            // Replica claimants first. They are the only sources that assert
+            // possession, so they are the ones worth a slot: a paid-only
+            // advertiser adds corroboration weight but can never be fetched
+            // from, and yields its place when the cap binds.
+            for source in entry.replica_hint_sources.iter().copied() {
+                if existing.replica_hint_sources.contains(&source) {
+                    continue;
+                }
+                if existing.hint_sources.len() >= MAX_HINT_SOURCES_PER_KEY
+                    && !Self::displace_paid_only_source(
+                        existing,
+                        &mut self.pending_keys_by_source,
+                        &key,
+                        owner,
+                    )
+                {
+                    // Cap reached with nothing droppable: every slot is held by
+                    // a replica claimant or the capacity owner.
+                    break;
+                }
+                existing.replica_hint_sources.insert(source);
+                existing.hint_sources.insert(source);
+                self.pending_keys_by_source
+                    .entry(source)
+                    .or_default()
+                    .insert(key);
+                changed = true;
+            }
+
+            // Then paid-only advertisers, strictly while under the cap. Losing
+            // one costs a unit of corroboration weight — never a fetch
+            // candidate, and never the key itself.
             for source in entry.hint_sources {
+                if existing.hint_sources.len() >= MAX_HINT_SOURCES_PER_KEY {
+                    break;
+                }
                 if existing.hint_sources.insert(source) {
-                    priority_changed = true;
                     self.pending_keys_by_source
                         .entry(source)
                         .or_default()
                         .insert(key);
+                    changed = true;
                 }
             }
-            if priority_changed {
+
+            // Any change to `hint_sources` invalidates the key's queued
+            // eviction candidate, whose `source_count` snapshot is compared for
+            // equality in `pop_reclaimable_victim`. Re-push it or the key
+            // becomes permanently un-reclaimable.
+            if changed {
                 self.refresh_eviction_candidate(&key);
             }
             return AdmissionResult::AlreadyPresent;
@@ -347,35 +419,64 @@ impl ReplicationQueues {
             .map_or(0, HashSet::len)
     }
 
+    fn retry_reserved_for_owner(&self, owner: &PeerId) -> usize {
+        self.retry_reserved_by_owner
+            .get(owner)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Total pending capacity charged to `owner`: keys resident in
+    /// `pending_verify` plus the slots its promoted keys still reserve.
+    ///
+    /// This is the per-owner counterpart of [`Self::pending_capacity_used`],
+    /// and the two must stay in step: a reservation occupies a slot in the
+    /// global cap, so it has to be charged to somebody's share or fair-share
+    /// targets are computed against a pool that nobody is billed for.
+    fn charged_count_for_owner(&self, owner: &PeerId) -> usize {
+        self.pending_count_for_owner_internal(owner)
+            .saturating_add(self.retry_reserved_for_owner(owner))
+    }
+
     fn least_loaded_source(&self, sources: &HashSet<PeerId>) -> Option<PeerId> {
         sources.iter().copied().min_by(|a, b| {
-            self.pending_count_for_owner_internal(a)
-                .cmp(&self.pending_count_for_owner_internal(b))
+            self.charged_count_for_owner(a)
+                .cmp(&self.charged_count_for_owner(b))
                 .then_with(|| a.cmp(b))
         })
     }
 
     fn reclaim_borrowed_slot(&mut self, incoming_owner: PeerId) -> Option<CapacityDisplacement> {
-        let available_pending = MAX_PENDING_VERIFY.saturating_sub(self.retry_reserved_slots);
-        let mut demands = self
+        // Allocate the FULL pool and charge reservations to their holders,
+        // rather than deducting reservations off the top and billing no one.
+        let mut demands = BTreeMap::new();
+        for owner in self
             .pending_keys_by_owner
-            .iter()
-            .map(|(owner, keys)| (*owner, keys.len()))
-            .collect::<BTreeMap<_, _>>();
+            .keys()
+            .chain(self.retry_reserved_by_owner.keys())
+        {
+            demands.insert(*owner, self.charged_count_for_owner(owner));
+        }
         *demands.entry(incoming_owner).or_default() += 1;
 
-        let targets = max_min_allocations(&demands, available_pending);
-        let incoming_count = self.pending_count_for_owner_internal(&incoming_owner);
+        let targets = max_min_allocations(&demands, MAX_PENDING_VERIFY);
+        let incoming_count = self.charged_count_for_owner(&incoming_owner);
         if targets.get(&incoming_owner).copied().unwrap_or(0) <= incoming_count {
             return None;
         }
 
+        // Only a resident key can actually be reclaimed — a reservation has no
+        // entry to evict — so an owner over its target purely on reservations
+        // is skipped rather than chased.
         let mut over_represented = self
             .pending_keys_by_owner
             .iter()
             .filter_map(|(owner, keys)| {
+                if keys.is_empty() {
+                    return None;
+                }
                 let target = targets.get(owner).copied().unwrap_or(0);
-                let excess = keys.len().saturating_sub(target);
+                let excess = self.charged_count_for_owner(owner).saturating_sub(target);
                 (excess > 0).then_some((*owner, excess))
             })
             .collect::<Vec<_>>();
@@ -506,25 +607,77 @@ impl ReplicationQueues {
         }
     }
 
-    fn reserve_retry_slot(&mut self) {
+    /// Free one hint-source slot on `entry` by dropping a paid-only advertiser.
+    ///
+    /// Returns whether a slot was freed. Replica claimants are never chosen —
+    /// they are the fetch candidates the set exists to hold — and neither is
+    /// `protected_owner`, which must remain a live hint source for the capacity
+    /// accounting in `insert_pending_owned_unchecked` to stay valid.
+    ///
+    /// The victim among eligible paid-only sources is arbitrary: they are
+    /// interchangeable, each contributing one unit of corroboration weight and
+    /// nothing else.
+    fn displace_paid_only_source(
+        entry: &mut VerificationEntry,
+        keys_by_source: &mut HashMap<PeerId, HashSet<XorName>>,
+        key: &XorName,
+        protected_owner: Option<PeerId>,
+    ) -> bool {
+        let victim = entry.hint_sources.iter().copied().find(|source| {
+            !entry.replica_hint_sources.contains(source) && protected_owner != Some(*source)
+        });
+        let Some(victim) = victim else {
+            return false;
+        };
+        entry.hint_sources.remove(&victim);
+        if let Some(keys) = keys_by_source.get_mut(&victim) {
+            keys.remove(key);
+            if keys.is_empty() {
+                keys_by_source.remove(&victim);
+            }
+        }
+        true
+    }
+
+    /// Reserve a pending slot for `key`, charged to its capacity owner.
+    ///
+    /// Must be called while `capacity_owner_by_key` still holds `key`, which is
+    /// why `promote_pending_to_fetch` takes the pending entry with
+    /// `forget_capacity_owner: false`.
+    fn reserve_retry_slot(&mut self, key: &XorName) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_add(1);
+        if let Some(owner) = self.capacity_owner_by_key.get(key).copied() {
+            *self.retry_reserved_by_owner.entry(owner).or_default() += 1;
+        }
         self.fair_rejection_cache.clear();
     }
 
-    fn release_retry_slot(&mut self) {
+    /// Release `key`'s reserved pending slot.
+    ///
+    /// Call before dropping `key` from `capacity_owner_by_key`, or the
+    /// per-owner charge is stranded.
+    fn release_retry_slot(&mut self, key: &XorName) {
         self.retry_reserved_slots = self.retry_reserved_slots.saturating_sub(1);
+        if let Some(owner) = self.capacity_owner_by_key.get(key).copied() {
+            if let Some(count) = self.retry_reserved_by_owner.get_mut(&owner) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.retry_reserved_by_owner.remove(&owner);
+                }
+            }
+        }
         self.fair_rejection_cache.clear();
     }
 
     fn release_retry_slot_for_entry(&mut self, entry: &InFlightEntry) {
         if entry.retry_verification.is_some() {
-            self.release_retry_slot();
+            self.release_retry_slot(&entry.key);
         }
     }
 
     fn release_retry_slot_for_candidate(&mut self, candidate: &FetchCandidate) {
         if candidate.retry_verification.is_some() {
-            self.release_retry_slot();
+            self.release_retry_slot(&candidate.key);
         }
     }
 
@@ -741,7 +894,6 @@ impl ReplicationQueues {
             }
         }
 
-        let mut retry_releases = 0usize;
         let mut retry_owner_updates = Vec::new();
         let mut orphaned_fetch_keys = HashSet::new();
         for (key, payload) in &mut self.fetch_payloads {
@@ -750,7 +902,6 @@ impl ReplicationQueues {
                 if verification.hint_sources.remove(source) {
                     verification.replica_hint_sources.remove(source);
                     if verification.hint_sources.is_empty() {
-                        retry_releases += 1;
                         payload.retry_verification = None;
                         retry_owner_updates.push((*key, None));
                     } else if self.capacity_owner_by_key.get(key) == Some(source) {
@@ -780,7 +931,6 @@ impl ReplicationQueues {
                 if verification.hint_sources.remove(source) {
                     verification.replica_hint_sources.remove(source);
                     if verification.hint_sources.is_empty() {
-                        retry_releases += 1;
                         entry.retry_verification = None;
                         retry_owner_updates.push((entry.key, None));
                     } else if self.capacity_owner_by_key.get(&entry.key) == Some(source) {
@@ -791,16 +941,21 @@ impl ReplicationQueues {
             }
         }
 
+        // Every key here holds a retry reservation charged to its current
+        // capacity owner, so each release must happen while
+        // `capacity_owner_by_key` still names that owner.
         for (key, owner) in retry_owner_updates {
-            if let Some(owner) = owner {
-                self.capacity_owner_by_key.insert(key, owner);
+            self.release_retry_slot(&key);
+            if let Some(new_owner) = owner {
+                // The retry survives but changes hands: re-charge it to the new
+                // owner, or it stays billed to a peer that has just departed
+                // and is never recovered.
+                self.capacity_owner_by_key.insert(key, new_owner);
+                self.reserve_retry_slot(&key);
             } else {
+                // The retry itself is gone with its last hint source.
                 self.capacity_owner_by_key.remove(&key);
             }
-        }
-
-        for _ in 0..retry_releases {
-            self.release_retry_slot();
         }
 
         orphaned
@@ -922,7 +1077,7 @@ impl ReplicationQueues {
         let retry_verification = self.take_pending(&key, false);
         let reserved_retry = retry_verification.is_some();
         if reserved_retry {
-            self.reserve_retry_slot();
+            self.reserve_retry_slot(&key);
         }
         // enqueue_fetch returns false only on capacity or already-queued; the
         // capacity check above and the just-removed pending state make this
@@ -930,7 +1085,7 @@ impl ReplicationQueues {
         // between, dropping the duplicate is fine.
         let enqueued = self.enqueue_fetch_with_retry(key, distance, sources, retry_verification);
         if !enqueued && reserved_retry {
-            self.release_retry_slot();
+            self.release_retry_slot(&key);
             self.capacity_owner_by_key.remove(&key);
         }
         enqueued
@@ -1053,7 +1208,7 @@ impl ReplicationQueues {
             ..
         } = candidate;
         if retry_verification.is_some() {
-            self.release_retry_slot();
+            self.release_retry_slot(&key);
             self.capacity_owner_by_key.remove(&key);
         }
     }
@@ -1107,11 +1262,13 @@ impl ReplicationQueues {
             .copied()
             .or_else(|| self.least_loaded_source(&verification.hint_sources));
         let Some(owner) = owner else {
-            self.release_retry_slot();
+            self.release_retry_slot(&key);
             return false;
         };
+        // Release before re-inserting: the reservation is charged to the owner
+        // recorded now, which `insert_pending_owned_unchecked` may replace.
+        self.release_retry_slot(&key);
         self.insert_pending_owned_unchecked(key, verification, owner, true);
-        self.release_retry_slot();
         true
     }
 
@@ -1136,11 +1293,13 @@ impl ReplicationQueues {
             .copied()
             .or_else(|| self.least_loaded_source(&verification.hint_sources));
         let Some(owner) = owner else {
-            self.release_retry_slot();
+            self.release_retry_slot(key);
             return false;
         };
+        // Release before re-inserting: the reservation is charged to the owner
+        // recorded now, which `insert_pending_owned_unchecked` may replace.
+        self.release_retry_slot(key);
         self.insert_pending_owned_unchecked(*key, verification, owner, true);
-        self.release_retry_slot();
         true
     }
 
@@ -1405,6 +1564,206 @@ mod tests {
             );
         }
         assert_eq!(queues.pending_count(), KEY_COUNT as usize);
+    }
+
+    /// Duplicate advertisements must not grow a key's source set without bound.
+    ///
+    /// `MAX_PENDING_VERIFY` counts keys, not the peers remembered against each
+    /// one, so before the cap N peers re-advertising a full queue cost
+    /// `N * MAX_PENDING_VERIFY` associations charged to nothing.
+    #[test]
+    fn duplicate_hints_cannot_grow_a_keys_source_set_without_bound() {
+        const ADVERTISERS: u8 = 40;
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x5A);
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+
+        for advertiser in 2..=ADVERTISERS {
+            queues.add_pending_verify(key, test_entry(advertiser));
+        }
+
+        let entry = queues.get_pending(&key).expect("pending entry");
+        assert!(
+            entry.hint_sources.len() <= MAX_HINT_SOURCES_PER_KEY,
+            "hint sources must stay capped, got {}",
+            entry.hint_sources.len()
+        );
+        assert!(
+            entry.replica_hint_sources.len() <= MAX_HINT_SOURCES_PER_KEY,
+            "replica hint sources must stay capped"
+        );
+        let indexed: usize = queues
+            .pending_keys_by_source
+            .values()
+            .map(|keys| keys.iter().filter(|k| **k == key).count())
+            .sum();
+        assert_eq!(
+            indexed,
+            entry.hint_sources.len(),
+            "the reverse index must not outlive the sources it mirrors"
+        );
+    }
+
+    /// Replica claimants outrank paid-only advertisers for a capped slot: they
+    /// are the only sources that assert possession, so only they are usable as
+    /// fetch candidates.
+    #[test]
+    fn replica_claimants_displace_paid_only_sources_at_the_cap() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x5B);
+
+        // Fill the cap with paid-only advertisers (no possession claim).
+        let mut first = test_entry(1);
+        first.replica_hint_sources.clear();
+        assert!(queues.add_pending_verify(key, first).admitted());
+        for advertiser in 2..=u8::try_from(MAX_HINT_SOURCES_PER_KEY).unwrap_or(u8::MAX) {
+            let mut paid_only = test_entry(advertiser);
+            paid_only.replica_hint_sources.clear();
+            queues.add_pending_verify(key, paid_only);
+        }
+        assert_eq!(
+            queues
+                .get_pending(&key)
+                .expect("pending entry")
+                .hint_sources
+                .len(),
+            MAX_HINT_SOURCES_PER_KEY,
+            "the cap should now be saturated with paid-only advertisers"
+        );
+
+        let claimant = peer_id_from_byte(0xF0);
+        let mut replica = test_entry(0xF0);
+        replica.hint_sources = HashSet::from([claimant]);
+        replica.replica_hint_sources = HashSet::from([claimant]);
+        queues.add_pending_verify(key, replica);
+
+        let entry = queues.get_pending(&key).expect("pending entry");
+        assert!(
+            entry.replica_hint_sources.contains(&claimant),
+            "a replica claimant must take a slot from a paid-only advertiser"
+        );
+        assert_eq!(
+            entry.hint_sources.len(),
+            MAX_HINT_SOURCES_PER_KEY,
+            "displacement must not grow the set"
+        );
+        assert!(
+            entry.hint_sources.contains(&claimant),
+            "the claimant must also be recorded as a live hint source"
+        );
+    }
+
+    /// A promoted key's retry reservation must stay charged to its owner.
+    ///
+    /// Reservations are deducted from the global pool, so if they are billed to
+    /// nobody an owner with many in-flight retries reads as under-loaded and
+    /// wins a larger fair share than it earned.
+    #[test]
+    fn promoted_retry_reservation_stays_charged_to_its_owner() {
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0x5C);
+        let owner = peer_id_from_byte(1);
+
+        assert!(queues.add_pending_verify(key, test_entry(1)).admitted());
+        assert_eq!(queues.charged_count_for_owner(&owner), 1);
+
+        assert!(queues.promote_pending_to_fetch(key, key, vec![owner]));
+        assert_eq!(
+            queues.retry_reserved_slot_count(),
+            1,
+            "promotion must reserve a slot for the later retry"
+        );
+        assert_eq!(
+            queues.charged_count_for_owner(&owner),
+            1,
+            "the reservation must remain charged to the promoting owner while \
+             the key sits in the fetch queue"
+        );
+
+        let candidate = queues.dequeue_fetch().expect("promoted key is fetchable");
+        queues.start_dequeued_fetch(candidate, owner);
+        assert_eq!(
+            queues.charged_count_for_owner(&owner),
+            1,
+            "the charge must survive the transfer into in-flight fetch"
+        );
+
+        queues.complete_fetch(&key);
+        assert_eq!(queues.retry_reserved_slot_count(), 0);
+        assert_eq!(
+            queues.charged_count_for_owner(&owner),
+            0,
+            "a terminal fetch must clear the owner's charge"
+        );
+    }
+
+    /// ADR-0005 decision 7: a sole sender may borrow the whole pool, but a
+    /// later sender reclaims its fair share within a bounded number of
+    /// admissions. This pins that convergence — the property that replaced the
+    /// removed `MAX_PENDING_VERIFY_PER_PEER` hard cap.
+    #[test]
+    fn borrowed_capacity_converges_to_fair_share_for_a_late_sender() {
+        /// Admissions the late sender is allowed before fairness must hold.
+        /// Each one reclaims at most a single borrowed slot, so reaching an
+        /// even split needs at least half the pool; the doubling is headroom
+        /// for skipped candidates, not an expectation.
+        const RECLAIM_BUDGET: usize = MAX_PENDING_VERIFY;
+
+        let mut queues = ReplicationQueues::new();
+        let borrower = peer_id_from_byte(1);
+        let late = peer_id_from_byte(2);
+
+        // A sole sender borrows the entire pool — permitted by design, and the
+        // behaviour that replaced the removed per-peer hard cap.
+        for index in 0..MAX_PENDING_VERIFY {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            assert!(queues
+                .add_pending_verify(xor_name_from_u32(index), test_entry(1))
+                .admitted());
+        }
+        assert_eq!(
+            queues.charged_count_for_owner(&borrower),
+            MAX_PENDING_VERIFY
+        );
+        assert!(
+            !queues
+                .add_pending_verify(xor_name_from_u32(u32::MAX), test_entry(1))
+                .admitted(),
+            "the borrower cannot exceed the global pool"
+        );
+
+        // A second sender arrives and keeps offering work. Every admission it
+        // wins must come out of the over-represented borrower's share.
+        let mut late_admitted = 0usize;
+        for offset in 0..RECLAIM_BUDGET {
+            let index = u32::try_from(MAX_PENDING_VERIFY + offset).unwrap_or(u32::MAX);
+            if queues
+                .add_pending_verify(xor_name_from_u32(index), test_entry(2))
+                .admitted()
+            {
+                late_admitted += 1;
+            }
+            if late_admitted >= MAX_PENDING_VERIFY / 2 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            queues.charged_count_for_owner(&late),
+            MAX_PENDING_VERIFY / 2,
+            "a late sender must reclaim an even share within its budget"
+        );
+        assert_eq!(
+            queues.charged_count_for_owner(&borrower) + late_admitted,
+            MAX_PENDING_VERIFY,
+            "reclaim must move slots between owners, never create them"
+        );
+        assert_eq!(
+            queues.pending_count(),
+            MAX_PENDING_VERIFY,
+            "the global bound must hold throughout"
+        );
     }
 
     #[test]
