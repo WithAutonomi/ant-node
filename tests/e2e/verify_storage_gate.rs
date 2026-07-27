@@ -51,12 +51,6 @@ const SYNC_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const CRAFTED_PAID_REQUEST_ID: u64 = 909_090;
 /// Request id for the crafted replica hint (message 2 of the attack).
 const CRAFTED_REPLICA_REQUEST_ID: u64 = 909_091;
-/// Paid close group narrowed for the far-key probe, so that a key outside the
-/// target's storage-admission group is outside its paid group too. At the
-/// production width (20) every node on a 12-node network is in every paid
-/// group, which would make "outside both gates" unrepresentable here.
-const FAR_KEY_PAID_GROUP: usize = 2;
-
 fn gate_config() -> ReplicationConfig {
     ReplicationConfig {
         close_group_size: GATE_CLOSE_GROUP_SIZE,
@@ -263,101 +257,165 @@ async fn replica_hint_storage_gate_observed_on_live_network() {
     harness.teardown().await.expect("teardown");
 }
 
-/// Probe: under the unified admission gate, a key that is out of range for
-/// *both* the paid group and storage admission must be rejected outright, and
-/// the label the sender picks must not change that.
+/// Send one labelled hint for `address` and report whether the target stored it
+/// by the end of the observation window.
 ///
-/// This is the "does mislabeling buy anything" question. With one gate, a
-/// replica hint and a paid hint for the same far key should reach the same
-/// verdict.
-#[tokio::test]
-#[serial]
-async fn far_key_rejected_under_either_label() {
-    let config = TestNetworkConfig {
-        node_count: GATE_NODE_COUNT,
-        replication_config: Some(ReplicationConfig {
-            close_group_size: GATE_CLOSE_GROUP_SIZE,
-            paid_list_close_group_size: FAR_KEY_PAID_GROUP,
-            ..ReplicationConfig::default()
-        }),
-        ..TestNetworkConfig::default()
-    };
-    let harness = TestHarness::setup_with_config(config)
-        .await
-        .expect("setup far-key network");
-    harness.warmup_dht().await.expect("warmup");
-
+/// The bytes are hosted on every other node and their payment cached, so a
+/// negative result means the target *declined* to store — never that it tried
+/// and failed to find a source.
+async fn drive_single_labelled_hint(
+    harness: &TestHarness,
+    content: &[u8],
+    address: [u8; 32],
+    as_replica: bool,
+    request_id: u64,
+) -> bool {
     let target = harness.test_node(TARGET_INDEX).expect("target");
     let target_p2p = target.p2p_node.as_ref().expect("target p2p");
     let target_peer = *target_p2p.peer_id();
     let target_storage = target.ant_protocol.as_ref().expect("protocol").storage();
 
-    // A key the target is not responsible for and not in the (narrowed) paid
-    // group for. Deliberately NOT seeded into the paid list: nothing should
-    // make this key relevant.
-    let (content, address) = find_key_for_target(
-        &harness,
-        TARGET_INDEX,
-        storage_admission_width(GATE_CLOSE_GROUP_SIZE),
-        false,
-        "far",
-    )
-    .await;
     for idx in 0..harness.node_count() {
         if idx == TARGET_INDEX {
             continue;
         }
         if let Some(node) = harness.test_node(idx) {
             if let Some(protocol) = node.ant_protocol.as_ref() {
-                let _ = protocol.storage().put(&address, &content).await;
+                let _ = protocol.storage().put(&address, content).await;
+                protocol.payment_verifier().cache_insert(address);
             }
         }
     }
 
+    assert!(
+        !target_storage.exists(&address).unwrap_or(true),
+        "target must not already hold the key before the hint"
+    );
+
     let advertiser = harness.test_node(ADVERTISER_INDEX).expect("advertiser");
     let advertiser_p2p = advertiser.p2p_node.as_ref().expect("advertiser p2p");
-
-    for (label, req) in [
-        (
-            "paid",
-            NeighborSyncRequest {
-                replica_hints: vec![],
-                paid_hints: vec![address],
-                bootstrapping: false,
-                commitment: None,
-            },
-        ),
-        (
-            "replica",
-            NeighborSyncRequest {
-                replica_hints: vec![address],
-                paid_hints: vec![],
-                bootstrapping: false,
-                commitment: None,
-            },
-        ),
-    ] {
-        let msg = ReplicationMessage {
-            request_id: CRAFTED_PAID_REQUEST_ID,
-            body: ReplicationMessageBody::NeighborSyncRequest(req),
-        };
-        let resp =
-            send_replication_request(advertiser_p2p, &target_peer, msg, SYNC_SEND_TIMEOUT).await;
-        assert!(
-            matches!(resp.body, ReplicationMessageBody::NeighborSyncResponse(_)),
-            "{label} hint accepted at the wire"
-        );
-    }
+    let (replica_hints, paid_hints) = if as_replica {
+        (vec![address], vec![])
+    } else {
+        (vec![], vec![address])
+    };
+    let msg = ReplicationMessage {
+        request_id,
+        body: ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+            replica_hints,
+            paid_hints,
+            bootstrapping: false,
+            commitment: None,
+        }),
+    };
+    let resp = send_replication_request(advertiser_p2p, &target_peer, msg, SYNC_SEND_TIMEOUT).await;
+    assert!(
+        matches!(resp.body, ReplicationMessageBody::NeighborSyncResponse(_)),
+        "target answered the hint at the wire: {resp:?}"
+    );
 
     let deadline = tokio::time::Instant::now() + CYCLE_OBSERVATION_WINDOW;
     while tokio::time::Instant::now() < deadline {
-        assert!(
-            !target_storage.exists(&address).unwrap_or(false),
-            "far key stored despite being outside both gates"
-        );
+        if target_storage.exists(&address).unwrap_or(false) {
+            return true;
+        }
         tokio::time::sleep(OBSERVATION_POLL).await;
     }
+    target_storage.exists(&address).unwrap_or(false)
+}
 
-    println!("PROBE-RESULT far_key_stored=false (both labels rejected)");
+/// Does the label a sender picks change what the receiver ends up storing?
+///
+/// The discriminating key lives in the **symmetric difference** of the two
+/// gates: inside the 20-wide paid close group (so it is relevant, and admission
+/// happens under either label) but outside `storage_admission_width` (so no
+/// storage responsibility). That is precisely where the pre-fix code diverged —
+/// a replica hint drove a fetch and a store, a paid hint only tracked validity.
+/// A key outside *both* gates cannot answer this question at all: every version
+/// of the code rejects it, so the test would pass without discriminating.
+///
+/// Scenario C is the positive control. Without it, "not stored" is
+/// indistinguishable from "the pipeline never ran".
+#[tokio::test]
+#[serial]
+async fn hint_label_does_not_change_what_gets_stored() {
+    let config = TestNetworkConfig {
+        node_count: GATE_NODE_COUNT,
+        replication_config: Some(gate_config()),
+        ..TestNetworkConfig::default()
+    };
+    let harness = TestHarness::setup_with_config(config)
+        .await
+        .expect("setup label-parity network");
+    harness.warmup_dht().await.expect("warmup");
+
+    let admission_width = storage_admission_width(GATE_CLOSE_GROUP_SIZE);
+
+    // -- Scenario A: symmetric-difference key, advertised as a REPLICA.
+    let (content_replica, key_replica) =
+        find_key_for_target(&harness, TARGET_INDEX, admission_width, false, "symdiff-r").await;
+    let stored_as_replica = drive_single_labelled_hint(
+        &harness,
+        &content_replica,
+        key_replica,
+        true,
+        CRAFTED_REPLICA_REQUEST_ID,
+    )
+    .await;
+
+    // -- Scenario B: a different symmetric-difference key, advertised as PAID.
+    //    Distinct keys so neither run can be contaminated by the other's
+    //    queue state.
+    let (content_paid, key_paid) =
+        find_key_for_target(&harness, TARGET_INDEX, admission_width, false, "symdiff-p").await;
+    let stored_as_paid = drive_single_labelled_hint(
+        &harness,
+        &content_paid,
+        key_paid,
+        false,
+        CRAFTED_PAID_REQUEST_ID,
+    )
+    .await;
+
+    // -- Scenario C (positive control): a key the target IS responsible for,
+    //    driven through the same helper. Proves the harness can observe a store
+    //    at all, so the two negatives above are refusals rather than silence.
+    let (content_in, key_in) =
+        find_key_for_target(&harness, TARGET_INDEX, admission_width, true, "in-range").await;
+    let stored_in_range = drive_single_labelled_hint(
+        &harness,
+        &content_in,
+        key_in,
+        true,
+        CRAFTED_REPLICA_REQUEST_ID,
+    )
+    .await;
+
+    println!(
+        "PARITY-RESULT replica_label_stored={stored_as_replica} \
+         paid_label_stored={stored_as_paid} in_range_control_stored={stored_in_range}"
+    );
+
+    assert!(
+        stored_in_range,
+        "CONTROL FAILED: the target did not store a key it IS responsible for, \
+         so the negative results below prove nothing (key {})",
+        hex::encode(key_in)
+    );
+    assert_eq!(
+        stored_as_replica,
+        stored_as_paid,
+        "SECURITY: the hint label changed the storage outcome for keys in the \
+         same gate position (replica key {}, paid key {})",
+        hex::encode(key_replica),
+        hex::encode(key_paid),
+    );
+    assert!(
+        !stored_as_replica,
+        "SECURITY: a replica hint made the target store a key it is not \
+         storage-responsible for (key {})",
+        hex::encode(key_replica)
+    );
+
     harness.teardown().await.expect("teardown");
 }
