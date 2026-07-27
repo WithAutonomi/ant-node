@@ -26,6 +26,18 @@ use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use tokio::sync::RwLock;
 
+// Test-only imports. Kept here rather than inside `mod tests` so every `use` in
+// this file lives at the top, and `#[cfg(test)]`-gated so non-test builds do
+// not carry them.
+#[cfg(test)]
+use crate::replication::config::REPAIR_HINT_MIN_AGE;
+#[cfg(test)]
+use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
+#[cfg(test)]
+use crate::storage::LmdbStorageConfig;
+#[cfg(test)]
+use tempfile::TempDir;
+
 // ---------------------------------------------------------------------------
 // Audit tick result
 // ---------------------------------------------------------------------------
@@ -89,40 +101,9 @@ pub(crate) fn responsible_audit_response_timeout(
 // Main audit tick
 // ---------------------------------------------------------------------------
 
-/// Execute one audit tick (Section 15 steps 2-9).
-///
-/// Returns the audit result. Caller is responsible for emitting trust events.
-///
-/// **Invariant 19**: Returns [`AuditTickResult::Idle`] immediately if
-/// `is_bootstrapping` is `true` — a node must not audit others while it
-/// is still bootstrapping.
-#[allow(clippy::implicit_hasher)]
-pub async fn audit_tick(
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    config: &ReplicationConfig,
-    sync_history: &HashMap<PeerId, PeerSyncRecord>,
-    is_bootstrapping: bool,
-) -> AuditTickResult {
-    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
-    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
-    audit_tick_with_repair_proofs(
-        p2p_node,
-        storage,
-        config,
-        sync_history,
-        &repair_proofs,
-        &audit_challenge_coordinator,
-        0,
-        is_bootstrapping,
-    )
-    .await
-}
-
 /// Execute one repair-proof-gated audit tick.
 ///
-/// This is the production path used by the replication engine. The
-/// compatibility [`audit_tick`] wrapper passes an empty proof table, so direct
+/// This is the production path used by the replication engine. Direct
 /// callers that have not adopted repair proofs remain conservative and do not
 /// audit peers for unproven keys.
 #[allow(
@@ -857,12 +838,6 @@ pub async fn handle_audit_challenge(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::replication::config::REPAIR_HINT_MIN_AGE;
-    use crate::replication::protocol::compute_audit_digest;
-    use crate::replication::types::{BootstrapClaimObservation, NeighborSyncState};
-    use crate::storage::LmdbStorageConfig;
-    use std::time::Instant;
-    use tempfile::TempDir;
 
     /// Simulated stored chunk count for tests. Large enough that the dynamic
     /// incoming audit limit (`2 * sqrt(N)`) never rejects small test challenges.

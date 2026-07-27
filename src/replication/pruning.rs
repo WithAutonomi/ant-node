@@ -353,53 +353,6 @@ struct PruneAuditContext<'a> {
 // Prune pass
 // ---------------------------------------------------------------------------
 
-/// Execute post-cycle responsibility pruning.
-///
-/// For each stored record K:
-/// - If `self` is within the storage-retention group
-///   (`close_group_size + STORAGE_ADMISSION_MARGIN`): clear
-///   `RecordOutOfRangeFirstSeen`.
-/// - If not in that group: set timestamp if not already set; delete if the
-///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old and all but one
-///   of the strict current close group prove they store the record.
-///
-/// For each `PaidForList` entry K:
-/// - If self is in `PaidCloseGroup(K)`: clear `PaidOutOfRangeFirstSeen`.
-/// - If not in group: set timestamp if not already set; remove entry if the
-///   timestamp is at least `PRUNE_HYSTERESIS_DURATION` old and three
-///   quarters of the current paid close group (15 of 20 at production
-///   parameters) confirm the key in their own `PaidForList`.
-///
-/// Convenience wrapper over [`run_prune_pass_with_context`] with a throwaway
-/// repair-proof table (only used to drop proofs for deleted keys) and no
-/// responder commitment state (so no commitment-retention deletion veto).
-/// The replication engine calls [`run_prune_pass_with_context`] directly.
-pub async fn run_prune_pass(
-    self_id: &PeerId,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    allow_remote_prune_audits: bool,
-) -> PruneResult {
-    let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
-    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
-    run_prune_pass_with_context(PrunePassContext {
-        self_id,
-        storage,
-        paid_list,
-        p2p_node,
-        config,
-        sync_state,
-        repair_proofs: &repair_proofs,
-        allow_remote_prune_audits,
-        commitment_state: None,
-        audit_challenge_coordinator: &audit_challenge_coordinator,
-    })
-    .await
-}
-
 /// Execute one prune pass (see the module docs for the record lifecycle).
 pub async fn run_prune_pass_with_context(ctx: PrunePassContext<'_>) -> PruneResult {
     let (stored_count, record_stats) = prune_stored_records(&ctx).await;
