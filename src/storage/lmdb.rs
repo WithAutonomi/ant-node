@@ -40,6 +40,27 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 /// Set to 256 MiB — enough for millions of LMDB pages.
 const MIN_MAP_SIZE: usize = 256 * 1024 * 1024;
 
+/// Maximum head-room (beyond the current data footprint) to reserve for the
+/// LMDB map **on Windows**.
+///
+/// The map is memory-mapped, and on Windows the kernel eagerly builds page
+/// tables proportional to the *mapped* size — ~1 byte of page-table per 512
+/// bytes mapped (an 8-byte PTE per 4 KiB page). Those page-table pages are
+/// resident, non-pageable kernel memory attributed to *no* process, so sizing
+/// the map to the whole disk (as [`compute_map_size`] otherwise does) costs
+/// ~0.2% of free disk in RAM/commit *per node*: a 10 TiB partition ≈ 20 GiB of
+/// page tables, multiplied by every node sharing the host. Linux populates map
+/// page tables lazily on access, so a sparse disk-sized map is nearly free
+/// there — this overhead is Windows-specific.
+///
+/// We therefore cap the head-room on Windows and lean on
+/// [`LmdbStorage::try_resize`] to extend the map on demand as data actually
+/// accumulates, keeping page-table overhead proportional to *stored data*
+/// rather than to *disk capacity*. At 32 GiB the resident page-table cost is
+/// ~64 MiB per node, and a resize happens at most once per 32 GiB written.
+#[cfg(windows)]
+const WINDOWS_MAP_HEADROOM: u64 = 32 * GIB;
+
 /// How often to re-query available disk space (in seconds).
 ///
 /// Between checks the cached result is trusted.  Disk space changes slowly
@@ -164,7 +185,8 @@ impl LmdbStorage {
             // Auto-scale: current DB footprint + available space − reserve.
             let computed = compute_map_size(&env_dir, config.disk_reserve)?;
             info!(
-                "Auto-computed LMDB map size: {:.2} GiB (available disk minus {:.2} GiB reserve)",
+                "Auto-computed LMDB map size: {:.2} GiB (data + available disk minus {:.2} GiB \
+                 reserve, head-room capped on Windows to bound page-table overhead)",
                 bytes_to_gib(computed as u64),
                 bytes_to_gib(config.disk_reserve),
             );
@@ -696,6 +718,10 @@ enum PutOutcome {
 /// it back ensures the map is always large enough for the data already
 /// stored.
 ///
+/// On Windows the disk-headroom term is additionally capped at
+/// [`WINDOWS_MAP_HEADROOM`] to bound page-table overhead (see that constant);
+/// [`LmdbStorage::try_resize`] extends the map on demand as data grows.
+///
 /// The result is page-aligned and never falls below [`MIN_MAP_SIZE`].
 fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let available = fs2::available_space(db_dir)
@@ -705,10 +731,7 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let mdb_file = db_dir.join("data.mdb");
     let current_db_bytes = std::fs::metadata(&mdb_file).map_or(0, |m| m.len());
 
-    // available_space excludes the DB file, so we add it back to get the
-    // total space the DB could occupy while still leaving `reserve` free.
-    let growth_room = available.saturating_sub(reserve);
-    let target = current_db_bytes.saturating_add(growth_room);
+    let target = map_target_bytes(current_db_bytes, available, reserve);
 
     // Align up to system page size (required by heed's resize).
     let page = page_size::get() as u64;
@@ -716,6 +739,27 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
 
     let result = usize::try_from(aligned).unwrap_or(usize::MAX);
     Ok(result.max(MIN_MAP_SIZE))
+}
+
+/// Head-room policy for the LMDB map, split out from [`compute_map_size`] so it
+/// is unit-testable without touching the real filesystem.
+///
+/// `map = current_db_bytes + max(0, available − reserve)`, with the head-room
+/// term capped at [`WINDOWS_MAP_HEADROOM`] on Windows. Existing data
+/// (`current_db_bytes`) is always covered so a resize can never truncate the
+/// database, even when the head-room cap or a nearly-full disk drives the
+/// growth term to zero.
+fn map_target_bytes(current_db_bytes: u64, available: u64, reserve: u64) -> u64 {
+    // available_space excludes the DB file, so we add it back to get the
+    // total space the DB could occupy while still leaving `reserve` free.
+    let growth_room = available.saturating_sub(reserve);
+
+    // On Windows, bound the head-room so page tables stay proportional to
+    // stored data rather than disk capacity. Elsewhere, use all reachable space.
+    #[cfg(windows)]
+    let growth_room = growth_room.min(WINDOWS_MAP_HEADROOM);
+
+    current_db_bytes.saturating_add(growth_room)
 }
 
 /// Reject the write early if available disk space is below `reserve`.
@@ -740,6 +784,44 @@ fn check_disk_space(db_dir: &Path, reserve: u64) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn map_target_covers_existing_data_and_headroom() {
+        // A partition with far more free space than any node needs.
+        let huge_free = 100 * 1024 * GIB; // 100 TiB
+        let reserve = 500 * MIB;
+
+        // Fresh node, no data yet.
+        let fresh = map_target_bytes(0, huge_free, reserve);
+        // Node already holding 16 GiB of chunks.
+        let with_data = map_target_bytes(16 * GIB, huge_free, reserve);
+
+        #[cfg(windows)]
+        {
+            // Windows: head-room is capped, so the map (and thus page tables)
+            // stay bounded regardless of disk size. Existing data always sits
+            // on top of the capped head-room.
+            assert_eq!(fresh, WINDOWS_MAP_HEADROOM);
+            assert_eq!(with_data, 16 * GIB + WINDOWS_MAP_HEADROOM);
+            // Sanity: page-table cost (~map/512) is tens of MiB, not tens of GiB.
+            assert!(with_data / 512 < 128 * MIB);
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Other platforms keep the disk-sized map (lazy page tables cost
+            // nothing), so head-room is the full free span minus reserve.
+            assert_eq!(fresh, huge_free - reserve);
+            assert_eq!(with_data, 16 * GIB + (huge_free - reserve));
+        }
+    }
+
+    #[test]
+    fn map_target_never_truncates_data_when_disk_nearly_full() {
+        // Free space below the reserve → head-room saturates to 0 on every
+        // platform, but the existing 4 GiB of data must still be covered.
+        assert_eq!(map_target_bytes(4 * GIB, 100 * MIB, 500 * MIB), 4 * GIB);
+    }
 
     async fn create_test_storage() -> (LmdbStorage, TempDir) {
         let temp_dir = TempDir::new().expect("create temp dir");
