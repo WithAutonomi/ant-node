@@ -334,3 +334,234 @@ attributing malicious silence/transient conditions network-wide is the
 (out-of-scope) distributed non-response problem. This supersedes the "unanswerable
 quoted pin is graced, never confirmed" rule and deletes `RejectKind::is_graced`;
 the regression tests are updated accordingly.
+
+---
+
+## Amendment 2 (2026-07-14): first audits are bounded best-effort sampling — payments nominate, the clock launches
+
+The original decision made the monetized first audit deterministic: every pinned
+quote in every verified client-put proof entered the first-audit queue at every
+verifying storer, gated only by the per-peer 30-minute cooldown. That per-peer
+gate bounds one observer against one peer but places no bound on the aggregate:
+fleet-wide launch pressure scaled as
+`uploads x pinned-quotes-per-proof x verifying-storers`, with hourly commitment
+rotation re-arming pin-level dedup every rotation. In the v0.14.3 production
+rollout this amplification saturated the audit-responder admission pools;
+overflow challenges were dropped and recorded by auditors as Timeout failures
+(545k Timeout errors/24h fleet-wide, ~31% slower downloads). A matched staging
+ablation attributed 97.7% of storage-commitment audit traffic and 99.955% of
+one-key timeout failures to this path, and a per-service concurrency cap alone
+(without a launch-rate budget) reproduced the storm. Amendment 1's answerability
+guarantees are unaffected; this amendment changes only who is nominated and how
+fast nominations launch.
+
+**Nomination narrows to paid pins.** Only the candidate whose on-chain
+settlement actually verified is nominated: the single-node path nominates the
+settlement-verified median candidate (not the whole bundle), and the merkle
+path nominates the contract-paid indices (not the whole pool). Unpaid quotes
+earned nothing; their gossiped commitments remain under the ADR-0002 lottery.
+The storer-side cross-check (arithmetic re-check and mismatch evidence) still
+runs on every quote and candidate.
+
+**Launches are budgeted, not deterministic.** Each node's first-audit drainer
+runs a launch limiter: a token bucket (burst 2, one token per 5 minutes — a
+sustained per-node rate of 12 launches/hour, plus at most the burst of 2 in
+the first hour), an in-flight cap (2), and a uniform
+0-30s launch jitter so the storers of one chunk, which all verify the same
+payment at the same instant, do not challenge the paid peer simultaneously.
+Fleet-wide first-audit pressure is therefore `nodes x refill-rate`, independent
+of upload volume. Budget deferral is penalty-free: a deferred pin stays pending
+(bounded, one entry per peer) and launches when tokens allow; only audits that
+actually launch have consequences.
+
+**Pending coalescing keeps the highest count per peer, not merely the newest.**
+The per-peer pending slot retains the pin that most needs auditing — the
+HIGHEST committed key count (newest on an equal-count tie). A strictly-lower-
+count nomination for a peer never displaces a higher-count pending pin, and a
+suppressed lower nomination does not disturb the retained pin's queue position.
+Without this rule a peer could erase an inflated (audit-worthy) commitment for
+the cost of one cheaper same-peer settlement, since the count-jump override
+only compares against the last AUDITED count and a sidecar-only inflated pin
+has no gossip-lottery backstop. The same rule governs the requeue of a
+reservation that loses the shared-cooldown race. Accepted residual: if the
+retained higher pin later ages out of the answerability window (un-auditable
+once aged, grace removed), the single per-peer slot has already discarded the
+lower fallback — a small coverage reduction versus keeping both, not a revival
+of the lower-count-displacement bypass.
+
+**Per-peer re-audit window survives pin rotation.** After a first audit
+launches at a peer, further nominations for that peer are dropped for 2 hours
+(inside the 3h answerability TTL) — unless the new pin's committed key count
+exceeds the audited one by more than 1.5x, which re-nominates immediately. The
+jump override preserves the anti-inflation property this queue exists for: an
+inflated commitment delivered only as a quote sidecar is visible to payment
+verifiers alone, so no gossip-lottery audit can ever select it; a peer that
+passes an audit on an honest count and then mints a much larger sidecar-only
+commitment is re-audited at once. Ordinary rotations with a stable count stop
+re-arming the fleet.
+
+**Coverage restated.** "The latest commitment earning money for a peer always
+faces an audit soon" becomes: the FIRST commitment earning money for a peer,
+and any later commitment whose claimed count materially jumps, faces an audit
+soon (minutes, from multiple independent storers, each within its own budget);
+commitments rotated without material count change rely on the ADR-0002 lottery
+for re-audit. First-audit coverage is best-effort supplementary sampling under
+an explicit load budget, not a per-payment guarantee. The scheduler's funnel
+(received / queued / coalesced / suppressed_lower / duplicates /
+capacity_evicted / window_deduped / rate_deferred / cooldown_deferred /
+launched / terminal outcomes, plus tokens and in-flight gauges) is exported in
+the periodic scheduler summary so this coverage is measurable in production;
+`suppressed_lower` in particular surfaces attempted cheaper-pin self-erasure.
+
+**Every pipeline stage is bounded, and the invariants hold by construction.**
+The verifier-to-drainer nomination channel is bounded (producers `try_send`
+and drop on full — penalty-free), the pending set is a bounded
+highest-count-per-peer LRU, and launches are token-bucketed. Durable
+suppression (the first-audited pin dedup, the per-peer re-audit window, the
+shared cooldown stamp, the lane flip, and the launch count) is committed ONLY
+at promotion, after an authoritative answerability + cooldown check-and-stamp
+taken immediately before the wire challenge; a reservation cancelled during
+its jitter refunds its token, releases its in-flight slot, and leaves no
+suppression behind. The answerability screen runs both as a schedule-time
+prefilter (over the whole jitter horizon) and authoritatively at promotion, so
+a pin can never be challenged outside its window regardless of how deferral
+time, jitter, and the skew margin compose.
+
+**Nomination scope and known coverage limits (measured in staging).** (a) On
+the single-node path only the FIRST settlement-verified median candidate is
+nominated; if a client settles several tied-median candidates, gossiped extras
+retain the ADR-0002 lottery but sidecar-only extra settled pins do not and are
+an accepted best-effort residual. The merkle path nominates every
+contract-paid index. (b) The per-peer re-audit window is stamped at LAUNCH, not
+at a passing outcome: a peer that answers with a `Transient`/silence reaches
+the ADR-0002 timeout lane and is not automatically re-launched by this
+scheduler (automatic retries would change the load bound and need their own
+policy). Both effects reduce coverage without weakening the price ceiling and
+are to be quantified against the terminal-outcome counters in the matched
+staging run.
+
+**Accepted residuals.** (1) *Budget-exhaustion starvation, mitigated by
+alternating lanes:* an attacker can try to keep observers' launch budgets
+saturated with newer settled decoy nominations so an older pending pin
+expires un-first-audited. Stated precisely: suppressing one pin requires
+outcompeting roughly 31 launch opportunities per observer over the 150-minute
+eligibility window; a single decoy settlement consumes budget at every storer
+of its chunk simultaneously (a cohort, not per-observer, cost), a merkle
+settlement nominates every paid index, principal recycles through
+sybil-controlled reward addresses (the real costs are gas, liquidity, and
+close-group positioning, not the transferred amount), and a sidecar-only
+target pin has NO lottery backstop. The scheduler therefore does not rely on
+economics alone: consecutive LAUNCHES strictly alternate between a
+newest-first and an oldest-first lane. The lane advances on every committed
+launch — not per scheduling pass (most pass over an empty bucket, and a pass
+is triggered by ingress, so per-pass parity would be attacker-steerable) and
+not once per launching pass (a full burst spends two tokens in one pass, and
+those two must alternate with each other). Fresh decoy nominations therefore
+cannot capture the oldest lane, and an aging pin is served there.
+
+Two suppression routes remain, both requiring real settled payments at scale.
+An attacker holding pre-aged pending decoys at every observer can occupy the
+oldest lane too — though that lane drains them, and the per-peer re-audit
+window blocks the same issuers from refreshing them. And 4096 fresher
+distinct-peer nominations at an observer evict the target from that
+observer's pending LRU, which is permanent for that nomination: coverage then
+depends on the peer's NEXT settled payment (or, for a gossiped commitment, on
+the ADR-0002 lottery). We accept this: both routes cost per-observer sybil
+positioning plus a stream of genuine on-chain settlements, and neither is
+free or silent — the scheduler funnel exports capacity evictions and lane
+outcomes. (2) *Settlement overwrite (pre-existing,
+contract-level):* the vault's `payForQuotes` unconditionally overwrites
+`completedPayments[quoteHash]`, so a third party who learns a quote hash can
+overwrite the record (already breaking the long-standing amount check with a
+1-wei payment, on all node versions) and now equivalently the
+rewards-address binding. This griefing race predates this amendment and
+needs a vault-side fix (reject or accumulate on existing entries); it is
+tracked as follow-up work, not a property this ADR can enforce from the node
+side.
+
+## Amendment 3 (2026-07-21): expired pending entries are dropped eagerly
+
+A pending entry past the answerability horizon can never launch, but the
+reserve scan that collected such entries only runs when launch tokens are
+available — under sustained load, effectively never (2026-07-17 staging:
+median oldest-pending age 270 minutes against the 150-minute eligibility
+window). Dead entries squatted the per-peer LRU, skewed the
+`pending`/`oldest_pending_quote_age_ms` telemetry, and — because coalescing
+compares key counts only — a dead higher-count pin permanently vetoed every
+live lower-count nomination for its peer (realistic after a legitimate
+prune). Fixed: enqueue drops a dead incumbent before coalescing, and the
+summary tick sweeps expired entries regardless of tokens; both removals are
+accounted as `outside_answerability_window`.
+
+Coverage remains as Amendment 2 states — a budgeted probabilistic exam, not
+a per-payment guarantee. Quantitatively: round 1 is structural, so only the
+3-5 fresh-random round-2 byte openings prove possession; per-audit detection
+of a peer missing fraction `x` of committed bytes is ~`1-(1-x)^k` dispersed
+(`k` = opened leaves), degrading toward the subtree-selection rate when
+clustered, compounding across the fleet's per-peer audit rate. Proposed
+target, pending an adversarial staging run with hash-retaining deleters:
+at least 99% detection within 24 hours for at least 1% missing bytes.
+
+## Amendment 4 (2026-07-23): pending admission is sized to the launch budget
+
+Amendment 3 stopped dead entries from squatting the queue, but admission
+itself was still unbounded relative to the budget: `pending` shared the
+4096-entry commitment-cache cap while the token bucket can launch at most
+~31 audits inside one effective answerability window (150 min of
+eligibility at one token per 5 minutes, plus a burst of 2). At the
+2026-07-17 staging arrival rate (~113 admitted nominations per node-hour
+against ~12 launches) over 99% of admitted work could never launch: the
+queue was an aging backlog whose entries mostly expired, and the
+`pending` / `oldest_pending_quote_age_ms` telemetry measured the backlog's
+age rather than schedulable work.
+
+`pending` is now capped at `FIRST_AUDIT_PENDING_CAP`, the number of usable
+launches inside one window under the STRICT reserve-time predicate: burst
+tokens at age zero plus every refill that still leaves the quote answerable
+through the maximum launch jitter and send slack (currently 31). The unit
+test simulates the shipped predicate instant-by-instant and must agree with
+the derivation, so retuning the budget, window, or jitter re-sizes
+admission automatically. The summary line reports `pending_cap` and
+`reserved` (the one reservation held outside the queue), so schedulable
+occupancy is `pending + reserved`, a first-class dashboard quantity.
+
+Overflow follows two rules, in order. First, an arrival that would displace
+a different peer grants the queue a reservation opportunity before anything
+is evicted: if no reservation is outstanding and a token and in-flight slot
+are free, one pending entry moves into the reservation and the arrival is
+admitted with no eviction. The scheduler holds at most ONE outstanding
+jitter reservation — a deliberate one-entry guard slot outside the queue,
+so total schedulable occupancy is at most `cap + 1`, reported as
+`pending` plus `reserved` — which means an ingress burst consumes at most
+one launch opportunity per jitter window, even while a second burst token
+remains. Second, if an otherwise-admissible distinct-peer arrival still
+finds the queue at capacity after that opportunity, it displaces a
+uniformly RANDOM incumbent, accounted as `capacity_evicted` — the steady
+overload signal.
+Random selection is the security property: with deterministic retention
+(oldest-out or newest-kept), an ordered batch of `cap` distinct-peer paid
+nominations flushes a chosen target with certainty; with a random victim,
+each overflow evicts a specific target with probability `1/cap`, so
+suppressing it with confidence `1−e` costs about `cap · ln(1/e)`
+distinct-peer nominations (~95 paid pins for 95% at cap 31, ~140 for 99%)
+and is never certain, while the target may launch in the meantime. A fresh
+pin still always enters the sample with an unpredictable chance of prompt
+audit; refusing at the door would instead let a sustained flood guarantee
+every later pin is never admitted. Displacement stamps no suppression
+state, so a displaced peer's next nomination is judged like any newcomer.
+Under light load (arrivals below the drain rate) the cap is not reached
+and coverage remains exhaustive.
+
+For comparison, the pre-cap queue's 4,096-entry bound made targeted
+eviction expensive but protected work that mostly could not launch anyway:
+at observed staging rates, over 99% of those entries expired unaudited, so
+the practical suppression of any given pin was already the budget share,
+not the eviction threshold. The honest quantity to compare across designs
+is P(audited before answerability expiry), which the cap leaves at the
+budget share while making the skipped remainder visible at admission time.
+
+Coverage semantics are otherwise unchanged from Amendments 2-3: a budgeted
+probabilistic exam backstopped by the gossip-lottery path. What changes is
+the honesty of the funnel — admitted now approximates launchable, and
+overflow is explicit at admission time (`capacity_evicted`) instead of
+surfacing hours later as mass expiry (`outside_answerability_window`).

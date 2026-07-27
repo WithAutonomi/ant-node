@@ -484,6 +484,86 @@ pub const FIRST_AUDIT_SUMMARY_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// events the drainer processes audits, then loops back to drain more.
 pub const FIRST_AUDIT_DRAIN_BATCH: usize = 64;
 
+/// ADR-0004 Amendment 2: token-bucket refill interval for monetized first-audit
+/// launches — one launch token per interval, per node.
+///
+/// This is the load-bearing bound: fleet-wide first-audit pressure becomes
+/// `nodes x (1 / interval)` regardless of upload volume, where the pre-amendment
+/// scheduler scaled with `uploads x pinned-quotes-per-proof x verifying-storers`
+/// (measured at ~110 storage-commitment audit events/hour/service in the
+/// DEV-01 staging run, with 77.7% of launches timing out in the DEV-03
+/// per-service-concurrency attempt). At 5 minutes the sustained rate is
+/// 12 launches/hour/node (a drained burst bucket adds at most
+/// [`FIRST_AUDIT_BUDGET_BURST`] more in the first hour); steady-state demand
+/// sits far below it because nomination is paid-pin-only and re-nominations
+/// are suppressed by [`FIRST_AUDIT_PEER_REAUDIT_INTERVAL`].
+pub const FIRST_AUDIT_LAUNCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// ADR-0004 Amendment 2: token-bucket capacity for monetized first-audit
+/// launches.
+///
+/// Lets a node absorb a small burst of NEW earning peers (several distinct
+/// paid pins verified back-to-back) without waiting a full refill interval per
+/// launch, while keeping the sustained rate pinned to
+/// [`FIRST_AUDIT_LAUNCH_INTERVAL`].
+pub const FIRST_AUDIT_BUDGET_BURST: u32 = 2;
+
+/// ADR-0004 Amendment 2: max concurrently in-flight monetized first audits per
+/// node.
+///
+/// A first audit can hold a slot for the full size-scaled two-round deadline,
+/// so without this cap a burst of slow/timing-out targets would pile up
+/// concurrent subtree audits even under the launch-rate budget. Deferral is
+/// penalty-free: the pin stays pending and is retried when a slot frees.
+pub const FIRST_AUDIT_MAX_INFLIGHT: u64 = 2;
+
+/// ADR-0004 Amendment 2: max uniform random delay applied before sending a
+/// monetized first-audit challenge.
+///
+/// Every storer of a chunk verifies the same payment at the same instant, so
+/// unjittered first audits from the whole close group would hit the paid peer
+/// simultaneously and trip its per-peer responder admission cap (drops that
+/// auditors then record as Timeout). The jitter decorrelates the observers.
+pub const FIRST_AUDIT_LAUNCH_JITTER_MAX: Duration = Duration::from_secs(30);
+
+/// ADR-0004 Amendment 2: per-peer suppression window between monetized first
+/// audits, across commitment rotations.
+///
+/// Pin-level dedup alone is defeated by the hourly commitment rotation (every
+/// rotation mints a fresh pin, re-arming every observer). After a first audit
+/// LAUNCHES at a peer, further monetized nominations for that peer are dropped
+/// for this window — unless the new pin's committed key count exceeds the
+/// audited one by more than [`FIRST_AUDIT_COUNT_JUMP_NUM`]/
+/// [`FIRST_AUDIT_COUNT_JUMP_DEN`] (a peer that passes an audit on an honest
+/// count and then mints a much larger commitment must be re-nominated
+/// immediately: inflated SIDECAR-ONLY pins are visible to payment verifiers
+/// only, so no gossip-lottery audit can ever cover them). Kept comfortably
+/// inside the 3h answerability TTL so a re-nomination after the window still
+/// lands in-window. Gossip-lottery re-audits are unaffected.
+pub const FIRST_AUDIT_PEER_REAUDIT_INTERVAL: Duration = Duration::from_secs(2 * 3600);
+
+/// ADR-0004 Amendment 2: committed-count jump that overrides the per-peer
+/// re-audit window, as a ratio (`new > old * NUM / DEN`, integer math).
+///
+/// 3/2: a >1.5x growth in claimed committed keys within the suppression window
+/// re-nominates the peer despite a recent first audit.
+pub const FIRST_AUDIT_COUNT_JUMP_NUM: u64 = 3;
+/// Denominator of the count-jump override ratio. See
+/// [`FIRST_AUDIT_COUNT_JUMP_NUM`].
+pub const FIRST_AUDIT_COUNT_JUMP_DEN: u64 = 2;
+
+/// ADR-0004 Amendment 2: capacity of the bounded verifier-to-drainer
+/// monetized-pin channel.
+///
+/// Nominations are gated behind SETTLED on-chain payments, so legitimate
+/// ingress is tiny; the drainer drains every wake (batched at
+/// [`FIRST_AUDIT_DRAIN_BATCH`]) and coalesces newest-per-peer, so a backlog
+/// this deep implies the drainer is starved, not that work is arriving fast.
+/// Producers `try_send` and drop on full: a dropped nomination is
+/// penalty-free; the peer's gossiped commitments stay lottery-covered and
+/// its next settled payment re-nominates the paid pin.
+pub const FIRST_AUDIT_INGRESS_CAPACITY: usize = 1024;
+
 /// Number of subtree leaves spot-checked against real chunk bytes per audit
 /// (ADR-0002 real-bytes layer).
 ///

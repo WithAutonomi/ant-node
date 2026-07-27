@@ -70,6 +70,9 @@ mod subtree_audit_testnet;
 mod fetch_responsibility_recheck;
 
 #[cfg(test)]
+mod first_audit_ab;
+
+#[cfg(test)]
 mod verify_storage_gate;
 
 pub use anvil::TestAnvil;
