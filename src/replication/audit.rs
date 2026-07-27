@@ -48,7 +48,11 @@ pub enum AuditTickResult {
         /// The peer claiming bootstrap status.
         peer: PeerId,
     },
-    /// No eligible peers for audit this tick.
+    /// No eligible peers for audit this tick, OR the auditor could not run a
+    /// meaningful check (e.g. the responsible-chunk audit found every sampled
+    /// key's own local copy unreadable). Nothing was proven either way: no
+    /// holder credit, no trust event, no penalty. The audit simply did not
+    /// happen this tick, exactly like having no peer to audit.
     Idle,
     /// Audit skipped (not enough local keys).
     InsufficientKeys,
@@ -535,62 +539,155 @@ async fn verify_digests(
     }
 
     let challenged_peer_bytes = challenged_peer.as_bytes();
-    let mut failed_keys = Vec::new();
-
+    let mut checks = Vec::with_capacity(keys.len());
     for (i, key) in keys.iter().enumerate() {
-        let received_digest = &digests[i];
-
-        // Check for absent sentinel.
-        if *received_digest == ABSENT_KEY_DIGEST {
-            failed_keys.push(AuditKeyFailure::absent(*key));
-            continue;
-        }
-
-        // Recompute expected digest from local copy.
+        // Read the local copy (logging the gone-vs-error distinction), then
+        // classify the peer's digest against it via the pure `classify_local_digest`.
         let local_bytes = match storage.get_raw(key).await {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) => Some(bytes),
             Ok(None) => {
-                // We should hold this key (we sampled it), but it's gone.
                 warn!(
                     "Audit: local key {} disappeared during audit",
                     hex::encode(key)
                 );
-                continue;
+                None
             }
             Err(e) => {
                 warn!("Audit: failed to read local key {}: {e}", hex::encode(key));
-                continue;
+                None
             }
         };
+        checks.push(classify_local_digest(
+            &digests[i],
+            key,
+            nonce,
+            challenged_peer_bytes,
+            local_bytes.as_deref(),
+        ));
+    }
 
-        let expected = compute_audit_digest(nonce, challenged_peer_bytes, key, &local_bytes);
-        if *received_digest != expected {
-            failed_keys.push(AuditKeyFailure::digest_mismatch(*key));
+    match aggregate_digest_checks(challenged_peer, checks, keys.len()) {
+        // No key explicitly failed: Passed (all verified) or Idle (any skip).
+        Ok(verdict) => verdict,
+        // Step 9: responsibility confirmation for the failed keys.
+        Err(failed_keys) => {
+            handle_classified_audit_failure(
+                challenged_peer,
+                challenge_id,
+                &failed_keys,
+                AuditFailureReason::DigestMismatch,
+                keys.len(),
+                p2p_node,
+                config,
+            )
+            .await
         }
     }
+}
 
-    if failed_keys.is_empty() {
-        info!(
-            "Audit: peer {challenged_peer} passed (all {} keys verified)",
-            keys.len()
-        );
-        return AuditTickResult::Passed {
-            challenged_peer: *challenged_peer,
-            keys_checked: keys.len(),
-        };
+/// Fold per-key [`DigestCheck`] outcomes into the responsible-audit result.
+///
+/// `Ok` when NO key explicitly failed: `Passed` iff every key verified, else
+/// `Idle` (any key was skipped — the response was not fully verified, so it must
+/// not mint a pass; see [`no_failure_verdict`]). `Err(failed_keys)` when at
+/// least one key failed, for the caller's responsibility-confirmation path.
+///
+/// Pure, so the security-critical fold — a skipped key must count as `skipped`,
+/// never `verified` — is unit-tested without a live `P2PNode`.
+fn aggregate_digest_checks(
+    challenged_peer: &PeerId,
+    checks: Vec<DigestCheck>,
+    challenged: usize,
+) -> Result<AuditTickResult, Vec<AuditKeyFailure>> {
+    let mut verified = 0usize;
+    let mut skipped = 0usize;
+    let mut failed_keys = Vec::new();
+    for check in checks {
+        match check {
+            DigestCheck::Verified => verified += 1,
+            DigestCheck::Skipped => skipped += 1,
+            DigestCheck::Failed(f) => failed_keys.push(f),
+        }
     }
+    if failed_keys.is_empty() {
+        Ok(no_failure_verdict(
+            challenged_peer,
+            challenged,
+            verified,
+            skipped,
+        ))
+    } else {
+        Err(failed_keys)
+    }
+}
 
-    // Step 9: Responsibility confirmation for failed keys.
-    handle_classified_audit_failure(
-        challenged_peer,
-        challenge_id,
-        &failed_keys,
-        AuditFailureReason::DigestMismatch,
-        keys.len(),
-        p2p_node,
-        config,
-    )
-    .await
+/// Outcome of checking one challenged key's digest against the auditor's own copy.
+#[cfg_attr(test, derive(Debug))]
+enum DigestCheck {
+    /// The peer's digest matches the digest recomputed from local bytes.
+    Verified,
+    /// The auditor's own copy was unreadable, so the peer's digest for this key
+    /// could not be checked. Not the peer's fault; not a pass either.
+    Skipped,
+    /// A provable failure: the absent sentinel, or a digest that disagrees with
+    /// the local copy.
+    Failed(AuditKeyFailure),
+}
+
+/// Classify one challenged key's response against the auditor's local copy.
+///
+/// `local_bytes` is `None` when the auditor's own copy is unreadable (gone or a
+/// read error) — the peer's digest is then unverifiable, so the key is
+/// [`DigestCheck::Skipped`], never silently treated as a pass. The absent
+/// sentinel and a digest that disagrees with the local bytes are provable
+/// failures.
+fn classify_local_digest(
+    received_digest: &[u8; 32],
+    key: &XorName,
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    local_bytes: Option<&[u8]>,
+) -> DigestCheck {
+    if *received_digest == ABSENT_KEY_DIGEST {
+        return DigestCheck::Failed(AuditKeyFailure::absent(*key));
+    }
+    let Some(bytes) = local_bytes else {
+        return DigestCheck::Skipped;
+    };
+    if *received_digest == compute_audit_digest(nonce, challenged_peer_bytes, key, bytes) {
+        DigestCheck::Verified
+    } else {
+        DigestCheck::Failed(AuditKeyFailure::digest_mismatch(*key))
+    }
+}
+
+/// Decide the verdict of a responsible-chunk audit when NO key explicitly
+/// failed (no absent sentinel, no digest mismatch on a readable key).
+///
+/// A `Passed` here means "the whole response was verified against local bytes".
+/// If any key was `skipped` (its own local copy was unreadable, so the peer's
+/// digest for it could not be checked), the response was NOT fully verified, so
+/// the tick yields no verdict (`Idle`: no success trust event, no penalty)
+/// rather than a pass reflecting only the keys that were readable. `verified ==
+/// 0` (nothing readable at all) is the same no-verdict case.
+fn no_failure_verdict(
+    challenged_peer: &PeerId,
+    challenged: usize,
+    verified: usize,
+    skipped: usize,
+) -> AuditTickResult {
+    if skipped > 0 || verified == 0 {
+        warn!(
+            "Audit: {skipped} of {challenged} challenged keys for {challenged_peer} were \
+             locally unverifiable; audit did not conclude this tick (Idle, no verdict)"
+        );
+        return AuditTickResult::Idle;
+    }
+    info!("Audit: peer {challenged_peer} passed (all {verified} keys verified)");
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: verified,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +971,139 @@ mod tests {
     /// Build a `PeerId` matching the raw bytes used in a challenge.
     fn peer_id_from_bytes(bytes: [u8; 32]) -> PeerId {
         PeerId::from_bytes(bytes)
+    }
+
+    // -- classify_local_digest: per-key skip/verify/fail accounting -----------
+
+    #[test]
+    fn classify_local_digest_verified_on_matching_local_bytes() {
+        let (key, nonce, peer, bytes) = ([1u8; 32], [2u8; 32], [3u8; 32], b"chunk-bytes");
+        let good = compute_audit_digest(&nonce, &peer, &key, bytes);
+        assert!(matches!(
+            classify_local_digest(&good, &key, &nonce, &peer, Some(bytes)),
+            DigestCheck::Verified
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_skipped_when_local_copy_unreadable() {
+        // When a key's own local copy is unreadable, its digest cannot be
+        // checked, so the outcome is Skipped (not Verified) regardless of the
+        // received digest value. no_failure_verdict then turns any skip into
+        // Idle, so an unverified key never contributes to a pass.
+        let (key, nonce, peer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        let unchecked = [0xAB; 32];
+        assert!(matches!(
+            classify_local_digest(&unchecked, &key, &nonce, &peer, None),
+            DigestCheck::Skipped
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_failed_on_digest_mismatch() {
+        let (key, nonce, peer, bytes) = ([1u8; 32], [2u8; 32], [3u8; 32], b"chunk-bytes");
+        let wrong = [0xCD; 32];
+        assert!(matches!(
+            classify_local_digest(&wrong, &key, &nonce, &peer, Some(bytes)),
+            DigestCheck::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_absent_sentinel_fails_even_when_local_unreadable() {
+        // Precedence: the peer's explicit admission of absence is a provable
+        // failure that must NOT be downgraded to `Skipped` just because the
+        // auditor's own copy is also unreadable (`None`). Absent is checked
+        // before the local read.
+        let (key, nonce, peer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        match classify_local_digest(&ABSENT_KEY_DIGEST, &key, &nonce, &peer, None) {
+            DigestCheck::Failed(f) => assert_eq!(f.kind, AuditKeyFailureKind::Absent),
+            other => panic!("absent sentinel must fail, got {other:?}"),
+        }
+    }
+
+    // -- aggregate_digest_checks: the composed fold verify_digests uses --------
+
+    fn peer() -> PeerId {
+        peer_id_from_bytes([0x44; 32])
+    }
+
+    #[test]
+    fn aggregate_all_verified_is_passed() {
+        let checks = vec![DigestCheck::Verified, DigestCheck::Verified];
+        assert!(matches!(
+            aggregate_digest_checks(&peer(), checks, 2),
+            Ok(AuditTickResult::Passed {
+                keys_checked: 2,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn aggregate_verified_plus_skipped_is_idle_not_passed() {
+        // The composition the split helpers alone do not cover: if any key was
+        // skipped, the fold must return Idle (not Passed), so a skipped key is
+        // never counted as verified.
+        let checks = vec![DigestCheck::Verified, DigestCheck::Skipped];
+        assert!(matches!(
+            aggregate_digest_checks(&peer(), checks, 2),
+            Ok(AuditTickResult::Idle)
+        ));
+    }
+
+    #[test]
+    fn aggregate_any_failed_returns_failed_keys_for_confirmation() {
+        let bad = [9u8; 32];
+        let checks = vec![
+            DigestCheck::Verified,
+            DigestCheck::Failed(AuditKeyFailure::digest_mismatch(bad)),
+        ];
+        match aggregate_digest_checks(&peer(), checks, 2) {
+            Err(failed) => {
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].key, bad);
+                assert_eq!(failed[0].kind, AuditKeyFailureKind::DigestMismatch);
+            }
+            Ok(v) => panic!("a failed key must not yield a verdict, got {v:?}"),
+        }
+    }
+
+    // -- no_failure_verdict: a partial local-read failure must not mint a pass --
+
+    #[test]
+    fn no_failure_verdict_passes_only_when_every_key_verified() {
+        let peer = peer_id_from_bytes([0x11; 32]);
+        // All three challenged keys verified, none skipped -> Passed.
+        assert!(matches!(
+            no_failure_verdict(&peer, 3, 3, 0),
+            AuditTickResult::Passed {
+                keys_checked: 3,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn no_failure_verdict_is_idle_when_any_key_skipped() {
+        let peer = peer_id_from_bytes([0x22; 32]);
+        // One key verified, one skipped (its local copy was unreadable, so its
+        // digest could not be checked). The response was not fully verified, so
+        // the verdict is Idle rather than a pass over only the readable key.
+        assert!(matches!(
+            no_failure_verdict(&peer, 2, 1, 1),
+            AuditTickResult::Idle
+        ));
+    }
+
+    #[test]
+    fn no_failure_verdict_is_idle_when_nothing_verified() {
+        let peer = peer_id_from_bytes([0x33; 32]);
+        // Every local read skipped: nothing proven either way -> no verdict.
+        assert!(matches!(
+            no_failure_verdict(&peer, 2, 0, 2),
+            AuditTickResult::Idle
+        ));
     }
 
     // -- handle_audit_challenge: present keys ---------------------------------

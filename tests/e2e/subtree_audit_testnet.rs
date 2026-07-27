@@ -43,11 +43,12 @@ async fn wait_for_first_audit_stats(
 }
 
 /// Store the same `n` chunks on both `a` (the audited holder) and `b` (the
-/// auditor — NOT because verification needs them: round 2 demands the bytes
-/// from `a` itself, so `b` could hold nothing; storing them just makes `b` a
-/// realistic co-holder of the keyspace), make `a` commit to them,
-/// then deterministically seed `b`'s cache with `a`'s commitment (simulating
-/// "b received a's gossip" without depending on neighbor-sync timing — that
+/// auditor). `b` verifies leaves it co-holds against its own copy, so `b`
+/// co-holding the chunks is exactly the production topology: commitments only
+/// reach self-close neighbors, which co-hold the shared range. Make `a` commit
+/// to them, then
+/// deterministically seed `b`'s cache with `a`'s commitment (simulating "b
+/// received a's gossip" without depending on neighbor-sync timing — that
 /// propagation is covered by the dedicated neighbor-sync tests). After this,
 /// `b.audit_peer_now(a)` pins `a`'s real commitment and runs the audit over the
 /// live wire against `a`'s real responder.
@@ -119,11 +120,69 @@ async fn honest_node_passes_subtree_audit() {
         .as_ref()
         .expect("b engine");
 
-    // Honest holder: B holds the chunks so it byte-verifies the proof → Passed.
+    // Honest holder: B co-holds the sampled chunks and verifies them against
+    // its own bytes, so the audit passes with no false rejection.
     let result = b_engine.audit_peer_now(&a_peer).await;
     assert!(
         matches!(result, AuditTickResult::Passed { keys_checked, .. } if keys_checked >= 1),
-        "honest node must pass with at least one byte-verified leaf, got {result:?}"
+        "honest node must pass with at least one verified leaf, got {result:?}"
+    );
+
+    harness.teardown().await.expect("teardown");
+}
+
+/// EGRESS SAVING: a co-held sampled leaf is verified against the auditor's OWN
+/// bytes, with NO byte challenge to the responder. `commit_and_seed` makes B
+/// co-hold every chunk A committed, so B's fresh-random sample lands only on
+/// co-held leaves; B verifies them all locally and sends A ZERO round-2 byte
+/// challenges for this commitment. That eliminates the round-2 chunk traffic
+/// (the dominant audit egress) for co-held leaves. A regression that
+/// wire-challenges co-held leaves would record byte challenges here and fail.
+#[tokio::test]
+#[serial]
+async fn coheld_sampled_leaf_is_verified_locally_zero_egress() {
+    let harness = TestHarness::setup_small().await.expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let (a_idx, b_idx) = (1, 2);
+    commit_and_seed(&harness, a_idx, b_idx, 64).await;
+
+    let a = harness.test_node(a_idx).expect("a");
+    let a_peer = *a.p2p_node.as_ref().expect("a p2p").peer_id();
+    let a_engine = a.replication_engine.as_ref().expect("a engine");
+    // A's freshly-rebuilt commitment (from `commit_and_seed`) was NOT gossiped;
+    // only B was handed it (via `inject_peer_commitment_for_test`). So a byte
+    // challenge pinned to this hash can only come from B's audit below — no
+    // other node holds this commitment to audit it. That makes the observation
+    // deterministically B's, immune to any incidental background audit.
+    let a_pin = a_engine
+        .commitment_state()
+        .current()
+        .expect("A has a current commitment")
+        .hash();
+
+    let b_engine = harness
+        .test_node(b_idx)
+        .expect("b")
+        .replication_engine
+        .as_ref()
+        .expect("b engine");
+    let result = b_engine.audit_peer_now(&a_peer).await;
+    assert!(
+        matches!(result, AuditTickResult::Passed { keys_checked, .. } if keys_checked >= 1),
+        "honest co-held audit must pass, got {result:?}"
+    );
+
+    // B co-holds every sampled key, so it verified them all against its own
+    // bytes: A received NO byte challenge for this commitment. That is the
+    // egress saving — the round-2 chunk transfer is eliminated for co-held
+    // leaves.
+    let challenged = a_engine
+        .commitment_state()
+        .byte_challenge_keys_for_pin(&a_pin);
+    assert!(
+        challenged.is_empty(),
+        "co-held leaves must be verified locally with no byte challenge, got {challenged:?}"
     );
 
     harness.teardown().await.expect("teardown");
@@ -173,7 +232,8 @@ async fn data_deleting_node_fails_subtree_audit() {
     // The adversary can no longer produce the subtree's bytes, so its responder
     // rejects ("missing bytes for committed key") → a confirmed Failed. (It must
     // NOT be Passed; Idle would mean B couldn't reach the audit, also a failure
-    // of the test setup.)
+    // of the test setup.) B co-holds the data, so this also confirms a co-held
+    // audit still catches a deleter (the round-1 proof requires the bytes).
     assert!(
         matches!(result, AuditTickResult::Failed { .. }),
         "a node that deleted its committed data must FAIL the audit, got {result:?}"

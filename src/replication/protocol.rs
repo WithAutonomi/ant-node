@@ -1023,11 +1023,24 @@ pub enum SubtreeByteResponse {
 // Audit digest helper
 // ---------------------------------------------------------------------------
 
-/// Compute `AuditKeyDigest(K_i) = BLAKE3(nonce || challenged_peer_id || K_i || record_bytes_i)`.
+/// Domain-separation context for the audit digest key derivation. Versioned
+/// with the replication protocol so no other BLAKE3 use in the codebase (or a
+/// future digest revision) can ever produce a colliding key from the same
+/// 96 bytes of challenge material.
+const AUDIT_DIGEST_KEY_CONTEXT: &str = "autonomi.ant.replication.v3.audit-digest-key";
+
+/// Compute the keyed possession digest.
 ///
-/// Returns the 32-byte BLAKE3 digest binding the nonce, peer identity, key,
-/// and record content together so a peer cannot forge proofs without holding
-/// the actual data.
+/// `BLAKE3_keyed(BLAKE3_derive_key(ctx, nonce || challenged_peer_id || K_i), record_bytes_i)`
+/// with `ctx` the versioned domain-separation string `AUDIT_DIGEST_KEY_CONTEXT`.
+/// Returns the 32-byte digest binding the nonce, peer identity, key, and
+/// record content together so a peer cannot forge proofs without holding the
+/// actual data.
+///
+/// The challenge context enters as the BLAKE3 *key*, not as an input prefix.
+/// In keyed mode the key replaces the IV of every 1 KiB block's compression, so
+/// every block's chaining value depends on the fresh nonce and the digest is
+/// bound to the challenge over the entire content.
 #[must_use]
 pub fn compute_audit_digest(
     nonce: &[u8; 32],
@@ -1035,12 +1048,12 @@ pub fn compute_audit_digest(
     key: &XorName,
     record_bytes: &[u8],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(nonce);
-    hasher.update(challenged_peer_id);
-    hasher.update(key);
-    hasher.update(record_bytes);
-    *hasher.finalize().as_bytes()
+    let mut key_hasher = blake3::Hasher::new_derive_key(AUDIT_DIGEST_KEY_CONTEXT);
+    key_hasher.update(nonce);
+    key_hasher.update(challenged_peer_id);
+    key_hasher.update(key);
+    let digest_key = *key_hasher.finalize().as_bytes();
+    *blake3::keyed_hash(&digest_key, record_bytes).as_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,6 +1776,33 @@ mod tests {
         assert_ne!(
             digest_a, digest_b,
             "different keys must produce different digests"
+        );
+    }
+
+    #[test]
+    fn audit_digest_is_the_domain_separated_keyed_construction() {
+        // Pin the exact KEYED construction: the challenge context enters as the
+        // BLAKE3 key (mixed into every 1 KiB block's compression via
+        // `derive_key`), never as an input prefix. A regression to a flat
+        // `BLAKE3(nonce || ... || bytes)` prefix produces a different digest and
+        // fails this exact-equality check. Use a multi-block record so the
+        // block-key mixing is actually exercised past block 0.
+        let nonce = [0x01; 32];
+        let peer_id = [0x02; 32];
+        let key: XorName = [0x03; 32];
+        let record_bytes = vec![0x5A; 8 * 1024];
+
+        let mut key_hasher =
+            blake3::Hasher::new_derive_key("autonomi.ant.replication.v3.audit-digest-key");
+        key_hasher.update(&nonce);
+        key_hasher.update(&peer_id);
+        key_hasher.update(&key);
+        let digest_key = *key_hasher.finalize().as_bytes();
+        let keyed = *blake3::keyed_hash(&digest_key, &record_bytes).as_bytes();
+        assert_eq!(
+            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
+            keyed,
+            "digest must be BLAKE3_keyed(derive_key(ctx, nonce||peer||key), bytes)"
         );
     }
 

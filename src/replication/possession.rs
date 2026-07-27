@@ -3,8 +3,8 @@
 //! After a node fresh-replicates a chunk, every close-group peer responsible
 //! for it is checked 5-15 minutes later for actual possession. The check is a
 //! single-key cryptographic
-//! [`AuditChallenge`]: the probed
-//! peer must return `BLAKE3(nonce ‖ peer_id ‖ key ‖ bytes)` computed over the
+//! [`AuditChallenge`]: the probed peer must return
+//! `compute_audit_digest(nonce, peer_id, key, bytes)` computed over the
 //! chunk it claims to hold. It cannot produce that digest without the bytes, so
 //! — unlike a self-reported presence flag — a peer cannot escape the check by
 //! falsely asserting possession. A peer that holds the chunk earns nothing —

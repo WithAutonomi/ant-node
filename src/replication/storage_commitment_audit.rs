@@ -8,6 +8,15 @@
 //! owns the auditor entry point [`run_subtree_audit`] and the responder handler
 //! [`handle_subtree_challenge`]; the pure proof maths live in
 //! [`crate::replication::subtree`].
+//!
+//! Round 2 draws ONE fresh-random sample over all leaves and verifies each
+//! sampled leaf the cheapest sound way, to reduce egress: a leaf the auditor
+//! already holds (and whose own copy passes the content-address self-check) is
+//! verified against the auditor's OWN canonical bytes (no chunk bytes on the
+//! wire); any other sampled leaf is wire-challenged for the original bytes. A
+//! gossip auditor is a self-close neighbour that holds a share of the peer's
+//! chunks, so it verifies those locally and saves that egress; the monetized
+//! first audit holds nothing and wire-challenges every sampled leaf.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,29 +139,32 @@ struct AuditCtx<'a> {
     expected_commitment_hash: [u8; 32],
     config: &'a ReplicationConfig,
     credit: Option<&'a AuditCredit<'a>>,
+    /// This auditor's own chunk store: a sampled leaf it co-holds is verified
+    /// against these canonical bytes (zero egress) instead of wire-challenged.
+    storage: &'a LmdbStorage,
 }
 
-/// Run one gossip-triggered subtree audit against `challenged_peer`, pinned to
-/// the commitment hash the peer just gossiped (`expected_commitment_hash`).
+/// Run one subtree audit against `challenged_peer`, pinned to the commitment
+/// hash the peer gossiped (`expected_commitment_hash`).
 ///
-/// ADR-0002 two-round audit. The auditor sends a fresh random nonce and runs:
+/// ADR-0002 audit. The auditor sends a fresh random nonce and runs:
 ///
 /// 1. **Structure** (round 1) — the returned subtree rebuilds to the pinned
 ///    root, within a size-scaled deadline.
-/// 2. **Real bytes** (round 2) — the auditor demands the ORIGINAL chunk content
-///    for a 3..=5 FRESHLY-RANDOM sample of the proven leaves (chosen after the
-///    proof arrives, not nonce-derived — see `random_spotcheck_leaves`) FROM the
-///    responder, and recomputes both the content-address hash and the nonce
-///    freshness hash from that served content. The auditor holds none of the
-///    peer's chunks.
-/// 3. **Timing** — each round's deadline is sized to an honest local-disk read,
-///    so a relay forced to fetch over the network blows it.
+/// 2. **Real bytes** (round 2) — one fresh-random sample over ALL leaves; a
+///    sampled leaf the auditor already holds is verified against its OWN
+///    canonical bytes (no chunk bytes on the wire), and any other sampled leaf
+///    is wire-challenged for the original bytes. This is the egress
+///    optimisation: a co-held leaf moves no chunk bytes.
+/// 3. **Timing** — the wire byte-response deadline is sized to an honest
+///    local-disk read.
 ///
-/// A timeout (either round) is reported as [`AuditFailureReason::Timeout`] (the
-/// caller applies the strike/grace policy). Any structural failure, served
-/// content that fails a hash, an explicit `Absent` for a committed sampled key,
-/// or a rejection of a recently gossiped commitment, is a confirmed failure
-/// acted on immediately. On a full pass, records the peer as a proven holder.
+/// A timeout is reported as [`AuditFailureReason::Timeout`] (the caller applies
+/// the strike/grace policy). Any structural failure, a committed hash that
+/// disagrees with the auditor's canonical bytes, served content that fails a
+/// hash, an explicit `Absent` for a committed sampled key, or a rejection of a
+/// recently gossiped commitment, is a confirmed failure acted on immediately.
+/// On a full pass, records the peer as a proven holder.
 pub async fn run_subtree_audit(
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
@@ -160,6 +172,7 @@ pub async fn run_subtree_audit(
     expected_commitment_hash: [u8; 32],
     key_count: u32,
     credit: Option<&AuditCredit<'_>>,
+    storage: &LmdbStorage,
 ) -> AuditTickResult {
     let (nonce, challenge_id) = {
         let mut rng = rand::thread_rng();
@@ -227,6 +240,7 @@ pub async fn run_subtree_audit(
         expected_commitment_hash,
         config,
         credit,
+        storage,
     };
     dispatch_subtree_response(resp_msg.body, &ctx).await
 }
@@ -451,11 +465,8 @@ async fn dispatch_subtree_response(
 /// gets exercised (no reimplementation that could drift).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AuditVerdict {
-    /// All gates passed and at least one leaf was byte-verified.
-    Pass {
-        /// Number of leaves whose real bytes were verified in round 2.
-        checked: usize,
-    },
+    /// Every requested leaf's served content reproduced its committed hashes.
+    Pass,
     /// A confirmed failure with this reason (penalizable / acted upon).
     Fail(AuditFailureReason),
 }
@@ -563,8 +574,8 @@ fn random_spotcheck_leaves(
 ///
 /// For each sampled leaf the auditor recomputes, from the SERVED content:
 ///   - `BLAKE3(content) == leaf.bytes_hash` (the chunk's content address), AND
-///   - `BLAKE3(nonce ‖ peer ‖ key ‖ content) == leaf.nonced_hash` (freshness),
-///     i.e. `compute_audit_digest(nonce, peer, key, content)`.
+///   - `compute_audit_digest(nonce, peer, key, content) == leaf.nonced_hash`
+///     (freshness).
 ///
 /// The freshness inputs are byte-identical to what the responder used to BUILD
 /// the leaf in round 1 (`subtree_leaf` → `nonced_leaf_hash`): the SAME four
@@ -577,14 +588,13 @@ fn random_spotcheck_leaves(
 /// hold none of the peer's chunks. Any `Absent`/omitted committed key, or any
 /// served content that fails a hash, is a provable lie → confirmed
 /// [`AuditFailureReason::DigestMismatch`]. All sampled leaves verifying →
-/// `Pass { checked }`.
+/// [`AuditVerdict::Pass`].
 pub(crate) fn verify_byte_response(
     leaves: &[&crate::replication::subtree::SubtreeLeaf],
     nonce: &[u8; 32],
     challenged_peer_bytes: &[u8; 32],
     served: impl Fn(&XorName) -> Option<Option<Vec<u8>>>,
 ) -> AuditVerdict {
-    let mut checked = 0usize;
     for leaf in leaves {
         // Present{bytes} -> Some(Some(bytes)); Absent -> Some(None); omitted -> None.
         // A committed key the responder cannot / will not serve is a provable lie.
@@ -603,23 +613,55 @@ pub(crate) fn verify_byte_response(
             // hash: cannot be the chunk it committed to.
             return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
         }
-        checked += 1;
     }
-    AuditVerdict::Pass { checked }
+    AuditVerdict::Pass
 }
 
-/// Verify a subtree-proof response (auditor side), ADR-0002 two-round audit.
+// ---------------------------------------------------------------------------
+// Byte layer: verify a co-held leaf locally (zero egress), else wire-challenge
+// ---------------------------------------------------------------------------
+
+/// Whether a co-held leaf matches this node's OWN canonical bytes for its key.
+///
+/// Recomputes, from `bytes`, the committed content hash and the fresh-nonce
+/// possession digest, and requires both to equal the leaf's committed values.
+/// Because content addressing admits exactly one byte string for a key, a
+/// committed hash that disagrees with the canonical bytes could not have been
+/// computed from the real chunk, so the leaf fails verification.
+#[must_use]
+fn local_leaf_matches(
+    leaf: &crate::replication::subtree::SubtreeLeaf,
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    bytes: &[u8],
+) -> bool {
+    let plain = *blake3::hash(bytes).as_bytes();
+    let nonced = crate::replication::subtree::nonced_leaf_hash(
+        nonce,
+        challenged_peer_bytes,
+        &leaf.key,
+        bytes,
+    );
+    leaf.bytes_hash == plain && leaf.nonced_hash == nonced
+}
+
+/// Verify a subtree-proof response (auditor side), ADR-0002.
 ///
 /// **Round 1** (this proof): pin + identity + signature + structure. If the
 /// proof structurally rebuilds to the pinned root, the tree SHAPE is committed —
-/// but not yet that the bytes are held. **Round 2**: the auditor picks a small
-/// freshly-random (post-proof) sample of the just-proven leaves and sends a
-/// [`SubtreeByteChallenge`] demanding their original chunk content FROM the
-/// responder, then verifies that content against the committed `bytes_hash`
-/// (content address) and `nonced_hash` (freshness). A responder that committed
-/// to a chunk it no longer holds cannot serve content that hashes to the
-/// committed address, so it fails — regardless of what the auditor holds. On a
-/// full pass, credits the peer as a proven holder.
+/// but not yet that the bytes are held.
+///
+/// **Round 2** (byte layer): draw ONE fresh-random post-proof sample over ALL
+/// leaves (the ADR's 3..=5 cut-and-choose) and verify each sampled leaf the
+/// cheapest sound way. A leaf the auditor already holds (and whose own copy
+/// passes the content-address self-check) is verified against the auditor's OWN
+/// canonical bytes — no chunk bytes on the wire. Any other sampled leaf (not
+/// held, unreadable, or a locally-corrupt copy) is wire-challenged for the
+/// original content. A local mismatch is a confirmed failure returned
+/// immediately.
+///
+/// A Pass is a whole-slice cut-and-choose that credits the peer as a proven
+/// holder of the committed keys.
 async fn verify_subtree_response(
     ctx: &AuditCtx<'_>,
     commitment: &StorageCommitment,
@@ -640,13 +682,7 @@ async fn verify_subtree_response(
         return failed(challenged_peer, challenge_id, reason);
     }
 
-    // -- Round 2: surprise byte challenge for a 3..=5 FRESHLY-RANDOM sample. --
-    // The sample is chosen now, with CSPRNG randomness, AFTER the round-1 proof
-    // is in hand — NOT derived from the round-1 nonce. The responder committed
-    // every leaf's `nonced_hash` in round 1 without knowing which leaves we will
-    // open, so it cannot have fabricated the un-opened ones (cut-and-choose).
-    // We cap the sample at the ADR's 3..=5 band (clamped to the subtree size) so
-    // the round-2 message and the responder's disk read stay cheap.
+    // -- Round 2: one fresh-random sample over ALL leaves (cut-and-choose). --
     let sample_n = ctx
         .config
         .audit_spotcheck_count()
@@ -662,114 +698,139 @@ async fn verify_subtree_response(
             AuditFailureReason::DigestMismatch,
         );
     }
-    // The sample is challenged in batches of MAX_BYTE_CHALLENGE_KEYS so each
-    // response — worst case, every requested chunk at MAX_CHUNK_SIZE — still
-    // encodes under MAX_REPLICATION_MESSAGE_SIZE. Each batch carries its own
-    // possession-in-time deadline (sized to its own length), so splitting does
-    // not widen the per-chunk window a relay would need to fetch over the
-    // network.
-    //
-    // CRITICAL: verify each batch's served bytes AS IT ARRIVES, against that
-    // batch's own sampled leaves, and return a CONFIRMED failure immediately.
-    // Deferring all verification until every batch is collected would let a
-    // later batch's timeout-lane Timeout (`round_failure`) mask a deterministic
-    // failure already proven by an earlier batch (an absent committed key or a
-    // hash mismatch) — a confirmed cheat would be downgraded to a timeout. A
-    // Timeout/Rejected/Malformed only becomes the verdict if NO earlier batch
-    // already produced confirmed bad bytes.
-    let verdict = 'rounds: {
-        for batch in sampled.chunks(MAX_BYTE_CHALLENGE_KEYS) {
-            let batch_keys: Vec<XorName> = batch.iter().map(|l| l.key).collect();
-            match request_byte_proof(ctx, &batch_keys).await {
-                ByteRound::Served(items) => {
-                    // Verify THIS batch now. A confirmed failure here is final —
-                    // a later batch's timeout must not be able to overwrite it.
-                    let v = verify_byte_response(
-                        batch,
-                        &ctx.nonce,
-                        challenged_peer.as_bytes(),
-                        |key| {
-                            items.iter().find_map(|it| match it {
-                                SubtreeByteItem::Present { key: k, bytes } if k == key => {
-                                    Some(Some(bytes.clone()))
-                                }
-                                SubtreeByteItem::Absent { key: k } if k == key => Some(None),
-                                _ => None,
-                            })
-                        },
-                    );
-                    if let AuditVerdict::Fail(reason) = v {
-                        break 'rounds AuditVerdict::Fail(reason);
-                    }
-                }
-                // The responder rejected the byte challenge for a recently
-                // pinned commitment → confirmed failure, same as round 1.
-                ByteRound::Rejected => {
-                    break 'rounds AuditVerdict::Fail(AuditFailureReason::Rejected)
-                }
-                // Transient reject (a local read error): ADR-0004 A1 routes it to
-                // the timeout lane — no trust penalty, but revoke the holder
-                // credit for THIS pinned commitment (the peer answered and could
-                // not prove possession) before taking the Timeout verdict. Scoped
-                // to the commitment hash, not the whole peer, so it never erases
-                // credit the peer re-earned for a newer commitment.
-                ByteRound::TransientReject => {
-                    if let Some(credit) = ctx.credit {
-                        credit
-                            .recent_provers
-                            .write()
-                            .await
-                            .forget_commitment(&ctx.expected_commitment_hash);
-                    }
-                    break 'rounds AuditVerdict::Fail(AuditFailureReason::Timeout);
-                }
-                // No response within the byte deadline (or transport error) →
-                // timeout (graced by the caller's strike policy — could be
-                // honest slowness). Keeps credit (a dropped packet is not
-                // evidence of loss). Only reached when no earlier batch already
-                // confirmed bad bytes.
-                ByteRound::Timeout => {
-                    break 'rounds AuditVerdict::Fail(AuditFailureReason::Timeout)
-                }
-                // Malformed/unexpected round-2 body.
-                ByteRound::Malformed => {
-                    break 'rounds AuditVerdict::Fail(AuditFailureReason::MalformedResponse)
-                }
-            }
-        }
-        // Every batch served bytes that verified.
-        AuditVerdict::Pass {
-            checked: sampled.len(),
-        }
-    };
 
-    match verdict {
-        AuditVerdict::Fail(reason) => {
-            warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
-            failed(challenged_peer, challenge_id, reason)
-        }
-        AuditVerdict::Pass { checked } => {
-            // Closeness (ADR-0002, soft/observe-only) — see observe_closeness.
-            observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
-            // Credit the peer as a proven holder of its committed keys.
-            if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
-                let now = std::time::Instant::now();
-                let mut provers = credit.recent_provers.write().await;
-                for leaf in &proof.leaves {
-                    provers.record_proof(leaf.key, *challenged_peer, pin, now);
+    // Real bytes, per leaf — the egress optimisation. For each sampled leaf: if
+    // this auditor already holds the key (and its own copy self-verifies),
+    // verify it against our OWN canonical bytes — no chunk bytes on the wire.
+    // Only a leaf we do NOT hold (or cannot vouch for) is wire-challenged,
+    // demanding the original content from the responder. A local mismatch is a
+    // CONFIRMED failure, returned immediately.
+    let mut wire_leaves: Vec<&crate::replication::subtree::SubtreeLeaf> = Vec::new();
+    for leaf in &sampled {
+        match get_raw_retrying(ctx.storage, &leaf.key).await {
+            Ok(Some(bytes)) if *blake3::hash(&bytes).as_bytes() == leaf.key => {
+                if !local_leaf_matches(leaf, &ctx.nonce, challenged_peer.as_bytes(), &bytes) {
+                    warn!(
+                        "Audit: {challenged_peer} committed hash for {} disagrees with this \
+                         auditor's canonical bytes (confirmed failure)",
+                        hex::encode(leaf.key)
+                    );
+                    return failed(
+                        challenged_peer,
+                        challenge_id,
+                        AuditFailureReason::DigestMismatch,
+                    );
                 }
+                // Verified locally, zero egress.
             }
-            info!(
-                "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {checked} \
-                 byte-checked)",
-                proof.leaves.len()
-            );
-            AuditTickResult::Passed {
-                challenged_peer: *challenged_peer,
-                keys_checked: checked,
+            // Not co-held, unreadable, or a locally-corrupt copy: wire-check it
+            // so every sampled leaf still gets a verdict.
+            Ok(Some(_)) => {
+                warn!(
+                    "Audit: own copy of {} fails self-integrity; wire-checking it instead \
+                     (local corruption, not the peer's fault)",
+                    hex::encode(leaf.key)
+                );
+                wire_leaves.push(leaf);
+            }
+            Ok(None) => wire_leaves.push(leaf),
+            Err(e) => {
+                debug!(
+                    "Audit: read error on own copy of {} ({e}); wire-checking it instead",
+                    hex::encode(leaf.key)
+                );
+                wire_leaves.push(leaf);
             }
         }
     }
+
+    // Wire-challenge only the leaves we could not verify locally (ADR round 2).
+    if !wire_leaves.is_empty() {
+        if let AuditVerdict::Fail(reason) = wire_verify_leaves(ctx, &wire_leaves).await {
+            warn!("Audit: {challenged_peer} failed subtree audit ({reason:?})");
+            return failed(challenged_peer, challenge_id, reason);
+        }
+    }
+
+    // Every sampled leaf verified (locally or over the wire). Whole-slice
+    // cut-and-choose: credit the peer as a proven holder of its committed keys.
+    observe_closeness(ctx.p2p_node, ctx.config, challenged_peer, proof).await;
+    if let (Some(credit), Some(pin)) = (ctx.credit, commitment_hash(commitment)) {
+        let now = std::time::Instant::now();
+        let mut provers = credit.recent_provers.write().await;
+        for leaf in &proof.leaves {
+            provers.record_proof(leaf.key, *challenged_peer, pin, now);
+        }
+    }
+    info!(
+        "Audit: peer {challenged_peer} passed subtree audit ({} leaves, {} byte-checked, {} \
+         over the wire)",
+        proof.leaves.len(),
+        sampled.len(),
+        wire_leaves.len(),
+    );
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: sampled.len(),
+    }
+}
+
+/// The ADR-0002 round-2 wire byte challenge for the sampled leaves the auditor
+/// could NOT verify locally: demand the original chunk content from the
+/// responder (batched under [`MAX_BYTE_CHALLENGE_KEYS`] to fit the wire cap) and
+/// verify each batch as it arrives.
+///
+/// Returns [`AuditVerdict::Pass`] iff every requested leaf's served content
+/// reproduced its committed hashes. A deterministic bad-bytes failure in any
+/// batch is returned immediately so a later batch's graced Timeout can never
+/// mask it (a confirmed cheat must not be downgraded).
+async fn wire_verify_leaves(
+    ctx: &AuditCtx<'_>,
+    leaves: &[&crate::replication::subtree::SubtreeLeaf],
+) -> AuditVerdict {
+    let challenged_peer = ctx.challenged_peer;
+    for batch in leaves.chunks(MAX_BYTE_CHALLENGE_KEYS) {
+        let batch_keys: Vec<XorName> = batch.iter().map(|l| l.key).collect();
+        match request_byte_proof(ctx, &batch_keys).await {
+            ByteRound::Served(items) => {
+                let v =
+                    verify_byte_response(batch, &ctx.nonce, challenged_peer.as_bytes(), |key| {
+                        items.iter().find_map(|it| match it {
+                            SubtreeByteItem::Present { key: k, bytes } if k == key => {
+                                Some(Some(bytes.clone()))
+                            }
+                            SubtreeByteItem::Absent { key: k } if k == key => Some(None),
+                            _ => None,
+                        })
+                    });
+                if let AuditVerdict::Fail(reason) = v {
+                    return AuditVerdict::Fail(reason);
+                }
+            }
+            // Repudiation of a recently pinned commitment → confirmed failure.
+            ByteRound::Rejected => return AuditVerdict::Fail(AuditFailureReason::Rejected),
+            // Transient local read error: timeout lane (no trust penalty), but
+            // revoke this pinned commitment's holder credit first — the peer
+            // answered and could not prove possession. Scoped to the commitment
+            // hash so it never erases credit re-earned for a newer commitment.
+            ByteRound::TransientReject => {
+                if let Some(credit) = ctx.credit {
+                    credit
+                        .recent_provers
+                        .write()
+                        .await
+                        .forget_commitment(&ctx.expected_commitment_hash);
+                }
+                return AuditVerdict::Fail(AuditFailureReason::Timeout);
+            }
+            // No response / transport error → graced timeout (keeps credit).
+            ByteRound::Timeout => return AuditVerdict::Fail(AuditFailureReason::Timeout),
+            ByteRound::Malformed => {
+                return AuditVerdict::Fail(AuditFailureReason::MalformedResponse)
+            }
+        }
+    }
+    AuditVerdict::Pass
 }
 
 /// Soft, density-aware closeness observation (ADR-0002). Logs — never fails —
@@ -1078,6 +1139,13 @@ pub async fn handle_subtree_byte_challenge(
         };
     };
 
+    // Test-only: record that these keys reached the round-2 byte challenge (for
+    // the pinned commitment), so an e2e test can prove co-held sampled leaves
+    // are verified locally instead (no byte challenge), correlated to a
+    // specific audit.
+    #[cfg(any(test, feature = "test-utils"))]
+    state.record_byte_challenge(challenge.expected_commitment_hash, &challenge.keys);
+
     let mut items = Vec::with_capacity(challenge.keys.len());
     for key in &challenge.keys {
         // Serve ONLY keys committed under this pin. A key the auditor asks for
@@ -1235,10 +1303,11 @@ mod tests {
         // Round 2: honest responder serves the real content for the sample.
         let s = sample(&proof, &nonce, built.commitment().key_count);
         assert!(!s.is_empty());
-        match verify_byte_response(&s, &nonce, &peer, served_honest) {
-            AuditVerdict::Pass { checked } => assert!(checked >= 1, "must verify >=1 leaf"),
-            other @ AuditVerdict::Fail(_) => panic!("expected Pass, got {other:?}"),
-        }
+        assert_eq!(
+            verify_byte_response(&s, &nonce, &peer, served_honest),
+            AuditVerdict::Pass,
+            "honest served content must verify"
+        );
     }
 
     #[test]
@@ -1376,10 +1445,9 @@ mod tests {
 
     #[test]
     fn auditor_holds_nothing_still_catches_deleter() {
-        // Explicit contract: the auditor's own storage is irrelevant. A deleter
-        // is caught purely from its served (absent) response. (Compare the OLD
-        // design, where an auditor holding none of the chunks went Inconclusive
-        // and the deleter walked free.)
+        // Explicit contract for the WIRE path (a sampled leaf the auditor does
+        // not co-hold): the auditor's own storage is irrelevant — a deleter is
+        // caught purely from its served (absent) response.
         let nonce = [0x21u8; 32];
         let (built, proof, peer) = honest(256, &nonce);
         assert!(structure(&built, &proof, &nonce, &peer).is_ok());
@@ -1401,19 +1469,6 @@ mod tests {
             "sample {} must be within 3..=5",
             s.len()
         );
-    }
-
-    #[test]
-    fn full_pass_requires_every_sampled_leaf() {
-        // checked must equal the number of sampled leaves on a pass (no leaf is
-        // silently skipped — every sampled, committed key must verify).
-        let nonce = [11u8; 32];
-        let (built, proof, peer) = honest(400, &nonce);
-        let s = sample(&proof, &nonce, built.commitment().key_count);
-        match verify_byte_response(&s, &nonce, &peer, served_honest) {
-            AuditVerdict::Pass { checked } => assert_eq!(checked, s.len()),
-            other @ AuditVerdict::Fail(_) => panic!("expected Pass, got {other:?}"),
-        }
     }
 
     // ---- end-to-end gate composition ----------------------------------------
@@ -1468,16 +1523,12 @@ mod tests {
         let sn = sample(&proof_near, &nonce, built_near.commitment().key_count);
         let v_near = verify_byte_response(&sn, &nonce, &peer_near, served_honest);
 
-        match (&v_far, &v_near) {
-            (AuditVerdict::Pass { checked: cf }, AuditVerdict::Pass { checked: cn }) => {
-                assert!(*cf >= 1 && *cn >= 1);
-            }
-            other => panic!("both honest proofs must Pass regardless of closeness, got {other:?}"),
-        }
-        assert!(
-            !matches!(v_far, AuditVerdict::Fail(_)),
-            "far/padding-shaped honest proof must NEVER fail, got {v_far:?}"
+        assert_eq!(
+            v_far,
+            AuditVerdict::Pass,
+            "far/padding honest proof must Pass"
         );
+        assert_eq!(v_near, AuditVerdict::Pass, "near honest proof must Pass");
     }
 
     // Unused-leaf constructor guard: keep SubtreeLeaf import meaningful.
@@ -1488,5 +1539,109 @@ mod tests {
             bytes_hash: [0u8; 32],
             nonced_hash: [0u8; 32],
         };
+    }
+
+    // ---- byte layer: local possession check for a co-held leaf ---------------
+
+    /// The leaf the honest tree built for `key(0)` under `nonce`, plus that
+    /// key's canonical bytes. The auditor co-holds this key.
+    fn honest_leaf_and_bytes(nonce: &[u8; 32]) -> (SubtreeLeaf, [u8; 32], Vec<u8>) {
+        let (_built, proof, peer) = honest(400, nonce);
+        let leaf = proof.leaves.first().cloned().unwrap();
+        let bytes = chunk_bytes(&leaf.key);
+        (leaf, peer, bytes)
+    }
+
+    #[test]
+    fn local_leaf_matches_honest_co_held_leaf() {
+        // The auditor co-holds the key: recomputing both hashes from its own
+        // canonical bytes reproduces the committed leaf exactly.
+        let nonce = [9u8; 32];
+        let (leaf, peer, bytes) = honest_leaf_and_bytes(&nonce);
+        assert!(local_leaf_matches(&leaf, &nonce, &peer, &bytes));
+    }
+
+    #[test]
+    fn local_leaf_rejects_fabricated_nonced_hash() {
+        // A modified deleter fabricates the freshness hash for a leaf it no
+        // longer holds. A co-holder recomputes the digest from the CANONICAL
+        // bytes and the fabrication does not match.
+        let nonce = [9u8; 32];
+        let (mut leaf, peer, bytes) = honest_leaf_and_bytes(&nonce);
+        leaf.nonced_hash = [0xAB; 32];
+        assert!(!local_leaf_matches(&leaf, &nonce, &peer, &bytes));
+    }
+
+    #[test]
+    fn local_leaf_rejects_stale_nonce_freshness() {
+        // A digest precomputed under an older nonce never satisfies a fresh
+        // challenge: the recompute is bound to THIS audit's nonce.
+        let nonce = [9u8; 32];
+        let stale = [0xEE; 32];
+        let (mut leaf, peer, bytes) = honest_leaf_and_bytes(&nonce);
+        leaf.nonced_hash = nonced_leaf_hash(&stale, &peer, &leaf.key, &bytes);
+        assert!(!local_leaf_matches(&leaf, &nonce, &peer, &bytes));
+    }
+
+    #[test]
+    fn local_leaf_rejects_bytes_hash_disagreeing_with_canonical_bytes() {
+        // The peer committed (key, junk_hash) for a key the auditor co-holds.
+        // The canonical bytes hash to bytes_hash, not junk_hash, so the
+        // substitution is caught against the auditor's own copy — a check the
+        // wire round (which compares the peer's SERVED bytes to the peer's own
+        // commitment) cannot make.
+        let nonce = [9u8; 32];
+        let (mut leaf, peer, bytes) = honest_leaf_and_bytes(&nonce);
+        leaf.bytes_hash = [0x77; 32];
+        assert!(!local_leaf_matches(&leaf, &nonce, &peer, &bytes));
+    }
+
+    #[test]
+    fn local_check_rejects_leaf_committed_over_non_canonical_bytes() {
+        // A leaf committed as `(key, BLAKE3(other))` with `nonced_hash` also
+        // over `other`, where `key` is the CONTENT ADDRESS of the canonical
+        // chunk. Even though the leaf's two committed hashes are internally
+        // consistent with `other`, an honest co-holder stores the CANONICAL
+        // bytes for `key`, and the local check recomputes both hashes from
+        // those — `BLAKE3(canonical) == key != BLAKE3(other) == committed
+        // bytes_hash` — so it rejects the leaf.
+        let nonce = [0x5A; 32];
+        let peer = [0x11; 32];
+        let canonical = b"the canonical chunk for this key".to_vec();
+        let other = b"different bytes committed for the same key".to_vec();
+        let key = *blake3::hash(&canonical).as_bytes();
+        let leaf = SubtreeLeaf {
+            key,
+            bytes_hash: *blake3::hash(&other).as_bytes(),
+            nonced_hash: nonced_leaf_hash(&nonce, &peer, &key, &other),
+        };
+        assert!(
+            !local_leaf_matches(&leaf, &nonce, &peer, &canonical),
+            "a leaf committed over non-canonical bytes must fail the local check"
+        );
+    }
+
+    #[test]
+    fn verify_byte_response_fails_when_only_the_last_sampled_leaf_is_bad() {
+        // No sampled leaf may be silently skipped: a bad LAST leaf must fail
+        // even when every earlier leaf verified (guards against a verifier that
+        // short-circuits to Pass on the first good leaf).
+        let nonce = [7u8; 32];
+        let (built, proof, peer) = honest(400, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        assert!(s.len() >= 2, "need multiple sampled leaves");
+        let last_key = s.last().unwrap().key;
+        let v = verify_byte_response(&s, &nonce, &peer, |k| {
+            if *k == last_key {
+                Some(Some(b"garbage-for-the-last-leaf".to_vec()))
+            } else {
+                Some(Some(chunk_bytes(k)))
+            }
+        });
+        assert_eq!(
+            v,
+            AuditVerdict::Fail(AuditFailureReason::DigestMismatch),
+            "a bad final sampled leaf must fail the whole verification"
+        );
     }
 }

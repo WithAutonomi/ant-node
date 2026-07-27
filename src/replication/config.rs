@@ -267,7 +267,12 @@ pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTER
 /// half-interpreted exchange, no spurious eviction. Replication between
 /// matched-version peers is unaffected. (DHT routing/lookups are a separate
 /// protocol and continue to span both versions.)
-pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
+/// v3: the possession digest (`compute_audit_digest`) became a keyed BLAKE3
+/// hash (the nonce enters every 1 KiB block via `derive_key`) instead of the
+/// old flat prefix hash. A v2 auditor would compute the old digest and read
+/// every v3 answer as a mismatch (and vice versa), so v2 and v3 nodes must not
+/// exchange replication traffic; same clean-cutover pattern as v1→v2.
+pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v3";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
@@ -484,13 +489,13 @@ pub const FIRST_AUDIT_COUNT_JUMP_DEN: u64 = 2;
 /// its next settled payment re-nominates the paid pin.
 pub const FIRST_AUDIT_INGRESS_CAPACITY: usize = 1024;
 
-/// Number of subtree leaves spot-checked against real chunk bytes per audit
-/// (ADR-0002 real-bytes layer).
+/// Number of subtree leaves spot-checked per audit (ADR-0002 real-bytes layer).
 ///
-/// The auditor clamps this to its 3..=5 band (`BYTE_SPOTCHECK_MIN..=MAX` in
-/// `storage_commitment_audit`), so this is the effective MAXIMUM — set it
-/// within the band rather than advertising a sample size the auditor never
-/// requests.
+/// A sampled leaf the auditor co-holds is verified against its own bytes (zero
+/// egress); any other sampled leaf is wire-challenged. The auditor clamps this
+/// to its 3..=5 band (`BYTE_SPOTCHECK_MIN..=MAX` in `storage_commitment_audit`),
+/// so this is the effective MAXIMUM — set it within the band rather than
+/// advertising a sample size the auditor never requests.
 pub const AUDIT_SPOTCHECK_COUNT: u32 = 5;
 
 /// Conservative leaf-count hint for sizing the subtree-audit response deadline.
@@ -897,13 +902,14 @@ mod tests {
     }
 
     #[test]
-    fn replication_protocol_id_is_v2() {
-        // The v12 storage-bound audit changes replication SEMANTICS. The
-        // protocol id MUST advance past v1 so v1 and v2 nodes never exchange
-        // replication traffic they can only half-interpret (rollout safety —
-        // see the const's doc). If this regresses to v1, mixed-version nodes
-        // would talk past each other and risk spurious penalties.
-        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
+    fn replication_protocol_id_is_v3() {
+        // The keyed possession digest changes replication SEMANTICS: a v2
+        // auditor computes the old flat digest and would read every v3 answer
+        // as a digest mismatch (a confirmed failure!). The protocol id MUST
+        // advance so v2 and v3 nodes never exchange replication traffic they
+        // can only half-interpret (rollout safety — see the const's doc). If
+        // this regresses, mixed-version nodes would risk spurious penalties.
+        assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v3");
     }
 
     #[test]

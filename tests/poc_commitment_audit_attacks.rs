@@ -10,20 +10,17 @@
 //!
 //! ## How the auditor is modelled here
 //!
-//! The production auditor's `verify_subtree_response` (in
-//! `src/replication/storage_commitment_audit.rs`) is private, so this file
-//! reproduces the exact ordered gates it runs — pin, peer-id binding,
-//! signature, structural [`verify_subtree_proof`], then the **round-2 byte
-//! challenge**: the auditor demands the ORIGINAL chunk bytes for a
-//! nonce-selected sample of the just-proven leaves FROM THE RESPONDER and
-//! verifies the served content against each leaf's committed `bytes_hash`
-//! (content address) and `nonced_hash` (freshness). Possession is
-//! non-delegable: the auditor needs to hold NONE of the responder's chunks,
-//! and a committed key the responder cannot serve is a deterministic,
-//! confirmed failure (`DigestMismatch` in production — never inconclusive,
-//! never graced). The helper [`auditor_accepts`] runs these gates in the same
-//! order with the same failure semantics, so a reviewer can see each attack
-//! is caught at the same gate the network code would catch it.
+//! After the shared round-1 gates (pin, peer-id binding, signature, structural
+//! [`verify_subtree_proof`]) the auditor verifies each sampled leaf's bytes. A
+//! sampled leaf the auditor does not itself hold is wire-challenged: it demands
+//! the ORIGINAL content FROM THE RESPONDER and verifies the served content
+//! against `bytes_hash` (content address) and `nonced_hash` (freshness). A
+//! committed key the responder cannot serve is a deterministic confirmed
+//! failure (`DigestMismatch`). The production dispatcher is private, so the
+//! helper [`auditor_accepts`] reproduces its exact ordered gates; the tests
+//! below model this wire path. (A sampled leaf the auditor holds is verified
+//! against its own bytes instead; that local path is unit-tested beside
+//! `local_leaf_matches`.)
 //!
 //! ## What changed from the old per-key audit (and why)
 //!

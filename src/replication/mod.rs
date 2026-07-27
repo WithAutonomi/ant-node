@@ -1479,6 +1479,7 @@ impl ReplicationEngine {
             pin,
             key_count,
             Some(&credit),
+            &self.storage,
         )
         .await
     }
@@ -1769,6 +1770,7 @@ impl ReplicationEngine {
             config: Arc::clone(&self.config),
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&self.sync_state),
+            storage: Arc::clone(&self.storage),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
             lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
@@ -1880,6 +1882,10 @@ impl ReplicationEngine {
                             let credit = storage_commitment_audit::AuditCredit {
                                 recent_provers: &trigger.recent_provers,
                             };
+                            // Monetized first audit: same run_subtree_audit as
+                            // the gossip path. Rare and budget-capped; it keeps
+                            // commitment inflation costing real storage at the
+                            // payment moment.
                             let result = storage_commitment_audit::run_subtree_audit(
                                 &trigger.p2p_node,
                                 &trigger.config,
@@ -1887,6 +1893,7 @@ impl ReplicationEngine {
                                 event.pin,
                                 event.key_count,
                                 Some(&credit),
+                                &trigger.storage,
                             )
                             .await;
                             let outcome = first_audit_terminal_outcome(&result);
@@ -2031,6 +2038,7 @@ impl ReplicationEngine {
             config: Arc::clone(&config),
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
+            storage: Arc::clone(&storage),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
             lottery_attempts: Arc::clone(&gossip_lottery_attempts),
         };
@@ -2201,6 +2209,7 @@ impl ReplicationEngine {
             config: Arc::clone(&config),
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
+            storage: Arc::clone(&self.storage),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
             lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
@@ -5540,6 +5549,9 @@ async fn handle_audit_result(
                     .await;
             }
         }
+        // Idle also covers "every challenged key's local copy was unreadable"
+        // (the auditor's own storage trouble): nothing verified either way, no
+        // trust event, no bootstrap-claim change — it must not mint a pass.
         AuditTickResult::Idle | AuditTickResult::InsufficientKeys => {}
     }
 }
@@ -5587,6 +5599,9 @@ struct GossipAuditTrigger {
     config: Arc<ReplicationConfig>,
     recent_provers: Arc<RwLock<RecentProvers>>,
     sync_state: Arc<RwLock<NeighborSyncState>>,
+    /// This node's own chunk store: a sampled leaf the auditor co-holds is
+    /// verified against its own bytes (zero egress) instead of wire-challenged.
+    storage: Arc<LmdbStorage>,
     /// Shared "an audit actually launched" cooldown, consulted by BOTH the
     /// gossip-lottery path and the monetized first-audit scheduler. Stamped
     /// only when a real audit is about to be sent — never by a losing lottery
@@ -5741,6 +5756,9 @@ async fn maybe_trigger_gossip_audit(
         let credit = storage_commitment_audit::AuditCredit {
             recent_provers: &trigger.recent_provers,
         };
+        // Gossip-triggered audit of a self-close neighbour's commitment. A
+        // co-held sampled leaf is verified against our own bytes (zero egress);
+        // the rest are wire-challenged (see run_subtree_audit).
         let result = storage_commitment_audit::run_subtree_audit(
             &trigger.p2p_node,
             &trigger.config,
@@ -5748,6 +5766,7 @@ async fn maybe_trigger_gossip_audit(
             target.pin_hash,
             target.key_count,
             Some(&credit),
+            &trigger.storage,
         )
         .await;
         handle_subtree_audit_result(

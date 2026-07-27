@@ -405,6 +405,15 @@ impl PersistedRetention {
 /// it gets gossiped. Rotation and gossip are the only paths that mutate this.
 pub struct ResponderCommitmentState {
     inner: RwLock<Inner>,
+    /// Test-only: `(pinned commitment hash, keys)` of each round-2
+    /// `SubtreeByteChallenge` this responder received. Lets an e2e test assert
+    /// that co-held sampled leaves are verified LOCALLY by the auditor (so this
+    /// responder receives NO byte challenge for them — the egress saving),
+    /// CORRELATED to a specific audited commitment (a freshly-rebuilt commitment
+    /// held by only one auditor pins uniquely to that auditor's audit). Never
+    /// read or written in production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    observed_byte_challenges: RwLock<Vec<([u8; 32], Vec<XorName>)>>,
 }
 
 /// A commitment hash that was emitted on the wire, with the monotonic instant at
@@ -460,7 +469,33 @@ impl ResponderCommitmentState {
                 has_current: false,
                 recently_gossiped: Vec::with_capacity(RETAINED_GOSSIPED_COMMITMENTS),
             }),
+            #[cfg(any(test, feature = "test-utils"))]
+            observed_byte_challenges: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Test-only: record an incoming round-2 byte challenge for `pin`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn record_byte_challenge(&self, pin: [u8; 32], keys: &[XorName]) {
+        self.observed_byte_challenges
+            .write()
+            .push((pin, keys.to_vec()));
+    }
+
+    /// Test-only: the distinct keys this responder has been asked to serve in
+    /// round-2 byte challenges pinned to `pin` since construction.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn byte_challenge_keys_for_pin(
+        &self,
+        pin: &[u8; 32],
+    ) -> std::collections::BTreeSet<XorName> {
+        self.observed_byte_challenges
+            .read()
+            .iter()
+            .filter(|(p, _)| p == pin)
+            .flat_map(|(_, keys)| keys.iter().copied())
+            .collect()
     }
 
     /// Rotate: the freshly-rebuilt commitment becomes `current`. Slots that are
