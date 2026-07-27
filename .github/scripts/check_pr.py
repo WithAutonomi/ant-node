@@ -20,14 +20,31 @@ import os
 import re
 import sys
 
-# A Linear issue key (e.g. V2-123, ENG-45) or a linear.app URL. The key pattern
-# is deliberately broad and case-insensitive so it also matches Linear-generated
-# branch names (which are lower-cased, e.g. chrisoneil/v2-720-...). It can match
-# the odd technical token like "UTF-8"; that permeability is acceptable for a
-# gate backed by human review and the train-manifest verification, and it keeps
-# false negatives (blocking a legitimate PR) rare.
-LINEAR_KEY = re.compile(r"\b[A-Za-z][A-Za-z0-9]*-[0-9]+\b")
+# Known Linear team keys (the issue-key prefixes). A Linear reference is a URL
+# under linear.app OR an issue key with one of these prefixes — this is what
+# keeps unrelated technical tokens like "UTF-8" / "SHA-256" / "RFC-123" from
+# satisfying the gate. Add a new team's key here when a team is created.
+LINEAR_TEAM_PREFIXES = ("V2", "AUTO", "REL", "INFRA", "QA")
+
+# Case-insensitive so it also matches Linear-generated branch names, which are
+# lower-cased (e.g. chrisoneil/v2-720-...).
+LINEAR_KEY = re.compile(
+    r"\b(?:" + "|".join(LINEAR_TEAM_PREFIXES) + r")-[0-9]+\b", re.IGNORECASE
+)
 LINEAR_URL = re.compile(r"linear\.app/", re.IGNORECASE)
+
+# Canonical section headings, exactly as they appear in the template, keyed by
+# their lower-cased form. Used so failure messages name the real heading.
+CANONICAL_HEADINGS = {
+    "linear issue": "Linear issue",
+    "risk tier": "Risk tier",
+    "compatibility": "Compatibility",
+    "semver impact": "Semver impact",
+    "test evidence": "Test evidence",
+    "new dependency": "New dependency",
+    "adr": "ADR",
+    "mitigation / rollback": "Mitigation / rollback",
+}
 
 
 def env(name):
@@ -45,11 +62,13 @@ def ok(msg):
 
 
 def strip_comments(text):
-    """Remove HTML comments so template scaffolding does not count as content."""
+    """Remove HTML comments so template scaffolding and its examples (e.g. the
+    'V2-123' hint in the Linear-issue comment) never count as real content."""
     return re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
 
 
-def has_linear_ref(*parts):
+def linear_ref(*parts):
+    """Return the first Linear URL/key found in the given (comment-free) parts."""
     haystack = "\n".join(parts)
     m = LINEAR_URL.search(haystack) or LINEAR_KEY.search(haystack)
     return m.group(0) if m else None
@@ -72,15 +91,16 @@ def sections(body):
 
 
 def check_linear():
-    ref = has_linear_ref(env("PR_TITLE"), env("PR_BODY"), env("PR_BRANCH"))
+    # Strip comments from the body so the template's own example does not count.
+    ref = linear_ref(env("PR_TITLE"), strip_comments(env("PR_BODY")), env("PR_BRANCH"))
     if ref:
         ok(f"✅ Linear reference found: {ref}")
     fail(
         "❌ No linked Linear issue found.\n\n"
-        "Every PR must reference a Linear issue — an issue key like V2-123 in\n"
-        "the PR title, body, or branch name, or a linear.app link in the body.\n\n"
-        "Add it to the '## Linear issue' section of the PR description and update\n"
-        "the pull request."
+        "Every PR must reference a Linear issue — an issue key ("
+        + " / ".join(f"{p}-123" for p in LINEAR_TEAM_PREFIXES)
+        + ") in the PR title, body, or branch name, or a linear.app issue URL in\n"
+        "the body. Add it to the '## Linear issue' section and update the PR."
     )
 
 
@@ -103,18 +123,9 @@ def check_template():
             "template into the PR body and fill every field."
         )
 
-    for heading in (
-        "linear issue",
-        "risk tier",
-        "compatibility",
-        "semver impact",
-        "test evidence",
-        "new dependency",
-        "adr",
-        "mitigation / rollback",
-    ):
+    for heading in CANONICAL_HEADINGS:
         if heading not in secs:
-            errors.append(f"missing section: ## {heading.title()}")
+            errors.append(f"missing section: ## {CANONICAL_HEADINGS[heading]}")
 
     # Exactly one Risk tier box checked.
     tiers = re.findall(
@@ -140,26 +151,30 @@ def check_template():
     # Free-text sections that must not be empty.
     for heading in ("test evidence", "new dependency", "mitigation / rollback"):
         if heading in secs and not strip_comments(secs[heading]).strip():
-            errors.append(f"'## {heading.title()}' is empty")
+            errors.append(f"'## {CANONICAL_HEADINGS[heading]}' is empty")
 
-    # Compatibility: at least one axis filled (a value after the colon).
+    # Compatibility: every axis must carry a value (use 'none' where N/A).
+    # Use [ \t] rather than \s after the colon so an empty axis cannot "borrow"
+    # the next line's content across a newline.
     comp = strip_comments(secs.get("compatibility", ""))
-    if not re.search(r"^\s*-\s*(Wire|Storage|API)\s*:\s*\S", comp, re.MULTILINE):
-        errors.append(
-            "'## Compatibility': fill at least one of Wire/Storage/API (use 'none')"
-        )
+    for axis in ("Wire", "Storage", "API"):
+        if not re.search(rf"^[ \t]*-[ \t]*{axis}[ \t]*:[ \t]*\S", comp, re.MULTILINE):
+            errors.append(
+                f"'## Compatibility': fill in {axis} (use 'none' if not applicable)"
+            )
 
-    # Linear reference present in its own section.
-    if "linear issue" in secs and not has_linear_ref(
-        strip_comments(secs["linear issue"])
-    ):
+    # Linear reference present in its own section (comments stripped).
+    if "linear issue" in secs and not linear_ref(strip_comments(secs["linear issue"])):
         errors.append("'## Linear issue': add the issue key or a linear.app link")
 
-    # ADR required for Tier 2/3.
-    if tier in ("T2", "T3"):
-        adr = strip_comments(secs.get("adr", ""))
-        if not re.search(r"https?://", adr):
-            errors.append(f"ADR is required for {tier}: add an ADR link in '## ADR'")
+    # ADR must be filled explicitly: 'n/a' for T0/T1, a link for T2/T3.
+    adr = strip_comments(secs.get("adr", "")).strip()
+    if not adr:
+        errors.append(
+            "'## ADR' is empty: write 'n/a' for Tier 0/1, or an ADR link for Tier 2/3"
+        )
+    elif tier in ("T2", "T3") and not re.search(r"https?://", adr):
+        errors.append(f"ADR is required for {tier}: add an ADR link in '## ADR'")
 
     if errors:
         fail(
