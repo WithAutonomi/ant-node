@@ -31,7 +31,12 @@ LINEAR_TEAM_PREFIXES = ("V2", "AUTO", "REL", "INFRA", "QA")
 LINEAR_KEY = re.compile(
     r"\b(?:" + "|".join(LINEAR_TEAM_PREFIXES) + r")-[0-9]+\b", re.IGNORECASE
 )
-LINEAR_URL = re.compile(r"linear\.app/", re.IGNORECASE)
+# A real Linear issue URL: linear.app/<workspace>/issue/<KEY>[/<slug>]. Constrained
+# to the /issue/<key> path so generic pages (linear.app/changelog,
+# linear.app/not-an-issue) do not count as a linked issue.
+LINEAR_URL = re.compile(
+    r"linear\.app/[^/\s]+/issue/[A-Za-z][A-Za-z0-9]*-[0-9]+", re.IGNORECASE
+)
 
 # Canonical section headings, exactly as they appear in the template, keyed by
 # their lower-cased form. Used so failure messages name the real heading.
@@ -99,8 +104,8 @@ def check_linear():
         "❌ No linked Linear issue found.\n\n"
         "Every PR must reference a Linear issue — an issue key ("
         + " / ".join(f"{p}-123" for p in LINEAR_TEAM_PREFIXES)
-        + ") in the PR title, body, or branch name, or a linear.app issue URL in\n"
-        "the body. Add it to the '## Linear issue' section and update the PR."
+        + "), or a linear.app/<workspace>/issue/<key> URL — in the PR title, body,\n"
+        "or branch name. Add it to the '## Linear issue' section and update the PR."
     )
 
 
