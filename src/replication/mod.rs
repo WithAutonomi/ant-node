@@ -215,6 +215,55 @@ const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 /// recovered by the sender's delayed possession check (ADR-0003).
 const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
+/// Maximum fresh offers admitted from one source peer.
+///
+/// Without a per-source share, one peer can hold every slot in the global pool
+/// and every honest offer arriving in that window is refused — and because a
+/// refusal is later read as absence by the sender's delayed possession check,
+/// those refusals land as audit-severity trust penalties on the *refuser*.
+/// That makes an unbounded global pool a targeted eviction primitive, so fresh
+/// offers get the same per-source treatment as every other responder class.
+///
+/// Two lets one sender pipeline a pair of chunks — matching
+/// [`FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER`], since a client PUT fans the
+/// same key out through overlapping close groups — while leaving at least two
+/// of the four workers reachable by other peers under a single-source flood.
+const FRESH_OFFER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
+
+/// Maximum paid-list notifications served concurrently.
+///
+/// A `PaidNotify` runs the same on-chain proof verification as a fresh offer
+/// but stores only paid-list metadata, so it needs no chunk-write headroom.
+/// Two workers keep cross-peer progress without multiplying concurrent EVM
+/// and DHT lookup pressure.
+const PAID_NOTIFY_WORKER_LIMIT: usize = 2;
+
+/// Maximum paid-list notifications admitted across workers and their waiters.
+///
+/// Sized as a **memory** ceiling, not a fairness device, because `PaidNotify`
+/// is one-way: the protocol defines no response and the sender never retries,
+/// so a refused notify is information permanently lost to this node until a
+/// later verification cycle happens to re-derive the key's paid status from a
+/// paid-list quorum. A tight admission bound therefore does not shed load, it
+/// discards durable state — which is why the class's real protection is
+/// [`PAID_NOTIFY_WORKER_LIMIT`], bounding the concurrent EVM and DHT work that
+/// is actually expensive, rather than this queue depth.
+///
+/// A client PUT fans one notify per key out to the whole paid close group, so
+/// a single upload legitimately arrives as a burst of tens. At the 512 KiB
+/// `MAX_PAYMENT_PROOF_SIZE_BYTES` worst case, sixty-four outstanding is a
+/// 32 MiB ceiling — half the fresh-offer admission ceiling, for messages that
+/// carry no chunk payload.
+const PAID_NOTIFY_MAX_OUTSTANDING: usize = 64;
+
+/// Maximum admitted paid-list notifications from one source peer.
+///
+/// A quarter of the pool. One peer legitimately supplies a whole upload's
+/// worth of notifies, so this must comfortably exceed a typical file's chunk
+/// count in flight; it exists to stop a single source evicting every other
+/// peer's durable paid-list evidence, not to ration ordinary traffic.
+const PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER: u32 = 16;
+
 /// Maximum fetch responses served concurrently.
 ///
 /// Each successful response can upload a 4 MiB chunk. Matching
@@ -620,9 +669,18 @@ pub struct ReplicationEngine {
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     /// Admission permits bounding offers running on a worker or queued for one.
     fresh_offer_admission_semaphore: Arc<Semaphore>,
+    /// Per-source fresh-offer counts, so one sender cannot hold the whole pool
+    /// and turn honest senders' refusals into trust penalties on this node.
+    fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Keys claimed by an in-flight fresh-offer handler, so concurrent
     /// duplicates collapse onto one verification and one write.
     fresh_offer_in_flight: FreshOfferInFlight,
+    /// Bounded worker permits for paid-list notification proof verification.
+    paid_notify_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding notifies on a worker or queued for one.
+    paid_notify_admission_semaphore: Arc<Semaphore>,
+    /// Per-source paid-notify counts for flood-fair admission.
+    paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -738,7 +796,11 @@ impl ReplicationEngine {
             neighbor_sync_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
+            fresh_offer_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            paid_notify_worker_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_WORKER_LIMIT)),
+            paid_notify_admission_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING)),
+            paid_notify_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -1017,10 +1079,29 @@ impl ReplicationEngine {
             }
         }
 
+        // Close the responder worker pools. Detached tasks still queued for a
+        // worker take the `Err` arm of `acquire_owned()` and exit immediately
+        // rather than waiting for a slot that will never free up — without
+        // this, work admitted just before shutdown would queue behind the last
+        // in-flight batch and hold the drain below open for its full duration.
+        self.fresh_offer_worker_semaphore.close();
+        self.paid_notify_worker_semaphore.close();
+        self.fetch_responder_worker_semaphore.close();
+        self.verification_responder_worker_semaphore.close();
+        self.neighbor_sync_responder_worker_semaphore.close();
+
         // All producers have stopped, so close and drain their detached work.
         // A started storage operation must run to completion: dropping an async
         // waiter does not cancel `spawn_blocking`, and would let shutdown return
         // while an LMDB transaction still owns the environment.
+        //
+        // Deliberately unbounded: the LMDB contract requires every worker to
+        // release its `Arc<LmdbStorage>` before the caller may reopen the
+        // environment, and a timeout here could return with one still held.
+        // What makes that safe is that every detached task is now guaranteed to
+        // finish — the pools above are closed, stale work is shed at dequeue,
+        // and the one genuinely unbounded await (payment verification) races
+        // `self.shutdown` via `verify_payment_until_shutdown`.
         self.detached_task_tracker.close();
         self.detached_task_tracker.wait().await;
 
@@ -1528,7 +1609,11 @@ impl ReplicationEngine {
         let neighbor_sync_responder_inflight = Arc::clone(&self.neighbor_sync_responder_inflight);
         let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
         let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
+        let fresh_offer_responder_inflight = Arc::clone(&self.fresh_offer_responder_inflight);
         let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
+        let paid_notify_worker_semaphore = Arc::clone(&self.paid_notify_worker_semaphore);
+        let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
+        let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
         let detached_task_tracker = self.detached_task_tracker.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
@@ -1573,7 +1658,12 @@ impl ReplicationEngine {
             neighbor_sync_responder_inflight,
             fresh_offer_worker_semaphore,
             fresh_offer_admission_semaphore,
+            fresh_offer_responder_inflight,
             fresh_offer_in_flight,
+            paid_notify_worker_semaphore,
+            paid_notify_admission_semaphore,
+            paid_notify_responder_inflight,
+            shutdown: shutdown.clone(),
             detached_task_tracker,
         };
 
@@ -2860,7 +2950,19 @@ struct ReplicationMessageHandlerContext {
     neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_worker_semaphore: Arc<Semaphore>,
     fresh_offer_admission_semaphore: Arc<Semaphore>,
+    fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     fresh_offer_in_flight: FreshOfferInFlight,
+    paid_notify_worker_semaphore: Arc<Semaphore>,
+    paid_notify_admission_semaphore: Arc<Semaphore>,
+    paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// The engine's shutdown token, for detached responder work.
+    ///
+    /// Workers on [`Self::detached_task_tracker`] race this around their
+    /// *network* phase only — never around an LMDB `spawn_blocking` await,
+    /// where dropping the awaiter would detach a live transaction. This is
+    /// what lets `shutdown()` keep its unbounded `tracker.wait()` and still
+    /// terminate: the wait stays safe because it is now guaranteed finite.
+    shutdown: CancellationToken,
     /// Shared tracker for detached work so `shutdown()` can await release of
     /// storage and P2P resources after all producer tasks have stopped.
     detached_task_tracker: TaskTracker,
@@ -3126,18 +3228,18 @@ async fn handle_replication_message(
 ) -> Result<()> {
     match msg.body {
         ReplicationMessageBody::FreshReplicationOffer(offer) => {
-            dispatch_fresh_offer(*source, offer, ctx, msg.request_id, rr_message_id).await
-        }
-        ReplicationMessageBody::PaidNotify(ref notify) => {
-            handle_paid_notify(
-                source,
-                notify,
-                &ctx.paid_list,
-                &ctx.payment_verifier,
-                &ctx.p2p_node,
-                &ctx.config,
+            dispatch_fresh_offer(
+                *source,
+                offer,
+                ctx,
+                msg.request_id,
+                received_at,
+                rr_message_id,
             )
             .await
+        }
+        ReplicationMessageBody::PaidNotify(notify) => {
+            dispatch_paid_notify(*source, notify, ctx, received_at).await
         }
         ReplicationMessageBody::NeighborSyncRequest(request) => {
             let bootstrapping = *ctx.is_bootstrapping.read().await;
@@ -3663,6 +3765,109 @@ async fn handle_replication_message(
 // Per-message-type handlers
 // ---------------------------------------------------------------------------
 
+/// Verify a payment proof, yielding early if the engine is shutting down.
+///
+/// Returns `None` when shutdown won the race, meaning no verdict was reached
+/// and the caller must abandon the message without storing or penalising.
+///
+/// Payment verification is pure network I/O — an EVM round trip and, on the
+/// merkle path, an iterative Kademlia lookup bounded only by the verifier's
+/// own `CLOSENESS_LOOKUP_TIMEOUT`. Racing it against the shutdown token is
+/// what keeps `ReplicationEngine::shutdown()`'s deliberately unbounded
+/// `detached_task_tracker.wait()` finite: the wait may block only on work that
+/// is guaranteed to end.
+///
+/// Deliberately NOT applied to `storage.put`: that awaits `spawn_blocking`, so
+/// dropping its awaiter would detach a live LMDB transaction and break the
+/// very contract the unbounded wait exists to uphold.
+async fn verify_payment_until_shutdown(
+    payment_verifier: &Arc<PaymentVerifier>,
+    key: &XorName,
+    proof_of_payment: &[u8],
+    context: VerificationContext,
+    shutdown: &CancellationToken,
+) -> Option<Result<crate::payment::PaymentStatus>> {
+    tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = payment_verifier.verify_payment(key, Some(proof_of_payment), context) => {
+            Some(result)
+        }
+    }
+}
+
+/// A fresh offer rejected on payload shape alone.
+struct FreshOfferRejection {
+    /// Wire-visible reason returned to the sender.
+    reason: String,
+    /// Whether the sender is charged for it. Reserved for offers no honest
+    /// node would construct, so an ordinary capacity refusal stays free.
+    penalise: bool,
+}
+
+/// Reject a fresh offer on payload shape, or return `None` to admit it.
+///
+/// Pure and non-blocking by construction: these are the checks cheap enough to
+/// run on the serial message loop *before* an admission permit is taken, so a
+/// malformed offer can never occupy one of the scarce
+/// [`FRESH_OFFER_MAX_OUTSTANDING`] slots for the duration of a payment
+/// verification. Anything needing I/O — the content-address hash, routing
+/// lookups, capacity checks, proof verification — stays on the worker.
+fn fresh_offer_structural_rejection(
+    offer: &protocol::FreshReplicationOffer,
+) -> Option<FreshOfferRejection> {
+    // Rule 5: reject if PoP is missing. An honest sender always attaches one,
+    // but an absent proof is also the cheapest possible slot-filler, so this is
+    // the first thing checked.
+    if offer.proof_of_payment.is_empty() {
+        return Some(FreshOfferRejection {
+            reason: "Missing proof of payment".to_string(),
+            penalise: false,
+        });
+    }
+
+    // Enforce chunk size invariant: the normal PUT path rejects data larger
+    // than MAX_CHUNK_SIZE; the replication receive path must do the same to
+    // prevent peers from pushing oversized records through replication.
+    if offer.data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Data size {} exceeds maximum chunk size {}",
+                offer.data.len(),
+                crate::ant_protocol::MAX_CHUNK_SIZE,
+            ),
+            penalise: true,
+        });
+    }
+
+    None
+}
+
+/// Tell `source` its offer for `key` was not taken.
+///
+/// Note the sender does not currently read this: `fresh::replicate_fresh` uses
+/// one-way `send_message`, so the refusal is observed only as a later absence by
+/// the delayed possession check. Recorded in ADR-0005 as a known gap.
+async fn refuse_fresh_offer(
+    source: &PeerId,
+    key: XorName,
+    reason: String,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    send_replication_response(
+        source,
+        &ctx.p2p_node,
+        request_id,
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            key,
+            reason,
+        }),
+        rr_message_id,
+    )
+    .await;
+}
+
 /// Admit a fresh offer for handling on a worker, or refuse it.
 ///
 /// This runs on the serial non-audit message loop, so it must stay cheap: every
@@ -3670,13 +3875,57 @@ async fn handle_replication_message(
 /// itself — an on-chain payment verification and a multi-MiB LMDB write — always
 /// runs on a tracked worker task, never inline, because stalling this loop backs
 /// up the inbound queue and ultimately drops replication messages wholesale.
+///
+/// Admission is bounded **per source** as well as globally
+/// ([`FRESH_OFFER_MAX_OUTSTANDING_PER_PEER`]). Without that share one peer can
+/// hold every slot, and since a refusal is later read as absence by the
+/// sender's delayed possession check, the resulting refusals land as
+/// audit-severity penalties on this node rather than on the flooder.
+///
+/// The structurally-invalid checks that cost nothing (missing proof, oversized
+/// payload) run **before** the permit is taken, so junk cannot occupy a slot
+/// for the duration of a payment verification. The content-address check stays
+/// on the worker: it hashes up to `MAX_CHUNK_SIZE` and belongs off this loop.
 async fn dispatch_fresh_offer(
     source: PeerId,
     offer: protocol::FreshReplicationOffer,
     ctx: &ReplicationMessageHandlerContext,
     request_id: u64,
+    received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    if let Some(rejection) = fresh_offer_structural_rejection(&offer) {
+        if rejection.penalise {
+            warn!(
+                "Rejecting fresh offer for key {} from {source}: {}",
+                hex::encode(offer.key),
+                rejection.reason
+            );
+            ctx.p2p_node
+                .report_trust_event(
+                    &source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+        } else {
+            debug!(
+                "Fresh offer for {} from {source} refused before admission: {}",
+                hex::encode(offer.key),
+                rejection.reason
+            );
+        }
+        refuse_fresh_offer(
+            &source,
+            offer.key,
+            rejection.reason,
+            ctx,
+            request_id,
+            rr_message_id,
+        )
+        .await;
+        return Ok(());
+    }
+
     // Claim the key first, so a duplicate never consumes an admission permit.
     // The first claimant does the verification and the write; a concurrent
     // duplicate is refused rather than made to wait, since the key is a content
@@ -3689,77 +3938,138 @@ async fn dispatch_fresh_offer(
             "Fresh offer for {} from {source} refused: already in flight",
             hex::encode(offer.key)
         );
-        send_replication_response(
+        refuse_fresh_offer(
             &source,
-            &ctx.p2p_node,
+            offer.key,
+            "Duplicate offer already in flight".to_string(),
+            ctx,
             request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: "Duplicate offer already in flight".to_string(),
-            }),
             rr_message_id,
         )
         .await;
         return Ok(());
     };
 
-    let Ok(admission) = Arc::clone(&ctx.fresh_offer_admission_semaphore).try_acquire_owned() else {
-        debug!(
-            "Fresh offer for {} from {source} refused: at capacity",
-            hex::encode(offer.key)
-        );
-        send_replication_response(
-            &source,
-            &ctx.p2p_node,
-            request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: "Receiver at fresh-offer capacity".to_string(),
-            }),
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
+    let admission = match admit_bounded_responder(
+        &ctx.fresh_offer_admission_semaphore,
+        &ctx.fresh_offer_responder_inflight,
+        &source,
+        FRESH_OFFER_MAX_OUTSTANDING,
+        FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            // Log the binding ceiling locally; the wire reason stays generic so
+            // a probing peer cannot map out this node's live occupancy.
+            debug!(
+                responder_class = "fresh_offer",
+                source = %source,
+                key = %hex::encode(offer.key),
+                "Fresh offer refused at admission: {failure}"
+            );
+            refuse_fresh_offer(
+                &source,
+                offer.key,
+                "Receiver at fresh-offer capacity".to_string(),
+                ctx,
+                request_id,
+                rr_message_id,
+            )
+            .await;
+            return Ok(());
+        }
     };
 
     let rr_message_id = rr_message_id.map(ToOwned::to_owned);
     let ctx = ctx.clone();
-    let worker_semaphore = Arc::clone(&ctx.fresh_offer_worker_semaphore);
-    let tracker = ctx.detached_task_tracker.clone();
     // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
     // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
     // those references be released before the caller reopens the environment.
-    // Do not cancel a started handler: `storage.put()` awaits `spawn_blocking`,
-    // and dropping that awaiter would detach the live LMDB transaction.
-    tracker.spawn(async move {
-        // Both guards released on completion: the claim frees the key for a
-        // later offer, the admission permit frees the payload's memory budget.
-        let _in_flight = in_flight;
-        let _admission = admission;
-        // Wait for a worker slot here rather than in the caller. The worker
-        // bound caps concurrent EVM and storage pressure; making the message
-        // loop wait on it is what put that pressure back on the loop.
-        let Ok(_worker) = worker_semaphore.acquire_owned().await else {
-            debug!("Fresh offer from {source} dropped: worker pool shut down");
-            return;
-        };
-        if let Err(e) = handle_fresh_offer(
-            &source,
-            &offer,
-            &ctx.storage,
-            &ctx.paid_list,
-            &ctx.payment_verifier,
-            &ctx.p2p_node,
-            &ctx.config,
+    ctx.detached_task_tracker
+        .clone()
+        .spawn(run_fresh_offer_worker(
+            source,
+            offer,
+            ctx,
             request_id,
-            rr_message_id.as_deref(),
-        )
-        .await
-        {
-            debug!("Fresh replication offer from {source} error: {e}");
-        }
-    });
+            received_at,
+            rr_message_id,
+            in_flight,
+            admission,
+        ));
     Ok(())
+}
+
+/// Body of one tracked fresh-offer worker.
+///
+/// Split out so `dispatch_fresh_offer` stays a readable admission decision.
+/// A started handler is never cancelled: `storage.put()` awaits
+/// `spawn_blocking`, and dropping that awaiter would detach the live LMDB
+/// transaction. Shutdown responsiveness comes from the closed worker semaphore
+/// and from `handle_fresh_offer` racing the token around payment verification.
+#[allow(clippy::too_many_arguments)]
+async fn run_fresh_offer_worker(
+    source: PeerId,
+    offer: protocol::FreshReplicationOffer,
+    ctx: ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<String>,
+    in_flight: FreshOfferInFlightGuard,
+    admission: ResponderGuard,
+) {
+    // Both guards released on completion: the claim frees the key for a later
+    // offer, the admission permit frees the payload's memory budget and the
+    // source's per-peer share.
+    let _in_flight = in_flight;
+    let _admission = admission;
+    // Wait for a worker slot here rather than in the caller. The worker bound
+    // caps concurrent EVM and storage pressure; making the message loop wait on
+    // it is what put that pressure back on the loop.
+    //
+    // The semaphore is closed by `shutdown()`, so this arm is the prompt exit
+    // path for offers still queued behind a worker when the engine stops — not
+    // dead code.
+    let Ok(_worker) = Arc::clone(&ctx.fresh_offer_worker_semaphore)
+        .acquire_owned()
+        .await
+    else {
+        debug!("Fresh offer from {source} dropped: worker pool shut down");
+        return;
+    };
+    // Fresh offers are fire-and-forget (`send_message`), so there is no
+    // requester deadline to honour and a late store is still genuinely useful.
+    // The shed threshold is therefore the point at which the work becomes
+    // *redundant* rather than merely late: once the sender's delayed possession
+    // check has run (ADR-0003) it has already re-offered the key, so finishing
+    // this copy buys nothing and only holds its multi-MiB payload longer.
+    if request_is_stale(received_at, ctx.config.possession_check_delay_min) {
+        debug!(
+            responder_class = "fresh_offer",
+            source = %source,
+            request_age_ms = received_at.elapsed().as_millis(),
+            "Superseded fresh offer shed at dequeue"
+        );
+        return;
+    }
+    if let Err(e) = handle_fresh_offer(
+        &source,
+        &offer,
+        &ctx.storage,
+        &ctx.paid_list,
+        &ctx.payment_verifier,
+        &ctx.p2p_node,
+        &ctx.config,
+        request_id,
+        rr_message_id.as_deref(),
+        &ctx.shutdown,
+    )
+    .await
+    {
+        debug!("Fresh replication offer from {source} error: {e}");
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -3773,52 +4083,34 @@ async fn handle_fresh_offer(
     config: &ReplicationConfig,
     request_id: u64,
     rr_message_id: Option<&str>,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
-    // Rule 5: reject if PoP is missing.
-    if offer.proof_of_payment.is_empty() {
+    // Defence in depth: `dispatch_fresh_offer` already applied these before
+    // taking an admission permit, so nothing reaching a worker should trip
+    // them. Kept so the handler is correct in isolation.
+    if let Some(rejection) = fresh_offer_structural_rejection(offer) {
+        if rejection.penalise {
+            warn!(
+                "Rejecting fresh offer for key {}: {}",
+                hex::encode(offer.key),
+                rejection.reason
+            );
+            p2p_node
+                .report_trust_event(
+                    source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+        }
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
                 key: offer.key,
-                reason: "Missing proof of payment".to_string(),
-            }),
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
-    }
-
-    // Enforce chunk size invariant: the normal PUT path rejects data larger
-    // than MAX_CHUNK_SIZE; the replication receive path must do the same to
-    // prevent peers from pushing oversized records through replication.
-    if offer.data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
-        warn!(
-            "Rejecting fresh offer for key {}: data size {} exceeds MAX_CHUNK_SIZE {}",
-            hex::encode(offer.key),
-            offer.data.len(),
-            crate::ant_protocol::MAX_CHUNK_SIZE,
-        );
-        p2p_node
-            .report_trust_event(
-                source,
-                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-            )
-            .await;
-        send_replication_response(
-            source,
-            p2p_node,
-            request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: format!(
-                    "Data size {} exceeds maximum chunk size {}",
-                    offer.data.len(),
-                    crate::ant_protocol::MAX_CHUNK_SIZE,
-                ),
+                reason: rejection.reason,
             }),
             rr_message_id,
         )
@@ -3923,14 +4215,23 @@ async fn handle_fresh_offer(
     // issuer K-closeness checks for single-node proofs, merkle candidate
     // closeness for merkle proofs, and the same price-floor policy — the
     // distinct context only labels price-floor telemetry.
-    match payment_verifier
-        .verify_payment(
-            &offer.key,
-            Some(&offer.proof_of_payment),
-            fresh_offer_payment_context(),
-        )
-        .await
-    {
+    let Some(verification) = verify_payment_until_shutdown(
+        payment_verifier,
+        &offer.key,
+        &offer.proof_of_payment,
+        fresh_offer_payment_context(),
+        shutdown,
+    )
+    .await
+    else {
+        debug!(
+            "Fresh offer for {} from {source} abandoned: engine shutting down \
+             during payment verification",
+            hex::encode(offer.key)
+        );
+        return Ok(());
+    };
+    match verification {
         Ok(status) if status.can_store() => {
             debug!(
                 "PoP validated for fresh offer key {}",
@@ -4014,6 +4315,96 @@ async fn handle_fresh_offer(
     Ok(())
 }
 
+/// Admit a paid-list notification for handling on a worker, or drop it.
+///
+/// `PaidNotify` used to be handled inline on the serial non-audit loop, which
+/// meant one message could park every other non-audit message behind a full
+/// payment verification. That verification is not a bounded local computation:
+/// on the merkle path it performs an iterative Kademlia lookup capped only by
+/// the verifier's `CLOSENESS_LOOKUP_TIMEOUT`, so a single notify could stall
+/// the loop for minutes while the bounded inbound queue behind it overflowed
+/// and dropped unrelated replication traffic wholesale.
+///
+/// It now follows the same detached-responder pattern as neighbor sync and
+/// verification (ADR-0005 decision 2): bounded globally and per source, shed
+/// when stale, and run on a tracked worker.
+///
+/// `PaidNotify` is one-way — the protocol defines no response variant — so a
+/// refused notify is simply dropped. The sender's own paid-list convergence
+/// (periodic neighbor sync and the verification cycle's paid-list quorum) is
+/// the recovery path, exactly as for a notify lost in transit.
+async fn dispatch_paid_notify(
+    source: PeerId,
+    notify: protocol::PaidNotify,
+    ctx: &ReplicationMessageHandlerContext,
+    received_at: Instant,
+) -> Result<()> {
+    let admission = match admit_bounded_responder(
+        &ctx.paid_notify_admission_semaphore,
+        &ctx.paid_notify_responder_inflight,
+        &source,
+        PAID_NOTIFY_MAX_OUTSTANDING,
+        PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            debug!(
+                responder_class = "paid_notify",
+                source = %source,
+                key = %hex::encode(notify.key),
+                "Paid notify dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let ctx = ctx.clone();
+    let worker_semaphore = Arc::clone(&ctx.paid_notify_worker_semaphore);
+    // Deliberately NOT the verification request deadline used by the
+    // request/response responders. Nobody is waiting on a notify, and shedding
+    // one discards durable paid-list evidence rather than a reply a requester
+    // has already given up on. The threshold is instead the point at which the
+    // pull path would have learned the same fact anyway: one slow-cadence
+    // neighbor-sync interval, after which the verification cycle's paid-list
+    // quorum makes this notify genuinely redundant.
+    let queue_max_age = ctx.config.neighbor_sync_interval_max;
+    ctx.detached_task_tracker.clone().spawn(async move {
+        let _admission = admission;
+        // Closed by `shutdown()`, so this is the prompt exit path for notifies
+        // still queued behind a worker when the engine stops.
+        let Ok(_worker) = worker_semaphore.acquire_owned().await else {
+            debug!("Paid notify from {source} dropped: worker pool shut down");
+            return;
+        };
+        if request_is_stale(received_at, queue_max_age) {
+            debug!(
+                responder_class = "paid_notify",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Redundant paid notify shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_paid_notify(
+            &source,
+            &notify,
+            &ctx.paid_list,
+            &ctx.payment_verifier,
+            &ctx.p2p_node,
+            &ctx.config,
+            &ctx.shutdown,
+        )
+        .await
+        {
+            debug!("Paid notify from {source} error: {e}");
+        }
+    });
+
+    Ok(())
+}
+
 async fn handle_paid_notify(
     _source: &PeerId,
     notify: &protocol::PaidNotify,
@@ -4021,6 +4412,7 @@ async fn handle_paid_notify(
     payment_verifier: &Arc<PaymentVerifier>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
@@ -4045,14 +4437,23 @@ async fn handle_paid_notify(
     // paid-list metadata, so local paid-list close-group membership was checked
     // above before proof work. The verifier then runs the same payment proof
     // checks as ClientPut while writing a paid-list-strength cache entry.
-    match payment_verifier
-        .verify_payment(
-            &notify.key,
-            Some(&notify.proof_of_payment),
-            paid_notify_payment_context(),
-        )
-        .await
-    {
+    let Some(verification) = verify_payment_until_shutdown(
+        payment_verifier,
+        &notify.key,
+        &notify.proof_of_payment,
+        paid_notify_payment_context(),
+        shutdown,
+    )
+    .await
+    else {
+        debug!(
+            "Paid notify for {} abandoned: engine shutting down during payment \
+             verification",
+            hex::encode(notify.key)
+        );
+        return Ok(());
+    };
+    match verification {
         Ok(status) if status.can_store() => {
             debug!(
                 "PoP validated for paid notify key {}",
@@ -7549,6 +7950,174 @@ mod tests {
         assert!(other_peer.is_ok());
         drop(first_guard);
         drop(other_peer);
+    }
+
+    /// One flooding peer must not be able to hold every fresh-offer slot.
+    ///
+    /// This is the eviction primitive the per-peer share closes: with only a
+    /// global bound, a single source occupies the pool, every honest offer in
+    /// that window is refused, and because a refusal reads as absence to the
+    /// sender's delayed possession check those refusals land as
+    /// audit-severity penalties on *this* node.
+    #[tokio::test]
+    async fn fresh_offer_admission_reserves_capacity_for_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let flooder = test_peer(0xC1);
+        let honest = test_peer(0xC2);
+
+        let mut held = Vec::new();
+        for _ in 0..FRESH_OFFER_MAX_OUTSTANDING_PER_PEER {
+            held.push(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    FRESH_OFFER_MAX_OUTSTANDING,
+                    FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await
+                .expect("offers within the per-peer share are admitted"),
+            );
+        }
+
+        let flooder_excess = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &flooder,
+            FRESH_OFFER_MAX_OUTSTANDING,
+            FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        assert!(
+            matches!(
+                flooder_excess,
+                Err(ResponderAdmissionFailure {
+                    reason: ResponderRejectReason::PerPeerCapFull,
+                    ..
+                })
+            ),
+            "one source must not exceed its fresh-offer share"
+        );
+
+        let honest_offer = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &honest,
+            FRESH_OFFER_MAX_OUTSTANDING,
+            FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        assert!(
+            honest_offer.is_ok(),
+            "an honest sender must still be admitted while another peer floods"
+        );
+
+        assert!(
+            usize::try_from(FRESH_OFFER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX)
+                < FRESH_OFFER_MAX_OUTSTANDING,
+            "the per-peer share must leave room for other sources"
+        );
+
+        drop(held);
+        drop(honest_offer);
+    }
+
+    /// Paid notifies get the same per-source treatment as every other class.
+    #[tokio::test]
+    async fn paid_notify_admission_reserves_capacity_for_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let flooder = test_peer(0xC3);
+        let honest = test_peer(0xC4);
+
+        let mut held = Vec::new();
+        for _ in 0..PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER {
+            held.push(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    PAID_NOTIFY_MAX_OUTSTANDING,
+                    PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await
+                .expect("notifies within the per-peer share are admitted"),
+            );
+        }
+
+        assert!(
+            matches!(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    PAID_NOTIFY_MAX_OUTSTANDING,
+                    PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await,
+                Err(ResponderAdmissionFailure {
+                    reason: ResponderRejectReason::PerPeerCapFull,
+                    ..
+                })
+            ),
+            "one source must not exceed its paid-notify share"
+        );
+        assert!(
+            admit_bounded_responder(
+                &semaphore,
+                &inflight,
+                &honest,
+                PAID_NOTIFY_MAX_OUTSTANDING,
+                PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+            )
+            .await
+            .is_ok(),
+            "an honest sender must still be admitted while another peer floods"
+        );
+
+        drop(held);
+    }
+
+    /// A malformed offer must be refused before it can occupy an admission
+    /// slot, so junk cannot hold capacity for the length of a verification.
+    #[test]
+    fn structurally_invalid_fresh_offers_are_rejected_before_admission() {
+        let key = test_key(0xC5);
+
+        let missing_proof = protocol::FreshReplicationOffer {
+            key,
+            data: vec![0u8; 1],
+            proof_of_payment: Vec::new(),
+        };
+        let rejection = fresh_offer_structural_rejection(&missing_proof)
+            .expect("an offer with no proof must be refused");
+        assert!(
+            !rejection.penalise,
+            "a missing proof is refused but not charged as misbehaviour"
+        );
+
+        let oversized = protocol::FreshReplicationOffer {
+            key,
+            data: vec![0u8; crate::ant_protocol::MAX_CHUNK_SIZE + 1],
+            proof_of_payment: vec![1u8; 1],
+        };
+        let rejection = fresh_offer_structural_rejection(&oversized)
+            .expect("an oversized offer must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an oversized offer"
+        );
+
+        let valid = protocol::FreshReplicationOffer {
+            key,
+            data: vec![0u8; 1],
+            proof_of_payment: vec![1u8; 1],
+        };
+        assert!(
+            fresh_offer_structural_rejection(&valid).is_none(),
+            "a well-formed offer must reach admission"
+        );
     }
 
     #[tokio::test]
