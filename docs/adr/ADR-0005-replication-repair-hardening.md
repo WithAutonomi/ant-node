@@ -213,6 +213,51 @@ tracking must live at the storage layer, not at each call site:
   All producer loops stop before the tracker is closed and drained, preventing
   late-registration races, and the best-effort timeout is removed so shutdown
   cannot claim LMDB-safe completion while blocking work remains.
+- That unbounded drain is only safe if every detached task is **guaranteed to
+  finish**, which fresh-offer workers were not: they neither checked the
+  cancellation token nor shed stale work, and awaited a payment verification
+  whose merkle path performs an iterative Kademlia lookup capped only by the
+  verifier's `CLOSENESS_LOOKUP_TIMEOUT` (240s). Three changes close that, keeping
+  the wait unbounded (a timeout could return with an `Arc<LmdbStorage>` still
+  held, breaking the very contract above):
+  1. `shutdown()` **closes the responder worker semaphores**, so tasks queued for
+     a worker take the existing `Err` arm of `acquire_owned()` and exit at once
+     rather than waiting behind the last in-flight batch. Those arms were
+     previously unreachable — no semaphore was ever closed — and are now the
+     prompt-exit path.
+  2. Payment verification runs through `verify_payment_until_shutdown`, which
+     races the shutdown token. The boundary is drawn at **network I/O only**:
+     `storage.put` awaits `spawn_blocking` and is never cancelled, since dropping
+     that awaiter detaches a live LMDB transaction.
+  3. Fresh offers shed at dequeue once older than `possession_check_delay_min`.
+     Unlike the sync/verification responders there is no requester deadline to
+     honour — the send is fire-and-forget and a late store is still useful — so
+     the threshold is the point at which the work becomes *redundant*: past it
+     the sender's delayed possession check has already re-offered the key.
+- Fresh offers and `PaidNotify` now use the **same bounded-responder admission**
+  as the other classes (`admit_bounded_responder`), globally and per source.
+  `PaidNotify` in particular was still verified **inline on the serial non-audit
+  loop**: one message could park every other non-audit message behind that same
+  240s-capped lookup while the bounded inbound queue behind it overflowed and
+  dropped unrelated replication traffic wholesale. Fresh offers additionally
+  apply their zero-cost structural checks (missing proof, oversized payload)
+  *before* taking a permit, so malformed work cannot occupy one of sixteen slots
+  for the length of a verification.
+- **`PaidNotify` is bounded differently from the request/response responders,
+  and deliberately so.** It is one-way: the protocol defines no response and the
+  sender never retries, so refusing or shedding one does not push work back onto
+  a requester — it discards durable paid-list evidence that this node then lacks
+  until a later verification cycle happens to re-derive the key's paid status
+  from a quorum. Sizing it like a request responder (8 outstanding / 2 per peer,
+  shed at the 15s verification deadline) measurably broke replication: a joining
+  node silently lost paid-list entries for a fraction of the keys it was
+  responsible for and never fetched them inside a 90s window
+  (`test_late_joiner_replicates_responsible_chunks`). The bounds are therefore
+  set as a **memory ceiling** (64 outstanding, 16 per peer — 32 MiB at the
+  512 KiB worst-case proof) and the staleness shed uses one slow-cadence
+  neighbor-sync interval, the point at which the pull path would have learned
+  the same fact. The class's real protection is `PAID_NOTIFY_WORKER_LIMIT` = 2,
+  which bounds the concurrent EVM and DHT work that is actually expensive.
 - Per-fetch tasks (initial and retry) are spawned on the detached tracker instead
   of bare `tokio::spawn`, so a dropped `in_flight` set can no longer leak
   `Arc<LmdbStorage>` past shutdown. Prompt network-I/O cancellation is unchanged —
@@ -251,13 +296,27 @@ deliberately distinguished.
 The capacity-rejection record is now a `HashMap<PeerId, Instant>` (most-recent
 rejection time) rather than a bare set (`types.rs`), and:
 
-- Records expire after **`CAPACITY_REJECTED_MAX_AGE`** — three neighbor-sync
-  intervals at the slowest cadence plus one minimum interval of slack
-  (`config.rs`). A live source re-hints every cycle, so silence that long means
-  re-delivery was abandoned (or the source departed in a race with its own
-  `PeerRemoved` cleanup). Expiry forfeits the departed source's owed keys,
+- Records expire after **`ReplicationConfig::capacity_rejected_max_age()`** —
+  a full round-robin neighbor cycle including one request deadline per peer,
+  plus the peer cooldown and one slow-cadence interval of slack (`config.rs`).
+- The recorded time is **first-seen and never refreshed**. A repeat rejection
+  re-asserts that the source still owes work but must not restart the clock:
+  measuring from the most recent rejection meant a source that keeps overflowing
+  the queue kept its own record permanently fresh, so `check_bootstrap_drained`
+  never returned true, `bootstrapping: true` stood indefinitely, and **auditing
+  stayed off for the entire duration of the pressure** (Invariant 19). That is a
+  liveness wedge reachable by an ordinarily busy peer, with no attacker needed.
+  First-seen semantics bound it at one TTL regardless of peer behaviour.
+- Expiry forfeits the source's owed keys — whether it departed, abandoned
+  re-delivery, or is simply overflowing us faster than it can re-deliver —
   consistent with `update_bootstrap_after_peer_removed`; post-bootstrap neighbor
   sync and audit/repair recover them.
+- A **fairness displacement never stamps its victim.** Reclaiming a borrowed slot
+  (decision 7) is this node's own fairness decision, not a failure by the peer
+  that held it. Recording the displaced owner as capacity-rejected let a
+  sustained flooder wedge our bootstrap drain open *through an unrelated honest
+  peer* that had never overflowed us. Only the displaced key is forfeited, to the
+  same recovery path as an expired record.
 - Expiry **plus a drain re-check** runs on **every verification worker tick**,
   ahead of the `pending_peer_requests` early-returns: pending requests legitimately
   block the drain check itself but must not block expiry. This also closes the
@@ -273,17 +332,52 @@ rejection time) rather than a bare set (`types.rs`), and:
 
 ### 7. Source-aware, bounded verification
 
-- Retain **all live hint sources** per key (including the subset that explicitly
+- Retain **live hint sources** per key (including the subset that explicitly
   claimed replica possession) instead of a single sender. Capacity ownership is
   tracked separately from evidence provenance: unique keys are charged to one
   authenticated source, while duplicate advertisements merge evidence without
   consuming another slot.
+- Bound that retention at **`MAX_HINT_SOURCES_PER_KEY` (8)** sources per key.
+  `MAX_PENDING_VERIFY` counts keys, not the peers remembered against each one,
+  and the duplicate-advertisement path merges a source into two per-key sets plus
+  the reverse index at no capacity cost — so without this cap, N routing-table
+  peers re-advertising a full queue cost `N x 131,072` associations charged
+  against nothing. Re-advertising an already-pending key is also the cheapest
+  path through admission, since `is_relevant` short-circuits on it without a
+  routing-table lookup. At the cap, replica claimants displace paid-only
+  advertisers: only a claimant is usable as a fetch candidate, so a paid-only
+  source forfeits its slot and the key loses one unit of corroboration weight —
+  never a fetch candidate and never the key itself. The capacity owner is never
+  displaced, since `insert_pending_owned_unchecked` requires it to remain a live
+  hint source.
 - Enforce **elastic max-min sender accounting** under the 131,072-entry global
   bound. A sole sender may borrow unused capacity for a large bootstrap snapshot;
   once another sender has work, its fair allocation is restored by reclaiming
   low-corroboration borrowed entries from an over-represented owner. Reclaimed
-  bootstrap work remains outstanding for its former owner, exactly like an
-  incoming capacity rejection.
+  bootstrap work is forfeited to post-bootstrap recovery (decision 6), not
+  charged against its former owner's standing.
+- **This removes `MAX_PENDING_VERIFY_PER_PEER` (8,192)**, the base branch's hard
+  per-source cap and — by its own doc comment — the primary flood defence. The
+  trade is explicit and worth stating in adversarial terms: a single sender's
+  worst-case resident footprint rises **8,192 -> 131,072 entries, a 16x jump**.
+  What replaces the hard cap is a convergence property rather than a ceiling: the
+  moment a second sender has work, max-min reclaim moves borrowed slots to it,
+  one slot per admission, until both hold an even share. Max-min is preferred
+  because a hard cap wastes capacity exactly when it is most useful — a
+  single-peer bootstrap snapshot against an otherwise-idle queue — while still
+  failing to bound N colluding senders, which the global cap has to catch
+  regardless. The convergence claim is pinned by
+  `borrowed_capacity_converges_to_fair_share_for_a_late_sender`, which fills the
+  pool from one sender and asserts a late sender reclaims an even share; it also
+  covers `fair_rejection_cache` and the stale-candidate skip loop in
+  `pop_reclaimable_victim`, where a convergence failure would otherwise hide.
+- Charge **retry reservations to their capacity owner**. A key promoted to the
+  fetch pipeline leaves `pending_keys_by_owner` but keeps a reservation against
+  the global pool; billing that to nobody let an owner with many in-flight
+  retries read as under-loaded and win more than its share, a skew growing with
+  exactly how much work it already held. `reclaim_borrowed_slot` now allocates
+  the full pool against `resident + reserved` per owner, matching
+  `pending_capacity_used`.
 - Select each bounded verification cycle round-robin across capacity owners,
   redistributing unused service immediately. Protected fetch retries and
   corroborating-source count retain priority within an owner's share. Thus a
@@ -313,11 +407,33 @@ rejection time) rather than a bare set (`types.rs`), and:
   (`types.rs`, `mod.rs`). Dequeue uses **by-value APIs** so retry reservations
   cannot be orphaned, and promoted verified keys keep counting against capacity so
   unrelated hints cannot steal the slot needed to requeue them.
-- Paid-list majority repair gains a **four-peer flexible edge** for full-width
-  close groups: negative/missing edge votes do not enlarge the denominator, positive
+- Paid-list majority repair gains a **flexible edge** for full-width close
+  groups: negative/missing edge votes do not enlarge the denominator, positive
   edge votes count and expand it, undersized groups stay on strict-majority rules,
   and inconclusive outcomes are preserved while unresolved votes could still change
   the result (`quorum.rs`, `paid_list.rs`).
+- The edge is **scaled to the group** (`paid_group_size / 5`, capped at
+  `PAID_LIST_FLEX_EDGE_COUNT = 4`) rather than a fixed four peers. At the
+  production width of 20 this is exactly 4, so shipped behaviour is unchanged;
+  at smaller *configured* widths a fixed four was disproportionate. The guard was
+  `configured_group_size > PAID_LIST_FLEX_EDGE_COUNT`, so a configured group of
+  five discounted four of its members, left a voting core of **one**, and
+  authorized on a **single `Confirmed` vote** — and `validate()` accepts any width
+  down to 1. Since `PaidListVerified` writes the paid list and enables repair
+  fetches, that is the gate deciding what a node fetches and keeps.
+- A **`PAID_LIST_ABSOLUTE_CONFIRM_FLOOR` of 3** confirmations applies on top of
+  the discounted majority, bounded by the true group size so it can never demand
+  more votes than there are peers to give them. The edge discount shrinks the
+  denominator and with it the threshold; the floor keeps a lone voter from ever
+  being decisive, whatever the discount does.
+- **Not addressed here:** an edge peer that answers `NotFound` is still
+  discounted identically to one that stays silent, so real negative evidence
+  vanishes at the boundary while the same vote from a core peer counts against
+  the key. Churn justifies discounting silence, not a peer that answered. The
+  behaviour is deliberate and pinned by
+  `paid_list_edge_notfound_votes_shrink_denominator_to_inner_group`; revisiting
+  it is left to a follow-up, as is the width-20 relaxation from 11/20 to 9/16
+  that the flexible edge introduces in the first place.
 
 ### 9. Merge duplicate hints in O(1) by separating ordering from payload
 
@@ -447,9 +563,28 @@ digest, nonce, or challenge-ID rule changes; the wire representation is untouche
 - **New refusal behaviour.** Past the 16-permit fresh-offer admission bound an offer
   is refused rather than queued; a refused offer is penalized as absent by the
   delayed possession check.
+- **A capacity refusal still costs the refuser trust — known gap.** The sender
+  transmits fresh offers with `send_message` and never reads the `Rejected`
+  response, so a refusal is indistinguishable from absence at the later possession
+  check and lands as `AUDIT_FAILURE_TRUST_WEIGHT` (5.0) on the *refuser*. This
+  fires under ordinary load bursts, not just attacks: any node reaching its
+  fresh-offer ceiling accumulates unearned trust damage from peers doing nothing
+  wrong, and that feeds the eviction path. The per-source share (decision 2) bounds
+  how much of the pool one peer can occupy, and so how *large* the effect can be
+  made deliberately, but does not remove it. Closing it properly needs the sender
+  to read the response — the receiver already returns a precise reason, it is
+  simply discarded — and to grade the possession outcome accordingly. Deferred.
 - **Forfeited owed keys on expiry.** When a capacity-rejection record expires, the
-  departed source's owed keys are forfeited and recovered later via post-bootstrap
-  neighbor sync and audit/repair, rather than held indefinitely.
+  source's owed keys are forfeited and recovered later via post-bootstrap neighbor
+  sync and audit/repair, rather than held indefinitely. This now also covers a
+  live source that keeps overflowing us, not only a departed one (decision 6):
+  bounding the wedge is worth more than holding the debt.
+- **Larger single-sender footprint.** Removing `MAX_PENDING_VERIFY_PER_PEER`
+  raises one sender's worst-case resident share 8,192 -> 131,072 entries. Traded
+  for max-min convergence and useful borrowing; see decision 7.
+- **Bounded per-key corroboration.** Capping hint sources at 8 per key means a
+  ninth advertiser of an already-well-corroborated key is not recorded. It costs
+  a unit of corroboration weight, never a fetch candidate or the key itself.
 - **More moving parts.** Task trackers, RAII in-flight guards, reservation
   bookkeeping, and the split heap add mechanism that must be kept correct; several
   new tunables now exist (see below).
@@ -459,10 +594,18 @@ digest, nonce, or challenge-ID rule changes; the wire representation is untouche
 
 ### Neutral / Operational
 
-- New/changed tunables, all in `src/replication/config.rs`:
-  `CAPACITY_REJECTED_MAX_AGE`, `MAX_VERIFICATION_KEYS_PER_CYCLE` (8,192),
+- New/changed tunables, in `src/replication/config.rs` unless noted:
+  `ReplicationConfig::capacity_rejected_max_age()` (derived, not a constant),
+  `MAX_VERIFICATION_KEYS_PER_CYCLE` (8,192),
   `MAX_CONCURRENT_VERIFICATION_REQUESTS` (32), the fresh-offer admission bound
-  (16 permits / 64 MiB), and the four-peer paid-list edge. The two responsibility
+  (16 permits / 64 MiB) and its new per-source share
+  (`FRESH_OFFER_MAX_OUTSTANDING_PER_PEER` = 2, `mod.rs`), the paid-notify
+  responder bounds (`PAID_NOTIFY_WORKER_LIMIT` = 2,
+  `PAID_NOTIFY_MAX_OUTSTANDING` = 8, `PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER` = 2,
+  `mod.rs`), `MAX_HINT_SOURCES_PER_KEY` (8, `scheduling.rs`), the paid-list edge
+  ceiling `PAID_LIST_FLEX_EDGE_COUNT` (4) with its
+  `PAID_LIST_FLEX_EDGE_DIVISOR` (5) scaling, and
+  `PAID_LIST_ABSOLUTE_CONFIRM_FLOOR` (3). The two responsibility
   widths (`storage_admission_width` = 9, `paid_list_close_group_size` = 20) are
   unchanged and shared with ADR-0003.
 - Prune passes use bounded candidate, request, and local fast-delete counts. The
