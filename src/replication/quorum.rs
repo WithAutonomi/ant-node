@@ -15,13 +15,18 @@ use tokio::task::JoinHandle;
 
 use crate::ant_protocol::XorName;
 use crate::replication::config::{
-    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, PAID_LIST_FLEX_EDGE_COUNT,
-    REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, MAX_CONCURRENT_VERIFICATION_REQUESTS, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     ReplicationMessage, ReplicationMessageBody, VerificationRequest, VerificationResponse,
 };
 use crate::replication::types::{KeyVerificationEvidence, PaidListEvidence, PresenceEvidence};
+
+// Test-only import, kept at the top of the file per the project's conventions.
+// The edge width is now derived via `ReplicationConfig::paid_list_flex_edge_count`,
+// so production code no longer references the ceiling directly.
+#[cfg(test)]
+use crate::replication::config::PAID_LIST_FLEX_EDGE_COUNT;
 
 /// Verification round duration that is worth surfacing at info level.
 const VERIFICATION_ROUND_SLOW_LOG_MS: u128 = 500;
@@ -37,6 +42,10 @@ struct PaidListVoteSummary {
     effective_group_size: usize,
     max_possible_confirmed: usize,
     max_possible_group_size: usize,
+    /// Undiscounted paid close-group size, before the flexible edge shrinks
+    /// the denominator. Bounds the absolute confirmation floor so it can never
+    /// exceed the number of peers able to answer.
+    full_group_size: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,7 +118,15 @@ pub async fn compute_verification_targets(
             .find_closest_nodes_local_with_self(&key, config.paid_list_close_group_size)
             .await;
         let paid_group_size = paid_closest.len();
-        let paid_edge_start = paid_group_size.saturating_sub(PAID_LIST_FLEX_EDGE_COUNT);
+        // Must use the SAME scaled width as `summarize_paid_list_votes`. If the
+        // membership here is wider than the count applied there,
+        // `core_group_size + confirmed_edge` can exceed the real group size and
+        // demand more confirmations than the group can produce.
+        let paid_edge_start =
+            paid_group_size.saturating_sub(ReplicationConfig::paid_list_flex_edge_count(
+                paid_group_size,
+                config.paid_list_close_group_size,
+            ));
         let mut paid_peers = Vec::new();
         let mut paid_edge_peers = HashSet::new();
         for (idx, node) in paid_closest.iter().enumerate() {
@@ -307,7 +324,10 @@ pub fn evaluate_key_evidence_with_holder_check(
         paid_peers,
         config.paid_list_close_group_size,
     );
-    let confirm_needed = ReplicationConfig::confirm_needed(paid_votes.effective_group_size);
+    let confirm_needed = ReplicationConfig::paid_confirm_needed(
+        paid_votes.effective_group_size,
+        paid_votes.full_group_size,
+    );
 
     // Step 10: Presence quorum reached.
     // quorum_needed == 0 means zero targets exist — quorum is impossible,
@@ -328,7 +348,10 @@ pub fn evaluate_key_evidence_with_holder_check(
     }
 
     // Step 14: Fail fast when both paths are impossible.
-    let max_confirm_needed = ReplicationConfig::confirm_needed(paid_votes.max_possible_group_size);
+    let max_confirm_needed = ReplicationConfig::paid_confirm_needed(
+        paid_votes.max_possible_group_size,
+        paid_votes.full_group_size,
+    );
     let paid_possible = paid_votes.max_possible_group_size > 0
         && paid_votes.max_possible_confirmed >= max_confirm_needed;
     let quorum_possible =
@@ -354,13 +377,8 @@ fn summarize_paid_list_votes(
         .get(key)
         .copied()
         .unwrap_or(paid_peers.len());
-    let paid_edge_count = if paid_group_size >= configured_group_size
-        && configured_group_size > PAID_LIST_FLEX_EDGE_COUNT
-    {
-        PAID_LIST_FLEX_EDGE_COUNT.min(paid_group_size)
-    } else {
-        0
-    };
+    let paid_edge_count =
+        ReplicationConfig::paid_list_flex_edge_count(paid_group_size, configured_group_size);
     let core_group_size = paid_group_size.saturating_sub(paid_edge_count);
     let edge_targets = (paid_edge_count > 0)
         .then(|| targets.paid_edge_targets.get(key))
@@ -397,6 +415,7 @@ fn summarize_paid_list_votes(
         effective_group_size,
         max_possible_confirmed: confirmed + unresolved_core + unresolved_edge,
         max_possible_group_size: effective_group_size + unresolved_edge,
+        full_group_size: paid_group_size,
     }
 }
 
@@ -761,9 +780,13 @@ fn process_verification_response_for_keys(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::replication::config::PAID_LIST_CLOSE_GROUP_SIZE;
-    use crate::replication::protocol::KeyVerificationResult;
 
+    // Bound through the glob rather than fresh `use` lines, which the project's
+    // conventions reserve for the top of the file.
+    type KeyVerificationResult = crate::replication::protocol::KeyVerificationResult;
+
+    const PAID_LIST_CLOSE_GROUP_SIZE: usize =
+        crate::replication::config::PAID_LIST_CLOSE_GROUP_SIZE;
     const PAID_LIST_INNER_GROUP_SIZE: usize =
         PAID_LIST_CLOSE_GROUP_SIZE - PAID_LIST_FLEX_EDGE_COUNT;
     const PAID_LIST_INNER_MAJORITY: usize = PAID_LIST_INNER_GROUP_SIZE / 2 + 1;
