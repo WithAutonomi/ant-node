@@ -986,14 +986,28 @@ fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
 /// sharing this one predicate between the guard and its regression test means a
 /// change to the rule cannot pass the test unnoticed.
 fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    let expected = if body.is_subtree_audit() {
+    protocol == response_protocol_for(body)
+}
+
+/// The protocol id a body belongs on — the single source of truth for BOTH
+/// directions: the receive guard ([`body_matches_protocol`]) and the outbound
+/// response selector in `send_replication_response_checked`.
+///
+/// Sharing one function is what makes the family isolation symmetric. It also
+/// removes a dependency on transport behaviour: saorsa-core correlates an RR
+/// response by `(peer, msg_id)` rather than by protocol name, so a possession
+/// `AuditResponse` sent on the core id would still reach an auditor waiting on
+/// the possession id — but a bare (non-RR) response sent that way is dropped by
+/// the peer's own guard, and correlation is a detail this layer should not rely
+/// on.
+fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
+    if body.is_subtree_audit() {
         SUBTREE_AUDIT_PROTOCOL_ID
     } else if body.is_possession_audit() {
         POSSESSION_AUDIT_PROTOCOL_ID
     } else {
         REPLICATION_PROTOCOL_ID
-    };
-    protocol == expected
+    }
 }
 
 fn fresh_offer_payment_context() -> VerificationContext {
@@ -3210,11 +3224,19 @@ enum SliceAdmission {
 /// Admit a round-2 slice challenge: take the responder permit BEFORE consuming
 /// the single-use round-1 session.
 ///
-/// The order is the point. The session is single-use, so consuming it and only
-/// then testing admission would let a transient local capacity drop destroy the
-/// exchange permanently: the auditor's retry would find no session and be
-/// refused with `Transient` forever, even after load cleared. Taking the permit
-/// first means a capacity refusal is exactly what it claims to be — temporary.
+/// The order is the point: a single-use token must not be spent on work that is
+/// then refused. Consuming first and testing admission second leaves the session
+/// destroyed by a purely local capacity drop, so the refusal is not recoverable
+/// even in principle.
+///
+/// Scope of the benefit today, stated honestly: `request_slice_proof` issues one
+/// `send_request` and maps any failure straight to `SliceRound::Timeout`, so the
+/// auditor does not currently re-send round 2 within an audit. The preserved
+/// session is therefore not yet *recovering* an audit — it keeps a refusal
+/// truthful (temporary means temporary) and keeps the invariant available for a
+/// retry, rather than baking "capacity drop is permanent" into the state
+/// machine. If an application-level retry is ruled out for good, this ordering
+/// still costs nothing over the alternative.
 ///
 /// Cost of the ordering: the permit and per-peer slot are held across the
 /// session probe, which is one in-memory map lookup and no chunk work. The
@@ -4439,17 +4461,7 @@ async fn send_replication_response_checked(
     ) {
         protocol::record_served(peer, encoded.len());
     }
-    // Reply on the id the request rode: subtree-audit responses go on the audit
-    // id, everything else on the core id. `is_subtree_audit()` is the same single
-    // predicate the receive guard uses, so the two can never disagree (an audit
-    // request only reaches a handler on the audit id, and it only produces an
-    // audit response). saorsa-core correlates RR responses by (peer, msg_id), not
-    // by protocol name, so a v3 auditor waiting on the audit id still matches.
-    let protocol = if msg.body.is_subtree_audit() {
-        SUBTREE_AUDIT_PROTOCOL_ID
-    } else {
-        REPLICATION_PROTOCOL_ID
-    };
+    let protocol = response_protocol_for(&msg.body);
     let result = if let Some(msg_id) = rr_message_id {
         p2p_node
             .send_response(peer, protocol, msg_id, encoded)
@@ -5764,10 +5776,30 @@ async fn handle_subtree_audit_result(
 /// bootstrapping); every confirmed storage-integrity reason does.
 ///
 /// Responsible-chunk `AuditChallenge` failures use this directly: timeouts keep
-/// the bootstrap claim but are still reported as audit failures, matching the
-/// pre-ADR-0002 behaviour.
+/// the bootstrap claim, matching the pre-ADR-0002 behaviour. Whether a timeout
+/// is also *penalised* is a separate question — see
+/// [`audit_failure_reports_trust_penalty`].
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
+}
+
+/// Whether an audit failure with this reason reports an application trust event
+/// at [`AUDIT_FAILURE_TRUST_WEIGHT`](config::AUDIT_FAILURE_TRUST_WEIGHT).
+///
+/// ROLLOUT GATE — see [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]. While that gate is
+/// set, a `Timeout` on the digest lanes is graced, because a peer on the other
+/// side of the possession-audit protocol move never answers and its silence is
+/// not evidence about its storage. Every other reason is a confirmed failure and
+/// is always penalised. When the gate is removed this becomes `true` for every
+/// reason, restoring the unconditional penalty.
+///
+/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: config::GRACE_POSSESSION_AUDIT_TIMEOUTS
+fn audit_failure_reports_trust_penalty(reason: &AuditFailureReason) -> bool {
+    if config::GRACE_POSSESSION_AUDIT_TIMEOUTS {
+        !matches!(reason, AuditFailureReason::Timeout)
+    } else {
+        true
+    }
 }
 
 /// Handle the result of a responsible-chunk audit tick (audit #2): emit trust
@@ -5825,12 +5857,19 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
+                if audit_failure_reports_trust_penalty(reason) {
+                    p2p_node
+                        .report_trust_event(
+                            challenged_peer,
+                            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                        )
+                        .await;
+                } else {
+                    debug!(
+                        "Audit timeout for {challenged_peer} graced during the possession-audit \
+                         protocol rollout (no confirmed-failure penalty)"
+                    );
+                }
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -6749,6 +6788,41 @@ mod tests {
                 "body must not be accepted on {wrong}"
             );
         }
+
+        // Send and receive must agree. A RESPONSE is routed by the same rule, so
+        // the id a body is sent on is always an id the peer's guard accepts.
+        // Before this was shared, possession responses went out on the core id
+        // and only worked because saorsa-core correlates RR replies by
+        // (peer, msg_id) rather than by protocol name — a bare possession
+        // response was dropped by the receiving guard.
+        for (body, expected) in [
+            (&audit, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&possession, POSSESSION_AUDIT_PROTOCOL_ID),
+            (&core, REPLICATION_PROTOCOL_ID),
+        ] {
+            assert_eq!(
+                response_protocol_for(body),
+                expected,
+                "a response must be sent on the family's own id"
+            );
+            assert!(
+                body_matches_protocol(body, response_protocol_for(body)),
+                "the id we send on must be one the receive guard accepts"
+            );
+        }
+
+        // The possession RESPONSE body (not just the challenge) routes to the
+        // possession id too — that is the direction that was actually wrong.
+        let possession_response = ReplicationMessageBody::AuditResponse(
+            crate::replication::protocol::AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![[0u8; 32]],
+            },
+        );
+        assert_eq!(
+            response_protocol_for(&possession_response),
+            POSSESSION_AUDIT_PROTOCOL_ID
+        );
     }
 
     fn test_peer(b: u8) -> PeerId {
@@ -6898,6 +6972,43 @@ mod tests {
             inflight.read().await.get(&peer).is_none_or(|n| *n == 0),
             "no per-peer slot may be left occupied"
         );
+    }
+
+    // The rollout gate must grace exactly ONE thing — a timeout — and nothing
+    // else. A confirmed storage-integrity failure is still penalised while the
+    // gate is set, otherwise moving the possession lanes onto their own protocol
+    // id would have handed cheating peers an amnesty for the upgrade window.
+    //
+    // FOLLOW-UP: when `GRACE_POSSESSION_AUDIT_TIMEOUTS` is set to false and the
+    // gate deleted, the timeout expectation below flips to `true`. That is the
+    // intended end state, and this test is where the flip is reflected.
+    #[test]
+    fn rollout_gate_graces_only_timeouts() {
+        for reason in [
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::KeyAbsent,
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::Rejected,
+        ] {
+            assert!(
+                audit_failure_reports_trust_penalty(&reason),
+                "{reason:?} is a confirmed failure and must be penalised even during rollout"
+            );
+        }
+        assert_eq!(
+            audit_failure_reports_trust_penalty(&AuditFailureReason::Timeout),
+            !config::GRACE_POSSESSION_AUDIT_TIMEOUTS,
+            "a timeout is penalised exactly when the rollout gate is off"
+        );
+
+        // Holder credit is a separate axis that was already timeout-safe; the
+        // gate must not have disturbed it.
+        assert!(!audit_failure_revokes_holder_credit(
+            &AuditFailureReason::Timeout
+        ));
+        assert!(audit_failure_revokes_holder_credit(
+            &AuditFailureReason::DigestMismatch
+        ));
     }
 
     #[tokio::test]

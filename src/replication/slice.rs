@@ -28,16 +28,37 @@
 //! second, nonce-free BLAKE3 chunk whose CV is precomputable, letting a node
 //! store ~10.7% less than each block and still reconstruct the leaf for any
 //! fresh nonce — a smaller version of the old flat-`nonced_hash` gap.) Building
-//! the correct `nonced_root` therefore requires *all* of a chunk's bytes at
+//! the *correct* `nonced_root` therefore requires all of a chunk's bytes at
 //! round-1 commit time, and the auditor picks which block to open with fresh
 //! randomness *after* the roots are committed (cut-and-choose): a responder
 //! cannot connect a real, after-the-fact-fetched block to a garbage committed
-//! root without a preimage break, and cannot commit a correct root without
-//! holding the bytes.
+//! root without a preimage break.
 //!
 //! In round 2 the auditor verifies both chains over the **same** block bytes:
 //! the Bao chain against the address (authenticity) and the nonced chain against
 //! the round-1 `nonced_root` (possession). Either failing is a confirmed cheat.
+//!
+//! ## What a pass does and does not prove
+//!
+//! This is a **sampling** check, and the strength claim should be read as such.
+//! The auditor holds none of the audited bytes, so it cannot tell a correct
+//! `nonced_root` from a responder-chosen one. A peer holding a fraction `p` of a
+//! chunk's blocks can commit a root built from real leaves for the blocks it
+//! kept and arbitrary leaves for the rest, and it passes whenever every fresh
+//! draw lands on a kept block. Per audit that is roughly `p^leaves` over the
+//! 3..=5 sampled leaves; the mandatory final-block opening pins the claimed
+//! length but adds no detection, since a partial holder simply keeps the final
+//! block.
+//!
+//! So a pass means "held the sampled blocks at commit time", and repeated audits
+//! drive the probability of sustained under-storage down geometrically rather
+//! than catching it outright on the first try. The full-byte round 2 this
+//! replaces caught any missing byte of a sampled chunk with certainty — that is
+//! the difference, and it is inherent: verifying every byte means moving every
+//! byte. In exchange the dominant audit message drops ~1000× (measured 417× on a
+//! same-network control cohort: 14.49 KB against 6.19 MB), which is what makes
+//! auditing *often* affordable, and audit frequency is the real lever against a
+//! partial deleter.
 
 use std::io::{Cursor, Read};
 
@@ -57,14 +78,28 @@ const DOMAIN_BLOCK_LEAF: &[u8] = b"autonomi.ant.audit.slice.block-leaf.v1";
 /// Domain tag for a nonced block-tree internal node.
 const DOMAIN_BLOCK_NODE: &[u8] = b"autonomi.ant.audit.slice.block-node.v1";
 
-/// Domain tag for deriving the per-audit BLAKE3 key of the nonced block tree.
-const DOMAIN_BLOCK_KEY: &[u8] = b"autonomi.ant.audit.slice.block-key.v1";
+/// Domain-separation context for deriving the per-audit BLAKE3 key of the
+/// nonced block tree.
+///
+/// Versioned alongside the subtree-audit protocol id, and distinct from the
+/// possession lane's [`AUDIT_DIGEST_KEY_CONTEXT`], so the two lanes cannot
+/// derive a colliding key from the same challenge material.
+///
+/// [`AUDIT_DIGEST_KEY_CONTEXT`]: crate::replication::protocol::AUDIT_DIGEST_KEY_CONTEXT
+const BLOCK_KEY_CONTEXT: &str = "autonomi.ant.audit.slice.block-key.v1";
 
 /// Per-audit keying material for the nonced block tree, derived from the fresh
 /// nonce, the challenged peer and the chunk key. Constant across a chunk's blocks.
 ///
-/// The nonce is fed in as a BLAKE3 **key**, not a message prefix. This is what
-/// forces every BLAKE3 chunk of a block leaf to depend on the nonce: keyed
+/// Uses BLAKE3's `derive_key` mode, the same construction as the possession
+/// lane's [`compute_audit_digest`] — that is what ADR-0007's "one freshness
+/// derivation across all audit lanes" means concretely. `derive_key` separates
+/// domains at the mode level (its own flag bits), so this key cannot collide
+/// with a plain or keyed hash of the same bytes; a plain hash over a domain
+/// prefix would separate only by convention.
+///
+/// The result is then used as a BLAKE3 **key**, not a message prefix. That is
+/// what forces every BLAKE3 chunk of a block leaf to depend on the nonce: keyed
 /// BLAKE3 mixes the key into the initial state of every chunk compression, so
 /// there is no nonce-independent chaining value. Prefixing the nonce instead
 /// leaves the block's tail in a second, nonce-free BLAKE3 chunk whose chaining
@@ -72,10 +107,11 @@ const DOMAIN_BLOCK_KEY: &[u8] = b"autonomi.ant.audit.slice.block-key.v1";
 /// bytes, so the last ~142 block bytes fall in chunk 1 with no nonce), letting a
 /// node store ~10.7% less than each block and still reconstruct the leaf for any
 /// fresh nonce.
+///
+/// [`compute_audit_digest`]: crate::replication::protocol::compute_audit_digest
 #[must_use]
 fn nonced_block_key(nonce: &[u8; 32], peer: &[u8; 32], key: &XorName) -> [u8; 32] {
-    let mut h = blake3::Hasher::new();
-    h.update(DOMAIN_BLOCK_KEY);
+    let mut h = blake3::Hasher::new_derive_key(BLOCK_KEY_CONTEXT);
     h.update(nonce);
     h.update(peer);
     h.update(key);
@@ -747,6 +783,126 @@ mod tests {
             got,
             *prefixed.finalize().as_bytes(),
             "leaf must not use the precomputable prefixed-nonce construction"
+        );
+    }
+
+    // The documented strength claim, made executable: a partial holder CAN pass,
+    // and what stops it is sampling, not the hash construction.
+    //
+    // A peer keeping blocks 0..k of a chunk commits a root whose kept-block
+    // leaves are genuine and whose dropped-block leaves are garbage. Every
+    // opening on a kept block verifies against that root; every opening on a
+    // dropped block fails. This is the whole basis for describing round 2 as a
+    // sampling check rather than a proof of complete possession.
+    #[test]
+    fn partial_holder_passes_on_kept_blocks_and_fails_on_dropped_ones() {
+        let content = content_of(8 * 1024); // 8 blocks
+        let count = block_count(content.len() as u64);
+        assert_eq!(count, 8);
+        let kept = 5u32; // blocks 0..5 retained, 5..8 dropped
+
+        // Build the tree a partial holder would commit: real leaves for kept
+        // blocks, arbitrary (wrong) leaves for the dropped ones.
+        let leaves: Vec<[u8; 32]> = (0..count)
+            .map(|i| {
+                if i < kept {
+                    nonced_block_leaf(&NONCE, &PEER, &KEY, i, block_bytes(&content, i))
+                } else {
+                    // No bytes for this block — anything at all goes here.
+                    nonced_block_leaf(&NONCE, &PEER, &KEY, i, b"dropped")
+                }
+            })
+            .collect();
+        let mut level = leaves.clone();
+        while level.len() > 1 {
+            level = fold_level(&level);
+        }
+        let forged_root = level.first().copied().expect("non-empty tree");
+
+        // An opening on a KEPT block verifies against the forged root: the peer
+        // passes this draw despite not holding the whole chunk.
+        for i in 0..kept {
+            let siblings = siblings_from_leaves(&leaves, i).expect("in range");
+            assert!(
+                verify_nonced_block(
+                    &NONCE,
+                    &PEER,
+                    &KEY,
+                    i,
+                    block_bytes(&content, i),
+                    &siblings,
+                    &forged_root,
+                    count,
+                ),
+                "a kept block must verify — this is the false-pass path the docs describe"
+            );
+        }
+
+        // An opening on a DROPPED block cannot be answered: the peer has no
+        // bytes whose leaf folds to the committed root at that index.
+        for i in kept..count {
+            let siblings = siblings_from_leaves(&leaves, i).expect("in range");
+            assert!(
+                !verify_nonced_block(
+                    &NONCE,
+                    &PEER,
+                    &KEY,
+                    i,
+                    block_bytes(&content, i),
+                    &siblings,
+                    &forged_root,
+                    count,
+                ),
+                "a dropped block must fail — sampling is what catches the partial holder"
+            );
+        }
+    }
+
+    // ADR-0007 claims ONE freshness derivation across every audit lane. That is
+    // only true if this lane and the possession lane derive their key the same
+    // way: BLAKE3 `derive_key` mode over `nonce ‖ peer ‖ key`, under a
+    // per-lane context string. The slice lane previously used a plain hash with
+    // a domain prefix, which separates domains only by convention, so the two
+    // constructions did not actually match and the claim was overstated.
+    #[test]
+    fn block_key_uses_the_same_derivation_as_the_possession_lane() {
+        let mut expected = blake3::Hasher::new_derive_key(BLOCK_KEY_CONTEXT);
+        expected.update(&NONCE);
+        expected.update(&PEER);
+        expected.update(&KEY);
+        assert_eq!(
+            nonced_block_key(&NONCE, &PEER, &KEY),
+            *expected.finalize().as_bytes(),
+            "block key must use derive_key mode, like compute_audit_digest"
+        );
+
+        // Mode separation is the point: the same material under a plain hash,
+        // or under keyed mode, must land somewhere else entirely.
+        let mut plain = blake3::Hasher::new();
+        plain.update(BLOCK_KEY_CONTEXT.as_bytes());
+        plain.update(&NONCE);
+        plain.update(&PEER);
+        plain.update(&KEY);
+        assert_ne!(
+            nonced_block_key(&NONCE, &PEER, &KEY),
+            *plain.finalize().as_bytes(),
+            "derive_key mode must not coincide with a plain domain-prefixed hash"
+        );
+
+        // The two lanes must never derive the SAME key from the same challenge
+        // material — that is what the distinct context strings buy.
+        assert_ne!(
+            nonced_block_key(&NONCE, &PEER, &KEY),
+            {
+                let mut other = blake3::Hasher::new_derive_key(
+                    crate::replication::protocol::AUDIT_DIGEST_KEY_CONTEXT,
+                );
+                other.update(&NONCE);
+                other.update(&PEER);
+                other.update(&KEY);
+                *other.finalize().as_bytes()
+            },
+            "the slice and possession lanes must derive different keys"
         );
     }
 

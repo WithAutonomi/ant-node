@@ -32,7 +32,8 @@ use tokio_util::sync::CancellationToken;
 use crate::ant_protocol::XorName;
 use crate::logging::{debug, warn};
 use crate::replication::config::{
-    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, POSSESSION_AUDIT_PROTOCOL_ID,
+    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, GRACE_POSSESSION_AUDIT_TIMEOUTS,
+    POSSESSION_AUDIT_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -148,8 +149,19 @@ pub(crate) async fn run_possession_check(
                 )
                 .await;
             }
+            // ROLLOUT GATE — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`. A probe to a
+            // peer on the other side of the protocol move is never answered, so
+            // a timeout here is not evidence about possession. Restore the
+            // unconditional report when that gate is removed.
             ProbeOutcome::Timeout => {
-                report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
+                if GRACE_POSSESSION_AUDIT_TIMEOUTS {
+                    debug!(
+                        "Possession check: {peer} timed out for {key_hex}; graced during the \
+                         possession-audit protocol rollout (not penalised)"
+                    );
+                } else {
+                    report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
+                }
             }
             ProbeOutcome::BootstrapClaim => {
                 handle_possession_bootstrap_claim(&peer, &key_hex, p2p_node, config, sync_state)

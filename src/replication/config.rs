@@ -502,6 +502,46 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
+/// ROLLOUT GATE (V2-685) — **temporary. Must be turned off in a follow-up.**
+///
+/// # Why this exists
+///
+/// The three digest-based audit lanes — the responsible-chunk audit, the
+/// post-replication possession probe, and prune confirmation — moved onto
+/// [`POSSESSION_AUDIT_PROTOCOL_ID`] because their digest construction changed.
+/// During the auto-upgrade window a v3 auditor's challenge to a still-v2 peer is
+/// therefore never answered, and an unanswered challenge times out.
+///
+/// Those three lanes report an `ApplicationFailure` carrying
+/// [`AUDIT_FAILURE_TRUST_WEIGHT`]
+/// on a timeout — weight 5, the confirmed-failure weight. Left alone, every
+/// honest peer on the other side of the version boundary would be penalised at
+/// confirmed-failure severity, repeatedly, for the entire window, for a skew
+/// that is not its fault. (The subtree lane already graces its timeouts and is
+/// unaffected; see `handle_subtree_failed_audit`.)
+///
+/// # What it does while `true`
+///
+/// The three lanes grace a timeout exactly as the subtree lane does: no
+/// application trust event and no holder-credit revocation. This is not a free
+/// pass — `saorsa-core`'s `send_request` still records its own unit transport
+/// failure for an unanswered request, so a peer that never answers still drifts
+/// down, just at weight 1 instead of 5.
+///
+/// # FOLLOW-UP — required, do not ship this permanently
+///
+/// Once the fleet has upgraded past the possession-audit protocol move, set this
+/// to `false`, then delete the constant and inline the guarded branches so the
+/// timeout penalty is restored unconditionally. Until that lands, a peer that
+/// silently drops audit challenges is under-penalised. Tracked on V2-685.
+///
+/// The guarded code is gated by this constant rather than commented out on
+/// purpose: it stays compiled, type-checked, linted and covered by tests while
+/// disabled, so it cannot rot before it is switched back on.
+///
+/// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
+pub const GRACE_POSSESSION_AUDIT_TIMEOUTS: bool = true;
+
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
 pub const AUDIT_ON_GOSSIP_PROBABILITY: f64 = 0.2;

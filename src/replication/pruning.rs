@@ -55,7 +55,8 @@ use crate::ant_protocol::XorName;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, POSSESSION_AUDIT_PROTOCOL_ID,
+    GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
+    POSSESSION_AUDIT_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1385,6 +1386,21 @@ async fn peer_proves_records(
         // audit failure just like a decoded bad proof below. Keep the historical
         // one-report-per-peer-per-pass guard by attempting each key against the
         // shared `report_state`.
+        //
+        // ROLLOUT GATE — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`. A peer on the
+        // other side of the possession-audit protocol move never answers, so no
+        // decoded response is not evidence about it. This lane cannot separate a
+        // timeout from a malformed reply here (both arrive as `None`), so the
+        // gate graces the pair; a malformed reply from a matched-version peer is
+        // still caught by the decoded-proof checks below. Restore the
+        // unconditional report when the gate is removed.
+        if GRACE_POSSESSION_AUDIT_TIMEOUTS {
+            debug!(
+                "Prune audit: no decoded response from {peer}; graced during the \
+                 possession-audit protocol rollout (not penalised)"
+            );
+            return Vec::new();
+        }
         let mut audit_failure_reported = false;
         for key in &challenge_keys {
             if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await {

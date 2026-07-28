@@ -99,13 +99,42 @@ round 1 from the same peer.
   measured 736/736 and 135/135 transfers with no failures, and the older cohort
   continued to accept and store paid chunks throughout.
 - A version skew on an audit lane produces no answer rather than a wrong answer,
-  so it lands in the graced timeout lane instead of the confirmed-failure lane.
+  so it lands in the timeout lane instead of the confirmed-failure lane. The
+  subtree lane already graces timeouts. The three digest lanes did not — they
+  reported a confirmed-failure trust event on a timeout — so a temporary rollout
+  gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) graces them for the upgrade window.
+  See the trade-offs below: that gate must be removed in a follow-up.
 
 ### Negative / Trade-offs
 
 - Round 2 now proves a sampled block rather than a whole chunk, so per-response
   coverage is narrower and the guarantee rests on repeated sampling over time.
+  Stated precisely, because it is the load-bearing trade-off: the auditor holds
+  none of the audited bytes, so it cannot distinguish a correct nonced root from
+  a responder-chosen one. A peer retaining a fraction `p` of a chunk's blocks can
+  commit a root with genuine leaves for what it kept and arbitrary leaves for
+  what it dropped, and passes whenever every draw lands on a kept block —
+  roughly `p^leaves` per audit over the 3..=5 sampled leaves. The mandatory
+  final-block opening anchors the claimed length but adds no detection, since a
+  partial holder keeps the final block. The full-byte round 2 this replaces
+  caught any missing byte of a sampled chunk with certainty.
+
+  The exchange is deliberate: security is close to what main gives at roughly a
+  thousandth of the egress, and cheap audits mean *frequent* audits, which is the
+  real lever against a partial deleter. Fleet evidence supports it — a 256 MB
+  in-place corruption was caught by three independent auditors on the first audit
+  that reached the node, against zero false positives across ~43,000 audits in
+  the preceding 5.5 hours. If a future threat model needs sharper per-audit
+  detection, the knob is openings per leaf, at linear egress cost.
 - Three protocol ids to reason about instead of one.
+- A temporary rollout gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) suppresses the
+  timeout penalty on the three digest lanes so a version skew cannot punish an
+  honest peer at confirmed-failure weight for the upgrade window. While it is
+  set, a peer that silently drops audit challenges is under-penalised: it still
+  takes the upstream unit transport decrement, but not the audit-severity one.
+  **This must be turned off and deleted in a follow-up once the fleet has
+  upgraded.** The guarded branches stay compiled rather than commented out so
+  they cannot rot while disabled.
 - Cross-version audits pause during the auto-upgrade window. Unanswered requests
   still register a unit trust decrement upstream, which decays back to neutral;
   the possession lanes probe more often than the subtree lane, so their dip is
