@@ -3196,6 +3196,59 @@ impl SubtreeRound1Limiter {
     }
 }
 
+/// Outcome of admitting a round-2 slice challenge.
+enum SliceAdmission {
+    /// Admitted: the guard holds the global permit and the per-peer slot, and
+    /// the single-use round-1 session has been consumed.
+    Admitted(AuditResponderGuard),
+    /// Refused at a responder ceiling. The round-1 session is left INTACT.
+    Capacity(AuditResponderAdmissionFailure),
+    /// No live round-1 session matched this challenge.
+    NoSession,
+}
+
+/// Admit a round-2 slice challenge: take the responder permit BEFORE consuming
+/// the single-use round-1 session.
+///
+/// The order is the point. The session is single-use, so consuming it and only
+/// then testing admission would let a transient local capacity drop destroy the
+/// exchange permanently: the auditor's retry would find no session and be
+/// refused with `Transient` forever, even after load cleared. Taking the permit
+/// first means a capacity refusal is exactly what it claims to be — temporary.
+///
+/// Cost of the ordering: the permit and per-peer slot are held across the
+/// session probe, which is one in-memory map lookup and no chunk work. The
+/// per-peer cap still bounds a peer sending unsessioned challenges to the same
+/// share it could already occupy with well-formed ones, so the admission
+/// surface is unchanged.
+async fn admit_slice_challenge(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    round1: &SubtreeRound1Limiter,
+    source: &PeerId,
+    challenge: &protocol::SubtreeSliceChallenge,
+) -> SliceAdmission {
+    let guard = match admit_audit_responder(semaphore, inflight, source).await {
+        Ok(guard) => guard,
+        Err(failure) => return SliceAdmission::Capacity(failure),
+    };
+    if !round1
+        .consume_session(
+            source,
+            challenge.challenge_id,
+            &challenge.expected_commitment_hash,
+            &challenge.nonce,
+        )
+        .await
+    {
+        // Release the permit and per-peer slot before the caller replies: no
+        // chunk work follows, so holding them would shrink the pool for nothing.
+        drop(guard);
+        return SliceAdmission::NoSession;
+    }
+    SliceAdmission::Admitted(guard)
+}
+
 /// Try to admit one audit-responder task for `source`: take a global permit AND
 /// a per-peer slot (both bounded). Returns `Err` with the binding ceiling and
 /// its decision-time counters (caller drops the challenge, leaving the remote
@@ -3580,61 +3633,57 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            // Round 2 must follow a live round-1 exchange from THIS peer: consume
-            // the single-use session (bound to challenge_id/commitment/nonce). On a
-            // miss, reply with a cheap `Transient` rejection rather than dropping
-            // silently. Sessions are ephemeral (an honest responder that restarts
-            // between rounds loses its session), and an unanswered `send_request`
-            // would make saorsa-core record a transport trust failure against that
-            // honest responder — an ongoing effect, not just a rollout-window one.
-            // A `Transient` reply routes the auditor to the graced timeout lane
-            // (no trust penalty; the responder re-earns pinned credit on the next
-            // audit) and does no chunk work, so it is not a DoS lever.
-            if !subtree_round1
-                .consume_session(
-                    source,
-                    challenge.challenge_id,
-                    &challenge.expected_commitment_hash,
-                    &challenge.nonce,
-                )
-                .await
-            {
-                protocol::record_audit_drop(protocol::AuditDropKind::Byte);
-                debug!(
-                    "Slice challenge without a live round-1 session source={source} \
-                     challenge_id={} → Transient reject",
-                    challenge.challenge_id
-                );
-                send_replication_response_checked(
-                    source,
-                    p2p_node,
-                    msg.request_id,
-                    ReplicationMessageBody::SubtreeSliceResponse(
-                        protocol::SubtreeSliceResponse::Rejected {
-                            challenge_id: challenge.challenge_id,
-                            kind: protocol::RejectKind::Transient,
-                            reason: "no live round-1 session".to_string(),
-                        },
-                    ),
-                    rr_message_id,
-                )
-                .await;
-                return Ok(());
-            }
-            let guard = match admit_audit_responder(
+            let guard = match admit_slice_challenge(
                 audit_responder_semaphore,
                 audit_responder_inflight,
+                subtree_round1,
                 source,
+                &challenge,
             )
             .await
             {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    protocol::record_audit_drop(protocol::AuditDropKind::Byte);
+                SliceAdmission::Admitted(guard) => guard,
+                // Capacity drop: same silent-shed contract as the other two audit
+                // handlers. The session is still live, so the auditor's retry once
+                // load clears can still be served.
+                SliceAdmission::Capacity(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Slice);
                     warn!(
-                        "Audit challenge reply not sent: kind=byte response=dropped \
+                        "Audit challenge reply not sent: kind=slice response=dropped \
                          source={source} {failure}"
                     );
+                    return Ok(());
+                }
+                // No live round-1 session: reply with a cheap `Transient` rejection
+                // rather than dropping silently. Sessions are ephemeral (an honest
+                // responder that restarts between rounds loses its session), and an
+                // unanswered `send_request` would make saorsa-core record a
+                // transport trust failure against that honest responder — an
+                // ongoing effect, not just a rollout-window one. A `Transient`
+                // reply routes the auditor to the graced timeout lane (no trust
+                // penalty; the responder re-earns pinned credit on the next audit)
+                // and does no chunk work, so it is not a DoS lever.
+                SliceAdmission::NoSession => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Slice);
+                    debug!(
+                        "Slice challenge without a live round-1 session source={source} \
+                         challenge_id={} → Transient reject",
+                        challenge.challenge_id
+                    );
+                    send_replication_response_checked(
+                        source,
+                        p2p_node,
+                        msg.request_id,
+                        ReplicationMessageBody::SubtreeSliceResponse(
+                            protocol::SubtreeSliceResponse::Rejected {
+                                challenge_id: challenge.challenge_id,
+                                kind: protocol::RejectKind::Transient,
+                                reason: "no live round-1 session".to_string(),
+                            },
+                        ),
+                        rr_message_id,
+                    )
+                    .await;
                     return Ok(());
                 }
             };
@@ -6746,6 +6795,109 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    /// Build a round-2 slice challenge matching an open session. `openings` is
+    /// empty: these tests exercise admission and session handling only, which
+    /// run before any block is opened.
+    fn slice_challenge(
+        challenge_id: u64,
+        commitment_hash: [u8; 32],
+        nonce: [u8; 32],
+    ) -> protocol::SubtreeSliceChallenge {
+        protocol::SubtreeSliceChallenge {
+            challenge_id,
+            nonce,
+            challenged_peer_id: [0u8; 32],
+            expected_commitment_hash: commitment_hash,
+            openings: Vec::new(),
+        }
+    }
+
+    // Regression (Copilot, PR #181): a round-2 slice challenge refused at the
+    // responder caps MUST NOT burn the single-use round-1 session.
+    //
+    // The handler used to consume the session first and admit second, so a
+    // transient local capacity drop permanently destroyed that audit exchange —
+    // every retry hit the `no live round-1 session` path and got `Transient`,
+    // even after load cleared. Turning momentary local load into a deterministic
+    // round-2 miss costs the responder its whole-slice credit for that round.
+    #[tokio::test]
+    async fn capacity_refused_slice_challenge_preserves_round1_session() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let round1 = SubtreeRound1Limiter::new(Duration::ZERO);
+        let peer = test_peer(0xB1);
+        let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
+        let challenge = slice_challenge(id, hash, nonce);
+
+        round1.open_session(peer, id, hash, nonce).await;
+
+        // Saturate this peer's share so the next admission must be refused.
+        let mut hold = Vec::new();
+        for _ in 0..MAX_AUDIT_RESPONSES_PER_PEER {
+            match admit_audit_responder(&semaphore, &inflight, &peer).await {
+                Ok(guard) => hold.push(guard),
+                Err(err) => panic!("unexpected admission failure below the cap: {err:?}"),
+            }
+        }
+
+        let refused =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(refused, SliceAdmission::Capacity(_)),
+            "a saturated peer share must refuse on capacity, not on session"
+        );
+
+        // Load clears. The session must have survived the refusal.
+        drop(hold);
+        let retried =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(retried, SliceAdmission::Admitted(_)),
+            "the round-1 session must survive a capacity refusal so the retry succeeds"
+        );
+
+        // Still single-use: the successful admission consumed it exactly once.
+        drop(retried);
+        let replayed =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(replayed, SliceAdmission::NoSession),
+            "a consumed session must not be replayable"
+        );
+    }
+
+    // The permit taken for the session probe is released when the probe misses,
+    // so an unsessioned flood cannot pin the responder pool shut.
+    #[tokio::test]
+    async fn unsessioned_slice_challenge_releases_its_admission_slot() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let round1 = SubtreeRound1Limiter::new(Duration::ZERO);
+        let peer = test_peer(0xB2);
+        let challenge = slice_challenge(1, [0u8; 32], [0u8; 32]);
+
+        // Far more unsessioned challenges than the per-peer cap would allow if
+        // the slot leaked on the miss path.
+        for _ in 0..(MAX_AUDIT_RESPONSES_PER_PEER * 4) {
+            let outcome =
+                admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+            assert!(
+                matches!(outcome, SliceAdmission::NoSession),
+                "no session was ever opened, so every attempt must miss"
+            );
+        }
+
+        assert_eq!(
+            semaphore.available_permits(),
+            MAX_CONCURRENT_AUDIT_RESPONSES,
+            "every global permit must be returned"
+        );
+        assert!(
+            inflight.read().await.get(&peer).is_none_or(|n| *n == 0),
+            "no per-peer slot may be left occupied"
+        );
     }
 
     #[tokio::test]

@@ -274,7 +274,13 @@ pub(crate) enum AuditDropKind {
     /// Subtree audit round-1 challenge.
     Subtree = 1,
     /// Subtree audit round-2 slice challenge.
-    Byte = 2,
+    ///
+    /// The emitted counter is still named `audit_dropped_byte` (see
+    /// `log_audit_outcome_summary`): round 2 no longer serves full chunk bytes,
+    /// but keeping the wire-visible counter name fixed is what lets a v2 fleet
+    /// and a v3 fleet be compared with no field mapping. The name is a metric
+    /// identifier, not a description of the payload.
+    Slice = 2,
 }
 
 /// One slot per [`AuditFailureReason`] variant, per [`AuditOutcomeKind`].
@@ -419,6 +425,14 @@ pub(crate) fn log_traffic_summary() {
         group = 3,
         subtree_audit_response_tx_bytes = tb(12), subtree_audit_response_tx_count = tc(12),
         subtree_audit_response_rx_bytes = rb(12), subtree_audit_response_rx_count = rc(12),
+        // Indices 13/14 are the round-2 pair, renamed on the wire to
+        // `SubtreeSliceChallenge`/`SubtreeSliceResponse`. The COUNTER names stay
+        // `subtree_byte_*` on purpose: they are the field names an operator
+        // queries, and holding them fixed is what let the V2-685 testnet compare
+        // a 0.15.0 cohort against a slice-audit cohort with no field mapping
+        // (6.19 MB vs 14.49 KB per response, same query). Renaming them would
+        // silently zero every existing dashboard and alert. The variant index,
+        // not the label, is the source of truth for what is being counted.
         subtree_byte_challenge_tx_bytes = tb(13), subtree_byte_challenge_tx_count = tc(13),
         subtree_byte_challenge_rx_bytes = rb(13), subtree_byte_challenge_rx_count = rc(13),
         subtree_byte_response_tx_bytes = tb(14), subtree_byte_response_tx_count = tc(14),
@@ -1220,7 +1234,7 @@ mod tests {
         for (kind, kind_index) in [
             (AuditDropKind::Responsible, 0usize),
             (AuditDropKind::Subtree, 1usize),
-            (AuditDropKind::Byte, 2usize),
+            (AuditDropKind::Slice, 2usize),
         ] {
             let before = AUDIT_DROPPED[kind_index].load(Ordering::Relaxed);
             record_audit_drop(kind);
@@ -1265,9 +1279,12 @@ mod tests {
     }
 
     // `is_subtree_audit()` classifies exactly the four subtree-audit variants
-    // (both rounds), and NOTHING else — crucially not the periodic possession
-    // `AuditResponse`, which stays on the core id. The receive guard and the
-    // response-routing both key off this one predicate, so it must be exact.
+    // (both rounds), and NOTHING else — crucially not the digest-based
+    // `AuditChallenge`/`AuditResponse` pair, which rides its own
+    // `POSSESSION_AUDIT_PROTOCOL_ID` via `is_possession_audit()`. The receive
+    // guard and the response-routing both key off this one predicate, so it
+    // must be exact: a body that answers `true` here is required to arrive on
+    // the subtree id, and is dropped on any other.
     #[test]
     fn is_subtree_audit_covers_both_rounds_only() {
         let z = [0u8; 32];

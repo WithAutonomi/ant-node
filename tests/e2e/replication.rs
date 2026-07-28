@@ -10,7 +10,8 @@ use super::TestHarness;
 use ant_node::client::compute_address;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
-    storage_admission_width, K_BUCKET_SIZE, REPLICATION_PROTOCOL_ID,
+    storage_admission_width, K_BUCKET_SIZE, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
+    SUBTREE_AUDIT_PROTOCOL_ID,
 };
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
@@ -47,6 +48,23 @@ const DUMMY_PAYMENT_PROOF_LEN: usize = 64;
 /// Dummy proof byte used when a test only needs to reach pre-payment gates.
 const DUMMY_PAYMENT_PROOF_BYTE: u8 = 0x01;
 
+/// The protocol id a body must be sent on for the receive guard to accept it.
+///
+/// Mirrors `body_matches_protocol` in `replication::mod`: subtree-audit bodies
+/// ride [`SUBTREE_AUDIT_PROTOCOL_ID`], the digest-based possession pair rides
+/// [`POSSESSION_AUDIT_PROTOCOL_ID`], everything else stays on the core id.
+/// Deriving it from the body — rather than hardcoding the core id — means a
+/// future family move cannot silently turn these tests into request timeouts.
+fn protocol_id_for(body: &ReplicationMessageBody) -> &'static str {
+    if body.is_subtree_audit() {
+        SUBTREE_AUDIT_PROTOCOL_ID
+    } else if body.is_possession_audit() {
+        POSSESSION_AUDIT_PROTOCOL_ID
+    } else {
+        REPLICATION_PROTOCOL_ID
+    }
+}
+
 /// Send a replication request via saorsa-core's request-response mechanism
 /// and decode the response.
 ///
@@ -59,9 +77,10 @@ async fn send_replication_request(
     msg: ReplicationMessage,
     timeout: Duration,
 ) -> ReplicationMessage {
+    let protocol = protocol_id_for(&msg.body);
     let encoded = msg.encode().expect("encode replication request");
     let response = sender
-        .send_request(target, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .send_request(target, protocol, encoded, timeout)
         .await
         .expect("send_request");
     ReplicationMessage::decode(&response.data).expect("decode replication response")
