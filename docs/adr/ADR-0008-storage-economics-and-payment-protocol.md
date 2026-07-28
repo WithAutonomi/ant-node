@@ -32,11 +32,13 @@ one. Two things follow from that and are called out wherever they appear:
   merkle batch path settled a third of what the single-node path settles for an
   identical chunk, because the 3× multiplier was never applied when pool
   commitments are built. This ADR **decides** to raise merkle to 3×, and the
-  change ships enforcing by default across a paired pair of PRs (ant-client
-  pays it, ant-node requires it) on one release train. There is no shadow mode
-  and no flag to flip afterwards. Because it is a pricing decision and not just
-  an arithmetic repair, it still needs the economic owner's sign-off before the
-  train ships; the alternatives that were weighed are recorded below.
+  change ships **client-first**: a released ant-client pays 3× on every batch
+  from the moment it is used, and nodes begin *requiring* 3× at a fixed instant
+  set after that release, **2026-08-04 15:00 UTC** (Unix `1785855600`). There is
+  no shadow mode and no flag to flip afterwards. Because it is a pricing
+  decision and not just an arithmetic repair, it still needs the economic
+  owner's sign-off before the client is published; the alternatives that were
+  weighed are recorded below.
 
 Terms: *record* (one stored chunk, the priced unit), *close group* (the 7 nodes
 closest to an address, which hold the replicas), *quote* (a node's signed
@@ -171,7 +173,7 @@ leaf on the merkle path.**
 
 The client needs ANT and Arbitrum gas, and approves the vault once.
 
-#### 4b. Decision: raise merkle to 3×, enforcing by default
+#### 4b. Decision: raise merkle to 3×, client-first, enforced from a fixed date
 
 Apply the same 3× multiplier on the merkle path, to the on-chain payable
 `amount` rather than to the signed quote, so a batch settles
@@ -179,44 +181,88 @@ Apply the same 3× multiplier on the merkle path, to the on-chain payable
 untouched, so every existing proof still verifies against the quotes the nodes
 actually signed.
 
-Two PRs on one release train: ant-client pays the multiplier, ant-node requires
-it. **The requirement is on by default** — no shadow mode, no follow-up flag.
+Two PRs: ant-client#161 pays the multiplier, this one makes ant-node require it.
+**The requirement is on by default** — no shadow mode, no follow-up flag — but
+the two halves do not arrive at the same time, and the gap between them is what
+makes the change safe.
+
+##### Five events, not one
+
+Most of the reasoning below is about ordering, so the events have to be kept
+apart. Saying "the release" conflates all five:
+
+| Event | What it is | Timing |
+|---|---|---|
+| **PR landing** | ant-client#161 and this PR merge | either order, no user-visible effect |
+| **Client publication** | a released ant-client that pays 3× | **must precede the boundary** |
+| **Client adoption** | users actually running that client | rolling, never complete |
+| **Node deployment** | operators running a node that knows the boundary | rolling, before or after the boundary |
+| **Enforcement** | upgraded nodes start requiring 3× | **2026-08-04 15:00 UTC** (`1785855600`) |
+
+Only the last is a date in the code. The others are release and operations
+events, and the boundary is chosen to sit after client publication with room
+for adoption.
+
+##### Why client-first works
+
+The client's 3× is unconditional and immediate: from the first upload made with
+the published client, batches settle at `3 × median16 × 2^depth`. It carries no
+date and consults no flag.
+
+Nodes that have not upgraded accept those payments anyway, because they require
+1× as a *minimum* and 3× clears it. So the client can go out — and be adopted —
+well ahead of any node change, paying the network the intended amount the whole
+time. That is the whole reason this ordering was chosen: the money is corrected
+from the moment the client ships, and the node-side requirement only closes the
+door behind it.
 
 ##### The cutover, and the receipts it must not destroy
 
 A merkle receipt stays spendable for one week. Refusing every 1× settlement the
-moment nodes upgrade would therefore reject uploads whose payment had already
+moment a node upgrades would therefore reject uploads whose payment had already
 been made, correctly, under the previous rule, with no way to refund it. So the
 requirement keys off **the receipt's own timestamp**, against a compiled-in
-boundary (`MERKLE_PARITY_ENFORCED_FROM_UNIX`, set one train after the change
-ships):
+boundary (`MERKLE_PARITY_ENFORCED_FROM_UNIX` = `1785855600`, 2026-08-04
+15:00 UTC — after client publication, with room for adoption):
 
 | Receipt stamped | Must settle |
 |---|---|
 | before the boundary | 1× (the rule it was bought under) |
 | at or after the boundary | 3× |
 
-Three properties make that safe rather than a loophole:
+Note what this keys off: not when the chunk was stored, not when the node
+upgraded, but when the *receipt* was bought. A node deployed after the boundary
+enforces immediately on fresh receipts and still honours the unexpired legacy
+ones.
+
+Two properties make that a bounded compatibility window rather than an open
+loophole:
 
 - **It self-retires.** Receipts older than one week are expired anyway, so once
   `boundary + 1 week` has passed, every still-valid receipt is necessarily
   stamped at or after the boundary and the 1× branch is unreachable. Nobody has
-  to remember to remove it.
-- **It cannot be gamed.** The timestamp is client-supplied, so a client might
-  try backdating to keep the old price — but a stamp early enough to qualify is
-  old enough to be expired. The evasion window is exactly the one week the
-  honest grace needs, and it closes by itself.
-- **Order of rollout does not matter.** A 3× settlement is accepted on both
-  sides of the boundary (it clears the 1× floor too), so an upgraded client
-  works against an un-upgraded node, and an upgraded node still honours
-  in-flight legacy receipts. Neither half has to land first.
+  to remember to remove it; the branch becomes dead code that can be deleted.
+- **Evasion is possible, but bounded and self-closing.** The timestamp is
+  client-chosen: it is passed to `payForMerkleTree`, and the contract only
+  checks that it is not in the future and not more than a week old. Quoting
+  nodes sign whatever stamp the request carries. So during the week after the
+  boundary, a *modified* client can deliberately stamp a receipt just before the
+  boundary, pay 1×, and be admitted — the same route the honest grace uses. What
+  closes it is expiry, not detection: a stamp before the boundary is unusable
+  once it is more than a week old, so the route disappears at
+  `boundary + 1 week` and cannot be extended. Nothing prevents backdating
+  *during* the window; it is accepted as the cost of not destroying legitimately
+  bought receipts, and it is bounded at one week of underpayment by clients who
+  went out of their way to underpay.
 
-What this does **not** protect: a client still running the old code after the
-boundary pays 1× on a fresh receipt and is refused. That is the deliberate cost
-of enforcing rather than shadowing, and the boundary is placed a train later
-precisely so that clients have taken the release before it bites. The failure is
-loud (the store is refused with the required multiplier named), not a silent
-underpayment.
+What this does **not** protect: a client still running the *old* code after the
+boundary builds a genuinely fresh 1× receipt, and every upgraded node refuses
+it. That is the deliberate cost of enforcing rather than shadowing. The boundary
+is placed after client publication precisely so adoption can run ahead of it,
+and the failure is loud — the store is refused with the required multiplier
+named — rather than a silent underpayment. Nodes that never upgrade keep
+accepting 1×; enforcement is per-node, so the old client degrades gradually as
+the fleet upgrades rather than failing everywhere at once.
 
 What that does and does not equalise, stated precisely, because "parity" is
 easy to over-read:
@@ -245,7 +291,8 @@ network underpaid for as long as it takes someone to flip a flag, and the
 timestamp boundary already provides the compatibility a shadow period was
 meant to buy. Tripling the common large-upload path is a pricing decision
 rather than an arithmetic repair, so (3) needs the economic owner's approval
-before the train ships.
+before the client is published — the client, not the node, is what starts
+charging 3×.
 
 ### 5. Storing and verifying
 
@@ -306,21 +353,25 @@ and a node that was actually paid is nominated for a first audit.
 | Quote/commitment mismatch reported to trust | off (telemetry only) |
 | Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 50% tolerance) |
 | Payee eligibility gate (ADR-0005) | **not merged**; observe-only on its branch (`ADR5_ENFORCE`) |
-| Client pays the 3× multiplier on the merkle path | **enforced** from this train (no flag) |
-| Storer requires it (`MERKLE_PARITY_ENFORCED_FROM_UNIX`) | **enforced** for receipts stamped from the boundary |
+| Client pays the 3× multiplier on the merkle path | **enforced** by the published client, immediately and unconditionally (no flag, no date) |
+| Storer requires it (`MERKLE_PARITY_ENFORCED_FROM_UNIX`) | **enforced** by upgraded nodes, for receipts stamped from 2026-08-04 15:00 UTC onward |
 
-So the guarantees after this train are: the client pays only prices it can
-recompute and resolve to a signed commitment; every **single-node** stored chunk
-is settled on-chain at ≥3× the supplied-set median, to the quoting node's own
-address; and every **merkle** chunk is settled at ≥3× the winner pool's median
-per padded leaf, except on receipts bought before the boundary, which keep the
-1× rule until they expire. Everything else in the table is still instrumented
-rather than enforced.
+So the guarantees once both halves are out are: the client pays only prices it
+can recompute and resolve to a signed commitment; every **single-node** stored
+chunk is settled on-chain at ≥3× the supplied-set median, to the quoting node's
+own address; and every **merkle** chunk from an upgraded client is settled at
+≥3× the winner pool's median per padded leaf. Upgraded nodes require that from
+the boundary, except on receipts stamped before it, which keep the 1× rule until
+they expire. Everything else in the table is still instrumented rather than
+enforced.
 
 The parity telemetry no longer gates a decision — the decision has been made.
 It now answers one operational question: how much traffic is still arriving on
 pre-boundary receipts, which is how we know the compatibility window has drained
-and the 1× branch is dead code that can be deleted.
+and the 1× branch is dead code that can be deleted. Traffic on pre-boundary
+receipts *after* the boundary is also the only visibility we have into
+deliberate backdating, since honest and evasive use of that branch are
+indistinguishable from a single receipt.
 
 ## Consequences
 
@@ -350,15 +401,27 @@ and the 1× branch is dead code that can be deleted.
 - **An un-upgraded client's batch uploads start failing at the boundary.** It
   pays 1× on a fresh receipt and upgraded storers refuse it. There is no way to
   both require 3× and accept a new 1× payment, so this is the unavoidable cost
-  of enforcing by default rather than shadowing. The boundary sits a train after
-  the change ships to give clients time, and the rejection names the required
+  of enforcing by default rather than shadowing. The boundary sits after client
+  publication to give adoption time, and the rejection names the required
   multiplier so the cause is obvious rather than looking like a random store
-  failure. Anyone pinned to an old client for longer than that window is
-  affected and needs telling before the train.
-- **The boundary is a compiled-in date.** If the train slips past it, nodes
-  begin requiring 3× before clients are paying it. The constant must be moved
-  forward with the train, and must never be set earlier than the release that
-  carries it.
+  failure. Anyone pinned to an old client past the boundary is affected and
+  needs telling before it, not after.
+- **The 1× branch is a one-week underpayment window for a determined client.**
+  Because the receipt timestamp is client-chosen and quoting nodes sign what
+  they are asked for, a modified client can keep paying 1× until
+  `boundary + 1 week` by stamping receipts just before the boundary. The window
+  is bounded and closes on its own, and the same branch is what protects honest
+  in-flight receipts, so it is accepted rather than fixed. It cannot be
+  narrowed without also refusing legitimately bought receipts.
+- **The boundary is a compiled-in date.** It has to sit after the client is
+  published and after operators have had time to deploy nodes carrying it. If
+  the client release slips past it, upgraded nodes begin requiring 3× while
+  clients are still paying 1×, and batch uploads fail for everyone. If node
+  rollout slips, enforcement is simply thinner than intended for a while, which
+  is far less harmful. So the constant must be moved forward if the **client**
+  release slips, must never be set earlier than the client that pays it, and
+  changing it is a fleet-wide recompile — a node built with the old value keeps
+  the old behaviour.
 - **Parity is exact only up to the contract's integer division.** The vault
   computes `amountPerNode = total / depth`, which discards a remainder when
   `depth` does not divide `median × 2^depth`. The loss is under one wei per
@@ -402,7 +465,7 @@ and the 1× branch is dead code that can be deleted.
   formula anywhere is a defect.
 - **End to end against a real chain.** Anvil-backed tests pay and verify both
   shapes, including the redirect-rejection and underpayment cases. **Still owed
-  before the train ships:** a client → vault → node test proving 3×
+  before the client is published:** a client → vault → node test proving 3×
   construction, settlement and acceptance against a real vault, plus the
   just-below-3× and redirected-payee cases. Unit tests cover the cutover matrix
   (1× refused after the boundary, 1× honoured before it, 3× accepted on both
@@ -423,18 +486,28 @@ and the 1× branch is dead code that can be deleted.
 - **Rollout telemetry has to be trustworthy before it is trusted.** The parity
   line is emitted only after a proof's paid indices, addresses and amounts have
   all validated, and only for store admissions, so rejected proofs and
-  paid-list replays cannot enter the signal. It is keyed by pool hash, so one
-  settlement covering 256 chunks contributes one sample per storer rather than
-  256.
+  paid-list replays cannot enter the signal. Cardinality is one line per
+  settlement per storer, not one per chunk: the line carries the pool hash, and
+  a bounded, pool-keyed first-emission cache — written only after that full
+  validation, and deliberately separate from the on-chain pool cache, which is
+  populated before it — drops the rest of the batch. Its check-and-insert is a
+  single locked operation, so the concurrent admissions a batch upload actually
+  produces still emit once. Regression tests pin all of it: zero events from an
+  invalid paid index, a wrong reward address, an underpayment or a paid-list
+  verification; one event from two chunks of one pool; one more from a second
+  pool; one from eight concurrent admissions of one pool.
 - **Re-open triggers.** The ANT price moving enough to put $/GiB outside its
-  intended band; the release train slipping past the parity boundary date, which
-  requires moving the constant; a rise in refused batch uploads after the
-  boundary, indicating clients that never upgraded; parity telemetry still
-  reporting pre-boundary receipts more than a week after the boundary, which
-  would mean the expiry assumption is wrong; enabling any of the gates still
-  listed as instrumented; any move to pay nodes for uptime rather than for
-  stores, which would make client payments no longer the only revenue and
-  invalidate this ADR's central assumption.
+  intended band; the **client** release slipping past the parity boundary date,
+  which requires moving the constant forward; node rollout not reaching enough
+  of the fleet before the boundary, which weakens enforcement without breaking
+  anything; a rise in refused batch uploads after the boundary, indicating
+  clients that never upgraded; parity telemetry still reporting pre-boundary
+  receipts more than a week after the boundary, which would mean the expiry
+  assumption is wrong; a volume of pre-boundary receipts during the window that
+  looks like deliberate backdating rather than honest in-flight traffic;
+  enabling any of the gates still listed as instrumented; any move to pay nodes
+  for uptime rather than for stores, which would make client payments no longer
+  the only revenue and invalidate this ADR's central assumption.
 
 ## Notes for AI-assisted work
 

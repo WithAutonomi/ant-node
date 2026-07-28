@@ -341,8 +341,14 @@ pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 /// merkle path submitted the bare quoted price as the on-chain payable amount,
 /// so the contract's `median16(amount) x 2^depth` came to 1x the median per
 /// padded leaf: the same chunk, stored and replicated identically, earned a
-/// third as much when it arrived in a batch. ant-client applies the multiplier
-/// from the same release train as this constant.
+/// third as much when it arrived in a batch.
+///
+/// **The rollout is client-first, and this constant is only its second half.**
+/// ant-client (ant-client#161) pays 3x immediately and unconditionally once
+/// released — no date, no flag — and un-upgraded nodes accept that, because 3x
+/// clears the 1x minimum they require. So the network is paid correctly from
+/// the moment the client ships. This instant is when upgraded nodes stop
+/// accepting anything less.
 ///
 /// **Enforcement is on by default.** There is no shadow mode and no flag to
 /// flip later: a receipt stamped at or after this instant must settle at 3x or
@@ -357,16 +363,22 @@ pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 ///   `boundary + one week` has passed, **every** still-valid receipt is
 ///   necessarily stamped at or after the boundary and the 1x branch becomes
 ///   unreachable. It retires itself; nobody has to remember to turn it off.
-/// - That same expiry rule is what stops a client backdating its way out of
-///   the increase. The timestamp is client-supplied, but a stamp early enough
-///   to claim the 1x rule is also old enough to be expired. The evasion window
-///   is exactly the one week the honest grace needs, and it closes on its own.
+/// - Backdating is **not** prevented during that week. The timestamp is
+///   client-chosen — it is a `payForMerkleTree` argument, the contract only
+///   rejects future and week-old stamps, and quoting nodes sign whatever stamp
+///   the request carries — so a modified client can stamp just before the
+///   boundary and keep paying 1x until such a stamp expires. Expiry is what
+///   closes the route, not detection, and it closes it at
+///   `boundary + one week`. The same branch protects honest in-flight receipts,
+///   so the window cannot be narrowed without also destroying those.
 ///
-/// Set to 2026-08-04 15:00 UTC: one release train after the change ships, so
-/// clients on that train are paying 3x well before any node requires it. The
-/// invariant when moving it is that **it must never be earlier than the
-/// release that carries it** — an earlier value refuses receipts bought under
-/// the previous rule, which is the one outcome this constant exists to avoid.
+/// Set to 2026-08-04 15:00 UTC, after the client release with room for
+/// adoption. Two invariants when moving it: **it must never be earlier than the
+/// client release that pays 3x** (an earlier value refuses receipts bought
+/// under the previous rule, the one outcome this constant exists to avoid), and
+/// it must move forward if that **client** release slips — a node enforcing
+/// before clients pay fails every batch upload. A slip in *node* rollout needs
+/// no change: it only means fewer nodes enforce for a while.
 pub const MERKLE_PARITY_ENFORCED_FROM_UNIX: u64 = 1_785_855_600;
 
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.

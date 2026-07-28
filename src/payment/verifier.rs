@@ -187,8 +187,15 @@ fn median_quote_index(quote_count: usize) -> usize {
 /// The boundary needs no sunset logic because receipt expiry supplies it: a
 /// receipt older than one week is refused regardless, so once
 /// `enforced_from + one week` has passed no valid receipt can still reach the
-/// `1` branch. That is also why a client cannot backdate to keep the old price
-/// — a stamp early enough to qualify is old enough to be expired.
+/// `1` branch.
+///
+/// Expiry bounds backdating rather than preventing it. The stamp is
+/// client-chosen and quoting nodes sign what they are asked for, so during the
+/// week after `enforced_from` a modified client can stamp just before the
+/// boundary and still settle at 1x — the same route honest in-flight receipts
+/// take. It closes when such stamps expire, at `enforced_from + one week`, and
+/// it cannot be narrowed without also refusing receipts bought in good faith
+/// under the previous rule.
 fn merkle_required_multiplier(receipt_timestamp: u64, enforced_from: u64) -> u64 {
     if receipt_timestamp >= enforced_from {
         PAID_QUOTE_PAYMENT_MULTIPLIER
@@ -5936,7 +5943,9 @@ mod tests {
     }
 
     /// An upgraded client's 3x settlement is accepted on both sides of the
-    /// boundary, so client and node can roll out in either order.
+    /// boundary. This is what makes the client-first rollout work: the client
+    /// pays 3x from the day it ships, and neither a node that predates the
+    /// boundary nor one enforcing past it has any reason to refuse.
     #[tokio::test]
     async fn merkle_parity_settlement_accepted_in_both_regimes() {
         for parity_from in [0u64, u64::MAX] {
@@ -6350,12 +6359,30 @@ mod tests {
     }
 
     /// The legacy branch cannot outlive the receipt lifetime, which is what
-    /// makes the cutover self-completing and closes the backdating loophole: a
-    /// stamp early enough to claim 1x is old enough to be expired.
+    /// makes the cutover self-completing.
+    ///
+    /// It bounds backdating rather than preventing it: mid-window, a stamp just
+    /// before the boundary is both unexpired and eligible for 1x, so a modified
+    /// client can take that route until it expires. Both halves are asserted
+    /// here so neither claim drifts.
     #[test]
     fn merkle_legacy_window_closes_one_receipt_lifetime_after_the_boundary() {
         let boundary = 1_785_855_600u64;
         let expiry = evmlib::merkle_payments::MERKLE_PAYMENT_EXPIRATION;
+
+        // Mid-window: a deliberately backdated stamp is still unexpired, and
+        // still gets the 1x rule. This route is open for exactly one week.
+        let mid_window = boundary + expiry / 2;
+        let backdated = boundary - 1;
+        assert!(
+            mid_window - backdated < expiry,
+            "the backdated stamp is still within its lifetime"
+        );
+        assert_eq!(
+            merkle_required_multiplier(backdated, boundary),
+            1,
+            "backdating is bounded by expiry, not blocked outright"
+        );
 
         // Once now is a full receipt lifetime past the boundary, the oldest
         // still-valid stamp is itself at or after the boundary.
