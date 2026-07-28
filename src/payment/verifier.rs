@@ -176,6 +176,87 @@ fn median_quote_index(quote_count: usize) -> usize {
     quote_count / 2
 }
 
+/// The settlement multiplier a merkle receipt must satisfy, from the instant it
+/// was stamped (ADR-0008).
+///
+/// `PAID_QUOTE_PAYMENT_MULTIPLIER` (3x, matching the single-node path) for a
+/// receipt stamped at or after `enforced_from`; the historic `1` for one
+/// stamped before it, which was bought under the previous rule and cannot be
+/// refunded.
+///
+/// The boundary needs no sunset logic because receipt expiry supplies it: a
+/// receipt older than one week is refused regardless, so once
+/// `enforced_from + one week` has passed no valid receipt can still reach the
+/// `1` branch.
+///
+/// Expiry bounds backdating rather than preventing it. The stamp is
+/// client-chosen and quoting nodes sign what they are asked for, so during the
+/// week after `enforced_from` a modified client can stamp just before the
+/// boundary and still settle at 1x — the same route honest in-flight receipts
+/// take. It closes when such stamps expire, at `enforced_from + one week`, and
+/// it cannot be narrowed without also refusing receipts bought in good faith
+/// under the previous rule.
+fn merkle_required_multiplier(receipt_timestamp: u64, enforced_from: u64) -> u64 {
+    if receipt_timestamp >= enforced_from {
+        PAID_QUOTE_PAYMENT_MULTIPLIER
+    } else {
+        1
+    }
+}
+
+/// Per-node payment implied by the merkle contract formula, for a given
+/// payment multiplier.
+///
+/// The contract settles `total = median16(amount) x 2^depth` and splits it
+/// evenly across the `depth` nodes it paid, so
+/// `per_node = multiplier x median16(price) x 2^depth / depth`.
+///
+/// `candidate_prices` are the candidates' **signed quoted** prices as they
+/// appear in the proof — always 1x, because the multiplier is applied by the
+/// client to the on-chain payable `amount` and never to the signed quote
+/// (ADR-0008). Passing `multiplier = 1` therefore reproduces the historic
+/// merkle expectation, and `PAID_QUOTE_PAYMENT_MULTIPLIER` the single-node
+/// parity expectation.
+///
+/// `median16` is the upper median (index `len / 2`), matching Solidity's
+/// `median16` with `k = 8`. Depth `0` yields zero: there is nothing to pay.
+///
+/// **Not linear in `multiplier`.** The trailing `/ depth` is integer division,
+/// so `expected(m)` is `floor(m x median x 2^depth / depth)`, which is NOT
+/// generally `m x expected(1)` — the two differ by up to `m - 1` wei whenever
+/// `depth` does not divide `median x 2^depth`. For example median 901 at depth
+/// 7 gives `expected(3) = 49426` but `3 x expected(1) = 49425`. Callers must
+/// therefore ask for the multiplier they mean and compare against that value;
+/// scaling a 1x result is wrong. The order here — multiply the total, then
+/// divide once — is deliberate, and matches the contract, which computes
+/// `totalAmount` before splitting it.
+fn merkle_expected_per_node(
+    candidate_prices: &[Amount],
+    depth: u8,
+    multiplier: u64,
+) -> Result<Amount> {
+    if depth == 0 {
+        return Ok(Amount::ZERO);
+    }
+
+    let mut sorted = candidate_prices.to_vec();
+    sorted.sort_unstable(); // ascending
+    let median_price = *sorted
+        .get(sorted.len() / 2)
+        .ok_or_else(|| Error::Payment("empty candidate pool in merkle proof".into()))?;
+
+    let leaves = 1u64
+        .checked_shl(u32::from(depth))
+        .ok_or_else(|| Error::Payment("merkle proof depth too large".into()))?;
+
+    let total_amount = median_price
+        .checked_mul(Amount::from(leaves))
+        .and_then(|total| total.checked_mul(Amount::from(multiplier)))
+        .ok_or_else(|| Error::Payment("merkle total payment overflow".into()))?;
+
+    Ok(total_amount / Amount::from(u64::from(depth)))
+}
+
 fn payment_proof_type_label(payment_proof: Option<&[u8]>) -> &'static str {
     match payment_proof.and_then(detect_proof_type) {
         Some(ProofType::Merkle) => "merkle",
@@ -328,6 +409,23 @@ impl PaymentStatus {
 /// Default capacity for the merkle pool cache (number of pool hashes to cache).
 const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
 
+/// Capacity of the ADR-0008 parity-telemetry first-emission cache: how many
+/// recently measured pool hashes this node remembers in order to emit one
+/// sample per settlement instead of one per admitted chunk.
+///
+/// Bounded, and deliberately its own cache rather than a flag on the pool
+/// cache: the pool cache is populated as soon as the on-chain record is read,
+/// which happens *before* the paid indices, addresses and amounts are checked,
+/// so keying first-emission off it would let a proof that is rejected moments
+/// later suppress (or produce) a sample. This one is written only after full
+/// admission validation.
+///
+/// LRU eviction means a pool that goes quiet for more than
+/// `MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY` distinct pools can be sampled a
+/// second time. That is the intended trade: the cache bounds memory, and the
+/// stream stays deduplicable by `pool` downstream.
+const MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY: usize = 1_000;
+
 /// ADR-0004: max commitment sidecars processed per bundle. A legitimate bundle
 /// carries at most one commitment per quote/candidate — `CANDIDATES_PER_POOL`
 /// (16) is the larger of the single-node (`CLOSE_GROUP_SIZE` = 7) and merkle
@@ -445,6 +543,30 @@ pub struct PaymentVerifier {
     /// future ops surface) can flip enforcement without rebuilding the
     /// verifier.
     price_floor: RwLock<PriceFloorConfig>,
+    /// ADR-0008: the instant from which a merkle receipt must settle at the
+    /// single-node 3x multiplier, defaulting to
+    /// [`crate::replication::config::MERKLE_PARITY_ENFORCED_FROM_UNIX`].
+    ///
+    /// Behind a lock purely so tests can pin it. Every merkle receipt is
+    /// necessarily stamped within one week of now (older ones are expired,
+    /// future ones refused), so a test that used the production boundary would
+    /// silently change which side of it the test data fell on as the wall clock
+    /// crossed that date. Pinning the boundary keeps those tests deterministic
+    /// forever.
+    merkle_parity_from: RwLock<u64>,
+    /// ADR-0008: pool hashes this node has already emitted a parity telemetry
+    /// line for. Bounded by
+    /// [`MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY`]; see that constant for why
+    /// this is separate from [`Self::pool_cache`].
+    ///
+    /// Check-and-insert happens under this one lock, so concurrent admissions
+    /// of different chunks from the same batch emit exactly one line between
+    /// them rather than one each.
+    merkle_parity_logged: Mutex<LruCache<PoolHash, ()>>,
+    /// Count of ADR-0008 parity lines this verifier has actually emitted.
+    /// Incremented only on first emission for a pool, so it measures
+    /// settlements sampled rather than chunks admitted.
+    merkle_parity_emissions: std::sync::atomic::AtomicUsize,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -574,6 +696,14 @@ impl PaymentVerifier {
             monetized_pin_tx: RwLock::new(None),
             local_commitment_source: RwLock::new(None),
             price_floor: RwLock::new(config.price_floor),
+            merkle_parity_from: RwLock::new(
+                crate::replication::config::MERKLE_PARITY_ENFORCED_FROM_UNIX,
+            ),
+            merkle_parity_logged: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY)
+                    .unwrap_or(NonZeroUsize::MIN),
+            )),
+            merkle_parity_emissions: std::sync::atomic::AtomicUsize::new(0),
             config,
         }
     }
@@ -662,6 +792,28 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_price_floor_for_tests(&self, config: PriceFloorConfig) {
         *self.price_floor.write() = config;
+    }
+
+    /// Test-only setter for the ADR-0008 merkle parity boundary, so both the
+    /// pre-boundary (historic 1x) and enforcing (3x) regimes can be exercised
+    /// against fixed receipt timestamps instead of the wall clock. `0` enforces
+    /// on every receipt; `u64::MAX` puts every receipt in the legacy window.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_merkle_parity_from_for_tests(&self, enforced_from: u64) {
+        *self.merkle_parity_from.write() = enforced_from;
+    }
+
+    /// Number of ADR-0008 parity telemetry lines this verifier has emitted.
+    ///
+    /// One per settlement pool this node admitted a store for — not one per
+    /// chunk, and none at all for proofs that failed validation or for
+    /// non-store contexts. Test-only surface for the cardinality regression
+    /// tests; the production signal is the log line itself.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn merkle_parity_emission_count(&self) -> usize {
+        self.merkle_parity_emissions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test-only setter for local closest peers used by the paid-quote
@@ -2064,6 +2216,81 @@ impl PaymentVerifier {
         }
     }
 
+    /// ADR-0008 merkle payment-parity telemetry.
+    ///
+    /// Records what a batch actually settled per paid node against what
+    /// single-node parity requires, and which regime the receipt's timestamp put
+    /// it in. Parity is enforced, so a post-boundary shortfall has already been
+    /// rejected before this runs and cannot appear here; what this measures is
+    /// how much traffic is still arriving on pre-boundary (1x) receipts, which
+    /// is what tells us the compatibility window can be considered closed.
+    /// Observational only: it never rejects and never feeds trust scoring — a
+    /// client on a legacy receipt is running old code, not misbehaving.
+    ///
+    /// Two call-site requirements, both load-bearing for the signal:
+    /// - **After full admission validation.** Every paid index, reward address
+    ///   and amount must already have been checked. Logging earlier lets a
+    ///   proof that is rejected moments later enter the rollout signal, which
+    ///   would understate parity with samples that never resulted in a store.
+    /// - **Store admissions only.** A paid-list admission reprices nothing and
+    ///   would double-count a batch already measured when it was stored.
+    ///
+    /// Keyed by `pool_hash`, not by chunk address: one on-chain settlement
+    /// covers up to 256 chunks, so a line per chunk would emit 256 duplicate
+    /// samples of one economic event and let a big batch outvote a small one.
+    ///
+    /// Carrying the pool hash in the line is not enough on its own — it makes
+    /// the stream *deduplicable* but leaves the emitted cardinality at one line
+    /// per chunk. So the first emission for a pool is recorded in
+    /// [`Self::merkle_parity_logged`] and later admissions from the same batch
+    /// return without logging. The check-and-insert is a single locked
+    /// operation, so concurrent admissions from one batch also produce exactly
+    /// one line. "Once per pool" is per node/verifier: every storer that admits
+    /// a chunk from the batch still contributes its own sample, which is what
+    /// makes the signal a measure of traffic reaching the fleet.
+    fn log_merkle_parity(
+        &self,
+        pool_hash: PoolHash,
+        payment_info: &OnChainPaymentInfo,
+        expected_bare: Amount,
+        expected_parity: Amount,
+        required_multiplier: u64,
+    ) {
+        // Check-and-insert under one lock: the loser of a race sees its own
+        // insert report a prior entry and stays quiet.
+        if self
+            .merkle_parity_logged
+            .lock()
+            .put(pool_hash, ())
+            .is_some()
+        {
+            return;
+        }
+        self.merkle_parity_emissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let min_paid = payment_info
+            .paid_node_addresses
+            .iter()
+            .map(|(_, _, amount)| *amount)
+            .min()
+            .unwrap_or(Amount::ZERO);
+        let at_parity = min_paid >= expected_parity;
+        let legacy_receipt = required_multiplier < PAID_QUOTE_PAYMENT_MULTIPLIER;
+
+        info!(
+            target: "ant_node::payment::merkle_parity",
+            "Merkle parity: pool={}, depth={}, paid_nodes={}, receipt_ts={}, \
+             min_paid={min_paid}, expected_bare={expected_bare}, \
+             expected_parity={expected_parity}, required_multiplier={required_multiplier}, \
+             legacy_receipt={legacy_receipt}, at_parity={at_parity}",
+            hex::encode(pool_hash),
+            payment_info.depth,
+            payment_info.paid_node_addresses.len(),
+            payment_info.merkle_payment_timestamp,
+        );
+    }
+
     /// Pure curve-canonicality predicate: does `price` lie exactly on the
     /// pricing curve? Equivalent to "there exists some non-negative integer
     /// `n` such that `calculate_price(n) == price`".
@@ -2749,38 +2976,41 @@ impl PaymentVerifier {
             )));
         }
 
-        // Compute expected per-node payment using the contract formula:
-        // totalAmount = median16(candidate_prices) * (1 << depth)
-        // amountPerNode = totalAmount / depth
-        let expected_per_node = if payment_info.depth > 0 {
-            let mut candidate_prices: Vec<Amount> = merkle_proof
-                .winner_pool
-                .candidate_nodes
-                .iter()
-                .map(|c| c.price)
-                .collect();
-            candidate_prices.sort_unstable(); // ascending
-                                              // Upper median (index 8 of 16) — matches Solidity's median16 (k = 8)
-            let median_price = *candidate_prices
-                .get(candidate_prices.len() / 2)
-                .ok_or_else(|| Error::Payment("empty candidate pool in merkle proof".into()))?;
-            let shift = u32::from(payment_info.depth);
-            let multiplier = 1u64
-                .checked_shl(shift)
-                .ok_or_else(|| Error::Payment("merkle proof depth too large".into()))?;
-            let total_amount = median_price * Amount::from(multiplier);
-            total_amount / Amount::from(u64::from(payment_info.depth))
-        } else {
-            Amount::ZERO
-        };
+        // Expected per-node payment from the contract formula. ADR-0008: which
+        // multiplier is REQUIRED depends on when the receipt was stamped —
+        // 3x from the parity boundary onward, the historic 1x before it, since
+        // that money was already spent under the old rule. The expiry check
+        // above bounds the legacy branch: no receipt older than a week is
+        // valid, so the branch is unreachable one week past the boundary.
+        let candidate_prices: Vec<Amount> = merkle_proof
+            .winner_pool
+            .candidate_nodes
+            .iter()
+            .map(|c| c.price)
+            .collect();
+        let parity_from = *self.merkle_parity_from.read();
+        let required_multiplier =
+            merkle_required_multiplier(payment_info.merkle_payment_timestamp, parity_from);
+        let expected_per_node_bare =
+            merkle_expected_per_node(&candidate_prices, payment_info.depth, 1)?;
+        let expected_per_node_parity = merkle_expected_per_node(
+            &candidate_prices,
+            payment_info.depth,
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+        )?;
+        let expected_per_node =
+            merkle_expected_per_node(&candidate_prices, payment_info.depth, required_multiplier)?;
 
         // Verify paid node indices, addresses, and amounts against the candidate pool.
         //
         // Each paid node must:
         // 1. Have a valid index within the candidate pool
         // 2. Match the expected reward address at that index
-        // 3. Have been paid at least the expected per-node amount from the
-        //    contract formula: median16(prices) * 2^depth / depth
+        // 3. Have been paid at least `expected_per_node`, which is the contract
+        //    formula `median16(prices) * 2^depth / depth` at the multiplier the
+        //    receipt's own timestamp selects (3x from the parity boundary, the
+        //    historic 1x before it). Do NOT re-assume the 1x formula here —
+        //    read `expected_per_node` rather than recomputing it.
         //
         // Note: unlike single-node payments, merkle proofs are NOT bound to a
         // specific storing node. The contract pays `depth` random nodes from the
@@ -2810,8 +3040,9 @@ impl PaymentVerifier {
                 return Err(Error::Payment(format!(
                     "Underpayment for node at index {idx}: paid {paid_amount}, \
                      expected at least {expected_per_node} \
-                     (median16 formula, depth={})",
-                    payment_info.depth
+                     (median16 formula, depth={}, {required_multiplier}x required for a \
+                     receipt stamped {} vs parity boundary {parity_from})",
+                    payment_info.depth, payment_info.merkle_payment_timestamp
                 )));
             }
         }
@@ -2821,6 +3052,24 @@ impl PaymentVerifier {
                 "Merkle payment verified for {} (pool: {})",
                 hex::encode(xorname),
                 hex::encode(pool_hash)
+            );
+        }
+
+        // ADR-0008 parity telemetry, emitted only now: every paid index, reward
+        // address and amount above has been validated, so a proof that is
+        // rejected later in this function can never enter the rollout signal.
+        // Store admissions only, matching the cross-check below — a paid-list
+        // receipt reprices no fresh economic decision and would otherwise
+        // double-count a batch already measured at its store admission.
+        // `log_merkle_parity` itself drops all but the first admission per
+        // pool, so a 256-chunk batch contributes one line here, not 256.
+        if context.is_store_admission() {
+            self.log_merkle_parity(
+                pool_hash,
+                &payment_info,
+                expected_per_node_bare,
+                expected_per_node_parity,
+                required_multiplier,
             );
         }
 
@@ -2977,6 +3226,142 @@ mod tests {
 
         assert_eq!(issuer_closeness_width, k_bucket_size);
         assert!(issuer_closeness_width > close_group_size);
+    }
+
+    /// 16 candidate prices 100..=1600; the upper median (index 8) is 900.
+    fn varied_candidate_prices() -> Vec<Amount> {
+        (1..=16u64).map(|i| Amount::from(i * 100)).collect()
+    }
+
+    #[test]
+    fn merkle_expected_per_node_reproduces_the_contract_formula() {
+        // total = median16 x 2^depth = 900 x 16 = 14400, over depth=4 nodes.
+        let per_node = merkle_expected_per_node(&varied_candidate_prices(), 4, 1)
+            .expect("depth 4 pool is payable");
+        assert_eq!(per_node, Amount::from(3_600u64));
+    }
+
+    /// 16 identical candidate prices, so the upper median is exactly `median`.
+    fn prices_with_median(median: u64) -> Vec<Amount> {
+        vec![Amount::from(median); 16]
+    }
+
+    /// The parity expectation is the floor of the multiplied total, which is
+    /// **not** the bare expectation times the multiplier.
+    ///
+    /// `expected(m) = floor(m x median x 2^depth / depth)` sits in
+    /// `[m x expected(1), m x expected(1) + (m - 1)]`: equal when `depth`
+    /// divides the total, up to `m - 1` wei above it when it does not.
+    /// Asserting exact equality would encode `floor(3x/d) == 3 x floor(x/d)`,
+    /// which is false in general and only happened to hold for the
+    /// evenly-dividing case the first version of this test used.
+    #[test]
+    fn merkle_expected_per_node_scales_within_the_division_remainder() {
+        let multiplier = PAID_QUOTE_PAYMENT_MULTIPLIER;
+
+        for median in [1u64, 899, 900, 901, 6_000, 1_000_003] {
+            for depth in 1..=8u8 {
+                let prices = prices_with_median(median);
+                let bare = merkle_expected_per_node(&prices, depth, 1)
+                    .expect("bare expectation is payable");
+                let parity = merkle_expected_per_node(&prices, depth, multiplier)
+                    .expect("parity expectation is payable");
+
+                let scaled_bare = bare * Amount::from(multiplier);
+                let slack = Amount::from(multiplier - 1);
+
+                assert!(
+                    parity >= scaled_bare && parity <= scaled_bare + slack,
+                    "median {median} depth {depth}: parity {parity} must lie in \
+                     [{scaled_bare}, {}]",
+                    scaled_bare + slack
+                );
+
+                // And it is exactly the floor of the multiplied total.
+                let leaves = 1u64 << u32::from(depth);
+                let expected =
+                    Amount::from(median * leaves * multiplier) / Amount::from(u64::from(depth));
+                assert_eq!(parity, expected, "median {median} depth {depth}");
+            }
+        }
+    }
+
+    /// Regression for the arithmetic order: the helper multiplies the total and
+    /// then divides once, as the contract does. Median 901 at depth 7 is a case
+    /// where that differs from scaling a 1x result by one wei, so a refactor
+    /// that divided first would fail here.
+    #[test]
+    fn merkle_expected_per_node_multiplies_before_dividing() {
+        let prices = prices_with_median(901);
+        let bare = merkle_expected_per_node(&prices, 7, 1).expect("bare expectation is payable");
+        let parity = merkle_expected_per_node(&prices, 7, PAID_QUOTE_PAYMENT_MULTIPLIER)
+            .expect("parity expectation is payable");
+
+        assert_eq!(bare, Amount::from(16_475u64));
+        assert_eq!(parity, Amount::from(49_426u64));
+        assert_eq!(
+            parity,
+            bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER) + Amount::from(1u64),
+            "dividing before multiplying would lose this wei"
+        );
+    }
+
+    /// The economic invariant ADR-0008 restores: a merkle **leaf** settles
+    /// for what the single-node path settles — 3x the median quote — up to
+    /// the contract's integer division.
+    ///
+    /// Leaf, not chunk: the tree pads to `2^ceil(log2(N))` and the contract
+    /// charges for every leaf, so a batch whose size is not a power of two
+    /// pays a padding premium on top. That premium is a property of the
+    /// contract formula, not of the multiplier under test here.
+    ///
+    /// `amountPerNode = totalAmount / depth` discards a remainder whenever
+    /// `depth` does not divide `median x 2^depth` (e.g. depth 7). The loss is
+    /// strictly under one wei per paid node, spread across `2^depth` chunks,
+    /// so it is economically irrelevant — but the invariant is "within
+    /// rounding", not exact equality, and the test says so rather than
+    /// picking depths that happen to divide evenly.
+    #[test]
+    fn merkle_parity_per_chunk_equals_single_node_settlement() {
+        let prices = varied_candidate_prices();
+        let median = Amount::from(900u64);
+
+        for depth in 1..=8u8 {
+            let per_node = merkle_expected_per_node(&prices, depth, PAID_QUOTE_PAYMENT_MULTIPLIER)
+                .expect("every supported depth is payable");
+            let required_total = per_node * Amount::from(u64::from(depth));
+
+            let leaves = Amount::from(1u64 << u32::from(depth));
+            let ideal_total = median * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER) * leaves;
+
+            assert!(
+                required_total <= ideal_total,
+                "at depth {depth} the required total {required_total} must not \
+                 exceed the 3x-median ideal {ideal_total}"
+            );
+            assert!(
+                ideal_total - required_total < Amount::from(u64::from(depth)),
+                "at depth {depth} the shortfall {} must be pure division \
+                 remainder (< depth wei), not a missing multiplier",
+                ideal_total - required_total
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_expected_per_node_is_zero_at_depth_zero() {
+        let per_node = merkle_expected_per_node(&varied_candidate_prices(), 0, 3)
+            .expect("depth zero is a valid no-op, not an error");
+        assert_eq!(per_node, Amount::ZERO);
+    }
+
+    #[test]
+    fn merkle_expected_per_node_rejects_an_empty_pool() {
+        let Err(err) = merkle_expected_per_node(&[], 4, 3) else {
+            panic!("an empty candidate pool has no median and must not be payable");
+        };
+        let err = err.to_string();
+        assert!(err.contains("empty candidate pool"), "got: {err}");
     }
 
     fn make_signed_quote(
@@ -4487,7 +4872,7 @@ mod tests {
     async fn test_merkle_tagged_proof_invalid_data_rejected() {
         use crate::ant_protocol::PROOF_TAG_MERKLE;
 
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let xorname = [0xA1u8; 32];
 
         // Build a merkle-tagged proof with garbage body.
@@ -5001,6 +5386,28 @@ mod tests {
 
     /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65
     /// signatures. Returns `(xorname, serialized_tagged_proof, pool_hash, timestamp)`.
+    /// Verifier for merkle admission tests, pinned to the **enforcing** side of
+    /// the ADR-0008 parity boundary.
+    ///
+    /// Merkle receipts must be stamped within one week of now or they are
+    /// expired, so these tests necessarily build near-`now` timestamps. Left on
+    /// the production boundary they would sit in the legacy 1x window today and
+    /// silently switch to the 3x rule when the wall clock crossed that date,
+    /// changing what each assertion means. Pinning to `0` means "every receipt
+    /// is post-boundary", which is the rule the release ships with.
+    fn merkle_test_verifier() -> PaymentVerifier {
+        let verifier = create_test_verifier();
+        verifier.set_merkle_parity_from_for_tests(0);
+        verifier
+    }
+
+    /// Per-node amount a depth-2 pool of 1024-priced candidates must settle
+    /// under parity: `median(1024) * 2^2 * 3 / 2`.
+    const MERKLE_PARITY_PER_NODE_DEPTH2: u64 = 6144;
+
+    /// The same pool's historic pre-parity amount: `median(1024) * 2^2 / 2`.
+    const MERKLE_LEGACY_PER_NODE_DEPTH2: u64 = 2048;
+
     fn make_valid_merkle_proof_bytes() -> (
         [u8; 32],
         Vec<u8>,
@@ -5015,7 +5422,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_address_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (_correct_xorname, tagged_proof, _pool_hash, _ts) = make_valid_merkle_proof_bytes();
 
         // Use a DIFFERENT xorname than what the proof was built for
@@ -5042,7 +5449,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_malformed_body_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let xorname = [0xA3u8; 32];
 
         // Valid merkle tag but truncated/corrupted msgpack body
@@ -5195,7 +5602,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_tampered_candidate_signature_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
 
         let (mut merkle_proof, _pool_hash, xorname, timestamp) = make_valid_merkle_proof();
 
@@ -5242,7 +5649,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_timestamp_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
 
         let (xorname, tagged, pool_hash, timestamp) = make_valid_merkle_proof_bytes();
 
@@ -5274,7 +5681,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_paid_node_index_out_of_bounds_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // The test tree has 4 addresses → depth 2. We must match the tree depth
@@ -5285,11 +5692,19 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // First paid node: valid (matches candidate 0, amount matches formula)
-                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
+                    // First paid node: valid (matches candidate 0, amount clears
+                    // the parity formula so the test reaches the index check)
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                     // Second paid node: index 999 is way beyond CANDIDATES_PER_POOL (16)
-                    (RewardsAddress::new([1u8; 20]), 999, Amount::from(2048u64)),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        999,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -5316,7 +5731,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_paid_node_address_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Tree has depth 2, so provide 2 paid node entries.
@@ -5326,11 +5741,19 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // Index 0 with matching address [0x00; 20]
-                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
+                    // Index 0 with matching address [0x00; 20], paid enough to
+                    // clear the parity formula so the test reaches index 1
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                     // Index 1 with WRONG address — candidate 1's address is [0x01; 20]
-                    (RewardsAddress::new([0xFF; 20]), 1, Amount::from(2048u64)),
+                    (
+                        RewardsAddress::new([0xFF; 20]),
+                        1,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -5354,7 +5777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_wrong_depth_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Pre-populate pool cache with depth=3 but only 1 paid node address
@@ -5394,7 +5817,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_underpayment_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Tree depth=2, so 2 paid nodes required. Candidates all quote price=1024.
@@ -5431,8 +5854,547 @@ mod tests {
         );
     }
 
+    /// A batch settled at the historic 1x is refused once its receipt is stamped
+    /// at or after the parity boundary. This is the fix being active by default:
+    /// no flag, no shadow mode.
+    #[tokio::test]
+    async fn merkle_legacy_1x_settlement_rejected_after_the_parity_boundary() {
+        let verifier = merkle_test_verifier(); // boundary pinned at 0 = always enforcing
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        1,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let err_msg = format!(
+            "{}",
+            verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&tagged_proof),
+                    VerificationContext::ClientPut,
+                )
+                .await
+                .expect_err("a 1x settlement must be refused past the boundary")
+        );
+        assert!(
+            err_msg.contains("Underpayment") && err_msg.contains("3x required"),
+            "Error should name the required multiplier: {err_msg}"
+        );
+    }
+
+    /// A receipt stamped BEFORE the boundary keeps its 1x price. The money was
+    /// already spent under the old rule and cannot be refunded, so refusing it
+    /// would destroy value. This is the compatibility half of the cutover.
+    #[tokio::test]
+    async fn merkle_legacy_1x_settlement_accepted_before_the_parity_boundary() {
+        let verifier = create_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+        // Boundary just after this receipt's stamp: the receipt is legacy.
+        verifier.set_merkle_parity_from_for_tests(ts + 1);
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        1,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a receipt stamped before the boundary keeps the 1x rule: {result:?}"
+        );
+    }
+
+    /// An upgraded client's 3x settlement is accepted on both sides of the
+    /// boundary. This is what makes the client-first rollout work: the client
+    /// pays 3x from the day it ships, and neither a node that predates the
+    /// boundary nor one enforcing past it has any reason to refuse.
+    #[tokio::test]
+    async fn merkle_parity_settlement_accepted_in_both_regimes() {
+        for parity_from in [0u64, u64::MAX] {
+            let verifier = create_test_verifier();
+            verifier.set_merkle_parity_from_for_tests(parity_from);
+            let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+            {
+                let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                    depth: 2,
+                    merkle_payment_timestamp: ts,
+                    paid_node_addresses: vec![
+                        (
+                            RewardsAddress::new([0u8; 20]),
+                            0,
+                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        ),
+                        (
+                            RewardsAddress::new([1u8; 20]),
+                            1,
+                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        ),
+                    ],
+                };
+                verifier.pool_cache.lock().put(pool_hash, info);
+            }
+
+            let result = verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&tagged_proof),
+                    VerificationContext::ClientPut,
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "3x must be accepted with boundary {parity_from}: {result:?}"
+            );
+        }
+    }
+
+    /// One chunk's payment proof as the verifier receives it: the stored
+    /// address and the tagged, serialized proof bytes.
+    type TaggedProof = ([u8; 32], Vec<u8>);
+
+    /// Build valid proofs for several addresses of ONE tree, all resolving to
+    /// the same winner pool hash — the shape a real batch upload has, and the
+    /// case the ADR-0008 parity telemetry must collapse to a single sample.
+    /// Returns `(Vec<(xorname, tagged_proof)>, pool_hash, timestamp)`.
+    fn make_valid_merkle_proofs_for_one_pool(
+        indices: &[usize],
+    ) -> (
+        Vec<TaggedProof>,
+        evmlib::merkle_batch_payment::PoolHash,
+        u64,
+    ) {
+        use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree};
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let addresses: Vec<xor_name::XorName> = (0..4u8)
+            .map(|i| xor_name::XorName::from_content(&[i]))
+            .collect();
+        let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
+
+        let midpoint_proof = tree
+            .reward_candidates(timestamp)
+            .expect("reward candidates")
+            .first()
+            .expect("at least one candidate")
+            .clone();
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof,
+            candidate_nodes: make_candidate_nodes(timestamp),
+        };
+
+        let mut proofs = Vec::with_capacity(indices.len());
+        let mut pool_hash = None;
+        for &index in indices {
+            let address = *addresses.get(index).expect("address index within the tree");
+            let address_proof = tree
+                .generate_address_proof(index, address)
+                .expect("address proof");
+            let proof = MerklePaymentProof::new(address, address_proof, pool.clone());
+            let hash = proof.winner_pool_hash();
+            match pool_hash {
+                None => pool_hash = Some(hash),
+                Some(first) => assert_eq!(
+                    hash, first,
+                    "every address in one tree must share one winner pool"
+                ),
+            }
+            let tagged =
+                crate::payment::proof::serialize_merkle_proof(&proof).expect("serialize proof");
+            proofs.push((address.0, tagged));
+        }
+
+        (proofs, pool_hash.expect("at least one proof"), timestamp)
+    }
+
+    /// The depth-2 test pool's on-chain record, settled at 3x parity so the
+    /// proof is admitted and the telemetry call site is actually reached.
+    fn parity_settled_pool_info(ts: u64) -> evmlib::merkle_payments::OnChainPaymentInfo {
+        evmlib::merkle_payments::OnChainPaymentInfo {
+            depth: 2,
+            merkle_payment_timestamp: ts,
+            paid_node_addresses: vec![
+                (
+                    RewardsAddress::new([0u8; 20]),
+                    0,
+                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                ),
+                (
+                    RewardsAddress::new([1u8; 20]),
+                    1,
+                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                ),
+            ],
+        }
+    }
+
     // =========================================================================
-    // Closeness-window constants regression tests
+    // ADR-0008 parity telemetry: what may enter the rollout signal, and at what
+    // cardinality. The signal is read to decide when the pre-boundary (1x)
+    // compatibility window has drained, so a sample from a proof that was
+    // rejected — or 256 samples from one settlement — would mislead that call.
+    // =========================================================================
+
+    /// A proof naming a paid index outside the pool is rejected in the paid-node
+    /// loop, before the telemetry call site. Nothing may be measured.
+    #[tokio::test]
+    async fn parity_telemetry_silent_when_a_paid_index_is_invalid() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let mut info = parity_settled_pool_info(ts);
+            // Second entry points past CANDIDATES_PER_POOL (16).
+            if let Some(entry) = info.paid_node_addresses.get_mut(1) {
+                entry.1 = 999;
+            }
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an out-of-bounds paid index must be refused"
+        );
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// A paid entry whose reward address does not match the candidate at that
+    /// index is rejected before the telemetry call site.
+    #[tokio::test]
+    async fn parity_telemetry_silent_when_a_reward_address_is_wrong() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let mut info = parity_settled_pool_info(ts);
+            // Candidate 1's address is [0x01; 20], not [0xFF; 20].
+            if let Some(entry) = info.paid_node_addresses.get_mut(1) {
+                entry.0 = RewardsAddress::new([0xFF; 20]);
+            }
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(result.is_err(), "a redirected payee must be refused");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// An underpaid batch is the case the signal most obviously must not
+    /// contain: it is rejected, so it never became a store.
+    #[tokio::test]
+    async fn parity_telemetry_silent_on_underpayment() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1u64)),
+                    (RewardsAddress::new([1u8; 20]), 1, Amount::from(1u64)),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(result.is_err(), "an underpaid batch must be refused");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// A paid-list admission verifies the same proof but reprices nothing. It
+    /// must not be measured, or a batch already sampled at its store admission
+    /// would be counted twice.
+    #[tokio::test]
+    async fn parity_telemetry_silent_for_paid_list_admission() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::PaidListAdmission,
+            )
+            .await;
+
+        assert!(result.is_ok(), "the proof itself is valid: {result:?}");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "only store admissions may be measured"
+        );
+    }
+
+    /// Two chunks of one batch are one economic event. The pool hash in the
+    /// line makes the stream deduplicable; the first-emission cache is what
+    /// keeps the emitted cardinality at one.
+    #[tokio::test]
+    async fn parity_telemetry_emits_once_for_two_chunks_of_one_pool() {
+        let verifier = merkle_test_verifier();
+        let (proofs, pool_hash, ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        for (xorname, tagged) in &proofs {
+            let result = verifier
+                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .await;
+            assert!(result.is_ok(), "both chunks must be admitted: {result:?}");
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            1,
+            "one settlement is one sample, however many chunks it covers"
+        );
+    }
+
+    /// Deduplication is per pool, not a global mute: a genuinely separate
+    /// settlement is a separate sample.
+    #[tokio::test]
+    async fn parity_telemetry_emits_once_more_for_a_second_pool() {
+        let verifier = merkle_test_verifier();
+
+        let (first, first_pool, first_ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(first_pool, parity_settled_pool_info(first_ts));
+        for (xorname, tagged) in &first {
+            verifier
+                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .await
+                .expect("first pool admitted");
+        }
+        assert_eq!(verifier.merkle_parity_emission_count(), 1);
+
+        // A fresh batch: new candidate keypairs and leaf salts give it a
+        // different pool hash. Its chunk is one the first batch did not carry,
+        // so this exercises verification rather than the verified-address cache.
+        let (second, second_pool, second_ts) = make_valid_merkle_proofs_for_one_pool(&[2]);
+        let (second_xorname, second_tagged) = second.first().expect("one proof").clone();
+        assert_ne!(first_pool, second_pool, "the second batch is a new pool");
+        verifier
+            .pool_cache
+            .lock()
+            .put(second_pool, parity_settled_pool_info(second_ts));
+        verifier
+            .verify_payment(
+                &second_xorname,
+                Some(&second_tagged),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect("second pool admitted");
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            2,
+            "a second settlement contributes a second sample"
+        );
+    }
+
+    /// Concurrent admissions of one batch — the normal case, since a client
+    /// PUTs a batch's chunks in parallel — must still emit once. The
+    /// check-and-insert is a single locked operation for exactly this reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parity_telemetry_emits_once_under_concurrent_admissions() {
+        let verifier = Arc::new(merkle_test_verifier());
+        let (proofs, pool_hash, ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1, 2, 3]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        let mut handles = Vec::new();
+        for (xorname, tagged) in proofs {
+            // Two racing admissions per address, as replication and the direct
+            // PUT can both arrive for the same chunk.
+            for _ in 0..2 {
+                let verifier = Arc::clone(&verifier);
+                let tagged = tagged.clone();
+                handles.push(tokio::spawn(async move {
+                    verifier
+                        .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+                        .await
+                }));
+            }
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task panicked");
+            assert!(
+                result.is_ok(),
+                "every concurrent admission must succeed: {result:?}"
+            );
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            1,
+            "concurrent admissions of one pool must not race into extra samples"
+        );
+    }
+
+    /// The first-emission cache is bounded, so a node admitting an unbounded
+    /// stream of distinct pools cannot grow it without limit.
+    #[test]
+    fn parity_telemetry_first_emission_cache_is_bounded() {
+        let verifier = create_test_verifier();
+        for i in 0..(MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY + 50) {
+            let mut hash: PoolHash = [0u8; 32];
+            for (j, b) in i.to_le_bytes().iter().enumerate() {
+                if let Some(slot) = hash.get_mut(j) {
+                    *slot = *b;
+                }
+            }
+            verifier.merkle_parity_logged.lock().put(hash, ());
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_logged.lock().len(),
+            MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY,
+            "the telemetry cache must stay at its capacity"
+        );
+    }
+
+    #[test]
+    fn merkle_required_multiplier_switches_exactly_at_the_boundary() {
+        let boundary = 1_785_855_600u64;
+
+        assert_eq!(merkle_required_multiplier(boundary - 1, boundary), 1);
+        assert_eq!(
+            merkle_required_multiplier(boundary, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+            "the boundary instant itself is enforcing"
+        );
+        assert_eq!(
+            merkle_required_multiplier(boundary + 1, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER
+        );
+    }
+
+    /// The legacy branch cannot outlive the receipt lifetime, which is what
+    /// makes the cutover self-completing.
+    ///
+    /// It bounds backdating rather than preventing it: mid-window, a stamp just
+    /// before the boundary is both unexpired and eligible for 1x, so a modified
+    /// client can take that route until it expires. Both halves are asserted
+    /// here so neither claim drifts.
+    #[test]
+    fn merkle_legacy_window_closes_one_receipt_lifetime_after_the_boundary() {
+        let boundary = 1_785_855_600u64;
+        let expiry = evmlib::merkle_payments::MERKLE_PAYMENT_EXPIRATION;
+
+        // Mid-window: a deliberately backdated stamp is still unexpired, and
+        // still gets the 1x rule. This route is open for exactly one week.
+        let mid_window = boundary + expiry / 2;
+        let backdated = boundary - 1;
+        assert!(
+            mid_window - backdated < expiry,
+            "the backdated stamp is still within its lifetime"
+        );
+        assert_eq!(
+            merkle_required_multiplier(backdated, boundary),
+            1,
+            "backdating is bounded by expiry, not blocked outright"
+        );
+
+        // Once now is a full receipt lifetime past the boundary, the oldest
+        // still-valid stamp is itself at or after the boundary.
+        let now = boundary + expiry;
+        let oldest_valid_stamp = now - expiry;
+        assert_eq!(
+            merkle_required_multiplier(oldest_valid_stamp, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+            "no unexpired receipt can still claim the 1x rule"
+        );
+    }
+
     //
     // These constants are load-bearing for both correctness (the storer
     // must look at the same window the client picks from, otherwise honest

@@ -334,6 +334,53 @@ pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 /// off-curve price, so it deserves its own dial.
 pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 
+/// Instant from which a merkle batch payment must carry the same 3x settlement
+/// multiplier the single-node path has always applied (ADR-0008). Unix seconds.
+///
+/// The single-node path settles a chunk at 3x the median quoted price. The
+/// merkle path submitted the bare quoted price as the on-chain payable amount,
+/// so the contract's `median16(amount) x 2^depth` came to 1x the median per
+/// padded leaf: the same chunk, stored and replicated identically, earned a
+/// third as much when it arrived in a batch.
+///
+/// **The rollout is client-first, and this constant is only its second half.**
+/// ant-client (ant-client#161) pays 3x immediately and unconditionally once
+/// released — no date, no flag — and un-upgraded nodes accept that, because 3x
+/// clears the 1x minimum they require. So the network is paid correctly from
+/// the moment the client ships. This instant is when upgraded nodes stop
+/// accepting anything less.
+///
+/// **Enforcement is on by default.** There is no shadow mode and no flag to
+/// flip later: a receipt stamped at or after this instant must settle at 3x or
+/// the store is refused. What the boundary buys is not a soft launch, it is
+/// compatibility with money that was already spent:
+///
+/// - A receipt stamped **before** the boundary is held to the historic 1x. It
+///   was paid in good faith under the old rule and the payer cannot get it
+///   back, so refusing it would destroy value rather than protect it.
+/// - Merkle receipts expire after `MERKLE_PAYMENT_EXPIRATION` (one week), and
+///   a receipt stamped in the future is refused outright. So once
+///   `boundary + one week` has passed, **every** still-valid receipt is
+///   necessarily stamped at or after the boundary and the 1x branch becomes
+///   unreachable. It retires itself; nobody has to remember to turn it off.
+/// - Backdating is **not** prevented during that week. The timestamp is
+///   client-chosen — it is a `payForMerkleTree` argument, the contract only
+///   rejects future and week-old stamps, and quoting nodes sign whatever stamp
+///   the request carries — so a modified client can stamp just before the
+///   boundary and keep paying 1x until such a stamp expires. Expiry is what
+///   closes the route, not detection, and it closes it at
+///   `boundary + one week`. The same branch protects honest in-flight receipts,
+///   so the window cannot be narrowed without also destroying those.
+///
+/// Set to 2026-08-04 15:00 UTC, after the client release with room for
+/// adoption. Two invariants when moving it: **it must never be earlier than the
+/// client release that pays 3x** (an earlier value refuses receipts bought
+/// under the previous rule, the one outcome this constant exists to avoid), and
+/// it must move forward if that **client** release slips — a node enforcing
+/// before clients pay fails every batch upload. A slip in *node* rollout needs
+/// no change: it only means fewer nodes enforce for a while.
+pub const MERKLE_PARITY_ENFORCED_FROM_UNIX: u64 = 1_785_855_600;
+
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.
 ///
 /// A bundle has at most `CLOSE_GROUP_SIZE` quotes; capping fetches per bundle
