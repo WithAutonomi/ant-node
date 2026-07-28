@@ -42,7 +42,7 @@ mimalloc = "0.1"
 ant-protocol = "2.3.0"
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)
-saorsa-core = "0.26.2"
+saorsa-core = "0.26.3"
 saorsa-pqc = "0.5"
 
 # Payment verification - autonomi network lookup + EVM payment
