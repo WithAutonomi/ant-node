@@ -282,16 +282,45 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
 /// Protocol identifier for core replication operations (fresh replication,
-/// neighbour sync, verification, fetch, repair, periodic possession/prune
-/// audits, commitment fetch).
+/// neighbour sync, verification, fetch, repair, commitment fetch).
 ///
 /// Kept at `v2`: none of these messages changed on the wire in the V2-685 slice
-/// audit, so v2 and v3 nodes interoperate on all of them. Only the *subtree*
-/// audit changed its wire format, and it rides a separate id
-/// ([`SUBTREE_AUDIT_PROTOCOL_ID`]) so a version bump there cannot partition core
-/// replication. A node filters inbound messages by exact topic match (see the
-/// dispatch in `mod.rs`).
+/// audit, so v2 and v3 nodes interoperate on all of them. The two message
+/// families whose *semantics* changed each ride their own id
+/// ([`SUBTREE_AUDIT_PROTOCOL_ID`], [`POSSESSION_AUDIT_PROTOCOL_ID`]) so a version
+/// bump in either cannot partition core replication. A node filters inbound
+/// messages by exact topic match (see the dispatch in `mod.rs`).
 pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
+
+/// Protocol identifier for the digest-based possession audits.
+///
+/// Carries the `AuditChallenge`/`AuditResponse` pair shared by the
+/// responsible-chunk audit, the post-replication possession probe, and the
+/// prune-confirmation audit.
+///
+/// These messages keep their wire *shape*, but the digest they carry is now the
+/// domain-separated keyed construction
+/// ([`crate::replication::protocol::compute_audit_digest`]) rather than the
+/// earlier flat prefix hash, so a peer on the old construction and a peer on the
+/// new one compute different digests for the same bytes. Left on the shared core
+/// id, that difference would read as a *confirmed* `DigestMismatch` on every
+/// cross-version exchange, which carries [`AUDIT_FAILURE_TRUST_WEIGHT`] and runs
+/// the responsibility-confirmation path — a false-positive penalty on honest
+/// peers for the whole upgrade window.
+///
+/// Routing them on their own id converts that into a benign pause: a
+/// cross-version challenge is simply not answered, so it lands in the graced
+/// timeout lane instead of the confirmed-failure lane. The rollout effect is the
+/// same bounded one described on [`SUBTREE_AUDIT_PROTOCOL_ID`]: `saorsa-core`'s
+/// `send_request` still records a unit trust failure per unanswered request, and
+/// these lanes probe more often than the 30-minute subtree cooldown, so the dip
+/// is larger than the subtree lane's while still decaying back to neutral. That
+/// is strictly milder than a stream of weight-5 confirmed failures, and milder
+/// than bumping the shared id, which would also break sync, quorum, fetch,
+/// repair and commitment fetch.
+///
+/// `v2` here is the digest generation, not the message shape.
+pub const POSSESSION_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.possession-audit.v2";
 
 /// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
 /// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
@@ -1006,18 +1035,31 @@ mod tests {
     }
 
     #[test]
-    fn core_replication_id_stays_v2_audit_rides_own_id() {
-        // The V2-685 slice audit changes ONLY the subtree-audit wire format, so
-        // core replication stays on v2 (mixed-version fleets keep replicating),
-        // and the changed subtree audit rides its own id that can be bumped
-        // independently. Two distinct ids so a v2 subtree audit never lands on the
-        // core-id handler (and vice versa) — see the id/body guard in `mod.rs`.
+    fn core_replication_id_stays_v2_changed_families_ride_their_own_ids() {
+        // Core replication stays on v2 (mixed-version fleets keep replicating).
+        // The two families whose semantics changed each ride their own id, so
+        // either can be bumped without partitioning core replication, and a
+        // message of one family never lands on another family's handler — see
+        // the id/body guard in `mod.rs`.
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
         assert_eq!(
             SUBTREE_AUDIT_PROTOCOL_ID,
             "autonomi.ant.replication.subtree-audit.v1"
         );
-        assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
+        assert_eq!(
+            POSSESSION_AUDIT_PROTOCOL_ID,
+            "autonomi.ant.replication.possession-audit.v2"
+        );
+        let ids = [
+            REPLICATION_PROTOCOL_ID,
+            SUBTREE_AUDIT_PROTOCOL_ID,
+            POSSESSION_AUDIT_PROTOCOL_ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in ids.iter().skip(i + 1) {
+                assert_ne!(a, b, "protocol ids must be pairwise distinct");
+            }
+        }
     }
 
     #[test]

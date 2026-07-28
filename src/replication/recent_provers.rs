@@ -44,8 +44,9 @@ use crate::ant_protocol::XorName;
 
 /// Maximum number of cached provers per key.
 ///
-/// Sized at 2× `CLOSE_GROUP_SIZE = 8`, giving 8 slack slots for churn
-/// without unbounded growth. LRU-evicted within the cap.
+/// Comfortably above `CLOSE_GROUP_SIZE = 7` (a key has at most 7 responsible
+/// holders), leaving slack slots for churn without unbounded growth.
+/// LRU-evicted within the cap.
 pub const MAX_PROVERS_PER_KEY: usize = 16;
 
 /// Maximum age of a cached prover entry before it is considered stale.

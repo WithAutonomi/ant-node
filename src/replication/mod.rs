@@ -66,7 +66,8 @@ use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
     MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
     MAX_CONCURRENT_SUBTREE_ROUND1, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
-    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_SESSION_TTL,
+    POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID,
+    SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -954,12 +955,16 @@ const RR_PREFIX: &str = "/rr/";
 /// Match an inbound topic against the replication protocol ids, in both the bare
 /// gossip form and the `/rr/<id>` request-response form.
 ///
-/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`] or
-/// [`SUBTREE_AUDIT_PROTOCOL_ID`]) and whether it was the RR form. The matched id
-/// is carried into the handler so it can enforce that subtree-audit bodies only
-/// arrive on the audit id and core bodies only on the core id.
+/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`],
+/// [`SUBTREE_AUDIT_PROTOCOL_ID`] or [`POSSESSION_AUDIT_PROTOCOL_ID`]) and
+/// whether it was the RR form. The matched id is carried into the handler so it
+/// can enforce that each message family only arrives on its own id.
 fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
-    for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
+    for id in [
+        REPLICATION_PROTOCOL_ID,
+        SUBTREE_AUDIT_PROTOCOL_ID,
+        POSSESSION_AUDIT_PROTOCOL_ID,
+    ] {
         if topic == id {
             return Some((id, false));
         }
@@ -972,15 +977,23 @@ fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
     None
 }
 
-/// Whether a decoded body belongs on the protocol id it arrived on: subtree-audit
-/// bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], every other body on
+/// Whether a decoded body belongs on the protocol id it arrived on:
+/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], possession-audit
+/// bodies on [`POSSESSION_AUDIT_PROTOCOL_ID`], every other body on
 /// [`REPLICATION_PROTOCOL_ID`].
 ///
 /// The receive guard drops any mismatch (a cross-version or misrouted message);
 /// sharing this one predicate between the guard and its regression test means a
 /// change to the rule cannot pass the test unnoticed.
 fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    body.is_subtree_audit() == (protocol == SUBTREE_AUDIT_PROTOCOL_ID)
+    let expected = if body.is_subtree_audit() {
+        SUBTREE_AUDIT_PROTOCOL_ID
+    } else if body.is_possession_audit() {
+        POSSESSION_AUDIT_PROTOCOL_ID
+    } else {
+        REPLICATION_PROTOCOL_ID
+    };
+    protocol == expected
 }
 
 fn fresh_offer_payment_context() -> VerificationContext {
@@ -6612,6 +6625,15 @@ mod tests {
             match_replication_protocol(&format!("{RR_PREFIX}{SUBTREE_AUDIT_PROTOCOL_ID}")),
             Some((SUBTREE_AUDIT_PROTOCOL_ID, true))
         );
+        // Possession-audit id, both forms.
+        assert_eq!(
+            match_replication_protocol(POSSESSION_AUDIT_PROTOCOL_ID),
+            Some((POSSESSION_AUDIT_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{POSSESSION_AUDIT_PROTOCOL_ID}")),
+            Some((POSSESSION_AUDIT_PROTOCOL_ID, true))
+        );
         // Foreign topics (incl. a bare /rr/ and an unrelated protocol) don't match.
         assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
         assert_eq!(match_replication_protocol(RR_PREFIX), None);
@@ -6622,24 +6644,32 @@ mod tests {
     }
 
     // The receive guard drops a body whose family disagrees with the id it rode:
-    // subtree-audit bodies only on the audit id, core bodies only on the core id.
-    // This is what stops a mixed-version peer's message from being honoured on the
-    // wrong handler after a postcard misdecode. The test drives the SAME
-    // `body_matches_protocol` the production guard uses, over real bodies, so a
-    // regression in the rule fails here.
+    // subtree-audit bodies only on the subtree id, possession-audit bodies only on
+    // the possession id, core bodies only on the core id. This is what stops a
+    // mixed-version peer's message from being honoured on the wrong handler after
+    // a postcard misdecode. The test drives the SAME `body_matches_protocol` the
+    // production guard uses, over real bodies, so a regression in the rule fails
+    // here.
     #[test]
     fn body_matches_protocol_is_symmetric_over_real_bodies() {
         use crate::replication::protocol::{
-            FreshReplicationOffer, ReplicationMessageBody, SubtreeSliceChallenge,
+            AuditChallenge, FreshReplicationOffer, ReplicationMessageBody, SubtreeSliceChallenge,
         };
         // A subtree-audit body (models a v2 SubtreeByteChallenge, which decodes to
-        // this variant 13 under the new enum) and a core body.
+        // this variant 13 under the new enum), a possession-audit body, and a
+        // core body.
         let audit = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
             challenge_id: 1,
             nonce: [0u8; 32],
             challenged_peer_id: [0u8; 32],
             expected_commitment_hash: [0u8; 32],
             openings: vec![],
+        });
+        let possession = ReplicationMessageBody::AuditChallenge(AuditChallenge {
+            challenge_id: 1,
+            nonce: [0u8; 32],
+            challenged_peer_id: [0u8; 32],
+            keys: vec![[0u8; 32]],
         });
         let core = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
             key: [0u8; 32],
@@ -6648,11 +6678,28 @@ mod tests {
         });
         // Correct routing is kept.
         assert!(body_matches_protocol(&audit, SUBTREE_AUDIT_PROTOCOL_ID));
+        assert!(body_matches_protocol(
+            &possession,
+            POSSESSION_AUDIT_PROTOCOL_ID
+        ));
         assert!(body_matches_protocol(&core, REPLICATION_PROTOCOL_ID));
-        // Cross-routing is dropped, both directions (a v2 subtree audit landing on
-        // the core id, and any core body on the audit id).
-        assert!(!body_matches_protocol(&audit, REPLICATION_PROTOCOL_ID));
-        assert!(!body_matches_protocol(&core, SUBTREE_AUDIT_PROTOCOL_ID));
+        // Every cross-routing is dropped. In particular an older peer's
+        // possession audit arriving on the shared core id is dropped rather than
+        // answered with a digest from a different generation, which would score
+        // as a confirmed mismatch against an honest peer.
+        for (body, wrong) in [
+            (&audit, REPLICATION_PROTOCOL_ID),
+            (&audit, POSSESSION_AUDIT_PROTOCOL_ID),
+            (&possession, REPLICATION_PROTOCOL_ID),
+            (&possession, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&core, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&core, POSSESSION_AUDIT_PROTOCOL_ID),
+        ] {
+            assert!(
+                !body_matches_protocol(body, wrong),
+                "body must not be accepted on {wrong}"
+            );
+        }
     }
 
     fn test_peer(b: u8) -> PeerId {

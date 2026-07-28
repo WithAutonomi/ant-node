@@ -55,7 +55,7 @@ use crate::ant_protocol::XorName;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
+    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, POSSESSION_AUDIT_PROTOCOL_ID,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1489,7 +1489,7 @@ async fn send_prune_audit_challenge(
 ) -> Option<ReplicationMessage> {
     let timeout = config.audit_response_timeout(key_count);
     let response = match p2p_node
-        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .send_request(peer, POSSESSION_AUDIT_PROTOCOL_ID, encoded, timeout)
         .await
     {
         Ok(response) => response,

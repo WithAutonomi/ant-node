@@ -3,8 +3,8 @@
 //! After a node fresh-replicates a chunk, every close-group peer responsible
 //! for it is checked 5-15 minutes later for actual possession. The check is a
 //! single-key cryptographic
-//! [`AuditChallenge`]: the probed
-//! peer must return `BLAKE3(nonce ‖ peer_id ‖ key ‖ bytes)` computed over the
+//! [`AuditChallenge`]: the probed peer must return
+//! `compute_audit_digest(nonce, peer_id, key, bytes)` computed over the
 //! chunk it claims to hold. It cannot produce that digest without the bytes, so
 //! — unlike a self-reported presence flag — a peer cannot escape the check by
 //! falsely asserting possession. A peer that holds the chunk earns nothing —
@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::ant_protocol::XorName;
 use crate::logging::{debug, warn};
 use crate::replication::config::{
-    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
+    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, POSSESSION_AUDIT_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -281,7 +281,7 @@ async fn probe_once(
     };
 
     let response = match p2p_node
-        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
+        .send_request(peer, POSSESSION_AUDIT_PROTOCOL_ID, encoded, probe_timeout)
         .await
     {
         Ok(response) => response,
