@@ -336,16 +336,33 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
         }
     };
 
-    match resp_msg.body {
+    classify_slice_response(resp_msg.body, ctx.challenge_id, ctx.challenged_peer)
+}
+
+/// Classify a decoded round-2 body into a [`SliceRound`].
+///
+/// Pure over the wire body so the round-2 accounting boundary is testable
+/// without a live `P2PNode`; [`request_slice_proof`] calls exactly this on the
+/// bytes it decoded.
+///
+/// Every arm is guarded on `challenge_id`: a body carrying any other id is
+/// `Malformed`, so a responder cannot answer a hard challenge with a softer
+/// verdict minted for a different one.
+fn classify_slice_response(
+    body: ReplicationMessageBody,
+    challenge_id: u64,
+    challenged_peer: &PeerId,
+) -> SliceRound {
+    match body {
         ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items {
-            challenge_id,
+            challenge_id: id,
             items,
-        }) if challenge_id == ctx.challenge_id => SliceRound::Served(items),
+        }) if id == challenge_id => SliceRound::Served(items),
         ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Rejected {
-            challenge_id,
+            challenge_id: id,
             kind,
             reason,
-        }) if challenge_id == ctx.challenge_id => {
+        }) if id == challenge_id => {
             // ADR-0004 A1: grace removed. UnknownCommitment/Protocol repudiation
             // of a pinned root is a confirmed failure; a Transient read error
             // routes to the timeout lane (credit revoked, no trust penalty) — the
@@ -354,15 +371,15 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
             match grade_reject(kind) {
                 RejectGrade::Confirmed => {
                     warn!(
-                        "Audit: {} rejected slice challenge ({kind:?}; confirmed): {reason}",
-                        ctx.challenged_peer
+                        "Audit: {challenged_peer} rejected slice challenge \
+                         ({kind:?}; confirmed): {reason}"
                     );
                     SliceRound::Rejected
                 }
                 RejectGrade::TimeoutLane => {
                     debug!(
-                        "Audit: {} returned Transient for slice challenge (timeout lane): {reason}",
-                        ctx.challenged_peer
+                        "Audit: {challenged_peer} returned Transient for slice challenge \
+                         (timeout lane): {reason}"
                     );
                     SliceRound::TransientReject
                 }
@@ -374,8 +391,8 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
         // holder credit it earned earlier while dodging every round-2 possession
         // check, so this is a confirmed failure with credit revocation.
         ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
-            challenge_id,
-        }) if challenge_id == ctx.challenge_id => SliceRound::ResponsiveBootstrap,
+            challenge_id: id,
+        }) if id == challenge_id => SliceRound::ResponsiveBootstrap,
         _ => SliceRound::Malformed,
     }
 }
@@ -1461,6 +1478,93 @@ mod tests {
             RejectGrade::TimeoutLane,
             "a transient read error routes to the timeout lane (no confirmed penalty)"
         );
+    }
+
+    /// A peer id for classification tests (never dialled).
+    fn classify_peer() -> PeerId {
+        PeerId::from_bytes([0x5Au8; 32])
+    }
+
+    // A node that answers round 1 with a valid signed proof and then claims
+    // `Bootstrapping` in round 2 is contradicting itself: a bootstrapping node
+    // has no committed data to prove. Grading that as a graced timeout would be
+    // the cheapest possible way to dodge every possession check while KEEPING
+    // the holder credit earned in round 1 — so it must be a confirmed failure.
+    #[test]
+    fn responsive_bootstrap_is_a_confirmed_failure_not_a_graced_timeout() {
+        let id = 4242u64;
+        let round = classify_slice_response(
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: id,
+            }),
+            id,
+            &classify_peer(),
+        );
+        assert!(
+            matches!(round, SliceRound::ResponsiveBootstrap),
+            "mid-audit Bootstrapping must classify as ResponsiveBootstrap"
+        );
+
+        // The production arm maps `ResponsiveBootstrap` alongside `Rejected` to
+        // `AuditFailureReason::Rejected`, and THAT reason is what revokes the
+        // peer's holder credit wholesale. Pin the policy both ways, since the
+        // whole point of the classification is landing on the revoking side.
+        assert!(
+            super::super::audit_failure_revokes_holder_credit(&AuditFailureReason::Rejected),
+            "a confirmed round-2 failure must revoke holder credit"
+        );
+        assert!(
+            !super::super::audit_failure_revokes_holder_credit(&AuditFailureReason::Timeout),
+            "the timeout lane must keep holder credit — the contrast that makes \
+             classifying ResponsiveBootstrap as confirmed load-bearing"
+        );
+    }
+
+    // Every classification arm is guarded on `challenge_id`. A responder must not
+    // be able to answer the challenge it was actually sent with a body minted for
+    // a different one — in particular it must not downgrade a live challenge by
+    // replaying a `Bootstrapping` or `Transient` body from another exchange.
+    #[test]
+    fn slice_response_for_another_challenge_is_malformed() {
+        let (sent, other) = (7u64, 8u64);
+        let peer = classify_peer();
+        let bodies = [
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: other,
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items {
+                challenge_id: other,
+                items: vec![],
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Rejected {
+                challenge_id: other,
+                kind: RejectKind::Transient,
+                reason: String::new(),
+            }),
+        ];
+        for body in bodies {
+            assert!(
+                matches!(
+                    classify_slice_response(body, sent, &peer),
+                    SliceRound::Malformed
+                ),
+                "a body carrying another challenge_id must be malformed"
+            );
+        }
+
+        // A non-round-2 body on the round-2 path is malformed too.
+        assert!(matches!(
+            classify_slice_response(
+                ReplicationMessageBody::SubtreeAuditResponse(
+                    crate::replication::protocol::SubtreeAuditResponse::Bootstrapping {
+                        challenge_id: sent,
+                    }
+                ),
+                sent,
+                &peer,
+            ),
+            SliceRound::Malformed
+        ));
     }
 
     // The two-round audit splits into SHIPPED pure functions exercised directly
