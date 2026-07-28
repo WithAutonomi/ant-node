@@ -43,11 +43,6 @@ closest to an address, which hold the replicas), *quote* (a node's signed
 offer), *commitment* (ADR-0002's signed Merkle root plus key count over what a
 node holds), *ANT* (the ERC-20 payment token on Arbitrum), *atto* (10⁻¹⁸ ANT).
 
-Terms: *record* (one stored chunk, the priced unit), *close group* (the 7 nodes
-closest to an address, which hold the replicas), *quote* (a node's signed
-offer), *commitment* (ADR-0002's signed Merkle root plus key count over what a
-node holds), *ANT* (the ERC-20 payment token on Arbitrum), *atto* (10⁻¹⁸ ANT).
-
 ## Decision Drivers
 
 - One payment, stored indefinitely — the client transacts once and never again
@@ -277,9 +272,11 @@ Two limits of that check, both current behaviour:
 
 Merkle proofs are checked against the pool's on-chain record: every candidate's
 signature, the pool's closeness to the midpoint, the tree proofs, and each paid
-node's index, address and amount. **Merkle admission still accepts the historic
-1× settlement** — the parity expectation is computed and logged but not
-required, until `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is turned on.
+node's index, address and amount. The required per-node amount depends on the
+receipt's own timestamp: **3× parity for receipts stamped from
+`MERKLE_PARITY_ENFORCED_FROM_UNIX` onward, the historic 1× for receipts bought
+before it** (see §4b). Since a receipt expires after a week, the 1× branch
+becomes unreachable one lifetime past the boundary.
 
 The chunk then replicates to the close group; peers admit the fan-out under
 the same proof. Later repair between neighbours carries no proof and is
