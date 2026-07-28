@@ -341,15 +341,20 @@ pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 /// price. The merkle path submitted the bare quoted price as the on-chain
 /// payable amount, so the contract's `median16(amount) x 2^depth` came to 1x
 /// the median per chunk: the same chunk, stored and replicated identically,
-/// earned a third as much when it arrived in a batch. ant-client now applies
-/// the multiplier when it builds pool commitments.
+/// earned a third as much when it arrived in a batch. Raising merkle to 3x is
+/// a pricing-policy proposal carried by a paired ant-client PR; it is NOT in
+/// effect yet, and ant-client main still submits bare quoted prices.
 ///
 /// While `false`, the storer keeps requiring only the 1x amount, so a client
-/// that has not upgraded is still admitted, and every merkle admission logs
-/// what it *would* have required (target
-/// `ant_node::payment::merkle_parity`). Flip to `true` only once that
-/// telemetry shows uploads settling at parity across the fleet — enforcing
-/// early rejects payments that are already settled and irrecoverable.
+/// that has not upgraded is still admitted, and every merkle **store**
+/// admission logs what it *would* have required once its payment has fully
+/// validated (target `ant_node::payment::merkle_parity`, keyed by pool hash).
+///
+/// Two conditions before flipping to `true`, both about not rejecting money
+/// that was already paid in good faith and cannot be recovered:
+/// - that telemetry shows uploads settling at parity across the fleet;
+/// - at least the one-week merkle receipt lifetime has elapsed since the last
+///   1x settlement, so no valid in-flight receipt is still priced at 1x.
 pub const MERKLE_PAYMENT_MULTIPLIER_ENFORCED: bool = false;
 
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.

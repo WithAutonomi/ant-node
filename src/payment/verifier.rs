@@ -192,6 +192,16 @@ fn median_quote_index(quote_count: usize) -> usize {
 ///
 /// `median16` is the upper median (index `len / 2`), matching Solidity's
 /// `median16` with `k = 8`. Depth `0` yields zero: there is nothing to pay.
+///
+/// **Not linear in `multiplier`.** The trailing `/ depth` is integer division,
+/// so `expected(m)` is `floor(m x median x 2^depth / depth)`, which is NOT
+/// generally `m x expected(1)` — the two differ by up to `m - 1` wei whenever
+/// `depth` does not divide `median x 2^depth`. For example median 901 at depth
+/// 7 gives `expected(3) = 49426` but `3 x expected(1) = 49425`. Callers must
+/// therefore ask for the multiplier they mean and compare against that value;
+/// scaling a 1x result is wrong. The order here — multiply the total, then
+/// divide once — is deliberate, and matches the contract, which computes
+/// `totalAmount` before splitting it.
 fn merkle_expected_per_node(
     candidate_prices: &[Amount],
     depth: u8,
@@ -2109,17 +2119,27 @@ impl PaymentVerifier {
 
     /// ADR-0008 merkle payment-parity telemetry.
     ///
-    /// Emits one line per merkle store admission recording what the batch
-    /// actually settled per node against what single-node parity would have
-    /// required, so the rollout can be measured before
-    /// [`crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED`] is
-    /// flipped. Observational only: it never rejects and never feeds trust
+    /// Records what a batch actually settled per paid node against what
+    /// single-node parity would have required, so the rollout can be measured
+    /// before [`crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED`]
+    /// is flipped. Observational only: it never rejects and never feeds trust
     /// scoring — an underpaying client is running old code, not misbehaving.
     ///
-    /// MUST be called only after the on-chain payment record has been read,
-    /// so an unauthenticated sender cannot poison rollout telemetry.
+    /// Two call-site requirements, both load-bearing for the signal:
+    /// - **After full admission validation.** Every paid index, reward address
+    ///   and amount must already have been checked. Logging earlier lets a
+    ///   proof that is rejected moments later enter the rollout signal, which
+    ///   would understate parity with samples that never resulted in a store.
+    /// - **Store admissions only.** A paid-list admission reprices nothing and
+    ///   would double-count a batch already measured when it was stored.
+    ///
+    /// Keyed by `pool_hash`, not by chunk address: one on-chain settlement
+    /// covers up to 256 chunks, so per-chunk lines would emit 256 duplicate
+    /// samples of one economic event and let a big batch outvote a small one.
+    /// The pool hash makes the stream deduplicable per settlement and keeps its
+    /// cardinality at one line per batch per storer.
     fn log_merkle_parity(
-        xorname: &XorName,
+        pool_hash: PoolHash,
         payment_info: &OnChainPaymentInfo,
         expected_bare: Amount,
         expected_parity: Amount,
@@ -2134,10 +2154,10 @@ impl PaymentVerifier {
 
         info!(
             target: "ant_node::payment::merkle_parity",
-            "Merkle parity: xorname={}, depth={}, paid_nodes={}, min_paid={min_paid}, \
+            "Merkle parity: pool={}, depth={}, paid_nodes={}, min_paid={min_paid}, \
              expected_bare={expected_bare}, expected_parity={expected_parity}, \
              at_parity={at_parity}, enforce={}",
-            hex::encode(xorname),
+            hex::encode(pool_hash),
             payment_info.depth,
             payment_info.paid_node_addresses.len(),
             crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED,
@@ -2852,20 +2872,17 @@ impl PaymentVerifier {
             expected_per_node_bare
         };
 
-        Self::log_merkle_parity(
-            xorname,
-            &payment_info,
-            expected_per_node_bare,
-            expected_per_node_parity,
-        );
-
         // Verify paid node indices, addresses, and amounts against the candidate pool.
         //
         // Each paid node must:
         // 1. Have a valid index within the candidate pool
         // 2. Match the expected reward address at that index
-        // 3. Have been paid at least the expected per-node amount from the
-        //    contract formula: median16(prices) * 2^depth / depth
+        // 3. Have been paid at least `expected_per_node`, which is the contract
+        //    formula `median16(prices) * 2^depth / depth` at the multiplier the
+        //    rollout gate selects: the historic 1x while
+        //    `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is false, the parity 3x once
+        //    it is on. Do NOT re-assume the 1x formula here — read
+        //    `expected_per_node` rather than recomputing it.
         //
         // Note: unlike single-node payments, merkle proofs are NOT bound to a
         // specific storing node. The contract pays `depth` random nodes from the
@@ -2906,6 +2923,21 @@ impl PaymentVerifier {
                 "Merkle payment verified for {} (pool: {})",
                 hex::encode(xorname),
                 hex::encode(pool_hash)
+            );
+        }
+
+        // ADR-0008 parity telemetry, emitted only now: every paid index, reward
+        // address and amount above has been validated, so a proof that is
+        // rejected later in this function can never enter the rollout signal.
+        // Store admissions only, matching the cross-check below — a paid-list
+        // receipt reprices no fresh economic decision and would otherwise
+        // double-count a batch already measured at its store admission.
+        if context.is_store_admission() {
+            Self::log_merkle_parity(
+                pool_hash,
+                &payment_info,
+                expected_per_node_bare,
+                expected_per_node_parity,
             );
         }
 
@@ -3077,18 +3109,68 @@ mod tests {
         assert_eq!(per_node, Amount::from(3_600u64));
     }
 
+    /// 16 identical candidate prices, so the upper median is exactly `median`.
+    fn prices_with_median(median: u64) -> Vec<Amount> {
+        vec![Amount::from(median); 16]
+    }
+
+    /// The parity expectation is the floor of the multiplied total, which is
+    /// **not** the bare expectation times the multiplier.
+    ///
+    /// `expected(m) = floor(m x median x 2^depth / depth)` sits in
+    /// `[m x expected(1), m x expected(1) + (m - 1)]`: equal when `depth`
+    /// divides the total, up to `m - 1` wei above it when it does not.
+    /// Asserting exact equality would encode `floor(3x/d) == 3 x floor(x/d)`,
+    /// which is false in general and only happened to hold for the
+    /// evenly-dividing case the first version of this test used.
     #[test]
-    fn merkle_expected_per_node_scales_with_the_parity_multiplier() {
-        let prices = varied_candidate_prices();
-        let bare = merkle_expected_per_node(&prices, 4, 1).expect("bare expectation is payable");
-        let parity = merkle_expected_per_node(&prices, 4, PAID_QUOTE_PAYMENT_MULTIPLIER)
+    fn merkle_expected_per_node_scales_within_the_division_remainder() {
+        let multiplier = PAID_QUOTE_PAYMENT_MULTIPLIER;
+
+        for median in [1u64, 899, 900, 901, 6_000, 1_000_003] {
+            for depth in 1..=8u8 {
+                let prices = prices_with_median(median);
+                let bare = merkle_expected_per_node(&prices, depth, 1)
+                    .expect("bare expectation is payable");
+                let parity = merkle_expected_per_node(&prices, depth, multiplier)
+                    .expect("parity expectation is payable");
+
+                let scaled_bare = bare * Amount::from(multiplier);
+                let slack = Amount::from(multiplier - 1);
+
+                assert!(
+                    parity >= scaled_bare && parity <= scaled_bare + slack,
+                    "median {median} depth {depth}: parity {parity} must lie in \
+                     [{scaled_bare}, {}]",
+                    scaled_bare + slack
+                );
+
+                // And it is exactly the floor of the multiplied total.
+                let leaves = 1u64 << u32::from(depth);
+                let expected =
+                    Amount::from(median * leaves * multiplier) / Amount::from(u64::from(depth));
+                assert_eq!(parity, expected, "median {median} depth {depth}");
+            }
+        }
+    }
+
+    /// Regression for the arithmetic order: the helper multiplies the total and
+    /// then divides once, as the contract does. Median 901 at depth 7 is a case
+    /// where that differs from scaling a 1x result by one wei, so a refactor
+    /// that divided first would fail here.
+    #[test]
+    fn merkle_expected_per_node_multiplies_before_dividing() {
+        let prices = prices_with_median(901);
+        let bare = merkle_expected_per_node(&prices, 7, 1).expect("bare expectation is payable");
+        let parity = merkle_expected_per_node(&prices, 7, PAID_QUOTE_PAYMENT_MULTIPLIER)
             .expect("parity expectation is payable");
 
+        assert_eq!(bare, Amount::from(16_475u64));
+        assert_eq!(parity, Amount::from(49_426u64));
         assert_eq!(
             parity,
-            bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER),
-            "parity expectation must be exactly the single-node multiplier \
-             above the historic bare expectation"
+            bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER) + Amount::from(1u64),
+            "dividing before multiplying would lose this wei"
         );
     }
 

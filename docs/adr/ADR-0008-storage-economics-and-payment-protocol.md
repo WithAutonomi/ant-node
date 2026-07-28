@@ -6,27 +6,41 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ADR-0002 (storage audit), ADR-0004 (commitment-bound quote
-  pricing), ADR-0006 (receiver-side revenue floor), ADR-0007 (audit proof
-  shape), ant-client ADR-0003 (earned-reward eligibility gate)
+- **Related:** ADR-0002 (storage audit, merged), ADR-0004 (commitment-bound
+  quote pricing, merged), ADR-0006 (receiver-side revenue floor, merged).
+  **Not merged at this head, referenced only as pending work:** ADR-0005
+  (earned-reward eligibility, on `adr-0005-earned-reward-eligibility`),
+  ADR-0007 (audit proof shape, on the verified-slice-audit branch),
+  ant-client ADR-0003 (client-side eligibility gate).
 
 ## Context
 
 Every ADR so far amends one corner of the economics — ADR-0004 puts a ceiling
-on what a node may charge, ADR-0006 puts a floor under what it will accept,
-ADR-0005/ant-client ADR-0003 decide who may be paid at all — but the model
-those amendments modify was never written down. Anyone reading the ADR set
-today can see the patches and not the machine.
+on what a node may charge, ADR-0006 puts a floor under what it will accept, the
+pending eligibility work decides who may be paid at all — but the model those
+amendments modify was never written down. Anyone reading the ADR set today can
+see the patches and not the machine.
 
-This ADR is **descriptive**: it records the pricing and payment design as
-built, so that later ADRs can amend a stated baseline instead of an implied
-one. Where the code is behind a rollout flag, the ADR says so.
+This ADR is **mostly descriptive**: it records the pricing and payment design
+as built, so that later ADRs can amend a stated baseline instead of an implied
+one. Two things follow from that and are called out wherever they appear:
 
-Writing it down immediately surfaced one defect, which this ADR also fixes:
-the merkle batch path was paying a third of what the single-node path pays for
-an identical chunk, because the 3× settlement multiplier was never applied
-when pool commitments were built. Nobody had compared the two paths' arithmetic
-side by side before, which is the argument for having written this down.
+- **Shipped vs pending.** Sections below mark what is live at this head, what
+  is behind a rollout flag, and what lives on an unmerged branch. Nothing here
+  should be read as deployed unless it says so.
+- **One normative proposal.** Writing the model down surfaced a defect: the
+  merkle batch path settles a third of what the single-node path settles for an
+  identical chunk, because the 3× multiplier was never applied when pool
+  commitments are built. Raising merkle to 3× is a **pricing-policy proposal**
+  carried by a paired ant-client PR, not a repair that is already in effect. It
+  is not merged, not released, and needs economic sign-off; the alternatives
+  are listed with it. This ADR must not be cited as evidence that parity is
+  deployed.
+
+Terms: *record* (one stored chunk, the priced unit), *close group* (the 7 nodes
+closest to an address, which hold the replicas), *quote* (a node's signed
+offer), *commitment* (ADR-0002's signed Merkle root plus key count over what a
+node holds), *ANT* (the ERC-20 payment token on Arbitrum), *atto* (10⁻¹⁸ ANT).
 
 Terms: *record* (one stored chunk, the priced unit), *close group* (the 7 nodes
 closest to an address, which hold the replicas), *quote* (a node's signed
@@ -103,70 +117,127 @@ small-chunk data.
 
 ### 3. Quoting
 
-The client asks the **witnessed close group** — the 7 nodes closest to the
-address, each confirmed by a 5-of-7 quorum of its neighbours' views, so the
+The client asks the **witnessed close group**: the 7 nodes closest to the
+address, each recognised by a quorum of its neighbours' reported views, so the
 client cannot be handed a fabricated group. The request carries the address,
 data size, type, and a fresh 32-byte nonce.
 
+The quorum is **not a fixed 5-of-7**. It starts at `ceil(7 × 2/3) = 5` and is
+reduced by one for every close-group peer that returned no responder view,
+floored at 1 (`witnessed_close_group_quorum_for_missing_views`). Under churn or
+partial responses the bar therefore degrades, in the worst case to a single
+witness. That is a deliberate liveness choice, but it means "witnessed" is a
+best-effort check, not a 5-of-7 guarantee.
+
 Each responder returns, signed with ML-DSA-65: the **quote** (content address,
-timestamp, price, rewards address, committed key count, commitment pin), the
-**signed commitment** the price was derived from, and its **audit report** on
-the peers it observes near that address, bound to the request nonce so it
-cannot be replayed. A responder that already holds the chunk says so, and the
-client skips payment for that address entirely.
+timestamp, price, rewards address, committed key count, commitment pin) and the
+**signed commitment** the price was derived from. A responder that already
+holds the chunk says so, and the client skips payment for that address
+entirely.
 
 Before paying, the client drops any quote it cannot fully resolve: wrong
 public-key-to-peer binding, bad signature, wrong content address, a price that
 is not exactly `calculate_price(committed_key_count)`, or a commitment that
 does not parse, does not belong to the quoter, or does not hash to the quote's
-pin. The audit reports feed the payee-eligibility gate, which excludes quoters
-their neighbours have not attested clean at the size they are monetizing.
+pin.
+
+*Pending, not at this head:* the quote response also carries a nonce-bound
+**audit report**, which feeds a payee-eligibility gate excluding quoters their
+neighbours have not attested clean at the size they are monetizing. That is
+ADR-0005 / ant-client ADR-0003 work on unmerged branches, observe-only even
+there. It is described here because it shapes the model, not because it is
+running.
 
 ### 4. Paying — two shapes
 
-**Single-node (default below 64 chunks).** The 7 quotes are sorted by price;
-the client pays the **median-priced** issuer **3× its quoted price** and the
-other six nothing, in one `payForQuotes` call. Cost per chunk is 3 × median.
-The multiplier keeps the network's revenue equal to paying three of the group
-while costing one transaction's gas.
+#### 4a. Shipped baseline
 
-**Merkle batch (64 chunks and above).** The client builds a Merkle tree over
-up to 256 addresses, derives `2^ceil(depth/2)` candidate pools from its
-midpoints, and collects 16 quotes per pool — one `payForMerkleTree` call for
-the whole batch. The contract selects a winner pool and pays `depth` of its 16
-candidates: `total = median16(amount) × 2^depth`, split evenly. The client
-applies the same 3× multiplier here, to the on-chain payable `amount` rather
-than to the signed quote, so a batch settles `3 × median16 × 2^depth`. The
-receipt is valid for one week; larger uploads split into successive batches.
+**Single-node (default below 64 chunks).** The quotes the client collected are
+sorted by price; it pays the **upper-median** issuer **3× its quoted price** and
+the others nothing, in one `payForQuotes` call. Cost per chunk is 3 × that
+median. The multiplier keeps the network's revenue equal to paying three of the
+group while costing one transaction's gas. The median is taken over *the set
+the client chose to supply*, which a storer cannot audit for completeness —
+ADR-0006's receiver-side floor exists for exactly that reason.
 
-The two paths now price a **leaf** identically at 3 × median. **They did not
-until this ADR**: the merkle path submitted the bare quoted price as the
-payable amount, so a chunk stored through a batch earned its node one third of
-what the same chunk earned through a single-node upload. Nothing detected it,
-because the storer recomputed its expectation from the same un-multiplied
-prices. The multiplier is now applied client-side when pool commitments are
-built, and the storer computes both expectations and logs the difference until
-the rollout gate below is flipped.
+**Merkle batch (64 chunks and above).** The client builds a Merkle tree over up
+to 256 addresses, derives `2^ceil(depth/2)` candidate pools from its midpoints,
+and collects 16 quotes per pool — one `payForMerkleTree` call for the whole
+batch. The contract selects a winner pool and pays `depth` of its 16
+candidates: `total = median16(amount) × 2^depth`, split evenly. Today the
+client submits the **bare quoted price** as the payable `amount`, so a batch
+settles `1 × median16 × 2^depth`. The receipt is valid for one week; larger
+uploads split into successive batches.
 
-Per *chunk*, parity is exact only when the batch size is a power of two. The
-tree pads to `2^ceil(log2(N))` leaves and the contract charges for all of
-them, so a 65-chunk batch pays for 128 leaves. Cost per chunk is therefore
-`3 × median16 × 2^depth / N`, between 3× and just under 6× the median. That
-padding premium is a property of the contract formula, predates this ADR, and
-is unchanged by it.
+So the shipped baseline is asymmetric: **3× the close-group median per chunk on
+the single-node path, 1× the winner pool's own 16-candidate median per padded
+leaf on the merkle path.**
 
 The client needs ANT and Arbitrum gas, and approves the vault once.
+
+#### 4b. Proposal: raise merkle to 3× (not merged, needs sign-off)
+
+Apply the same 3× multiplier on the merkle path, to the on-chain payable
+`amount` rather than to the signed quote, so a batch settles
+`3 × median16 × 2^depth`. Signed candidate prices and the pool hash stay
+untouched, so every existing proof still verifies against the quotes the nodes
+actually signed. Carried by a paired ant-client PR; **not** in effect at this
+head, where ant-client main still submits bare prices.
+
+What that does and does not equalise, stated precisely, because "parity" is
+easy to over-read:
+
+- It equalises **aggregate client spend per padded tree leaf**, at 3× a median.
+- The two medians are **different quantities**: the single-node median is over
+  the close-group quotes the client supplied for that one chunk; the merkle
+  median is over the winner pool's 16 candidates for a midpoint address. Equal
+  multipliers do not make them equal prices.
+- It does **not** equalise what any individual node earns. Merkle pays `depth`
+  candidates drawn from the batch's winner pool, not the storer of each chunk;
+  a node can store a merkle chunk and be paid nothing for it. Single-node pays
+  one close-group issuer per chunk. Both are lotteries, with different draws.
+- Per *chunk* rather than per leaf, it is exact only at power-of-two batch
+  sizes. The tree pads to `2^ceil(log2(N))` and the contract charges for every
+  leaf, so 65 chunks pay for 128. Cost per chunk is
+  `3 × median16 × 2^depth / N`, from 3× up to just under 6× the median. This
+  padding premium predates the proposal and is unchanged by it.
+
+**Alternatives considered.** (1) Retain the differential and document it as a
+volume discount. (2) Lower single-node to 1×, which cuts per-chunk revenue
+network-wide by two thirds. (3) Raise merkle to 3× — the proposal, and the
+direction the multiplier was designed for. (4) Defer until there is pricing
+evidence, keeping only the shadow telemetry below. Tripling the common
+large-upload path is a pricing decision rather than an arithmetic repair, so
+(3) needs the economic owner's approval before the client half ships.
 
 ### 5. Storing and verifying
 
 The PUT carries the payment proof. Every storer independently re-verifies,
-before writing anything: the bundle's structure (1 to 7 quotes, no duplicate
-peers), each quote's price against the curve, the median selection, that the
-paid issuer is among its own K closest peers for that address, the ML-DSA-65
-signature, and the on-chain settlement — which must be at least 3× the median
-**and recorded for the quote's own rewards address**, so a client cannot
-redirect the money to itself and still be admitted. Merkle proofs are checked
-the same way against the pool's on-chain record.
+before writing anything: the bundle's structure (**1 to 7 quotes** — a
+single-quote bundle is valid, so "the median of seven" is the intended shape,
+not an enforced one), the median selection, and then, **for the paid median
+candidate only**: its content address, that its public key hashes to the peer
+it claims, that the issuer is among the storer's own K closest peers for that
+address, its ML-DSA-65 signature, and the on-chain settlement — which must be
+at least 3× the median **and recorded for the quote's own rewards address**, so
+a client cannot redirect the money to itself and still be admitted.
+
+Two limits of that check, both current behaviour:
+
+- **Non-paid quotes are not fully re-verified.** They position the median but
+  their signatures and content addresses are not checked, so a bad signature on
+  an unpaid quote is accepted (`test_legacy_unpaid_quote_bad_signature_accepted`
+  pins this). They still influence which quote gets paid.
+- **The on-curve price check is off.** ADR-0004's
+  `price == calculate_price(committed_key_count)` recheck over every quote is
+  rollout-gated by `QUOTE_ARITHMETIC_RECHECK_ENABLED`, which is `false`; today
+  off-curve quotes are only logged.
+
+Merkle proofs are checked against the pool's on-chain record: every candidate's
+signature, the pool's closeness to the midpoint, the tree proofs, and each paid
+node's index, address and amount. **Merkle admission still accepts the historic
+1× settlement** — the parity expectation is computed and logged but not
+required, until `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is turned on.
 
 The chunk then replicates to the close group; peers admit the fan-out under
 the same proof. Later repair between neighbours carries no proof and is
@@ -187,20 +258,30 @@ and a node that was actually paid is nominated for a first audit.
 
 ### 7. Enforcement state at the time of writing
 
-| Gate | Default today |
+| Gate | State at this head |
 |---|---|
 | Client resolve-before-pay quote binding | **enforced** |
+| Node re-verification of the **paid median** quote (signature, content, K-closeness, settlement, payee address) | **enforced** |
+| Node re-verification of **non-paid** quotes in the bundle | not done (bad signature on an unpaid quote is accepted) |
 | Node rejection of off-curve quotes (`QUOTE_ARITHMETIC_RECHECK_ENABLED`) | off (telemetry only) |
 | Quote/commitment mismatch reported to trust | off (telemetry only) |
 | Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 50% tolerance) |
-| Payee eligibility gate (ADR-0005) | observe-only (`ADR5_ENFORCE`) |
-| Client applies the 3× multiplier on the merkle path | **enforced** |
+| Payee eligibility gate (ADR-0005) | **not merged**; observe-only on its branch (`ADR5_ENFORCE`) |
+| Client applies the 3× multiplier on the merkle path | **not merged** — paired PR; main still submits bare prices |
 | Storer requires it (`MERKLE_PAYMENT_MULTIPLIER_ENFORCED`) | off (telemetry only) |
 
-So the guarantees live in production today are: the client pays only prices it
-can recompute and resolve to a signed commitment, and every stored chunk is
-settled on-chain at ≥3× the median quote, to the quoting node's own address.
-The rest is instrumented and awaiting evidence before it rejects.
+So the guarantees live in production today are narrower than the model above:
+the client pays only prices it can recompute and resolve to a signed
+commitment; every **single-node** stored chunk is settled on-chain at ≥3× the
+supplied-set median, to the quoting node's own address; and every **merkle**
+chunk is settled at ≥1× the winner pool's median per padded leaf. The rest is
+instrumented and awaiting evidence before it rejects.
+
+Before `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is turned on, the parity telemetry
+has to show upgraded clients settling at 3× **and** a drain period of at least
+the one-week receipt lifetime has to pass after the last 1× settlement, or the
+gate will reject payments that were already made in good faith and cannot be
+recovered.
 
 ## Consequences
 
@@ -220,10 +301,10 @@ The rest is instrumented and awaiting evidence before it rejects.
 
 ### Negative / Trade-offs
 
-- **Batch uploads get three times more expensive.** Restoring parity raises
-  the merkle path from 1× to 3× the median per chunk. That is a real price
+- **Batch uploads would get three times more expensive.** The proposal raises
+  the merkle path from 1× to 3× the median per padded leaf. That is a real price
   increase for every upload of 64 chunks or more — the common path for files —
-  and it lands the moment clients upgrade. The alternative, lowering the
+  and it lands as clients upgrade. The alternative, lowering the
   single-node path to 1×, would instead cut per-chunk revenue across the whole
   network by two thirds; parity had to be restored in one direction or the
   other, and this is the one the 3× multiplier was designed for.
@@ -269,17 +350,30 @@ The rest is instrumented and awaiting evidence before it rejects.
   and monotonicity tests hold in `ant-protocol`. A second implementation of the
   formula anywhere is a defect.
 - **End to end against a real chain.** Anvil-backed tests pay and verify both
-  shapes, including the redirect-rejection and underpayment cases.
+  shapes, including the redirect-rejection and underpayment cases. **Still
+  owed for the 3× proposal:** a client → vault → node test proving 3×
+  construction, settlement and acceptance, plus the 1×, just-below-3× and
+  redirected-payee cases, and old-client × new-node / new-client × old-node
+  coverage in both shadow and enforcing modes. The proposal must not be called
+  deployed until those exist.
 - **Telemetry before enforcement.** Price-floor shadow lines, off-curve quote
   counts, and observe-only eligibility decisions must show honest nodes
   clearing each gate before that gate is flipped to reject; a wrongly
   calibrated gate rejects payments that are already settled and irrecoverable.
-- **Payment parity holds across both paths.** Unit tests assert that a merkle
-  chunk's settlement equals the single-node 3× median at every tree depth, up
-  to the contract's division remainder, and that applying the multiplier
-  leaves the signed candidate prices and the pool hash untouched. Any future
-  change to either path must keep that test passing; a per-path price
-  difference is a defect unless an ADR says otherwise.
+- **The parity arithmetic is pinned by unit tests.** They assert that a merkle
+  **leaf** settles for the single-node 3× median at every tree depth; that the
+  per-node expectation is the floor of the multiplied total, which is *not* the
+  1× expectation scaled (they differ by up to `multiplier - 1` wei, so a
+  refactor that divided before multiplying fails); and, client-side, that
+  applying the multiplier leaves the signed candidate prices and the pool hash
+  untouched. Any future change to either path must keep these passing; a
+  per-path price difference is a defect unless an ADR says otherwise.
+- **Rollout telemetry has to be trustworthy before it is trusted.** The parity
+  line is emitted only after a proof's paid indices, addresses and amounts have
+  all validated, and only for store admissions, so rejected proofs and
+  paid-list replays cannot enter the signal. It is keyed by pool hash, so one
+  settlement covering 256 chunks contributes one sample per storer rather than
+  256.
 - **Re-open triggers.** The ANT price moving enough to put $/GiB outside its
   intended band; merkle-parity telemetry showing uploads still settling at 1×
   after clients have upgraded; enabling any of the gates above; any proposal to
