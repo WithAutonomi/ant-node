@@ -402,6 +402,23 @@ impl PaymentStatus {
 /// Default capacity for the merkle pool cache (number of pool hashes to cache).
 const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
 
+/// Capacity of the ADR-0008 parity-telemetry first-emission cache: how many
+/// recently measured pool hashes this node remembers in order to emit one
+/// sample per settlement instead of one per admitted chunk.
+///
+/// Bounded, and deliberately its own cache rather than a flag on the pool
+/// cache: the pool cache is populated as soon as the on-chain record is read,
+/// which happens *before* the paid indices, addresses and amounts are checked,
+/// so keying first-emission off it would let a proof that is rejected moments
+/// later suppress (or produce) a sample. This one is written only after full
+/// admission validation.
+///
+/// LRU eviction means a pool that goes quiet for more than
+/// `MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY` distinct pools can be sampled a
+/// second time. That is the intended trade: the cache bounds memory, and the
+/// stream stays deduplicable by `pool` downstream.
+const MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY: usize = 1_000;
+
 /// ADR-0004: max commitment sidecars processed per bundle. A legitimate bundle
 /// carries at most one commitment per quote/candidate — `CANDIDATES_PER_POOL`
 /// (16) is the larger of the single-node (`CLOSE_GROUP_SIZE` = 7) and merkle
@@ -530,6 +547,19 @@ pub struct PaymentVerifier {
     /// crossed that date. Pinning the boundary keeps those tests deterministic
     /// forever.
     merkle_parity_from: RwLock<u64>,
+    /// ADR-0008: pool hashes this node has already emitted a parity telemetry
+    /// line for. Bounded by
+    /// [`MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY`]; see that constant for why
+    /// this is separate from [`Self::pool_cache`].
+    ///
+    /// Check-and-insert happens under this one lock, so concurrent admissions
+    /// of different chunks from the same batch emit exactly one line between
+    /// them rather than one each.
+    merkle_parity_logged: Mutex<LruCache<PoolHash, ()>>,
+    /// Count of ADR-0008 parity lines this verifier has actually emitted.
+    /// Incremented only on first emission for a pool, so it measures
+    /// settlements sampled rather than chunks admitted.
+    merkle_parity_emissions: std::sync::atomic::AtomicUsize,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -662,6 +692,11 @@ impl PaymentVerifier {
             merkle_parity_from: RwLock::new(
                 crate::replication::config::MERKLE_PARITY_ENFORCED_FROM_UNIX,
             ),
+            merkle_parity_logged: Mutex::new(LruCache::new(
+                NonZeroUsize::new(MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY)
+                    .unwrap_or(NonZeroUsize::MIN),
+            )),
+            merkle_parity_emissions: std::sync::atomic::AtomicUsize::new(0),
             config,
         }
     }
@@ -759,6 +794,19 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_merkle_parity_from_for_tests(&self, enforced_from: u64) {
         *self.merkle_parity_from.write() = enforced_from;
+    }
+
+    /// Number of ADR-0008 parity telemetry lines this verifier has emitted.
+    ///
+    /// One per settlement pool this node admitted a store for — not one per
+    /// chunk, and none at all for proofs that failed validation or for
+    /// non-store contexts. Test-only surface for the cardinality regression
+    /// tests; the production signal is the log line itself.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn merkle_parity_emission_count(&self) -> usize {
+        self.merkle_parity_emissions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Test-only setter for local closest peers used by the paid-quote
@@ -2181,17 +2229,39 @@ impl PaymentVerifier {
     ///   would double-count a batch already measured when it was stored.
     ///
     /// Keyed by `pool_hash`, not by chunk address: one on-chain settlement
-    /// covers up to 256 chunks, so per-chunk lines would emit 256 duplicate
+    /// covers up to 256 chunks, so a line per chunk would emit 256 duplicate
     /// samples of one economic event and let a big batch outvote a small one.
-    /// The pool hash makes the stream deduplicable per settlement and keeps its
-    /// cardinality at one line per batch per storer.
+    ///
+    /// Carrying the pool hash in the line is not enough on its own — it makes
+    /// the stream *deduplicable* but leaves the emitted cardinality at one line
+    /// per chunk. So the first emission for a pool is recorded in
+    /// [`Self::merkle_parity_logged`] and later admissions from the same batch
+    /// return without logging. The check-and-insert is a single locked
+    /// operation, so concurrent admissions from one batch also produce exactly
+    /// one line. "Once per pool" is per node/verifier: every storer that admits
+    /// a chunk from the batch still contributes its own sample, which is what
+    /// makes the signal a measure of traffic reaching the fleet.
     fn log_merkle_parity(
+        &self,
         pool_hash: PoolHash,
         payment_info: &OnChainPaymentInfo,
         expected_bare: Amount,
         expected_parity: Amount,
         required_multiplier: u64,
     ) {
+        // Check-and-insert under one lock: the loser of a race sees its own
+        // insert report a prior entry and stays quiet.
+        if self
+            .merkle_parity_logged
+            .lock()
+            .put(pool_hash, ())
+            .is_some()
+        {
+            return;
+        }
+        self.merkle_parity_emissions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let min_paid = payment_info
             .paid_node_addresses
             .iter()
@@ -2984,8 +3054,10 @@ impl PaymentVerifier {
         // Store admissions only, matching the cross-check below — a paid-list
         // receipt reprices no fresh economic decision and would otherwise
         // double-count a batch already measured at its store admission.
+        // `log_merkle_parity` itself drops all but the first admission per
+        // pool, so a 256-chunk batch contributes one line here, not 256.
         if context.is_store_admission() {
-            Self::log_merkle_parity(
+            self.log_merkle_parity(
                 pool_hash,
                 &payment_info,
                 expected_per_node_bare,
@@ -5904,6 +5976,361 @@ mod tests {
                 "3x must be accepted with boundary {parity_from}: {result:?}"
             );
         }
+    }
+
+    /// One chunk's payment proof as the verifier receives it: the stored
+    /// address and the tagged, serialized proof bytes.
+    type TaggedProof = ([u8; 32], Vec<u8>);
+
+    /// Build valid proofs for several addresses of ONE tree, all resolving to
+    /// the same winner pool hash — the shape a real batch upload has, and the
+    /// case the ADR-0008 parity telemetry must collapse to a single sample.
+    /// Returns `(Vec<(xorname, tagged_proof)>, pool_hash, timestamp)`.
+    fn make_valid_merkle_proofs_for_one_pool(
+        indices: &[usize],
+    ) -> (
+        Vec<TaggedProof>,
+        evmlib::merkle_batch_payment::PoolHash,
+        u64,
+    ) {
+        use evmlib::merkle_payments::{MerklePaymentCandidatePool, MerklePaymentProof, MerkleTree};
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let addresses: Vec<xor_name::XorName> = (0..4u8)
+            .map(|i| xor_name::XorName::from_content(&[i]))
+            .collect();
+        let tree = MerkleTree::from_xornames(addresses.clone()).expect("tree");
+
+        let midpoint_proof = tree
+            .reward_candidates(timestamp)
+            .expect("reward candidates")
+            .first()
+            .expect("at least one candidate")
+            .clone();
+        let pool = MerklePaymentCandidatePool {
+            midpoint_proof,
+            candidate_nodes: make_candidate_nodes(timestamp),
+        };
+
+        let mut proofs = Vec::with_capacity(indices.len());
+        let mut pool_hash = None;
+        for &index in indices {
+            let address = *addresses.get(index).expect("address index within the tree");
+            let address_proof = tree
+                .generate_address_proof(index, address)
+                .expect("address proof");
+            let proof = MerklePaymentProof::new(address, address_proof, pool.clone());
+            let hash = proof.winner_pool_hash();
+            match pool_hash {
+                None => pool_hash = Some(hash),
+                Some(first) => assert_eq!(
+                    hash, first,
+                    "every address in one tree must share one winner pool"
+                ),
+            }
+            let tagged =
+                crate::payment::proof::serialize_merkle_proof(&proof).expect("serialize proof");
+            proofs.push((address.0, tagged));
+        }
+
+        (proofs, pool_hash.expect("at least one proof"), timestamp)
+    }
+
+    /// The depth-2 test pool's on-chain record, settled at 3x parity so the
+    /// proof is admitted and the telemetry call site is actually reached.
+    fn parity_settled_pool_info(ts: u64) -> evmlib::merkle_payments::OnChainPaymentInfo {
+        evmlib::merkle_payments::OnChainPaymentInfo {
+            depth: 2,
+            merkle_payment_timestamp: ts,
+            paid_node_addresses: vec![
+                (
+                    RewardsAddress::new([0u8; 20]),
+                    0,
+                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                ),
+                (
+                    RewardsAddress::new([1u8; 20]),
+                    1,
+                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                ),
+            ],
+        }
+    }
+
+    // =========================================================================
+    // ADR-0008 parity telemetry: what may enter the rollout signal, and at what
+    // cardinality. The signal is read to decide when the pre-boundary (1x)
+    // compatibility window has drained, so a sample from a proof that was
+    // rejected — or 256 samples from one settlement — would mislead that call.
+    // =========================================================================
+
+    /// A proof naming a paid index outside the pool is rejected in the paid-node
+    /// loop, before the telemetry call site. Nothing may be measured.
+    #[tokio::test]
+    async fn parity_telemetry_silent_when_a_paid_index_is_invalid() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let mut info = parity_settled_pool_info(ts);
+            // Second entry points past CANDIDATES_PER_POOL (16).
+            if let Some(entry) = info.paid_node_addresses.get_mut(1) {
+                entry.1 = 999;
+            }
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an out-of-bounds paid index must be refused"
+        );
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// A paid entry whose reward address does not match the candidate at that
+    /// index is rejected before the telemetry call site.
+    #[tokio::test]
+    async fn parity_telemetry_silent_when_a_reward_address_is_wrong() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let mut info = parity_settled_pool_info(ts);
+            // Candidate 1's address is [0x01; 20], not [0xFF; 20].
+            if let Some(entry) = info.paid_node_addresses.get_mut(1) {
+                entry.0 = RewardsAddress::new([0xFF; 20]);
+            }
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(result.is_err(), "a redirected payee must be refused");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// An underpaid batch is the case the signal most obviously must not
+    /// contain: it is rejected, so it never became a store.
+    #[tokio::test]
+    async fn parity_telemetry_silent_on_underpayment() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(1u64)),
+                    (RewardsAddress::new([1u8; 20]), 1, Amount::from(1u64)),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+
+        assert!(result.is_err(), "an underpaid batch must be refused");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "a refused proof must not enter the parity signal"
+        );
+    }
+
+    /// A paid-list admission verifies the same proof but reprices nothing. It
+    /// must not be measured, or a batch already sampled at its store admission
+    /// would be counted twice.
+    #[tokio::test]
+    async fn parity_telemetry_silent_for_paid_list_admission() {
+        let verifier = merkle_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::PaidListAdmission,
+            )
+            .await;
+
+        assert!(result.is_ok(), "the proof itself is valid: {result:?}");
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            0,
+            "only store admissions may be measured"
+        );
+    }
+
+    /// Two chunks of one batch are one economic event. The pool hash in the
+    /// line makes the stream deduplicable; the first-emission cache is what
+    /// keeps the emitted cardinality at one.
+    #[tokio::test]
+    async fn parity_telemetry_emits_once_for_two_chunks_of_one_pool() {
+        let verifier = merkle_test_verifier();
+        let (proofs, pool_hash, ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        for (xorname, tagged) in &proofs {
+            let result = verifier
+                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .await;
+            assert!(result.is_ok(), "both chunks must be admitted: {result:?}");
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            1,
+            "one settlement is one sample, however many chunks it covers"
+        );
+    }
+
+    /// Deduplication is per pool, not a global mute: a genuinely separate
+    /// settlement is a separate sample.
+    #[tokio::test]
+    async fn parity_telemetry_emits_once_more_for_a_second_pool() {
+        let verifier = merkle_test_verifier();
+
+        let (first, first_pool, first_ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(first_pool, parity_settled_pool_info(first_ts));
+        for (xorname, tagged) in &first {
+            verifier
+                .verify_payment(xorname, Some(tagged), VerificationContext::ClientPut)
+                .await
+                .expect("first pool admitted");
+        }
+        assert_eq!(verifier.merkle_parity_emission_count(), 1);
+
+        // A fresh batch: new candidate keypairs and leaf salts give it a
+        // different pool hash. Its chunk is one the first batch did not carry,
+        // so this exercises verification rather than the verified-address cache.
+        let (second, second_pool, second_ts) = make_valid_merkle_proofs_for_one_pool(&[2]);
+        let (second_xorname, second_tagged) = second.first().expect("one proof").clone();
+        assert_ne!(first_pool, second_pool, "the second batch is a new pool");
+        verifier
+            .pool_cache
+            .lock()
+            .put(second_pool, parity_settled_pool_info(second_ts));
+        verifier
+            .verify_payment(
+                &second_xorname,
+                Some(&second_tagged),
+                VerificationContext::ClientPut,
+            )
+            .await
+            .expect("second pool admitted");
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            2,
+            "a second settlement contributes a second sample"
+        );
+    }
+
+    /// Concurrent admissions of one batch — the normal case, since a client
+    /// PUTs a batch's chunks in parallel — must still emit once. The
+    /// check-and-insert is a single locked operation for exactly this reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parity_telemetry_emits_once_under_concurrent_admissions() {
+        let verifier = Arc::new(merkle_test_verifier());
+        let (proofs, pool_hash, ts) = make_valid_merkle_proofs_for_one_pool(&[0, 1, 2, 3]);
+        verifier
+            .pool_cache
+            .lock()
+            .put(pool_hash, parity_settled_pool_info(ts));
+
+        let mut handles = Vec::new();
+        for (xorname, tagged) in proofs {
+            // Two racing admissions per address, as replication and the direct
+            // PUT can both arrive for the same chunk.
+            for _ in 0..2 {
+                let verifier = Arc::clone(&verifier);
+                let tagged = tagged.clone();
+                handles.push(tokio::spawn(async move {
+                    verifier
+                        .verify_payment(&xorname, Some(&tagged), VerificationContext::ClientPut)
+                        .await
+                }));
+            }
+        }
+
+        for handle in handles {
+            let result = handle.await.expect("task panicked");
+            assert!(
+                result.is_ok(),
+                "every concurrent admission must succeed: {result:?}"
+            );
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_emission_count(),
+            1,
+            "concurrent admissions of one pool must not race into extra samples"
+        );
+    }
+
+    /// The first-emission cache is bounded, so a node admitting an unbounded
+    /// stream of distinct pools cannot grow it without limit.
+    #[test]
+    fn parity_telemetry_first_emission_cache_is_bounded() {
+        let verifier = create_test_verifier();
+        for i in 0..(MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY + 50) {
+            let mut hash: PoolHash = [0u8; 32];
+            for (j, b) in i.to_le_bytes().iter().enumerate() {
+                if let Some(slot) = hash.get_mut(j) {
+                    *slot = *b;
+                }
+            }
+            verifier.merkle_parity_logged.lock().put(hash, ());
+        }
+
+        assert_eq!(
+            verifier.merkle_parity_logged.lock().len(),
+            MERKLE_PARITY_TELEMETRY_CACHE_CAPACITY,
+            "the telemetry cache must stay at its capacity"
+        );
     }
 
     #[test]
