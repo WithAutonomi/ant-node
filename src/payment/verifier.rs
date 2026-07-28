@@ -176,6 +176,49 @@ fn median_quote_index(quote_count: usize) -> usize {
     quote_count / 2
 }
 
+/// Per-node payment implied by the merkle contract formula, for a given
+/// payment multiplier.
+///
+/// The contract settles `total = median16(amount) x 2^depth` and splits it
+/// evenly across the `depth` nodes it paid, so
+/// `per_node = multiplier x median16(price) x 2^depth / depth`.
+///
+/// `candidate_prices` are the candidates' **signed quoted** prices as they
+/// appear in the proof — always 1x, because the multiplier is applied by the
+/// client to the on-chain payable `amount` and never to the signed quote
+/// (ADR-0008). Passing `multiplier = 1` therefore reproduces the historic
+/// merkle expectation, and `PAID_QUOTE_PAYMENT_MULTIPLIER` the single-node
+/// parity expectation.
+///
+/// `median16` is the upper median (index `len / 2`), matching Solidity's
+/// `median16` with `k = 8`. Depth `0` yields zero: there is nothing to pay.
+fn merkle_expected_per_node(
+    candidate_prices: &[Amount],
+    depth: u8,
+    multiplier: u64,
+) -> Result<Amount> {
+    if depth == 0 {
+        return Ok(Amount::ZERO);
+    }
+
+    let mut sorted = candidate_prices.to_vec();
+    sorted.sort_unstable(); // ascending
+    let median_price = *sorted
+        .get(sorted.len() / 2)
+        .ok_or_else(|| Error::Payment("empty candidate pool in merkle proof".into()))?;
+
+    let leaves = 1u64
+        .checked_shl(u32::from(depth))
+        .ok_or_else(|| Error::Payment("merkle proof depth too large".into()))?;
+
+    let total_amount = median_price
+        .checked_mul(Amount::from(leaves))
+        .and_then(|total| total.checked_mul(Amount::from(multiplier)))
+        .ok_or_else(|| Error::Payment("merkle total payment overflow".into()))?;
+
+    Ok(total_amount / Amount::from(u64::from(depth)))
+}
+
 fn payment_proof_type_label(payment_proof: Option<&[u8]>) -> &'static str {
     match payment_proof.and_then(detect_proof_type) {
         Some(ProofType::Merkle) => "merkle",
@@ -2064,6 +2107,43 @@ impl PaymentVerifier {
         }
     }
 
+    /// ADR-0008 merkle payment-parity telemetry.
+    ///
+    /// Emits one line per merkle store admission recording what the batch
+    /// actually settled per node against what single-node parity would have
+    /// required, so the rollout can be measured before
+    /// [`crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED`] is
+    /// flipped. Observational only: it never rejects and never feeds trust
+    /// scoring — an underpaying client is running old code, not misbehaving.
+    ///
+    /// MUST be called only after the on-chain payment record has been read,
+    /// so an unauthenticated sender cannot poison rollout telemetry.
+    fn log_merkle_parity(
+        xorname: &XorName,
+        payment_info: &OnChainPaymentInfo,
+        expected_bare: Amount,
+        expected_parity: Amount,
+    ) {
+        let min_paid = payment_info
+            .paid_node_addresses
+            .iter()
+            .map(|(_, _, amount)| *amount)
+            .min()
+            .unwrap_or(Amount::ZERO);
+        let at_parity = min_paid >= expected_parity;
+
+        info!(
+            target: "ant_node::payment::merkle_parity",
+            "Merkle parity: xorname={}, depth={}, paid_nodes={}, min_paid={min_paid}, \
+             expected_bare={expected_bare}, expected_parity={expected_parity}, \
+             at_parity={at_parity}, enforce={}",
+            hex::encode(xorname),
+            payment_info.depth,
+            payment_info.paid_node_addresses.len(),
+            crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED,
+        );
+    }
+
     /// Pure curve-canonicality predicate: does `price` lie exactly on the
     /// pricing curve? Equivalent to "there exists some non-negative integer
     /// `n` such that `calculate_price(n) == price`".
@@ -2749,30 +2829,35 @@ impl PaymentVerifier {
             )));
         }
 
-        // Compute expected per-node payment using the contract formula:
-        // totalAmount = median16(candidate_prices) * (1 << depth)
-        // amountPerNode = totalAmount / depth
-        let expected_per_node = if payment_info.depth > 0 {
-            let mut candidate_prices: Vec<Amount> = merkle_proof
-                .winner_pool
-                .candidate_nodes
-                .iter()
-                .map(|c| c.price)
-                .collect();
-            candidate_prices.sort_unstable(); // ascending
-                                              // Upper median (index 8 of 16) — matches Solidity's median16 (k = 8)
-            let median_price = *candidate_prices
-                .get(candidate_prices.len() / 2)
-                .ok_or_else(|| Error::Payment("empty candidate pool in merkle proof".into()))?;
-            let shift = u32::from(payment_info.depth);
-            let multiplier = 1u64
-                .checked_shl(shift)
-                .ok_or_else(|| Error::Payment("merkle proof depth too large".into()))?;
-            let total_amount = median_price * Amount::from(multiplier);
-            total_amount / Amount::from(u64::from(payment_info.depth))
+        // Expected per-node payment from the contract formula. ADR-0008: the
+        // parity expectation (what the single-node path would settle for the
+        // same chunk) is always computed for telemetry; it only becomes the
+        // admission requirement once the rollout gate is on.
+        let candidate_prices: Vec<Amount> = merkle_proof
+            .winner_pool
+            .candidate_nodes
+            .iter()
+            .map(|c| c.price)
+            .collect();
+        let expected_per_node_bare =
+            merkle_expected_per_node(&candidate_prices, payment_info.depth, 1)?;
+        let expected_per_node_parity = merkle_expected_per_node(
+            &candidate_prices,
+            payment_info.depth,
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+        )?;
+        let expected_per_node = if crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED {
+            expected_per_node_parity
         } else {
-            Amount::ZERO
+            expected_per_node_bare
         };
+
+        Self::log_merkle_parity(
+            xorname,
+            &payment_info,
+            expected_per_node_bare,
+            expected_per_node_parity,
+        );
 
         // Verify paid node indices, addresses, and amounts against the candidate pool.
         //
@@ -2977,6 +3062,92 @@ mod tests {
 
         assert_eq!(issuer_closeness_width, k_bucket_size);
         assert!(issuer_closeness_width > close_group_size);
+    }
+
+    /// 16 candidate prices 100..=1600; the upper median (index 8) is 900.
+    fn varied_candidate_prices() -> Vec<Amount> {
+        (1..=16u64).map(|i| Amount::from(i * 100)).collect()
+    }
+
+    #[test]
+    fn merkle_expected_per_node_reproduces_the_contract_formula() {
+        // total = median16 x 2^depth = 900 x 16 = 14400, over depth=4 nodes.
+        let per_node = merkle_expected_per_node(&varied_candidate_prices(), 4, 1)
+            .expect("depth 4 pool is payable");
+        assert_eq!(per_node, Amount::from(3_600u64));
+    }
+
+    #[test]
+    fn merkle_expected_per_node_scales_with_the_parity_multiplier() {
+        let prices = varied_candidate_prices();
+        let bare = merkle_expected_per_node(&prices, 4, 1).expect("bare expectation is payable");
+        let parity = merkle_expected_per_node(&prices, 4, PAID_QUOTE_PAYMENT_MULTIPLIER)
+            .expect("parity expectation is payable");
+
+        assert_eq!(
+            parity,
+            bare * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER),
+            "parity expectation must be exactly the single-node multiplier \
+             above the historic bare expectation"
+        );
+    }
+
+    /// The economic invariant ADR-0008 restores: a merkle **leaf** settles
+    /// for what the single-node path settles — 3x the median quote — up to
+    /// the contract's integer division.
+    ///
+    /// Leaf, not chunk: the tree pads to `2^ceil(log2(N))` and the contract
+    /// charges for every leaf, so a batch whose size is not a power of two
+    /// pays a padding premium on top. That premium is a property of the
+    /// contract formula, not of the multiplier under test here.
+    ///
+    /// `amountPerNode = totalAmount / depth` discards a remainder whenever
+    /// `depth` does not divide `median x 2^depth` (e.g. depth 7). The loss is
+    /// strictly under one wei per paid node, spread across `2^depth` chunks,
+    /// so it is economically irrelevant — but the invariant is "within
+    /// rounding", not exact equality, and the test says so rather than
+    /// picking depths that happen to divide evenly.
+    #[test]
+    fn merkle_parity_per_chunk_equals_single_node_settlement() {
+        let prices = varied_candidate_prices();
+        let median = Amount::from(900u64);
+
+        for depth in 1..=8u8 {
+            let per_node = merkle_expected_per_node(&prices, depth, PAID_QUOTE_PAYMENT_MULTIPLIER)
+                .expect("every supported depth is payable");
+            let required_total = per_node * Amount::from(u64::from(depth));
+
+            let leaves = Amount::from(1u64 << u32::from(depth));
+            let ideal_total = median * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER) * leaves;
+
+            assert!(
+                required_total <= ideal_total,
+                "at depth {depth} the required total {required_total} must not \
+                 exceed the 3x-median ideal {ideal_total}"
+            );
+            assert!(
+                ideal_total - required_total < Amount::from(u64::from(depth)),
+                "at depth {depth} the shortfall {} must be pure division \
+                 remainder (< depth wei), not a missing multiplier",
+                ideal_total - required_total
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_expected_per_node_is_zero_at_depth_zero() {
+        let per_node = merkle_expected_per_node(&varied_candidate_prices(), 0, 3)
+            .expect("depth zero is a valid no-op, not an error");
+        assert_eq!(per_node, Amount::ZERO);
+    }
+
+    #[test]
+    fn merkle_expected_per_node_rejects_an_empty_pool() {
+        let Err(err) = merkle_expected_per_node(&[], 4, 3) else {
+            panic!("an empty candidate pool has no median and must not be payable");
+        };
+        let err = err.to_string();
+        assert!(err.contains("empty candidate pool"), "got: {err}");
     }
 
     fn make_signed_quote(

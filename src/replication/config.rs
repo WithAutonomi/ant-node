@@ -334,6 +334,24 @@ pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 /// off-curve price, so it deserves its own dial.
 pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 
+/// Rollout gate for requiring the single-node payment multiplier on the
+/// **merkle** path (ADR-0008).
+///
+/// The single-node path has always settled a chunk at 3x the median quoted
+/// price. The merkle path submitted the bare quoted price as the on-chain
+/// payable amount, so the contract's `median16(amount) x 2^depth` came to 1x
+/// the median per chunk: the same chunk, stored and replicated identically,
+/// earned a third as much when it arrived in a batch. ant-client now applies
+/// the multiplier when it builds pool commitments.
+///
+/// While `false`, the storer keeps requiring only the 1x amount, so a client
+/// that has not upgraded is still admitted, and every merkle admission logs
+/// what it *would* have required (target
+/// `ant_node::payment::merkle_parity`). Flip to `true` only once that
+/// telemetry shows uploads settling at parity across the fleet — enforcing
+/// early rejects payments that are already settled and irrecoverable.
+pub const MERKLE_PAYMENT_MULTIPLIER_ENFORCED: bool = false;
+
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.
 ///
 /// A bundle has at most `CLOSE_GROUP_SIZE` quotes; capping fetches per bundle
