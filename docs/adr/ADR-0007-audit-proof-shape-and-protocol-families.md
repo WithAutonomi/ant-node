@@ -6,7 +6,7 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ADR-0002 (gossip-triggered contiguous-subtree audit), ADR-0003 (possession verification)
+- **Related:** ADR-0002 (gossip-triggered contiguous-subtree audit), ADR-0003 (possession verification), ant-node #181, V2-685
 
 ## Context
 
