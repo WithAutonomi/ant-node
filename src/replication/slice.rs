@@ -6,7 +6,14 @@
 //! which turned proof-of-storage into the fleet's second-largest bandwidth cost
 //! (~7.5 TB/day). This module replaces that with a two-chain verified slice: the
 //! response for one opened 1 KiB block is a few KB instead of a full chunk, a
-//! ~1000× reduction, while proving *more* than the old flat check.
+//! ~1000× reduction.
+//!
+//! Two axes move in opposite directions, and it is worth separating them. The
+//! *freshness* construction gets strictly stronger: the nonce now enters every
+//! block leaf, closing a preprocessing gap in the old flat `nonced_hash`. The
+//! *coverage* gets weaker: round 2 samples blocks instead of checking every
+//! byte. See "What a pass does and does not prove" below — that trade is the
+//! whole design, not a footnote to it.
 //!
 //! ## Why two chains
 //!
@@ -55,10 +62,22 @@
 //! than catching it outright on the first try. The full-byte round 2 this
 //! replaces caught any missing byte of a sampled chunk with certainty — that is
 //! the difference, and it is inherent: verifying every byte means moving every
-//! byte. In exchange the dominant audit message drops ~1000× (measured 417× on a
-//! same-network control cohort: 14.49 KB against 6.19 MB), which is what makes
-//! auditing *often* affordable, and audit frequency is the real lever against a
-//! partial deleter.
+//! byte.
+//!
+//! Be precise about the comparison, in both directions:
+//!
+//! - Against a node under-storing **in bulk** — the realistic case, a node
+//!   dropping data to save disk — detection is close to what the full-byte
+//!   audit gave, at ~1/1000 of the egress (measured 417× on a same-network
+//!   control cohort: 14.49 KB against 6.19 MB). A 990-node run caught a 256 MB
+//!   in-place corruption on the first audit that reached the node.
+//! - Against a **fine-grained** partial deleter, one shaving a little off every
+//!   chunk, this is strictly weaker per audit than serving every byte. The
+//!   compensating lever is audit *frequency*, which is exactly what the cost
+//!   reduction buys: the old shape made frequent auditing unaffordable.
+//!
+//! If a threat model ever needs sharper per-audit detection, the knob is
+//! openings per leaf, at linear egress cost.
 
 use std::io::{Cursor, Read};
 

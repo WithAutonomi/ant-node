@@ -119,13 +119,18 @@ round 1 from the same peer.
   partial holder keeps the final block. The full-byte round 2 this replaces
   caught any missing byte of a sampled chunk with certainty.
 
-  The exchange is deliberate: security is close to what main gives at roughly a
-  thousandth of the egress, and cheap audits mean *frequent* audits, which is the
-  real lever against a partial deleter. Fleet evidence supports it — a 256 MB
-  in-place corruption was caught by three independent auditors on the first audit
-  that reached the node, against zero false positives across ~43,000 audits in
-  the preceding 5.5 hours. If a future threat model needs sharper per-audit
-  detection, the knob is openings per leaf, at linear egress cost.
+  The exchange is deliberate, and the comparison should be stated in both
+  directions. Against a node under-storing **in bulk** — the realistic case, a
+  node dropping data to save disk — detection is close to what the full-byte
+  audit gave, at roughly a thousandth of the egress; the fleet run caught a
+  256 MB in-place corruption on the first audit that reached the node, by three
+  independent auditors, against zero false positives across ~43,000 audits in
+  the preceding 5.5 hours. Against a **fine-grained** partial deleter, one
+  shaving a little off every chunk, it is strictly weaker per audit than serving
+  every byte. The compensating lever is audit *frequency*, which is what the cost
+  reduction buys: the old shape made frequent auditing unaffordable. If a future
+  threat model needs sharper per-audit detection, the knob is openings per leaf,
+  at linear egress cost.
 - Three protocol ids to reason about instead of one.
 - A temporary rollout gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) suppresses the
   timeout penalty on the three digest lanes so a version skew cannot punish an
