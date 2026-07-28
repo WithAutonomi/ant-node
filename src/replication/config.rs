@@ -528,6 +528,12 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 /// failure for an unanswered request, so a peer that never answers still drifts
 /// down, just at weight 1 instead of 5.
 ///
+/// The grace covers *silence only*. A peer that answers is being judged on what
+/// it said, so every confirmed outcome — digest mismatch, absent key, malformed
+/// reply, explicit rejection — is penalised throughout the window exactly as
+/// before. This is deliberately not an amnesty for cheating; it is only a
+/// refusal to read "did not reply" as "lost the data".
+///
 /// # FOLLOW-UP — required, do not ship this permanently
 ///
 /// Once the fleet has upgraded past the possession-audit protocol move, set this

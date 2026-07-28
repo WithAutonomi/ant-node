@@ -1378,40 +1378,45 @@ async fn peer_proves_records(
     else {
         return Vec::new();
     };
-    let Some(decoded) =
-        send_prune_audit_challenge(&peer, encoded, key_count, p2p_node, config).await
-    else {
-        // No decoded response means a timeout or malformed reply. Prune
-        // confirmation reuses `AuditChallenge` semantics, so this is an immediate
-        // audit failure just like a decoded bad proof below. Keep the historical
-        // one-report-per-peer-per-pass guard by attempting each key against the
-        // shared `report_state`.
+    let decoded = match send_prune_audit_challenge(&peer, encoded, key_count, p2p_node, config)
+        .await
+    {
+        Ok(decoded) => decoded,
+        // No usable response. Prune confirmation reuses `AuditChallenge`
+        // semantics, so this is an immediate audit failure just like a decoded
+        // bad proof below. Keep the historical one-report-per-peer-per-pass
+        // guard by attempting each key against the shared `report_state`.
         //
         // ROLLOUT GATE — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`. A peer on the
-        // other side of the possession-audit protocol move never answers, so no
-        // decoded response is not evidence about it. This lane cannot separate a
-        // timeout from a malformed reply here (both arrive as `None`), so the
-        // gate graces the pair; a malformed reply from a matched-version peer is
-        // still caught by the decoded-proof checks below. Restore the
-        // unconditional report when the gate is removed.
-        if GRACE_POSSESSION_AUDIT_TIMEOUTS {
-            debug!(
-                "Prune audit: no decoded response from {peer}; graced during the \
-                 possession-audit protocol rollout (not penalised)"
-            );
+        // far side of the possession-audit protocol move never answers, so an
+        // unanswered challenge is not evidence about it. Only that case is
+        // graced: a peer that DID answer with undecodable bytes is a real
+        // protocol failure, not a version skew, and is still penalised.
+        Err(failure) => {
+            if GRACE_POSSESSION_AUDIT_TIMEOUTS
+                && matches!(failure, PruneAuditSendFailure::Unanswered)
+            {
+                debug!(
+                    "Prune audit: {peer} did not answer; graced during the \
+                     possession-audit protocol rollout (not penalised)"
+                );
+                return Vec::new();
+            }
+            let mut audit_failure_reported = false;
+            for key in &challenge_keys {
+                if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await
+                {
+                    audit_failure_reported = true;
+                    break;
+                }
+            }
+            if audit_failure_reported {
+                debug!(
+                    "Prune audit: reported one failure for unanswered/malformed batch from {peer}"
+                );
+            }
             return Vec::new();
         }
-        let mut audit_failure_reported = false;
-        for key in &challenge_keys {
-            if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await {
-                audit_failure_reported = true;
-                break;
-            }
-        }
-        if audit_failure_reported {
-            debug!("Prune audit: reported one failure for timed-out/malformed batch from {peer}");
-        }
-        return Vec::new();
     };
 
     let statuses = prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
@@ -1496,13 +1501,29 @@ fn encode_prune_audit_challenge(
     Some((encoded, key_count))
 }
 
+/// Why a prune-audit challenge yielded no usable response.
+///
+/// The two cases must stay distinguishable: only `Unanswered` is graced by the
+/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] rollout gate. Collapsing both into one
+/// "no response" case would let the gate also excuse a matched-version peer that
+/// answered with garbage, which is a real protocol failure, not a version skew.
+enum PruneAuditSendFailure {
+    /// No answer within the deadline, or a transport error. Not evidence about
+    /// the peer's storage — and the expected outcome for a peer on the far side
+    /// of the possession-audit protocol move.
+    Unanswered,
+    /// The peer answered, but the bytes did not decode as a replication message.
+    /// A matched-version peer should never do this.
+    Malformed,
+}
+
 async fn send_prune_audit_challenge(
     peer: &PeerId,
     encoded: Vec<u8>,
     key_count: usize,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Option<ReplicationMessage> {
+) -> std::result::Result<ReplicationMessage, PruneAuditSendFailure> {
     let timeout = config.audit_response_timeout(key_count);
     let response = match p2p_node
         .send_request(peer, POSSESSION_AUDIT_PROTOCOL_ID, encoded, timeout)
@@ -1511,19 +1532,17 @@ async fn send_prune_audit_challenge(
         Ok(response) => response,
         Err(e) => {
             debug!("Prune audit challenge with {key_count} keys against {peer} failed: {e}");
-            return None;
+            return Err(PruneAuditSendFailure::Unanswered);
         }
     };
 
-    let decoded = match ReplicationMessage::decode(&response.data) {
-        Ok(msg) => msg,
+    match ReplicationMessage::decode(&response.data) {
+        Ok(msg) => Ok(msg),
         Err(e) => {
             warn!("Failed to decode prune audit response from {peer}: {e}");
-            return None;
+            Err(PruneAuditSendFailure::Malformed)
         }
-    };
-
-    Some(decoded)
+    }
 }
 
 fn prune_audit_response_statuses(
