@@ -73,6 +73,9 @@ mod fetch_responsibility_recheck;
 mod first_audit_ab;
 
 #[cfg(test)]
+mod fresh_offer_capacity;
+
+#[cfg(test)]
 mod verify_storage_gate;
 
 pub use anvil::TestAnvil;

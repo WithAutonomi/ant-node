@@ -65,7 +65,8 @@ use crate::payment::{PaymentVerifier, VerificationContext};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
-    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics, ReplicationResponderClass,
+    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics,
+    ReplicationResponderClass, ResponderAdmissionCeiling,
 };
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{
@@ -990,20 +991,41 @@ const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 /// recovered by the sender's delayed possession check (ADR-0003).
 const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
+/// Fresh-offer slots kept reachable by sources that hold none.
+///
+/// The property worth guaranteeing is that one peer cannot *starve* others, not
+/// that any peer is held to a small quota. Expressing the bound as a reserve
+/// rather than a quota is what keeps those two apart.
+const FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES: usize = 4;
+
 /// Maximum fresh offers admitted from one source peer.
 ///
-/// Without a per-source share, one peer can hold every slot in the global pool
+/// Without a per-source bound, one peer can hold every slot in the global pool
 /// and every honest offer arriving in that window is refused — and because a
 /// refusal is later read as absence by the sender's delayed possession check,
 /// those refusals land as audit-severity trust penalties on the *refuser*.
-/// That makes an unbounded global pool a targeted eviction primitive, so fresh
-/// offers get the same per-source treatment as every other responder class.
+/// That makes an unbounded global pool a targeted eviction primitive.
 ///
-/// Two lets one sender pipeline a pair of chunks — matching
-/// [`FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER`], since a client PUT fans the
-/// same key out through overlapping close groups — while leaving at least two
-/// of the four workers reachable by other peers under a single-source flood.
-const FRESH_OFFER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
+/// The bound is deliberately far looser than the other responder classes'
+/// (fetch 2, verification 1, neighbor sync 1), because the traffic pattern is
+/// the opposite shape. Those are request/response: a requester needs only a
+/// couple in flight, so a small quota costs it nothing. Fresh offers are a
+/// one-way bulk fan-out, and in the ordinary case a node's offers come almost
+/// entirely from ONE peer — whichever node took the client's PUT. A quota sized
+/// for request/response traffic therefore binds on completely legitimate
+/// uploads: at 2, an ordinary 48-chunk upload had offers refused (see
+/// `tests/e2e/fresh_offer_capacity.rs`), every one of them attributed to this
+/// ceiling and none to the global pool.
+///
+/// Sizing it as "the pool minus a reserve" keeps the anti-starvation guarantee
+/// exact — [`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES`] slots always remain for a
+/// peer holding none — while leaving a single legitimate fan-out unthrottled.
+// The cast is from a compile-time constant difference of two small literals
+// (16 - 4), so truncation is impossible; deriving the share keeps the reserve
+// relationship visible in the code rather than only in a test.
+#[allow(clippy::cast_possible_truncation)]
+const FRESH_OFFER_MAX_OUTSTANDING_PER_PEER: u32 =
+    (FRESH_OFFER_MAX_OUTSTANDING - FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES) as u32;
 
 /// Maximum paid-list notifications served concurrently.
 ///
@@ -3062,6 +3084,7 @@ impl ReplicationEngine {
                         protocol::log_traffic_summary();
                         protocol::log_served_peers_summary();
                         protocol::log_audit_outcome_summary();
+                        audit_metrics::log_responder_admission_summary();
                     }
                 }
             }
@@ -3673,6 +3696,71 @@ impl From<ResponderRejectReason> for AuditResponderDropReason {
             ResponderRejectReason::PerPeerCapFull => Self::PerPeerCapFull,
         }
     }
+}
+
+impl From<ResponderRejectReason> for ResponderAdmissionCeiling {
+    fn from(reason: ResponderRejectReason) -> Self {
+        match reason {
+            ResponderRejectReason::GlobalPoolFull => Self::GlobalPool,
+            ResponderRejectReason::PerPeerCapFull => Self::PerPeerShare,
+        }
+    }
+}
+
+/// Cumulative fresh-offer admission refusals in this process.
+///
+/// **Expected value in healthy operation is zero.** A node that refuses a
+/// legitimate fresh offer does not merely shed load: the sender transmits
+/// offers one-way and never reads the refusal, so the chunk's absence
+/// resurfaces at the sender's delayed possession check and is charged to the
+/// refusing node at audit severity (ADR-0003). Reaching this ceiling therefore
+/// means the node is either under-provisioned for its offered load or its
+/// admission share is mis-sized — and is accruing unearned trust damage either
+/// way. Operators should alarm on any sustained non-zero rate.
+///
+/// Process-global rather than per-engine, which is exactly right in production
+/// (one node per process) and adequate in multi-node test harnesses, where the
+/// useful assertion is that *no* node in the fleet refused.
+#[must_use]
+pub fn fresh_offer_admission_refusals() -> u64 {
+    audit_metrics::responder_admission_drops(ReplicationResponderClass::FreshOffer)
+}
+
+/// Cumulative paid-list notification admission refusals in this process.
+///
+/// As with [`fresh_offer_admission_refusals`], zero is the expected value.
+/// `PaidNotify` is one-way with no retry, so a refusal discards durable
+/// paid-list evidence outright rather than pushing work back onto a requester.
+#[must_use]
+pub fn paid_notify_admission_refusals() -> u64 {
+    audit_metrics::responder_admission_drops(ReplicationResponderClass::PaidNotify)
+}
+
+/// Fresh-offer refusals caused by the class-wide pool being exhausted.
+///
+/// Split from [`fresh_offer_refusals_per_peer_share`] because the two indict
+/// different things: this one says the node was saturated across all sources
+/// and is genuinely under-provisioned for its offered load.
+#[must_use]
+pub fn fresh_offer_refusals_global_pool() -> u64 {
+    audit_metrics::responder_admission_drops_by_ceiling(
+        ReplicationResponderClass::FreshOffer,
+        ResponderAdmissionCeiling::GlobalPool,
+    )
+}
+
+/// Fresh-offer refusals caused by one source exhausting its per-peer share.
+///
+/// For fresh offers this usually indicts the *share's size* rather than the
+/// sender: the legitimate traffic pattern is bulk from a single peer — the one
+/// node handling a client's PUT and fanning it out — so a share sized for
+/// request/response traffic will refuse ordinary uploads.
+#[must_use]
+pub fn fresh_offer_refusals_per_peer_share() -> u64 {
+    audit_metrics::responder_admission_drops_by_ceiling(
+        ReplicationResponderClass::FreshOffer,
+        ResponderAdmissionCeiling::PerPeerShare,
+    )
 }
 
 /// Why an audit-responder admission attempt failed, with the decision-time
@@ -4782,13 +4870,21 @@ async fn dispatch_fresh_offer(
     {
         Ok(guard) => guard,
         Err(failure) => {
-            // Log the binding ceiling locally; the wire reason stays generic so
-            // a probing peer cannot map out this node's live occupancy.
-            debug!(
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::FreshOffer,
+                failure.reason.into(),
+            );
+            // WARN, not DEBUG: a healthy node should never refuse a legitimate
+            // fresh offer. The sender does not read this refusal, so it
+            // resurfaces as a missing key at the delayed possession check and
+            // is charged to US at audit severity. Log the binding ceiling
+            // locally; the wire reason stays generic so a probing peer cannot
+            // map out this node's live occupancy.
+            warn!(
                 responder_class = "fresh_offer",
                 source = %source,
                 key = %hex::encode(offer.key),
-                "Fresh offer refused at admission: {failure}"
+                "Fresh offer refused at admission — this node will be penalised                  for the resulting absence: {failure}"
             );
             refuse_fresh_offer(
                 &source,
@@ -5171,11 +5267,18 @@ async fn dispatch_paid_notify(
     {
         Ok(guard) => guard,
         Err(failure) => {
-            debug!(
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::PaidNotify,
+                failure.reason.into(),
+            );
+            // WARN for the same reason as fresh offers: PaidNotify is one-way,
+            // so a refusal discards durable paid-list evidence outright rather
+            // than pushing work back onto a requester.
+            warn!(
                 responder_class = "paid_notify",
                 source = %source,
                 key = %hex::encode(notify.key),
-                "Paid notify dropped at admission: {failure}"
+                "Paid notify dropped at admission — paid-list evidence lost                  until a verification cycle re-derives it: {failure}"
             );
             return Ok(());
         }
@@ -5326,7 +5429,10 @@ async fn dispatch_neighbor_sync_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
-            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::NeighborSync);
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::NeighborSync,
+                failure.reason.into(),
+            );
             warn!(
                 responder_class = "neighbor_sync",
                 source = %source,
@@ -5631,7 +5737,10 @@ async fn dispatch_verification_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
-            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::Verification);
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::Verification,
+                failure.reason.into(),
+            );
             warn!(
                 responder_class = "verification",
                 source = %source,
@@ -5725,7 +5834,10 @@ async fn dispatch_fetch_request(
     {
         Ok(guard) => guard,
         Err(failure) => {
-            audit_metrics::record_responder_admission_drop(ReplicationResponderClass::Fetch);
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::Fetch,
+                failure.reason.into(),
+            );
             warn!(
                 responder_class = "fetch",
                 source = %source,
@@ -8961,6 +9073,36 @@ mod tests {
         );
 
         drop(held);
+    }
+
+    /// The fresh-offer per-source bound must guarantee headroom for a peer
+    /// holding nothing, without throttling a single legitimate fan-out.
+    ///
+    /// Sized as a quota rather than a reserve, this bound refused offers during
+    /// an ordinary upload (see `tests/e2e/fresh_offer_capacity.rs`), and every
+    /// refusal is charged to THIS node at audit severity because the sender
+    /// never reads it.
+    #[test]
+    fn fresh_offer_share_reserves_headroom_without_throttling_one_sender() {
+        let share = usize::try_from(FRESH_OFFER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX);
+
+        assert_eq!(
+            FRESH_OFFER_MAX_OUTSTANDING - share,
+            FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES,
+            "a source holding none must always find a free slot"
+        );
+        assert!(
+            share < FRESH_OFFER_MAX_OUTSTANDING,
+            "one peer must not be able to take the whole pool"
+        );
+        // The failure this pins: a share sized like the request/response
+        // classes (fetch 2, verification 1, neighbor sync 1) binds on ordinary
+        // one-way bulk traffic.
+        assert!(
+            share > usize::try_from(FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX),
+            "fresh offers are one-way bulk, not request/response — their share \
+             must not be sized like the request classes'"
+        );
     }
 
     /// A malformed offer must be refused before it can occupy an admission

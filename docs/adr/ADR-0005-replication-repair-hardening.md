@@ -258,6 +258,35 @@ tracking must live at the storage layer, not at each call site:
   neighbor-sync interval, the point at which the pull path would have learned
   the same fact. The class's real protection is `PAID_NOTIFY_WORKER_LIMIT` = 2,
   which bounds the concurrent EVM and DHT work that is actually expensive.
+- **Fresh-offer admission is bounded by a reserve, not a quota**, for the same
+  reason. Reaching this ceiling is a *health signal*, not routine backpressure:
+  the sender transmits offers one-way and never reads the refusal, so the
+  chunk's absence resurfaces at its delayed possession check and is charged to
+  the refusing node at audit severity. A node at capacity is a node accruing
+  unearned trust damage. The property worth guaranteeing is therefore that one
+  peer cannot *starve* others — not that any peer is held to a small quota — so
+  the per-source bound is expressed as the pool minus
+  `FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES` (4 of 16), keeping four slots always
+  reachable by a source holding none while leaving a single legitimate fan-out
+  unthrottled.
+  This is deliberately far looser than the request/response classes (fetch 2,
+  verification 1, neighbor sync 1), because the traffic shape is the opposite:
+  those are requests, where a requester needs only a couple in flight, while
+  fresh offers are a one-way bulk fan-out that in the ordinary case arrives
+  almost entirely from ONE peer — whichever node took the client's PUT. Sized
+  as a quota of 2, an ordinary 48-chunk upload had offers refused, **every
+  refusal attributed to the per-peer share and none to the global pool**
+  (`tests/e2e/fresh_offer_capacity.rs`). The 16-slot pool was never the
+  constraint.
+- Admission refusals and staleness sheds are **counted per class and per binding
+  ceiling** and emitted in a periodic summary (`audit_metrics.rs`), so capacity
+  pressure is alarmable rather than a debug line. The split is what makes a
+  refusal actionable: `global_pool` says the node is saturated overall and is
+  genuinely under-provisioned, `per_peer_share` says one source outran its
+  allotment — which for a bulk-from-one-sender class usually indicts the
+  share's size rather than the sender. Fresh-offer and paid-notify refusals log
+  at WARN, not DEBUG, because both are lossy: the first returns as a trust
+  penalty, the second discards durable paid-list evidence outright.
 - Per-fetch tasks (initial and retry) are spawned on the detached tracker instead
   of bare `tokio::spawn`, so a dropped `in_flight` set can no longer leak
   `Arc<LmdbStorage>` past shutdown. Prompt network-I/O cancellation is unchanged —
@@ -598,8 +627,9 @@ digest, nonce, or challenge-ID rule changes; the wire representation is untouche
   `ReplicationConfig::capacity_rejected_max_age()` (derived, not a constant),
   `MAX_VERIFICATION_KEYS_PER_CYCLE` (8,192),
   `MAX_CONCURRENT_VERIFICATION_REQUESTS` (32), the fresh-offer admission bound
-  (16 permits / 64 MiB) and its new per-source share
-  (`FRESH_OFFER_MAX_OUTSTANDING_PER_PEER` = 2, `mod.rs`), the paid-notify
+  (16 permits / 64 MiB) and its new per-source reserve
+  (`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES` = 4, giving a per-peer share of 12,
+  `mod.rs`), the paid-notify
   responder bounds (`PAID_NOTIFY_WORKER_LIMIT` = 2,
   `PAID_NOTIFY_MAX_OUTSTANDING` = 8, `PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER` = 2,
   `mod.rs`), `MAX_HINT_SOURCES_PER_KEY` (8, `scheduling.rs`), the paid-list edge

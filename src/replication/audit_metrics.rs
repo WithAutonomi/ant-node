@@ -326,7 +326,55 @@ pub enum ReplicationResponderClass {
     Verification,
     /// Neighbor-sync responder.
     NeighborSync,
+    /// Fresh replication offer handler.
+    FreshOffer,
+    /// Paid-list notification handler.
+    PaidNotify,
 }
+
+impl ReplicationResponderClass {
+    /// Dense index into the per-class counter tables.
+    const fn index(self) -> usize {
+        match self {
+            Self::Fetch => 0,
+            Self::Verification => 1,
+            Self::NeighborSync => 2,
+            Self::FreshOffer => 3,
+            Self::PaidNotify => 4,
+        }
+    }
+}
+
+/// Number of [`ReplicationResponderClass`] variants (counter-table width).
+const N_RESPONDER_CLASSES: usize = 5;
+
+/// Which ceiling refused an admission.
+///
+/// Split because the two mean different things operationally: the global pool
+/// filling says the node is saturated overall, while a per-peer share filling
+/// says one source is outrunning its allotment — which, for a class whose
+/// legitimate traffic is bulk-from-one-sender (fresh offers, paid notifies),
+/// usually means the share is sized too tightly rather than that the sender is
+/// misbehaving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponderAdmissionCeiling {
+    /// The class-wide permit pool was exhausted.
+    GlobalPool,
+    /// The source already held its per-peer share.
+    PerPeerShare,
+}
+
+impl ResponderAdmissionCeiling {
+    const fn index(self) -> usize {
+        match self {
+            Self::GlobalPool => 0,
+            Self::PerPeerShare => 1,
+        }
+    }
+}
+
+/// Number of [`ResponderAdmissionCeiling`] variants.
+const N_ADMISSION_CEILINGS: usize = 2;
 
 static RESPONSIBLE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static RESPONSIBLE_UNREACHABLE: AtomicU64 = AtomicU64::new(0);
@@ -340,13 +388,17 @@ static DIGEST_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static SUBTREE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static BYTE_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
 static COMMITMENT_PIN_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
-static FETCH_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
-static VERIFICATION_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
-static NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Admission refusals per `[class][ceiling]`.
+///
+/// For fresh offers this is a health signal, not routine bookkeeping: a healthy
+/// node should never refuse a legitimate offer, and a refusal is read as
+/// absence by the sender's later possession check and charged to this node as
+/// an audit failure. Any non-zero value here warrants investigation.
+static RESPONDER_ADMISSION_DROPS: [AtomicU64; N_RESPONDER_CLASSES * N_ADMISSION_CEILINGS] =
+    [const { AtomicU64::new(0) }; N_RESPONDER_CLASSES * N_ADMISSION_CEILINGS];
 
-static FETCH_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
-static VERIFICATION_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
-static NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS: AtomicU64 = AtomicU64::new(0);
+static RESPONDER_STALENESS_SHEDS: [AtomicU64; N_RESPONDER_CLASSES] =
+    [const { AtomicU64::new(0) }; N_RESPONDER_CLASSES];
 
 static SERIAL_QUEUE_OVERFLOW_DROPS: [AtomicU64; protocol::N_REPLICATION_VARIANTS] =
     [const { AtomicU64::new(0) }; protocol::N_REPLICATION_VARIANTS];
@@ -464,32 +516,65 @@ pub fn record_admission_drop(class: AuditResponderClass) {
     }
 }
 
-pub fn record_responder_admission_drop(class: ReplicationResponderClass) {
-    match class {
-        ReplicationResponderClass::Fetch => {
-            FETCH_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
-        ReplicationResponderClass::Verification => {
-            VERIFICATION_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
-        ReplicationResponderClass::NeighborSync => {
-            NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS.fetch_add(1, Ordering::Relaxed);
-        }
+pub fn record_responder_admission_drop(
+    class: ReplicationResponderClass,
+    ceiling: ResponderAdmissionCeiling,
+) {
+    let slot = class.index() * N_ADMISSION_CEILINGS + ceiling.index();
+    if let Some(counter) = RESPONDER_ADMISSION_DROPS.get(slot) {
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 pub fn record_responder_staleness_shed(class: ReplicationResponderClass) {
-    match class {
-        ReplicationResponderClass::Fetch => {
-            FETCH_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
-        }
-        ReplicationResponderClass::Verification => {
-            VERIFICATION_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
-        }
-        ReplicationResponderClass::NeighborSync => {
-            NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS.fetch_add(1, Ordering::Relaxed);
+    if let Some(counter) = RESPONDER_STALENESS_SHEDS.get(class.index()) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One class's admission pressure, read together for a summary line.
+#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+struct ResponderAdmissionSnapshot {
+    global_pool: u64,
+    per_peer_share: u64,
+    staleness_shed: u64,
+}
+
+impl ResponderAdmissionSnapshot {
+    #[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+    fn of(class: ReplicationResponderClass) -> Self {
+        Self {
+            global_pool: responder_admission_drops_by_ceiling(
+                class,
+                ResponderAdmissionCeiling::GlobalPool,
+            ),
+            per_peer_share: responder_admission_drops_by_ceiling(
+                class,
+                ResponderAdmissionCeiling::PerPeerShare,
+            ),
+            staleness_shed: responder_staleness_sheds_total(class),
         }
     }
+}
+
+/// Total admission refusals for `class` across both ceilings.
+#[must_use]
+pub fn responder_admission_drops(class: ReplicationResponderClass) -> u64 {
+    (0..N_ADMISSION_CEILINGS)
+        .filter_map(|c| RESPONDER_ADMISSION_DROPS.get(class.index() * N_ADMISSION_CEILINGS + c))
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .sum()
+}
+
+/// Admission refusals for `class` attributable to one specific ceiling.
+#[must_use]
+pub fn responder_admission_drops_by_ceiling(
+    class: ReplicationResponderClass,
+    ceiling: ResponderAdmissionCeiling,
+) -> u64 {
+    RESPONDER_ADMISSION_DROPS
+        .get(class.index() * N_ADMISSION_CEILINGS + ceiling.index())
+        .map_or(0, |counter| counter.load(Ordering::Relaxed))
 }
 
 pub fn record_serial_queue_overflow_drop(body: &ReplicationMessageBody) {
@@ -512,28 +597,57 @@ pub fn replication_event_lagged_total() -> u64 {
 
 #[cfg(test)]
 pub fn responder_admission_drops_total(class: ReplicationResponderClass) -> u64 {
-    match class {
-        ReplicationResponderClass::Fetch => FETCH_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed),
-        ReplicationResponderClass::Verification => {
-            VERIFICATION_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed)
-        }
-        ReplicationResponderClass::NeighborSync => {
-            NEIGHBOR_SYNC_RESPONDER_ADMISSION_DROPS.load(Ordering::Relaxed)
-        }
-    }
+    responder_admission_drops(class)
 }
 
-#[cfg(test)]
+#[must_use]
 pub fn responder_staleness_sheds_total(class: ReplicationResponderClass) -> u64 {
-    match class {
-        ReplicationResponderClass::Fetch => FETCH_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed),
-        ReplicationResponderClass::Verification => {
-            VERIFICATION_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed)
-        }
-        ReplicationResponderClass::NeighborSync => {
-            NEIGHBOR_SYNC_RESPONDER_STALENESS_SHEDS.load(Ordering::Relaxed)
-        }
-    }
+    RESPONDER_STALENESS_SHEDS
+        .get(class.index())
+        .map_or(0, |counter| counter.load(Ordering::Relaxed))
+}
+
+/// Emit responder admission pressure as one INFO summary line, alongside the
+/// traffic and audit-outcome summaries (`group = 4`).
+///
+/// Fresh-offer and paid-notify refusals are the fields worth alarming on. A
+/// healthy node should never refuse a legitimate fresh offer: the sender does
+/// not read the refusal, so it resurfaces as a missing key at the delayed
+/// possession check and is charged to THIS node at audit severity. A non-zero
+/// `fresh_offer_admission_dropped_*` therefore means this node is either
+/// under-provisioned or its share is mis-sized — and is accumulating unearned
+/// trust damage either way. The per-ceiling split says which: `global_pool`
+/// means saturated overall, `per_peer_share` means one sender outran its
+/// allotment, which for a bulk-from-one-sender class usually indicts the
+/// share's size rather than the sender.
+#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+pub fn log_responder_admission_summary() {
+    let fresh_offer = ResponderAdmissionSnapshot::of(ReplicationResponderClass::FreshOffer);
+    let paid_notify = ResponderAdmissionSnapshot::of(ReplicationResponderClass::PaidNotify);
+    let fetch = ResponderAdmissionSnapshot::of(ReplicationResponderClass::Fetch);
+    let verification = ResponderAdmissionSnapshot::of(ReplicationResponderClass::Verification);
+    let neighbor_sync = ResponderAdmissionSnapshot::of(ReplicationResponderClass::NeighborSync);
+
+    crate::logging::info!(
+        target: "ant_node::replication::traffic",
+        group = 4,
+        fresh_offer_admission_dropped_global_pool = fresh_offer.global_pool,
+        fresh_offer_admission_dropped_per_peer_share = fresh_offer.per_peer_share,
+        fresh_offer_staleness_shed = fresh_offer.staleness_shed,
+        paid_notify_admission_dropped_global_pool = paid_notify.global_pool,
+        paid_notify_admission_dropped_per_peer_share = paid_notify.per_peer_share,
+        paid_notify_staleness_shed = paid_notify.staleness_shed,
+        fetch_admission_dropped_global_pool = fetch.global_pool,
+        fetch_admission_dropped_per_peer_share = fetch.per_peer_share,
+        fetch_staleness_shed = fetch.staleness_shed,
+        verification_admission_dropped_global_pool = verification.global_pool,
+        verification_admission_dropped_per_peer_share = verification.per_peer_share,
+        verification_staleness_shed = verification.staleness_shed,
+        neighbor_sync_admission_dropped_global_pool = neighbor_sync.global_pool,
+        neighbor_sync_admission_dropped_per_peer_share = neighbor_sync.per_peer_share,
+        neighbor_sync_staleness_shed = neighbor_sync.staleness_shed,
+        "replication responder admission summary (cumulative)"
+    );
 }
 
 #[cfg(test)]
@@ -585,12 +699,22 @@ mod tests {
         let verification_before =
             responder_admission_drops_total(ReplicationResponderClass::Verification);
 
-        record_responder_admission_drop(class);
+        record_responder_admission_drop(class, ResponderAdmissionCeiling::GlobalPool);
+        record_responder_admission_drop(class, ResponderAdmissionCeiling::PerPeerShare);
         record_responder_staleness_shed(class);
 
         assert_eq!(
             responder_admission_drops_total(class).saturating_sub(admission_before),
-            1
+            2,
+            "both ceilings must roll up into the class total"
+        );
+        assert!(
+            responder_admission_drops_by_ceiling(class, ResponderAdmissionCeiling::GlobalPool) > 0
+                && responder_admission_drops_by_ceiling(
+                    class,
+                    ResponderAdmissionCeiling::PerPeerShare
+                ) > 0,
+            "the split must attribute each refusal to its binding ceiling"
         );
         assert_eq!(
             responder_staleness_sheds_total(class).saturating_sub(staleness_before),
