@@ -176,6 +176,27 @@ fn median_quote_index(quote_count: usize) -> usize {
     quote_count / 2
 }
 
+/// The settlement multiplier a merkle receipt must satisfy, from the instant it
+/// was stamped (ADR-0008).
+///
+/// `PAID_QUOTE_PAYMENT_MULTIPLIER` (3x, matching the single-node path) for a
+/// receipt stamped at or after `enforced_from`; the historic `1` for one
+/// stamped before it, which was bought under the previous rule and cannot be
+/// refunded.
+///
+/// The boundary needs no sunset logic because receipt expiry supplies it: a
+/// receipt older than one week is refused regardless, so once
+/// `enforced_from + one week` has passed no valid receipt can still reach the
+/// `1` branch. That is also why a client cannot backdate to keep the old price
+/// — a stamp early enough to qualify is old enough to be expired.
+fn merkle_required_multiplier(receipt_timestamp: u64, enforced_from: u64) -> u64 {
+    if receipt_timestamp >= enforced_from {
+        PAID_QUOTE_PAYMENT_MULTIPLIER
+    } else {
+        1
+    }
+}
+
 /// Per-node payment implied by the merkle contract formula, for a given
 /// payment multiplier.
 ///
@@ -498,6 +519,17 @@ pub struct PaymentVerifier {
     /// future ops surface) can flip enforcement without rebuilding the
     /// verifier.
     price_floor: RwLock<PriceFloorConfig>,
+    /// ADR-0008: the instant from which a merkle receipt must settle at the
+    /// single-node 3x multiplier, defaulting to
+    /// [`crate::replication::config::MERKLE_PARITY_ENFORCED_FROM_UNIX`].
+    ///
+    /// Behind a lock purely so tests can pin it. Every merkle receipt is
+    /// necessarily stamped within one week of now (older ones are expired,
+    /// future ones refused), so a test that used the production boundary would
+    /// silently change which side of it the test data fell on as the wall clock
+    /// crossed that date. Pinning the boundary keeps those tests deterministic
+    /// forever.
+    merkle_parity_from: RwLock<u64>,
     /// Configuration.
     config: PaymentVerifierConfig,
 }
@@ -627,6 +659,9 @@ impl PaymentVerifier {
             monetized_pin_tx: RwLock::new(None),
             local_commitment_source: RwLock::new(None),
             price_floor: RwLock::new(config.price_floor),
+            merkle_parity_from: RwLock::new(
+                crate::replication::config::MERKLE_PARITY_ENFORCED_FROM_UNIX,
+            ),
             config,
         }
     }
@@ -715,6 +750,15 @@ impl PaymentVerifier {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn set_price_floor_for_tests(&self, config: PriceFloorConfig) {
         *self.price_floor.write() = config;
+    }
+
+    /// Test-only setter for the ADR-0008 merkle parity boundary, so both the
+    /// pre-boundary (historic 1x) and enforcing (3x) regimes can be exercised
+    /// against fixed receipt timestamps instead of the wall clock. `0` enforces
+    /// on every receipt; `u64::MAX` puts every receipt in the legacy window.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_merkle_parity_from_for_tests(&self, enforced_from: u64) {
+        *self.merkle_parity_from.write() = enforced_from;
     }
 
     /// Test-only setter for local closest peers used by the paid-quote
@@ -2120,10 +2164,13 @@ impl PaymentVerifier {
     /// ADR-0008 merkle payment-parity telemetry.
     ///
     /// Records what a batch actually settled per paid node against what
-    /// single-node parity would have required, so the rollout can be measured
-    /// before [`crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED`]
-    /// is flipped. Observational only: it never rejects and never feeds trust
-    /// scoring — an underpaying client is running old code, not misbehaving.
+    /// single-node parity requires, and which regime the receipt's timestamp put
+    /// it in. Parity is enforced, so a post-boundary shortfall has already been
+    /// rejected before this runs and cannot appear here; what this measures is
+    /// how much traffic is still arriving on pre-boundary (1x) receipts, which
+    /// is what tells us the compatibility window can be considered closed.
+    /// Observational only: it never rejects and never feeds trust scoring — a
+    /// client on a legacy receipt is running old code, not misbehaving.
     ///
     /// Two call-site requirements, both load-bearing for the signal:
     /// - **After full admission validation.** Every paid index, reward address
@@ -2143,6 +2190,7 @@ impl PaymentVerifier {
         payment_info: &OnChainPaymentInfo,
         expected_bare: Amount,
         expected_parity: Amount,
+        required_multiplier: u64,
     ) {
         let min_paid = payment_info
             .paid_node_addresses
@@ -2151,16 +2199,18 @@ impl PaymentVerifier {
             .min()
             .unwrap_or(Amount::ZERO);
         let at_parity = min_paid >= expected_parity;
+        let legacy_receipt = required_multiplier < PAID_QUOTE_PAYMENT_MULTIPLIER;
 
         info!(
             target: "ant_node::payment::merkle_parity",
-            "Merkle parity: pool={}, depth={}, paid_nodes={}, min_paid={min_paid}, \
-             expected_bare={expected_bare}, expected_parity={expected_parity}, \
-             at_parity={at_parity}, enforce={}",
+            "Merkle parity: pool={}, depth={}, paid_nodes={}, receipt_ts={}, \
+             min_paid={min_paid}, expected_bare={expected_bare}, \
+             expected_parity={expected_parity}, required_multiplier={required_multiplier}, \
+             legacy_receipt={legacy_receipt}, at_parity={at_parity}",
             hex::encode(pool_hash),
             payment_info.depth,
             payment_info.paid_node_addresses.len(),
-            crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED,
+            payment_info.merkle_payment_timestamp,
         );
     }
 
@@ -2849,16 +2899,21 @@ impl PaymentVerifier {
             )));
         }
 
-        // Expected per-node payment from the contract formula. ADR-0008: the
-        // parity expectation (what the single-node path would settle for the
-        // same chunk) is always computed for telemetry; it only becomes the
-        // admission requirement once the rollout gate is on.
+        // Expected per-node payment from the contract formula. ADR-0008: which
+        // multiplier is REQUIRED depends on when the receipt was stamped —
+        // 3x from the parity boundary onward, the historic 1x before it, since
+        // that money was already spent under the old rule. The expiry check
+        // above bounds the legacy branch: no receipt older than a week is
+        // valid, so the branch is unreachable one week past the boundary.
         let candidate_prices: Vec<Amount> = merkle_proof
             .winner_pool
             .candidate_nodes
             .iter()
             .map(|c| c.price)
             .collect();
+        let parity_from = *self.merkle_parity_from.read();
+        let required_multiplier =
+            merkle_required_multiplier(payment_info.merkle_payment_timestamp, parity_from);
         let expected_per_node_bare =
             merkle_expected_per_node(&candidate_prices, payment_info.depth, 1)?;
         let expected_per_node_parity = merkle_expected_per_node(
@@ -2866,11 +2921,8 @@ impl PaymentVerifier {
             payment_info.depth,
             PAID_QUOTE_PAYMENT_MULTIPLIER,
         )?;
-        let expected_per_node = if crate::replication::config::MERKLE_PAYMENT_MULTIPLIER_ENFORCED {
-            expected_per_node_parity
-        } else {
-            expected_per_node_bare
-        };
+        let expected_per_node =
+            merkle_expected_per_node(&candidate_prices, payment_info.depth, required_multiplier)?;
 
         // Verify paid node indices, addresses, and amounts against the candidate pool.
         //
@@ -2879,10 +2931,9 @@ impl PaymentVerifier {
         // 2. Match the expected reward address at that index
         // 3. Have been paid at least `expected_per_node`, which is the contract
         //    formula `median16(prices) * 2^depth / depth` at the multiplier the
-        //    rollout gate selects: the historic 1x while
-        //    `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is false, the parity 3x once
-        //    it is on. Do NOT re-assume the 1x formula here — read
-        //    `expected_per_node` rather than recomputing it.
+        //    receipt's own timestamp selects (3x from the parity boundary, the
+        //    historic 1x before it). Do NOT re-assume the 1x formula here —
+        //    read `expected_per_node` rather than recomputing it.
         //
         // Note: unlike single-node payments, merkle proofs are NOT bound to a
         // specific storing node. The contract pays `depth` random nodes from the
@@ -2912,8 +2963,9 @@ impl PaymentVerifier {
                 return Err(Error::Payment(format!(
                     "Underpayment for node at index {idx}: paid {paid_amount}, \
                      expected at least {expected_per_node} \
-                     (median16 formula, depth={})",
-                    payment_info.depth
+                     (median16 formula, depth={}, {required_multiplier}x required for a \
+                     receipt stamped {} vs parity boundary {parity_from})",
+                    payment_info.depth, payment_info.merkle_payment_timestamp
                 )));
             }
         }
@@ -2938,6 +2990,7 @@ impl PaymentVerifier {
                 &payment_info,
                 expected_per_node_bare,
                 expected_per_node_parity,
+                required_multiplier,
             );
         }
 
@@ -4740,7 +4793,7 @@ mod tests {
     async fn test_merkle_tagged_proof_invalid_data_rejected() {
         use crate::ant_protocol::PROOF_TAG_MERKLE;
 
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let xorname = [0xA1u8; 32];
 
         // Build a merkle-tagged proof with garbage body.
@@ -5254,6 +5307,28 @@ mod tests {
 
     /// Helper: build a minimal valid `MerklePaymentProof` with real ML-DSA-65
     /// signatures. Returns `(xorname, serialized_tagged_proof, pool_hash, timestamp)`.
+    /// Verifier for merkle admission tests, pinned to the **enforcing** side of
+    /// the ADR-0008 parity boundary.
+    ///
+    /// Merkle receipts must be stamped within one week of now or they are
+    /// expired, so these tests necessarily build near-`now` timestamps. Left on
+    /// the production boundary they would sit in the legacy 1x window today and
+    /// silently switch to the 3x rule when the wall clock crossed that date,
+    /// changing what each assertion means. Pinning to `0` means "every receipt
+    /// is post-boundary", which is the rule the release ships with.
+    fn merkle_test_verifier() -> PaymentVerifier {
+        let verifier = create_test_verifier();
+        verifier.set_merkle_parity_from_for_tests(0);
+        verifier
+    }
+
+    /// Per-node amount a depth-2 pool of 1024-priced candidates must settle
+    /// under parity: `median(1024) * 2^2 * 3 / 2`.
+    const MERKLE_PARITY_PER_NODE_DEPTH2: u64 = 6144;
+
+    /// The same pool's historic pre-parity amount: `median(1024) * 2^2 / 2`.
+    const MERKLE_LEGACY_PER_NODE_DEPTH2: u64 = 2048;
+
     fn make_valid_merkle_proof_bytes() -> (
         [u8; 32],
         Vec<u8>,
@@ -5268,7 +5343,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_address_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (_correct_xorname, tagged_proof, _pool_hash, _ts) = make_valid_merkle_proof_bytes();
 
         // Use a DIFFERENT xorname than what the proof was built for
@@ -5295,7 +5370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_malformed_body_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let xorname = [0xA3u8; 32];
 
         // Valid merkle tag but truncated/corrupted msgpack body
@@ -5448,7 +5523,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_tampered_candidate_signature_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
 
         let (mut merkle_proof, _pool_hash, xorname, timestamp) = make_valid_merkle_proof();
 
@@ -5495,7 +5570,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_timestamp_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
 
         let (xorname, tagged, pool_hash, timestamp) = make_valid_merkle_proof_bytes();
 
@@ -5527,7 +5602,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_paid_node_index_out_of_bounds_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // The test tree has 4 addresses → depth 2. We must match the tree depth
@@ -5538,11 +5613,19 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // First paid node: valid (matches candidate 0, amount matches formula)
-                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
+                    // First paid node: valid (matches candidate 0, amount clears
+                    // the parity formula so the test reaches the index check)
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                     // Second paid node: index 999 is way beyond CANDIDATES_PER_POOL (16)
-                    (RewardsAddress::new([1u8; 20]), 999, Amount::from(2048u64)),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        999,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -5569,7 +5652,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_paid_node_address_mismatch_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Tree has depth 2, so provide 2 paid node entries.
@@ -5579,11 +5662,19 @@ mod tests {
                 depth: 2,
                 merkle_payment_timestamp: ts,
                 paid_node_addresses: vec![
-                    // Index 0 with matching address [0x00; 20]
-                    // Expected per-node: median(1024) * 2^2 / 2 = 2048
-                    (RewardsAddress::new([0u8; 20]), 0, Amount::from(2048u64)),
+                    // Index 0 with matching address [0x00; 20], paid enough to
+                    // clear the parity formula so the test reaches index 1
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                     // Index 1 with WRONG address — candidate 1's address is [0x01; 20]
-                    (RewardsAddress::new([0xFF; 20]), 1, Amount::from(2048u64)),
+                    (
+                        RewardsAddress::new([0xFF; 20]),
+                        1,
+                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    ),
                 ],
             };
             verifier.pool_cache.lock().put(pool_hash, info);
@@ -5607,7 +5698,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_wrong_depth_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Pre-populate pool cache with depth=3 but only 1 paid node address
@@ -5647,7 +5738,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_merkle_underpayment_rejected() {
-        let verifier = create_test_verifier();
+        let verifier = merkle_test_verifier();
         let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
 
         // Tree depth=2, so 2 paid nodes required. Candidates all quote price=1024.
@@ -5684,8 +5775,172 @@ mod tests {
         );
     }
 
-    // =========================================================================
-    // Closeness-window constants regression tests
+    /// A batch settled at the historic 1x is refused once its receipt is stamped
+    /// at or after the parity boundary. This is the fix being active by default:
+    /// no flag, no shadow mode.
+    #[tokio::test]
+    async fn merkle_legacy_1x_settlement_rejected_after_the_parity_boundary() {
+        let verifier = merkle_test_verifier(); // boundary pinned at 0 = always enforcing
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        1,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let err_msg = format!(
+            "{}",
+            verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&tagged_proof),
+                    VerificationContext::ClientPut,
+                )
+                .await
+                .expect_err("a 1x settlement must be refused past the boundary")
+        );
+        assert!(
+            err_msg.contains("Underpayment") && err_msg.contains("3x required"),
+            "Error should name the required multiplier: {err_msg}"
+        );
+    }
+
+    /// A receipt stamped BEFORE the boundary keeps its 1x price. The money was
+    /// already spent under the old rule and cannot be refunded, so refusing it
+    /// would destroy value. This is the compatibility half of the cutover.
+    #[tokio::test]
+    async fn merkle_legacy_1x_settlement_accepted_before_the_parity_boundary() {
+        let verifier = create_test_verifier();
+        let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+        // Boundary just after this receipt's stamp: the receipt is legacy.
+        verifier.set_merkle_parity_from_for_tests(ts + 1);
+
+        {
+            let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                depth: 2,
+                merkle_payment_timestamp: ts,
+                paid_node_addresses: vec![
+                    (
+                        RewardsAddress::new([0u8; 20]),
+                        0,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                    (
+                        RewardsAddress::new([1u8; 20]),
+                        1,
+                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                    ),
+                ],
+            };
+            verifier.pool_cache.lock().put(pool_hash, info);
+        }
+
+        let result = verifier
+            .verify_payment(
+                &xorname,
+                Some(&tagged_proof),
+                VerificationContext::ClientPut,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "a receipt stamped before the boundary keeps the 1x rule: {result:?}"
+        );
+    }
+
+    /// An upgraded client's 3x settlement is accepted on both sides of the
+    /// boundary, so client and node can roll out in either order.
+    #[tokio::test]
+    async fn merkle_parity_settlement_accepted_in_both_regimes() {
+        for parity_from in [0u64, u64::MAX] {
+            let verifier = create_test_verifier();
+            verifier.set_merkle_parity_from_for_tests(parity_from);
+            let (xorname, tagged_proof, pool_hash, ts) = make_valid_merkle_proof_bytes();
+
+            {
+                let info = evmlib::merkle_payments::OnChainPaymentInfo {
+                    depth: 2,
+                    merkle_payment_timestamp: ts,
+                    paid_node_addresses: vec![
+                        (
+                            RewardsAddress::new([0u8; 20]),
+                            0,
+                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        ),
+                        (
+                            RewardsAddress::new([1u8; 20]),
+                            1,
+                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        ),
+                    ],
+                };
+                verifier.pool_cache.lock().put(pool_hash, info);
+            }
+
+            let result = verifier
+                .verify_payment(
+                    &xorname,
+                    Some(&tagged_proof),
+                    VerificationContext::ClientPut,
+                )
+                .await;
+            assert!(
+                result.is_ok(),
+                "3x must be accepted with boundary {parity_from}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merkle_required_multiplier_switches_exactly_at_the_boundary() {
+        let boundary = 1_785_855_600u64;
+
+        assert_eq!(merkle_required_multiplier(boundary - 1, boundary), 1);
+        assert_eq!(
+            merkle_required_multiplier(boundary, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+            "the boundary instant itself is enforcing"
+        );
+        assert_eq!(
+            merkle_required_multiplier(boundary + 1, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER
+        );
+    }
+
+    /// The legacy branch cannot outlive the receipt lifetime, which is what
+    /// makes the cutover self-completing and closes the backdating loophole: a
+    /// stamp early enough to claim 1x is old enough to be expired.
+    #[test]
+    fn merkle_legacy_window_closes_one_receipt_lifetime_after_the_boundary() {
+        let boundary = 1_785_855_600u64;
+        let expiry = evmlib::merkle_payments::MERKLE_PAYMENT_EXPIRATION;
+
+        // Once now is a full receipt lifetime past the boundary, the oldest
+        // still-valid stamp is itself at or after the boundary.
+        let now = boundary + expiry;
+        let oldest_valid_stamp = now - expiry;
+        assert_eq!(
+            merkle_required_multiplier(oldest_valid_stamp, boundary),
+            PAID_QUOTE_PAYMENT_MULTIPLIER,
+            "no unexpired receipt can still claim the 1x rule"
+        );
+    }
+
     //
     // These constants are load-bearing for both correctness (the storer
     // must look at the same window the client picks from, otherwise honest

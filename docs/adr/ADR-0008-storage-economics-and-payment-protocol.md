@@ -28,14 +28,15 @@ one. Two things follow from that and are called out wherever they appear:
 - **Shipped vs pending.** Sections below mark what is live at this head, what
   is behind a rollout flag, and what lives on an unmerged branch. Nothing here
   should be read as deployed unless it says so.
-- **One normative proposal.** Writing the model down surfaced a defect: the
-  merkle batch path settles a third of what the single-node path settles for an
+- **One normative decision.** Writing the model down surfaced a defect: the
+  merkle batch path settled a third of what the single-node path settles for an
   identical chunk, because the 3× multiplier was never applied when pool
-  commitments are built. Raising merkle to 3× is a **pricing-policy proposal**
-  carried by a paired ant-client PR, not a repair that is already in effect. It
-  is not merged, not released, and needs economic sign-off; the alternatives
-  are listed with it. This ADR must not be cited as evidence that parity is
-  deployed.
+  commitments are built. This ADR **decides** to raise merkle to 3×, and the
+  change ships enforcing by default across a paired pair of PRs (ant-client
+  pays it, ant-node requires it) on one release train. There is no shadow mode
+  and no flag to flip afterwards. Because it is a pricing decision and not just
+  an arithmetic repair, it still needs the economic owner's sign-off before the
+  train ships; the alternatives that were weighed are recorded below.
 
 Terms: *record* (one stored chunk, the priced unit), *close group* (the 7 nodes
 closest to an address, which hold the replicas), *quote* (a node's signed
@@ -175,14 +176,52 @@ leaf on the merkle path.**
 
 The client needs ANT and Arbitrum gas, and approves the vault once.
 
-#### 4b. Proposal: raise merkle to 3× (not merged, needs sign-off)
+#### 4b. Decision: raise merkle to 3×, enforcing by default
 
 Apply the same 3× multiplier on the merkle path, to the on-chain payable
 `amount` rather than to the signed quote, so a batch settles
 `3 × median16 × 2^depth`. Signed candidate prices and the pool hash stay
 untouched, so every existing proof still verifies against the quotes the nodes
-actually signed. Carried by a paired ant-client PR; **not** in effect at this
-head, where ant-client main still submits bare prices.
+actually signed.
+
+Two PRs on one release train: ant-client pays the multiplier, ant-node requires
+it. **The requirement is on by default** — no shadow mode, no follow-up flag.
+
+##### The cutover, and the receipts it must not destroy
+
+A merkle receipt stays spendable for one week. Refusing every 1× settlement the
+moment nodes upgrade would therefore reject uploads whose payment had already
+been made, correctly, under the previous rule, with no way to refund it. So the
+requirement keys off **the receipt's own timestamp**, against a compiled-in
+boundary (`MERKLE_PARITY_ENFORCED_FROM_UNIX`, set one train after the change
+ships):
+
+| Receipt stamped | Must settle |
+|---|---|
+| before the boundary | 1× (the rule it was bought under) |
+| at or after the boundary | 3× |
+
+Three properties make that safe rather than a loophole:
+
+- **It self-retires.** Receipts older than one week are expired anyway, so once
+  `boundary + 1 week` has passed, every still-valid receipt is necessarily
+  stamped at or after the boundary and the 1× branch is unreachable. Nobody has
+  to remember to remove it.
+- **It cannot be gamed.** The timestamp is client-supplied, so a client might
+  try backdating to keep the old price — but a stamp early enough to qualify is
+  old enough to be expired. The evasion window is exactly the one week the
+  honest grace needs, and it closes by itself.
+- **Order of rollout does not matter.** A 3× settlement is accepted on both
+  sides of the boundary (it clears the 1× floor too), so an upgraded client
+  works against an un-upgraded node, and an upgraded node still honours
+  in-flight legacy receipts. Neither half has to land first.
+
+What this does **not** protect: a client still running the old code after the
+boundary pays 1× on a fresh receipt and is refused. That is the deliberate cost
+of enforcing rather than shadowing, and the boundary is placed a train later
+precisely so that clients have taken the release before it bites. The failure is
+loud (the store is refused with the required multiplier named), not a silent
+underpayment.
 
 What that does and does not equalise, stated precisely, because "parity" is
 easy to over-read:
@@ -204,11 +243,14 @@ easy to over-read:
 
 **Alternatives considered.** (1) Retain the differential and document it as a
 volume discount. (2) Lower single-node to 1×, which cuts per-chunk revenue
-network-wide by two thirds. (3) Raise merkle to 3× — the proposal, and the
-direction the multiplier was designed for. (4) Defer until there is pricing
-evidence, keeping only the shadow telemetry below. Tripling the common
-large-upload path is a pricing decision rather than an arithmetic repair, so
-(3) needs the economic owner's approval before the client half ships.
+network-wide by two thirds. (3) Raise merkle to 3× — **chosen**, and the
+direction the multiplier was designed for. (4) Ship it in shadow mode first and
+enforce later, which was the earlier plan and was rejected: it leaves the
+network underpaid for as long as it takes someone to flip a flag, and the
+timestamp boundary already provides the compatibility a shadow period was
+meant to buy. Tripling the common large-upload path is a pricing decision
+rather than an arithmetic repair, so (3) needs the economic owner's approval
+before the train ships.
 
 ### 5. Storing and verifying
 
@@ -267,21 +309,21 @@ and a node that was actually paid is nominated for a first audit.
 | Quote/commitment mismatch reported to trust | off (telemetry only) |
 | Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 50% tolerance) |
 | Payee eligibility gate (ADR-0005) | **not merged**; observe-only on its branch (`ADR5_ENFORCE`) |
-| Client applies the 3× multiplier on the merkle path | **not merged** — paired PR; main still submits bare prices |
-| Storer requires it (`MERKLE_PAYMENT_MULTIPLIER_ENFORCED`) | off (telemetry only) |
+| Client pays the 3× multiplier on the merkle path | **enforced** from this train (no flag) |
+| Storer requires it (`MERKLE_PARITY_ENFORCED_FROM_UNIX`) | **enforced** for receipts stamped from the boundary |
 
-So the guarantees live in production today are narrower than the model above:
-the client pays only prices it can recompute and resolve to a signed
-commitment; every **single-node** stored chunk is settled on-chain at ≥3× the
-supplied-set median, to the quoting node's own address; and every **merkle**
-chunk is settled at ≥1× the winner pool's median per padded leaf. The rest is
-instrumented and awaiting evidence before it rejects.
+So the guarantees after this train are: the client pays only prices it can
+recompute and resolve to a signed commitment; every **single-node** stored chunk
+is settled on-chain at ≥3× the supplied-set median, to the quoting node's own
+address; and every **merkle** chunk is settled at ≥3× the winner pool's median
+per padded leaf, except on receipts bought before the boundary, which keep the
+1× rule until they expire. Everything else in the table is still instrumented
+rather than enforced.
 
-Before `MERKLE_PAYMENT_MULTIPLIER_ENFORCED` is turned on, the parity telemetry
-has to show upgraded clients settling at 3× **and** a drain period of at least
-the one-week receipt lifetime has to pass after the last 1× settlement, or the
-gate will reject payments that were already made in good faith and cannot be
-recovered.
+The parity telemetry no longer gates a decision — the decision has been made.
+It now answers one operational question: how much traffic is still arriving on
+pre-boundary receipts, which is how we know the compatibility window has drained
+and the 1× branch is dead code that can be deleted.
 
 ## Consequences
 
@@ -301,13 +343,25 @@ recovered.
 
 ### Negative / Trade-offs
 
-- **Batch uploads would get three times more expensive.** The proposal raises
-  the merkle path from 1× to 3× the median per padded leaf. That is a real price
-  increase for every upload of 64 chunks or more — the common path for files —
-  and it lands as clients upgrade. The alternative, lowering the
-  single-node path to 1×, would instead cut per-chunk revenue across the whole
-  network by two thirds; parity had to be restored in one direction or the
-  other, and this is the one the 3× multiplier was designed for.
+- **Batch uploads get three times more expensive.** Raising the merkle path
+  from 1× to 3× the median per padded leaf is a real price increase for every
+  upload of 64 chunks or more — the common path for files. The alternative,
+  lowering the single-node path to 1×, would instead cut per-chunk revenue
+  across the whole network by two thirds; parity had to be restored in one
+  direction or the other, and this is the one the 3× multiplier was designed
+  for.
+- **An un-upgraded client's batch uploads start failing at the boundary.** It
+  pays 1× on a fresh receipt and upgraded storers refuse it. There is no way to
+  both require 3× and accept a new 1× payment, so this is the unavoidable cost
+  of enforcing by default rather than shadowing. The boundary sits a train after
+  the change ships to give clients time, and the rejection names the required
+  multiplier so the cause is obvious rather than looking like a random store
+  failure. Anyone pinned to an old client for longer than that window is
+  affected and needs telling before the train.
+- **The boundary is a compiled-in date.** If the train slips past it, nodes
+  begin requiring 3× before clients are paying it. The constant must be moved
+  forward with the train, and must never be set earlier than the release that
+  carries it.
 - **Parity is exact only up to the contract's integer division.** The vault
   computes `amountPerNode = total / depth`, which discards a remainder when
   `depth` does not divide `median × 2^depth`. The loss is under one wei per
@@ -350,16 +404,17 @@ recovered.
   and monotonicity tests hold in `ant-protocol`. A second implementation of the
   formula anywhere is a defect.
 - **End to end against a real chain.** Anvil-backed tests pay and verify both
-  shapes, including the redirect-rejection and underpayment cases. **Still
-  owed for the 3× proposal:** a client → vault → node test proving 3×
-  construction, settlement and acceptance, plus the 1×, just-below-3× and
-  redirected-payee cases, and old-client × new-node / new-client × old-node
-  coverage in both shadow and enforcing modes. The proposal must not be called
-  deployed until those exist.
-- **Telemetry before enforcement.** Price-floor shadow lines, off-curve quote
-  counts, and observe-only eligibility decisions must show honest nodes
-  clearing each gate before that gate is flipped to reject; a wrongly
-  calibrated gate rejects payments that are already settled and irrecoverable.
+  shapes, including the redirect-rejection and underpayment cases. **Still owed
+  before the train ships:** a client → vault → node test proving 3×
+  construction, settlement and acceptance against a real vault, plus the
+  just-below-3× and redirected-payee cases. Unit tests cover the cutover matrix
+  (1× refused after the boundary, 1× honoured before it, 3× accepted on both
+  sides) but not against a live chain.
+- **The cutover is exercised in both directions.** Tests pin the boundary
+  explicitly rather than reading the production constant, because every merkle
+  receipt is stamped within a week of now — a test left on the real boundary
+  would silently change which regime it exercised once the wall clock crossed
+  that date.
 - **The parity arithmetic is pinned by unit tests.** They assert that a merkle
   **leaf** settles for the single-node 3× median at every tree depth; that the
   per-node expectation is the floor of the multiplied total, which is *not* the
@@ -375,10 +430,14 @@ recovered.
   settlement covering 256 chunks contributes one sample per storer rather than
   256.
 - **Re-open triggers.** The ANT price moving enough to put $/GiB outside its
-  intended band; merkle-parity telemetry showing uploads still settling at 1×
-  after clients have upgraded; enabling any of the gates above; any proposal to
-  pay nodes for uptime rather than for stores, which would make client payments
-  no longer the only revenue and invalidate this ADR's central assumption.
+  intended band; the release train slipping past the parity boundary date, which
+  requires moving the constant; a rise in refused batch uploads after the
+  boundary, indicating clients that never upgraded; parity telemetry still
+  reporting pre-boundary receipts more than a week after the boundary, which
+  would mean the expiry assumption is wrong; enabling any of the gates still
+  listed as instrumented; any move to pay nodes for uptime rather than for
+  stores, which would make client payments no longer the only revenue and
+  invalidate this ADR's central assumption.
 
 ## Notes for AI-assisted work
 

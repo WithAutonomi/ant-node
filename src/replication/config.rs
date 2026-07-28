@@ -334,28 +334,40 @@ pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
 /// off-curve price, so it deserves its own dial.
 pub const QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED: bool = false;
 
-/// Rollout gate for requiring the single-node payment multiplier on the
-/// **merkle** path (ADR-0008).
+/// Instant from which a merkle batch payment must carry the same 3x settlement
+/// multiplier the single-node path has always applied (ADR-0008). Unix seconds.
 ///
-/// The single-node path has always settled a chunk at 3x the median quoted
-/// price. The merkle path submitted the bare quoted price as the on-chain
-/// payable amount, so the contract's `median16(amount) x 2^depth` came to 1x
-/// the median per chunk: the same chunk, stored and replicated identically,
-/// earned a third as much when it arrived in a batch. Raising merkle to 3x is
-/// a pricing-policy proposal carried by a paired ant-client PR; it is NOT in
-/// effect yet, and ant-client main still submits bare quoted prices.
+/// The single-node path settles a chunk at 3x the median quoted price. The
+/// merkle path submitted the bare quoted price as the on-chain payable amount,
+/// so the contract's `median16(amount) x 2^depth` came to 1x the median per
+/// padded leaf: the same chunk, stored and replicated identically, earned a
+/// third as much when it arrived in a batch. ant-client applies the multiplier
+/// from the same release train as this constant.
 ///
-/// While `false`, the storer keeps requiring only the 1x amount, so a client
-/// that has not upgraded is still admitted, and every merkle **store**
-/// admission logs what it *would* have required once its payment has fully
-/// validated (target `ant_node::payment::merkle_parity`, keyed by pool hash).
+/// **Enforcement is on by default.** There is no shadow mode and no flag to
+/// flip later: a receipt stamped at or after this instant must settle at 3x or
+/// the store is refused. What the boundary buys is not a soft launch, it is
+/// compatibility with money that was already spent:
 ///
-/// Two conditions before flipping to `true`, both about not rejecting money
-/// that was already paid in good faith and cannot be recovered:
-/// - that telemetry shows uploads settling at parity across the fleet;
-/// - at least the one-week merkle receipt lifetime has elapsed since the last
-///   1x settlement, so no valid in-flight receipt is still priced at 1x.
-pub const MERKLE_PAYMENT_MULTIPLIER_ENFORCED: bool = false;
+/// - A receipt stamped **before** the boundary is held to the historic 1x. It
+///   was paid in good faith under the old rule and the payer cannot get it
+///   back, so refusing it would destroy value rather than protect it.
+/// - Merkle receipts expire after `MERKLE_PAYMENT_EXPIRATION` (one week), and
+///   a receipt stamped in the future is refused outright. So once
+///   `boundary + one week` has passed, **every** still-valid receipt is
+///   necessarily stamped at or after the boundary and the 1x branch becomes
+///   unreachable. It retires itself; nobody has to remember to turn it off.
+/// - That same expiry rule is what stops a client backdating its way out of
+///   the increase. The timestamp is client-supplied, but a stamp early enough
+///   to claim the 1x rule is also old enough to be expired. The evasion window
+///   is exactly the one week the honest grace needs, and it closes on its own.
+///
+/// Set to 2026-08-04 15:00 UTC: one release train after the change ships, so
+/// clients on that train are paying 3x well before any node requires it. The
+/// invariant when moving it is that **it must never be earlier than the
+/// release that carries it** — an earlier value refuses receipts bought under
+/// the previous rule, which is the one outcome this constant exists to avoid.
+pub const MERKLE_PARITY_ENFORCED_FROM_UNIX: u64 = 1_785_855_600;
 
 /// ADR-0004: max unresolved quote pins to fetch per payment bundle.
 ///
