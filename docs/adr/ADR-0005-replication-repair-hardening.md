@@ -593,6 +593,77 @@ at most one trust report per peer per prune pass.
   because it is evidence about the assumption itself rather than about the
   hypothetical.
 
+### 12. Bound the inbound serial queue by message count, and acknowledge its byte ceiling
+
+The receiver hands non-audit messages to the serial loop across a bounded `mpsc`
+(`INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY`, `mod.rs`). The queue exists because
+the receiver must never block: handling inline stalls the loop, and a stalled loop
+laps the P2P broadcast ring (`DEFAULT_EVENT_CHANNEL_CAPACITY`, 1000 upstream) and
+loses messages it never observed — the same failure mode decision 2 removes for
+fresh offers, and the origin of the false audit-challenge timeouts this branch
+fixes. Digest `AuditChallenge`s are fast-pathed past the queue entirely, so bulk
+traffic cannot delay a latency-critical challenge. On overflow the message is
+dropped, not run inline; every serial-lane class has protocol recovery, so a drop
+costs a retry rather than the message.
+
+The bound is **64 messages**, reduced from 256.
+
+**The bound is a count; the resident cost is not.** A queued item is an owned
+decoded `ReplicationMessage` of up to `MAX_REPLICATION_MESSAGE_SIZE` (10 MiB),
+because decode runs on the receiver — *before* admission — to keep deserialization
+off the serial loop. The worst-case resident footprint is therefore
+**64 × 10 MiB = 640 MiB**; at the previous 256 the same arithmetic gave 2.5 GiB.
+Nothing in `try_enqueue_serial_message` accounts for bytes or for the originating
+peer: the only admission test is `mpsc::Sender::try_send`.
+
+This ceiling is **acknowledged, not designed for**, and reaching it takes a
+specific traffic shape rather than ordinary load. What the lane carries is
+narrower than the message enum suggests: `replication_payload_from_event` admits
+one-way `send_message` traffic and request-response **requests**, filtering
+responses out (`.filter(|(_, is_resp, _)| !is_resp)`). An RR response is
+correlated by its own requester — neighbor sync awaits its reply through
+`send_request` (`neighbor_sync.rs`) — so it never enters the lane at all, which
+is why all eight response variants are `Ok(())` no-ops in
+`handle_replication_message`. The queue therefore holds small requests and
+challenges (key lists, nonces) plus one-way traffic, and `FreshReplicationOffer`
+(`fresh.rs`) is its **only large class**: 4 MiB legitimately, 10 MiB from a peer
+that lies about `MAX_CHUNK_SIZE`. That case is real — the size check lives in
+`fresh_offer_structural_rejection`, which runs **on the serial loop**, so an
+oversized offer holds a slot until dequeued and cannot be shed at admission — but
+it is an attack shape, not a load shape.
+
+**Depth should normally sit near zero.** Every dispatcher spawns
+(`dispatch_fresh_offer`, `dispatch_paid_notify`, `dispatch_neighbor_sync_request`,
+`dispatch_verification_request`, `dispatch_fetch_request`); responder admission is
+a non-blocking try-acquire that refuses rather than waits, and the worker permit is
+awaited *inside* the spawned task. The loop drains at dispatch speed, so the queue
+backs up only when arrivals outrun dispatch — a fresh-offer burst, or the inline
+signature verification `ingest_peer_commitment` performs on a sync request.
+
+- **Rejected: keeping 256.** The count was never chosen against a byte budget.
+  640 MiB is a materially better worst case for a bound that no measurement
+  supports in either direction.
+- **Rejected: dropping to 32 or lower.** Not because 32 would shed legitimate
+  traffic — given the drain property above it probably would not — but because
+  there is no evidence either way, and 64 keeps headroom for a fresh-offer burst
+  at a ceiling already an order of magnitude below the old one. Trading that
+  headroom for a tighter ceiling is worth doing only once the depth gauge below
+  exists, and the count is not where that trade should be made.
+- **Deferred, not rejected: byte accounting.** The correct fix is to charge the
+  queue in bytes. The raw `payload.len()` is already in scope at the enqueue site
+  before decode, postcard does not compress so wire length tracks resident size,
+  and the charge can be released by an RAII guard on dequeue — the pattern already
+  used for per-key in-flight state and responder permits. A byte budget also
+  subsumes the oversized-offer case above, charging the offer its real size rather
+  than one slot of 64. Decision 2 sets the precedent by expressing the fresh-offer
+  bound as a 16-permit / 64 MiB payload ceiling.
+
+**Re-open trigger.** `queue_depth` is recorded only when a message is dropped
+(`SerialQueueDrop`), so there is no steady-state depth signal and the 64 is not
+backed by field data. If `serial_queue_drops` or the per-variant overflow counters
+fire under normal load, the first move is to add a high-water depth gauge to the
+traffic summary and size a byte budget from it — not to raise the count again.
+
 ## Consequences
 
 ### Positive
@@ -658,6 +729,12 @@ at most one trust report per peer per prune pass.
 - **Accepted far-copy durability risk.** A complete local width-20 view is a
   distance statement, not a possession proof. Fast deletion can remove the last
   surviving copy after hysteresis if replication failed across all closer peers.
+- **Inbound serial queue bounded by count, not bytes.** At 64 slots holding owned
+  decoded messages of up to 10 MiB, the queue's worst-case resident footprint is
+  640 MiB — a ceiling that is acknowledged rather than designed for, and one no
+  field measurement currently supports or refutes. It is reachable only by a peer
+  sustaining oversized fresh offers, the lane's one large class; byte accounting
+  is the real fix and is deferred. See decision 12, including its re-open trigger.
 
 ### Neutral / Operational
 
@@ -673,7 +750,9 @@ at most one trust report per peer per prune pass.
   `mod.rs`), `MAX_HINT_SOURCES_PER_KEY` (8, `scheduling.rs`), the paid-list edge
   ceiling `PAID_LIST_FLEX_EDGE_COUNT` (4) with its
   `PAID_LIST_FLEX_EDGE_DIVISOR` (5) scaling, and
-  `PAID_LIST_ABSOLUTE_CONFIRM_FLOOR` (3). The two responsibility
+  `PAID_LIST_ABSOLUTE_CONFIRM_FLOOR` (3),
+  `INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY` (256 -> 64, `mod.rs`; decision 12).
+  The two responsibility
   widths (`storage_admission_width` = 9, `paid_list_close_group_size` = 20) are
   unchanged and shared with ADR-0003.
 - Prune passes use bounded candidate, request, and local fast-delete counts. The

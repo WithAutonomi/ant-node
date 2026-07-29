@@ -967,10 +967,21 @@ const RR_PREFIX: &str = "/rr/";
 /// replication processing.
 ///
 /// The receiver fast-paths digest `AuditChallenge`s immediately and queues
-/// bulk/non-audit messages here. If this fills, the receiver handles the
-/// message inline instead of dropping it, preserving delivery while bounding
-/// memory.
-const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 256;
+/// bulk/non-audit messages here. If this fills, the message is **dropped** —
+/// `start_message_handler` must never block on a full queue, because a stalled
+/// receiver laps the P2P broadcast ring and silently loses messages it never
+/// observed. Every serial-lane class has protocol recovery, so a drop costs a
+/// retry rather than the message.
+///
+/// This bounds a message COUNT, but a queued item is an owned decoded message
+/// of up to [`config::MAX_REPLICATION_MESSAGE_SIZE`], so the resident worst
+/// case is 64 × 10 MiB = 640 MiB. That ceiling is acknowledged, not designed
+/// for: the lane carries small requests and challenges alongside
+/// `FreshReplicationOffer`, its one multi-MiB class, so no single count is
+/// right for both. Responses never reach here — `replication_payload_from_event`
+/// filters them out and their requesters correlate them. ADR-0005 decision 12
+/// records the trade and why byte accounting is the correct eventual fix.
+const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 64;
 
 /// Maximum fresh-replication offers processed concurrently, away from the
 /// serial non-audit loop.
