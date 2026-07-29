@@ -2144,9 +2144,25 @@ impl ReplicationEngine {
                         let delay_max = config.possession_check_delay_max;
                         detached_task_tracker.spawn(async move {
                             let delay = possession::random_delay(delay_min, delay_max);
+                            // Race shutdown against the whole settle-then-probe
+                            // sequence, not just the sleep. Once a check starts it
+                            // may park on the per-target audit coordinator, which
+                            // has no deadline of its own: with the settle delay
+                            // inside the branch BODY the select is already resolved,
+                            // so those waiters would drain only at the probe timeout
+                            // (roughly `queued / per-target-limit` probes deep) while
+                            // `detached_task_tracker.wait()` — deliberately unbounded
+                            // for the LMDB contract — held shutdown open.
+                            //
+                            // Dropping this future mid-probe is safe and is the same
+                            // shape the neighbor-sync round uses: a parked coordinator
+                            // acquire releases its counted reference via
+                            // `ReferenceGuard`, and a dropped LMDB `spawn_blocking` is
+                            // covered by the storage-quiescence wait in `shutdown`.
                             tokio::select! {
                                 () = shutdown.cancelled() => {}
-                                () = tokio::time::sleep(delay) => {
+                                () = async {
+                                    tokio::time::sleep(delay).await;
                                     possession::run_possession_check(
                                         event.key,
                                         event.peers,
@@ -2158,7 +2174,7 @@ impl ReplicationEngine {
                                         &shutdown,
                                     )
                                     .await;
-                                }
+                                } => {}
                             }
                         });
                     }
