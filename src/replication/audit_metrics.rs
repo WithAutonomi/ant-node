@@ -533,7 +533,7 @@ pub fn record_responder_staleness_shed(class: ReplicationResponderClass) {
 }
 
 /// One class's admission pressure, read together for a summary line.
-#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
 struct ResponderAdmissionSnapshot {
     global_pool: u64,
     per_peer_share: u64,

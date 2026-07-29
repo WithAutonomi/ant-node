@@ -50,7 +50,7 @@ pub const PAID_LIST_CLOSE_GROUP_SIZE: usize = 20;
 /// paid close group. Undersized groups keep their ordinary strict majority.
 ///
 /// This is a **ceiling**, not a fixed width: the effective edge is scaled to
-/// the group by [`paid_list_flex_edge_count`] so the discount stays
+/// the group by [`ReplicationConfig::paid_list_flex_edge_count`] so the discount stays
 /// proportionate. A fixed four peers is a fifth of the production width but
 /// would be four fifths of a configured width of five, collapsing the voting
 /// core to a single peer.
