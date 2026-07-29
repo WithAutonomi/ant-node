@@ -3,10 +3,12 @@
 //!
 //! The audit's round 2 used to make a challenged peer return the **complete
 //! original bytes** of the sampled chunks (up to two 4 MiB chunks per response),
-//! which turned proof-of-storage into the fleet's second-largest bandwidth cost
-//! (~7.5 TB/day). This module replaces that with a two-chain verified slice: the
-//! response for one opened 1 KiB block is a few KB instead of a full chunk, a
-//! ~1000× reduction.
+//! at 5.8 to 6.2 MB per response measured in production. What that cost the
+//! fleet per day moved with the audit *rate*, not the response size, so
+//! frequency caps could move the daily total but never the cost of an
+//! individual audit. This module replaces the response shape instead: one
+//! opened 1 KiB block is a few KB rather than a full chunk, about 427x smaller,
+//! and that holds whatever the rate does.
 //!
 //! Two axes move in opposite directions, and it is worth separating them. The
 //! *freshness* construction gets strictly stronger: the nonce now enters every
@@ -64,13 +66,23 @@
 //! the difference, and it is inherent: verifying every byte means moving every
 //! byte.
 //!
+//! For `p^leaves` to describe *detection* rather than merely a pass, declining
+//! to answer must not be cheaper than answering. The responder sees the drawn
+//! blocks before it replies, so an unanswered round 2 following a valid round-1
+//! proof revokes the holder credit for the commitment under audit (see
+//! `storage_commitment_audit::round2_revokes_pinned_credit`). It stays in the
+//! graced timeout lane and costs no trust, so an honest dropped reply is
+//! harmless; what it removes is the option of holding credit while never
+//! completing a possession check.
+//!
 //! Be precise about the comparison, in both directions:
 //!
 //! - Against a node under-storing **in bulk** — the realistic case, a node
 //!   dropping data to save disk — detection is close to what the full-byte
-//!   audit gave, at ~1/1000 of the egress (measured 417× on a same-network
-//!   control cohort: 14.49 KB against 6.19 MB). A 990-node run caught a 256 MB
-//!   in-place corruption on the first audit that reached the node.
+//!   audit gave, at roughly 1/430 of the egress (measured about 427x on a
+//!   same-network control cohort: 14.49 KB against 6.19 MB). A 990-node run
+//!   caught a 256 MB in-place corruption on the first audit that reached the
+//!   node.
 //! - Against a **fine-grained** partial deleter, one shaving a little off every
 //!   chunk, this is strictly weaker per audit than serving every byte. The
 //!   compensating lever is audit *frequency*, which is exactly what the cost
@@ -111,7 +123,7 @@ const BLOCK_KEY_CONTEXT: &str = "autonomi.ant.audit.slice.block-key.v1";
 /// nonce, the challenged peer and the chunk key. Constant across a chunk's blocks.
 ///
 /// Uses BLAKE3's `derive_key` mode, the same construction as the possession
-/// lane's [`compute_audit_digest`] — that is what ADR-0007's "one freshness
+/// lane's [`compute_audit_digest`] — that is what ADR-0009's "one freshness
 /// derivation across all audit lanes" means concretely. `derive_key` separates
 /// domains at the mode level (its own flag bits), so this key cannot collide
 /// with a plain or keyed hash of the same bytes; a plain hash over a domain
@@ -326,6 +338,13 @@ pub fn verify_nonced_block(
     if siblings.len() != nonced_tree_depth(block_count) {
         return false;
     }
+    // An index past the last block names no leaf of the committed tree, so there
+    // is nothing it could legitimately open. Production requests are always in
+    // range; rejecting here makes a malformed or forged one fail deterministically
+    // and cheaply, rather than folding a hash chain to reach the same answer.
+    if index >= block_count {
+        return false;
+    }
     let mut node_index = index as usize;
     let mut cur = nonced_block_leaf(nonce, peer, key, index, block);
     for sibling in siblings {
@@ -490,6 +509,15 @@ pub fn verify_block_slice(
         return None;
     }
 
+    // Reject an out-of-range index outright. `block_range` clamps one to the
+    // empty range `[content_len, content_len)`, which would decode to an empty
+    // block and return `Some(vec![])` — a malformed request reading as a
+    // partially valid answer. Nothing legitimate opens a block that does not
+    // exist.
+    if index >= block_count(content_len) {
+        return None;
+    }
+
     let (start, end) = block_range(content_len, index);
     let len = end - start;
     let hash = blake3::Hash::from_bytes(*address);
@@ -564,6 +592,39 @@ mod tests {
                 "bao root must equal blake3(content) at len {len}"
             );
         }
+    }
+
+    // Both verifiers reject a block index past the end of the chunk. Nothing the
+    // auditor generates is ever out of range, so this is about failing cleanly:
+    // `block_range` clamps an over-large index to an empty range, which without
+    // the check reads back as a successfully verified empty block rather than as
+    // the malformed request it is.
+    #[test]
+    fn verifiers_reject_a_block_index_past_the_end() {
+        let len = 4096usize;
+        let content = content_of(len);
+        let address = *blake3::hash(&content).as_bytes();
+        let count = block_count(len as u64);
+
+        // A real slice for the last block does not become a valid opening for a
+        // block that does not exist.
+        let slice = extract_block_slice(&content, count - 1).expect("extract");
+        assert!(
+            verify_block_slice(&slice, &address, len as u64, count).is_none(),
+            "the first index past the end must be rejected, not read as empty"
+        );
+        assert!(verify_block_slice(&slice, &address, len as u64, u32::MAX).is_none());
+
+        // Same on the possession chain, with a genuine sibling path.
+        let siblings =
+            nonced_block_siblings(&NONCE, &PEER, &KEY, &content, count - 1).expect("siblings");
+        let root = nonced_block_root(&NONCE, &PEER, &KEY, &content);
+        let (s, e) = block_range(len as u64, count - 1);
+        let block = &content[s as usize..e as usize];
+        assert!(
+            !verify_nonced_block(&NONCE, &PEER, &KEY, count, block, &siblings, &root, count),
+            "an index past the last leaf names nothing in the committed tree"
+        );
     }
 
     #[test]
@@ -877,7 +938,7 @@ mod tests {
         }
     }
 
-    // ADR-0007 claims ONE freshness derivation across every audit lane. That is
+    // ADR-0009 claims ONE freshness derivation across every audit lane. That is
     // only true if this lane and the possession lane derive their key the same
     // way: BLAKE3 `derive_key` mode over `nonce ‖ peer ‖ key`, under a
     // per-lane context string. The slice lane previously used a plain hash with
