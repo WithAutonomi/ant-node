@@ -41,6 +41,30 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 /// Set to 256 MiB — enough for millions of LMDB pages.
 const MIN_MAP_SIZE: usize = 256 * 1024 * 1024;
 
+/// Maximum head-room (beyond the current data footprint) to reserve for the
+/// LMDB map **on Windows**.
+///
+/// On Windows a node's committed / private memory scales with the *mapped*
+/// size rather than with the data actually stored. Measured on a live node:
+/// ~7.4 GB of extra commit for a ~3.7 TiB map, versus ~181 MB for a ~55 GiB
+/// map — roughly 0.2% of the mapped size, resident and attributed to *no*
+/// user-space allocation. That size-proportional cost is consistent with
+/// kernel page tables / section metadata for the mapping; the exact kernel
+/// structure was inferred from the scaling rather than measured directly, but
+/// the size-proportional *effect* is what this cap targets. Linux keeps the
+/// mapping sparse, so a disk-sized map is nearly free there — the overhead is
+/// Windows-specific, which is why it only surfaced in Windows reports.
+///
+/// Sizing the map to the whole disk therefore costs ~0.2% of *free disk* per
+/// node, multiplied by every node sharing the host (e.g. a 10 TiB partition ≈
+/// 20 GiB). We instead cap the head-room on Windows and lean on
+/// `LmdbStorage::try_resize` to extend the map on demand as data accumulates,
+/// keeping the overhead proportional to *stored data* rather than *disk
+/// capacity*. At 32 GiB the extra commit is ~100 MB, and a resize happens at
+/// most once per 32 GiB written.
+#[cfg(windows)]
+const WINDOWS_MAP_HEADROOM: u64 = 32 * GIB;
+
 /// How often to re-query available disk space (in seconds).
 ///
 /// Between checks the cached result is trusted.  Disk space changes slowly
@@ -189,7 +213,8 @@ impl LmdbStorage {
             // Auto-scale: current DB footprint + available space − reserve.
             let computed = compute_map_size(&env_dir, config.disk_reserve)?;
             info!(
-                "Auto-computed LMDB map size: {:.2} GiB (available disk minus {:.2} GiB reserve)",
+                "Auto-computed LMDB map size: {:.2} GiB (data + available disk minus {:.2} GiB \
+                 reserve, head-room capped on Windows to bound page-table overhead)",
                 bytes_to_gib(computed as u64),
                 bytes_to_gib(config.disk_reserve),
             );
@@ -572,8 +597,9 @@ impl LmdbStorage {
         let keys = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<Vec<XorName>> {
-                // Shared lock: blocks a concurrent map resize (which takes the
-                // exclusive lock) from running while this read txn is open.
+                // Hold the shared lock for the whole read so try_resize() (which
+                // takes the exclusive lock before the unsafe Env::resize()) cannot
+                // unmap the environment while this txn and its cursor are live.
                 let _guard = lock.read();
                 let rtxn = env
                     .read_txn()
@@ -623,8 +649,8 @@ impl LmdbStorage {
         let value = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<Option<Vec<u8>>> {
-                // Shared lock: blocks a concurrent map resize (which takes the
-                // exclusive lock) from running while this read txn is open.
+                // Shared lock held until the bytes are copied out, so a concurrent
+                // try_resize() cannot unmap the environment mid-read. See all_keys.
                 let _guard = lock.read();
                 // Test-only: parks here, still holding the shared lock, while a
                 // test holds the write half — used to prove a resize waits.
@@ -799,6 +825,11 @@ enum PutOutcome {
 /// it back ensures the map is always large enough for the data already
 /// stored.
 ///
+/// On Windows the disk-headroom term is additionally capped at
+/// `WINDOWS_MAP_HEADROOM` to bound the map-proportional commit overhead (see
+/// that constant); [`LmdbStorage::try_resize`] extends the map on demand as
+/// data grows.
+///
 /// The result is page-aligned and never falls below [`MIN_MAP_SIZE`].
 fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let available = fs2::available_space(db_dir)
@@ -808,10 +839,7 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let mdb_file = db_dir.join("data.mdb");
     let current_db_bytes = std::fs::metadata(&mdb_file).map_or(0, |m| m.len());
 
-    // available_space excludes the DB file, so we add it back to get the
-    // total space the DB could occupy while still leaving `reserve` free.
-    let growth_room = available.saturating_sub(reserve);
-    let target = current_db_bytes.saturating_add(growth_room);
+    let target = map_target_bytes(current_db_bytes, available, reserve);
 
     // Align up to system page size (required by heed's resize).
     let page = page_size::get() as u64;
@@ -819,6 +847,28 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
 
     let result = usize::try_from(aligned).unwrap_or(usize::MAX);
     Ok(result.max(MIN_MAP_SIZE))
+}
+
+/// Head-room policy for the LMDB map, split out from [`compute_map_size`] so it
+/// is unit-testable without touching the real filesystem.
+///
+/// `map = current_db_bytes + max(0, available − reserve)`, with the head-room
+/// term capped at `WINDOWS_MAP_HEADROOM` on Windows. Existing data
+/// (`current_db_bytes`) is always covered so a resize can never truncate the
+/// database, even when the head-room cap or a nearly-full disk drives the
+/// growth term to zero.
+fn map_target_bytes(current_db_bytes: u64, available: u64, reserve: u64) -> u64 {
+    // available_space excludes the DB file, so we add it back to get the
+    // total space the DB could occupy while still leaving `reserve` free.
+    let growth_room = available.saturating_sub(reserve);
+
+    // On Windows, bound the head-room so the mapped size (and its
+    // size-proportional commit overhead) stays proportional to stored data
+    // rather than disk capacity. Elsewhere, use all reachable space.
+    #[cfg(windows)]
+    let growth_room = growth_room.min(WINDOWS_MAP_HEADROOM);
+
+    current_db_bytes.saturating_add(growth_room)
 }
 
 /// Reject the write early if available disk space is below `reserve`.
@@ -855,6 +905,91 @@ mod tests {
     const RESIZE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
     /// Generous ceiling for `try_resize` to complete once the raw read releases.
     const RESIZE_COMPLETE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[test]
+    fn map_target_covers_existing_data_and_headroom() {
+        // A partition with far more free space than any node needs.
+        let huge_free = 100 * 1024 * GIB; // 100 TiB
+        let reserve = 500 * MIB;
+
+        // Fresh node, no data yet.
+        let fresh = map_target_bytes(0, huge_free, reserve);
+        // Node already holding 16 GiB of chunks.
+        let with_data = map_target_bytes(16 * GIB, huge_free, reserve);
+
+        #[cfg(windows)]
+        {
+            // Windows: head-room is capped, so the map (and thus page tables)
+            // stay bounded regardless of disk size. Existing data always sits
+            // on top of the capped head-room.
+            assert_eq!(fresh, WINDOWS_MAP_HEADROOM);
+            assert_eq!(with_data, 16 * GIB + WINDOWS_MAP_HEADROOM);
+            // Sanity: page-table cost (~map/512) is tens of MiB, not tens of GiB.
+            assert!(with_data / 512 < 128 * MIB);
+        }
+
+        #[cfg(not(windows))]
+        {
+            // Other platforms keep the disk-sized map (lazy page tables cost
+            // nothing), so head-room is the full free span minus reserve.
+            assert_eq!(fresh, huge_free - reserve);
+            assert_eq!(with_data, 16 * GIB + (huge_free - reserve));
+        }
+    }
+
+    #[test]
+    fn map_target_never_truncates_data_when_disk_nearly_full() {
+        // Free space below the reserve → head-room saturates to 0 on every
+        // platform, but the existing 4 GiB of data must still be covered.
+        assert_eq!(map_target_bytes(4 * GIB, 100 * MIB, 500 * MIB), 4 * GIB);
+    }
+
+    /// Regression (V2-620 review): `all_keys` and `get_raw` must take the shared
+    /// `env_lock` so their LMDB read transaction can never run concurrently with
+    /// `try_resize()`'s unsafe `Env::resize()` — which this PR turns into a
+    /// routine ~per-32-GiB Windows event. We prove it by holding the exclusive
+    /// lock (as a resize does) and asserting both calls block until it is freed.
+    ///
+    /// Holding a `parking_lot` guard across `.await` is deliberate and safe here:
+    /// the guard stays on this current-thread test task while `all_keys`/`get_raw`
+    /// run their blocking work on the `spawn_blocking` pool (separate threads).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn read_paths_block_while_env_is_being_resized() {
+        use std::time::Duration;
+        let (storage, _temp) = create_test_storage().await;
+
+        // Store one chunk so the read paths have real work to return.
+        let content = b"resize-safety";
+        let address = LmdbStorage::compute_address(content);
+        storage.put(&address, content).await.expect("put");
+
+        // Simulate a resize in progress: hold the exclusive env lock.
+        let write_guard = storage.env_lock.write();
+
+        // Neither read path may complete while the exclusive lock is held —
+        // before the fix they took no lock and would return immediately.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), storage.all_keys())
+                .await
+                .is_err(),
+            "all_keys completed while env_lock was held exclusively — missing shared guard"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), storage.get_raw(&address))
+                .await
+                .is_err(),
+            "get_raw completed while env_lock was held exclusively — missing shared guard"
+        );
+
+        // Once the exclusive lock is released, both proceed and see the data.
+        drop(write_guard);
+        assert_eq!(storage.all_keys().await.expect("all_keys").len(), 1);
+        assert_eq!(
+            storage.get_raw(&address).await.expect("get_raw").as_deref(),
+            Some(content.as_slice())
+        );
+    }
 
     async fn create_test_storage() -> (LmdbStorage, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
