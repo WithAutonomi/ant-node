@@ -1010,23 +1010,6 @@ fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
     }
 }
 
-/// Whether `protocol` is one of the two audit families, which carry only small
-/// bodies and so take the tighter [`MAX_AUDIT_MESSAGE_SIZE`] wire ceiling.
-fn is_audit_protocol(protocol: &str) -> bool {
-    protocol == SUBTREE_AUDIT_PROTOCOL_ID || protocol == POSSESSION_AUDIT_PROTOCOL_ID
-}
-
-/// Bytes of chunk content a round-1 proof covered.
-///
-/// One leaf per chunk read from LMDB and hashed twice (plain and nonced), so
-/// this is the read-and-hash cost of the proof and what it owes the responder's
-/// work budget.
-fn subtree_proof_content_bytes(proof: &crate::replication::subtree::SubtreeProof) -> i64 {
-    proof.leaves.iter().fold(0i64, |acc, leaf| {
-        acc.saturating_add(i64::from(leaf.content_len))
-    })
-}
-
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::FreshReplication
 }
@@ -1784,8 +1767,9 @@ impl ReplicationEngine {
     /// Drains scheduled possession-check events and, for each, waits a
     /// randomised 5-15 minute settle delay before probing every responsible
     /// peer for actual possession. A peer that cryptographically fails to prove
-    /// possession, including by timeout, is penalised at `AuditChallenge`
-    /// severity.
+    /// possession is penalised at `AuditChallenge` severity. A peer that simply
+    /// does not answer normally is too, but that is suspended for the
+    /// possession-audit protocol rollout — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`.
     fn start_possession_check_scheduler(&mut self) {
         let Some(mut rx) = self.possession_check_rx.take() else {
             return;
@@ -3497,7 +3481,8 @@ async fn handle_replication_message(
     subtree_round1: &SubtreeRound1Limiter,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // Size guard BEFORE decoding, for the audit families only.
+    // Size guard BEFORE decoding, keyed on the BODY's family — not on the id the
+    // message arrived on.
     //
     // Every later check — protocol family, live round-1 session, responder
     // admission — reads fields of the decoded body, so none of them can run
@@ -3505,13 +3490,26 @@ async fn handle_replication_message(
     // node do, and the audit bodies carry variable-length collections, so under
     // the 10 MiB core ceiling a sessionless peer could force multi-megabyte
     // allocation and decode work per message with nothing spent on its side.
-    // The encoded length needs no parsing, so it is the one check that can come
-    // before decode. Audit bodies are ~110 KiB at worst (see
-    // `MAX_AUDIT_MESSAGE_SIZE`), so a tighter family ceiling costs honest
-    // traffic nothing.
-    if is_audit_protocol(inbound_protocol) && data.len() > MAX_AUDIT_MESSAGE_SIZE {
+    // Audit bodies are ~110 KiB at worst (see `MAX_AUDIT_MESSAGE_SIZE`), so a
+    // tighter family ceiling costs honest traffic nothing.
+    //
+    // Selecting that ceiling from `inbound_protocol` did NOT close the path it
+    // claimed to: an audit body addressed to the CORE id skipped the audit
+    // ceiling entirely, was decoded under the 10 MiB allowance, and only then
+    // dropped by `body_matches_protocol` — after its collections had been
+    // allocated. A `SubtreeSliceChallenge` carrying 200,000 openings encodes to
+    // ~6.6 MB and sailed through. The ceiling has to follow the body, and the
+    // body's discriminant is readable from the first few bytes without decoding
+    // anything attacker-sized, so it can be read first.
+    //
+    // A prefix too malformed to classify gets the strict ceiling: a message we
+    // cannot classify is not one to decode generously.
+    let peeked_family = protocol::peek_variant_index(data).map(protocol::family_of_variant);
+    let is_audit_body = peeked_family.map_or(true, protocol::BodyFamily::is_audit);
+    if is_audit_body && data.len() > MAX_AUDIT_MESSAGE_SIZE {
         debug!(
-            "Dropping oversized {inbound_protocol} message from {source}: {} bytes > {MAX_AUDIT_MESSAGE_SIZE}",
+            "Dropping oversized audit-family message from {source} on {inbound_protocol}: \
+             {} bytes > {MAX_AUDIT_MESSAGE_SIZE}",
             data.len()
         );
         return Ok(());
@@ -3638,7 +3636,8 @@ async fn handle_replication_message(
             // block all other replication traffic until its digests complete
             // (head-of-line blocking). The same flood-fair admission applies: a
             // global ceiling AND a per-peer cap, dropping the challenge if either
-            // is hit. Responsible/prune audit timeouts are penalised by the
+            // is hit. A dropped challenge reads as a timeout to the auditor, and
+            // once the rollout gate is removed that is penalised again by the
             // caller, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
             let guard = match admit_audit_responder(
@@ -3721,7 +3720,10 @@ async fn handle_replication_message(
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             tokio::spawn(async move {
                 let _guard = guard; // heavy permit + per-peer slot, held until done
-                let response = storage_commitment_audit::handle_subtree_challenge(
+                let storage_commitment_audit::Round1Work {
+                    response,
+                    content_bytes,
+                } = storage_commitment_audit::handle_subtree_challenge_measured(
                     &challenge,
                     &storage,
                     p2p_node.peer_id(),
@@ -3729,24 +3731,26 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                // Charge the work actually done, on EVERY outcome.
+                //
+                // This used to charge only the `Proof` arm, reasoning that the
+                // rejecting paths either read nothing or reflected this node's
+                // own broken storage. The second half of that was wrong: a
+                // retained commitment containing one unreadable key still costs
+                // a full run of reads and keyed-BLAKE3 passes over every leaf
+                // before it, and then rejects. An attacker who finds such a
+                // commitment could replay subtrees over it indefinitely for
+                // free. The per-peer cooldown does not catch that either, since
+                // it is escapable by rotating identity — the responder-wide
+                // budget is the only bound that applies, so it has to see the
+                // work. A zero charge is a no-op, so the untouched paths are
+                // unaffected.
+                subtree_round1.charge_work(content_bytes).await;
                 // A round-1 proof authorizes exactly one matching round 2: open a
                 // single-use session so a slice challenge cannot be served without
                 // a live round-1 exchange.
-                //
-                // Charge the work budget here too, for the bytes this proof
-                // actually covered. Only the `Proof` arm needs charging: every
-                // rejection an auditor can provoke (wrong target, no commitment
-                // state, unknown pin, unplannable subtree) returns before a
-                // single chunk is read, and the two that do read — a committed
-                // key missing from the store, or a persistent read error — turn
-                // on this node's own storage rather than on anything the caller
-                // sends.
-                if let crate::replication::protocol::SubtreeAuditResponse::Proof { proof, .. } =
-                    &response
+                if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
                 {
-                    subtree_round1
-                        .charge_work(subtree_proof_content_bytes(proof))
-                        .await;
                     subtree_round1
                         .open_session(
                             source,

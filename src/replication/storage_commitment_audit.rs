@@ -251,10 +251,15 @@ enum SliceRound {
     /// recently pinned commitment).
     Rejected,
     /// The responder rejected with `Transient` (a local read error): routed to
-    /// the non-response/timeout lane — no trust penalty, but holder credit is
-    /// revoked, because the peer answered and could not prove possession, so it
-    /// must not keep stale credit. Distinct from a silent network `Timeout`,
-    /// which keeps credit (a dropped packet is not evidence of loss).
+    /// the non-response/timeout lane — no trust penalty, but the pinned
+    /// commitment's holder credit is revoked, because the peer answered and
+    /// could not prove possession, so it must not keep stale credit.
+    ///
+    /// This lands in the same place as [`SliceRound::Timeout`] below, which also
+    /// revokes commitment-scoped credit without a trust penalty. The two are
+    /// kept separate because they say different things about the peer — one
+    /// could not read its disk, the other did not reply at all — and only the
+    /// reason is logged differently.
     TransientReject,
     /// No response within the slice deadline, or a transport error. Routed to
     /// the non-response/timeout lane: no trust penalty, but the pinned
@@ -1075,13 +1080,80 @@ fn subtree_failure_summary(reason: &AuditFailureReason) -> AuditFailureSummary {
 /// nonce-selected branch. If this node is bootstrapping it says so; if it
 /// genuinely does not retain the pinned commitment it rejects (which, with audit
 /// grace removed, the auditor treats as a confirmed failure for an in-window pin).
-#[allow(clippy::too_many_lines)]
 pub async fn handle_subtree_challenge(
     challenge: &SubtreeAuditChallenge,
     storage: &LmdbStorage,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> SubtreeAuditResponse {
+    handle_subtree_challenge_measured(
+        challenge,
+        storage,
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+    )
+    .await
+    .response
+}
+
+/// A round-1 response together with the chunk bytes spent producing it.
+pub struct Round1Work {
+    /// What to send back.
+    pub response: SubtreeAuditResponse,
+    /// Chunk content read from LMDB and hashed BEFORE this response was
+    /// produced.
+    ///
+    /// Counted on the rejecting paths too, which is the point. A subtree is read
+    /// leaf by leaf, so a commitment holding one unreadable key still costs a
+    /// full run of reads and keyed-BLAKE3 passes over every leaf before it. If
+    /// only the `Proof` arm were charged, an attacker who found such a
+    /// commitment could replay subtrees over it indefinitely for free — and
+    /// since the per-peer cooldown is escapable by rotating identity, the
+    /// responder-wide work budget is the only bound that would have caught it.
+    pub content_bytes: i64,
+}
+
+/// [`handle_subtree_challenge`], additionally reporting the read-and-hash work
+/// it performed so the caller can charge it on every exit path.
+pub async fn handle_subtree_challenge_measured(
+    challenge: &SubtreeAuditChallenge,
+    storage: &LmdbStorage,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+) -> Round1Work {
+    // The accumulator is threaded in rather than returned per-arm so that every
+    // exit reports its work by construction: a new early return cannot forget to
+    // account for the reads that already happened.
+    let mut content_bytes = 0i64;
+    let response = subtree_challenge_response(
+        challenge,
+        storage,
+        self_peer_id,
+        is_bootstrapping,
+        commitment_state,
+        &mut content_bytes,
+    )
+    .await;
+    Round1Work {
+        response,
+        content_bytes,
+    }
+}
+
+/// The round-1 responder proper. `content_bytes` accrues the chunk content read
+/// and hashed so far, and is meaningful on every return path, not just the
+/// successful one.
+#[allow(clippy::too_many_lines)]
+async fn subtree_challenge_response(
+    challenge: &SubtreeAuditChallenge,
+    storage: &LmdbStorage,
+    self_peer_id: &PeerId,
+    is_bootstrapping: bool,
+    commitment_state: Option<&Arc<ResponderCommitmentState>>,
+    content_bytes: &mut i64,
 ) -> SubtreeAuditResponse {
     if is_bootstrapping {
         return SubtreeAuditResponse::Bootstrapping {
@@ -1175,6 +1247,14 @@ pub async fn handle_subtree_challenge(
                 };
             }
         };
+        // Charge at the READ, not at the end. The disk read and the keyed-BLAKE3
+        // pass below are both already owed at this point, and every remaining
+        // exit from this loop — a later missing key, a persistent read error, a
+        // failed hashing task — discards the leaves but not the work. Accruing
+        // here is what makes a commitment with one bad key cost the attacker
+        // something per replay instead of nothing.
+        *content_bytes =
+            content_bytes.saturating_add(i64::try_from(bytes.len()).unwrap_or(i64::MAX));
         // Hash the leaf (a full keyed-BLAKE3 pass over the chunk) on a blocking
         // thread, not the async worker: a maximal subtree is ~sqrt(N) leaves of up
         // to MAX_CHUNK_SIZE each, so doing this inline would tie up a Tokio worker

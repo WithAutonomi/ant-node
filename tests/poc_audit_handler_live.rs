@@ -32,7 +32,7 @@ use ant_node::replication::protocol::{
 };
 use ant_node::replication::slice::{nonced_block_root, verify_block_slice, verify_nonced_block};
 use ant_node::replication::storage_commitment_audit::{
-    handle_subtree_challenge, handle_subtree_slice_challenge,
+    handle_subtree_challenge, handle_subtree_challenge_measured, handle_subtree_slice_challenge,
 };
 use ant_node::replication::subtree::{verify_subtree_proof, StructureVerdict};
 use ant_node::storage::{LmdbStorage, LmdbStorageConfig};
@@ -333,6 +333,102 @@ async fn committed_key_with_missing_bytes_is_rejected() {
         }
         other => panic!("expected Rejected(missing bytes), got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 5b. Partial round-1 work is charged even when the response is a rejection
+// ---------------------------------------------------------------------------
+
+/// A successful proof reports exactly the chunk content it read and hashed.
+/// Anchors the rejection case below: it fixes what the measurement means.
+#[tokio::test]
+async fn round1_proof_reports_the_content_it_read() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let challenge = challenge_for(&r, r.current_hash(), [0x11u8; 32]);
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    let SubtreeAuditResponse::Proof { ref proof, .. } = work.response else {
+        panic!("expected Proof, got {:?}", work.response);
+    };
+    let from_proof: i64 = proof
+        .leaves
+        .iter()
+        .map(|leaf| i64::from(leaf.content_len))
+        .sum();
+    assert_eq!(
+        work.content_bytes, from_proof,
+        "reported work must equal the content the proof covers"
+    );
+    assert!(work.content_bytes > 0, "a real proof reads real bytes");
+}
+
+/// Regression (dirvine, PR #181): round 1 reads and hashes leaf by leaf, so a
+/// commitment holding ONE unreadable key still costs a full run of reads and
+/// keyed-BLAKE3 passes over every leaf before it — and then rejects.
+///
+/// The responder used to charge its work budget only on the `Proof` arm, so
+/// that run was free. An attacker who found such a commitment could replay
+/// subtrees over it indefinitely at no cost, and the per-peer cooldown does not
+/// help because it is escapable by rotating identity — the responder-wide budget
+/// is the only bound that applies to this, so it has to see the work.
+///
+/// FLIPS IF: the accounting goes back to charging only successful proofs.
+#[tokio::test]
+async fn rejected_round1_still_reports_the_work_it_spent() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+
+    // Find a nonce whose selected subtree spans more than one leaf, then delete
+    // the bytes behind its LAST leaf only. Everything before it is readable, so
+    // the responder does real work and then hits the hole.
+    let challenge = challenge_for(&r, pin, [0x11u8; 32]);
+    let baseline =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+    let SubtreeAuditResponse::Proof { ref proof, .. } = baseline.response else {
+        panic!("expected a baseline Proof, got {:?}", baseline.response);
+    };
+    assert!(
+        proof.leaves.len() > 1,
+        "need a multi-leaf subtree for partial work to exist; got {}",
+        proof.leaves.len()
+    );
+    let last_leaf = proof.leaves.last().expect("non-empty");
+    let (last, deleted_len) = (last_leaf.key, i64::from(last_leaf.content_len));
+    let baseline_bytes = baseline.content_bytes;
+    storage.delete(&last).await.expect("delete last leaf chunk");
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match work.response {
+        SubtreeAuditResponse::Rejected { ref reason, .. } => {
+            assert!(
+                reason.contains("missing bytes for committed key"),
+                "expected the missing-bytes rejection, got: {reason}"
+            );
+        }
+        ref other => panic!("expected Rejected(missing bytes), got {other:?}"),
+    }
+    assert!(
+        work.content_bytes > 0,
+        "the leaves read before the hole must be charged, not written off"
+    );
+    // Everything except the deleted leaf was read, so the charge is the
+    // baseline minus that one leaf.
+    assert_eq!(
+        work.content_bytes,
+        baseline_bytes - deleted_len,
+        "charge must cover exactly the leaves actually read"
+    );
 }
 
 // ---------------------------------------------------------------------------

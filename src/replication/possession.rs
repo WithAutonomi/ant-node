@@ -15,10 +15,17 @@
 //! push is irrelevant: a peer the push never reached is still checked and
 //! penalised if it lacks the chunk.
 //!
-//! A peer unreachable at check time is penalised immediately at audit severity,
-//! matching the responsible-chunk `AuditChallenge` path. A matching bootstrap
-//! claim uses the shared bootstrap-claim grace/abuse tracker; peer-side
-//! malformed, rejected, or mismatched responses are audit failures.
+//! Peer-side malformed, rejected, or mismatched responses are audit failures. A
+//! matching bootstrap claim uses the shared bootstrap-claim grace/abuse tracker.
+//!
+//! A peer unreachable at check time would normally be penalised at audit
+//! severity too, matching the responsible-chunk `AuditChallenge` path, but that
+//! is currently suspended: this lane moved to its own protocol id, so a peer on
+//! the far side of the upgrade never answers, and
+//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] graces silence until the fleet has moved
+//! over. See `probe_outcome_is_penalised`.
+//!
+//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: crate::replication::config::GRACE_POSSESSION_AUDIT_TIMEOUTS
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,6 +64,7 @@ pub struct PossessionCheckEvent {
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
+#[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum ProbeOutcome {
     /// Peer returned a digest proving it holds the chunk's bytes.
@@ -64,14 +72,40 @@ enum ProbeOutcome {
     /// Peer failed the audit challenge: absent sentinel, digest mismatch,
     /// rejection, mismatched challenge ID, wrong digest count, or malformed reply.
     Failed,
-    /// No response (transport error / deadline). Penalised immediately at
-    /// audit-failure severity.
+    /// No response (transport error / deadline). Penalised at audit-failure
+    /// severity — except while the rollout gate graces silence; see
+    /// [`probe_outcome_is_penalised`].
     Timeout,
     /// Peer returned a matching bootstrap claim. Graced only through the shared
     /// bootstrap-claim tracker.
     BootstrapClaim,
     /// The probe could not be sent locally. Graced: no penalty.
     Inconclusive,
+}
+
+/// Whether a probe outcome is reported as an audit-severity failure.
+///
+/// `Failed` is the peer answering and being wrong — the absent sentinel, a
+/// digest that does not match, a rejection. That is evidence, and it is
+/// penalised throughout.
+///
+/// `Timeout` is silence, and while the [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]
+/// rollout gate is set it is graced: a peer on the far side of the
+/// possession-audit protocol move never answers this lane, so its silence says
+/// nothing about whether it holds the chunk. Penalising it would punish honest
+/// peers for a version skew for the whole upgrade window.
+///
+/// Exhaustive rather than a catch-all, so a new outcome cannot silently inherit
+/// "not penalised", and extracted as a predicate so the rollout decision can be
+/// asserted without driving a live probe.
+#[must_use]
+fn probe_outcome_is_penalised(outcome: ProbeOutcome) -> bool {
+    match outcome {
+        ProbeOutcome::Failed => true,
+        ProbeOutcome::Timeout => !GRACE_POSSESSION_AUDIT_TIMEOUTS,
+        // Proven, claimed-and-tracked, or never actually asked.
+        ProbeOutcome::Present | ProbeOutcome::BootstrapClaim | ProbeOutcome::Inconclusive => false,
+    }
 }
 
 /// Pick a randomised delay in `[min, max]` to wait before a possession check
@@ -149,18 +183,14 @@ pub(crate) async fn run_possession_check(
                 )
                 .await;
             }
-            // ROLLOUT GATE — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`. A probe to a
-            // peer on the other side of the protocol move is never answered, so
-            // a timeout here is not evidence about possession. Restore the
-            // unconditional report when that gate is removed.
             ProbeOutcome::Timeout => {
-                if GRACE_POSSESSION_AUDIT_TIMEOUTS {
+                if probe_outcome_is_penalised(ProbeOutcome::Timeout) {
+                    report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
+                } else {
                     debug!(
                         "Possession check: {peer} timed out for {key_hex}; graced during the \
                          possession-audit protocol rollout (not penalised)"
                     );
-                } else {
-                    report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
                 }
             }
             ProbeOutcome::BootstrapClaim => {
@@ -375,6 +405,35 @@ fn interpret_audit_response(
 mod tests {
     use super::*;
     use crate::replication::config::{POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN};
+
+    // The possession probe's half of the rollout-gate contract (dirvine, PR
+    // #181). Silence is graced while the gate is set; every outcome where the
+    // peer actually answered and was wrong stays penalised.
+    #[test]
+    fn possession_rollout_gate_graces_silence_but_never_a_bad_answer() {
+        assert!(
+            probe_outcome_is_penalised(ProbeOutcome::Failed),
+            "an absent sentinel or mismatched digest is evidence — always penalised"
+        );
+        assert_eq!(
+            probe_outcome_is_penalised(ProbeOutcome::Timeout),
+            !GRACE_POSSESSION_AUDIT_TIMEOUTS,
+            "silence is penalised exactly when the rollout gate is off"
+        );
+        // A proven holder, a tracked bootstrap claim, and a probe that never
+        // left this node are all not failures at all — the gate must not have
+        // made any of them one.
+        for outcome in [
+            ProbeOutcome::Present,
+            ProbeOutcome::BootstrapClaim,
+            ProbeOutcome::Inconclusive,
+        ] {
+            assert!(
+                !probe_outcome_is_penalised(outcome),
+                "{outcome:?} is not an audit failure"
+            );
+        }
+    }
 
     const PEER_ID: [u8; 32] = [0x42; 32];
     const NONCE: [u8; 32] = [0x7a; 32];

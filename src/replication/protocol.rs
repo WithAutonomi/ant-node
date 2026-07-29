@@ -221,13 +221,7 @@ impl ReplicationMessageBody {
     /// [`REPLICATION_PROTOCOL_ID`]: crate::replication::config::REPLICATION_PROTOCOL_ID
     #[must_use]
     pub fn is_subtree_audit(&self) -> bool {
-        matches!(
-            self,
-            Self::SubtreeAuditChallenge(_)
-                | Self::SubtreeAuditResponse(_)
-                | Self::SubtreeSliceChallenge(_)
-                | Self::SubtreeSliceResponse(_)
-        )
+        family_of_variant(self.variant_index()) == BodyFamily::SubtreeAudit
     }
 
     /// Whether this body is a digest-based possession audit message.
@@ -242,8 +236,100 @@ impl ReplicationMessageBody {
     /// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
     #[must_use]
     pub fn is_possession_audit(&self) -> bool {
-        matches!(self, Self::AuditChallenge(_) | Self::AuditResponse(_))
+        family_of_variant(self.variant_index()) == BodyFamily::PossessionAudit
     }
+}
+
+/// Which protocol family a body belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyFamily {
+    /// Core replication: everything that is not an audit.
+    Core,
+    /// The digest-based possession pair (`AuditChallenge`/`AuditResponse`).
+    PossessionAudit,
+    /// The four subtree storage-commitment audit bodies, both rounds.
+    SubtreeAudit,
+}
+
+impl BodyFamily {
+    /// Whether this family takes the tighter audit wire ceiling.
+    #[must_use]
+    pub(crate) fn is_audit(self) -> bool {
+        matches!(self, Self::PossessionAudit | Self::SubtreeAudit)
+    }
+}
+
+/// The family of a body, keyed by its postcard discriminant.
+///
+/// Keyed by discriminant rather than by `&self` on purpose: the receive path has
+/// to classify a message BEFORE decoding it, because the pre-decode size ceiling
+/// is the only check that can run before an attacker-sized collection is
+/// allocated. The discriminant is the one field reachable that early (see
+/// [`peek_variant_index`]).
+///
+/// Everything that classifies a body reads this one table —
+/// [`ReplicationMessageBody::is_subtree_audit`],
+/// [`ReplicationMessageBody::is_possession_audit`], the outbound response
+/// routing, the post-decode family guard, and the pre-decode ceiling — so the
+/// pre- and post-decode views of "which family is this" cannot drift apart. A
+/// drift is exactly what let an audit body sent on the core id skip the audit
+/// ceiling and decode under the 10 MiB core allowance.
+///
+/// Indices match [`ReplicationMessageBody::variant_index`], which is declaration
+/// order and postcard-stable.
+#[must_use]
+pub(crate) fn family_of_variant(index: usize) -> BodyFamily {
+    match index {
+        9 | 10 => BodyFamily::PossessionAudit,
+        11..=14 => BodyFamily::SubtreeAudit,
+        _ => BodyFamily::Core,
+    }
+}
+
+/// Maximum bytes a postcard varint can occupy for a `u64`.
+const MAX_VARINT_LEN: usize = 10;
+
+/// Read one postcard varint (LEB128, little-endian base-128) from `bytes`.
+///
+/// Returns the value and how many bytes it consumed. Bounded by `max_bytes` and
+/// by the 64-bit shift, so a hostile prefix cannot spin here.
+fn read_varint(bytes: &[u8], max_bytes: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, byte) in bytes.iter().take(max_bytes).enumerate() {
+        value |= u64::from(byte & 0x7F).checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+        shift = shift.checked_add(7)?;
+        if shift >= u64::BITS {
+            return None;
+        }
+    }
+    None
+}
+
+/// Read a message's body discriminant without decoding the body.
+///
+/// `ReplicationMessage` is `{ request_id: u64, body: ReplicationMessageBody }`,
+/// and postcard writes struct fields in order with no length prefix: a varint
+/// `request_id`, then the enum's varint discriminant. So the discriminant sits
+/// behind at most [`MAX_VARINT_LEN`] bytes and costs two bounded varint reads to
+/// reach — no allocation, and nothing attacker-sized is touched.
+///
+/// `None` means the prefix is not even well-formed enough to classify; the
+/// caller treats that as "apply the strictest ceiling", since a message we
+/// cannot classify is one we should not decode generously.
+///
+/// A test round-trips every variant through `encode` to prove this agrees with
+/// [`ReplicationMessageBody::variant_index`] for real messages, rather than
+/// trusting this reading of postcard's format.
+#[must_use]
+pub(crate) fn peek_variant_index(data: &[u8]) -> Option<usize> {
+    let (_request_id, consumed) = read_varint(data, MAX_VARINT_LEN)?;
+    let rest = data.get(consumed..)?;
+    let (variant, _) = read_varint(rest, MAX_VARINT_LEN)?;
+    usize::try_from(variant).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1334,6 +1420,177 @@ mod tests {
              {MAX_AUDIT_MESSAGE_SIZE}",
             encoded.len()
         );
+    }
+
+    /// Every body variant, in declaration order, so a test can walk the whole
+    /// enum rather than a hand-picked sample.
+    fn all_bodies() -> Vec<ReplicationMessageBody> {
+        let z = [0u8; 32];
+        vec![
+            ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                key: z,
+                data: vec![],
+                proof_of_payment: vec![],
+            }),
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted {
+                key: z,
+            }),
+            ReplicationMessageBody::PaidNotify(PaidNotify {
+                key: z,
+                proof_of_payment: vec![],
+            }),
+            ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                commitment: None,
+            }),
+            ReplicationMessageBody::NeighborSyncResponse(NeighborSyncResponse {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                rejected_keys: vec![],
+                commitment: None,
+            }),
+            ReplicationMessageBody::VerificationRequest(VerificationRequest {
+                keys: vec![],
+                paid_list_check_indices: vec![],
+            }),
+            ReplicationMessageBody::VerificationResponse(VerificationResponse { results: vec![] }),
+            ReplicationMessageBody::FetchRequest(FetchRequest { key: z }),
+            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { key: z }),
+            ReplicationMessageBody::AuditChallenge(AuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                keys: vec![],
+            }),
+            ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![],
+            }),
+            ReplicationMessageBody::SubtreeAuditChallenge(SubtreeAuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+            }),
+            ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+                openings: vec![],
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::GetCommitmentByPin(GetCommitmentByPin { pin: z }),
+            ReplicationMessageBody::GetCommitmentByPinResponse(
+                GetCommitmentByPinResponse::NotRetained { pin: z },
+            ),
+        ]
+    }
+
+    // The pre-decode ceiling reads the body's discriminant straight off the
+    // wire, so `peek_variant_index` MUST agree with `variant_index()` for every
+    // variant, at request ids that straddle postcard's varint width boundaries.
+    // If it ever disagreed, a body would be sized against the wrong family's
+    // ceiling — which is the bug this whole path exists to prevent.
+    #[test]
+    fn peeked_discriminant_matches_the_decoded_one_for_every_variant() {
+        // 1-byte, 2-byte, 5-byte and 10-byte `request_id` varints.
+        for request_id in [0u64, 1, 127, 128, 300, u64::from(u32::MAX), u64::MAX] {
+            for body in all_bodies() {
+                let expected = body.variant_index();
+                let encoded = ReplicationMessage { request_id, body }
+                    .encode()
+                    .expect("encode");
+                assert_eq!(
+                    peek_variant_index(&encoded),
+                    Some(expected),
+                    "peek disagreed with variant_index at request_id {request_id}"
+                );
+            }
+        }
+    }
+
+    // A truncated or nonsense prefix must not classify as `Core`, because Core
+    // is the LENIENT ceiling. Failing to classify has to mean "apply the strict
+    // one", never "let it through".
+    #[test]
+    fn unclassifiable_prefix_yields_no_family() {
+        assert_eq!(peek_variant_index(&[]), None);
+        // A varint that never terminates: all continuation bits set.
+        assert_eq!(peek_variant_index(&[0xFF; 32]), None);
+        // A well-formed request_id with nothing after it.
+        assert_eq!(peek_variant_index(&[0x01]), None);
+    }
+
+    // Regression (dirvine, PR #181): the pre-decode ceiling used to be chosen
+    // from the protocol id the message arrived on, so an audit body addressed to
+    // the CORE id skipped the audit ceiling and was decoded under the 10 MiB core
+    // allowance — its collections allocated — before the family guard dropped it.
+    //
+    // The reproduction from that review: a valid `SubtreeSliceChallenge` with
+    // 200,000 openings encodes to ~6.6 MB, far past the 512 KiB audit ceiling.
+    // Classifying by discriminant catches it wherever it is addressed.
+    #[test]
+    fn oversized_audit_body_is_classified_as_audit_wherever_it_is_addressed() {
+        let z = [0u8; 32];
+        let challenge = SubtreeSliceChallenge {
+            challenge_id: 1,
+            nonce: z,
+            challenged_peer_id: z,
+            expected_commitment_hash: z,
+            openings: (0..200_000u32)
+                .map(|i| SubtreeSliceOpening {
+                    key: z,
+                    block_index: i,
+                })
+                .collect(),
+        };
+        let encoded = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::SubtreeSliceChallenge(challenge),
+        }
+        .encode()
+        .expect("encode");
+
+        assert!(
+            encoded.len() > crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            "the reproduction must exceed the audit ceiling to be meaningful; got {} bytes",
+            encoded.len()
+        );
+        // The classification the receive path performs, before any decode.
+        let family = peek_variant_index(&encoded).map(family_of_variant);
+        assert_eq!(family, Some(BodyFamily::SubtreeAudit));
+        assert!(
+            family.is_none_or(BodyFamily::is_audit),
+            "an audit body must take the audit ceiling regardless of the id it rode"
+        );
+    }
+
+    // The family table is the single source of truth: the `&self` predicates,
+    // the response routing and the pre-decode ceiling all read it, so they
+    // cannot drift. Walk every variant and check both views agree.
+    #[test]
+    fn family_table_agrees_with_the_body_predicates() {
+        for body in all_bodies() {
+            let family = family_of_variant(body.variant_index());
+            assert_eq!(body.is_subtree_audit(), family == BodyFamily::SubtreeAudit);
+            assert_eq!(
+                body.is_possession_audit(),
+                family == BodyFamily::PossessionAudit
+            );
+            assert_eq!(
+                family.is_audit(),
+                body.is_subtree_audit() || body.is_possession_audit()
+            );
+        }
     }
 
     // `is_subtree_audit()` classifies exactly the four subtree-audit variants
