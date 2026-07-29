@@ -63,11 +63,11 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_MESSAGE_SIZE,
+    MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
     MAX_CONCURRENT_SUBTREE_ROUND1, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
     POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID,
-    SUBTREE_SESSION_TTL,
+    SUBTREE_ROUND1_WORK_BURST_BYTES, SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1008,6 +1008,23 @@ fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
     } else {
         REPLICATION_PROTOCOL_ID
     }
+}
+
+/// Whether `protocol` is one of the two audit families, which carry only small
+/// bodies and so take the tighter [`MAX_AUDIT_MESSAGE_SIZE`] wire ceiling.
+fn is_audit_protocol(protocol: &str) -> bool {
+    protocol == SUBTREE_AUDIT_PROTOCOL_ID || protocol == POSSESSION_AUDIT_PROTOCOL_ID
+}
+
+/// Bytes of chunk content a round-1 proof covered.
+///
+/// One leaf per chunk read from LMDB and hashed twice (plain and nonced), so
+/// this is the read-and-hash cost of the proof and what it owes the responder's
+/// work budget.
+fn subtree_proof_content_bytes(proof: &crate::replication::subtree::SubtreeProof) -> i64 {
+    proof.leaves.iter().fold(0i64, |acc, leaf| {
+        acc.saturating_add(i64::from(leaf.content_len))
+    })
 }
 
 fn fresh_offer_payment_context() -> VerificationContext {
@@ -3096,10 +3113,83 @@ struct SubtreeSession {
     inserted: Instant,
 }
 
+/// Responder-wide token bucket over the chunk bytes round-1 proof building may
+/// read and hash, refilled continuously at
+/// [`SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC`] up to
+/// [`SUBTREE_ROUND1_WORK_BURST_BYTES`].
+///
+/// Deliberately keyed by nothing. The per-peer cooldown limits how often one
+/// identity may ask, so it is refilled by acquiring more identities; this is
+/// charged for work done regardless of who asked, so it is not.
+///
+/// Charged after the fact, with the bytes the proof actually covered: the cost
+/// of a request is not known until the pinned commitment has been resolved and
+/// its subtree selected, both of which happen inside the handler. Admission
+/// therefore asks only whether the balance is positive, and a proof that costs
+/// more than is left drives the balance NEGATIVE rather than stopping at zero.
+/// Carrying the debt is what makes the bound real: without it a maximal proof
+/// would cost the same as a trivial one, since either way the next request only
+/// has to wait for the balance to climb back above zero. With it, sustained
+/// throughput settles at refill ÷ cost-per-proof, so expensive proofs are
+/// admitted proportionally less often.
+struct Round1WorkBudget {
+    /// Signed, so an over-large proof leaves debt to work off.
+    balance: i64,
+    last_refill: Instant,
+}
+
+impl Round1WorkBudget {
+    /// Deepest debt carried, so one huge proof cannot lock out honest audits
+    /// for longer than the burst takes to refill.
+    const MAX_DEBT: i64 = -SUBTREE_ROUND1_WORK_BURST_BYTES;
+    /// Nanoseconds per second, for the sub-second part of a refill.
+    const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+    fn new() -> Self {
+        Self {
+            balance: SUBTREE_ROUND1_WORK_BURST_BYTES,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Add the tokens accrued since the last touch, capped at the burst size.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        let whole_secs = i64::try_from(elapsed.as_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC);
+        let sub_sec = i64::from(elapsed.subsec_nanos())
+            .saturating_mul(SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC)
+            / Self::NANOS_PER_SEC;
+        self.balance = self
+            .balance
+            .saturating_add(whole_secs.saturating_add(sub_sec))
+            .min(SUBTREE_ROUND1_WORK_BURST_BYTES);
+    }
+
+    /// Whether budget remains for a new round-1 proof.
+    fn has_budget(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.balance > 0
+    }
+
+    /// Charge `bytes` of completed proof work, carrying debt down to
+    /// [`Self::MAX_DEBT`].
+    fn charge(&mut self, bytes: i64, now: Instant) {
+        self.refill(now);
+        self.balance = self.balance.saturating_sub(bytes).max(Self::MAX_DEBT);
+    }
+}
+
 /// Resource controls for the HEAVY subtree-audit round 1: a tight
 /// admission pool separate from the light responsible/slice audits, a per-peer
 /// rate cooldown, and single-use round-1 → round-2 sessions so a round-2 slice
 /// challenge is only served after a matching round 1.
+///
+/// It also holds the responder-wide [`Round1WorkBudget`], the only one of those
+/// bounds not keyed by peer identity, and so the only one that bounds sustained
+/// work rather than concurrency or per-identity frequency.
 #[derive(Clone)]
 struct SubtreeRound1Limiter {
     semaphore: Arc<Semaphore>,
@@ -3109,6 +3199,8 @@ struct SubtreeRound1Limiter {
     /// [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`] in production, near-zero in tests).
     cooldown_interval: Duration,
     sessions: Arc<RwLock<HashMap<(PeerId, u64), SubtreeSession>>>,
+    /// Identity-independent ceiling on sustained round-1 work.
+    work: Arc<RwLock<Round1WorkBudget>>,
 }
 
 impl SubtreeRound1Limiter {
@@ -3119,13 +3211,23 @@ impl SubtreeRound1Limiter {
             cooldown: Arc::new(RwLock::new(HashMap::new())),
             cooldown_interval,
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            work: Arc::new(RwLock::new(Round1WorkBudget::new())),
         }
+    }
+
+    /// Charge completed round-1 proof work against the responder-wide budget.
+    async fn charge_work(&self, content_bytes: i64) {
+        self.work
+            .write()
+            .await
+            .charge(content_bytes, Instant::now());
     }
 
     /// Admit one heavy round-1 proof for `source`: take a concurrency permit
     /// FIRST (so a full pool never wastes the peer's cooldown allowance), then
-    /// enforce the per-peer rate cooldown. `None` drops the challenge (the remote
-    /// auditor applies its own graced-timeout policy).
+    /// the responder-wide work budget, then the per-peer rate cooldown. `None`
+    /// drops the challenge (the remote auditor applies its own graced-timeout
+    /// policy).
     async fn admit(&self, source: &PeerId) -> Option<AuditResponderGuard> {
         let guard = admit_audit_responder_with_limits(
             &self.semaphore,
@@ -3136,6 +3238,11 @@ impl SubtreeRound1Limiter {
         )
         .await
         .ok()?;
+        // Checked before the per-peer cooldown is stamped, so a peer refused for
+        // want of budget is not also charged its next allowance.
+        if !self.work.write().await.has_budget(Instant::now()) {
+            return None; // guard drops here, releasing the permit + slot
+        }
         let now = Instant::now();
         let mut cooldown = self.cooldown.write().await;
         if let Some(&last) = cooldown.get(source) {
@@ -3390,6 +3497,26 @@ async fn handle_replication_message(
     subtree_round1: &SubtreeRound1Limiter,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    // Size guard BEFORE decoding, for the audit families only.
+    //
+    // Every later check — protocol family, live round-1 session, responder
+    // admission — reads fields of the decoded body, so none of them can run
+    // first. Decoding is therefore the first thing an unknown peer can make this
+    // node do, and the audit bodies carry variable-length collections, so under
+    // the 10 MiB core ceiling a sessionless peer could force multi-megabyte
+    // allocation and decode work per message with nothing spent on its side.
+    // The encoded length needs no parsing, so it is the one check that can come
+    // before decode. Audit bodies are ~110 KiB at worst (see
+    // `MAX_AUDIT_MESSAGE_SIZE`), so a tighter family ceiling costs honest
+    // traffic nothing.
+    if is_audit_protocol(inbound_protocol) && data.len() > MAX_AUDIT_MESSAGE_SIZE {
+        debug!(
+            "Dropping oversized {inbound_protocol} message from {source}: {} bytes > {MAX_AUDIT_MESSAGE_SIZE}",
+            data.len()
+        );
+        return Ok(());
+    }
+
     let msg = ReplicationMessage::decode(data)
         .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
 
@@ -3605,10 +3732,21 @@ async fn handle_replication_message(
                 // A round-1 proof authorizes exactly one matching round 2: open a
                 // single-use session so a slice challenge cannot be served without
                 // a live round-1 exchange.
-                if matches!(
-                    &response,
-                    crate::replication::protocol::SubtreeAuditResponse::Proof { .. }
-                ) {
+                //
+                // Charge the work budget here too, for the bytes this proof
+                // actually covered. Only the `Proof` arm needs charging: every
+                // rejection an auditor can provoke (wrong target, no commitment
+                // state, unknown pin, unplannable subtree) returns before a
+                // single chunk is read, and the two that do read — a committed
+                // key missing from the store, or a persistent read error — turn
+                // on this node's own storage rather than on anything the caller
+                // sends.
+                if let crate::replication::protocol::SubtreeAuditResponse::Proof { proof, .. } =
+                    &response
+                {
+                    subtree_round1
+                        .charge_work(subtree_proof_content_bytes(proof))
+                        .await;
                     subtree_round1
                         .open_session(
                             source,
@@ -6863,6 +7001,75 @@ mod tests {
         // The matching round 2 consumes it — and only once (single-use).
         assert!(limiter.consume_session(&peer, 42, &hash, &nonce).await);
         assert!(!limiter.consume_session(&peer, 42, &hash, &nonce).await);
+    }
+
+    // The concurrency pool and the per-peer cooldown are both keyed by peer id,
+    // so a party holding several identities refills its allowance by rotating
+    // between them and can keep the heavy pool busy indefinitely. The work
+    // budget is keyed by nothing: it is charged for bytes proved, whoever asked,
+    // so a fresh identity is refused exactly like a repeat caller once it is
+    // spent. That is the difference between bounding concurrency and bounding
+    // sustained work.
+    #[tokio::test]
+    async fn round1_work_budget_is_not_refilled_by_a_fresh_identity() {
+        // Cooldown disabled so only the work budget can refuse anything.
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO);
+        assert!(
+            limiter.admit(&test_peer(1)).await.is_some(),
+            "a node starts with budget in hand so it can serve audits at once"
+        );
+
+        // Serve enough proof work to run the balance into debt. Charging exactly
+        // the burst would leave it at zero, which the next nanosecond of refill
+        // lifts back above the line — the debt is the point.
+        limiter
+            .charge_work(2 * SUBTREE_ROUND1_WORK_BURST_BYTES)
+            .await;
+
+        for id in 2..8u8 {
+            assert!(
+                limiter.admit(&test_peer(id)).await.is_none(),
+                "a never-seen peer must still be refused while the budget is spent"
+            );
+        }
+    }
+
+    // The budget is a rate, not a quota: it comes back on its own, so an honest
+    // auditor blocked by a flood is only delayed. Carrying the debt is what
+    // prices an expensive proof above a cheap one — without it, a proof reading
+    // a maximal subtree would cost no more of the next caller's wait than a
+    // one-leaf proof.
+    #[test]
+    fn round1_work_budget_carries_debt_and_refills_over_time() {
+        let now = Instant::now();
+        let at = |secs: u64| {
+            now.checked_add(Duration::from_secs(secs))
+                .unwrap_or_else(Instant::now)
+        };
+        let mut budget = Round1WorkBudget {
+            balance: 0,
+            last_refill: now,
+        };
+        assert!(!budget.has_budget(now), "empty means empty");
+
+        // A proof costing four seconds' worth of refill leaves four seconds of
+        // debt, so the wait scales with what was actually served.
+        budget.charge(4 * SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, now);
+        assert!(
+            !budget.has_budget(at(3)),
+            "still in debt three seconds after an over-large proof"
+        );
+        assert!(
+            budget.has_budget(at(5)),
+            "the debt is worked off at the refill rate"
+        );
+
+        // Idle time does not bank unbounded credit for a later flood.
+        budget.refill(at(24 * 60 * 60));
+        assert_eq!(
+            budget.balance, SUBTREE_ROUND1_WORK_BURST_BYTES,
+            "refill is capped at the burst size"
+        );
     }
 
     fn test_key(b: u8) -> crate::ant_protocol::XorName {

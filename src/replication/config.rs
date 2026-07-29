@@ -196,6 +196,38 @@ pub const SUBTREE_SESSION_TTL: Duration = Duration::from_secs(2 * 60);
 /// peers open sessions; oldest are evicted past this).
 pub const MAX_SUBTREE_SESSIONS: usize = 4 * MAX_CONCURRENT_SUBTREE_ROUND1 * 256;
 
+/// Sustained rate at which the responder-wide round-1 work budget refills, in
+/// bytes of chunk content per second.
+///
+/// [`MAX_CONCURRENT_SUBTREE_ROUND1`] bounds how many round-1 proofs run at once
+/// and [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`] bounds how often one peer id may
+/// ask, but neither bounds sustained work: the cooldown is keyed by identity, so
+/// a party holding several identities refills its allowance by rotating between
+/// them and keeps the small pool permanently busy. This budget is keyed by
+/// nothing at all — it is charged for the bytes read and hashed no matter who
+/// asked — so identity count cannot buy more of it.
+///
+/// Sized to clear honest demand even at the worst commitment size, since
+/// starving honest audits would cost more than it saves. The 990-node run
+/// served about 24 audits per node per hour. At the `MAX_COMMITMENT_KEY_COUNT`
+/// cap one proof reads close to 4 GiB, so honest demand there is ~96 GiB/h,
+/// against the 225 GiB/h this allows — and a flooder is held to about twice
+/// honest load rather than to whatever the disk will bear. For the far more
+/// common mid-sized commitment, where a proof reads a few hundred MiB, the
+/// headroom is more than an order of magnitude.
+///
+/// Signed because the budget it refills carries debt when a proof costs more
+/// than is left.
+pub const SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC: i64 = 64 * 1024 * 1024;
+
+/// Burst capacity of the round-1 work budget, in bytes of chunk content.
+///
+/// Also its starting fill, so a freshly started node can serve audits at once.
+/// Two maximal proofs' worth, matching [`MAX_CONCURRENT_SUBTREE_ROUND1`], so a
+/// legitimate burst is never refused for arriving together — the budget limits
+/// the sustained rate, which is what a concurrency cap cannot do.
+pub const SUBTREE_ROUND1_WORK_BURST_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
 /// Uses `std::thread::available_parallelism()` so the node scales to the
@@ -353,6 +385,29 @@ pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-au
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
+
+/// Maximum wire size for a message on either audit protocol family.
+///
+/// The 10 MiB core ceiling is sized for hint batches, which no audit body
+/// carries. Applying it to the audit families would let a peer make this node
+/// allocate and decode megabytes of attacker-shaped collection before any
+/// family, session or admission check has run — those checks all read fields of
+/// the decoded body, so they cannot come first. Checking the encoded length
+/// against a family-appropriate ceiling can, because it needs nothing but the
+/// byte count.
+///
+/// Sized against the largest legitimate audit body, the round-1
+/// `SubtreeAuditResponse::Proof`: at the `MAX_COMMITMENT_KEY_COUNT` cap a
+/// subtree is at most 1,024 leaves of ~100 bytes each, plus the sibling cut
+/// hashes and the signed commitment, so ~110 KiB. Every other audit body —
+/// both challenges, the round-2 response — is far smaller. This leaves roughly
+/// 4x headroom over the worst legitimate case while cutting the pre-admission
+/// allocation ceiling by a factor of 20.
+pub const MAX_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
+const _: () = assert!(
+    MAX_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
+    "the audit-family ceiling must be tighter than the core one, or it is pointless"
+);
 
 /// Maximum block openings per round-2 [`SubtreeSliceChallenge`].
 ///

@@ -1276,6 +1276,64 @@ mod tests {
         // Comfortably under 1 MiB, itself a fraction of the 10 MiB wire cap.
         assert!(encoded.len() <= 1024 * 1024);
         assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
+        assert!(
+            encoded.len() <= crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            "round 2 must fit the tighter audit-family ceiling"
+        );
+    }
+
+    // The audit families take a much tighter wire ceiling than the 10 MiB core
+    // one, checked before decoding so an unknown peer cannot make this node
+    // allocate megabytes before any admission check has run. That ceiling is
+    // only safe if it clears the largest body an honest audit can produce, which
+    // is the round-1 proof at the commitment key-count cap: 1,024 leaves plus
+    // the sibling cut hashes and the signed commitment. Build that worst case
+    // and pin the headroom, so a later change to leaf size or commitment
+    // encoding cannot quietly start dropping honest proofs.
+    #[test]
+    fn max_round1_proof_fits_the_audit_family_ceiling() {
+        use crate::replication::commitment::{StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
+        use crate::replication::config::MAX_AUDIT_MESSAGE_SIZE;
+        use crate::replication::subtree::{max_subtree_leaves, SubtreeLeaf, SubtreeProof};
+
+        let leaf_count = max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT) as usize;
+        let leaves: Vec<SubtreeLeaf> = (0..leaf_count)
+            .map(|_| SubtreeLeaf {
+                key: [0xAB; 32],
+                bytes_hash: [0xCD; 32],
+                content_len: u32::MAX,
+                nonced_root: [0xEF; 32],
+            })
+            .collect();
+        let msg = ReplicationMessage {
+            request_id: 11,
+            body: ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof {
+                challenge_id: 11,
+                commitment: StorageCommitment {
+                    root: [0x01; 32],
+                    key_count: MAX_COMMITMENT_KEY_COUNT,
+                    sender_peer_id: [0x02; 32],
+                    // Over-sized stand-ins for the ML-DSA-65 key and signature.
+                    sender_public_key: vec![0x03; 4096],
+                    signature: vec![0x04; 8192],
+                },
+                proof: SubtreeProof {
+                    leaves,
+                    // One per level down to the subtree root; 32 is far past the
+                    // real depth at this key count.
+                    sibling_cut_hashes: vec![[0x05; 32]; 32],
+                },
+            }),
+        };
+        let encoded = msg
+            .encode()
+            .expect("worst-case round-1 proof must fit the wire cap");
+        assert!(
+            encoded.len() <= MAX_AUDIT_MESSAGE_SIZE,
+            "worst legitimate round-1 proof is {} bytes, over the audit ceiling of \
+             {MAX_AUDIT_MESSAGE_SIZE}",
+            encoded.len()
+        );
     }
 
     // `is_subtree_audit()` classifies exactly the four subtree-audit variants
@@ -1322,7 +1380,9 @@ mod tests {
                 data: vec![],
                 proof_of_payment: vec![],
             }),
-            // Periodic possession audit — NOT the subtree audit; stays on core id.
+            // Periodic possession audit — NOT the subtree audit. It rides the
+            // possession id, not the core one; what matters here is only that
+            // `is_subtree_audit()` does not claim it.
             ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 }),
         ];
         for body in &core {
