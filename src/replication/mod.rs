@@ -1757,6 +1757,19 @@ impl ReplicationEngine {
         self.ever_capable_peers.write().await.insert(*peer);
     }
 
+    /// Test-only: isolate a monetized first audit of `peer` from live gossip
+    /// audits. Suppresses new gossip lottery attempts for the current cooldown
+    /// window and clears any shared cooldown stamped by an earlier gossip
+    /// launch. The locks follow the production gossip-audit lock order.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn isolate_first_audit_for_test(&self, peer: &PeerId) {
+        let now = Instant::now();
+        let mut lottery_attempts = self.gossip_lottery_attempts.write().await;
+        let mut launched = self.audit_on_gossip_cooldown.write().await;
+        lottery_attempts.insert(*peer, now);
+        launched.remove(peer);
+    }
+
     /// Test-only: run ONE subtree audit against `peer` right now, pinned to the
     /// commitment this node has cached for it (from gossip), over the live wire.
     /// Returns the audit outcome so tests can assert honest-pass / adversary-fail
