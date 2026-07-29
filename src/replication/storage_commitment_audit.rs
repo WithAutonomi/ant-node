@@ -256,8 +256,19 @@ enum SliceRound {
     /// must not keep stale credit. Distinct from a silent network `Timeout`,
     /// which keeps credit (a dropped packet is not evidence of loss).
     TransientReject,
-    /// No response within the slice deadline, or a transport error (graced
-    /// timeout). Keeps holder credit.
+    /// No response within the slice deadline, or a transport error. Routed to
+    /// the non-response/timeout lane: no trust penalty, but the pinned
+    /// commitment's holder credit is revoked.
+    ///
+    /// Silence here is not the same as a silent peer in general. The responder
+    /// answered round 1 in this same exchange, so it was live and reachable, and
+    /// it saw which blocks were drawn before deciding whether to reply. Leaving
+    /// credit in place would make "answer only when the draw is favourable" a
+    /// free strategy: an unfavourable sample would cost nothing and the credit
+    /// earned from an earlier favourable one would survive. Revoking scopes the
+    /// cost to the pinned commitment, so the peer must actually answer a round 2
+    /// to hold credit, while an honest node that drops one reply keeps its trust
+    /// intact and re-earns credit on its next audit.
     Timeout,
     /// The responder claimed `Bootstrapping` in round 2 after answering a valid
     /// round-1 proof. A node that just produced a signed subtree proof is
@@ -395,6 +406,31 @@ fn classify_slice_response(
         }) if id == challenge_id => SliceRound::ResponsiveBootstrap,
         _ => SliceRound::Malformed,
     }
+}
+
+/// Whether a round-2 outcome must revoke the holder credit carried by the
+/// commitment the auditor pinned.
+///
+/// True for every outcome that ends round 2 without a completed possession
+/// proof but stays in the graced timeout lane — an explicit `Transient` reject
+/// and silence alike. Both mean the peer did not prove it still holds the bytes
+/// it committed to, so it must not keep standing earned by an earlier audit.
+///
+/// Silence matters most here. By round 2 the responder has already answered
+/// round 1, so it is demonstrably live, and it learns which blocks were drawn
+/// before it decides whether to reply. If silence kept credit, replying only to
+/// favourable draws would cost nothing: unfavourable samples would be free and
+/// credit from an earlier favourable one would persist, so the sampling
+/// probability would describe answered passes rather than detection. Revoking
+/// makes every unanswered round 2 cost the peer its standing for that
+/// commitment, while an honest peer that drops one reply takes no trust penalty
+/// and re-earns credit on its next audit.
+///
+/// The confirmed lanes (`Rejected`, `ResponsiveBootstrap`, `Malformed`) are
+/// excluded because they revoke more broadly downstream, via
+/// `apply_audit_failure_credit_revocation` → `forget_peer`.
+const fn round2_revokes_pinned_credit(round: &SliceRound) -> bool {
+    matches!(round, SliceRound::TransientReject | SliceRound::Timeout)
 }
 
 /// Map a decoded response body to an audit outcome (auditor side). A response
@@ -846,7 +882,23 @@ async fn verify_subtree_response(
         })
         .collect();
 
-    let verdict = match request_slice_proof(ctx, &openings).await {
+    let round = request_slice_proof(ctx, &openings).await;
+
+    // Round 2 ended without a completed possession proof: drop the holder credit
+    // this pinned commitment carries, before mapping the outcome to a verdict.
+    // Scoped to the commitment hash, so credit the peer re-earned for a newer
+    // commitment survives.
+    if round2_revokes_pinned_credit(&round) {
+        if let Some(credit) = ctx.credit {
+            credit
+                .recent_provers
+                .write()
+                .await
+                .forget_commitment(&ctx.expected_commitment_hash);
+        }
+    }
+
+    let verdict = match round {
         // The responder served openings: verify both chains for every one. Any
         // failing chain is a confirmed cheat.
         SliceRound::Served(items) => verify_slice_response(
@@ -865,25 +917,13 @@ async fn verify_subtree_response(
         SliceRound::Rejected | SliceRound::ResponsiveBootstrap => {
             AuditVerdict::Fail(AuditFailureReason::Rejected)
         }
-        // Transient reject (a local read error): ADR-0004 A1 routes it to the
-        // timeout lane — no trust penalty, but revoke the holder credit for THIS
-        // pinned commitment (the peer answered and could not prove possession).
-        // Scoped to the commitment hash, so it never erases credit the peer
-        // re-earned for a newer commitment.
-        SliceRound::TransientReject => {
-            if let Some(credit) = ctx.credit {
-                credit
-                    .recent_provers
-                    .write()
-                    .await
-                    .forget_commitment(&ctx.expected_commitment_hash);
-            }
+        // Round 2 produced no proof, either as an explicit `Transient` (a local
+        // read error) or as silence. Both route to the timeout lane: no trust
+        // penalty, the strike policy still graces them, and the credit for the
+        // pinned commitment was already revoked above.
+        SliceRound::TransientReject | SliceRound::Timeout => {
             AuditVerdict::Fail(AuditFailureReason::Timeout)
         }
-        // No response within the slice deadline (or transport error) → timeout
-        // (graced by the caller's strike policy — could be honest slowness).
-        // Keeps credit (a dropped packet is not evidence of loss).
-        SliceRound::Timeout => AuditVerdict::Fail(AuditFailureReason::Timeout),
         // Malformed/unexpected round-2 body.
         SliceRound::Malformed => AuditVerdict::Fail(AuditFailureReason::MalformedResponse),
     };
@@ -1459,6 +1499,7 @@ mod tests {
     use crate::replication::commitment_state::BuiltCommitment;
     use crate::replication::subtree::{build_subtree_proof, SubtreeLeaf};
     use saorsa_pqc::api::sig::ml_dsa_65;
+    use std::time::Instant;
 
     /// ADR-0004 A1 grade flip (grace removed): a responsive `UnknownCommitment`
     /// or `Protocol` rejection is a CONFIRMED failure; only `Transient` routes to
@@ -1515,8 +1556,71 @@ mod tests {
         );
         assert!(
             !super::super::audit_failure_revokes_holder_credit(&AuditFailureReason::Timeout),
-            "the timeout lane must keep holder credit — the contrast that makes \
-             classifying ResponsiveBootstrap as confirmed load-bearing"
+            "the timeout lane must not revoke credit WHOLESALE — the contrast that \
+             makes classifying ResponsiveBootstrap as confirmed load-bearing. The \
+             timeout lane still drops the pinned commitment's own credit; see \
+             round2_revokes_pinned_credit"
+        );
+    }
+
+    /// A responder that answered round 1 and then goes quiet must not keep the
+    /// holder credit for the commitment under audit.
+    ///
+    /// Round 2 names the blocks after the roots are committed, so a responder
+    /// chooses whether to reply already knowing the draw. If silence kept
+    /// credit, answering only favourable draws would be free and standing earned
+    /// once would survive every dodged check afterwards. Both no-proof outcomes
+    /// therefore drop the pinned credit, while the confirmed lanes are excluded
+    /// here because they revoke the peer's credit wholesale downstream.
+    #[test]
+    fn round2_without_a_proof_drops_the_pinned_commitment_credit() {
+        assert!(
+            round2_revokes_pinned_credit(&SliceRound::Timeout),
+            "silence after a valid round-1 proof must cost the pinned credit"
+        );
+        assert!(
+            round2_revokes_pinned_credit(&SliceRound::TransientReject),
+            "a transient reject also ends round 2 with no possession proof"
+        );
+        assert!(
+            !round2_revokes_pinned_credit(&SliceRound::Served(vec![])),
+            "a served response is judged on its contents, not here"
+        );
+        for confirmed in [
+            SliceRound::Rejected,
+            SliceRound::ResponsiveBootstrap,
+            SliceRound::Malformed,
+        ] {
+            assert!(
+                !round2_revokes_pinned_credit(&confirmed),
+                "confirmed failures revoke wholesale downstream, not scoped here"
+            );
+        }
+    }
+
+    /// The scoped revocation must not erase credit the peer re-earned under a
+    /// different commitment: an unanswered round 2 costs the pin it was about,
+    /// not the peer's whole standing.
+    #[test]
+    fn pinned_credit_revocation_is_scoped_to_the_audited_commitment() {
+        let peer = classify_peer();
+        let (audited, newer) = ([0x11u8; 32], [0x22u8; 32]);
+        let key: XorName = [0xC3u8; 32];
+        let now = Instant::now();
+        let mut provers = RecentProvers::new();
+        provers.record_proof(key, peer, audited, now);
+        provers.record_proof(key, peer, newer, now);
+
+        // What `verify_subtree_response` does when round 2 yields no proof.
+        provers.forget_commitment(&audited);
+
+        assert!(
+            !provers.is_credited_holder(&key, &peer, &audited),
+            "credit for the audited pin must be gone after an unanswered round 2"
+        );
+        assert!(
+            provers.is_credited_holder(&key, &peer, &newer),
+            "credit re-earned under a newer commitment must survive"
         );
     }
 
