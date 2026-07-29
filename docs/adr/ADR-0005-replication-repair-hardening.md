@@ -173,20 +173,34 @@ never-responsible keys out of the queue.
 
 ### 2. Keep fresh-offer verification and storage off the serial message loop
 
-Fresh-offer dispatch now **only claims the key, takes an admission permit, and
-spawns**; the worker permit is awaited *inside* the spawned task, so
-`handle_fresh_offer` has a single caller and no inline verification/LMDB path
-exists on the serial loop (`mod.rs`, `fresh.rs`).
+Fresh-offer dispatch now **validates the payload, claims the key, takes an
+admission permit, and spawns**; the worker permit is awaited *inside* the spawned
+task, so `handle_fresh_offer` has a single caller and no inline
+verification/LMDB path exists on the serial loop (`mod.rs`, `fresh.rs`).
 
 - Outstanding admitted offers are bounded by a **16-permit admission semaphore**
   (a 64 MiB payload ceiling). Past the bound an offer is **refused** — not queued,
   not handled inline — and a refused offer is penalized as absent by the delayed
-  possession check, identical to any other declined replica.
+  possession check, identical to any other declined replica. Note the penalty is
+  the *only* thing the possession check does; the copy itself is refilled later
+  by neighbor sync.
 - The `key[0] % 64` shard locks are replaced by an **exact per-key in-flight set
   behind an RAII guard**, so unrelated keys never contend and concurrent duplicates
   collapse onto the first claimant instead of repeating its verification. The
   ordering the shard locks preserved has no meaning here: the key is the content
   address of the data, so same key implies same bytes.
+- **The claim is taken only after `key == BLAKE3(data)` is verified**, on the
+  serial loop. The claim is exclusive and outlives dispatch, so granting it on an
+  unverified key/bytes association makes it a **suppression primitive**: any peer
+  that knows a key can reserve it with junk, have the genuine offer refused as a
+  duplicate, store nothing, and leave the absence charged to this node. Knowing
+  the key is not confined to the close group — `PaidNotify` carries it to
+  `PaidCloseGroup(K)` (20) while the chunk goes only to `CLOSE_GROUP_SIZE` (7),
+  so ~13 peers learn the key without receiving the data, over a small message
+  that is not gated by `MAX_CONCURRENT_REPLICATION_SENDS` and can therefore
+  outrun the multi-MiB push it describes. Hashing on the loop is affordable
+  because BLAKE3 runs at GB/s against offers arriving at link speed; an attacker
+  cannot make the loop hash faster than it can deliver bytes.
 
 - **Rejected:** keeping the inline fallback but enlarging the worker pool — does
   not remove the serial-loop stall, only raises the load needed to trigger it. The
@@ -232,8 +246,12 @@ tracking must live at the storage layer, not at each call site:
   3. Fresh offers shed at dequeue once older than `possession_check_delay_min`.
      Unlike the sync/verification responders there is no requester deadline to
      honour — the send is fire-and-forget and a late store is still useful — so
-     the threshold is the point at which the work becomes *redundant*: past it
-     the sender's delayed possession check has already re-offered the key.
+     the threshold is the point past which the offer has already cost what it was
+     going to cost: the possession check has run and charged the absence here.
+     The shed is a memory-pressure trade (releasing a multi-MiB payload, and
+     keeping a backlog from outliving its admission bound), not a redundancy
+     one — the copy is late, not useless, and repair otherwise waits for
+     neighbor sync.
 - Fresh offers and `PaidNotify` now use the **same bounded-responder admission**
   as the other classes (`admit_bounded_responder`), globally and per source.
   `PaidNotify` in particular was still verified **inline on the serial non-audit

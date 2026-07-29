@@ -997,9 +997,12 @@ const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 /// An admitted offer holds its payload until it completes, so this bounds
 /// memory rather than latency: at 4 MiB each, sixteen is a 64 MiB ceiling.
 /// Offers past the bound are refused rather than queued or handled inline —
-/// handling one on the message loop stalls every other non-audit message
-/// behind a payment verification and a multi-MiB write, and the refusal is
-/// recovered by the sender's delayed possession check (ADR-0003).
+/// handling one on the message loop stalls every other non-audit message behind
+/// a payment verification and a multi-MiB write. A refusal is not free: the
+/// sender does not read it, so it resurfaces as a missing key at the delayed
+/// possession check (5-15 min, ADR-0003) and is charged to this node at audit
+/// severity. Only neighbor sync (10-20 min) actually refills the gap, so the
+/// bound is sized to make refusal rare rather than cheap.
 const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
 /// Fresh-offer slots kept reachable by sources that hold none.
@@ -2639,10 +2642,11 @@ impl ReplicationEngine {
                                     .record_serial_queue_drop(dropped.source);
                             }
                             // Every serial-lane class has protocol recovery: syncs rerun,
-                            // fetches retry, verification re-asks, and fresh offers are
-                            // recovered by ADR-0003's delayed possession check. Responses
-                            // are covered by their requester's deadline/retry path. Never
-                            // run a bulk handler here: event receipt must remain non-blocking.
+                            // fetches retry, verification re-asks, and a dropped fresh
+                            // offer is refilled by neighbor sync (the possession check
+                            // penalises the absence but never re-offers). Responses are
+                            // covered by their requester's deadline/retry path. Never run
+                            // a bulk handler here: event receipt must remain non-blocking.
                             warn!(
                                 message_class = dropped.message_class,
                                 source = %dropped.source,
@@ -4755,12 +4759,21 @@ struct FreshOfferRejection {
 
 /// Reject a fresh offer on payload shape, or return `None` to admit it.
 ///
-/// Pure and non-blocking by construction: these are the checks cheap enough to
-/// run on the serial message loop *before* an admission permit is taken, so a
-/// malformed offer can never occupy one of the scarce
+/// Pure and non-blocking by construction: these are the checks answerable from
+/// the payload alone, run on the serial message loop *before* the in-flight
+/// claim and the admission permit, so a malformed offer can neither lock an
+/// honest offer out of its key nor occupy one of the scarce
 /// [`FRESH_OFFER_MAX_OUTSTANDING`] slots for the duration of a payment
-/// verification. Anything needing I/O — the content-address hash, routing
-/// lookups, capacity checks, proof verification — stays on the worker.
+/// verification. Anything needing I/O — routing lookups, capacity checks, proof
+/// verification — stays on the worker.
+///
+/// The content-address hash is deliberately included despite costing real CPU
+/// on the loop: it is what makes the claim below *earned* rather than merely
+/// asserted. Its cost is self-limiting — BLAKE3 runs at GB/s while offers
+/// arrive at link speed, so a flooder can never make this loop hash faster than
+/// it can deliver the bytes, and delivering them already cost it more than the
+/// hash costs us. The receive path has in any case already deserialised the
+/// same buffer.
 fn fresh_offer_structural_rejection(
     offer: &protocol::FreshReplicationOffer,
 ) -> Option<FreshOfferRejection> {
@@ -4783,6 +4796,30 @@ fn fresh_offer_structural_rejection(
                 "Data size {} exceeds maximum chunk size {}",
                 offer.data.len(),
                 crate::ant_protocol::MAX_CHUNK_SIZE,
+            ),
+            penalise: true,
+        });
+    }
+
+    // Mirror the normal PUT path: the advertised key must be the content
+    // address of the supplied bytes. Ordered last of the three so an oversized
+    // payload is refused without being hashed.
+    //
+    // This is the check that makes the key claim safe to take. Until it passes,
+    // the sender has only *asserted* an association between the key and the
+    // bytes; the claim grants exclusive rights over that key for as long as the
+    // handler runs, so granting it on an assertion lets any peer that knows a
+    // key — every recipient of its `PaidNotify`, not just the close group —
+    // reserve it with junk and have the genuine offer refused as a duplicate.
+    // Nothing would then be stored, and the resulting absence is charged to
+    // *this* node by the delayed possession check (ADR-0003).
+    let computed_key = crate::client::compute_address(&offer.data);
+    if computed_key != offer.key {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Content address mismatch: expected {}, computed {}",
+                hex::encode(offer.key),
+                hex::encode(computed_key),
             ),
             penalise: true,
         });
@@ -4875,12 +4912,20 @@ async fn dispatch_fresh_offer(
         return Ok(());
     }
 
-    // Claim the key first, so a duplicate never consumes an admission permit.
-    // The first claimant does the verification and the write; a concurrent
-    // duplicate is refused rather than made to wait, since the key is a content
-    // address and both offers therefore carry identical bytes. If the claimant
-    // ends up not storing the record, the sender's delayed possession check
-    // (ADR-0003) re-offers it.
+    // Claim the key before taking an admission permit, so a duplicate never
+    // consumes one. The first claimant does the verification and the write; a
+    // concurrent duplicate is refused rather than made to wait, since the key is
+    // a content address and — because the claim is only reachable once
+    // `fresh_offer_structural_rejection` has confirmed `key == BLAKE3(data)` —
+    // both offers therefore genuinely carry identical bytes.
+    //
+    // That ordering is load-bearing, not incidental: the claim is exclusive and
+    // outlives this function, so it must never be grantable on an unverified
+    // association between key and bytes. A claimant that still fails later (bad
+    // payment, no capacity) leaves the record unstored, and the only mechanism
+    // that refills that gap is neighbor sync (10-20 min) — the possession check
+    // (5-15 min) only penalises, it never re-offers — so the loss is real and
+    // lands on this node.
     let Some(in_flight) = FreshOfferInFlightGuard::try_claim(&ctx.fresh_offer_in_flight, offer.key)
     else {
         debug!(
@@ -4998,10 +5043,16 @@ async fn run_fresh_offer_worker(
     };
     // Fresh offers are fire-and-forget (`send_message`), so there is no
     // requester deadline to honour and a late store is still genuinely useful.
-    // The shed threshold is therefore the point at which the work becomes
-    // *redundant* rather than merely late: once the sender's delayed possession
-    // check has run (ADR-0003) it has already re-offered the key, so finishing
-    // this copy buys nothing and only holds its multi-MiB payload longer.
+    // The threshold is the point past which the offer has already cost us what
+    // it was going to cost: the possession check (ADR-0003) has run by then and
+    // charged the absence to this node, and it does not re-offer the key —
+    // repair comes later from neighbor sync. Shedding here trades a copy that
+    // would have arrived after the penalty for the multi-MiB payload it is
+    // holding, and keeps a backlog from outliving its own admission bound.
+    //
+    // Note this is a memory-pressure decision, not a redundancy one: the copy
+    // is late, not useless, so on a node with headroom finishing it would still
+    // beat waiting for neighbor sync.
     if request_is_stale(received_at, ctx.config.possession_check_delay_min) {
         debug!(
             responder_class = "fresh_offer",
@@ -5044,9 +5095,10 @@ async fn handle_fresh_offer(
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
-    // Defence in depth: `dispatch_fresh_offer` already applied these before
-    // taking an admission permit, so nothing reaching a worker should trip
-    // them. Kept so the handler is correct in isolation.
+    // Defence in depth: `dispatch_fresh_offer` already applied these — missing
+    // proof, oversized payload, content-address mismatch — before claiming the
+    // key or taking an admission permit, so nothing reaching a worker should
+    // trip them. Kept so the handler is correct in isolation.
     if let Some(rejection) = fresh_offer_structural_rejection(offer) {
         if rejection.penalise {
             warn!(
@@ -5068,39 +5120,6 @@ async fn handle_fresh_offer(
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
                 key: offer.key,
                 reason: rejection.reason,
-            }),
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
-    }
-
-    // Mirror the normal PUT path: the advertised key must be the content
-    // address of the supplied bytes before any expensive payment verification.
-    let computed_key = crate::client::compute_address(&offer.data);
-    if computed_key != offer.key {
-        warn!(
-            "Rejecting fresh offer for key {}: content address mismatch, computed {}",
-            hex::encode(offer.key),
-            hex::encode(computed_key),
-        );
-        p2p_node
-            .report_trust_event(
-                source,
-                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-            )
-            .await;
-        send_replication_response(
-            source,
-            p2p_node,
-            request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: format!(
-                    "Content address mismatch: expected {}, computed {}",
-                    hex::encode(offer.key),
-                    hex::encode(computed_key),
-                ),
             }),
             rr_message_id,
         )
@@ -9175,14 +9194,61 @@ mod tests {
             "no honest sender constructs an oversized offer"
         );
 
+        let data = vec![0u8; 1];
         let valid = protocol::FreshReplicationOffer {
-            key,
-            data: vec![0u8; 1],
+            key: crate::client::compute_address(&data),
+            data,
             proof_of_payment: vec![1u8; 1],
         };
         assert!(
             fresh_offer_structural_rejection(&valid).is_none(),
             "a well-formed offer must reach admission"
+        );
+    }
+
+    /// Knowing a key must not be enough to reserve it.
+    ///
+    /// The in-flight claim is exclusive and outlives dispatch, so it has to be
+    /// unreachable until the offer has proved it carries the key's bytes. Taken
+    /// any earlier it becomes a suppression primitive: a peer that has only
+    /// *learned* the key — every recipient of its `PaidNotify`, not just the
+    /// close group that gets the chunk — claims it with junk, the genuine offer
+    /// is refused as a duplicate, nothing is stored, and the delayed possession
+    /// check charges the resulting absence to THIS node while the only actual
+    /// repair path (neighbor sync) runs later still.
+    #[test]
+    fn a_fresh_offer_cannot_claim_a_key_whose_bytes_it_lacks() {
+        let genuine_data = vec![0x5Au8; 128];
+        let key = crate::client::compute_address(&genuine_data);
+
+        let forged = protocol::FreshReplicationOffer {
+            key,
+            data: vec![0xFFu8; 1],
+            proof_of_payment: vec![1u8; 1],
+        };
+        let rejection = fresh_offer_structural_rejection(&forged)
+            .expect("bytes that do not hash to the advertised key must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender offers bytes that do not hash to the advertised key"
+        );
+
+        // Dispatch reaches the claim only past that rejection, so the forged
+        // offer never held the key and the genuine one still gets it.
+        let genuine = protocol::FreshReplicationOffer {
+            key,
+            data: genuine_data,
+            proof_of_payment: vec![1u8; 1],
+        };
+        assert!(
+            fresh_offer_structural_rejection(&genuine).is_none(),
+            "the offer that actually carries the key's bytes must reach the claim"
+        );
+
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
+        assert!(
+            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_some(),
+            "an offer refused on payload shape must leave the key claimable"
         );
     }
 
