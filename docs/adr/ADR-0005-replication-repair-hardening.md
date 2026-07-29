@@ -92,14 +92,14 @@ decision below:
 
 Constraints inherited from ADR-0002/ADR-0003 and the wider system:
 
-- Wire compatibility: all changes are patch-level; no protocol message shape
-  changes. Prune confirmation continues using the deployed multi-key
-  `AuditChallenge` / `AuditResponse` variants. A rolling upgrade interoperates
-  in both directions with 0.14.4 nodes at commit `571868a`: every message is
-  understood on the wire. The only behavioural difference is that an oversized-
-  batch `Rejected` is now treated as an attributable failure (see option 11)
-  rather than recovered in-band, which under the store-spread assumption below
-  does not occur for honestly-sized peers.
+- Wire compatibility: no protocol message shape changes. Prune confirmation
+  continues using the deployed multi-key `AuditChallenge` / `AuditResponse`
+  variants. A rolling upgrade interoperates in both directions with 0.14.4
+  nodes at commit `571868a`: every message is understood on the wire. The only
+  behavioural difference is that an oversized-batch `Rejected` is now treated
+  as an attributable failure (see option 11) rather than recovered in-band,
+  which under the store-spread assumption below does not occur for
+  honestly-sized peers.
 - Trust/eviction semantics (ADR-0002, ADR-0003) must not be widened: only
   directly-observed, attributable misbehaviour produces a penalty, and a peer
   that did nothing wrong (e.g. a source whose key we declined for our own churn)
@@ -125,7 +125,7 @@ At the whole-change level:
    be revisited if the pipeline count grows further.
 3. **Apply the five principles above as a coordinated set of local, testable
    decisions, each shippable and independently covered (chosen).** Keeps the
-   change patch-level and reviewable commit-by-commit while closing the root
+   change localized and reviewable commit-by-commit while closing the root
    shapes, not just their symptoms.
 
 Per-area alternatives that were weighed and rejected are recorded inline in each
@@ -758,9 +758,69 @@ traffic summary and size a byte budget from it — not to raise the count again.
 - Prune passes use bounded candidate, request, and local fast-delete counts. The
   per-request key count remains dynamic (`floor(sqrt(local_stored_keys))`), and
   timeouts continue to scale with the actual number of challenged keys.
-- **SemVer: patch.** No wire-format or public-API change; oversized verification
-  requests retain their deployed response and prune audits retain the deployed
-  multi-key challenge/response representation.
+- **Compatibility: wire format unchanged, public Rust API broken.**
+
+  The **wire format is unchanged**, which is what governs deployability:
+  `REPLICATION_PROTOCOL_ID` stays at `v2`, no `ReplicationMessageBody` variant
+  or field is added, removed, or reordered, oversized verification requests
+  retain their deployed response, and prune audits retain the deployed
+  multi-key challenge/response representation. A node running this change and
+  one running the previous release replicate with each other unchanged, so the
+  rollout carries no mixed-version window.
+
+  What breaks is the **Rust surface** of `ant_node::replication`, which is a
+  `pub mod` (`src/lib.rs`) and therefore a real compatibility boundary even
+  though every in-tree caller is first-party. Downstream Rust callers must
+  adapt:
+
+  - `audit::audit_tick` **removed**. Callers use
+    `audit::audit_tick_with_repair_proofs`, which itself takes a new required
+    `&Arc<AuditChallengeCoordinator>` argument (decision 10). The removed
+    wrapper was already degenerate — it constructed a fresh, empty repair-proof
+    table on every call, so no sampled key could ever be mature and the tick
+    returned `Idle` without issuing a challenge. Retaining it under decision 10
+    would additionally mean fabricating a throwaway coordinator per call, which
+    defeats the shared per-target bound decision 10 exists to establish.
+  - `audit::AuditTickResult::Failed` gains a required `no_response_class` field.
+    The enum stays **not** `#[non_exhaustive]` deliberately: exhaustive matching
+    is what forces a caller to confront a new audit outcome rather than fold it
+    into a wildcard arm, and the trust consequences of a silently-ignored
+    outcome are exactly what this ADR is hardening.
+  - `pruning::run_prune_pass` **removed** — it was a convenience wrapper over
+    `run_prune_pass_with_context`, which remains public and is what the engine
+    calls. `PrunePassContext` gains a required `audit_challenge_coordinator`
+    field, so struct-literal construction must be updated.
+  - `quorum::VerificationTargets` gains a required `paid_edge_targets` field
+    (paid-list edge ceiling, decision 8), likewise breaking struct literals.
+  - `types::VerificationEntry` drops `pipeline` and `hint_sender` in favour of
+    `next_verify_at`, `hint_sources`, and `replica_hint_sources`; `pipeline()`
+    is now a derived method. This is the representational core of decision 7
+    (multi-source corroboration), not an incidental rename.
+  - `types::FetchCandidate`'s *queued* role is split into the new `FetchOrder`
+    (immutable heap key: `key`, `distance`) and `FetchPayload` (mutable half:
+    `sources`, `retry_verification`), held outside the heap so that merging a
+    newly-discovered source into an already-queued key cannot disturb heap order
+    — decision 9, and the reason that merge is O(1). `FetchCandidate` itself
+    survives as the *dequeued* rejoined form, but gains a `retry_verification`
+    field and **loses its `Ord`/`PartialOrd`/`Eq` impls** to `FetchOrder`, so
+    any caller that held it in a `BinaryHeap` must move to `FetchOrder`.
+    `HintPipeline::capacity_rejected_sources` becomes
+    `HashMap<PeerId, Instant>` to carry the expiry that decision 6 needs.
+  - `scheduling::MAX_PENDING_VERIFY_PER_PEER` **removed** (decision 7);
+    `config::MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS` **removed**, superseded by the
+    separate `MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS` and
+    `MAX_PRUNE_AUDIT_REQUESTS_PER_PASS` bounds (decision 11).
+  - `scheduling::pending_count_for_sender` is replaced by
+    `pending_count_for_owner` — not a rename: under decision 7 a key has many
+    hint sources, so the per-sender tally is meaningless and accounting moves to
+    the owning peer. `evict_stale` now returns the evicted keys instead of `()`.
+
+  **No compatibility shims are provided**, and that is the decision rather than
+  an oversight: the changed items are the data structures this ADR restructures,
+  so a parallel deprecated surface would pin the old representation in place and
+  forfeit the properties (multi-source corroboration, heap-stable requeue,
+  coordinator-gated audits) the restructure exists to obtain. Every consumer is
+  first-party and is updated alongside the change.
 - Runs alongside ADR-0002's gossip-triggered audit and ADR-0003's full-node
   detection, sharing the same trust/eviction path; the sole-source replica penalty
   is another attributable-misbehaviour source feeding it.
