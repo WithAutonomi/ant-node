@@ -555,6 +555,44 @@ in the field, the store-spread assumption is being violated and the accommodatio
 should be reconsidered. No protocol identifier, enum discriminant, message field,
 digest, nonce, or challenge-ID rule changes; the wire representation is untouched.
 
+**Why the ~2x store-spread assumption holds.** Close-group membership is decided
+by XOR distance to the key, and a node's store is the union of the keys it ranks
+closest to. Over any realistic key population the members of one close group are
+therefore responsible for statistically indistinguishable slices of the keyspace,
+and their stored-chunk counts converge on the same value. The spread that does
+exist comes from join recency and downtime — both transient, and both closed by
+the same repair machinery this ADR hardens: a newly joined or recently returned
+peer is actively being filled toward its neighbours' count. A peer answering
+audits with a store below a quarter of its close-group neighbours' is therefore
+not a normal steady state. It is either mid-fill, in which case the condition
+clears on its own within a few sync cycles, or it is misreporting its size — and
+the second is what the failure grade exists to catch.
+
+**Reachability, and why the exposure is bounded.** The candidate budget adopted
+here (`MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS = 1024`, replacing the
+candidate-to-peer-edge budget that capped a pass at roughly nine records) is what
+makes a batch large enough to reach a responder's ceiling at all; under the
+previous accounting the question could not arise in practice. The grading itself
+is **not new**: before this change a `Rejected` already mapped to
+`PruneAuditStatus::Failed` and already reached `report_trust_event` with
+`AUDIT_FAILURE_TRUST_WEIGHT`. What this option changes is the label
+(`size_reject` rather than an undifferentiated failure) and the fact that the
+path is now exercised. The blast radius stays bounded by the 4x threshold above,
+by the fresh-responsibility-confirmation gate, and by per-peer-per-pass dedup —
+at most one trust report per peer per prune pass.
+
+- **Rejected:** grading a size `Rejected` as trust-neutral (metric only). This
+  would spare an honest under-filled peer, but it also discards the only signal
+  this node has that a close-group peer is failing an audit it should be able to
+  serve, and it discards it for every peer rather than only the mis-sized ones.
+  Under the store-spread property above, the honest-but-tiny responder is not the
+  expected case, so the trade runs the wrong way. **This is a settled decision:
+  it should not be re-opened on the reasoning that a smaller-store peer might be
+  honest — that possibility is understood and priced in above.** The `size_reject`
+  metric firing under normal load remains the one legitimate re-open trigger,
+  because it is evidence about the assumption itself rather than about the
+  hypothetical.
+
 ## Consequences
 
 ### Positive
@@ -675,7 +713,9 @@ How we will know this decision remains correct (coverage added in PR #165):
   a no-op, rejection recorded after for the departed peer, drain blocked, then TTL
   expiry drains it); per-source TTL semantics (within-TTL still blocks; a stale
   source's expiry does not forfeit a fresh source's owed re-delivery; a repeat
-  rejection refreshes the timestamp); and the verification-tick self-heal helper.
+  rejection re-asserts the debt without refreshing the first-seen stamp, so
+  sustained pressure from one source still drains once the TTL elapses); and the
+  verification-tick self-heal helper.
 - **Neighbor sync:** priority drain/termination contract and lag recovery (resnapshot
   + departed-peer prune); closed vs. lagged P2P event handling (terminal control flow
   vs. continuation with metric accounting).
