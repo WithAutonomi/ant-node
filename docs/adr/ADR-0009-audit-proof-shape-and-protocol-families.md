@@ -1,7 +1,7 @@
-# ADR-0007: Audit proof shape and protocol families
+# ADR-0009: Audit proof shape and protocol families
 
 - **Status:** Proposed
-- **Date:** 2026-07-28
+- **Date:** 2026-07-29
 - **Decision owners:** Anselme (@grumbach)
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -18,18 +18,19 @@ sampling agreed at 5.79 to 6.15 MB across four separate days. The cost is paid
 per audit event regardless of how often audits fire, so frequency caps alone
 cannot bound it.
 
-Separately, the node has three audit lanes that each ask a peer to prove it holds
+Separately, the node has four audit lanes that each ask a peer to prove it holds
 specific bytes:
 
 1. the subtree storage-commitment audit (ADR-0002),
-2. the post-replication possession probe (ADR-0003),
-3. the prune-confirmation audit.
+2. the periodic responsible-chunk audit,
+3. the post-replication possession probe (ADR-0003),
+4. the prune-confirmation audit.
 
-Lanes 2 and 3 share one wire message pair with lane 2's digest helper. Lane 1
-built its own per-leaf commitment. The three lanes did not derive their
-per-audit freshness the same way, which meant a change to one left the others on
-a different footing. Keeping three different answers to the same question is a
-maintenance and review hazard independent of any single lane's strength.
+Lanes 2, 3 and 4 are digest-based and share one wire message pair. Lane 1 built
+its own per-leaf commitment. The lanes did not derive their per-audit freshness
+the same way, which meant a change to one left the others on a different
+footing. Keeping several different answers to the same question is a maintenance
+and review hazard independent of any single lane's strength.
 
 ADR-0002 is not amended by this decision. It records what was decided then; this
 ADR records what replaces its round-2 proof shape and how the freshness
@@ -39,7 +40,7 @@ derivation is unified.
 
 - Egress reduction is the primary goal; the audit must stop moving whole chunks
   to prove they exist.
-- One freshness construction across all audit lanes, not three.
+- One freshness construction across all audit lanes, not one per lane.
 - A mixed-version fleet must keep replicating during the auto-upgrade window.
   Partitioning core replication to ship an audit change is too blunt.
 - A version skew must never be scored as a peer's fault.
@@ -49,7 +50,7 @@ derivation is unified.
 1. Keep full-chunk round-2 responses and rely on frequency caps alone.
 2. Return a verified slice for round 2, and leave the other lanes as they were.
 3. Return a verified slice for round 2, unify the freshness derivation across all
-   three lanes, and give each changed message family its own protocol id.
+   four lanes, and give each changed message family its own protocol id.
 4. As option 3, but advance the single shared replication protocol id instead of
    introducing per-family ids.
 
@@ -67,16 +68,25 @@ with fresh randomness after the round-1 commitment arrives. The auditor also
 anchors the responder's claimed content length against the address rather than
 trusting it.
 
-**Freshness derivation.** All three lanes derive their per-audit freshness the
+**Freshness derivation.** All four lanes derive their per-audit freshness the
 same way: the challenge material (nonce, challenged peer, key) is used to derive
 a BLAKE3 key under a versioned domain-separation context, and the content is
 hashed under that key. Deriving a key rather than prefixing the challenge means
 the whole proof depends on the fresh nonce rather than only its leading bytes.
 
 **Protocol families.** Core replication keeps its existing id. The subtree audit
-rides its own id, and the digest-based possession audits (lanes 2 and 3, one
-shared message pair) ride a second one. A symmetric guard drops any message whose
-family disagrees with the id it arrived on.
+rides its own id, and the three digest-based lanes (one shared message pair)
+ride a second one. A symmetric guard drops any message whose family disagrees
+with the id it arrived on.
+
+**Unanswered round 2.** Because round 2 names the blocks to open only after the
+round-1 roots are committed, a responder learns the draw before it decides
+whether to reply. An unanswered round 2 that follows a valid round-1 proof
+therefore revokes the holder credit carried by the commitment under audit,
+scoped to that commitment. It stays in the graced timeout lane and takes no
+trust penalty: honest peers drop replies, and version-skewed peers never reach
+this state because they cannot complete the new round 1. What it removes is the
+option of holding credit without ever completing a possession check.
 
 **Round-1 work bounds.** A single round-1 challenge selects a fixed-depth block
 of the commitment tree sized to about the square root of the key count, so the
@@ -85,16 +95,35 @@ small admission pool, a per-peer responder cooldown, and its hashing runs off th
 async executor. Round 2 is bound to a single-use session opened by a matching
 round 1 from the same peer.
 
+Those bounds are all keyed by peer identity or by concurrency, and neither
+bounds sustained work: a concurrency cap can be refilled the moment a slot frees,
+and a per-peer cooldown can be refilled by presenting a different peer id. Round
+1 is therefore also charged against a responder-wide budget over the chunk bytes
+it reads and hashes, refilled at a fixed rate and keyed by nothing at all. The
+budget carries debt, so an expensive proof is admitted proportionally less often
+than a cheap one, and the sustained rate settles at the refill rate whatever the
+caller's identity. It is sized above honest demand at the largest commitment the
+system allows, so it costs honest auditing nothing.
+
+**Pre-admission bounds.** Family, session and admission checks all read fields of
+a decoded message, so none of them can run before decoding. The audit families
+therefore take their own wire-size ceiling, checked against the encoded length
+before any parsing, sized against the largest legitimate audit body — the round-1
+proof at the commitment key-count cap. This keeps the work an unknown peer can
+demand before admission proportional to what an audit can legitimately carry
+rather than to the core replication ceiling, which is sized for hint batches that
+no audit body contains.
+
 ## Consequences
 
 ### Positive
 
 - Round-2 responses fall from megabytes to kilobytes. A 990-node run measured
   14.49 KB over 69,903 responses against 6.19 MB on a simultaneous same-network
-  control cohort.
+  control cohort — a reduction of about 427x in decimal units.
 - The cost per audit event is bounded regardless of audit rate, which frequency
   caps cannot achieve on their own.
-- One freshness construction across all three lanes instead of three.
+- One freshness construction across all four lanes instead of one per lane.
 - Core replication is not partitioned by an audit change. A mixed-version run
   measured 736/736 and 135/135 transfers with no failures, and the older cohort
   continued to accept and store paid chunks throughout.
@@ -122,7 +151,7 @@ round 1 from the same peer.
   The exchange is deliberate, and the comparison should be stated in both
   directions. Against a node under-storing **in bulk** — the realistic case, a
   node dropping data to save disk — detection is close to what the full-byte
-  audit gave, at roughly a thousandth of the egress; the fleet run caught a
+  audit gave, at roughly 1/430 of the egress; the fleet run caught a
   256 MB in-place corruption on the first audit that reached the node, by three
   independent auditors, against zero false positives across ~43,000 audits in
   the preceding 5.5 hours. Against a **fine-grained** partial deleter, one
@@ -137,9 +166,19 @@ round 1 from the same peer.
   honest peer at confirmed-failure weight for the upgrade window. While it is
   set, a peer that silently drops audit challenges is under-penalised: it still
   takes the upstream unit transport decrement, but not the audit-severity one.
-  **This must be turned off and deleted in a follow-up once the fleet has
-  upgraded.** The guarded branches stay compiled rather than commented out so
-  they cannot rot while disabled.
+  The guarded branches stay compiled rather than commented out so they cannot rot
+  while disabled.
+
+  **Removal is owed, on an objective criterion.** Owner: Anselme (@grumbach),
+  the decision owner for this ADR. The gate exists only to cover peers that have
+  not yet upgraded, so the criterion is a fleet-version one: once the released
+  version carrying this change accounts for at least 99% of nodes seen in the
+  routing table over a seven-day window, and no supported release still on the
+  old audit protocol remains in the field, set the constant to `false`, delete
+  it, and inline the guarded branches. Until that is done, the timeout penalty on
+  those three lanes is suppressed for everyone, not only for old peers, so this
+  is a live weakening and not merely a compatibility shim. It should be tracked
+  as an open follow-up rather than closed with this change.
 - Cross-version audits pause during the auto-upgrade window. Unanswered requests
   still register a unit trust decrement upstream, which decays back to neutral;
   the possession lanes probe more often than the subtree lane, so their dip is
@@ -166,6 +205,11 @@ round 1 from the same peer.
   positives.
 - Routing tests assert that each message family is accepted only on its own
   protocol id, in both directions.
+- Unit tests pin the round-2 credit boundary (which outcomes revoke the pinned
+  commitment's credit, and that the revocation is scoped to that commitment),
+  that the round-1 work budget is not refilled by a fresh peer id and recovers at
+  its configured rate, and that the worst legitimate round-1 proof fits the
+  audit-family wire ceiling.
 - Fleet evidence: response size against a same-network control cohort,
   detection parity, false-positive rate, mixed-version transfer success,
   round-1 CPU and memory against baseline, and node stability.
