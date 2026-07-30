@@ -717,6 +717,75 @@ backed by field data. If `serial_queue_drops` or the per-variant overflow counte
 fire under normal load, the first move is to add a high-water depth gauge to the
 traffic summary and size a byte budget from it — not to raise the count again.
 
+### 13. Leave the possession-check backlog unbounded; make it cancellable instead
+
+The delayed possession check (ADR-0003) is scheduled over an **unbounded** channel
+(`possession_check_tx`, `mod.rs`), and each event becomes its own tracked task
+that sleeps a randomised 5-15 minutes before probing. Both are deliberate.
+
+**The backlog is self-generated paid work, not remote input.** Events come from
+exactly one place — a `FreshWriteEvent` this node accepted, fanned out through
+`replicate_fresh`, and only when the fan-out actually reached peers (`mod.rs`).
+Every entry therefore corresponds to a chunk this node took a client PUT for and
+was paid for. Nobody can inflate the queue without paying for each chunk *and*
+having this node accept it, which is categorically unlike the inbound serial
+queue of decision 12, where a stranger's bytes size the queue. That difference is
+why a bound is right there and wrong here.
+
+**A cap would discard the thing the queue exists for.** A dropped possession
+check is a peer that failed to store going unpunished — shedding accountability
+precisely when there is most to account for. Any figure chosen would also be the
+same unprincipled constant decision 12's own re-open trigger objects to.
+
+**Memory does not motivate one either.** An event is an `XorName` plus a
+`Vec<PeerId>` (~224 bytes) plus task overhead, and the steady-state count is
+arrival rate × the ~10 minute settle window. A sustained 10 chunks/s — around
+40 MB/s of accepted ingest — parks roughly 6,000 tasks, on the order of 10 MB.
+
+**What is genuinely unbounded is lateness, not memory.** `probe_once` challenges
+a single key (`POSSESSION_PROBE_KEY_COUNT` = 1) and
+`MAX_CONCURRENT_AUDIT_CHALLENGES_PER_TARGET` is 2, so throughput per target is
+two probes per round trip. Against a healthy peer (~50 ms) that is ~40 probes/s
+and no queue forms. Against an unresponsive one it collapses to 2 / 4.4 s ≈
+**0.45 probes/s** (the 4 s floor plus the 400 ms bandwidth-scaled term), so the
+backlog only runs away when peers are already timing out. The cost then is that
+checks fire arbitrarily late, and a late verdict is a *wrong* verdict: neighbor
+sync may have delivered the chunk in the meantime, so the probe would penalise a
+peer that now holds it. A count cap does not address that — it discards a
+different arbitrary subset of the same checks.
+
+**Cancellability is what actually had to be fixed.** `run_possession_check` was
+called from inside the settle sleep's `select!` *branch body*, so once the sleep
+won, the select was resolved and nothing downstream was cancellable — while a
+started check can park on the per-target coordinator, which has no deadline of
+its own. Shutdown then waited out the whole drain, because
+`detached_task_tracker.wait()` is deliberately unbounded for the LMDB contract
+(decision 3). The sleep and the check are now wrapped in a single future so
+shutdown races both. Dropping it mid-probe is safe: a parked coordinator acquire
+releases its counted reference through `ReferenceGuard`, and a dropped LMDB
+`spawn_blocking` is covered by the storage-quiescence wait in `shutdown`.
+
+- **Rejected: capping the scheduler queue.** See above — it defends against
+  nothing an attacker can cheaply reach and sheds accountability to buy memory
+  that was never scarce.
+- **Rejected: closing the coordinator semaphore at shutdown.** `acquire`
+  returning `None` is mapped to `MalformedResponse` in the prune path, which
+  would report misbehaviour against an innocent peer on every shutdown. Racing
+  the future leaves that path dormant.
+- **Deferred, not rejected: coalescing per target.** `AuditChallenge.keys` is
+  already a `Vec<XorName>` answered by per-key digests in
+  `AuditResponse::Digests` — the same deployed multi-key form prune audits use —
+  so matured keys for one peer could go out as a single challenge, multiplying
+  throughput by the batch factor instead of discarding work. Close-group overlap
+  means checks against the same peer accumulate naturally, and the batch size has
+  a principled ceiling already to hand: `audit_response_timeout(key_count)`
+  scales with the count, so the batch is sized by what an honest peer can serve.
+
+**Re-open trigger.** Probe lateness is the signal, not queue depth: if the
+interval between an event being scheduled and its probe completing drifts past
+the settle window — visible as possession failures against peers that turn out to
+hold the key — coalesce per target as above. Do not add a count cap.
+
 ## Consequences
 
 ### Positive
@@ -788,6 +857,14 @@ traffic summary and size a byte budget from it — not to raise the count again.
   field measurement currently supports or refutes. It is reachable only by a peer
   sustaining oversized fresh offers, the lane's one large class; byte accounting
   is the real fix and is deferred. See decision 12, including its re-open trigger.
+- **Possession-check lateness is unbounded when peers stop answering.** The
+  scheduler queue is deliberately uncapped (the work is self-generated and paid
+  for), but per-target probe throughput falls to ~0.45/s against a peer that
+  burns the full response deadline. A backlog that forms then delays checks past
+  the point where their verdict is sound, since neighbor sync may have delivered
+  the chunk in the meantime. Accepted rather than capped: a cap would drop checks
+  instead of running them late, which forfeits the accountability the check
+  exists for. See decision 13, including its re-open trigger.
 
 ### Neutral / Operational
 
