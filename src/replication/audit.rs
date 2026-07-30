@@ -297,8 +297,8 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
-    // Step 7: Parse response.
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
+    // Step 7: Parse response, under the audit ceiling rather than the core one.
+    let resp_msg = match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Audit: failed to decode response from {challenged_peer}: {e}");

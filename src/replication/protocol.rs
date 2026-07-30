@@ -13,6 +13,7 @@ use crate::ant_protocol::XorName;
 
 use super::types::AuditFailureReason;
 
+use super::config::MAX_AUDIT_MESSAGE_SIZE;
 pub use super::config::MAX_REPLICATION_MESSAGE_SIZE;
 
 /// Sentinel digest value indicating the challenged key is absent from storage.
@@ -88,6 +89,38 @@ impl ReplicationMessage {
         record_rx(&message.body, data.len());
 
         Ok(message)
+    }
+
+    /// Decode a reply to an audit challenge, under the audit family ceiling.
+    ///
+    /// The pre-decode ceiling on the receive path bounds what an auditor can
+    /// make a responder decode. This is that same bound in the other direction.
+    /// A challenge costs a few hundred bytes to send, so without it a challenged
+    /// peer could answer with up to [`MAX_REPLICATION_MESSAGE_SIZE`] and make
+    /// the auditor allocate and decode all of it — the cheap side of the
+    /// exchange paying for the expensive one, which is the shape the responder
+    /// ceiling exists to prevent. Audit bodies are ~110 KiB at worst (see
+    /// [`MAX_AUDIT_MESSAGE_SIZE`]), so this costs an honest responder nothing.
+    ///
+    /// No discriminant peek is needed here, unlike the receive path: the auditor
+    /// asked the question, so it already knows the reply belongs to an audit
+    /// family, and a body that turns out not to be the expected one is rejected
+    /// by the lane's own matching afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicationProtocolError::MessageTooLarge`] above the audit
+    /// ceiling, which every audit lane already reads as a malformed answer
+    /// rather than as silence: a peer that answers at all is on this protocol,
+    /// so the rollout grace does not cover it.
+    pub fn decode_audit_response(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
+        if data.len() > MAX_AUDIT_MESSAGE_SIZE {
+            return Err(ReplicationProtocolError::MessageTooLarge {
+                size: data.len(),
+                max_size: MAX_AUDIT_MESSAGE_SIZE,
+            });
+        }
+        Self::decode(data)
     }
 }
 
@@ -2158,6 +2191,45 @@ mod tests {
             matches!(err, ReplicationProtocolError::MessageTooLarge { .. }),
             "expected MessageTooLarge, got {err:?}"
         );
+    }
+
+    // A challenge is a few hundred bytes; without the tighter ceiling the reply
+    // to it could cost the auditor up to the full core allowance in allocation
+    // and decode. The gap between the two ceilings is exactly what an audited
+    // peer could spend the auditor's memory on, so pin that it is refused as an
+    // audit reply while still being a legal core message.
+    #[test]
+    fn an_audit_reply_above_the_audit_ceiling_is_refused_before_decode() {
+        let between_the_ceilings = vec![0u8; MAX_AUDIT_MESSAGE_SIZE + 1];
+        assert!(between_the_ceilings.len() < MAX_REPLICATION_MESSAGE_SIZE);
+
+        let err = ReplicationMessage::decode_audit_response(&between_the_ceilings)
+            .expect_err("an audit reply over the audit ceiling must not be decoded");
+        assert!(
+            matches!(
+                err,
+                ReplicationProtocolError::MessageTooLarge { max_size, .. }
+                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+            ),
+            "expected the audit ceiling to be the one reported, got {err:?}"
+        );
+    }
+
+    // The tighter ceiling must not clip a legitimate reply. Round 1's `Proof` is
+    // the largest audit body there is, and `MAX_AUDIT_MESSAGE_SIZE` is sized
+    // against it; this checks the auditor accepts what a responder may send.
+    #[test]
+    fn a_legitimate_audit_reply_still_decodes_under_the_audit_ceiling() {
+        let msg = ReplicationMessage {
+            request_id: 7,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
+                challenge_id: 42,
+            }),
+        };
+        let encoded = msg.encode().expect("encode should succeed");
+        let decoded = ReplicationMessage::decode_audit_response(&encoded)
+            .expect("a small audit reply must decode");
+        assert_eq!(decoded.request_id, 7);
     }
 
     #[test]

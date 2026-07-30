@@ -333,7 +333,7 @@ async fn probe_once(
         }
     };
 
-    let decoded = match ReplicationMessage::decode(&response.data) {
+    let decoded = match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(decoded) => decoded,
         Err(e) => {
             debug!("Failed to decode possession response from {peer}: {e}");

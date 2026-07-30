@@ -1556,7 +1556,7 @@ async fn send_prune_audit_challenge(
         }
     };
 
-    match ReplicationMessage::decode(&response.data) {
+    match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(msg) => Ok(msg),
         Err(e) => {
             warn!("Failed to decode prune audit response from {peer}: {e}");

@@ -219,7 +219,7 @@ pub async fn run_subtree_audit(
         }
     };
 
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
+    let resp_msg = match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Audit: failed to decode subtree response from {challenged_peer}: {e}");
@@ -344,7 +344,7 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
         }
     };
 
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
+    let resp_msg = match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Audit: failed to decode slice response: {e}");
