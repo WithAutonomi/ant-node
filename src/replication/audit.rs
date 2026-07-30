@@ -11,7 +11,7 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 
 use crate::ant_protocol::XorName;
-use crate::replication::config::{ReplicationConfig, POSSESSION_AUDIT_PROTOCOL_ID};
+use crate::replication::config::{possession_challenge_protocol, ReplicationConfig};
 use crate::replication::protocol::{
     compute_audit_digest, compute_audit_digest_as, AuditChallenge, AuditDigestVersion,
     AuditResponse, ReplicationMessage, ReplicationMessageBody, ABSENT_KEY_DIGEST,
@@ -248,7 +248,7 @@ pub async fn audit_tick_with_repair_proofs(
     let response = match p2p_node
         .send_request(
             &challenged_peer,
-            POSSESSION_AUDIT_PROTOCOL_ID,
+            possession_challenge_protocol(),
             encoded,
             audit_timeout,
         )

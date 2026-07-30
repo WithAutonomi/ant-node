@@ -39,8 +39,8 @@ use tokio_util::sync::CancellationToken;
 use crate::ant_protocol::XorName;
 use crate::logging::{debug, warn};
 use crate::replication::config::{
-    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, GRACE_POSSESSION_AUDIT_TIMEOUTS,
-    POSSESSION_AUDIT_PROTOCOL_ID,
+    possession_challenge_protocol, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
+    GRACE_POSSESSION_AUDIT_TIMEOUTS,
 };
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -160,8 +160,9 @@ pub(crate) async fn run_possession_check(
     };
 
     // Single-key probe budget, matched to the audit response timeout's
-    // bandwidth-calibrated deadline (tight enough that a relay that must refetch
-    // the bytes blows it, generous for an honest local-disk read).
+    // bandwidth-calibrated deadline: generous for an honest local-disk read, and
+    // a liveness bound rather than an anti-relay one — the reply is one digest,
+    // so no deadline prices a relay out of producing it (ADR-0009).
     let probe_timeout = config.audit_response_timeout(POSSESSION_PROBE_KEY_COUNT);
 
     for peer in peers {
@@ -323,7 +324,12 @@ async fn probe_once(
     };
 
     let response = match p2p_node
-        .send_request(peer, POSSESSION_AUDIT_PROTOCOL_ID, encoded, probe_timeout)
+        .send_request(
+            peer,
+            possession_challenge_protocol(),
+            encoded,
+            probe_timeout,
+        )
         .await
     {
         Ok(response) => response,

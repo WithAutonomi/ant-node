@@ -173,9 +173,13 @@ no audit body contains.
   before, which weakens replication multiplicity rather than possession itself.
   Nothing at this layer fixes it: non-delegability needs either peer-specific
   encoding committed at rest, or an economic bound that makes a passed audit
-  worth less than the storage it stands in for. Recorded as a known gap, owned
-  with the payment-provenance work, and not claimed as solved anywhere in this
-  change.
+  worth less than the storage it stands in for. Recorded here as a known gap,
+  owned with the payment-provenance work.
+
+  This supersedes the claim in ADR-0002 that a relay is priced out by the
+  round-2 deadline. That was true of the full-byte shape ADR-0002 described and
+  is not true of this one. ADR-0002 is left unedited, as accepted ADRs are; this
+  paragraph is where the correction lives.
 - Three protocol ids to reason about instead of one.
 - A temporary rollout gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) suppresses the
   timeout penalty on the three digest lanes so a version skew cannot punish an

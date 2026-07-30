@@ -1146,11 +1146,19 @@ pub struct SubtreeSliceOpening {
 ///   - the Bao slice against `leaf.bytes_hash` (the chunk's content address), AND
 ///   - the nonced opening against `leaf.nonced_root` (round-1 possession commit).
 ///
-/// This makes possession non-delegable *and* cheap to prove: the response is a
-/// few KB, not up to two 4 MiB chunks. A responder that did not hold the bytes at
-/// round-1 commit time cannot have committed a correct `nonced_root`, and cannot
-/// fold an after-the-fact-fetched block to a foreign root without a preimage
-/// break — so it is caught regardless of who audits it.
+/// The pair binds the opened block to bytes that were held when round 1 was
+/// answered, cheaply: the response is a few KB, not up to two 4 MiB chunks.
+/// Whoever answered round 1 without the bytes cannot have committed a correct
+/// `nonced_root`, and cannot fold an after-the-fact-fetched block to a foreign
+/// root without a preimage break.
+///
+/// What it does NOT bind is *which* party held them. Every input is public, so
+/// a backend holding one copy can answer for any number of front-end
+/// identities; the proof is delegable, and cheaper to delegate than the
+/// full-byte round 2 it replaces, which priced delegation by forcing the chunk
+/// through the relay. ADR-0009 records that as a known gap. Anything in this
+/// tree that reads as "non-delegable" or "a relay blows the deadline" is a
+/// claim about the older design and is superseded there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtreeSliceChallenge {
     /// The same `challenge_id` as the round-1 [`SubtreeAuditChallenge`], so the
@@ -2320,6 +2328,49 @@ mod tests {
         assert!(
             ReplicationMessage::decode(&core_body).is_ok(),
             "a core body must keep the core allowance"
+        );
+    }
+
+    // Regression (dirvine, PR #181): the reviewed reproduction, verbatim. A
+    // solicited reply is delivered straight to the `send_request` caller, so it
+    // never passes the receive path's guard; every audit lane decoded it under
+    // the core allowance. A challenged peer could answer a few-hundred-byte
+    // challenge with a *valid* `AuditResponse::Digests` carrying 200,000
+    // digests, and have all 6.4 MB allocated before the lane looked at the
+    // count. Prune confirmation can have up to 32 of these in flight.
+    //
+    // FLIPS IF: the family ceiling stops applying to replies.
+    #[test]
+    fn an_oversized_digest_reply_is_refused_before_its_collection_is_allocated() {
+        let encoded = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![[0xAB; 32]; 200_000],
+            }),
+        }
+        .encode()
+        .expect("the reproduction must be a legal core-sized message to be interesting");
+
+        assert!(
+            encoded.len() > MAX_AUDIT_MESSAGE_SIZE,
+            "reproduction must exceed the audit ceiling"
+        );
+        assert!(
+            encoded.len() < MAX_REPLICATION_MESSAGE_SIZE,
+            "and sit under the core one, which is what let it through"
+        );
+
+        // Refused by the lane's own decoder...
+        assert!(
+            ReplicationMessage::decode_audit_response(&encoded).is_err(),
+            "an audit lane must not decode an oversized reply"
+        );
+        // ...and by the general decoder, since the body's family says audit.
+        // Both, so neither is load-bearing alone.
+        assert!(
+            ReplicationMessage::decode(&encoded).is_err(),
+            "and the family ceiling must catch it even without lane context"
         );
     }
 

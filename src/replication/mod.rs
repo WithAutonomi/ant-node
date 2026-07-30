@@ -1010,6 +1010,23 @@ fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool 
 /// only the digest construction moved, and the responder picks it from the
 /// asker. Challenges only: this node always sends its own on the dedicated id,
 /// so a *response* on the core id is never one it asked for and stays refused.
+///
+/// What this costs, stated exactly, because it is a weakening and not only a
+/// shim. The legacy construction is the flat prefix hash this release replaced
+/// precisely because it is preprocessing-weak: a responder can keep BLAKE3
+/// chaining state instead of the record and still match. So an upgraded node
+/// answering an old auditor is no stronger than an old node answering it, which
+/// matters most in the prune lane, where a matching digest counts toward a
+/// quorum authorising deletion.
+///
+/// The bound is that this never goes below what is deployed today, and cannot be
+/// steered. The dialect is chosen by the ASKER, while the party that gains from
+/// the weak construction is the RESPONDER, so a malicious holder cannot elect to
+/// be asked weakly. Only a peer whose own binary already accepts nothing
+/// stronger asks that way — every lane on this release asks on the dedicated id,
+/// pinned by `every_digest_lane_asks_on_the_dedicated_id` — so the exposure is
+/// exactly the one that peer already has to every un-upgraded node it audits,
+/// and it ends when the gate does.
 fn is_legacy_possession_challenge(body: &ReplicationMessageBody, protocol: &str) -> bool {
     GRACE_POSSESSION_AUDIT_TIMEOUTS
         && protocol == REPLICATION_PROTOCOL_ID
@@ -7087,6 +7104,38 @@ mod tests {
             possession_reply_dialect(REPLICATION_PROTOCOL_ID),
             (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID),
             "a peer still on the core id verifies with the previous construction"
+        );
+    }
+
+    // The legacy construction is preprocessing-weak — that is why it was
+    // replaced — so being answered in it is a real weakening. It is bounded by
+    // the fact that the ASKER picks the dialect while the RESPONDER is the one
+    // who gains from a weak one: a malicious holder cannot elect to be asked
+    // weakly, and only a peer that already accepts nothing stronger asks that
+    // way. That holds exactly while no lane on this release asks on the core id,
+    // which is what this pins. All three route through one function so a new
+    // lane cannot pick an id by hand.
+    //
+    // FLIPS IF: a digest lane is given its own protocol id again, or the shared
+    // one is pointed at the core id.
+    #[test]
+    fn every_digest_lane_asks_on_the_dedicated_id() {
+        use crate::replication::config::possession_challenge_protocol;
+
+        let (dialect, reply_on) = possession_reply_dialect(possession_challenge_protocol());
+        assert_eq!(
+            dialect,
+            AuditDigestVersion::Keyed,
+            "what this release asks on must be answered in the current construction"
+        );
+        assert_eq!(
+            reply_on, POSSESSION_AUDIT_PROTOCOL_ID,
+            "and answered on the dedicated id"
+        );
+        assert_ne!(
+            possession_challenge_protocol(),
+            REPLICATION_PROTOCOL_ID,
+            "asking on the core id would be asking for the superseded digest"
         );
     }
 

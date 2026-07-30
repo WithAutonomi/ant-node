@@ -455,6 +455,58 @@ async fn rejected_round1_still_reports_the_work_it_spent() {
     );
 }
 
+/// Follow-up (dirvine, PR #181): a round 1 that fails on its FIRST leaf returns
+/// no bytes and hashes nothing, but it is not free — the lookup ran, with its
+/// retries and backoffs behind it. Charging only content left that case at
+/// exactly zero, so a commitment whose first selected leaf is unreadable could
+/// be replayed indefinitely without touching the responder-wide budget, and the
+/// per-peer cooldown does not help because it is escapable by rotating identity.
+///
+/// The attempt itself is now charged, so the floor is the floor: not the bytes
+/// that came back, but the work owed before knowing whether any would.
+///
+/// FLIPS IF: the charge moves back behind a successful read.
+#[tokio::test]
+async fn a_round1_failing_on_its_first_leaf_still_reports_the_attempt() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+
+    // Take a baseline to learn which leaf this nonce selects first, then delete
+    // exactly that one so the responder fails before reading any bytes at all.
+    let challenge = challenge_for(&r, pin, [0x11u8; 32]);
+    let baseline =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+    let SubtreeAuditResponse::Proof { ref proof, .. } = baseline.response else {
+        panic!("expected a baseline Proof, got {:?}", baseline.response);
+    };
+    let first = proof.leaves.first().expect("non-empty").key;
+    storage
+        .delete(&first)
+        .await
+        .expect("delete first leaf chunk");
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match work.response {
+        SubtreeAuditResponse::Rejected { ref reason, .. } => {
+            assert!(
+                reason.contains("missing bytes for committed key"),
+                "expected the missing-bytes rejection, got: {reason}"
+            );
+        }
+        ref other => panic!("expected Rejected(missing bytes), got {other:?}"),
+    }
+    assert_eq!(
+        work.content_bytes, SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES,
+        "a first-leaf failure must cost the attempt, and exactly the attempt"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 6. Round 2 (slice challenge): honest open + oversize-request rejection
 // ---------------------------------------------------------------------------

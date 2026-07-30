@@ -49,9 +49,10 @@ use crate::replication::audit::AuditTickResult;
 
 /// ADR-0002 round-2 slice challenge samples a SMALL surprise set of the proven
 /// leaves (3..=5). Small enough that the responder's honest local-disk read of
-/// the original chunks stays well inside the response deadline (a liveness bound), while
-/// a relay forced to fetch them over the network blows it; large enough that
-/// faking a fraction `x` of leaves survives only `(1 - x)^k`.
+/// the original chunks stays well inside the response deadline, which is a
+/// liveness bound and nothing more here: the reply is a few KB, so no deadline
+/// prices a relay out of fetching it (ADR-0009). Large enough that faking a
+/// fraction `x` of leaves survives only `(1 - x)^k`.
 const BYTE_SPOTCHECK_MIN: u32 = 3;
 const BYTE_SPOTCHECK_MAX: u32 = 5;
 
@@ -199,10 +200,11 @@ pub async fn run_subtree_audit(
 
     // Size the proof deadline from the ACTUAL selected subtree (its real-leaf
     // count for this nonce + key_count), not a fixed worst-case hint. This keeps
-    // the deadline tight to "responder hashes ~sqrt(N) chunks at local-disk
-    // speed", so a relay that must fetch the subtree over the network blows it.
-    // The auditor and responder derive the same selection, so we know the leaf
-    // count before the response arrives.
+    // the deadline proportional to the work an honest responder actually owes —
+    // hashing ~sqrt(N) chunks at local-disk speed — so a slow honest node is not
+    // failed for being large. It is not an anti-relay bound: see ADR-0009, the
+    // proof is delegable at any deadline. The auditor and responder derive the
+    // same selection, so we know the leaf count before the response arrives.
     let subtree_leaves = select_subtree_path(&nonce, key_count).map_or_else(
         || config.subtree_audit_timeout_leaf_hint(),
         |p| p.real_leaf_count() as usize,
@@ -321,9 +323,10 @@ async fn request_slice_proof(ctx: &AuditCtx<'_>, openings: &[SubtreeSliceOpening
     };
 
     // Deadline sized to "honest responder reads `openings.len()` full local
-    // chunks to build their proofs": generous, because possession is now
-    // guaranteed by the round-1 nonced commitment, not by this deadline being
-    // too tight for a relay to fetch bytes.
+    // chunks to build their proofs": generous, because what binds the bytes is
+    // the round-1 nonced commitment, not the clock. It is a liveness bound only
+    // — the reply is a few KB, so no deadline prices a relay out of it, and the
+    // proof is delegable at any deadline (ADR-0009).
     let timeout = ctx.config.slice_audit_response_timeout(openings.len());
     let response = match ctx
         .p2p_node

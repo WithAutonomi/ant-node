@@ -54,9 +54,9 @@ use tokio::sync::RwLock;
 use crate::ant_protocol::XorName;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
-    storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
-    POSSESSION_AUDIT_PROTOCOL_ID,
+    possession_challenge_protocol, storage_admission_width, ReplicationConfig,
+    AUDIT_FAILURE_TRUST_WEIGHT, GRACE_POSSESSION_AUDIT_TIMEOUTS,
+    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1546,7 +1546,7 @@ async fn send_prune_audit_challenge(
 ) -> std::result::Result<ReplicationMessage, PruneAuditSendFailure> {
     let timeout = config.audit_response_timeout(key_count);
     let response = match p2p_node
-        .send_request(peer, POSSESSION_AUDIT_PROTOCOL_ID, encoded, timeout)
+        .send_request(peer, possession_challenge_protocol(), encoded, timeout)
         .await
     {
         Ok(response) => response,

@@ -371,6 +371,19 @@ pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
 /// `v2` here is the digest generation, not the message shape.
 pub const POSSESSION_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.possession-audit.v2";
 
+/// The id every digest lane asks on.
+///
+/// One function rather than three hand-written constants, because during the
+/// rollout window the id a challenge is sent on selects the digest construction
+/// it comes back in: a lane that asked on the core id would be asking for the
+/// superseded one, which is preprocessing-weak and is the reason it was
+/// replaced. A lane cannot get that wrong if it cannot choose. Pinned by
+/// `every_digest_lane_asks_on_the_dedicated_id`.
+#[must_use]
+pub const fn possession_challenge_protocol() -> &'static str {
+    POSSESSION_AUDIT_PROTOCOL_ID
+}
+
 /// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
 /// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
 /// `SubtreeSliceChallenge`/`Response` (round 2).
