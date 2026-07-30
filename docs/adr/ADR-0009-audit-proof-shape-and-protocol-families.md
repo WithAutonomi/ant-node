@@ -160,6 +160,22 @@ no audit body contains.
   reduction buys: the old shape made frequent auditing unaffordable. If a future
   threat model needs sharper per-audit detection, the knob is openings per leaf,
   at linear egress cost.
+- **The proof is delegable, and cheaper to delegate than what it replaces.**
+  Every input to both rounds is public — the nonce, the challenged peer id and
+  the key — so a backend holding one copy of the data can compute round-1 roots
+  and round-2 openings on behalf of any number of front-end identities. What the
+  proof binds is that *someone* holding the bytes computed it under a fresh
+  nonce, not that the audited peer did. This is not introduced here: the
+  full-byte round 2 was equally delegable, it merely priced it, by forcing the
+  whole chunk through the relay per audit under a deadline sized to a disk read.
+  This design removes that price — a few KB and a generous deadline — so a
+  warehouse backing many replica identities is materially cheaper to run than
+  before, which weakens replication multiplicity rather than possession itself.
+  Nothing at this layer fixes it: non-delegability needs either peer-specific
+  encoding committed at rest, or an economic bound that makes a passed audit
+  worth less than the storage it stands in for. Recorded as a known gap, owned
+  with the payment-provenance work, and not claimed as solved anywhere in this
+  change.
 - Three protocol ids to reason about instead of one.
 - A temporary rollout gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) suppresses the
   timeout penalty on the three digest lanes so a version skew cannot punish an

@@ -21,6 +21,7 @@ use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
     ReplicationConfig, MAX_SLICE_OPENINGS, SUBTREE_AUDIT_PROTOCOL_ID,
+    SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES,
 };
 use crate::replication::protocol::{
     RejectKind, ReplicationMessage, ReplicationMessageBody, SubtreeAuditChallenge,
@@ -1214,6 +1215,15 @@ async fn subtree_challenge_response(
     // of subtree size, hashing each into its plain + nonced leaf.
     let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
     for key in &plan.leaf_keys {
+        // Charge the fixed cost of ATTEMPTING a leaf before the read, because
+        // it is owed whether or not the read succeeds: the LMDB lookup and its
+        // retries, and the blocking-task round trip below. Charging only
+        // content bytes left both a failing leaf and a tiny one nearly free,
+        // and nothing bounds a chunk from below, so a commitment of a million
+        // small records could run a full subtree of lookups per audit against
+        // almost no budget. The top-up after a successful read makes the total
+        // `max(bytes, floor)` rather than a surcharge on honest chunks.
+        *content_bytes = content_bytes.saturating_add(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES);
         let bytes = match get_raw_retrying(storage, key).await {
             Ok(Some(bytes)) => bytes,
             // Key is in our committed tree but definitively NOT stored — real
@@ -1247,14 +1257,19 @@ async fn subtree_challenge_response(
                 };
             }
         };
-        // Charge at the READ, not at the end. The disk read and the keyed-BLAKE3
-        // pass below are both already owed at this point, and every remaining
-        // exit from this loop — a later missing key, a persistent read error, a
-        // failed hashing task — discards the leaves but not the work. Accruing
-        // here is what makes a commitment with one bad key cost the attacker
-        // something per replay instead of nothing.
-        *content_bytes =
-            content_bytes.saturating_add(i64::try_from(bytes.len()).unwrap_or(i64::MAX));
+        // Top up to the content actually read, above the floor already charged.
+        // Charged at the READ, not at the end: the disk read and the
+        // keyed-BLAKE3 pass below are both already owed at this point, and
+        // every remaining exit from this loop — a later missing key, a
+        // persistent read error, a failed hashing task — discards the leaves
+        // but not the work. Accruing here is what makes a commitment with one
+        // bad key cost the attacker something per replay instead of nothing.
+        let content = i64::try_from(bytes.len()).unwrap_or(i64::MAX);
+        *content_bytes = content_bytes.saturating_add(
+            content
+                .saturating_sub(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES)
+                .max(0),
+        );
         // Hash the leaf (a full keyed-BLAKE3 pass over the chunk) on a blocking
         // thread, not the async worker: a maximal subtree is ~sqrt(N) leaves of up
         // to MAX_CHUNK_SIZE each, so doing this inline would tie up a Tokio worker

@@ -25,7 +25,7 @@
 use std::sync::Arc;
 
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
-use ant_node::replication::config::MAX_SLICE_OPENINGS;
+use ant_node::replication::config::{MAX_SLICE_OPENINGS, SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES};
 use ant_node::replication::protocol::{
     SubtreeAuditChallenge, SubtreeAuditResponse, SubtreeSliceChallenge, SubtreeSliceItem,
     SubtreeSliceOpening, SubtreeSliceResponse,
@@ -339,8 +339,14 @@ async fn committed_key_with_missing_bytes_is_rejected() {
 // 5b. Partial round-1 work is charged even when the response is a rejection
 // ---------------------------------------------------------------------------
 
-/// A successful proof reports exactly the chunk content it read and hashed.
+/// A successful proof reports what it read and hashed, at a floor per leaf.
 /// Anchors the rejection case below: it fixes what the measurement means.
+///
+/// A leaf costs more than its bytes — an LMDB lookup and a blocking-task round
+/// trip are owed whatever its size — and nothing bounds a chunk from below, so
+/// the charge is `max(content, floor)` per leaf. These test records are 1 KiB,
+/// well under the floor, which is the case that used to be nearly free: the
+/// charge here is therefore the floor times the leaf count, not the content.
 #[tokio::test]
 async fn round1_proof_reports_the_content_it_read() {
     let (storage, _t) = test_storage().await;
@@ -358,13 +364,25 @@ async fn round1_proof_reports_the_content_it_read() {
     let from_proof: i64 = proof
         .leaves
         .iter()
-        .map(|leaf| i64::from(leaf.content_len))
+        .map(|leaf| i64::from(leaf.content_len).max(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES))
         .sum();
     assert_eq!(
         work.content_bytes, from_proof,
-        "reported work must equal the content the proof covers"
+        "reported work must equal the floored content the proof covers"
     );
     assert!(work.content_bytes > 0, "a real proof reads real bytes");
+
+    // The floor is what makes a tiny-record commitment cost something. Without
+    // it these leaves would charge a quarter of what they do.
+    let unfloored: i64 = proof
+        .leaves
+        .iter()
+        .map(|leaf| i64::from(leaf.content_len))
+        .sum();
+    assert!(
+        work.content_bytes > unfloored,
+        "sub-floor records must not be charged at their byte count alone"
+    );
 }
 
 /// Regression (dirvine, PR #181): round 1 reads and hashes leaf by leaf, so a
@@ -401,7 +419,12 @@ async fn rejected_round1_still_reports_the_work_it_spent() {
         proof.leaves.len()
     );
     let last_leaf = proof.leaves.last().expect("non-empty");
-    let (last, deleted_len) = (last_leaf.key, i64::from(last_leaf.content_len));
+    // What the deleted leaf contributed to the baseline charge. It is still
+    // ATTEMPTED in the rejecting run — the lookup happens and fails — so only
+    // the part above the floor comes off.
+    let last_leaf_charge = i64::from(last_leaf.content_len);
+    let deleted_len = (last_leaf_charge - SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES).max(0);
+    let last = last_leaf.key;
     let baseline_bytes = baseline.content_bytes;
     storage.delete(&last).await.expect("delete last leaf chunk");
 
@@ -422,12 +445,13 @@ async fn rejected_round1_still_reports_the_work_it_spent() {
         work.content_bytes > 0,
         "the leaves read before the hole must be charged, not written off"
     );
-    // Everything except the deleted leaf was read, so the charge is the
-    // baseline minus that one leaf.
+    // Everything except the deleted leaf was read, and the deleted one was
+    // still attempted, so the charge is the baseline minus only that leaf's
+    // content above the floor.
     assert_eq!(
         work.content_bytes,
         baseline_bytes - deleted_len,
-        "charge must cover exactly the leaves actually read"
+        "charge must cover every leaf attempted, at the floor for the failed one"
     );
 }
 

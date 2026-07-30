@@ -228,6 +228,23 @@ pub const SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC: i64 = 64 * 1024 * 1024;
 /// the sustained rate, which is what a concurrency cap cannot do.
 pub const SUBTREE_ROUND1_WORK_BURST_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 
+/// Floor charged against the round-1 work budget per leaf attempted, in bytes.
+///
+/// The budget counts content bytes, which is the right unit for the hashing but
+/// misses what a leaf costs before its size is known: an LMDB point lookup with
+/// its retries, and a `spawn_blocking` dispatch and join. Nothing bounds a
+/// chunk from below, so a commitment made of a million tiny records would run a
+/// full subtree of reads and task round-trips per audit while charging almost
+/// nothing, and a leaf that fails to read charged nothing at all. Since the
+/// per-peer cooldown is escapable by rotating identity, the budget is the only
+/// bound that applies, so it has to see that cost.
+///
+/// Charged at the attempt, then topped up by whatever the content exceeds it
+/// by, so a leaf costs `max(bytes, this)`. At 4 KiB an honest chunk is almost
+/// always above it and pays exactly its bytes, which leaves the sizing of the
+/// refill rate above unchanged.
+pub const SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES: i64 = 4 * 1024;
+
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
 /// Uses `std::thread::available_parallelism()` so the node scales to the
@@ -1033,12 +1050,19 @@ impl ReplicationConfig {
     /// opening), on the `BYTE_AUDIT_RESPONSE_FLOOR_SECS` floor to absorb the
     /// handshake and a busy disk.
     ///
-    /// Unlike the old full-byte round 2, security here does NOT rest on this
-    /// deadline being too tight for a relay to fetch bytes — the possession
-    /// guarantee is the round-1 `nonced_root` commitment (uncomputable without
-    /// all the bytes, under a fresh nonce), so the deadline can be generous
-    /// without weakening the audit. It exists only to bound how long the auditor
-    /// waits for an honest reply.
+    /// The deadline is not a security parameter, and this is worth stating
+    /// precisely because an earlier version of this comment claimed more than
+    /// it should. The round-1 `nonced_root` is uncomputable without all the
+    /// bytes under a fresh nonce, but that binds only that SOMEONE holding them
+    /// computed it, not that the audited peer did: nonce, peer id and key are
+    /// all public, so a backend holding one copy can compute roots and openings
+    /// for any number of front-end identities, and only the compact proof
+    /// crosses the link. The old full-byte round 2 did not prevent that either
+    /// — it priced it, by forcing megabytes through the relay per audit, and a
+    /// tight deadline was part of that price. Both are gone here. So the
+    /// deadline exists only to bound how long the auditor waits for an honest
+    /// reply, and non-delegability is not a property either design provides;
+    /// see ADR-0009 for where that is left.
     #[must_use]
     pub fn slice_audit_response_timeout(&self, openings: usize) -> Duration {
         let scaled = self

@@ -75,10 +75,24 @@ impl ReplicationMessage {
     /// [`ReplicationProtocolError::DeserializationFailed`] if postcard cannot
     /// parse the data.
     pub fn decode(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
-        if data.len() > MAX_REPLICATION_MESSAGE_SIZE {
+        // The ceiling follows the body's own family, read from its discriminant
+        // before anything attacker-sized is touched. Putting it here rather than
+        // only on the receive path is what makes it unskippable: a *response* is
+        // decoded by whichever lane asked, and an audit lane asks a question a
+        // few hundred bytes long, so without this a challenged peer could answer
+        // with megabytes and be allocated all of it. Core bodies keep the core
+        // allowance — a fetch response legitimately carries a whole chunk.
+        // A prefix too malformed to classify takes the strict ceiling too: it
+        // cannot be a legitimate message of any family, so it is not one to
+        // decode generously.
+        let max_size = match peek_variant_index(data).map(family_of_variant) {
+            Some(BodyFamily::Core) => MAX_REPLICATION_MESSAGE_SIZE,
+            _ => MAX_AUDIT_MESSAGE_SIZE,
+        };
+        if data.len() > max_size {
             return Err(ReplicationProtocolError::MessageTooLarge {
                 size: data.len(),
-                max_size: MAX_REPLICATION_MESSAGE_SIZE,
+                max_size,
             });
         }
         let message: Self = postcard::from_bytes(data)
@@ -2257,6 +2271,55 @@ mod tests {
                     if max_size == MAX_AUDIT_MESSAGE_SIZE
             ),
             "expected the audit ceiling to be the one reported, got {err:?}"
+        );
+    }
+
+    // The ceiling lives in `decode` itself, so it cannot be skipped by reaching
+    // a decode site that forgot to ask. A core lane that gets answered with an
+    // audit-discriminant body still gets the audit ceiling, even though the same
+    // lane may legitimately receive a whole chunk when the body is a core one.
+    #[test]
+    fn the_family_ceiling_is_enforced_by_decode_itself() {
+        let mut oversized_audit_body = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: [0u8; 32],
+                challenged_peer_id: [0u8; 32],
+                expected_commitment_hash: [0u8; 32],
+                openings: vec![],
+            }),
+        }
+        .encode()
+        .expect("a small audit body encodes");
+        // Postcard ignores trailing bytes, so padding keeps this a decodable
+        // audit body while pushing it between the two ceilings.
+        oversized_audit_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        assert!(oversized_audit_body.len() < MAX_REPLICATION_MESSAGE_SIZE);
+
+        let err = ReplicationMessage::decode(&oversized_audit_body)
+            .expect_err("an audit-family body over the audit ceiling must not be decoded");
+        assert!(
+            matches!(
+                err,
+                ReplicationProtocolError::MessageTooLarge { max_size, .. }
+                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+            ),
+            "the audit ceiling must be the one applied, got {err:?}"
+        );
+
+        // A core body of the same size is still fine: that is the allowance a
+        // fetched chunk needs.
+        let mut core_body = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::FetchRequest(FetchRequest { key: [0u8; 32] }),
+        }
+        .encode()
+        .expect("a small core body encodes");
+        core_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        assert!(
+            ReplicationMessage::decode(&core_body).is_ok(),
+            "a core body must keep the core allowance"
         );
     }
 
