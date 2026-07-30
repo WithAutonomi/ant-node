@@ -215,9 +215,14 @@ inline verification/LMDB path exists on the serial loop (`mod.rs`, `fresh.rs`).
   first arrival the only arrival: one bad proof lost the record even with a valid
   proof queued behind it. Rotation also makes each proof independently
   attributable, which is what makes the structural penalties below safe to apply.
-- The queue holds at most `MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` =
-  `CLOSE_GROUP_MAJORITY` proofs, **one per source peer**, so a single peer cannot
-  fill it and each queued proof costs at most one extra verification. The
+- An entry admits at most `MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` =
+  `CLOSE_GROUP_MAJORITY` proofs **over its lifetime**, one per source peer. The
+  budget counts admissions and is never decremented, which is the load-bearing
+  detail: the handler pops a proof before verifying it, so a cap on the queue's
+  instantaneous length would let a fresh source refill each popped slot and run
+  unbounded sequential on-chain verifications while holding one of the four
+  worker slots. Counted as a lifetime budget, a key costs at most that many
+  verifications no matter how many peers offer it. The
   ceiling is now **64 MiB of payload + 32 MiB of proofs** (16 keys × 4 proofs ×
   `MAX_PAYMENT_PROOF_SIZE_BYTES`), which is why the proof-size bounds moved from
   the verifier onto the serial loop: the verifier only sees a proof on a worker,

@@ -1019,9 +1019,16 @@ const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 ///
 /// Sizing the queue to the number of legitimate senders is what lets a failing
 /// proof fall through to the next one instead of costing the node the record.
-/// It also bounds the work an attacker can buy: each queued proof is at most one
-/// extra on-chain verification, and one attempt per source means a single peer
-/// occupies a single slot.
+///
+/// This is a **lifetime budget per entry**, not a queue depth: it counts proofs
+/// admitted, and a proof the handler has popped has spent its slot rather than
+/// returned it. That distinction is what bounds the work an attacker can buy —
+/// at most this many on-chain verifications per key, after which the entry
+/// refuses everyone until it closes. Gating on the queue's instantaneous length
+/// instead would let a stream of distinct sources refill each popped slot and
+/// run unbounded sequential verifications while holding one of the four worker
+/// slots. One attempt per source additionally means a single peer can only ever
+/// consume one of these.
 const MAX_FRESH_OFFER_ATTEMPTS_PER_KEY: usize = crate::ant_protocol::CLOSE_GROUP_MAJORITY;
 
 /// Fresh-offer slots kept reachable by sources that hold none.
@@ -1215,6 +1222,15 @@ struct FreshOfferEntry {
     pending: VecDeque<FreshOfferAttempt>,
     /// Sources already represented, so one peer cannot fill the queue alone.
     sources: HashSet<PeerId>,
+    /// Proofs admitted over this entry's whole life, **never decremented**.
+    ///
+    /// The budget has to be spent by admissions rather than held by the queue.
+    /// The handler pops a proof before verifying it, so gating on
+    /// `pending.len()` would let a fresh source refill the slot that pop just
+    /// freed, and a stream of distinct sources could then run unbounded
+    /// sequential payment verifications while holding one of only four worker
+    /// slots. Counting admissions makes the cap a lifetime budget instead.
+    admitted: usize,
 }
 
 /// How an arriving fresh offer joined the work already in flight for its key.
@@ -1293,9 +1309,12 @@ impl FreshOfferEntryGuard {
             if entry.sources.contains(&source) {
                 return FreshOfferAdmission::DuplicateSource;
             }
-            if entry.pending.len() >= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
+            // Lifetime budget, not queue depth: a proof the handler has already
+            // popped has spent its slot, not returned it.
+            if entry.admitted >= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
                 return FreshOfferAdmission::Full;
             }
+            entry.admitted = entry.admitted.saturating_add(1);
             entry.sources.insert(source);
             entry.pending.push_back(attempt);
             return FreshOfferAdmission::Joined;
@@ -1305,7 +1324,14 @@ impl FreshOfferEntryGuard {
         sources.insert(source);
         let mut pending = VecDeque::new();
         pending.push_back(attempt);
-        in_flight_map.insert(key, FreshOfferEntry { pending, sources });
+        in_flight_map.insert(
+            key,
+            FreshOfferEntry {
+                pending,
+                sources,
+                admitted: 1,
+            },
+        );
         drop(in_flight_map);
         FreshOfferAdmission::Opened(Box::new(Self {
             in_flight: Arc::clone(in_flight),
@@ -9236,6 +9262,46 @@ mod tests {
                 FreshOfferAdmission::Opened(_)
             ),
             "an exhausted entry should release its key"
+        );
+    }
+
+    /// The cap has to be a lifetime budget, not a queue depth.
+    ///
+    /// The handler pops a proof before verifying it, so gating admission on the
+    /// *instantaneous* queue length lets a fresh source refill the slot that pop
+    /// just freed. Each refill is another on-chain payment verification, run
+    /// sequentially while the entry holds its admission permit and a worker
+    /// slot, so a stream of distinct sources could keep one key's handler — and
+    /// one of only four workers — busy indefinitely.
+    #[test]
+    fn refilling_a_popped_slot_cannot_extend_a_keys_attempt_budget() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x3Du8; 32];
+
+        let FreshOfferAdmission::Opened(mut entry) =
+            admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(0))
+        else {
+            panic!("the first offer should open the entry")
+        };
+
+        // Drive pop-then-admit with a fresh source every time, exactly as a
+        // sybil stream would. The budget must be spent by admissions, not
+        // returned by pops.
+        let mut admitted = 1;
+        for i in 1..u8::try_from(MAX_FRESH_OFFER_ATTEMPTS_PER_KEY * 4).unwrap_or(u8::MAX) {
+            let _ = entry.next_attempt();
+            if matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(i)),
+                FreshOfferAdmission::Joined
+            ) {
+                admitted += 1;
+            }
+        }
+
+        assert!(
+            admitted <= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY,
+            "a key accepted {admitted} proofs over its lifetime, but the budget is \
+             {MAX_FRESH_OFFER_ATTEMPTS_PER_KEY}: popping a proof must not return its slot"
         );
     }
 
