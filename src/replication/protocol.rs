@@ -297,7 +297,16 @@ fn read_varint(bytes: &[u8], max_bytes: usize) -> Option<(u64, usize)> {
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
     for (i, byte) in bytes.iter().take(max_bytes).enumerate() {
-        value |= u64::from(byte & 0x7F).checked_shl(shift)?;
+        let payload = u64::from(byte & 0x7F);
+        // A u64 LEB128 has only one payload bit left in byte ten. Rust's
+        // shifts discard high bits rather than reporting value overflow, so
+        // `checked_shl` alone would accept (and wrap) a terminal payload > 1.
+        // Treat that malformed prefix as unclassifiable and apply the strict
+        // audit ceiling.
+        if shift == 63 && payload > 1 {
+            return None;
+        }
+        value |= payload.checked_shl(shift)?;
         if byte & 0x80 == 0 {
             return Some((value, i + 1));
         }
@@ -1528,6 +1537,17 @@ mod tests {
         assert_eq!(peek_variant_index(&[0xFF; 32]), None);
         // A well-formed request_id with nothing after it.
         assert_eq!(peek_variant_index(&[0x01]), None);
+        // Ten-byte u64 varints have only one payload bit in the final byte.
+        // Reject overflow in either prefix field instead of letting the shift
+        // discard high bits and classify attacker-controlled trailing bytes.
+        let mut overflowing_request_id = vec![0x80; 9];
+        overflowing_request_id.extend([0x02, 0x0B]);
+        assert_eq!(peek_variant_index(&overflowing_request_id), None);
+
+        let mut overflowing_discriminant = vec![0x01];
+        overflowing_discriminant.extend([0x80; 9]);
+        overflowing_discriminant.push(0x02);
+        assert_eq!(peek_variant_index(&overflowing_discriminant), None);
     }
 
     // Regression (dirvine, PR #181): the pre-decode ceiling used to be chosen
@@ -1569,7 +1589,7 @@ mod tests {
         let family = peek_variant_index(&encoded).map(family_of_variant);
         assert_eq!(family, Some(BodyFamily::SubtreeAudit));
         assert!(
-            family.is_none_or(BodyFamily::is_audit),
+            family.map_or(true, BodyFamily::is_audit),
             "an audit body must take the audit ceiling regardless of the id it rode"
         );
     }

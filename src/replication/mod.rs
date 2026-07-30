@@ -7180,7 +7180,7 @@ mod tests {
             "every global permit must be returned"
         );
         assert!(
-            inflight.read().await.get(&peer).is_none_or(|n| *n == 0),
+            inflight.read().await.get(&peer).copied().unwrap_or(0) == 0,
             "no per-peer slot may be left occupied"
         );
     }
