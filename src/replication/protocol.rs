@@ -1275,6 +1275,51 @@ pub fn compute_audit_digest(
     *blake3::keyed_hash(&digest_key, record_bytes).as_bytes()
 }
 
+/// Which construction a possession digest is built with.
+///
+/// Two exist only during the upgrade window. A peer verifies a digest with the
+/// construction its own binary knows, so the responder has to answer in the
+/// asker's dialect or the answer reads as a mismatch — which is a confirmed
+/// failure, strictly worse for the honest responder than silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDigestVersion {
+    /// The construction on the previous release: a plain BLAKE3 over
+    /// `nonce || peer || key || bytes`. Answered only to a challenge that
+    /// arrived on the core protocol id, which is where a peer that has not
+    /// upgraded still sends them.
+    Legacy,
+    /// This release: a domain-separated key derived from
+    /// `nonce || peer || key`, then a keyed hash over the content.
+    Keyed,
+}
+
+/// The digest a given peer will verify against.
+///
+/// [`compute_audit_digest`] is the construction this node uses everywhere it
+/// asks; this is only for answering, where the asker picks the dialect.
+#[must_use]
+pub fn compute_audit_digest_as(
+    version: AuditDigestVersion,
+    nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    key: &XorName,
+    record_bytes: &[u8],
+) -> [u8; 32] {
+    match version {
+        AuditDigestVersion::Keyed => {
+            compute_audit_digest(nonce, challenged_peer_id, key, record_bytes)
+        }
+        AuditDigestVersion::Legacy => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(nonce);
+            hasher.update(challenged_peer_id);
+            hasher.update(key);
+            hasher.update(record_bytes);
+            *hasher.finalize().as_bytes()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Error type
 // ---------------------------------------------------------------------------
@@ -2305,6 +2350,50 @@ mod tests {
             compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
             *flat.finalize().as_bytes(),
             "keyed digest must differ from the flat prefix construction"
+        );
+    }
+
+    // The legacy dialect is not ours to choose: it is what a peer on the
+    // previous release computes and compares against. Pin it to that exact
+    // construction, because a drift here is invisible locally and shows up in
+    // the field as honest upgraded nodes failing old peers' audits.
+    #[test]
+    fn the_legacy_dialect_is_the_previous_release_construction() {
+        let nonce = [0x11; 32];
+        let peer_id = [0x22; 32];
+        let key: XorName = [0x33; 32];
+        let record_bytes = vec![0xA5; 8 * 1024];
+
+        let mut flat = blake3::Hasher::new();
+        flat.update(&nonce);
+        flat.update(&peer_id);
+        flat.update(&key);
+        flat.update(&record_bytes);
+
+        assert_eq!(
+            compute_audit_digest_as(
+                AuditDigestVersion::Legacy,
+                &nonce,
+                &peer_id,
+                &key,
+                &record_bytes
+            ),
+            *flat.finalize().as_bytes(),
+            "the legacy dialect must stay BLAKE3(nonce || peer || key || bytes)"
+        );
+
+        // And the keyed selector must still be this release's construction, so
+        // the two cannot be swapped by a careless edit.
+        assert_eq!(
+            compute_audit_digest_as(
+                AuditDigestVersion::Keyed,
+                &nonce,
+                &peer_id,
+                &key,
+                &record_bytes
+            ),
+            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
+            "the keyed dialect must be the construction this release asks in"
         );
     }
 

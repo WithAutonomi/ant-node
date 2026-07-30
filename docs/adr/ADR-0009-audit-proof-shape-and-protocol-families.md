@@ -184,6 +184,23 @@ no audit body contains.
   the possession lanes probe more often than the subtree lane, so their dip is
   larger. This is milder than either a stream of confirmed failures or a fleet
   wide replication partition, but it is not zero.
+- The grace gate covers only one direction, so a second temporary accommodation
+  is paired with it: an inbound possession **challenge** on the core id is
+  answered there, in the digest construction the asker verifies with. The gate
+  softens what a node on this release concludes about a silent peer; it cannot
+  reach the other side. A peer on the previous release sends its
+  responsible-chunk and prune-confirmation challenges on the core id, has no
+  dedicated possession id to try, and converts the resulting timeout directly
+  into an audit-severity failure. Refusing those challenges would therefore have
+  every not-yet-upgraded neighbour penalise an upgraded node at
+  confirmed-failure weight for the whole window — the release penalising its own
+  adopters, and worst exactly when the upgraded population is smallest. The two
+  possession messages are byte-identical across the two releases, so nothing is
+  reinterpreted; only the digest construction moved, and the responder selects
+  it from the id the challenge arrived on. Challenges only: this node always
+  asks on the dedicated id, so a possession *response* on the core id is never
+  one it solicited and stays refused. This is removed together with the gate,
+  under the same criterion.
 - The responsible-chunk audit now returns no verdict when it cannot check a
   challenged key against its own copy, so some ticks that previously recorded a
   pass now record nothing.

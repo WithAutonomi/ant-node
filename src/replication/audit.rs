@@ -13,8 +13,8 @@ use rand::Rng;
 use crate::ant_protocol::XorName;
 use crate::replication::config::{ReplicationConfig, POSSESSION_AUDIT_PROTOCOL_ID};
 use crate::replication::protocol::{
-    compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
-    ReplicationMessageBody, ABSENT_KEY_DIGEST,
+    compute_audit_digest, compute_audit_digest_as, AuditChallenge, AuditDigestVersion,
+    AuditResponse, ReplicationMessage, ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
 use crate::replication::types::{
     AuditFailureReason, AuditFailureSummary, FailureEvidence, PeerSyncRecord, RepairProofs,
@@ -807,12 +807,18 @@ async fn handle_audit_timeout(
 /// and returns the response.  Rejects challenges where
 /// `challenged_peer_id` does not match `self_peer_id` to prevent an oracle
 /// attack where a malicious challenger forges digests for a different peer.
+///
+/// `digest_version` is the asker's dialect, taken from the protocol id the
+/// challenge arrived on, not from what this node would use itself: a peer
+/// verifies with the construction its own binary knows, so answering in the
+/// wrong one is a mismatch and reads as a confirmed failure.
 pub async fn handle_audit_challenge(
     challenge: &AuditChallenge,
     storage: &LmdbStorage,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     stored_chunks: usize,
+    digest_version: AuditDigestVersion,
 ) -> AuditResponse {
     if is_bootstrapping {
         return AuditResponse::Bootstrapping {
@@ -853,7 +859,8 @@ pub async fn handle_audit_challenge(
     for key in &challenge.keys {
         match storage.get_raw(key).await {
             Ok(Some(data)) => {
-                let digest = compute_audit_digest(
+                let digest = compute_audit_digest_as(
+                    digest_version,
                     &challenge.nonce,
                     &challenge.challenged_peer_id,
                     key,
@@ -1083,8 +1090,15 @@ mod tests {
         let challenge = make_challenge(42, nonce, peer_id, vec![addr_a, addr_b]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -1120,8 +1134,15 @@ mod tests {
         let challenge = make_challenge(99, nonce, peer_id, vec![absent_key]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -1160,8 +1181,15 @@ mod tests {
         let challenge = make_challenge(7, nonce, peer_id, vec![addr_present, addr_absent]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests { digests, .. } => {
@@ -1193,8 +1221,15 @@ mod tests {
         let challenge = make_challenge(55, [0x00; 32], [0x01; 32], vec![[0x02; 32]]);
         let self_id = peer_id_from_bytes([0x01; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Bootstrapping { challenge_id } => {
@@ -1218,8 +1253,15 @@ mod tests {
         let challenge = make_challenge(100, [0x10; 32], [0x20; 32], vec![]);
         let self_id = peer_id_from_bytes([0x20; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -1345,8 +1387,15 @@ mod tests {
         let challenge = make_challenge(200, [0xCC; 32], [0xDD; 32], vec![addr]);
         let self_id = peer_id_from_bytes([0xDD; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         assert!(
             matches!(response, AuditResponse::Bootstrapping { challenge_id: 200 }),
@@ -1387,8 +1436,15 @@ mod tests {
         };
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests { digests, .. } => {
@@ -1438,8 +1494,15 @@ mod tests {
         };
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         match response {
             AuditResponse::Digests { digests, .. } => {
                 assert_eq!(digests.len(), 3);
@@ -1774,8 +1837,15 @@ mod tests {
         let challenge = make_challenge(300, nonce, peer_id, keys);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         match response {
             AuditResponse::Digests { digests, .. } => {
                 assert_eq!(
@@ -1829,8 +1899,15 @@ mod tests {
         let self_id = peer_id_from_bytes([0x29; 32]);
 
         // Responder is bootstrapping → Bootstrapping response, NOT Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         assert!(
             matches!(
                 response,
@@ -1840,8 +1917,15 @@ mod tests {
         );
 
         // Responder is NOT bootstrapping → normal Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         assert!(
             matches!(response, AuditResponse::Digests { .. }),
             "drained node should compute digests normally"
@@ -1924,36 +2008,60 @@ mod tests {
 
         // Challenge with 1 key.
         let challenge1 = make_challenge(3201, nonce, peer_id, vec![addrs[0]]);
-        let resp1 =
-            handle_audit_challenge(&challenge1, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp1 = handle_audit_challenge(
+            &challenge1,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp1 {
             assert_eq!(digests.len(), 1, "|PeerKeySet| = 1 → 1 digest");
         }
 
         // Challenge with 3 keys.
         let challenge3 = make_challenge(3203, nonce, peer_id, addrs[0..3].to_vec());
-        let resp3 =
-            handle_audit_challenge(&challenge3, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp3 = handle_audit_challenge(
+            &challenge3,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp3 {
             assert_eq!(digests.len(), 3, "|PeerKeySet| = 3 → 3 digests");
         }
 
         // Challenge with all 5 keys.
         let challenge5 = make_challenge(3205, nonce, peer_id, addrs.clone());
-        let resp5 =
-            handle_audit_challenge(&challenge5, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp5 = handle_audit_challenge(
+            &challenge5,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp5 {
             assert_eq!(digests.len(), 5, "|PeerKeySet| = 5 → 5 digests");
         }
 
         // Challenge with 0 keys (idle equivalent — no work).
         let challenge0 = make_challenge(3200, nonce, peer_id, vec![]);
-        let resp0 =
-            handle_audit_challenge(&challenge0, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp0 = handle_audit_challenge(
+            &challenge0,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp0 {
             assert!(digests.is_empty(), "|PeerKeySet| = 0 → 0 digests (idle)");
         }
@@ -1977,8 +2085,15 @@ mod tests {
         let self_id = peer_id_from_bytes([0x47; 32]);
 
         // Bootstrapping peer → Bootstrapping response (grace period start).
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         let challenge_id = match response {
             AuditResponse::Bootstrapping { challenge_id } => challenge_id,
             AuditResponse::Digests { .. } => {
