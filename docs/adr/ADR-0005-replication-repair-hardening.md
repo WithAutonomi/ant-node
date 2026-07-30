@@ -236,11 +236,17 @@ inline verification/LMDB path exists on the serial loop (`mod.rs`, `fresh.rs`).
   group at once. A verification *error* is usually our own EVM endpoint and is
   likewise never charged to the sender.
 - **Residual:** `MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` distinct sybil identities can
-  still fill a key's queue with proofs that all fail, suppressing the genuine
-  offer. That is the cost of sizing the queue to the legitimate fan-out rather
-  than higher; the fix if it ever matters is to record refused senders as replica
-  hint sources so the existing verification/fetch pipeline self-heals the key,
-  which needs no new trust machinery.
+  spend a key's whole budget on proofs that all fail, and while that entry is
+  open a genuine offer is refused as `Full`. Making the budget a lifetime count
+  sharpens this deliberately — a spent budget is not replenished by the handler
+  working through it — but it does not extend it: the entry closes as soon as its
+  queue drains, and the next genuine offer opens a fresh entry with a fresh
+  budget, so the suppression is a bounded window rather than a lasting hold on
+  the key. That window is the cost of sizing the budget to the legitimate
+  fan-out rather than higher, and of bounding an attacker's verification spend.
+  The fix if it ever matters is to record refused senders as replica hint sources
+  so the existing verification/fetch pipeline self-heals the key, which needs no
+  new trust machinery.
 
 - **Rejected:** keeping the inline fallback but enlarging the worker pool — does
   not remove the serial-loop stall, only raises the load needed to trigger it. The
@@ -879,9 +885,9 @@ hold the key — coalesce per target as above. Do not add a count cap.
   `MAX_CONCURRENT_VERIFICATION_REQUESTS` (32), the fresh-offer admission bound
   (16 permits, one per key: 64 MiB of payload plus 32 MiB of queued proofs) with
   its new per-source reserve (`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES` = 4,
-  giving a per-peer share of 12) and its per-key proof queue
-  (`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` = `CLOSE_GROUP_MAJORITY` = 4, one proof per
-  source, `mod.rs`), the paid-notify
+  giving a per-peer share of 12) and its per-key **lifetime** proof budget
+  (`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` = `CLOSE_GROUP_MAJORITY` = 4 admissions per
+  entry, never decremented, one proof per source, `mod.rs`), the paid-notify
   responder bounds (`PAID_NOTIFY_WORKER_LIMIT` = 2,
   `PAID_NOTIFY_MAX_OUTSTANDING` = 8, `PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER` = 2,
   `mod.rs`), `MAX_HINT_SOURCES_PER_KEY` (8, `scheduling.rs`), the paid-list edge
