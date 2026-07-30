@@ -1231,6 +1231,9 @@ enum FreshOfferAdmission {
     DuplicateSource,
 }
 
+// Gated on `logging` like `SerialQueueDropReason::as_str`: the only caller is a
+// `debug!`, which compiles to nothing without the feature.
+#[cfg(feature = "logging")]
 impl FreshOfferAdmission {
     /// Why the offer added nothing to the work already queued for its key.
     ///
