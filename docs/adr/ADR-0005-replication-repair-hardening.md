@@ -173,34 +173,69 @@ never-responsible keys out of the queue.
 
 ### 2. Keep fresh-offer verification and storage off the serial message loop
 
-Fresh-offer dispatch now **validates the payload, claims the key, takes an
-admission permit, and spawns**; the worker permit is awaited *inside* the spawned
-task, so `handle_fresh_offer` has a single caller and no inline
-verification/LMDB path exists on the serial loop (`mod.rs`, `fresh.rs`).
+Fresh-offer dispatch now **validates the payload, enters the key's in-flight
+entry, takes an admission permit, and spawns**; the worker permit is awaited
+*inside* the spawned task, so `handle_fresh_offer` has a single caller and no
+inline verification/LMDB path exists on the serial loop (`mod.rs`, `fresh.rs`).
 
-- Outstanding admitted offers are bounded by a **16-permit admission semaphore**
-  (a 64 MiB payload ceiling). Past the bound an offer is **refused** — not queued,
-  not handled inline — and a refused offer is penalized as absent by the delayed
-  possession check, identical to any other declined replica. Note the penalty is
-  the *only* thing the possession check does; the copy itself is refilled later
-  by neighbor sync.
-- The `key[0] % 64` shard locks are replaced by an **exact per-key in-flight set
-  behind an RAII guard**, so unrelated keys never contend and concurrent duplicates
-  collapse onto the first claimant instead of repeating its verification. The
-  ordering the shard locks preserved has no meaning here: the key is the content
-  address of the data, so same key implies same bytes.
-- **The claim is taken only after `key == BLAKE3(data)` is verified**, on the
-  serial loop. The claim is exclusive and outlives dispatch, so granting it on an
-  unverified key/bytes association makes it a **suppression primitive**: any peer
-  that knows a key can reserve it with junk, have the genuine offer refused as a
-  duplicate, store nothing, and leave the absence charged to this node. Knowing
-  the key is not confined to the close group — `PaidNotify` carries it to
-  `PaidCloseGroup(K)` (20) while the chunk goes only to `CLOSE_GROUP_SIZE` (7),
-  so ~13 peers learn the key without receiving the data, over a small message
-  that is not gated by `MAX_CONCURRENT_REPLICATION_SENDS` and can therefore
-  outrun the multi-MiB push it describes. Hashing on the loop is affordable
-  because BLAKE3 runs at GB/s against offers arriving at link speed; an attacker
-  cannot make the loop hash faster than it can deliver bytes.
+- Outstanding admitted offers are bounded by a **16-permit admission semaphore**,
+  one permit per *key* rather than per offer. Past the bound an offer is
+  **refused** — not queued, not handled inline — and a refused offer is penalized
+  as absent by the delayed possession check, identical to any other declined
+  replica. Note the penalty is the *only* thing the possession check does; the
+  copy itself is refilled later by neighbor sync.
+- The `key[0] % 64` shard locks are replaced by an **exact per-key in-flight
+  entry behind an RAII guard**, so unrelated keys never contend. The ordering the
+  shard locks preserved has no meaning here: the key is the content address of
+  the data, so same key implies same bytes.
+- **The entry is opened only after `key == BLAKE3(data)` is verified**, on the
+  serial loop. Opening it on an unverified key/bytes association makes it a
+  **suppression primitive**: any peer that knows a key can seize it with junk,
+  have the genuine offer refused, store nothing, and leave the absence charged to
+  this node. Knowing the key is not confined to the close group — `PaidNotify`
+  carries it to `PaidCloseGroup(K)` (20) while the chunk goes only to
+  `CLOSE_GROUP_SIZE` (7), so ~13 peers learn the key without receiving the data,
+  over a small message that is not gated by `MAX_CONCURRENT_REPLICATION_SENDS`
+  and can therefore outrun the multi-MiB push it describes. Hashing on the loop
+  is affordable because BLAKE3 runs at GB/s against offers arriving at link
+  speed; an attacker cannot make the loop hash faster than it can deliver bytes.
+- **Duplicates contribute a proof rather than being refused.** Verifying the
+  content address before the entry establishes that every offer for a key carries
+  identical bytes, so the entry holds the bytes **once** and queues each sender's
+  `proof_of_payment`; the handler works down that queue. This is what keeps the
+  routine duplication of a client PUT cheap — a PUT is confirmed by
+  `CLOSE_GROUP_MAJORITY` (4) nodes and *each* fans out to the close group, so a
+  receiver sees ~4 offers per chunk. One permit, one worker slot, one payload,
+  and (on the happy path) one on-chain verification cover all of them.
+- **A failing proof disqualifies its sender, not the record.** The handler
+  distinguishes a rejected *proof* — retry the next sender's, against the bytes
+  already in hand — from a verdict about the key itself (not responsible, no
+  capacity, shutting down, write failed), where every queued proof would meet the
+  same wall and the key is abandoned. Refusing every duplicate outright made the
+  first arrival the only arrival: one bad proof lost the record even with a valid
+  proof queued behind it. Rotation also makes each proof independently
+  attributable, which is what makes the structural penalties below safe to apply.
+- The queue holds at most `MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` =
+  `CLOSE_GROUP_MAJORITY` proofs, **one per source peer**, so a single peer cannot
+  fill it and each queued proof costs at most one extra verification. The
+  ceiling is now **64 MiB of payload + 32 MiB of proofs** (16 keys × 4 proofs ×
+  `MAX_PAYMENT_PROOF_SIZE_BYTES`), which is why the proof-size bounds moved from
+  the verifier onto the serial loop: the verifier only sees a proof on a worker,
+  far too late to stop a retained one, and on the wire a proof is capped only by
+  `MAX_REPLICATION_MESSAGE_SIZE`.
+- **Only structural defects are penalised** — absent, undersized, oversized, or
+  non-matching payloads, none of which an honest sender can produce. A payment
+  that fails to verify is *not*: `PaymentRequired` means "no payment found", not
+  "definitively unpaid", so a lagging or reorganising chain view would make
+  honest senders indistinguishable from forgers and penalise the whole close
+  group at once. A verification *error* is usually our own EVM endpoint and is
+  likewise never charged to the sender.
+- **Residual:** `MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` distinct sybil identities can
+  still fill a key's queue with proofs that all fail, suppressing the genuine
+  offer. That is the cost of sizing the queue to the legitimate fan-out rather
+  than higher; the fix if it ever matters is to record refused senders as replica
+  hint sources so the existing verification/fetch pipeline self-heals the key,
+  which needs no new trust machinery.
 
 - **Rejected:** keeping the inline fallback but enlarging the worker pool — does
   not remove the serial-loop stall, only raises the load needed to trigger it. The
@@ -760,9 +795,11 @@ traffic summary and size a byte budget from it — not to raise the count again.
   `ReplicationConfig::capacity_rejected_max_age()` (derived, not a constant),
   `MAX_VERIFICATION_KEYS_PER_CYCLE` (8,192),
   `MAX_CONCURRENT_VERIFICATION_REQUESTS` (32), the fresh-offer admission bound
-  (16 permits / 64 MiB) and its new per-source reserve
-  (`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES` = 4, giving a per-peer share of 12,
-  `mod.rs`), the paid-notify
+  (16 permits, one per key: 64 MiB of payload plus 32 MiB of queued proofs) with
+  its new per-source reserve (`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES` = 4,
+  giving a per-peer share of 12) and its per-key proof queue
+  (`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY` = `CLOSE_GROUP_MAJORITY` = 4, one proof per
+  source, `mod.rs`), the paid-notify
   responder bounds (`PAID_NOTIFY_WORKER_LIMIT` = 2,
   `PAID_NOTIFY_MAX_OUTSTANDING` = 8, `PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER` = 2,
   `mod.rs`), `MAX_HINT_SOURCES_PER_KEY` (8, `scheduling.rs`), the paid-list edge

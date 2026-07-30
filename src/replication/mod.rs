@@ -35,7 +35,7 @@ pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
@@ -61,7 +61,10 @@ use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::payment::{PaymentVerifier, VerificationContext};
+use crate::payment::{
+    PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    MIN_PAYMENT_PROOF_SIZE_BYTES,
+};
 use crate::replication::audit::AuditTickResult;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{
@@ -1005,6 +1008,22 @@ const FRESH_OFFER_WORKER_LIMIT: usize = 4;
 /// bound is sized to make refusal rare rather than cheap.
 const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
 
+/// Distinct payment proofs queued for one fresh-offer key.
+///
+/// Duplicate offers for a key are routine rather than adversarial: a client PUT
+/// is confirmed by `CLOSE_GROUP_MAJORITY` nodes, and *each* of them fans the
+/// chunk out to the close group, so a receiver sees the same key from about that
+/// many senders. They differ only in their proof — the bytes are provably
+/// identical, since `fresh_offer_structural_rejection` has confirmed
+/// `key == BLAKE3(data)` before any of them is queued.
+///
+/// Sizing the queue to the number of legitimate senders is what lets a failing
+/// proof fall through to the next one instead of costing the node the record.
+/// It also bounds the work an attacker can buy: each queued proof is at most one
+/// extra on-chain verification, and one attempt per source means a single peer
+/// occupies a single slot.
+const MAX_FRESH_OFFER_ATTEMPTS_PER_KEY: usize = crate::ant_protocol::CLOSE_GROUP_MAJORITY;
+
 /// Fresh-offer slots kept reachable by sources that hold none.
 ///
 /// The property worth guaranteeing is that one peer cannot *starve* others, not
@@ -1146,43 +1165,200 @@ fn paid_notify_payment_context() -> VerificationContext {
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
 
-/// Fresh-offer keys currently claimed by a handler.
+/// Fresh-offer keys currently being handled, each with the proofs still to try.
 ///
-/// Concurrent duplicates are routine: a client PUT fans out through overlapping
-/// close groups, so one key commonly arrives from several senders at once, and
-/// each would repeat the on-chain verification before the verifier's cache is
-/// warm. A claim collapses that onto the first handler.
+/// Concurrent duplicates are routine: a client PUT is confirmed by
+/// `CLOSE_GROUP_MAJORITY` nodes and each of them fans the chunk out, so one key
+/// commonly arrives from several senders at once. Collapsing them onto one
+/// handler is what keeps a burst of PUTs from costing a permit, a worker slot,
+/// and an on-chain verification per copy.
+///
+/// What they collapse *onto* is the load-bearing part. Keeping only the key and
+/// refusing every later offer outright made the first arrival the only arrival:
+/// if its proof failed, the record was lost even though a valid proof for the
+/// same bytes was queued behind it, and the resulting absence was charged to
+/// this node by the delayed possession check. So the entry holds the bytes once
+/// and queues each sender's proof, and the handler works down that queue. A
+/// later offer therefore costs a proof, not a payload — sound only because
+/// `fresh_offer_structural_rejection` has confirmed `key == BLAKE3(data)` for
+/// every one of them before it is queued, which is what makes their bytes
+/// provably identical.
 ///
 /// Entries are exact keys rather than hash shards. A node only receives offers
 /// for keys it is close to, so the accepted key set clusters tightly around its
 /// own ID — any index derived from the key would land nearly every offer on one
 /// shard and serialize unrelated keys behind each other. Exact keys keep them
-/// independent, and the set stays bounded by [`FRESH_OFFER_MAX_OUTSTANDING`].
+/// independent, and the map stays bounded by [`FRESH_OFFER_MAX_OUTSTANDING`],
+/// each entry by [`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY`].
 ///
-/// The critical section is a set insert or remove and is never held across an
-/// await, so this is a blocking mutex rather than an async one.
-type FreshOfferInFlight = Arc<Mutex<HashSet<XorName>>>;
+/// The critical section is a map insert, pop, or remove and is never held across
+/// an await, so this is a blocking mutex rather than an async one.
+type FreshOfferInFlight = Arc<Mutex<HashMap<XorName, FreshOfferEntry>>>;
 
-/// RAII claim on one fresh-offer key: clears the entry on drop, so an early
-/// return, an error, or a panic cannot strand a key as permanently in-flight.
-struct FreshOfferInFlightGuard {
-    in_flight: FreshOfferInFlight,
-    key: XorName,
+/// One sender's unverified claim to have paid for a key already in flight.
+///
+/// Carries no payload: the bytes live once in [`FreshOfferEntryGuard`], and the
+/// content-address check ran before this attempt was queued.
+struct FreshOfferAttempt {
+    source: PeerId,
+    proof_of_payment: Vec<u8>,
+    request_id: u64,
+    rr_message_id: Option<String>,
 }
 
-impl FreshOfferInFlightGuard {
-    /// Claim `key`, or return `None` if another handler already holds it.
-    fn try_claim(in_flight: &FreshOfferInFlight, key: XorName) -> Option<Self> {
-        in_flight.lock().insert(key).then(|| Self {
-            in_flight: Arc::clone(in_flight),
-            key,
-        })
+/// Proofs still to try for one in-flight key, and who supplied them.
+///
+/// Deliberately holds neither the bytes nor an arrival time: both belong to the
+/// handler that owns the key, and live once in [`FreshOfferEntryGuard`].
+struct FreshOfferEntry {
+    /// Untried proofs in arrival order. The handler holds the current one.
+    pending: VecDeque<FreshOfferAttempt>,
+    /// Sources already represented, so one peer cannot fill the queue alone.
+    sources: HashSet<PeerId>,
+}
+
+/// How an arriving fresh offer joined the work already in flight for its key.
+enum FreshOfferAdmission {
+    /// Opened the entry. This offer's handler owns the key and drives every
+    /// queued proof, including proofs that arrive later.
+    Opened(Box<FreshOfferEntryGuard>),
+    /// Merged into an entry another offer opened; its handler reaches this proof
+    /// if the ones ahead of it fail.
+    Joined,
+    /// The entry already holds [`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY`] proofs.
+    Full,
+    /// This source already has a proof queued for this key.
+    DuplicateSource,
+}
+
+impl FreshOfferAdmission {
+    /// Why the offer added nothing to the work already queued for its key.
+    ///
+    /// Local logging only — the wire reason stays uniform so a probing peer
+    /// cannot tell a full queue from a repeat of its own proof.
+    const fn surplus_reason(&self) -> &'static str {
+        match self {
+            Self::DuplicateSource => "this source already has a proof queued",
+            Self::Full => "the key already holds its full complement of proofs",
+            Self::Opened(_) | Self::Joined => "not surplus",
+        }
     }
 }
 
-impl Drop for FreshOfferInFlightGuard {
+/// RAII ownership of one in-flight fresh-offer key.
+///
+/// Clears the entry on drop, so an early return, an error, or a panic cannot
+/// strand a key as permanently in flight. Also owns the single copy of the
+/// offered bytes that every queued proof is tried against.
+struct FreshOfferEntryGuard {
+    in_flight: FreshOfferInFlight,
+    key: XorName,
+    /// The bytes every attempt for this key shares, held exactly once.
+    data: Vec<u8>,
+    /// Arrival of the offer that opened the entry.
+    received_at: Instant,
+    /// Cleared once the entry has been removed, so `drop` cannot delete an entry
+    /// a *later* offer has since opened for the same key.
+    holds_entry: bool,
+}
+
+impl FreshOfferEntryGuard {
+    /// Open an entry for this offer's key, or queue its proof behind the entry
+    /// already open.
+    ///
+    /// Takes the offer by value: on `Opened` its bytes move into the guard, and
+    /// on every other outcome they are dropped here rather than held for the
+    /// lifetime of the entry.
+    fn admit(
+        in_flight: &FreshOfferInFlight,
+        offer: protocol::FreshReplicationOffer,
+        source: PeerId,
+        request_id: u64,
+        rr_message_id: Option<String>,
+        received_at: Instant,
+    ) -> FreshOfferAdmission {
+        let key = offer.key;
+        let attempt = FreshOfferAttempt {
+            source,
+            proof_of_payment: offer.proof_of_payment,
+            request_id,
+            rr_message_id,
+        };
+
+        let mut in_flight_map = in_flight.lock();
+        if let Some(entry) = in_flight_map.get_mut(&key) {
+            if entry.sources.contains(&source) {
+                return FreshOfferAdmission::DuplicateSource;
+            }
+            if entry.pending.len() >= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
+                return FreshOfferAdmission::Full;
+            }
+            entry.sources.insert(source);
+            entry.pending.push_back(attempt);
+            return FreshOfferAdmission::Joined;
+        }
+
+        let mut sources = HashSet::new();
+        sources.insert(source);
+        let mut pending = VecDeque::new();
+        pending.push_back(attempt);
+        in_flight_map.insert(key, FreshOfferEntry { pending, sources });
+        drop(in_flight_map);
+        FreshOfferAdmission::Opened(Box::new(Self {
+            in_flight: Arc::clone(in_flight),
+            key,
+            data: offer.data,
+            received_at,
+            holds_entry: true,
+        }))
+    }
+
+    /// The bytes every proof for this key is tried against.
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// When the first offer for this key arrived.
+    fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
+    /// Take the next untried proof, releasing the key when none remain.
+    ///
+    /// Popping and releasing happen under one lock so a proof arriving exactly
+    /// as the queue empties is never silently discarded: it either lands in this
+    /// entry and is returned here, or finds no entry and opens its own.
+    fn next_attempt(&mut self) -> Option<FreshOfferAttempt> {
+        let mut in_flight = self.in_flight.lock();
+        let Some(entry) = in_flight.get_mut(&self.key) else {
+            self.holds_entry = false;
+            return None;
+        };
+        if let Some(attempt) = entry.pending.pop_front() {
+            return Some(attempt);
+        }
+        in_flight.remove(&self.key);
+        self.holds_entry = false;
+        None
+    }
+
+    /// Release the key and return the proofs that were never tried, so their
+    /// senders can be told the outcome the key reached without them.
+    fn release(&mut self) -> Vec<FreshOfferAttempt> {
+        let mut in_flight = self.in_flight.lock();
+        self.holds_entry = false;
+        in_flight
+            .remove(&self.key)
+            .map(|entry| entry.pending.into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for FreshOfferEntryGuard {
     fn drop(&mut self) {
-        self.in_flight.lock().remove(&self.key);
+        if self.holds_entry {
+            self.in_flight.lock().remove(&self.key);
+        }
     }
 }
 
@@ -1675,7 +1851,7 @@ impl ReplicationEngine {
             fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
             fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
             fresh_offer_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
-            fresh_offer_in_flight: Arc::new(Mutex::new(HashSet::new())),
+            fresh_offer_in_flight: Arc::new(Mutex::new(HashMap::new())),
             paid_notify_worker_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_WORKER_LIMIT)),
             paid_notify_admission_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING)),
             paid_notify_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
@@ -4768,33 +4944,69 @@ struct FreshOfferRejection {
 /// verification — stays on the worker.
 ///
 /// The content-address hash is deliberately included despite costing real CPU
-/// on the loop: it is what makes the claim below *earned* rather than merely
+/// on the loop: it is what makes the entry below *earned* rather than merely
 /// asserted. Its cost is self-limiting — BLAKE3 runs at GB/s while offers
 /// arrive at link speed, so a flooder can never make this loop hash faster than
 /// it can deliver the bytes, and delivering them already cost it more than the
 /// hash costs us. The receive path has in any case already deserialised the
 /// same buffer.
+///
+/// Every rejection here is penalised. These are the conditions no honest sender
+/// can produce — an absent, undersized, oversized, or non-matching payload — as
+/// distinct from a capacity refusal, which is this node's own state and stays
+/// free. Payment *outcomes* are deliberately not judged here or anywhere: a
+/// proof that fails to verify may simply have been read against a lagging chain
+/// view, and penalising that would charge honest senders in correlated bursts.
 fn fresh_offer_structural_rejection(
-    offer: &protocol::FreshReplicationOffer,
+    key: &XorName,
+    data: &[u8],
+    proof_of_payment: &[u8],
 ) -> Option<FreshOfferRejection> {
     // Rule 5: reject if PoP is missing. An honest sender always attaches one,
-    // but an absent proof is also the cheapest possible slot-filler, so this is
-    // the first thing checked.
-    if offer.proof_of_payment.is_empty() {
+    // and an absent proof is the cheapest possible slot-filler, so this is the
+    // first thing checked.
+    if proof_of_payment.is_empty() {
         return Some(FreshOfferRejection {
             reason: "Missing proof of payment".to_string(),
-            penalise: false,
+            penalise: true,
+        });
+    }
+
+    // Bound the proof before it can be queued. The verifier applies the same
+    // limits, but only once the offer reaches a worker — too late here, because
+    // an entry retains a proof per queued sender, and a proof is capped on the
+    // wire only by MAX_REPLICATION_MESSAGE_SIZE. Without this an offer carrying
+    // a byte of data and a 10 MiB "proof" would be admitted, and
+    // MAX_FRESH_OFFER_ATTEMPTS_PER_KEY of them per key across
+    // FRESH_OFFER_MAX_OUTSTANDING keys would dwarf the payload ceiling the
+    // admission bound exists to enforce.
+    if proof_of_payment.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Proof of payment {} is below the minimum {MIN_PAYMENT_PROOF_SIZE_BYTES} bytes",
+                proof_of_payment.len(),
+            ),
+            penalise: true,
+        });
+    }
+    if proof_of_payment.len() > MAX_PAYMENT_PROOF_SIZE_BYTES {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Proof of payment {} exceeds the maximum {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes",
+                proof_of_payment.len(),
+            ),
+            penalise: true,
         });
     }
 
     // Enforce chunk size invariant: the normal PUT path rejects data larger
     // than MAX_CHUNK_SIZE; the replication receive path must do the same to
     // prevent peers from pushing oversized records through replication.
-    if offer.data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+    if data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
         return Some(FreshOfferRejection {
             reason: format!(
                 "Data size {} exceeds maximum chunk size {}",
-                offer.data.len(),
+                data.len(),
                 crate::ant_protocol::MAX_CHUNK_SIZE,
             ),
             penalise: true,
@@ -4802,23 +5014,23 @@ fn fresh_offer_structural_rejection(
     }
 
     // Mirror the normal PUT path: the advertised key must be the content
-    // address of the supplied bytes. Ordered last of the three so an oversized
-    // payload is refused without being hashed.
+    // address of the supplied bytes. Ordered last so an oversized payload is
+    // refused without being hashed.
     //
-    // This is the check that makes the key claim safe to take. Until it passes,
-    // the sender has only *asserted* an association between the key and the
-    // bytes; the claim grants exclusive rights over that key for as long as the
-    // handler runs, so granting it on an assertion lets any peer that knows a
-    // key — every recipient of its `PaidNotify`, not just the close group —
-    // reserve it with junk and have the genuine offer refused as a duplicate.
-    // Nothing would then be stored, and the resulting absence is charged to
-    // *this* node by the delayed possession check (ADR-0003).
-    let computed_key = crate::client::compute_address(&offer.data);
-    if computed_key != offer.key {
+    // This is the check that makes the entry safe to open, and safe for later
+    // offers to be folded into. Until it passes, the sender has only *asserted*
+    // an association between the key and the bytes. Opening an entry on an
+    // assertion would let any peer that knows a key — every recipient of its
+    // `PaidNotify`, not just the close group — seize it with junk; folding a
+    // later offer into an entry on an assertion would be worse still, since the
+    // handler tries each queued proof against the *opener's* bytes and would be
+    // storing bytes nobody offered for that proof.
+    let computed_key = crate::client::compute_address(data);
+    if computed_key != *key {
         return Some(FreshOfferRejection {
             reason: format!(
                 "Content address mismatch: expected {}, computed {}",
-                hex::encode(offer.key),
+                hex::encode(key),
                 hex::encode(computed_key),
             ),
             penalise: true,
@@ -4854,6 +5066,73 @@ async fn refuse_fresh_offer(
     .await;
 }
 
+/// Refuse an offer that failed [`fresh_offer_structural_rejection`], charging
+/// the sender when the defect is one no honest node could produce.
+///
+/// Kept apart from the capacity refusal in `dispatch_fresh_offer` because the
+/// two say opposite things: this is the sender's fault, that one is ours.
+async fn refuse_malformed_fresh_offer(
+    source: &PeerId,
+    key: XorName,
+    rejection: FreshOfferRejection,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    if rejection.penalise {
+        warn!(
+            "Rejecting fresh offer for key {} from {source}: {}",
+            hex::encode(key),
+            rejection.reason
+        );
+        ctx.p2p_node
+            .report_trust_event(
+                source,
+                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+            )
+            .await;
+    } else {
+        debug!(
+            "Fresh offer for {} from {source} refused before admission: {}",
+            hex::encode(key),
+            rejection.reason
+        );
+    }
+    refuse_fresh_offer(
+        source,
+        key,
+        rejection.reason,
+        ctx,
+        request_id,
+        rr_message_id,
+    )
+    .await;
+}
+
+/// Tell senders whose proofs joined an entry that was torn down before a handler
+/// ever ran for it.
+///
+/// Only reachable in the window between opening an entry and failing to take an
+/// admission permit. Their proofs are answered rather than dropped with the
+/// entry, so the refusal count reflects what actually happened.
+async fn refuse_stranded_fresh_offers(
+    key: XorName,
+    stranded: Vec<FreshOfferAttempt>,
+    ctx: &ReplicationMessageHandlerContext,
+) {
+    for attempt in stranded {
+        refuse_fresh_offer(
+            &attempt.source,
+            key,
+            "Receiver at fresh-offer capacity".to_string(),
+            ctx,
+            attempt.request_id,
+            attempt.rr_message_id.as_deref(),
+        )
+        .await;
+    }
+}
+
 /// Admit a fresh offer for handling on a worker, or refuse it.
 ///
 /// This runs on the serial non-audit message loop, so it must stay cheap: every
@@ -4868,10 +5147,15 @@ async fn refuse_fresh_offer(
 /// sender's delayed possession check, the resulting refusals land as
 /// audit-severity penalties on this node rather than on the flooder.
 ///
-/// The structurally-invalid checks that cost nothing (missing proof, oversized
-/// payload) run **before** the permit is taken, so junk cannot occupy a slot
-/// for the duration of a payment verification. The content-address check stays
-/// on the worker: it hashes up to `MAX_CHUNK_SIZE` and belongs off this loop.
+/// The structurally-invalid checks run **before** the entry is opened and before
+/// the permit is taken, so junk can neither seize a key nor occupy a slot for
+/// the duration of a payment verification.
+///
+/// Only the offer that *opens* an entry costs a permit and a worker. Later
+/// offers for the same key contribute their proof and are answered by whatever
+/// the opener's handler concludes, which is what keeps the routine
+/// `CLOSE_GROUP_MAJORITY`-way duplication of a client PUT down to one permit and
+/// one verification per key.
 async fn dispatch_fresh_offer(
     source: PeerId,
     offer: protocol::FreshReplicationOffer,
@@ -4880,30 +5164,13 @@ async fn dispatch_fresh_offer(
     received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    if let Some(rejection) = fresh_offer_structural_rejection(&offer) {
-        if rejection.penalise {
-            warn!(
-                "Rejecting fresh offer for key {} from {source}: {}",
-                hex::encode(offer.key),
-                rejection.reason
-            );
-            ctx.p2p_node
-                .report_trust_event(
-                    &source,
-                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                )
-                .await;
-        } else {
-            debug!(
-                "Fresh offer for {} from {source} refused before admission: {}",
-                hex::encode(offer.key),
-                rejection.reason
-            );
-        }
-        refuse_fresh_offer(
+    if let Some(rejection) =
+        fresh_offer_structural_rejection(&offer.key, &offer.data, &offer.proof_of_payment)
+    {
+        refuse_malformed_fresh_offer(
             &source,
             offer.key,
-            rejection.reason,
+            rejection,
             ctx,
             request_id,
             rr_message_id,
@@ -4912,36 +5179,55 @@ async fn dispatch_fresh_offer(
         return Ok(());
     }
 
-    // Claim the key before taking an admission permit, so a duplicate never
-    // consumes one. The first claimant does the verification and the write; a
-    // concurrent duplicate is refused rather than made to wait, since the key is
-    // a content address and — because the claim is only reachable once
-    // `fresh_offer_structural_rejection` has confirmed `key == BLAKE3(data)` —
-    // both offers therefore genuinely carry identical bytes.
+    // Join the work already in flight for this key before taking an admission
+    // permit, so the duplicates a single client PUT produces cost one permit
+    // between them rather than one each.
     //
-    // That ordering is load-bearing, not incidental: the claim is exclusive and
-    // outlives this function, so it must never be grantable on an unverified
-    // association between key and bytes. A claimant that still fails later (bad
-    // payment, no capacity) leaves the record unstored, and the only mechanism
-    // that refills that gap is neighbor sync (10-20 min) — the possession check
-    // (5-15 min) only penalises, it never re-offers — so the loss is real and
-    // lands on this node.
-    let Some(in_flight) = FreshOfferInFlightGuard::try_claim(&ctx.fresh_offer_in_flight, offer.key)
-    else {
-        debug!(
-            "Fresh offer for {} from {source} refused: already in flight",
-            hex::encode(offer.key)
-        );
-        refuse_fresh_offer(
-            &source,
-            offer.key,
-            "Duplicate offer already in flight".to_string(),
-            ctx,
-            request_id,
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
+    // Reaching this point means `fresh_offer_structural_rejection` has confirmed
+    // `key == BLAKE3(data)`, so this offer's bytes are provably identical to any
+    // already held for the key. That is what lets its payload be dropped here
+    // and only its proof retained: the handler will try that proof against the
+    // bytes it already has.
+    let key = offer.key;
+    let admission_outcome = FreshOfferEntryGuard::admit(
+        &ctx.fresh_offer_in_flight,
+        offer,
+        source,
+        request_id,
+        rr_message_id.map(ToOwned::to_owned),
+        received_at,
+    );
+    let mut entry = match admission_outcome {
+        FreshOfferAdmission::Opened(entry) => entry,
+        FreshOfferAdmission::Joined => {
+            // No response yet: this proof has not been judged. The handler that
+            // owns the key answers every queued sender once it settles.
+            debug!(
+                "Fresh offer for {} from {source} queued behind the handler already \
+                 holding the key",
+                hex::encode(key)
+            );
+            return Ok(());
+        }
+        // Surplus, not suspect: the proofs already queued are enough to place
+        // the record, so neither case is charged as misbehaviour.
+        surplus => {
+            debug!(
+                "Fresh offer for {} from {source} refused: {}",
+                hex::encode(key),
+                surplus.surplus_reason()
+            );
+            refuse_fresh_offer(
+                &source,
+                key,
+                "Duplicate offer already in flight".to_string(),
+                ctx,
+                request_id,
+                rr_message_id,
+            )
+            .await;
+            return Ok(());
+        }
     };
 
     let admission = match admit_bounded_responder(
@@ -4968,65 +5254,65 @@ async fn dispatch_fresh_offer(
             warn!(
                 responder_class = "fresh_offer",
                 source = %source,
-                key = %hex::encode(offer.key),
+                key = %hex::encode(key),
                 "Fresh offer refused at admission — this node will be penalised                  for the resulting absence: {failure}"
             );
+            // Release the key explicitly rather than on drop, so the next offer
+            // opens a fresh entry rather than queueing behind a handler that was
+            // never spawned — and so any proof that joined in the window between
+            // opening the entry and failing here is answered rather than
+            // discarded with it.
+            let stranded = entry.release();
             refuse_fresh_offer(
                 &source,
-                offer.key,
+                key,
                 "Receiver at fresh-offer capacity".to_string(),
                 ctx,
                 request_id,
                 rr_message_id,
             )
             .await;
+            refuse_stranded_fresh_offers(key, stranded, ctx).await;
             return Ok(());
         }
     };
 
-    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
     let ctx = ctx.clone();
     // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
     // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
     // those references be released before the caller reopens the environment.
     ctx.detached_task_tracker
         .clone()
-        .spawn(run_fresh_offer_worker(
-            source,
-            offer,
-            ctx,
-            request_id,
-            received_at,
-            rr_message_id,
-            in_flight,
-            admission,
-        ));
+        .spawn(run_fresh_offer_worker(key, entry, ctx, admission));
     Ok(())
 }
 
-/// Body of one tracked fresh-offer worker.
+/// Body of one tracked fresh-offer worker: drive one key to a verdict.
 ///
 /// Split out so `dispatch_fresh_offer` stays a readable admission decision.
 /// A started handler is never cancelled: `storage.put()` awaits
 /// `spawn_blocking`, and dropping that awaiter would detach the live LMDB
 /// transaction. Shutdown responsiveness comes from the closed worker semaphore
 /// and from `handle_fresh_offer` racing the token around payment verification.
-#[allow(clippy::too_many_arguments)]
+///
+/// Works down the key's queued proofs rather than judging the key on the first
+/// one. A proof that fails to establish payment disqualifies its *sender*, not
+/// the record: the bytes are content-addressed and identical across every offer,
+/// so the next sender's proof is tried against the copy already in hand — no
+/// second payload, no second permit, no refetch. Only when a failure is about
+/// the key itself (not responsible, no capacity, shutting down) does rotating
+/// become pointless, because every remaining proof would meet the same wall.
 async fn run_fresh_offer_worker(
-    source: PeerId,
-    offer: protocol::FreshReplicationOffer,
+    key: XorName,
+    mut entry: Box<FreshOfferEntryGuard>,
     ctx: ReplicationMessageHandlerContext,
-    request_id: u64,
-    received_at: Instant,
-    rr_message_id: Option<String>,
-    in_flight: FreshOfferInFlightGuard,
     admission: ResponderGuard,
 ) {
-    // Both guards released on completion: the claim frees the key for a later
-    // offer, the admission permit frees the payload's memory budget and the
-    // source's per-peer share.
-    let _in_flight = in_flight;
+    // The admission permit is released on completion, freeing the payload's
+    // memory budget and the opening source's per-peer share. The entry releases
+    // the key itself, either as the queue empties or on drop.
     let _admission = admission;
+    let received_at = entry.received_at();
     // Wait for a worker slot here rather than in the caller. The worker bound
     // caps concurrent EVM and storage pressure; making the message loop wait on
     // it is what put that pressure back on the loop.
@@ -5038,7 +5324,10 @@ async fn run_fresh_offer_worker(
         .acquire_owned()
         .await
     else {
-        debug!("Fresh offer from {source} dropped: worker pool shut down");
+        debug!(
+            "Fresh offer for {} dropped: worker pool shut down",
+            hex::encode(key)
+        );
         return;
     };
     // Fresh offers are fire-and-forget (`send_message`), so there is no
@@ -5056,54 +5345,116 @@ async fn run_fresh_offer_worker(
     if request_is_stale(received_at, ctx.config.possession_check_delay_min) {
         debug!(
             responder_class = "fresh_offer",
-            source = %source,
+            key = %hex::encode(key),
             request_age_ms = received_at.elapsed().as_millis(),
             "Superseded fresh offer shed at dequeue"
         );
         return;
     }
-    if let Err(e) = handle_fresh_offer(
-        &source,
-        &offer,
-        &ctx.storage,
-        &ctx.paid_list,
-        &ctx.payment_verifier,
-        &ctx.p2p_node,
-        &ctx.config,
-        request_id,
-        rr_message_id.as_deref(),
-        &ctx.shutdown,
-    )
-    .await
-    {
-        debug!("Fresh replication offer from {source} error: {e}");
+
+    let mut verdict = FreshOfferOutcome::Abandoned;
+    while let Some(attempt) = entry.next_attempt() {
+        match handle_fresh_offer(&key, entry.data(), &attempt, &ctx).await {
+            Ok(outcome) => {
+                verdict = outcome;
+                match outcome {
+                    // Settled: the record is down and every remaining sender
+                    // wanted exactly that. Abandoned: the key cannot be placed
+                    // by anyone right now, so the proofs behind this one would
+                    // fail identically. Either way there is nothing left to try.
+                    FreshOfferOutcome::Settled | FreshOfferOutcome::Abandoned => break,
+                    // This sender's claim to have paid did not hold up. Say so
+                    // to that sender alone and try the next proof.
+                    FreshOfferOutcome::ProofRejected => {}
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Fresh replication offer for {} from {} error: {e}",
+                    hex::encode(key),
+                    attempt.source
+                );
+                verdict = FreshOfferOutcome::Abandoned;
+                break;
+            }
+        }
+    }
+
+    // Answer the senders whose proofs were never reached. A stored record is
+    // what they were asking for, so it is an acceptance even though their own
+    // proof went untested.
+    let unreached = entry.release();
+    if unreached.is_empty() {
+        return;
+    }
+    let response = match verdict {
+        FreshOfferOutcome::Settled => FreshReplicationResponse::Accepted { key },
+        FreshOfferOutcome::ProofRejected | FreshOfferOutcome::Abandoned => {
+            FreshReplicationResponse::Rejected {
+                key,
+                reason: "Record could not be stored from any offered proof".to_string(),
+            }
+        }
+    };
+    for attempt in unreached {
+        send_replication_response(
+            &attempt.source,
+            &ctx.p2p_node,
+            attempt.request_id,
+            ReplicationMessageBody::FreshReplicationResponse(response.clone()),
+            attempt.rr_message_id.as_deref(),
+        )
+        .await;
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// What one proof concluded, and whether another proof for the same key is worth
+/// trying.
+///
+/// The distinction the worker acts on is *what the failure was about*. A
+/// rejected proof is a statement about its sender; anything else is a statement
+/// about the key or this node, which no other sender's proof can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshOfferOutcome {
+    /// The record is stored. The key is done.
+    Settled,
+    /// This proof did not establish payment. A different sender's proof for the
+    /// same bytes may still succeed.
+    ProofRejected,
+    /// Nothing about this key can succeed right now — not responsible, no disk,
+    /// shutting down, or a write that failed. Rotating repeats the failure.
+    Abandoned,
+}
+
+// A linear sequence of protocol steps — structural recheck, responsibility,
+// capacity, payment, write — each with its own refusal response. Splitting it
+// would scatter one decision across several functions.
+#[allow(clippy::too_many_lines)]
 async fn handle_fresh_offer(
-    source: &PeerId,
-    offer: &protocol::FreshReplicationOffer,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    payment_verifier: &Arc<PaymentVerifier>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    request_id: u64,
-    rr_message_id: Option<&str>,
-    shutdown: &CancellationToken,
-) -> Result<()> {
+    key: &XorName,
+    data: &[u8],
+    attempt: &FreshOfferAttempt,
+    ctx: &ReplicationMessageHandlerContext,
+) -> Result<FreshOfferOutcome> {
+    let source = &attempt.source;
+    let request_id = attempt.request_id;
+    let rr_message_id = attempt.rr_message_id.as_deref();
+    let p2p_node = &ctx.p2p_node;
+    let config = &ctx.config;
     let self_id = *p2p_node.peer_id();
 
     // Defence in depth: `dispatch_fresh_offer` already applied these — missing
-    // proof, oversized payload, content-address mismatch — before claiming the
-    // key or taking an admission permit, so nothing reaching a worker should
-    // trip them. Kept so the handler is correct in isolation.
-    if let Some(rejection) = fresh_offer_structural_rejection(offer) {
+    // proof, bad proof size, oversized payload, content-address mismatch —
+    // before opening the entry or taking an admission permit, so nothing
+    // reaching a worker should trip them. Kept so the handler is correct in
+    // isolation. Note this re-checks the *pairing* actually being used: these
+    // bytes against this attempt's proof.
+    if let Some(rejection) = fresh_offer_structural_rejection(key, data, &attempt.proof_of_payment)
+    {
         if rejection.penalise {
             warn!(
                 "Rejecting fresh offer for key {}: {}",
-                hex::encode(offer.key),
+                hex::encode(key),
                 rejection.reason
             );
             p2p_node
@@ -5118,13 +5469,14 @@ async fn handle_fresh_offer(
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
+                key: *key,
                 reason: rejection.reason,
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // Structurally invalid is a fact about this attempt, not the key.
+        return Ok(FreshOfferOutcome::ProofRejected);
     }
 
     // Rule 7: check storage admission. Fresh chunk receivers accept across the
@@ -5135,26 +5487,22 @@ async fn handle_fresh_offer(
     // outside the narrow window in its own view; the wider accept window absorbs
     // that transient skew so the chunk still lands. Retention (pruning) stays at
     // `storage_admission_width`, so steady-state replication is unchanged.
-    if !admission::is_responsible(
-        &self_id,
-        &offer.key,
-        p2p_node,
-        config.paid_list_close_group_size,
-    )
-    .await
+    if !admission::is_responsible(&self_id, key, p2p_node, config.paid_list_close_group_size).await
     {
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
+                key: *key,
                 reason: "Not in storage-admission range for this key".to_string(),
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // About the key and this node's place in the routing table, not about
+        // the sender: every queued proof would be refused identically.
+        return Ok(FreshOfferOutcome::Abandoned);
     }
 
     // Disk-space pre-check — mirror the PUT handler (V2-411). A full node can
@@ -5163,10 +5511,10 @@ async fn handle_fresh_offer(
     // and only then failing at `storage.put` below. Reuses the cached capacity
     // check (passing results only, so freed space is detected promptly), and the
     // store path keeps its own check as defence-in-depth.
-    if let Err(e) = storage.check_capacity() {
+    if let Err(e) = ctx.storage.check_capacity() {
         info!(
             target: "ant_node::storage::disk_precheck",
-            key = %hex::encode(offer.key),
+            key = %hex::encode(key),
             "Rejecting fresh replication offer before payment verification: {e}"
         );
         send_replication_response(
@@ -5174,13 +5522,14 @@ async fn handle_fresh_offer(
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
+                key: *key,
                 reason: e.to_string(),
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // A full disk is this node's condition, not the sender's.
+        return Ok(FreshOfferOutcome::Abandoned);
     }
 
     // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
@@ -5192,84 +5541,97 @@ async fn handle_fresh_offer(
     // closeness for merkle proofs, and the same price-floor policy — the
     // distinct context only labels price-floor telemetry.
     let Some(verification) = verify_payment_until_shutdown(
-        payment_verifier,
-        &offer.key,
-        &offer.proof_of_payment,
+        &ctx.payment_verifier,
+        key,
+        &attempt.proof_of_payment,
         fresh_offer_payment_context(),
-        shutdown,
+        &ctx.shutdown,
     )
     .await
     else {
         debug!(
             "Fresh offer for {} from {source} abandoned: engine shutting down \
              during payment verification",
-            hex::encode(offer.key)
+            hex::encode(key)
         );
-        return Ok(());
+        return Ok(FreshOfferOutcome::Abandoned);
     };
     match verification {
         Ok(status) if status.can_store() => {
-            debug!(
-                "PoP validated for fresh offer key {}",
-                hex::encode(offer.key)
-            );
+            debug!("PoP validated for fresh offer key {}", hex::encode(key));
         }
+        // The chain has no record of this payment. That is a statement about
+        // *this sender's* proof, so the key rotates to the next one rather than
+        // being written off — the whole point of queueing them.
+        //
+        // Deliberately unpenalised. `PaymentRequired` means "no payment found",
+        // not "definitively unpaid", so a lagging or reorganising chain view
+        // renders honest senders indistinguishable from forgers, and penalising
+        // would land on the entire close group at once. The structural checks in
+        // `fresh_offer_structural_rejection` are where misbehaviour is charged,
+        // because those cannot be produced by an honest sender at all.
         Ok(_) => {
+            debug!(
+                "Fresh offer for {} from {source}: no payment found for this proof",
+                hex::encode(key)
+            );
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: "Payment verification failed: payment required".to_string(),
                     },
                 ),
                 rr_message_id,
             )
             .await;
-            return Ok(());
+            return Ok(FreshOfferOutcome::ProofRejected);
         }
+        // A verification *error* is usually ours — an unreachable or failing EVM
+        // endpoint — so it is neither penalised nor treated as this sender's
+        // fault. Another proof still gets its turn, since the next call may well
+        // succeed against a recovered endpoint.
         Err(e) => {
-            warn!(
-                "PoP verification error for key {}: {e}",
-                hex::encode(offer.key)
-            );
+            warn!("PoP verification error for key {}: {e}", hex::encode(key));
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: format!("Payment verification error: {e}"),
                     },
                 ),
                 rr_message_id,
             )
             .await;
-            return Ok(());
+            return Ok(FreshOfferOutcome::ProofRejected);
         }
     }
 
     // Rule 6: add to PaidForList.
-    if let Err(e) = paid_list.insert(&offer.key).await {
+    if let Err(e) = ctx.paid_list.insert(key).await {
         warn!("Failed to add key to PaidForList: {e}");
     }
 
     // Store the record.
-    match storage.put(&offer.key, &offer.data).await {
+    match ctx.storage.put(key, data).await {
         Ok(_) => {
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
-                    FreshReplicationResponse::Accepted { key: offer.key },
+                    FreshReplicationResponse::Accepted { key: *key },
                 ),
                 rr_message_id,
             )
             .await;
+            Ok(FreshOfferOutcome::Settled)
         }
         Err(e) => {
             send_replication_response(
@@ -5278,17 +5640,18 @@ async fn handle_fresh_offer(
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: e.to_string(),
                     },
                 ),
                 rr_message_id,
             )
             .await;
+            // The payment was good and the write still failed, so this is local
+            // storage trouble that another proof cannot get around.
+            Ok(FreshOfferOutcome::Abandoned)
         }
     }
-
-    Ok(())
 }
 
 /// Admit a paid-list notification for handling on a worker, or drop it.
@@ -8740,41 +9103,165 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
-    #[test]
-    fn fresh_offer_claim_refuses_a_duplicate_then_frees_the_key_on_drop() {
-        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
-        let key = [7u8; 32];
+    /// A structurally valid offer for `data`: real content address, a proof of
+    /// the minimum accepted size, distinguished by `proof_marker` so a test can
+    /// tell whose proof came back out of the queue.
+    fn test_fresh_offer(data: Vec<u8>, proof_marker: u8) -> protocol::FreshReplicationOffer {
+        protocol::FreshReplicationOffer {
+            key: crate::client::compute_address(&data),
+            data,
+            proof_of_payment: vec![proof_marker; MIN_PAYMENT_PROOF_SIZE_BYTES],
+        }
+    }
 
-        let claim = FreshOfferInFlightGuard::try_claim(&in_flight, key);
-        assert!(claim.is_some(), "first offer for a key should claim it");
+    fn admit_test_offer(
+        in_flight: &FreshOfferInFlight,
+        offer: protocol::FreshReplicationOffer,
+        source: PeerId,
+    ) -> FreshOfferAdmission {
+        FreshOfferEntryGuard::admit(in_flight, offer, source, 0, None, Instant::now())
+    }
+
+    #[test]
+    fn fresh_offer_entry_queues_one_proof_per_source_then_frees_the_key_on_drop() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x11u8; 64];
+
+        let opened = admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 1), test_peer(1));
+        let FreshOfferAdmission::Opened(entry) = opened else {
+            panic!("first offer for a key should open the entry")
+        };
+
+        // A second sender contributes its proof instead of being turned away:
+        // its bytes are provably the same, so only the proof is worth keeping.
         assert!(
-            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_none(),
-            "a concurrent duplicate should be refused rather than repeat the work"
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 2), test_peer(2)),
+                FreshOfferAdmission::Joined
+            ),
+            "a duplicate from a new source should queue its proof"
+        );
+        // The same peer twice is not extra evidence, just extra work.
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 3), test_peer(1)),
+                FreshOfferAdmission::DuplicateSource
+            ),
+            "one source should hold at most one queued proof per key"
         );
 
-        // A claim that outlived its handler would bar the key forever.
-        drop(claim);
+        // An entry that outlived its handler would bar the key forever.
+        drop(entry);
         assert!(
-            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_some(),
-            "a released key should be claimable again"
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 4), test_peer(3)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "a released key should be openable again"
         );
     }
 
     #[test]
-    fn fresh_offer_claims_are_independent_across_keys_sharing_a_prefix() {
-        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
-        let mut first_key = [0u8; 32];
-        first_key[31] = 1;
-        let mut second_key = [0u8; 32];
-        second_key[31] = 2;
+    fn fresh_offer_entries_are_independent_across_keys_sharing_a_prefix() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
 
         // A node only receives offers for keys close to its own ID, so accepted
         // keys share a long prefix. Any prefix-derived shard index would have
         // funnelled these two onto one lock and serialized them.
-        let _first = FreshOfferInFlightGuard::try_claim(&in_flight, first_key);
+        let _first = admit_test_offer(&in_flight, test_fresh_offer(vec![1u8; 8], 1), test_peer(1));
         assert!(
-            FreshOfferInFlightGuard::try_claim(&in_flight, second_key).is_some(),
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(vec![2u8; 8], 1), test_peer(1)),
+                FreshOfferAdmission::Opened(_)
+            ),
             "distinct keys should never block each other"
+        );
+    }
+
+    /// The regression that motivated queueing proofs at all.
+    ///
+    /// A sender whose proof does not verify must cost the network its own
+    /// attempt and nothing more. Refusing every later offer outright made the
+    /// first arrival the only arrival, so one bad proof lost the record — and
+    /// the delayed possession check then charged that absence to this node.
+    #[test]
+    fn a_failing_proof_hands_the_key_to_the_next_sender() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x5Au8; 128];
+        let forger = test_peer(0xF0);
+        let genuine = test_peer(0x0F);
+
+        let FreshOfferAdmission::Opened(mut entry) =
+            admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0xBA), forger)
+        else {
+            panic!("the first offer should open the entry");
+        };
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0x60), genuine),
+                FreshOfferAdmission::Joined
+            ),
+            "the genuine sender must not be turned away by the forger"
+        );
+
+        let first = entry
+            .next_attempt()
+            .expect("the opener's proof comes first");
+        assert_eq!(first.source, forger);
+
+        // Treat the forger's proof as failed: the next one is still reachable,
+        // and it is tried against the bytes already held rather than a refetch.
+        let second = entry
+            .next_attempt()
+            .expect("a failed proof must not consume the key");
+        assert_eq!(second.source, genuine);
+        assert_eq!(
+            second.proof_of_payment,
+            vec![0x60u8; MIN_PAYMENT_PROOF_SIZE_BYTES]
+        );
+        assert_eq!(
+            entry.data(),
+            data.as_slice(),
+            "every proof is tried against the one copy of the bytes"
+        );
+
+        // Draining the queue releases the key rather than stranding it.
+        assert!(entry.next_attempt().is_none());
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 0x70), test_peer(9)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "an exhausted entry should release its key"
+        );
+    }
+
+    #[test]
+    fn a_fresh_offer_entry_queues_no_more_proofs_than_the_close_group_can_send() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x2Cu8; 32];
+
+        // The opener occupies the first slot, so the cap is reached after
+        // MAX_FRESH_OFFER_ATTEMPTS_PER_KEY distinct sources in total.
+        let _entry = admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(0));
+        for i in 1..MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
+            let source = test_peer(u8::try_from(i).unwrap_or(u8::MAX));
+            assert!(
+                matches!(
+                    admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), source),
+                    FreshOfferAdmission::Joined
+                ),
+                "sender {i} is within the legitimate close-group fan-out"
+            );
+        }
+
+        let surplus = test_peer(0xEE);
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 0), surplus),
+                FreshOfferAdmission::Full
+            ),
+            "past the cap a proof is surplus: enough are already queued to place the record"
         );
     }
 
@@ -9170,85 +9657,90 @@ mod tests {
     fn structurally_invalid_fresh_offers_are_rejected_before_admission() {
         let key = test_key(0xC5);
 
-        let missing_proof = protocol::FreshReplicationOffer {
-            key,
-            data: vec![0u8; 1],
-            proof_of_payment: Vec::new(),
-        };
-        let rejection = fresh_offer_structural_rejection(&missing_proof)
+        let valid_proof = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES];
+
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &[])
             .expect("an offer with no proof must be refused");
         assert!(
-            !rejection.penalise,
-            "a missing proof is refused but not charged as misbehaviour"
+            rejection.penalise,
+            "an honest sender always attaches a proof"
         );
 
-        let oversized = protocol::FreshReplicationOffer {
-            key,
-            data: vec![0u8; crate::ant_protocol::MAX_CHUNK_SIZE + 1],
-            proof_of_payment: vec![1u8; 1],
-        };
-        let rejection = fresh_offer_structural_rejection(&oversized)
-            .expect("an oversized offer must be refused");
+        // A proof is retained per queued sender, so its size has to be bounded
+        // here rather than at the verifier, which only sees it on a worker.
+        let undersized = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &undersized)
+            .expect("an undersized proof must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an undersized proof"
+        );
+        let oversized_proof = vec![1u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &oversized_proof)
+            .expect("an oversized proof must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an oversized proof"
+        );
+
+        let rejection = fresh_offer_structural_rejection(
+            &key,
+            &vec![0u8; crate::ant_protocol::MAX_CHUNK_SIZE + 1],
+            &valid_proof,
+        )
+        .expect("an oversized offer must be refused");
         assert!(
             rejection.penalise,
             "no honest sender constructs an oversized offer"
         );
 
         let data = vec![0u8; 1];
-        let valid = protocol::FreshReplicationOffer {
-            key: crate::client::compute_address(&data),
-            data,
-            proof_of_payment: vec![1u8; 1],
-        };
         assert!(
-            fresh_offer_structural_rejection(&valid).is_none(),
+            fresh_offer_structural_rejection(
+                &crate::client::compute_address(&data),
+                &data,
+                &valid_proof
+            )
+            .is_none(),
             "a well-formed offer must reach admission"
         );
     }
 
-    /// Knowing a key must not be enough to reserve it.
+    /// Knowing a key must not be enough to enter its entry.
     ///
-    /// The in-flight claim is exclusive and outlives dispatch, so it has to be
-    /// unreachable until the offer has proved it carries the key's bytes. Taken
-    /// any earlier it becomes a suppression primitive: a peer that has only
-    /// *learned* the key — every recipient of its `PaidNotify`, not just the
-    /// close group that gets the chunk — claims it with junk, the genuine offer
-    /// is refused as a duplicate, nothing is stored, and the delayed possession
-    /// check charges the resulting absence to THIS node while the only actual
-    /// repair path (neighbor sync) runs later still.
+    /// Opening an entry on an unverified key/bytes association would let a peer
+    /// that has only *learned* the key — every recipient of its `PaidNotify`,
+    /// not just the close group that gets the chunk — seize it with junk.
+    /// Joining one would be worse: the handler tries each queued proof against
+    /// the *opener's* bytes, so an unchecked joiner could have its proof spent
+    /// on bytes it never offered.
     #[test]
-    fn a_fresh_offer_cannot_claim_a_key_whose_bytes_it_lacks() {
+    fn a_fresh_offer_cannot_enter_an_entry_for_bytes_it_lacks() {
         let genuine_data = vec![0x5Au8; 128];
         let key = crate::client::compute_address(&genuine_data);
+        let valid_proof = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES];
 
-        let forged = protocol::FreshReplicationOffer {
-            key,
-            data: vec![0xFFu8; 1],
-            proof_of_payment: vec![1u8; 1],
-        };
-        let rejection = fresh_offer_structural_rejection(&forged)
+        let rejection = fresh_offer_structural_rejection(&key, &[0xFFu8; 1], &valid_proof)
             .expect("bytes that do not hash to the advertised key must be refused");
         assert!(
             rejection.penalise,
             "no honest sender offers bytes that do not hash to the advertised key"
         );
 
-        // Dispatch reaches the claim only past that rejection, so the forged
-        // offer never held the key and the genuine one still gets it.
-        let genuine = protocol::FreshReplicationOffer {
-            key,
-            data: genuine_data,
-            proof_of_payment: vec![1u8; 1],
-        };
+        // Dispatch reaches the entry only past that rejection, so the forged
+        // offer never touched the key and the genuine one still opens it.
         assert!(
-            fresh_offer_structural_rejection(&genuine).is_none(),
-            "the offer that actually carries the key's bytes must reach the claim"
+            fresh_offer_structural_rejection(&key, &genuine_data, &valid_proof).is_none(),
+            "the offer that actually carries the key's bytes must reach the entry"
         );
 
-        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashSet::new()));
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
         assert!(
-            FreshOfferInFlightGuard::try_claim(&in_flight, key).is_some(),
-            "an offer refused on payload shape must leave the key claimable"
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(genuine_data, 1), test_peer(1)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "an offer refused on payload shape must leave the key openable"
         );
     }
 
