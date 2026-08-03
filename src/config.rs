@@ -120,6 +120,13 @@ pub struct NodeConfig {
     #[serde(default)]
     pub storage: StorageConfig,
 
+    /// Experimental direct-browser WebTransport listener.
+    ///
+    /// This is the ADR-0009 interoperability proof and is disabled by
+    /// default. Enabling it requires a build with `webtransport-poc`.
+    #[serde(default)]
+    pub webtransport: WebTransportConfig,
+
     /// Directory for persisting the close group cache.
     ///
     /// When `None` (default), the node's `root_dir` is used — the cache
@@ -141,6 +148,97 @@ pub struct NodeConfig {
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+/// Configuration for the ADR-0009 WebTransport proof of concept.
+///
+/// This listener is deliberately separate from the native Saorsa QUIC port.
+/// It exposes only local closest-node lookup and local immutable chunk GET.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebTransportConfig {
+    /// Enable the experimental listener.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// UDP address for the HTTP/3 listener.
+    #[serde(default = "default_webtransport_bind")]
+    pub bind: SocketAddr,
+
+    /// URL advertised to the browser in `HELLO` and self lookup results.
+    ///
+    /// When omitted, the URL is derived from the bound socket and
+    /// [`Self::path`]. A wildcard bind therefore needs an explicit public URL.
+    #[serde(default)]
+    pub advertised_url: Option<String>,
+
+    /// WebTransport session path.
+    #[serde(default = "default_webtransport_path")]
+    pub path: String,
+
+    /// Exact browser origins accepted by the `PoC`.
+    ///
+    /// `"*"` is supported for local experimentation but must not be used for
+    /// a public deployment.
+    #[serde(default = "default_webtransport_origins")]
+    pub allowed_origins: Vec<String>,
+
+    /// Subject alternative names for the automatically generated certificate.
+    #[serde(default = "default_webtransport_sans")]
+    pub certificate_sans: Vec<String>,
+
+    /// Maximum simultaneously accepted browser sessions.
+    #[serde(default = "default_webtransport_max_connections")]
+    pub max_connections: usize,
+
+    /// Maximum JSON request size, in bytes.
+    #[serde(default = "default_webtransport_max_request_bytes")]
+    pub max_request_bytes: usize,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind: default_webtransport_bind(),
+            advertised_url: None,
+            path: default_webtransport_path(),
+            allowed_origins: default_webtransport_origins(),
+            certificate_sans: default_webtransport_sans(),
+            max_connections: default_webtransport_max_connections(),
+            max_request_bytes: default_webtransport_max_request_bytes(),
+        }
+    }
+}
+
+fn default_webtransport_bind() -> SocketAddr {
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+}
+
+fn default_webtransport_path() -> String {
+    "/autonomi/webtransport/v1".to_string()
+}
+
+fn default_webtransport_origins() -> Vec<String> {
+    vec![
+        "http://localhost:5173".to_string(),
+        "http://127.0.0.1:5173".to_string(),
+    ]
+}
+
+fn default_webtransport_sans() -> Vec<String> {
+    vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ]
+}
+
+const fn default_webtransport_max_connections() -> usize {
+    32
+}
+
+const fn default_webtransport_max_request_bytes() -> usize {
+    16 * 1024
 }
 
 /// Auto-upgrade configuration.
@@ -279,6 +377,7 @@ impl Default for NodeConfig {
             upgrade: UpgradeConfig::default(),
             payment: PaymentConfig::default(),
             storage: StorageConfig::default(),
+            webtransport: WebTransportConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),
