@@ -87,6 +87,15 @@ impl NodeBuilder {
 
         Self::validate_production_rewards_address(&self.config)?;
 
+        #[cfg(not(feature = "webtransport-poc"))]
+        if self.config.webtransport.enabled {
+            return Err(Error::Config(
+                "webtransport is enabled but this binary was not built with the \
+                 'webtransport-poc' feature"
+                    .to_string(),
+            ));
+        }
+
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
         let peer_id = identity.peer_id().to_hex();
@@ -206,6 +215,8 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
+            #[cfg(feature = "webtransport-poc")]
+            webtransport_task: None,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -465,6 +476,9 @@ pub struct RunningNode {
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// ADR-0009 experimental browser listener task.
+    #[cfg(feature = "webtransport-poc")]
+    webtransport_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -524,6 +538,27 @@ impl RunningNode {
             port = actual_port,
             "Node is running on port: {}", actual_port
         );
+
+        #[cfg(feature = "webtransport-poc")]
+        if self.config.webtransport.enabled {
+            let endpoint_catalog =
+                Arc::new(crate::web_transport::BrowserEndpointCatalog::default());
+            match crate::web_transport::spawn(
+                &self.config.webtransport,
+                Arc::clone(&self.p2p_node),
+                self.ant_protocol.clone(),
+                self.shutdown.clone(),
+                endpoint_catalog,
+            ) {
+                Ok(server) => self.webtransport_task = Some(server.task),
+                Err(error) => {
+                    if let Err(shutdown_error) = self.p2p_node.shutdown().await {
+                        warn!("P2P shutdown after WebTransport startup failure failed: {shutdown_error}");
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         // Emit started event
         if let Err(e) = self.events_tx.send(NodeEvent::Started) {
@@ -692,6 +727,15 @@ impl RunningNode {
 
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
+
+        // The shared token closes the WebTransport accept loop and active
+        // browser sessions before storage and native P2P are torn down.
+        #[cfg(feature = "webtransport-poc")]
+        if let Some(task) = self.webtransport_task.take() {
+            if let Err(error) = task.await {
+                warn!("WebTransport task shutdown failed: {error}");
+            }
+        }
 
         // Shutdown replication engine before P2P so background tasks don't
         // use a dead P2P layer, and Arc<LmdbStorage> references are released.

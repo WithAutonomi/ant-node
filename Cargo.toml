@@ -112,6 +112,12 @@ page_size = "0.6"
 # Protocol serialization
 postcard = { version = "1.1.3", features = ["use-std"] }
 
+# ADR-0009 transport interoperability proof. Kept optional so the existing
+# node build and its Rust 1.75 MSRV are unchanged. wtransport 0.7 itself
+# requires Rust 1.88 when this feature is enabled.
+wtransport = { version = "0.7.1", optional = true }
+self_encryption = { version = "0.36", optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -166,6 +172,11 @@ name = "poc_price_floor_live"
 path = "tests/poc_price_floor_live.rs"
 required-features = ["test-utils"]
 
+[[test]]
+name = "webtransport_devnet"
+path = "tests/webtransport_devnet.rs"
+required-features = ["webtransport-poc"]
+
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.
@@ -176,6 +187,9 @@ logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Expose test helpers (cache_insert, payment_verifier accessor) for
 # integration tests and downstream test harnesses.
 test-utils = []
+# Non-production direct-browser interoperability proof from ADR-0009.
+# This enables a second HTTP/3/WebTransport UDP listener and requires Rust 1.88.
+webtransport-poc = ["dep:self_encryption", "dep:wtransport"]
 
 [profile.release]
 lto = true

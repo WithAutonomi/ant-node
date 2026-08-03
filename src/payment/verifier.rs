@@ -1104,6 +1104,18 @@ impl PaymentVerifier {
         self.cache.insert(xorname);
     }
 
+    /// Mark startup content as prepaid for the in-process browser devnet.
+    ///
+    /// This remains crate-private and feature-gated: it is used only by
+    /// [`crate::devnet::Devnet::publish_public_file`] before that local devnet
+    /// is handed to a browser. The subsequent PUT still traverses the normal
+    /// address, responsibility, payment-cache, storage, and read-verification
+    /// checks.
+    #[cfg(feature = "webtransport-poc")]
+    pub(crate) fn cache_insert_browser_devnet_seed(&self, xorname: XorName) {
+        self.cache.insert(xorname);
+    }
+
     /// Pre-populate the merkle pool cache. Testing helper that lets e2e tests
     /// bypass the on-chain `completedMerklePayments` lookup when the point of
     /// the test is to exercise merkle-verification logic BEFORE the on-chain
