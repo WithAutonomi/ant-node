@@ -13,6 +13,7 @@ use crate::ant_protocol::XorName;
 
 use super::types::AuditFailureReason;
 
+use super::config::MAX_AUDIT_MESSAGE_SIZE;
 pub use super::config::MAX_REPLICATION_MESSAGE_SIZE;
 
 /// Sentinel digest value indicating the challenged key is absent from storage.
@@ -74,10 +75,24 @@ impl ReplicationMessage {
     /// [`ReplicationProtocolError::DeserializationFailed`] if postcard cannot
     /// parse the data.
     pub fn decode(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
-        if data.len() > MAX_REPLICATION_MESSAGE_SIZE {
+        // The ceiling follows the body's own family, read from its discriminant
+        // before anything attacker-sized is touched. Putting it here rather than
+        // only on the receive path is what makes it unskippable: a *response* is
+        // decoded by whichever lane asked, and an audit lane asks a question a
+        // few hundred bytes long, so without this a challenged peer could answer
+        // with megabytes and be allocated all of it. Core bodies keep the core
+        // allowance — a fetch response legitimately carries a whole chunk.
+        // A prefix too malformed to classify takes the strict ceiling too: it
+        // cannot be a legitimate message of any family, so it is not one to
+        // decode generously.
+        let max_size = match peek_variant_index(data).map(family_of_variant) {
+            Some(BodyFamily::Core) => MAX_REPLICATION_MESSAGE_SIZE,
+            _ => MAX_AUDIT_MESSAGE_SIZE,
+        };
+        if data.len() > max_size {
             return Err(ReplicationProtocolError::MessageTooLarge {
                 size: data.len(),
-                max_size: MAX_REPLICATION_MESSAGE_SIZE,
+                max_size,
             });
         }
         let message: Self = postcard::from_bytes(data)
@@ -88,6 +103,38 @@ impl ReplicationMessage {
         record_rx(&message.body, data.len());
 
         Ok(message)
+    }
+
+    /// Decode a reply to an audit challenge, under the audit family ceiling.
+    ///
+    /// The pre-decode ceiling on the receive path bounds what an auditor can
+    /// make a responder decode. This is that same bound in the other direction.
+    /// A challenge costs a few hundred bytes to send, so without it a challenged
+    /// peer could answer with up to [`MAX_REPLICATION_MESSAGE_SIZE`] and make
+    /// the auditor allocate and decode all of it — the cheap side of the
+    /// exchange paying for the expensive one, which is the shape the responder
+    /// ceiling exists to prevent. Audit bodies are ~110 KiB at worst (see
+    /// [`MAX_AUDIT_MESSAGE_SIZE`]), so this costs an honest responder nothing.
+    ///
+    /// No discriminant peek is needed here, unlike the receive path: the auditor
+    /// asked the question, so it already knows the reply belongs to an audit
+    /// family, and a body that turns out not to be the expected one is rejected
+    /// by the lane's own matching afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReplicationProtocolError::MessageTooLarge`] above the audit
+    /// ceiling, which every audit lane already reads as a malformed answer
+    /// rather than as silence: a peer that answers at all is on this protocol,
+    /// so the rollout grace does not cover it.
+    pub fn decode_audit_response(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
+        if data.len() > MAX_AUDIT_MESSAGE_SIZE {
+            return Err(ReplicationProtocolError::MessageTooLarge {
+                size: data.len(),
+                max_size: MAX_AUDIT_MESSAGE_SIZE,
+            });
+        }
+        Self::decode(data)
     }
 }
 
@@ -137,10 +184,10 @@ pub enum ReplicationMessageBody {
     SubtreeAuditChallenge(SubtreeAuditChallenge),
     /// Response to a contiguous-subtree storage audit challenge (round 1).
     SubtreeAuditResponse(SubtreeAuditResponse),
-    /// Surprise byte challenge for the spot-checked leaves (round 2).
-    SubtreeByteChallenge(SubtreeByteChallenge),
-    /// Response carrying the requested chunks' original bytes (round 2).
-    SubtreeByteResponse(SubtreeByteResponse),
+    /// Surprise slice challenge for the spot-checked leaves (round 2).
+    SubtreeSliceChallenge(SubtreeSliceChallenge),
+    /// Response carrying verified slices for the opened blocks (round 2).
+    SubtreeSliceResponse(SubtreeSliceResponse),
 
     // === Commitment fetch by pin (ADR-0004) ===
     // APPENDED at the end so postcard variant discriminants of all the
@@ -203,12 +250,142 @@ impl ReplicationMessageBody {
             Self::AuditResponse(_) => 10,
             Self::SubtreeAuditChallenge(_) => 11,
             Self::SubtreeAuditResponse(_) => 12,
-            Self::SubtreeByteChallenge(_) => 13,
-            Self::SubtreeByteResponse(_) => 14,
+            Self::SubtreeSliceChallenge(_) => 13,
+            Self::SubtreeSliceResponse(_) => 14,
             Self::GetCommitmentByPin(_) => 15,
             Self::GetCommitmentByPinResponse(_) => 16,
         }
     }
+
+    /// Whether this body is a subtree storage-commitment audit message (both
+    /// rounds). These ride [`SUBTREE_AUDIT_PROTOCOL_ID`], not the core
+    /// [`REPLICATION_PROTOCOL_ID`]; the receive dispatch uses this to enforce
+    /// that audit bodies only arrive on the audit id and core bodies only on the
+    /// core id, so a mixed-version peer's message can never be honoured on the
+    /// wrong handler even if postcard misdecodes it into a valid-looking value.
+    ///
+    /// [`SUBTREE_AUDIT_PROTOCOL_ID`]: crate::replication::config::SUBTREE_AUDIT_PROTOCOL_ID
+    /// [`REPLICATION_PROTOCOL_ID`]: crate::replication::config::REPLICATION_PROTOCOL_ID
+    #[must_use]
+    pub fn is_subtree_audit(&self) -> bool {
+        family_of_variant(self.variant_index()) == BodyFamily::SubtreeAudit
+    }
+
+    /// Whether this body is a digest-based possession audit message.
+    ///
+    /// One wire pair (`AuditChallenge`/`AuditResponse`) serves three callers:
+    /// the responsible-chunk audit, the post-replication possession probe, and
+    /// the prune-confirmation audit. They ride [`POSSESSION_AUDIT_PROTOCOL_ID`]
+    /// because the digest they carry is keyed by the challenge material, so a
+    /// peer on an older digest generation must not be answered on this lane at
+    /// all rather than be scored as a confirmed mismatch.
+    ///
+    /// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
+    #[must_use]
+    pub fn is_possession_audit(&self) -> bool {
+        family_of_variant(self.variant_index()) == BodyFamily::PossessionAudit
+    }
+}
+
+/// Which protocol family a body belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BodyFamily {
+    /// Core replication: everything that is not an audit.
+    Core,
+    /// The digest-based possession pair (`AuditChallenge`/`AuditResponse`).
+    PossessionAudit,
+    /// The four subtree storage-commitment audit bodies, both rounds.
+    SubtreeAudit,
+}
+
+impl BodyFamily {
+    /// Whether this family takes the tighter audit wire ceiling.
+    #[must_use]
+    pub(crate) fn is_audit(self) -> bool {
+        matches!(self, Self::PossessionAudit | Self::SubtreeAudit)
+    }
+}
+
+/// The family of a body, keyed by its postcard discriminant.
+///
+/// Keyed by discriminant rather than by `&self` on purpose: the receive path has
+/// to classify a message BEFORE decoding it, because the pre-decode size ceiling
+/// is the only check that can run before an attacker-sized collection is
+/// allocated. The discriminant is the one field reachable that early (see
+/// [`peek_variant_index`]).
+///
+/// Everything that classifies a body reads this one table —
+/// [`ReplicationMessageBody::is_subtree_audit`],
+/// [`ReplicationMessageBody::is_possession_audit`], the outbound response
+/// routing, the post-decode family guard, and the pre-decode ceiling — so the
+/// pre- and post-decode views of "which family is this" cannot drift apart. A
+/// drift is exactly what let an audit body sent on the core id skip the audit
+/// ceiling and decode under the 10 MiB core allowance.
+///
+/// Indices match [`ReplicationMessageBody::variant_index`], which is declaration
+/// order and postcard-stable.
+#[must_use]
+pub(crate) fn family_of_variant(index: usize) -> BodyFamily {
+    match index {
+        9 | 10 => BodyFamily::PossessionAudit,
+        11..=14 => BodyFamily::SubtreeAudit,
+        _ => BodyFamily::Core,
+    }
+}
+
+/// Maximum bytes a postcard varint can occupy for a `u64`.
+const MAX_VARINT_LEN: usize = 10;
+
+/// Read one postcard varint (LEB128, little-endian base-128) from `bytes`.
+///
+/// Returns the value and how many bytes it consumed. Bounded by `max_bytes` and
+/// by the 64-bit shift, so a hostile prefix cannot spin here.
+fn read_varint(bytes: &[u8], max_bytes: usize) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    let mut shift: u32 = 0;
+    for (i, byte) in bytes.iter().take(max_bytes).enumerate() {
+        let payload = u64::from(byte & 0x7F);
+        // A u64 LEB128 has only one payload bit left in byte ten. Rust's
+        // shifts discard high bits rather than reporting value overflow, so
+        // `checked_shl` alone would accept (and wrap) a terminal payload > 1.
+        // Treat that malformed prefix as unclassifiable and apply the strict
+        // audit ceiling.
+        if shift == 63 && payload > 1 {
+            return None;
+        }
+        value |= payload.checked_shl(shift)?;
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+        shift = shift.checked_add(7)?;
+        if shift >= u64::BITS {
+            return None;
+        }
+    }
+    None
+}
+
+/// Read a message's body discriminant without decoding the body.
+///
+/// `ReplicationMessage` is `{ request_id: u64, body: ReplicationMessageBody }`,
+/// and postcard writes struct fields in order with no length prefix: a varint
+/// `request_id`, then the enum's varint discriminant. So the discriminant sits
+/// behind at most [`MAX_VARINT_LEN`] bytes and costs two bounded varint reads to
+/// reach — no allocation, and nothing attacker-sized is touched.
+///
+/// `None` means the prefix is not even well-formed enough to classify; the
+/// caller treats that as "apply the strictest ceiling", since a message we
+/// cannot classify is one we should not decode generously.
+///
+/// A test round-trips every variant through `encode` to prove this agrees with
+/// [`ReplicationMessageBody::variant_index`] for real messages, rather than
+/// trusting this reading of postcard's format.
+#[must_use]
+pub(crate) fn peek_variant_index(data: &[u8]) -> Option<usize> {
+    let (_request_id, consumed) = read_varint(data, MAX_VARINT_LEN)?;
+    let rest = data.get(consumed..)?;
+    let (variant, _) = read_varint(rest, MAX_VARINT_LEN)?;
+    usize::try_from(variant).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -238,8 +415,14 @@ pub(crate) enum AuditDropKind {
     Responsible = 0,
     /// Subtree audit round-1 challenge.
     Subtree = 1,
-    /// Subtree audit round-2 byte challenge.
-    Byte = 2,
+    /// Subtree audit round-2 slice challenge.
+    ///
+    /// The emitted counter is still named `audit_dropped_byte` (see
+    /// `log_audit_outcome_summary`): round 2 no longer serves full chunk bytes,
+    /// but keeping the wire-visible counter name fixed is what lets a v2 fleet
+    /// and a v3 fleet be compared with no field mapping. The name is a metric
+    /// identifier, not a description of the payload.
+    Slice = 2,
 }
 
 /// One slot per [`AuditFailureReason`] variant, per [`AuditOutcomeKind`].
@@ -384,6 +567,14 @@ pub(crate) fn log_traffic_summary() {
         group = 3,
         subtree_audit_response_tx_bytes = tb(12), subtree_audit_response_tx_count = tc(12),
         subtree_audit_response_rx_bytes = rb(12), subtree_audit_response_rx_count = rc(12),
+        // Indices 13/14 are the round-2 pair, renamed on the wire to
+        // `SubtreeSliceChallenge`/`SubtreeSliceResponse`. The COUNTER names stay
+        // `subtree_byte_*` on purpose: they are the field names an operator
+        // queries, and holding them fixed is what let the V2-685 testnet compare
+        // a 0.15.0 cohort against a slice-audit cohort with no field mapping
+        // (6.19 MB vs 14.49 KB per response, same query). Renaming them would
+        // silently zero every existing dashboard and alert. The variant index,
+        // not the label, is the source of truth for what is being counted.
         subtree_byte_challenge_tx_bytes = tb(13), subtree_byte_challenge_tx_count = tc(13),
         subtree_byte_challenge_rx_bytes = rb(13), subtree_byte_challenge_rx_count = rc(13),
         subtree_byte_response_tx_bytes = tb(14), subtree_byte_response_tx_count = tc(14),
@@ -404,9 +595,9 @@ pub(crate) fn log_traffic_summary() {
 //
 // Follow-up to V2-623: the per-variant table above says how many bytes each
 // message type served, but not WHICH peers pulled them. This adds per-peer
-// attribution for the heavy serve paths (`FetchResponse`, `SubtreeByteResponse`,
-// `NeighborSyncResponse` — ~99% of served bytes), emitted as a top-10-by-bytes
-// INFO line on the same cadence and target as `log_traffic_summary`.
+// attribution for the heavy serve paths (`FetchResponse`, `NeighborSyncResponse`
+// — ~99% of served bytes), emitted as a top-10-by-bytes INFO line on the same
+// cadence and target as `log_traffic_summary`.
 //
 // Design (mirrors V2-623's process-global-static choice for the same reason —
 // the serve choke point is a free function with no engine handle):
@@ -832,7 +1023,8 @@ pub enum AuditResponse {
 /// [`SubtreeAuditResponse::Proof`] for that selected subtree against the pinned
 /// commitment, or a [`SubtreeAuditResponse::Rejected`] if it genuinely cannot
 /// (for a recently gossiped pinned commitment a rejection is a confirmed
-/// failure, since the responder retains its last two gossiped commitments).
+/// failure, since the responder retains its recently gossiped commitments for a
+/// bounded TTL window).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubtreeAuditChallenge {
     /// Unique challenge identifier.
@@ -864,11 +1056,12 @@ pub enum SubtreeAuditResponse {
     ///      the root from the proof, and requires it to equal the commitment
     ///      root (structure).
     ///
-    /// The leaves carry only hashes (`bytes_hash`, `nonced_hash`), so this round
+    /// The leaves carry only hashes (`bytes_hash`, `nonced_root`), so this round
     /// proves the tree SHAPE is committed — not that the bytes are still held.
     /// Real possession is proven in **round 2**: the auditor picks a few of the
-    /// just-verified leaves and sends a [`SubtreeByteChallenge`] requesting their
-    /// original chunk bytes FROM the responder (see that type).
+    /// just-verified leaves and sends a [`SubtreeSliceChallenge`] opening one
+    /// random 1 KiB block of each against both the chunk address and the round-1
+    /// `nonced_root` (see that type).
     Proof {
         /// The challenge this response answers.
         challenge_id: u64,
@@ -923,56 +1116,87 @@ pub enum RejectKind {
     /// timeout lane (holder credit revoked, no trust penalty).
     Transient,
     /// Any other rejection (wrong target peer, no commitment state, malformed
-    /// proof plan, oversized byte challenge, …). CONFIRMED failure.
+    /// proof plan, oversized slice challenge, …). CONFIRMED failure.
     Protocol,
 }
 
-/// Round 2 of the storage audit (ADR-0002): the **surprise byte challenge**.
+/// A single block the round-2 slice challenge opens: which committed key, and
+/// which 1 KiB block within it.
 ///
-/// After the auditor has structurally verified a [`SubtreeAuditResponse::Proof`]
-/// it picks a small sample of that subtree's just-proven leaves with FRESH
-/// randomness (chosen now, after the proof is committed — NOT derived from the
-/// round-1 nonce, so the responder could not have predicted it at proof-build
-/// time) and asks the responder to return the ORIGINAL chunk bytes for exactly
-/// those keys. The auditor then checks each returned chunk against the committed
-/// leaf:
-///   - `BLAKE3(bytes) == leaf.bytes_hash` (the chunk's content address), AND
-///   - `compute_audit_digest(nonce, peer, key, bytes) == leaf.nonced_hash`.
+/// The `block_index` is drawn with FRESH auditor randomness after round 1 (never
+/// nonce-derived), so the responder cannot have prepared only the opened block.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubtreeSliceOpening {
+    /// The committed key whose block is opened.
+    pub key: XorName,
+    /// The 1 KiB block index within the chunk, in `0..block_count(content_len)`.
+    pub block_index: u32,
+}
+
+/// Round 2 of the storage audit (ADR-0002 / V2-685): the **surprise slice
+/// challenge**.
 ///
-/// This makes possession non-delegable to the auditor: the auditor needs to
-/// hold NONE of the responder's chunks. A responder that committed to a chunk it
-/// no longer holds cannot fabricate bytes that hash to the committed address (a
-/// preimage break), so it is caught regardless of who audits it.
+/// After structurally verifying a [`SubtreeAuditResponse::Proof`] the auditor
+/// picks a small sample of the just-proven leaves with FRESH randomness (chosen
+/// now, after the proof is committed — NOT derived from the round-1 nonce) and,
+/// for each, a fresh-random 1 KiB block index. It asks the responder to open
+/// exactly those blocks. For each opened block the responder returns a Bao
+/// verified slice plus a nonced block-tree opening; the auditor checks, over the
+/// same block bytes:
+///   - the Bao slice against `leaf.bytes_hash` (the chunk's content address), AND
+///   - the nonced opening against `leaf.nonced_root` (round-1 possession commit).
+///
+/// The pair binds the opened block to bytes that were held when round 1 was
+/// answered, cheaply: the response is a few KB, not up to two 4 MiB chunks.
+/// Whoever answered round 1 without the bytes cannot have committed a correct
+/// `nonced_root`, and cannot fold an after-the-fact-fetched block to a foreign
+/// root without a preimage break.
+///
+/// What it does NOT bind is *which* party held them. Every input is public, so
+/// a backend holding one copy can answer for any number of front-end
+/// identities; the proof is delegable, and cheaper to delegate than the
+/// full-byte round 2 it replaces, which priced delegation by forcing the chunk
+/// through the relay. ADR-0009 records that as a known gap. Anything in this
+/// tree that reads as "non-delegable" or "a relay blows the deadline" is a
+/// claim about the older design and is superseded there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubtreeByteChallenge {
+pub struct SubtreeSliceChallenge {
     /// The same `challenge_id` as the round-1 [`SubtreeAuditChallenge`], so the
     /// responder/auditor correlate the two rounds.
     pub challenge_id: u64,
-    /// The same nonce as round 1 — needed for the freshness (`nonced_hash`)
-    /// check and to bind these bytes to this audit.
+    /// The same nonce as round 1 — binds each nonced block opening to this audit.
     pub nonce: [u8; 32],
-    /// The challenged peer ID (bound into each leaf's possession hash).
+    /// The challenged peer ID (bound into every nonced block leaf).
     pub challenged_peer_id: [u8; 32],
     /// The pinned commitment hash from round 1, so the responder resolves the
-    /// SAME tree it just proved and serves bytes only for keys it committed to.
+    /// SAME tree it just proved and opens blocks only for keys it committed to.
     pub expected_commitment_hash: [u8; 32],
-    /// The exact keys whose original bytes the responder must return. These are
-    /// the auditor's freshly-randomised spot-check sample of the round-1 subtree
-    /// (chosen after the proof was received; not nonce-derived).
-    pub keys: Vec<XorName>,
+    /// The exact blocks to open: the auditor's freshly-randomised spot-check
+    /// sample of the round-1 subtree (chosen after the proof was received; not
+    /// nonce-derived), up to two blocks per sampled leaf (a fresh-random block
+    /// plus the final block, for the content-length pin).
+    pub openings: Vec<SubtreeSliceOpening>,
 }
 
-/// One requested chunk in a [`SubtreeByteResponse`].
+/// One opened block in a [`SubtreeSliceResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum SubtreeByteItem {
-    /// The responder holds this committed key and returns its original bytes.
+pub enum SubtreeSliceItem {
+    /// The responder holds this committed key and opens the requested block.
     Present {
         /// The requested key.
         key: XorName,
-        /// The original chunk bytes (the auditor re-hashes to verify).
-        bytes: Vec<u8>,
+        /// The 1 KiB block index that was opened.
+        block_index: u32,
+        /// Bao verified slice: the block bytes plus the BLAKE3 parent hashes that
+        /// authenticate them against the chunk address. The auditor decodes this
+        /// to recover the verified block bytes.
+        bao_slice: Vec<u8>,
+        /// Sibling hashes on the path from this block up to the committed
+        /// `nonced_root`, bottom-up. The auditor folds the block leaf with these
+        /// to prove the block was committed under round 1's fresh nonce.
+        nonced_siblings: Vec<[u8; 32]>,
     },
-    /// The responder committed to this key but cannot serve its bytes. This is a
+    /// The responder committed to this key but cannot serve its block. This is a
     /// PROVABLE cheat (it published a commitment over a chunk it does not hold),
     /// so the auditor counts it as a confirmed failure — NOT a graced timeout.
     /// Distinguishing this explicit signal from silence is what separates a
@@ -983,29 +1207,43 @@ pub enum SubtreeByteItem {
     },
 }
 
-/// Response to a [`SubtreeByteChallenge`] (round 2). One item per requested key,
-/// in the requested order.
+/// Response to a [`SubtreeSliceChallenge`] (round 2).
 ///
-/// Sizing rule: a challenge carries at most
-/// [`MAX_BYTE_CHALLENGE_KEYS`](super::config::MAX_BYTE_CHALLENGE_KEYS) keys —
-/// the auditor batches its sample, the responder rejects larger requests — so
-/// the WORST-CASE `Items` response (every chunk at `MAX_CHUNK_SIZE`) always
-/// encodes under [`MAX_REPLICATION_MESSAGE_SIZE`].
+/// The contract is **coalesced and order-independent**: the responder groups the
+/// requested openings by key (reading and hashing each chunk once), so
+/// - a `Present` item is unique per distinct `(key, block_index)`;
+/// - an `Absent` item is at most one per key and covers ALL of that key's
+///   requested openings (it has no `block_index`);
+/// - duplicate requested openings do not multiply work or response items;
+/// - item order is unspecified — the auditor matches by identity, not position.
+///
+/// The auditor rejects a response whose identities collide (a duplicate
+/// `(key, block_index)`, or a key that is both `Present` and `Absent`) as
+/// malformed, so first-match ambiguity cannot decide a verdict.
+///
+/// Each item is a few KB (a 1 KiB block plus O(log n) hashes on two short
+/// chains), so even the worst-case sample fits far under
+/// [`MAX_REPLICATION_MESSAGE_SIZE`] with no batching — the auditor bounds the
+/// sample to [`MAX_SLICE_OPENINGS`](super::config::MAX_SLICE_OPENINGS) and the
+/// responder rejects larger requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SubtreeByteResponse {
-    /// The responder's per-key answers (bytes or an explicit absent signal).
+pub enum SubtreeSliceResponse {
+    /// The responder's per-opening answers (a verified slice or an absent signal).
     Items {
         /// The challenge this response answers.
         challenge_id: u64,
-        /// One entry per requested key.
-        items: Vec<SubtreeByteItem>,
+        /// One item per DISTINCT requested opening, coalesced and
+        /// order-independent (see the type-level contract above): duplicate
+        /// openings do not multiply items, and one `Absent` covers all of a
+        /// key's openings.
+        items: Vec<SubtreeSliceItem>,
     },
     /// Peer is still bootstrapping (should not happen mid-audit, but handled).
     Bootstrapping {
         /// The challenge this response answers.
         challenge_id: u64,
     },
-    /// The responder rejects the byte challenge outright. `kind` drives the
+    /// The responder rejects the slice challenge outright. `kind` drives the
     /// auditor's accounting (ADR-0004 A1: grace removed): [`RejectKind::Transient`]
     /// routes to the timeout lane (no trust penalty, holder credit revoked); every
     /// other kind is a confirmed failure, like round 1.
@@ -1023,11 +1261,27 @@ pub enum SubtreeByteResponse {
 // Audit digest helper
 // ---------------------------------------------------------------------------
 
-/// Compute `AuditKeyDigest(K_i) = BLAKE3(nonce || challenged_peer_id || K_i || record_bytes_i)`.
+/// Domain-separation context for the audit digest key derivation.
 ///
-/// Returns the 32-byte BLAKE3 digest binding the nonce, peer identity, key,
-/// and record content together so a peer cannot forge proofs without holding
-/// the actual data.
+/// Versioned alongside the possession-audit protocol id so no other BLAKE3 use
+/// in this codebase, and no future revision of this digest, can derive a
+/// colliding key from the same challenge material.
+pub const AUDIT_DIGEST_KEY_CONTEXT: &str =
+    "autonomi.ant.replication.possession-audit.v2.digest-key";
+
+/// Compute the possession digest for one challenged key.
+///
+/// `BLAKE3_keyed(BLAKE3_derive_key(ctx, nonce || challenged_peer_id || K_i), record_bytes_i)`,
+/// with `ctx` the versioned [`AUDIT_DIGEST_KEY_CONTEXT`]. Returns the 32-byte
+/// digest binding the nonce, peer identity, key, and record content together so
+/// a peer cannot produce it without holding the actual data.
+///
+/// The challenge material enters as the BLAKE3 *key*, not as an input prefix.
+/// In keyed mode the key replaces the IV of every block's compression, so the
+/// whole digest depends on the fresh per-audit nonce rather than only its
+/// leading bytes. This matches the construction the subtree audit already uses
+/// for its per-leaf commitments, so every audit lane binds the nonce the same
+/// way.
 #[must_use]
 pub fn compute_audit_digest(
     nonce: &[u8; 32],
@@ -1035,12 +1289,57 @@ pub fn compute_audit_digest(
     key: &XorName,
     record_bytes: &[u8],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(nonce);
-    hasher.update(challenged_peer_id);
-    hasher.update(key);
-    hasher.update(record_bytes);
-    *hasher.finalize().as_bytes()
+    let mut key_hasher = blake3::Hasher::new_derive_key(AUDIT_DIGEST_KEY_CONTEXT);
+    key_hasher.update(nonce);
+    key_hasher.update(challenged_peer_id);
+    key_hasher.update(key);
+    let digest_key = *key_hasher.finalize().as_bytes();
+    *blake3::keyed_hash(&digest_key, record_bytes).as_bytes()
+}
+
+/// Which construction a possession digest is built with.
+///
+/// Two exist only during the upgrade window. A peer verifies a digest with the
+/// construction its own binary knows, so the responder has to answer in the
+/// asker's dialect or the answer reads as a mismatch — which is a confirmed
+/// failure, strictly worse for the honest responder than silence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditDigestVersion {
+    /// The construction on the previous release: a plain BLAKE3 over
+    /// `nonce || peer || key || bytes`. Answered only to a challenge that
+    /// arrived on the core protocol id, which is where a peer that has not
+    /// upgraded still sends them.
+    Legacy,
+    /// This release: a domain-separated key derived from
+    /// `nonce || peer || key`, then a keyed hash over the content.
+    Keyed,
+}
+
+/// The digest a given peer will verify against.
+///
+/// [`compute_audit_digest`] is the construction this node uses everywhere it
+/// asks; this is only for answering, where the asker picks the dialect.
+#[must_use]
+pub fn compute_audit_digest_as(
+    version: AuditDigestVersion,
+    nonce: &[u8; 32],
+    challenged_peer_id: &[u8; 32],
+    key: &XorName,
+    record_bytes: &[u8],
+) -> [u8; 32] {
+    match version {
+        AuditDigestVersion::Keyed => {
+            compute_audit_digest(nonce, challenged_peer_id, key, record_bytes)
+        }
+        AuditDigestVersion::Legacy => {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(nonce);
+            hasher.update(challenged_peer_id);
+            hasher.update(key);
+            hasher.update(record_bytes);
+            *hasher.finalize().as_bytes()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,7 +1429,7 @@ mod tests {
         for (kind, kind_index) in [
             (AuditDropKind::Responsible, 0usize),
             (AuditDropKind::Subtree, 1usize),
-            (AuditDropKind::Byte, 2usize),
+            (AuditDropKind::Slice, 2usize),
         ] {
             let before = AUDIT_DROPPED[kind_index].load(Ordering::Relaxed);
             record_audit_drop(kind);
@@ -1141,31 +1440,335 @@ mod tests {
         }
     }
 
-    // === Round-2 byte response sizing ===
+    // === Round-2 slice response sizing ===
 
     #[test]
-    fn max_batch_worst_case_byte_response_fits_wire_cap() {
-        // The auditor batches its round-2 sample to MAX_BYTE_CHALLENGE_KEYS per
-        // challenge precisely so this worst case — every requested chunk at
-        // MAX_CHUNK_SIZE — still encodes. If this fails, honest responders
-        // would hit encode errors and fail otherwise valid byte challenges.
-        let items: Vec<SubtreeByteItem> = (0..crate::replication::config::MAX_BYTE_CHALLENGE_KEYS)
-            .map(|i| SubtreeByteItem::Present {
+    fn max_slice_response_is_tiny_relative_to_wire_cap() {
+        // A worst-case round-2 slice response is MAX_SLICE_OPENINGS openings, each
+        // a 1 KiB block plus a Bao proof and a nonced sibling chain. For a 4 MiB
+        // chunk that is ~4096 BLAKE3 chunks → ~12 parent hashes per chain. We
+        // overestimate generously (16 KiB slice + 24 sibling hashes per opening)
+        // and assert it encodes far under the wire cap — the whole point of the
+        // change is that round 2 is now KB-scale, not up to 8 MiB.
+        let items: Vec<SubtreeSliceItem> = (0..crate::replication::config::MAX_SLICE_OPENINGS)
+            .map(|i| SubtreeSliceItem::Present {
                 key: [u8::try_from(i).unwrap_or(u8::MAX); 32],
-                bytes: vec![0xAB; crate::ant_protocol::MAX_CHUNK_SIZE],
+                block_index: u32::try_from(i).unwrap_or(u32::MAX),
+                bao_slice: vec![0xAB; 16 * 1024],
+                nonced_siblings: vec![[0x5A; 32]; 24],
             })
             .collect();
         let msg = ReplicationMessage {
             request_id: 7,
-            body: ReplicationMessageBody::SubtreeByteResponse(SubtreeByteResponse::Items {
+            body: ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Items {
                 challenge_id: 7,
                 items,
             }),
         };
         let encoded = msg
             .encode()
-            .expect("worst-case max-batch byte response must fit the wire cap");
+            .expect("worst-case slice response must fit the wire cap");
+        // Comfortably under 1 MiB, itself a fraction of the 10 MiB wire cap.
+        assert!(encoded.len() <= 1024 * 1024);
         assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
+        assert!(
+            encoded.len() <= crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            "round 2 must fit the tighter audit-family ceiling"
+        );
+    }
+
+    // The audit families take a much tighter wire ceiling than the 10 MiB core
+    // one, checked before decoding so an unknown peer cannot make this node
+    // allocate megabytes before any admission check has run. That ceiling is
+    // only safe if it clears the largest body an honest audit can produce, which
+    // is the round-1 proof at the commitment key-count cap: 1,024 leaves plus
+    // the sibling cut hashes and the signed commitment. Build that worst case
+    // and pin the headroom, so a later change to leaf size or commitment
+    // encoding cannot quietly start dropping honest proofs.
+    #[test]
+    fn max_round1_proof_fits_the_audit_family_ceiling() {
+        use crate::replication::commitment::{StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
+        use crate::replication::config::MAX_AUDIT_MESSAGE_SIZE;
+        use crate::replication::subtree::{max_subtree_leaves, SubtreeLeaf, SubtreeProof};
+
+        let leaf_count = max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT) as usize;
+        let leaves: Vec<SubtreeLeaf> = (0..leaf_count)
+            .map(|_| SubtreeLeaf {
+                key: [0xAB; 32],
+                bytes_hash: [0xCD; 32],
+                content_len: u32::MAX,
+                nonced_root: [0xEF; 32],
+            })
+            .collect();
+        let msg = ReplicationMessage {
+            request_id: 11,
+            body: ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Proof {
+                challenge_id: 11,
+                commitment: StorageCommitment {
+                    root: [0x01; 32],
+                    key_count: MAX_COMMITMENT_KEY_COUNT,
+                    sender_peer_id: [0x02; 32],
+                    // Over-sized stand-ins for the ML-DSA-65 key and signature.
+                    sender_public_key: vec![0x03; 4096],
+                    signature: vec![0x04; 8192],
+                },
+                proof: SubtreeProof {
+                    leaves,
+                    // One per level down to the subtree root; 32 is far past the
+                    // real depth at this key count.
+                    sibling_cut_hashes: vec![[0x05; 32]; 32],
+                },
+            }),
+        };
+        let encoded = msg
+            .encode()
+            .expect("worst-case round-1 proof must fit the wire cap");
+        assert!(
+            encoded.len() <= MAX_AUDIT_MESSAGE_SIZE,
+            "worst legitimate round-1 proof is {} bytes, over the audit ceiling of \
+             {MAX_AUDIT_MESSAGE_SIZE}",
+            encoded.len()
+        );
+    }
+
+    /// Every body variant, in declaration order, so a test can walk the whole
+    /// enum rather than a hand-picked sample.
+    fn all_bodies() -> Vec<ReplicationMessageBody> {
+        let z = [0u8; 32];
+        vec![
+            ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                key: z,
+                data: vec![],
+                proof_of_payment: vec![],
+            }),
+            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Accepted {
+                key: z,
+            }),
+            ReplicationMessageBody::PaidNotify(PaidNotify {
+                key: z,
+                proof_of_payment: vec![],
+            }),
+            ReplicationMessageBody::NeighborSyncRequest(NeighborSyncRequest {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                commitment: None,
+            }),
+            ReplicationMessageBody::NeighborSyncResponse(NeighborSyncResponse {
+                replica_hints: vec![],
+                paid_hints: vec![],
+                bootstrapping: false,
+                rejected_keys: vec![],
+                commitment: None,
+            }),
+            ReplicationMessageBody::VerificationRequest(VerificationRequest {
+                keys: vec![],
+                paid_list_check_indices: vec![],
+            }),
+            ReplicationMessageBody::VerificationResponse(VerificationResponse { results: vec![] }),
+            ReplicationMessageBody::FetchRequest(FetchRequest { key: z }),
+            ReplicationMessageBody::FetchResponse(FetchResponse::NotFound { key: z }),
+            ReplicationMessageBody::AuditChallenge(AuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                keys: vec![],
+            }),
+            ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![],
+            }),
+            ReplicationMessageBody::SubtreeAuditChallenge(SubtreeAuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+            }),
+            ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+                openings: vec![],
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::GetCommitmentByPin(GetCommitmentByPin { pin: z }),
+            ReplicationMessageBody::GetCommitmentByPinResponse(
+                GetCommitmentByPinResponse::NotRetained { pin: z },
+            ),
+        ]
+    }
+
+    // The pre-decode ceiling reads the body's discriminant straight off the
+    // wire, so `peek_variant_index` MUST agree with `variant_index()` for every
+    // variant, at request ids that straddle postcard's varint width boundaries.
+    // If it ever disagreed, a body would be sized against the wrong family's
+    // ceiling — which is the bug this whole path exists to prevent.
+    #[test]
+    fn peeked_discriminant_matches_the_decoded_one_for_every_variant() {
+        // 1-byte, 2-byte, 5-byte and 10-byte `request_id` varints.
+        for request_id in [0u64, 1, 127, 128, 300, u64::from(u32::MAX), u64::MAX] {
+            for body in all_bodies() {
+                let expected = body.variant_index();
+                let encoded = ReplicationMessage { request_id, body }
+                    .encode()
+                    .expect("encode");
+                assert_eq!(
+                    peek_variant_index(&encoded),
+                    Some(expected),
+                    "peek disagreed with variant_index at request_id {request_id}"
+                );
+            }
+        }
+    }
+
+    // A truncated or nonsense prefix must not classify as `Core`, because Core
+    // is the LENIENT ceiling. Failing to classify has to mean "apply the strict
+    // one", never "let it through".
+    #[test]
+    fn unclassifiable_prefix_yields_no_family() {
+        assert_eq!(peek_variant_index(&[]), None);
+        // A varint that never terminates: all continuation bits set.
+        assert_eq!(peek_variant_index(&[0xFF; 32]), None);
+        // A well-formed request_id with nothing after it.
+        assert_eq!(peek_variant_index(&[0x01]), None);
+        // Ten-byte u64 varints have only one payload bit in the final byte.
+        // Reject overflow in either prefix field instead of letting the shift
+        // discard high bits and classify attacker-controlled trailing bytes.
+        let mut overflowing_request_id = vec![0x80; 9];
+        overflowing_request_id.extend([0x02, 0x0B]);
+        assert_eq!(peek_variant_index(&overflowing_request_id), None);
+
+        let mut overflowing_discriminant = vec![0x01];
+        overflowing_discriminant.extend([0x80; 9]);
+        overflowing_discriminant.push(0x02);
+        assert_eq!(peek_variant_index(&overflowing_discriminant), None);
+    }
+
+    // Regression (dirvine, PR #181): the pre-decode ceiling used to be chosen
+    // from the protocol id the message arrived on, so an audit body addressed to
+    // the CORE id skipped the audit ceiling and was decoded under the 10 MiB core
+    // allowance — its collections allocated — before the family guard dropped it.
+    //
+    // The reproduction from that review: a valid `SubtreeSliceChallenge` with
+    // 200,000 openings encodes to ~6.6 MB, far past the 512 KiB audit ceiling.
+    // Classifying by discriminant catches it wherever it is addressed.
+    #[test]
+    fn oversized_audit_body_is_classified_as_audit_wherever_it_is_addressed() {
+        let z = [0u8; 32];
+        let challenge = SubtreeSliceChallenge {
+            challenge_id: 1,
+            nonce: z,
+            challenged_peer_id: z,
+            expected_commitment_hash: z,
+            openings: (0..200_000u32)
+                .map(|i| SubtreeSliceOpening {
+                    key: z,
+                    block_index: i,
+                })
+                .collect(),
+        };
+        let encoded = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::SubtreeSliceChallenge(challenge),
+        }
+        .encode()
+        .expect("encode");
+
+        assert!(
+            encoded.len() > crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            "the reproduction must exceed the audit ceiling to be meaningful; got {} bytes",
+            encoded.len()
+        );
+        // The classification the receive path performs, before any decode.
+        let family = peek_variant_index(&encoded).map(family_of_variant);
+        assert_eq!(family, Some(BodyFamily::SubtreeAudit));
+        assert!(
+            family.map_or(true, BodyFamily::is_audit),
+            "an audit body must take the audit ceiling regardless of the id it rode"
+        );
+    }
+
+    // The family table is the single source of truth: the `&self` predicates,
+    // the response routing and the pre-decode ceiling all read it, so they
+    // cannot drift. Walk every variant and check both views agree.
+    #[test]
+    fn family_table_agrees_with_the_body_predicates() {
+        for body in all_bodies() {
+            let family = family_of_variant(body.variant_index());
+            assert_eq!(body.is_subtree_audit(), family == BodyFamily::SubtreeAudit);
+            assert_eq!(
+                body.is_possession_audit(),
+                family == BodyFamily::PossessionAudit
+            );
+            assert_eq!(
+                family.is_audit(),
+                body.is_subtree_audit() || body.is_possession_audit()
+            );
+        }
+    }
+
+    // `is_subtree_audit()` classifies exactly the four subtree-audit variants
+    // (both rounds), and NOTHING else — crucially not the digest-based
+    // `AuditChallenge`/`AuditResponse` pair, which rides its own
+    // `POSSESSION_AUDIT_PROTOCOL_ID` via `is_possession_audit()`. The receive
+    // guard and the response-routing both key off this one predicate, so it
+    // must be exact: a body that answers `true` here is required to arrive on
+    // the subtree id, and is dropped on any other.
+    #[test]
+    fn is_subtree_audit_covers_both_rounds_only() {
+        let z = [0u8; 32];
+        let audit = [
+            ReplicationMessageBody::SubtreeAuditChallenge(SubtreeAuditChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+            }),
+            ReplicationMessageBody::SubtreeAuditResponse(SubtreeAuditResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+            ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+                openings: vec![],
+            }),
+            ReplicationMessageBody::SubtreeSliceResponse(SubtreeSliceResponse::Bootstrapping {
+                challenge_id: 1,
+            }),
+        ];
+        for body in &audit {
+            assert!(
+                body.is_subtree_audit(),
+                "variant {} must be subtree-audit",
+                body.variant_index()
+            );
+        }
+        let core = [
+            ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+                key: z,
+                data: vec![],
+                proof_of_payment: vec![],
+            }),
+            // Periodic possession audit — NOT the subtree audit. It rides the
+            // possession id, not the core one; what matters here is only that
+            // `is_subtree_audit()` does not claim it.
+            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 }),
+        ];
+        for body in &core {
+            assert!(
+                !body.is_subtree_audit(),
+                "variant {} must be core, not subtree-audit",
+                body.variant_index()
+            );
+        }
     }
 
     // === Fresh Replication roundtrip ===
@@ -1657,6 +2260,137 @@ mod tests {
         );
     }
 
+    // A challenge is a few hundred bytes; without the tighter ceiling the reply
+    // to it could cost the auditor up to the full core allowance in allocation
+    // and decode. The gap between the two ceilings is exactly what an audited
+    // peer could spend the auditor's memory on, so pin that it is refused as an
+    // audit reply while still being a legal core message.
+    #[test]
+    fn an_audit_reply_above_the_audit_ceiling_is_refused_before_decode() {
+        let between_the_ceilings = vec![0u8; MAX_AUDIT_MESSAGE_SIZE + 1];
+        assert!(between_the_ceilings.len() < MAX_REPLICATION_MESSAGE_SIZE);
+
+        let err = ReplicationMessage::decode_audit_response(&between_the_ceilings)
+            .expect_err("an audit reply over the audit ceiling must not be decoded");
+        assert!(
+            matches!(
+                err,
+                ReplicationProtocolError::MessageTooLarge { max_size, .. }
+                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+            ),
+            "expected the audit ceiling to be the one reported, got {err:?}"
+        );
+    }
+
+    // The ceiling lives in `decode` itself, so it cannot be skipped by reaching
+    // a decode site that forgot to ask. A core lane that gets answered with an
+    // audit-discriminant body still gets the audit ceiling, even though the same
+    // lane may legitimately receive a whole chunk when the body is a core one.
+    #[test]
+    fn the_family_ceiling_is_enforced_by_decode_itself() {
+        let mut oversized_audit_body = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: [0u8; 32],
+                challenged_peer_id: [0u8; 32],
+                expected_commitment_hash: [0u8; 32],
+                openings: vec![],
+            }),
+        }
+        .encode()
+        .expect("a small audit body encodes");
+        // Postcard ignores trailing bytes, so padding keeps this a decodable
+        // audit body while pushing it between the two ceilings.
+        oversized_audit_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        assert!(oversized_audit_body.len() < MAX_REPLICATION_MESSAGE_SIZE);
+
+        let err = ReplicationMessage::decode(&oversized_audit_body)
+            .expect_err("an audit-family body over the audit ceiling must not be decoded");
+        assert!(
+            matches!(
+                err,
+                ReplicationProtocolError::MessageTooLarge { max_size, .. }
+                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+            ),
+            "the audit ceiling must be the one applied, got {err:?}"
+        );
+
+        // A core body of the same size is still fine: that is the allowance a
+        // fetched chunk needs.
+        let mut core_body = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::FetchRequest(FetchRequest { key: [0u8; 32] }),
+        }
+        .encode()
+        .expect("a small core body encodes");
+        core_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        assert!(
+            ReplicationMessage::decode(&core_body).is_ok(),
+            "a core body must keep the core allowance"
+        );
+    }
+
+    // Regression (dirvine, PR #181): the reviewed reproduction, verbatim. A
+    // solicited reply is delivered straight to the `send_request` caller, so it
+    // never passes the receive path's guard; every audit lane decoded it under
+    // the core allowance. A challenged peer could answer a few-hundred-byte
+    // challenge with a *valid* `AuditResponse::Digests` carrying 200,000
+    // digests, and have all 6.4 MB allocated before the lane looked at the
+    // count. Prune confirmation can have up to 32 of these in flight.
+    //
+    // FLIPS IF: the family ceiling stops applying to replies.
+    #[test]
+    fn an_oversized_digest_reply_is_refused_before_its_collection_is_allocated() {
+        let encoded = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![[0xAB; 32]; 200_000],
+            }),
+        }
+        .encode()
+        .expect("the reproduction must be a legal core-sized message to be interesting");
+
+        assert!(
+            encoded.len() > MAX_AUDIT_MESSAGE_SIZE,
+            "reproduction must exceed the audit ceiling"
+        );
+        assert!(
+            encoded.len() < MAX_REPLICATION_MESSAGE_SIZE,
+            "and sit under the core one, which is what let it through"
+        );
+
+        // Refused by the lane's own decoder...
+        assert!(
+            ReplicationMessage::decode_audit_response(&encoded).is_err(),
+            "an audit lane must not decode an oversized reply"
+        );
+        // ...and by the general decoder, since the body's family says audit.
+        // Both, so neither is load-bearing alone.
+        assert!(
+            ReplicationMessage::decode(&encoded).is_err(),
+            "and the family ceiling must catch it even without lane context"
+        );
+    }
+
+    // The tighter ceiling must not clip a legitimate reply. Round 1's `Proof` is
+    // the largest audit body there is, and `MAX_AUDIT_MESSAGE_SIZE` is sized
+    // against it; this checks the auditor accepts what a responder may send.
+    #[test]
+    fn a_legitimate_audit_reply_still_decodes_under_the_audit_ceiling() {
+        let msg = ReplicationMessage {
+            request_id: 7,
+            body: ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
+                challenge_id: 42,
+            }),
+        };
+        let encoded = msg.encode().expect("encode should succeed");
+        let decoded = ReplicationMessage::decode_audit_response(&encoded)
+            .expect("a small audit reply must decode");
+        assert_eq!(decoded.request_id, 7);
+    }
+
     #[test]
     fn encode_rejects_oversized_message() {
         // Build a message whose serialized form exceeds the limit.
@@ -1692,6 +2426,90 @@ mod tests {
     }
 
     // === Audit digest computation ===
+
+    #[test]
+    fn audit_digest_is_the_domain_separated_keyed_construction() {
+        // Pin the exact KEYED construction: the challenge material enters as the
+        // BLAKE3 key (via `derive_key`, mixed into every block's compression),
+        // never as an input prefix. A regression to a flat
+        // `BLAKE3(nonce || peer || key || bytes)` produces a different digest and
+        // fails this exact-equality check. The context comes from the single
+        // source of truth so the test cannot drift from the implementation.
+        // A multi-block record exercises the key mixing past the first block.
+        let nonce = [0x01; 32];
+        let peer_id = [0x02; 32];
+        let key: XorName = [0x03; 32];
+        let record_bytes = vec![0x5A; 8 * 1024];
+
+        let mut key_hasher = blake3::Hasher::new_derive_key(AUDIT_DIGEST_KEY_CONTEXT);
+        key_hasher.update(&nonce);
+        key_hasher.update(&peer_id);
+        key_hasher.update(&key);
+        let digest_key = *key_hasher.finalize().as_bytes();
+        let expected = *blake3::keyed_hash(&digest_key, &record_bytes).as_bytes();
+
+        assert_eq!(
+            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
+            expected,
+            "digest must be BLAKE3_keyed(derive_key(ctx, nonce||peer||key), bytes)"
+        );
+
+        // And it must NOT be the superseded flat prefix hash.
+        let mut flat = blake3::Hasher::new();
+        flat.update(&nonce);
+        flat.update(&peer_id);
+        flat.update(&key);
+        flat.update(&record_bytes);
+        assert_ne!(
+            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
+            *flat.finalize().as_bytes(),
+            "keyed digest must differ from the flat prefix construction"
+        );
+    }
+
+    // The legacy dialect is not ours to choose: it is what a peer on the
+    // previous release computes and compares against. Pin it to that exact
+    // construction, because a drift here is invisible locally and shows up in
+    // the field as honest upgraded nodes failing old peers' audits.
+    #[test]
+    fn the_legacy_dialect_is_the_previous_release_construction() {
+        let nonce = [0x11; 32];
+        let peer_id = [0x22; 32];
+        let key: XorName = [0x33; 32];
+        let record_bytes = vec![0xA5; 8 * 1024];
+
+        let mut flat = blake3::Hasher::new();
+        flat.update(&nonce);
+        flat.update(&peer_id);
+        flat.update(&key);
+        flat.update(&record_bytes);
+
+        assert_eq!(
+            compute_audit_digest_as(
+                AuditDigestVersion::Legacy,
+                &nonce,
+                &peer_id,
+                &key,
+                &record_bytes
+            ),
+            *flat.finalize().as_bytes(),
+            "the legacy dialect must stay BLAKE3(nonce || peer || key || bytes)"
+        );
+
+        // And the keyed selector must still be this release's construction, so
+        // the two cannot be swapped by a careless edit.
+        assert_eq!(
+            compute_audit_digest_as(
+                AuditDigestVersion::Keyed,
+                &nonce,
+                &peer_id,
+                &key,
+                &record_bytes
+            ),
+            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
+            "the keyed dialect must be the construction this release asks in"
+        );
+    }
 
     #[test]
     fn audit_digest_is_deterministic() {

@@ -29,6 +29,7 @@ pub mod pruning;
 pub mod quorum;
 pub mod recent_provers;
 pub mod scheduling;
+pub mod slice;
 pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
@@ -62,13 +63,17 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, REPLICATION_PROTOCOL_ID,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig,
+    GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_AUDIT_MESSAGE_SIZE, MAX_AUDIT_RESPONSES_PER_PEER,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, MAX_SUBTREE_ROUND1_PER_PEER,
+    MAX_SUBTREE_SESSIONS, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
+    SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
+    SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
-    FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
-    VerificationResponse,
+    AuditDigestVersion, FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage,
+    ReplicationMessageBody, VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
@@ -948,6 +953,122 @@ impl FirstAuditScheduler {
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
 
+/// Match an inbound topic against the replication protocol ids, in both the bare
+/// gossip form and the `/rr/<id>` request-response form.
+///
+/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`],
+/// [`SUBTREE_AUDIT_PROTOCOL_ID`] or [`POSSESSION_AUDIT_PROTOCOL_ID`]) and
+/// whether it was the RR form. The matched id is carried into the handler so it
+/// can enforce that each message family only arrives on its own id.
+fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
+    for id in [
+        REPLICATION_PROTOCOL_ID,
+        SUBTREE_AUDIT_PROTOCOL_ID,
+        POSSESSION_AUDIT_PROTOCOL_ID,
+    ] {
+        if topic == id {
+            return Some((id, false));
+        }
+        if let Some(rest) = topic.strip_prefix(RR_PREFIX) {
+            if rest == id {
+                return Some((id, true));
+            }
+        }
+    }
+    None
+}
+
+/// Whether a decoded body belongs on the protocol id it arrived on:
+/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], possession-audit
+/// bodies on [`POSSESSION_AUDIT_PROTOCOL_ID`], every other body on
+/// [`REPLICATION_PROTOCOL_ID`].
+///
+/// The receive guard drops any mismatch (a cross-version or misrouted message);
+/// sharing this one predicate between the guard and its regression test means a
+/// change to the rule cannot pass the test unnoticed.
+fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
+    protocol == response_protocol_for(body) || is_legacy_possession_challenge(body, protocol)
+}
+
+/// A possession challenge from a peer that predates the family split, arriving
+/// on the core id.
+///
+/// ROLLOUT — paired with [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] and removed with
+/// it. That gate softens what THIS node concludes about a silent peer, which is
+/// only half the window: the other half is what an un-upgraded peer concludes
+/// about this one. Its binary sends responsible-chunk and prune-confirmation
+/// challenges on the core id, has no dedicated possession id to try, and turns
+/// the resulting timeout straight into an audit-severity failure. Dropping
+/// those challenges would therefore have every not-yet-upgraded neighbour
+/// penalise an upgraded node at confirmed-failure weight for the whole window,
+/// which is the release punishing the nodes that took it — and no constant in
+/// this binary can reach the auditor to stop it.
+///
+/// So they are answered, on the id they arrived on and in the digest
+/// construction that peer verifies with. The two possession messages are
+/// byte-identical to the previous release, so nothing is being reinterpreted;
+/// only the digest construction moved, and the responder picks it from the
+/// asker. Challenges only: this node always sends its own on the dedicated id,
+/// so a *response* on the core id is never one it asked for and stays refused.
+///
+/// What this costs, stated exactly, because it is a weakening and not only a
+/// shim. The legacy construction is the flat prefix hash this release replaced
+/// precisely because it is preprocessing-weak: a responder can keep BLAKE3
+/// chaining state instead of the record and still match. So an upgraded node
+/// answering an old auditor is no stronger than an old node answering it, which
+/// matters most in the prune lane, where a matching digest counts toward a
+/// quorum authorising deletion.
+///
+/// The bound is that this never goes below what is deployed today, and cannot be
+/// steered. The dialect is chosen by the ASKER, while the party that gains from
+/// the weak construction is the RESPONDER, so a malicious holder cannot elect to
+/// be asked weakly. Only a peer whose own binary already accepts nothing
+/// stronger asks that way — every lane on this release asks on the dedicated id,
+/// pinned by `every_digest_lane_asks_on_the_dedicated_id` — so the exposure is
+/// exactly the one that peer already has to every un-upgraded node it audits,
+/// and it ends when the gate does.
+fn is_legacy_possession_challenge(body: &ReplicationMessageBody, protocol: &str) -> bool {
+    GRACE_POSSESSION_AUDIT_TIMEOUTS
+        && protocol == REPLICATION_PROTOCOL_ID
+        && matches!(body, ReplicationMessageBody::AuditChallenge(_))
+}
+
+/// The digest construction to answer a possession challenge in, and the id to
+/// answer it on, given where it arrived.
+///
+/// The dedicated id exists only on this release, so a challenge there is from a
+/// peer that shares this construction. Anything else is the legacy dialect, and
+/// [`is_legacy_possession_challenge`] has already refused the bodies that must
+/// not reach here.
+fn possession_reply_dialect(inbound_protocol: &str) -> (AuditDigestVersion, &'static str) {
+    if inbound_protocol == POSSESSION_AUDIT_PROTOCOL_ID {
+        (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID)
+    } else {
+        (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID)
+    }
+}
+
+/// The protocol id a body belongs on — the single source of truth for BOTH
+/// directions: the receive guard ([`body_matches_protocol`]) and the outbound
+/// response selector in `send_replication_response_checked`.
+///
+/// Sharing one function is what makes the family isolation symmetric. It also
+/// removes a dependency on transport behaviour: saorsa-core correlates an RR
+/// response by `(peer, msg_id)` rather than by protocol name, so a possession
+/// `AuditResponse` sent on the core id would still reach an auditor waiting on
+/// the possession id — but a bare (non-RR) response sent that way is dropped by
+/// the peer's own guard, and correlation is a detail this layer should not rely
+/// on.
+fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
+    if body.is_subtree_audit() {
+        SUBTREE_AUDIT_PROTOCOL_ID
+    } else if body.is_possession_audit() {
+        POSSESSION_AUDIT_PROTOCOL_ID
+    } else {
+        REPLICATION_PROTOCOL_ID
+    }
+}
+
 fn fresh_offer_payment_context() -> VerificationContext {
     VerificationContext::FreshReplication
 }
@@ -1250,8 +1371,10 @@ pub struct ReplicationEngine {
     /// Limits concurrent outbound replication sends to prevent bandwidth
     /// saturation on home broadband connections.
     send_semaphore: Arc<Semaphore>,
-    /// Bounds concurrent IN-FLIGHT audit-responder tasks (subtree round 1 +
-    /// byte round 2). Those are spawned off the serial message loop so disk
+    /// Bounds concurrent IN-FLIGHT LIGHT audit-responder tasks (responsible-chunk
+    /// audits + subtree slice round 2). The heavy subtree round 1 has its own
+    /// tighter pool ([`SubtreeRound1Limiter`]). Those are spawned off the serial
+    /// message loop so disk
     /// reads don't block replication; the semaphore restores a global
     /// backpressure ceiling so the node can't fan out unbounded `get_raw` reads
     /// / multi-MiB byte serves.
@@ -1264,6 +1387,11 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Resource controls for the HEAVY subtree-audit round 1: its own
+    /// tight admission pool (so a burst of full-subtree hashing can't starve the
+    /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
+    /// sessions binding a slice challenge to a matching round 1.
+    subtree_round1: SubtreeRound1Limiter,
     /// Receiver for fresh-write events from the chunk PUT handler.
     ///
     /// When present, `start()` spawns a drainer task that calls
@@ -1360,6 +1488,10 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            subtree_round1: SubtreeRound1Limiter::new(
+                config.subtree_round1_responder_cooldown,
+                config.subtree_round1_max_concurrent,
+            ),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -1697,8 +1829,9 @@ impl ReplicationEngine {
     /// Drains scheduled possession-check events and, for each, waits a
     /// randomised 5-15 minute settle delay before probing every responsible
     /// peer for actual possession. A peer that cryptographically fails to prove
-    /// possession, including by timeout, is penalised at `AuditChallenge`
-    /// severity.
+    /// possession is penalised at `AuditChallenge` severity. A peer that simply
+    /// does not answer normally is too, but that is suspended for the
+    /// possession-audit protocol rollout — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`.
     fn start_possession_check_scheduler(&mut self) {
         let Some(mut rx) = self.possession_check_rx.take() else {
             return;
@@ -2023,6 +2156,7 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let subtree_round1 = self.subtree_round1.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
         // commitment can spawn a probabilistic, cooldown-gated subtree audit.
@@ -2047,24 +2181,28 @@ impl ReplicationEngine {
                             data,
                             ..
                         } = event {
-                            // Determine if this is a replication message
-                            // and whether it arrived via the /rr/ request-response
-                            // path (which wraps payloads in RequestResponseEnvelope).
-                            let rr_info = if topic == REPLICATION_PROTOCOL_ID {
-                                Some((data.clone(), None))
-                            } else if topic.starts_with(RR_PREFIX)
-                                && &topic[RR_PREFIX.len()..] == REPLICATION_PROTOCOL_ID
-                            {
-                                P2PNode::parse_request_envelope(&data)
-                                    .filter(|(_, is_resp, _)| !is_resp)
-                                    .map(|(msg_id, _, payload)| (payload, Some(msg_id)))
-                            } else {
-                                None
-                            };
-                            if let Some((payload, rr_message_id)) = rr_info {
+                            // Determine which replication protocol this message
+                            // rode (core or subtree-audit) and whether it arrived
+                            // via the /rr/ request-response path (which wraps
+                            // payloads in a RequestResponseEnvelope).
+                            let rr_info = match_replication_protocol(&topic).and_then(
+                                |(matched_id, is_rr)| {
+                                    if is_rr {
+                                        P2PNode::parse_request_envelope(&data)
+                                            .filter(|(_, is_resp, _)| !is_resp)
+                                            .map(|(msg_id, _, payload)| {
+                                                (matched_id, payload, Some(msg_id))
+                                            })
+                                    } else {
+                                        Some((matched_id, data.clone(), None))
+                                    }
+                                },
+                            );
+                            if let Some((matched_id, payload, rr_message_id)) = rr_info {
                                 match handle_replication_message(
                                     &source,
                                     &payload,
+                                    matched_id,
                                     &p2p,
                                     &storage,
                                     &paid_list,
@@ -2083,6 +2221,7 @@ impl ReplicationEngine {
                                     &gossip_audit,
                                     &audit_responder_semaphore,
                                     &audit_responder_inflight,
+                                    &subtree_round1,
                                     rr_message_id.as_deref(),
                                 ).await {
                                     Ok(()) => {}
@@ -3013,6 +3152,288 @@ impl Drop for AuditResponderGuard {
     }
 }
 
+/// A live round-1 → round-2 subtree-audit session: proof of a matching round 1.
+struct SubtreeSession {
+    commitment_hash: [u8; 32],
+    nonce: [u8; 32],
+    inserted: Instant,
+}
+
+/// Responder-wide token bucket over the chunk bytes round-1 proof building may
+/// read and hash, refilled continuously at
+/// [`SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC`] up to
+/// [`SUBTREE_ROUND1_WORK_BURST_BYTES`].
+///
+/// Deliberately keyed by nothing. The per-peer cooldown limits how often one
+/// identity may ask, so it is refilled by acquiring more identities; this is
+/// charged for work done regardless of who asked, so it is not.
+///
+/// Charged after the fact, with the bytes the proof actually covered: the cost
+/// of a request is not known until the pinned commitment has been resolved and
+/// its subtree selected, both of which happen inside the handler. Admission
+/// therefore asks only whether the balance is positive, and a proof that costs
+/// more than is left drives the balance NEGATIVE rather than stopping at zero.
+/// Carrying the debt is what makes the bound real: without it a maximal proof
+/// would cost the same as a trivial one, since either way the next request only
+/// has to wait for the balance to climb back above zero. With it, sustained
+/// throughput settles at refill ÷ cost-per-proof, so expensive proofs are
+/// admitted proportionally less often.
+struct Round1WorkBudget {
+    /// Signed, so an over-large proof leaves debt to work off.
+    balance: i64,
+    last_refill: Instant,
+}
+
+impl Round1WorkBudget {
+    /// Deepest debt carried, so one huge proof cannot lock out honest audits
+    /// for longer than the burst takes to refill.
+    const MAX_DEBT: i64 = -SUBTREE_ROUND1_WORK_BURST_BYTES;
+    /// Nanoseconds per second, for the sub-second part of a refill.
+    const NANOS_PER_SEC: i64 = 1_000_000_000;
+
+    fn new() -> Self {
+        Self {
+            balance: SUBTREE_ROUND1_WORK_BURST_BYTES,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Add the tokens accrued since the last touch, capped at the burst size.
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        let whole_secs = i64::try_from(elapsed.as_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_mul(SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC);
+        let sub_sec = i64::from(elapsed.subsec_nanos())
+            .saturating_mul(SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC)
+            / Self::NANOS_PER_SEC;
+        self.balance = self
+            .balance
+            .saturating_add(whole_secs.saturating_add(sub_sec))
+            .min(SUBTREE_ROUND1_WORK_BURST_BYTES);
+    }
+
+    /// Whether budget remains for a new round-1 proof.
+    fn has_budget(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.balance > 0
+    }
+
+    /// Charge `bytes` of completed proof work, carrying debt down to
+    /// [`Self::MAX_DEBT`].
+    fn charge(&mut self, bytes: i64, now: Instant) {
+        self.refill(now);
+        self.balance = self.balance.saturating_sub(bytes).max(Self::MAX_DEBT);
+    }
+}
+
+/// Resource controls for the HEAVY subtree-audit round 1: a tight
+/// admission pool separate from the light responsible/slice audits, a per-peer
+/// rate cooldown, and single-use round-1 → round-2 sessions so a round-2 slice
+/// challenge is only served after a matching round 1.
+///
+/// It also holds the responder-wide [`Round1WorkBudget`], the only one of those
+/// bounds not keyed by peer identity, and so the only one that bounds sustained
+/// work rather than concurrency or per-identity frequency.
+#[derive(Clone)]
+struct SubtreeRound1Limiter {
+    semaphore: Arc<Semaphore>,
+    /// Global ceiling on concurrent round-1 proofs (config-driven;
+    /// [`MAX_CONCURRENT_SUBTREE_ROUND1`] in production). Held alongside the
+    /// semaphore because the per-peer admission helper needs the same number.
+    max_concurrent: usize,
+    inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    /// Per-peer minimum spacing between served round-1 proofs (config-driven;
+    /// [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`] in production, near-zero in tests).
+    cooldown_interval: Duration,
+    sessions: Arc<RwLock<HashMap<(PeerId, u64), SubtreeSession>>>,
+    /// Identity-independent ceiling on sustained round-1 work.
+    work: Arc<RwLock<Round1WorkBudget>>,
+}
+
+impl SubtreeRound1Limiter {
+    /// `max_concurrent` of 0 would wedge the responder into refusing every
+    /// round-1 proof, which reads on the auditor side as a silent whole-fleet
+    /// audit outage. Clamp to at least one so a mis-set config degrades to slow
+    /// rather than to off.
+    fn new(cooldown_interval: Duration, max_concurrent: usize) -> Self {
+        let max_concurrent = max_concurrent.max(1);
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+            inflight: Arc::new(RwLock::new(HashMap::new())),
+            cooldown: Arc::new(RwLock::new(HashMap::new())),
+            cooldown_interval,
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            work: Arc::new(RwLock::new(Round1WorkBudget::new())),
+        }
+    }
+
+    /// Charge completed round-1 proof work against the responder-wide budget.
+    async fn charge_work(&self, content_bytes: i64) {
+        self.work
+            .write()
+            .await
+            .charge(content_bytes, Instant::now());
+    }
+
+    /// Admit one heavy round-1 proof for `source`: take a concurrency permit
+    /// FIRST (so a full pool never wastes the peer's cooldown allowance), then
+    /// the responder-wide work budget, then the per-peer rate cooldown. `None`
+    /// drops the challenge (the remote auditor applies its own graced-timeout
+    /// policy).
+    async fn admit(&self, source: &PeerId) -> Option<AuditResponderGuard> {
+        let guard = admit_audit_responder_with_limits(
+            &self.semaphore,
+            &self.inflight,
+            source,
+            self.max_concurrent,
+            MAX_SUBTREE_ROUND1_PER_PEER,
+        )
+        .await
+        .ok()?;
+        // Checked before the per-peer cooldown is stamped, so a peer refused for
+        // want of budget is not also charged its next allowance.
+        if !self.work.write().await.has_budget(Instant::now()) {
+            return None; // guard drops here, releasing the permit + slot
+        }
+        let now = Instant::now();
+        let mut cooldown = self.cooldown.write().await;
+        if let Some(&last) = cooldown.get(source) {
+            if now.duration_since(last) < self.cooldown_interval {
+                return None; // guard drops here, releasing the permit + slot
+            }
+        }
+        // Evict lapsed entries (their cooldown has expired, so they no longer
+        // limit) and cap capacity, so peer-id churn can't grow this map unbounded.
+        cooldown.retain(|_, &mut last| now.duration_since(last) < self.cooldown_interval);
+        if cooldown.len() >= MAX_SUBTREE_SESSIONS {
+            if let Some(oldest) = cooldown.iter().min_by_key(|(_, &t)| t).map(|(k, _)| *k) {
+                cooldown.remove(&oldest);
+            }
+        }
+        cooldown.insert(*source, now);
+        Some(guard)
+    }
+
+    /// Record a single-use session once a round-1 proof is built and about to be
+    /// sent, so the matching round 2 is admitted exactly once.
+    async fn open_session(
+        &self,
+        source: PeerId,
+        challenge_id: u64,
+        commitment_hash: [u8; 32],
+        nonce: [u8; 32],
+    ) {
+        let now = Instant::now();
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, e| now.duration_since(e.inserted) < SUBTREE_SESSION_TTL);
+        if sessions.len() >= MAX_SUBTREE_SESSIONS {
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, e)| e.inserted)
+                .map(|(k, _)| *k)
+            {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions.insert(
+            (source, challenge_id),
+            SubtreeSession {
+                commitment_hash,
+                nonce,
+                inserted: now,
+            },
+        );
+    }
+
+    /// Atomically consume the round-2 session for this exchange. `true` iff a
+    /// live session matching `(source, challenge_id, commitment_hash, nonce)`
+    /// existed (and is now removed); a miss silently drops round 2 to the graced
+    /// timeout lane (sessions are ephemeral and can be lost across a restart).
+    async fn consume_session(
+        &self,
+        source: &PeerId,
+        challenge_id: u64,
+        commitment_hash: &[u8; 32],
+        nonce: &[u8; 32],
+    ) -> bool {
+        let mut sessions = self.sessions.write().await;
+        let matches = sessions.get(&(*source, challenge_id)).is_some_and(|e| {
+            Instant::now().duration_since(e.inserted) < SUBTREE_SESSION_TTL
+                && &e.commitment_hash == commitment_hash
+                && &e.nonce == nonce
+        });
+        if matches {
+            sessions.remove(&(*source, challenge_id));
+        }
+        matches
+    }
+}
+
+/// Outcome of admitting a round-2 slice challenge.
+enum SliceAdmission {
+    /// Admitted: the guard holds the global permit and the per-peer slot, and
+    /// the single-use round-1 session has been consumed.
+    Admitted(AuditResponderGuard),
+    /// Refused at a responder ceiling. The round-1 session is left INTACT.
+    Capacity(AuditResponderAdmissionFailure),
+    /// No live round-1 session matched this challenge.
+    NoSession,
+}
+
+/// Admit a round-2 slice challenge: take the responder permit BEFORE consuming
+/// the single-use round-1 session.
+///
+/// The order is the point: a single-use token must not be spent on work that is
+/// then refused. Consuming first and testing admission second leaves the session
+/// destroyed by a purely local capacity drop, so the refusal is not recoverable
+/// even in principle.
+///
+/// Scope of the benefit today, stated honestly: `request_slice_proof` issues one
+/// `send_request` and maps any failure straight to `SliceRound::Timeout`, so the
+/// auditor does not currently re-send round 2 within an audit. The preserved
+/// session is therefore not yet *recovering* an audit — it keeps a refusal
+/// truthful (temporary means temporary) and keeps the invariant available for a
+/// retry, rather than baking "capacity drop is permanent" into the state
+/// machine. If an application-level retry is ruled out for good, this ordering
+/// still costs nothing over the alternative.
+///
+/// Cost of the ordering: the permit and per-peer slot are held across the
+/// session probe, which is one in-memory map lookup and no chunk work. The
+/// per-peer cap still bounds a peer sending unsessioned challenges to the same
+/// share it could already occupy with well-formed ones, so the admission
+/// surface is unchanged.
+async fn admit_slice_challenge(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    round1: &SubtreeRound1Limiter,
+    source: &PeerId,
+    challenge: &protocol::SubtreeSliceChallenge,
+) -> SliceAdmission {
+    let guard = match admit_audit_responder(semaphore, inflight, source).await {
+        Ok(guard) => guard,
+        Err(failure) => return SliceAdmission::Capacity(failure),
+    };
+    if !round1
+        .consume_session(
+            source,
+            challenge.challenge_id,
+            &challenge.expected_commitment_hash,
+            &challenge.nonce,
+        )
+        .await
+    {
+        // Release the permit and per-peer slot before the caller replies: no
+        // chunk work follows, so holding them would shrink the pool for nothing.
+        drop(guard);
+        return SliceAdmission::NoSession;
+    }
+    SliceAdmission::Admitted(guard)
+}
+
 /// Try to admit one audit-responder task for `source`: take a global permit AND
 /// a per-peer slot (both bounded). Returns `Err` with the binding ceiling and
 /// its decision-time counters (caller drops the challenge, leaving the remote
@@ -3026,8 +3447,26 @@ async fn admit_audit_responder(
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
     source: &PeerId,
 ) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
-    let global_limit = MAX_CONCURRENT_AUDIT_RESPONSES;
-    let peer_limit = MAX_AUDIT_RESPONSES_PER_PEER;
+    admit_audit_responder_with_limits(
+        semaphore,
+        inflight,
+        source,
+        MAX_CONCURRENT_AUDIT_RESPONSES,
+        MAX_AUDIT_RESPONSES_PER_PEER,
+    )
+    .await
+}
+
+/// Admission core shared by the light audit pool ([`admit_audit_responder`]) and
+/// the tight heavy subtree round-1 pool: take a global permit AND a per-peer slot
+/// under the given limits.
+async fn admit_audit_responder_with_limits(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    source: &PeerId,
+    global_limit: usize,
+    peer_limit: u32,
+) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
     // `available_permits()` is a cheap atomic load; `global_limit - available`
     // is the best-effort in-flight count at decision time. Not synchronized with
     // the per-peer lock, so it is a snapshot, not a single atomic view.
@@ -3092,6 +3531,7 @@ async fn admit_audit_responder(
 async fn handle_replication_message(
     source: &PeerId,
     data: &[u8],
+    inbound_protocol: &str,
     p2p_node: &Arc<P2PNode>,
     storage: &Arc<LmdbStorage>,
     paid_list: &Arc<PaidList>,
@@ -3110,10 +3550,61 @@ async fn handle_replication_message(
     gossip_audit: &GossipAuditTrigger,
     audit_responder_semaphore: &Arc<Semaphore>,
     audit_responder_inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    subtree_round1: &SubtreeRound1Limiter,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
+    // Size guard BEFORE decoding, keyed on the BODY's family — not on the id the
+    // message arrived on.
+    //
+    // Every later check — protocol family, live round-1 session, responder
+    // admission — reads fields of the decoded body, so none of them can run
+    // first. Decoding is therefore the first thing an unknown peer can make this
+    // node do, and the audit bodies carry variable-length collections, so under
+    // the 10 MiB core ceiling a sessionless peer could force multi-megabyte
+    // allocation and decode work per message with nothing spent on its side.
+    // Audit bodies are ~110 KiB at worst (see `MAX_AUDIT_MESSAGE_SIZE`), so a
+    // tighter family ceiling costs honest traffic nothing.
+    //
+    // Selecting that ceiling from `inbound_protocol` did NOT close the path it
+    // claimed to: an audit body addressed to the CORE id skipped the audit
+    // ceiling entirely, was decoded under the 10 MiB allowance, and only then
+    // dropped by `body_matches_protocol` — after its collections had been
+    // allocated. A `SubtreeSliceChallenge` carrying 200,000 openings encodes to
+    // ~6.6 MB and sailed through. The ceiling has to follow the body, and the
+    // body's discriminant is readable from the first few bytes without decoding
+    // anything attacker-sized, so it can be read first.
+    //
+    // A prefix too malformed to classify gets the strict ceiling: a message we
+    // cannot classify is not one to decode generously.
+    let peeked_family = protocol::peek_variant_index(data).map(protocol::family_of_variant);
+    let is_audit_body = peeked_family.map_or(true, protocol::BodyFamily::is_audit);
+    if is_audit_body && data.len() > MAX_AUDIT_MESSAGE_SIZE {
+        debug!(
+            "Dropping oversized audit-family message from {source} on {inbound_protocol}: \
+             {} bytes > {MAX_AUDIT_MESSAGE_SIZE}",
+            data.len()
+        );
+        return Ok(());
+    }
+
     let msg = ReplicationMessage::decode(data)
         .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
+
+    // Symmetric id/body guard: subtree-audit bodies are valid ONLY on the audit
+    // id, and core bodies ONLY on the core id. postcard::from_bytes ignores
+    // trailing bytes, so a mixed-version peer's message could otherwise decode
+    // into a valid-looking but wrong body (e.g. an old round-1 `Proof` on the
+    // core id misreading its bytes as the new `content_len`/`nonced_root`). The
+    // outer enum discriminants are unchanged across versions, so this drop by
+    // (id, is_subtree_audit) is exact.
+    if !body_matches_protocol(&msg.body, inbound_protocol) {
+        debug!(
+            "Dropping replication body (variant {}) on protocol {inbound_protocol}: \
+             wrong id for its family (cross-version or misrouted)",
+            msg.body.variant_index()
+        );
+        return Ok(());
+    }
 
     match msg.body {
         ReplicationMessageBody::FreshReplicationOffer(ref offer) => {
@@ -3217,7 +3708,8 @@ async fn handle_replication_message(
             // block all other replication traffic until its digests complete
             // (head-of-line blocking). The same flood-fair admission applies: a
             // global ceiling AND a per-peer cap, dropping the challenge if either
-            // is hit. Responsible/prune audit timeouts are penalised by the
+            // is hit. A dropped challenge reads as a timeout to the auditor, and
+            // once the rollout gate is removed that is penalised again by the
             // caller, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
             let guard = match admit_audit_responder(
@@ -3243,6 +3735,11 @@ async fn handle_replication_message(
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+            // Answer in the asker's dialect, on the id it asked over. During
+            // the rollout window both can be the previous release's. Resolved
+            // here because both halves are `Copy` and `'static`, so the
+            // inbound protocol's borrow does not have to outlive this frame.
+            let (digest_version, reply_protocol) = possession_reply_dialect(inbound_protocol);
             tokio::spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
                 if let Err(e) = handle_audit_challenge_msg(
@@ -3251,8 +3748,12 @@ async fn handle_replication_message(
                     &storage,
                     &p2p_node,
                     bootstrapping,
-                    request_id,
-                    rr_message_id.as_deref(),
+                    ReplyRoute {
+                        request_id,
+                        rr_message_id: rr_message_id.as_deref(),
+                        protocol: reply_protocol,
+                    },
+                    digest_version,
                 )
                 .await
                 {
@@ -3278,33 +3779,32 @@ async fn handle_replication_message(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let guard = match admit_audit_responder(
-                audit_responder_semaphore,
-                audit_responder_inflight,
-                source,
-            )
-            .await
-            {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
-                    warn!(
-                        "Audit challenge reply not sent: kind=subtree response=dropped \
-                         source={source} {failure}"
-                    );
-                    return Ok(());
-                }
+            // Round 1 is the HEAVY path (rebuilds + hashes the whole sqrt-subtree),
+            // so it uses its own tight admission pool + per-peer rate cooldown,
+            // separate from the light responsible/slice audits, and a miss silently
+            // drops (subtree auditors grace timeouts).
+            let Some(guard) = subtree_round1.admit(source).await else {
+                protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
+                warn!(
+                    "Audit challenge reply not sent: kind=subtree response=dropped \
+                     source={source} (heavy round-1 pool full or per-peer cooldown)"
+                );
+                return Ok(());
             };
             let bootstrapping = *is_bootstrapping.read().await;
             let storage = Arc::clone(storage);
             let p2p_node = Arc::clone(p2p_node);
             let my_commitment_state = Arc::clone(my_commitment_state);
+            let subtree_round1 = subtree_round1.clone();
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             tokio::spawn(async move {
-                let _guard = guard; // global permit + per-peer slot, held until done
-                let response = storage_commitment_audit::handle_subtree_challenge(
+                let _guard = guard; // heavy permit + per-peer slot, held until done
+                let storage_commitment_audit::Round1Work {
+                    response,
+                    content_bytes,
+                } = storage_commitment_audit::handle_subtree_challenge_measured(
                     &challenge,
                     &storage,
                     p2p_node.peer_id(),
@@ -3312,6 +3812,35 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                // Charge the work actually done, on EVERY outcome.
+                //
+                // This used to charge only the `Proof` arm, reasoning that the
+                // rejecting paths either read nothing or reflected this node's
+                // own broken storage. The second half of that was wrong: a
+                // retained commitment containing one unreadable key still costs
+                // a full run of reads and keyed-BLAKE3 passes over every leaf
+                // before it, and then rejects. An attacker who finds such a
+                // commitment could replay subtrees over it indefinitely for
+                // free. The per-peer cooldown does not catch that either, since
+                // it is escapable by rotating identity — the responder-wide
+                // budget is the only bound that applies, so it has to see the
+                // work. A zero charge is a no-op, so the untouched paths are
+                // unaffected.
+                subtree_round1.charge_work(content_bytes).await;
+                // A round-1 proof authorizes exactly one matching round 2: open a
+                // single-use session so a slice challenge cannot be served without
+                // a live round-1 exchange.
+                if let crate::replication::protocol::SubtreeAuditResponse::Proof { .. } = &response
+                {
+                    subtree_round1
+                        .open_session(
+                            source,
+                            challenge.challenge_id,
+                            challenge.expected_commitment_hash,
+                            challenge.nonce,
+                        )
+                        .await;
+                }
                 let response_kind = subtree_audit_response_kind(&response);
                 let sent = send_replication_response_checked(
                     &source,
@@ -3319,6 +3848,7 @@ async fn handle_replication_message(
                     request_id,
                     ReplicationMessageBody::SubtreeAuditResponse(response),
                     rr_message_id.as_deref(),
+                    None,
                 )
                 .await;
                 if sent {
@@ -3337,30 +3867,70 @@ async fn handle_replication_message(
             });
             Ok(())
         }
-        ReplicationMessageBody::SubtreeByteChallenge(challenge) => {
-            // Round 2 of the storage audit (ADR-0002): serve the original bytes
-            // for the auditor's spot-check keys, or signal `Absent` for a
-            // committed key we can no longer produce. Reads chunk bytes from
-            // disk, so likewise spawned off the serial loop (§5) under the same
-            // flood-fair admission (codex#1 + codex-r2 A).
+        ReplicationMessageBody::SubtreeSliceChallenge(challenge) => {
+            // Round 2 of the storage audit (ADR-0002 / V2-685): open one 1 KiB
+            // block of each of the auditor's spot-check keys with a Bao verified
+            // slice + nonced block-tree opening, or signal `Absent` for a
+            // committed key we can no longer produce. Reads chunk bytes from disk
+            // to build the proofs, so likewise spawned off the serial loop
+            // under the same flood-fair admission (a global ceiling plus a
+            // per-peer cap).
             info!(
-                "Audit challenge received: kind=byte source={source} request_response={}",
+                "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
-            let guard = match admit_audit_responder(
+            let guard = match admit_slice_challenge(
                 audit_responder_semaphore,
                 audit_responder_inflight,
+                subtree_round1,
                 source,
+                &challenge,
             )
             .await
             {
-                Ok(guard) => guard,
-                Err(failure) => {
-                    protocol::record_audit_drop(protocol::AuditDropKind::Byte);
+                SliceAdmission::Admitted(guard) => guard,
+                // Capacity drop: same silent-shed contract as the other two audit
+                // handlers. The session is still live, so the auditor's retry once
+                // load clears can still be served.
+                SliceAdmission::Capacity(failure) => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Slice);
                     warn!(
-                        "Audit challenge reply not sent: kind=byte response=dropped \
+                        "Audit challenge reply not sent: kind=slice response=dropped \
                          source={source} {failure}"
                     );
+                    return Ok(());
+                }
+                // No live round-1 session: reply with a cheap `Transient` rejection
+                // rather than dropping silently. Sessions are ephemeral (an honest
+                // responder that restarts between rounds loses its session), and an
+                // unanswered `send_request` would make saorsa-core record a
+                // transport trust failure against that honest responder — an
+                // ongoing effect, not just a rollout-window one. A `Transient`
+                // reply routes the auditor to the graced timeout lane (no trust
+                // penalty; the responder re-earns pinned credit on the next audit)
+                // and does no chunk work, so it is not a DoS lever.
+                SliceAdmission::NoSession => {
+                    protocol::record_audit_drop(protocol::AuditDropKind::Slice);
+                    debug!(
+                        "Slice challenge without a live round-1 session source={source} \
+                         challenge_id={} → Transient reject",
+                        challenge.challenge_id
+                    );
+                    send_replication_response_checked(
+                        source,
+                        p2p_node,
+                        msg.request_id,
+                        ReplicationMessageBody::SubtreeSliceResponse(
+                            protocol::SubtreeSliceResponse::Rejected {
+                                challenge_id: challenge.challenge_id,
+                                kind: protocol::RejectKind::Transient,
+                                reason: "no live round-1 session".to_string(),
+                            },
+                        ),
+                        rr_message_id,
+                        None,
+                    )
+                    .await;
                     return Ok(());
                 }
             };
@@ -3373,7 +3943,7 @@ async fn handle_replication_message(
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             tokio::spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
-                let response = storage_commitment_audit::handle_subtree_byte_challenge(
+                let response = storage_commitment_audit::handle_subtree_slice_challenge(
                     &challenge,
                     &storage,
                     p2p_node.peer_id(),
@@ -3381,24 +3951,25 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
-                let response_kind = subtree_byte_response_kind(&response);
+                let response_kind = subtree_slice_response_kind(&response);
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
                     request_id,
-                    ReplicationMessageBody::SubtreeByteResponse(response),
+                    ReplicationMessageBody::SubtreeSliceResponse(response),
                     rr_message_id.as_deref(),
+                    None,
                 )
                 .await;
                 if sent {
                     info!(
-                        "Audit challenge reply sent: kind=byte response={response_kind} \
+                        "Audit challenge reply sent: kind=slice response={response_kind} \
                          source={source} request_response={}",
                         rr_message_id.is_some(),
                     );
                 } else {
                     warn!(
-                        "Audit challenge reply not sent: kind=byte response={response_kind} \
+                        "Audit challenge reply not sent: kind=slice response={response_kind} \
                          source={source} request_response={}",
                         rr_message_id.is_some(),
                     );
@@ -3454,7 +4025,7 @@ async fn handle_replication_message(
         | ReplicationMessageBody::FetchResponse(_)
         | ReplicationMessageBody::AuditResponse(_)
         | ReplicationMessageBody::SubtreeAuditResponse(_)
-        | ReplicationMessageBody::SubtreeByteResponse(_)
+        | ReplicationMessageBody::SubtreeSliceResponse(_)
         | ReplicationMessageBody::GetCommitmentByPinResponse(_) => Ok(()),
     }
 }
@@ -3830,6 +4401,7 @@ async fn handle_neighbor_sync_request(
         request_id,
         ReplicationMessageBody::NeighborSyncResponse(response),
         rr_message_id,
+        None,
     )
     .await;
 
@@ -3988,8 +4560,8 @@ async fn handle_audit_challenge_msg(
     storage: &Arc<LmdbStorage>,
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
-    request_id: u64,
-    rr_message_id: Option<&str>,
+    reply: ReplyRoute<'_>,
+    digest_version: AuditDigestVersion,
 ) -> Result<()> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
@@ -3997,7 +4569,7 @@ async fn handle_audit_challenge_msg(
         "Audit challenge received: kind=responsible keys={} bootstrapping={} request_response={}",
         challenge.keys.len(),
         is_bootstrapping,
-        rr_message_id.is_some(),
+        reply.rr_message_id.is_some(),
     );
 
     let response = audit::handle_audit_challenge(
@@ -4006,6 +4578,7 @@ async fn handle_audit_challenge_msg(
         p2p_node.peer_id(),
         is_bootstrapping,
         stored_chunks,
+        digest_version,
     )
     .await;
     let response_kind = audit_response_kind(&response);
@@ -4013,9 +4586,10 @@ async fn handle_audit_challenge_msg(
     let sent = send_replication_response_checked(
         source,
         p2p_node,
-        request_id,
+        reply.request_id,
         ReplicationMessageBody::AuditResponse(response),
-        rr_message_id,
+        reply.rr_message_id,
+        Some(reply.protocol),
     )
     .await;
     if sent {
@@ -4023,18 +4597,34 @@ async fn handle_audit_challenge_msg(
             "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
             response_kind,
             challenge.keys.len(),
-            rr_message_id.is_some(),
+            reply.rr_message_id.is_some(),
         );
     } else {
         warn!(
             "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
             response_kind,
             challenge.keys.len(),
-            rr_message_id.is_some(),
+            reply.rr_message_id.is_some(),
         );
     }
 
     Ok(())
+}
+
+/// Where a reply goes and how it is addressed.
+///
+/// Grouped because the audit responder needs all three together and one of them
+/// is not derivable from the body: during the rollout window a possession reply
+/// may have to go out on the core id rather than its family's own (see
+/// [`is_legacy_possession_challenge`]).
+struct ReplyRoute<'a> {
+    /// Correlates the reply with the challenge, at the replication layer.
+    request_id: u64,
+    /// Present when the challenge arrived over request-response, in which case
+    /// the reply rides the same exchange back.
+    rr_message_id: Option<&'a str>,
+    /// The protocol id to answer on.
+    protocol: &'static str,
 }
 
 fn audit_response_kind(response: &protocol::AuditResponse) -> &'static str {
@@ -4053,11 +4643,11 @@ fn subtree_audit_response_kind(response: &protocol::SubtreeAuditResponse) -> &'s
     }
 }
 
-fn subtree_byte_response_kind(response: &protocol::SubtreeByteResponse) -> &'static str {
+fn subtree_slice_response_kind(response: &protocol::SubtreeSliceResponse) -> &'static str {
     match response {
-        protocol::SubtreeByteResponse::Items { .. } => "items",
-        protocol::SubtreeByteResponse::Bootstrapping { .. } => "bootstrapping",
-        protocol::SubtreeByteResponse::Rejected { .. } => "rejected",
+        protocol::SubtreeSliceResponse::Items { .. } => "items",
+        protocol::SubtreeSliceResponse::Bootstrapping { .. } => "bootstrapping",
+        protocol::SubtreeSliceResponse::Rejected { .. } => "rejected",
     }
 }
 
@@ -4078,7 +4668,8 @@ async fn send_replication_response(
     rr_message_id: Option<&str>,
 ) {
     let _ =
-        send_replication_response_checked(peer, p2p_node, request_id, body, rr_message_id).await;
+        send_replication_response_checked(peer, p2p_node, request_id, body, rr_message_id, None)
+            .await;
 }
 
 /// Send a replication response message and report whether it was accepted.
@@ -4090,12 +4681,19 @@ async fn send_replication_response(
 /// When `rr_message_id` is `Some`, the response is sent via the `/rr/`
 /// request-response path so saorsa-core can route it back to the caller's
 /// `send_request` future. Otherwise it is sent as a plain message.
+///
+/// `protocol` overrides the id the body would route on by family. Exactly one
+/// caller needs it: a possession challenge from a peer that predates the family
+/// split has to be answered where it was asked (see
+/// [`is_legacy_possession_challenge`]). Everything else passes `None` and gets
+/// [`response_protocol_for`], which is what keeps send and receive symmetric.
 async fn send_replication_response_checked(
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
     body: ReplicationMessageBody,
     rr_message_id: Option<&str>,
+    protocol: Option<&'static str>,
 ) -> bool {
     let msg = ReplicationMessage { request_id, body };
     let encoded = match msg.encode() {
@@ -4106,25 +4704,23 @@ async fn send_replication_response_checked(
         }
     };
     // V2-684: per-peer served-bytes attribution for the heavy serve paths.
-    // `FetchResponse` + `SubtreeByteResponse` carry ~99% of served bytes;
-    // `NeighborSyncResponse` is included for completeness. Other response
-    // variants (verification/audit/commitment) are intentionally excluded.
+    // `FetchResponse` carries ~99% of served bytes; `NeighborSyncResponse` is
+    // included for completeness. Other response variants (verification/audit/
+    // commitment) are intentionally excluded — the round-2 audit reply is now a
+    // few-KB verified slice (V2-685), not a full-chunk transfer, so it is light.
     if matches!(
         msg.body,
-        ReplicationMessageBody::FetchResponse(_)
-            | ReplicationMessageBody::SubtreeByteResponse(_)
-            | ReplicationMessageBody::NeighborSyncResponse(_)
+        ReplicationMessageBody::FetchResponse(_) | ReplicationMessageBody::NeighborSyncResponse(_)
     ) {
         protocol::record_served(peer, encoded.len());
     }
+    let protocol = protocol.unwrap_or_else(|| response_protocol_for(&msg.body));
     let result = if let Some(msg_id) = rr_message_id {
         p2p_node
-            .send_response(peer, REPLICATION_PROTOCOL_ID, msg_id, encoded)
+            .send_response(peer, protocol, msg_id, encoded)
             .await
     } else {
-        p2p_node
-            .send_message(peer, REPLICATION_PROTOCOL_ID, encoded, &[])
-            .await
+        p2p_node.send_message(peer, protocol, encoded, &[]).await
     };
     if let Err(e) = result {
         debug!("Failed to send replication response to {peer}: {e}");
@@ -5433,10 +6029,30 @@ async fn handle_subtree_audit_result(
 /// bootstrapping); every confirmed storage-integrity reason does.
 ///
 /// Responsible-chunk `AuditChallenge` failures use this directly: timeouts keep
-/// the bootstrap claim but are still reported as audit failures, matching the
-/// pre-ADR-0002 behaviour.
+/// the bootstrap claim, matching the pre-ADR-0002 behaviour. Whether a timeout
+/// is also *penalised* is a separate question — see
+/// [`audit_failure_reports_trust_penalty`].
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
+}
+
+/// Whether an audit failure with this reason reports an application trust event
+/// at [`AUDIT_FAILURE_TRUST_WEIGHT`](config::AUDIT_FAILURE_TRUST_WEIGHT).
+///
+/// ROLLOUT GATE — see [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]. While that gate is
+/// set, a `Timeout` on the digest lanes is graced, because a peer on the other
+/// side of the possession-audit protocol move never answers and its silence is
+/// not evidence about its storage. Every other reason is a confirmed failure and
+/// is always penalised. When the gate is removed this becomes `true` for every
+/// reason, restoring the unconditional penalty.
+///
+/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: config::GRACE_POSSESSION_AUDIT_TIMEOUTS
+fn audit_failure_reports_trust_penalty(reason: &AuditFailureReason) -> bool {
+    if config::GRACE_POSSESSION_AUDIT_TIMEOUTS {
+        !matches!(reason, AuditFailureReason::Timeout)
+    } else {
+        true
+    }
 }
 
 /// Handle the result of a responsible-chunk audit tick (audit #2): emit trust
@@ -5494,12 +6110,19 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
+                if audit_failure_reports_trust_penalty(reason) {
+                    p2p_node
+                        .report_trust_event(
+                            challenged_peer,
+                            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                        )
+                        .await;
+                } else {
+                    debug!(
+                        "Audit timeout for {challenged_peer} graced during the possession-audit \
+                         protocol rollout (no confirmed-failure penalty)"
+                    );
+                }
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -6227,14 +6850,16 @@ async fn rebuild_and_rotate_commitment(
     // the Merkle root commits to the SET OF KEYS, not to the bytes. The
     // commitment therefore binds "which keys I claim to hold"; it does NOT
     // by itself prove byte possession. Byte possession is enforced by the
-    // audit-verify path, which recomputes `bytes_hash == BLAKE3(local_bytes)`
-    // and the per-key digest against the AUDITOR'S OWN local copy of the
-    // bytes — so a responder that holds the key list but dropped the bytes
-    // still fails (`missing bytes for committed key` / digest mismatch).
-    // This is sound ONLY while keys are content addresses. If this module
-    // is ever reused for non-content-addressed records (`bytes_hash != key`),
-    // the `(k, k)` shortcut would let a byte-less node forge a valid root and
-    // MUST be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
+    // round-2 slice audit: a Bao verified slice decoded against the chunk
+    // ADDRESS plus a keyed nonced block-tree opening under a fresh per-audit
+    // nonce, so a responder that holds the key list but dropped the bytes
+    // cannot answer. This is sound ONLY while keys are content addresses;
+    // the round-1 verifier enforces `bytes_hash == key` on every audited leaf
+    // (`evaluate_subtree_structure`), so a non-content-addressed
+    // `(key, bytes_hash)` leaf is rejected rather than letting a byte-less node
+    // earn credit for `key`. If this module is ever reused for
+    // non-content-addressed records, that `(k, k)` shortcut AND the verifier
+    // gate must be replaced with `(key, BLAKE3(bytes))` computed from real bytes.
     let entries: Vec<_> = keys.into_iter().take(cap).map(|k| (k, k)).collect();
 
     // No-op-rotation guard: compute just the Merkle root from `entries`
@@ -6321,16 +6946,505 @@ mod tests {
     use std::time::Instant;
     use std::time::SystemTime;
 
+    #[test]
+    fn match_replication_protocol_accepts_both_ids_bare_and_rr() {
+        // Core id, bare gossip form and /rr/ request-response form.
+        assert_eq!(
+            match_replication_protocol(REPLICATION_PROTOCOL_ID),
+            Some((REPLICATION_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{REPLICATION_PROTOCOL_ID}")),
+            Some((REPLICATION_PROTOCOL_ID, true))
+        );
+        // Subtree-audit id, both forms.
+        assert_eq!(
+            match_replication_protocol(SUBTREE_AUDIT_PROTOCOL_ID),
+            Some((SUBTREE_AUDIT_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{SUBTREE_AUDIT_PROTOCOL_ID}")),
+            Some((SUBTREE_AUDIT_PROTOCOL_ID, true))
+        );
+        // Possession-audit id, both forms.
+        assert_eq!(
+            match_replication_protocol(POSSESSION_AUDIT_PROTOCOL_ID),
+            Some((POSSESSION_AUDIT_PROTOCOL_ID, false))
+        );
+        assert_eq!(
+            match_replication_protocol(&format!("{RR_PREFIX}{POSSESSION_AUDIT_PROTOCOL_ID}")),
+            Some((POSSESSION_AUDIT_PROTOCOL_ID, true))
+        );
+        // Foreign topics (incl. a bare /rr/ and an unrelated protocol) don't match.
+        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
+        assert_eq!(match_replication_protocol(RR_PREFIX), None);
+        assert_eq!(
+            match_replication_protocol("autonomi.ant.replication.v3"),
+            None
+        );
+    }
+
+    // The receive guard drops a body whose family disagrees with the id it rode:
+    // subtree-audit bodies only on the subtree id, possession-audit bodies only on
+    // the possession id, core bodies only on the core id. This is what stops a
+    // mixed-version peer's message from being honoured on the wrong handler after
+    // a postcard misdecode. The test drives the SAME `body_matches_protocol` the
+    // production guard uses, over real bodies, so a regression in the rule fails
+    // here.
+    #[test]
+    fn body_matches_protocol_is_symmetric_over_real_bodies() {
+        use crate::replication::protocol::{
+            AuditChallenge, AuditResponse, FreshReplicationOffer, ReplicationMessageBody,
+            SubtreeSliceChallenge,
+        };
+        // A subtree-audit body (models a v2 SubtreeByteChallenge, which decodes to
+        // this variant 13 under the new enum), a possession-audit body, and a
+        // core body.
+        let audit = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+            challenge_id: 1,
+            nonce: [0u8; 32],
+            challenged_peer_id: [0u8; 32],
+            expected_commitment_hash: [0u8; 32],
+            openings: vec![],
+        });
+        let possession = ReplicationMessageBody::AuditChallenge(AuditChallenge {
+            challenge_id: 1,
+            nonce: [0u8; 32],
+            challenged_peer_id: [0u8; 32],
+            keys: vec![[0u8; 32]],
+        });
+        let core = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
+            key: [0u8; 32],
+            data: vec![],
+            proof_of_payment: vec![],
+        });
+        // Correct routing is kept.
+        assert!(body_matches_protocol(&audit, SUBTREE_AUDIT_PROTOCOL_ID));
+        assert!(body_matches_protocol(
+            &possession,
+            POSSESSION_AUDIT_PROTOCOL_ID
+        ));
+        assert!(body_matches_protocol(&core, REPLICATION_PROTOCOL_ID));
+        // Every cross-routing is dropped, with one deliberate exception below.
+        for (body, wrong) in [
+            (&audit, REPLICATION_PROTOCOL_ID),
+            (&audit, POSSESSION_AUDIT_PROTOCOL_ID),
+            (&possession, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&core, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&core, POSSESSION_AUDIT_PROTOCOL_ID),
+        ] {
+            assert!(
+                !body_matches_protocol(body, wrong),
+                "body must not be accepted on {wrong}"
+            );
+        }
+
+        // The exception: a possession CHALLENGE on the core id, which is where a
+        // peer that predates the family split still sends it.
+        //
+        // This used to be dropped, reasoning that answering with a digest from a
+        // different generation would score as a confirmed mismatch against an
+        // honest peer. True, but it weighed only one side. Dropping it does not
+        // make the old peer neutral — its binary turns the resulting timeout
+        // straight into an audit-severity failure, and no constant here can
+        // reach it. So silence costs the honest upgraded node exactly what a
+        // mismatch would, and the release would penalise the nodes that took it.
+        // Answered in the asker's dialect, neither happens.
+        assert_eq!(
+            body_matches_protocol(&possession, REPLICATION_PROTOCOL_ID),
+            GRACE_POSSESSION_AUDIT_TIMEOUTS,
+            "a legacy possession challenge is answered exactly while the rollout gate is set"
+        );
+
+        // A possession RESPONSE on the core id stays refused either way: this
+        // node always asks on the dedicated id, so a reply there is not one it
+        // asked for.
+        let possession_reply =
+            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 });
+        assert!(
+            !body_matches_protocol(&possession_reply, REPLICATION_PROTOCOL_ID),
+            "an unsolicited possession response on the core id must never be accepted"
+        );
+
+        // Send and receive must agree. A RESPONSE is routed by the same rule, so
+        // the id a body is sent on is always an id the peer's guard accepts.
+        // Before this was shared, possession responses went out on the core id
+        // and only worked because saorsa-core correlates RR replies by
+        // (peer, msg_id) rather than by protocol name — a bare possession
+        // response was dropped by the receiving guard.
+        for (body, expected) in [
+            (&audit, SUBTREE_AUDIT_PROTOCOL_ID),
+            (&possession, POSSESSION_AUDIT_PROTOCOL_ID),
+            (&core, REPLICATION_PROTOCOL_ID),
+        ] {
+            assert_eq!(
+                response_protocol_for(body),
+                expected,
+                "a response must be sent on the family's own id"
+            );
+            assert!(
+                body_matches_protocol(body, response_protocol_for(body)),
+                "the id we send on must be one the receive guard accepts"
+            );
+        }
+
+        // The possession RESPONSE body (not just the challenge) routes to the
+        // possession id too — that is the direction that was actually wrong.
+        let possession_response = ReplicationMessageBody::AuditResponse(
+            crate::replication::protocol::AuditResponse::Digests {
+                challenge_id: 1,
+                digests: vec![[0u8; 32]],
+            },
+        );
+        assert_eq!(
+            response_protocol_for(&possession_response),
+            POSSESSION_AUDIT_PROTOCOL_ID
+        );
+    }
+
+    // A challenge is answered in the dialect it was asked in, on the id it was
+    // asked over. Getting either half wrong during the rollout window costs an
+    // honest node an audit-severity failure: the wrong digest reads as a
+    // mismatch, and the wrong id never reaches the asker at all.
+    #[test]
+    fn a_possession_challenge_is_answered_in_the_dialect_it_was_asked_in() {
+        assert_eq!(
+            possession_reply_dialect(POSSESSION_AUDIT_PROTOCOL_ID),
+            (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID),
+            "a peer on the dedicated id shares this release's construction"
+        );
+        assert_eq!(
+            possession_reply_dialect(REPLICATION_PROTOCOL_ID),
+            (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID),
+            "a peer still on the core id verifies with the previous construction"
+        );
+    }
+
+    // The legacy construction is preprocessing-weak — that is why it was
+    // replaced — so being answered in it is a real weakening. It is bounded by
+    // the fact that the ASKER picks the dialect while the RESPONDER is the one
+    // who gains from a weak one: a malicious holder cannot elect to be asked
+    // weakly, and only a peer that already accepts nothing stronger asks that
+    // way. That holds exactly while no lane on this release asks on the core id,
+    // which is what this pins. All three route through one function so a new
+    // lane cannot pick an id by hand.
+    //
+    // FLIPS IF: a digest lane is given its own protocol id again, or the shared
+    // one is pointed at the core id.
+    #[test]
+    fn every_digest_lane_asks_on_the_dedicated_id() {
+        use crate::replication::config::possession_challenge_protocol;
+
+        let (dialect, reply_on) = possession_reply_dialect(possession_challenge_protocol());
+        assert_eq!(
+            dialect,
+            AuditDigestVersion::Keyed,
+            "what this release asks on must be answered in the current construction"
+        );
+        assert_eq!(
+            reply_on, POSSESSION_AUDIT_PROTOCOL_ID,
+            "and answered on the dedicated id"
+        );
+        assert_ne!(
+            possession_challenge_protocol(),
+            REPLICATION_PROTOCOL_ID,
+            "asking on the core id would be asking for the superseded digest"
+        );
+    }
+
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
     }
 
+    // The heavy round-1 limiter enforces the per-peer rate cooldown
+    // and single-use round-1 → round-2 sessions.
+    #[tokio::test]
+    async fn subtree_round1_limiter_cooldown_and_single_use_session() {
+        let limiter = SubtreeRound1Limiter::new(
+            Duration::from_secs(3600),
+            config::MAX_CONCURRENT_SUBTREE_ROUND1,
+        );
+        let peer = test_peer(1);
+
+        // First round-1 is admitted; drop the guard so concurrency is free again.
+        let guard = limiter.admit(&peer).await;
+        assert!(guard.is_some(), "first round-1 admitted");
+        drop(guard);
+        // A second round-1 within the cooldown is dropped even though the heavy
+        // pool now has a free slot — the rate cooldown, not concurrency, blocks it.
+        assert!(
+            limiter.admit(&peer).await.is_none(),
+            "second round-1 within cooldown is rate-dropped"
+        );
+        // A different peer has its own cooldown.
+        assert!(limiter.admit(&test_peer(2)).await.is_some());
+
+        // Session: opened by round 1, consumed exactly once by the matching round 2.
+        let hash = [7u8; 32];
+        let nonce = [9u8; 32];
+        limiter.open_session(peer, 42, hash, nonce).await;
+        // Wrong nonce / commitment does not match.
+        assert!(!limiter.consume_session(&peer, 42, &hash, &[0u8; 32]).await);
+        assert!(!limiter.consume_session(&peer, 42, &[0u8; 32], &nonce).await);
+        // A round 2 with no prior round 1 (wrong challenge_id) misses.
+        assert!(!limiter.consume_session(&peer, 99, &hash, &nonce).await);
+        // The matching round 2 consumes it — and only once (single-use).
+        assert!(limiter.consume_session(&peer, 42, &hash, &nonce).await);
+        assert!(!limiter.consume_session(&peer, 42, &hash, &nonce).await);
+    }
+
+    // The concurrency pool and the per-peer cooldown are both keyed by peer id,
+    // so a party holding several identities refills its allowance by rotating
+    // between them and can keep the heavy pool busy indefinitely. The work
+    // budget is keyed by nothing: it is charged for bytes proved, whoever asked,
+    // so a fresh identity is refused exactly like a repeat caller once it is
+    // spent. That is the difference between bounding concurrency and bounding
+    // sustained work.
+    #[tokio::test]
+    async fn round1_work_budget_is_not_refilled_by_a_fresh_identity() {
+        // Cooldown disabled so only the work budget can refuse anything.
+        let limiter =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
+        assert!(
+            limiter.admit(&test_peer(1)).await.is_some(),
+            "a node starts with budget in hand so it can serve audits at once"
+        );
+
+        // Serve enough proof work to run the balance into debt. Charging exactly
+        // the burst would leave it at zero, which the next nanosecond of refill
+        // lifts back above the line — the debt is the point.
+        limiter
+            .charge_work(2 * SUBTREE_ROUND1_WORK_BURST_BYTES)
+            .await;
+
+        for id in 2..8u8 {
+            assert!(
+                limiter.admit(&test_peer(id)).await.is_none(),
+                "a never-seen peer must still be refused while the budget is spent"
+            );
+        }
+    }
+
+    // The budget is a rate, not a quota: it comes back on its own, so an honest
+    // auditor blocked by a flood is only delayed. Carrying the debt is what
+    // prices an expensive proof above a cheap one — without it, a proof reading
+    // a maximal subtree would cost no more of the next caller's wait than a
+    // one-leaf proof.
+    #[test]
+    fn round1_work_budget_carries_debt_and_refills_over_time() {
+        let now = Instant::now();
+        let at = |secs: u64| {
+            now.checked_add(Duration::from_secs(secs))
+                .unwrap_or_else(Instant::now)
+        };
+        let mut budget = Round1WorkBudget {
+            balance: 0,
+            last_refill: now,
+        };
+        assert!(!budget.has_budget(now), "empty means empty");
+
+        // A proof costing four seconds' worth of refill leaves four seconds of
+        // debt, so the wait scales with what was actually served.
+        budget.charge(4 * SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, now);
+        assert!(
+            !budget.has_budget(at(3)),
+            "still in debt three seconds after an over-large proof"
+        );
+        assert!(
+            budget.has_budget(at(5)),
+            "the debt is worked off at the refill rate"
+        );
+
+        // Idle time does not bank unbounded credit for a later flood.
+        budget.refill(at(24 * 60 * 60));
+        assert_eq!(
+            budget.balance, SUBTREE_ROUND1_WORK_BURST_BYTES,
+            "refill is capped at the burst size"
+        );
+    }
+
+    // The heavy round-1 pool size is the tightest bound the responder applies and
+    // the one least backed by fleet measurement, so it is read from config rather
+    // than baked into the binary: a fleet that lands on the wrong number retunes
+    // instead of waiting for a release. These pin that the configured value is
+    // what actually gates admission, and that a 0 degrades to slow, not to off —
+    // a wedged-shut responder would read on every auditor as a graced timeout,
+    // i.e. a silent audit outage with nobody penalised and nothing in the logs.
+    #[tokio::test]
+    async fn round1_pool_size_comes_from_config() {
+        // Cooldown disabled so only concurrency can refuse anything.
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let held = limiter.admit(&test_peer(1)).await;
+        assert!(held.is_some(), "the single configured slot is admitted");
+        assert!(
+            limiter.admit(&test_peer(2)).await.is_none(),
+            "a second concurrent round 1 is refused at a configured pool of 1, \
+             proving admission follows config rather than the compiled-in default"
+        );
+        drop(held);
+        assert!(
+            limiter.admit(&test_peer(2)).await.is_some(),
+            "the slot is reusable once the first proof completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn round1_pool_size_of_zero_is_clamped_to_one() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 0);
+        assert!(
+            limiter.admit(&test_peer(1)).await.is_some(),
+            "a mis-set pool of 0 must still serve audits, not silently refuse every one"
+        );
+    }
+
     fn test_key(b: u8) -> crate::ant_protocol::XorName {
         let mut k = [0u8; 32];
         k[0] = b;
         k
+    }
+
+    /// Build a round-2 slice challenge matching an open session. `openings` is
+    /// empty: these tests exercise admission and session handling only, which
+    /// run before any block is opened.
+    fn slice_challenge(
+        challenge_id: u64,
+        commitment_hash: [u8; 32],
+        nonce: [u8; 32],
+    ) -> protocol::SubtreeSliceChallenge {
+        protocol::SubtreeSliceChallenge {
+            challenge_id,
+            nonce,
+            challenged_peer_id: [0u8; 32],
+            expected_commitment_hash: commitment_hash,
+            openings: Vec::new(),
+        }
+    }
+
+    // Regression (Copilot, PR #181): a round-2 slice challenge refused at the
+    // responder caps MUST NOT burn the single-use round-1 session.
+    //
+    // The handler used to consume the session first and admit second, so a
+    // transient local capacity drop permanently destroyed that audit exchange —
+    // every retry hit the `no live round-1 session` path and got `Transient`,
+    // even after load cleared. Turning momentary local load into a deterministic
+    // round-2 miss costs the responder its whole-slice credit for that round.
+    #[tokio::test]
+    async fn capacity_refused_slice_challenge_preserves_round1_session() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let round1 =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
+        let peer = test_peer(0xB1);
+        let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
+        let challenge = slice_challenge(id, hash, nonce);
+
+        round1.open_session(peer, id, hash, nonce).await;
+
+        // Saturate this peer's share so the next admission must be refused.
+        let mut hold = Vec::new();
+        for _ in 0..MAX_AUDIT_RESPONSES_PER_PEER {
+            match admit_audit_responder(&semaphore, &inflight, &peer).await {
+                Ok(guard) => hold.push(guard),
+                Err(err) => panic!("unexpected admission failure below the cap: {err:?}"),
+            }
+        }
+
+        let refused =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(refused, SliceAdmission::Capacity(_)),
+            "a saturated peer share must refuse on capacity, not on session"
+        );
+
+        // Load clears. The session must have survived the refusal.
+        drop(hold);
+        let retried =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(retried, SliceAdmission::Admitted(_)),
+            "the round-1 session must survive a capacity refusal so the retry succeeds"
+        );
+
+        // Still single-use: the successful admission consumed it exactly once.
+        drop(retried);
+        let replayed =
+            admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+        assert!(
+            matches!(replayed, SliceAdmission::NoSession),
+            "a consumed session must not be replayable"
+        );
+    }
+
+    // The permit taken for the session probe is released when the probe misses,
+    // so an unsessioned flood cannot pin the responder pool shut.
+    #[tokio::test]
+    async fn unsessioned_slice_challenge_releases_its_admission_slot() {
+        let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let round1 =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
+        let peer = test_peer(0xB2);
+        let challenge = slice_challenge(1, [0u8; 32], [0u8; 32]);
+
+        // Far more unsessioned challenges than the per-peer cap would allow if
+        // the slot leaked on the miss path.
+        for _ in 0..(MAX_AUDIT_RESPONSES_PER_PEER * 4) {
+            let outcome =
+                admit_slice_challenge(&semaphore, &inflight, &round1, &peer, &challenge).await;
+            assert!(
+                matches!(outcome, SliceAdmission::NoSession),
+                "no session was ever opened, so every attempt must miss"
+            );
+        }
+
+        assert_eq!(
+            semaphore.available_permits(),
+            MAX_CONCURRENT_AUDIT_RESPONSES,
+            "every global permit must be returned"
+        );
+        assert!(
+            inflight.read().await.get(&peer).copied().unwrap_or(0) == 0,
+            "no per-peer slot may be left occupied"
+        );
+    }
+
+    // The rollout gate must grace exactly ONE thing — a timeout — and nothing
+    // else. A confirmed storage-integrity failure is still penalised while the
+    // gate is set, otherwise moving the possession lanes onto their own protocol
+    // id would have handed cheating peers an amnesty for the upgrade window.
+    //
+    // FOLLOW-UP: when `GRACE_POSSESSION_AUDIT_TIMEOUTS` is set to false and the
+    // gate deleted, the timeout expectation below flips to `true`. That is the
+    // intended end state, and this test is where the flip is reflected.
+    #[test]
+    fn rollout_gate_graces_only_timeouts() {
+        for reason in [
+            AuditFailureReason::DigestMismatch,
+            AuditFailureReason::KeyAbsent,
+            AuditFailureReason::MalformedResponse,
+            AuditFailureReason::Rejected,
+        ] {
+            assert!(
+                audit_failure_reports_trust_penalty(&reason),
+                "{reason:?} is a confirmed failure and must be penalised even during rollout"
+            );
+        }
+        assert_eq!(
+            audit_failure_reports_trust_penalty(&AuditFailureReason::Timeout),
+            !config::GRACE_POSSESSION_AUDIT_TIMEOUTS,
+            "a timeout is penalised exactly when the rollout gate is off"
+        );
+
+        // Holder credit is a separate axis that was already timeout-safe; the
+        // gate must not have disturbed it.
+        assert!(!audit_failure_revokes_holder_credit(
+            &AuditFailureReason::Timeout
+        ));
+        assert!(audit_failure_revokes_holder_credit(
+            &AuditFailureReason::DigestMismatch
+        ));
     }
 
     #[tokio::test]

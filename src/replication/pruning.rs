@@ -54,8 +54,9 @@ use tokio::sync::RwLock;
 use crate::ant_protocol::XorName;
 use crate::replication::commitment_state::ResponderCommitmentState;
 use crate::replication::config::{
-    storage_admission_width, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS, REPLICATION_PROTOCOL_ID,
+    possession_challenge_protocol, storage_admission_width, ReplicationConfig,
+    AUDIT_FAILURE_TRUST_WEIGHT, GRACE_POSSESSION_AUDIT_TIMEOUTS,
+    MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1377,25 +1378,43 @@ async fn peer_proves_records(
     else {
         return Vec::new();
     };
-    let Some(decoded) =
-        send_prune_audit_challenge(&peer, encoded, key_count, p2p_node, config).await
-    else {
-        // No decoded response means a timeout or malformed reply. Prune
-        // confirmation reuses `AuditChallenge` semantics, so this is an immediate
-        // audit failure just like a decoded bad proof below. Keep the historical
-        // one-report-per-peer-per-pass guard by attempting each key against the
-        // shared `report_state`.
-        let mut audit_failure_reported = false;
-        for key in &challenge_keys {
-            if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await {
-                audit_failure_reported = true;
-                break;
+    let decoded = match send_prune_audit_challenge(&peer, encoded, key_count, p2p_node, config)
+        .await
+    {
+        Ok(decoded) => decoded,
+        // No usable response. Prune confirmation reuses `AuditChallenge`
+        // semantics, so this is an immediate audit failure just like a decoded
+        // bad proof below. Keep the historical one-report-per-peer-per-pass
+        // guard by attempting each key against the shared `report_state`.
+        //
+        // ROLLOUT GATE — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`. A peer on the
+        // far side of the possession-audit protocol move never answers, so an
+        // unanswered challenge is not evidence about it. Only that case is
+        // graced: a peer that DID answer with undecodable bytes is a real
+        // protocol failure, not a version skew, and is still penalised.
+        Err(failure) => {
+            if !prune_send_failure_is_penalised(failure) {
+                debug!(
+                    "Prune audit: {peer} did not answer; graced during the \
+                     possession-audit protocol rollout (not penalised)"
+                );
+                return Vec::new();
             }
+            let mut audit_failure_reported = false;
+            for key in &challenge_keys {
+                if report_prune_audit_failure_once(&peer, key, p2p_node, config, report_state).await
+                {
+                    audit_failure_reported = true;
+                    break;
+                }
+            }
+            if audit_failure_reported {
+                debug!(
+                    "Prune audit: reported one failure for unanswered/malformed batch from {peer}"
+                );
+            }
+            return Vec::new();
         }
-        if audit_failure_reported {
-            debug!("Prune audit: reported one failure for timed-out/malformed batch from {peer}");
-        }
-        return Vec::new();
     };
 
     let statuses = prune_audit_response_statuses(decoded, challenge_id, &peer, &challenge_material);
@@ -1480,34 +1499,70 @@ fn encode_prune_audit_challenge(
     Some((encoded, key_count))
 }
 
+/// Why a prune-audit challenge yielded no usable response.
+///
+/// The two cases must stay distinguishable: only `Unanswered` is graced by the
+/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] rollout gate. Collapsing both into one
+/// "no response" case would let the gate also excuse a matched-version peer that
+/// answered with garbage, which is a real protocol failure, not a version skew.
+#[derive(Clone, Copy)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum PruneAuditSendFailure {
+    /// No answer within the deadline, or a transport error. Not evidence about
+    /// the peer's storage — and the expected outcome for a peer on the far side
+    /// of the possession-audit protocol move.
+    Unanswered,
+    /// The peer answered, but the bytes did not decode as a replication message.
+    /// A matched-version peer should never do this.
+    Malformed,
+}
+
+/// Whether a prune-audit send failure is penalised at audit severity, or graced
+/// by the [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] rollout gate.
+///
+/// Silence is graced while the gate is set, because a peer on the far side of
+/// the possession-audit protocol move never answers and its silence says nothing
+/// about its storage. An undecodable *answer* is not silence: the peer replied,
+/// so it is on this protocol and its reply is simply wrong. That stays a
+/// confirmed failure throughout, which is what keeps the gate from being an
+/// amnesty rather than a grace.
+///
+/// Extracted as a predicate so the rollout decision is assertable directly,
+/// rather than only reachable through a live prune pass.
+#[must_use]
+fn prune_send_failure_is_penalised(failure: PruneAuditSendFailure) -> bool {
+    match failure {
+        PruneAuditSendFailure::Unanswered => !GRACE_POSSESSION_AUDIT_TIMEOUTS,
+        PruneAuditSendFailure::Malformed => true,
+    }
+}
+
 async fn send_prune_audit_challenge(
     peer: &PeerId,
     encoded: Vec<u8>,
     key_count: usize,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-) -> Option<ReplicationMessage> {
+) -> std::result::Result<ReplicationMessage, PruneAuditSendFailure> {
     let timeout = config.audit_response_timeout(key_count);
     let response = match p2p_node
-        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
+        .send_request(peer, possession_challenge_protocol(), encoded, timeout)
         .await
     {
         Ok(response) => response,
         Err(e) => {
             debug!("Prune audit challenge with {key_count} keys against {peer} failed: {e}");
-            return None;
+            return Err(PruneAuditSendFailure::Unanswered);
         }
     };
 
-    let decoded = match ReplicationMessage::decode(&response.data) {
-        Ok(msg) => msg,
+    match ReplicationMessage::decode_audit_response(&response.data) {
+        Ok(msg) => Ok(msg),
         Err(e) => {
             warn!("Failed to decode prune audit response from {peer}: {e}");
-            return None;
+            Err(PruneAuditSendFailure::Malformed)
         }
-    };
-
-    Some(decoded)
+    }
 }
 
 fn prune_audit_response_statuses(
@@ -1772,6 +1827,38 @@ async fn peer_is_currently_responsible(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    // Regression (dirvine, PR #181): the prune lane collapsed "no answer" and
+    // "answered with undecodable bytes" into a single `None`, so the rollout
+    // gate excused both. The implementation now distinguishes them, and THIS is
+    // the test that holds the distinction in place — the generic
+    // `rollout_gate_graces_only_timeouts` test lives on the responsible-audit
+    // predicate and passed happily while the prune collapse was still present,
+    // so it could never have caught this.
+    //
+    // The gate grants grace to silence, not to a wrong answer. A peer that
+    // replies at all is on this protocol, so a reply that does not decode is a
+    // real protocol failure and stays penalised for the whole upgrade window.
+    #[test]
+    fn prune_rollout_gate_graces_silence_but_never_a_bad_answer() {
+        assert!(
+            !prune_send_failure_is_penalised(PruneAuditSendFailure::Unanswered),
+            "an unanswered prune challenge must be graced while the rollout gate is set"
+        );
+        assert!(
+            prune_send_failure_is_penalised(PruneAuditSendFailure::Malformed),
+            "an undecodable REPLY is a protocol failure, not a version skew — always penalised"
+        );
+
+        // Tie the first assertion to the gate rather than to a constant, so the
+        // follow-up that removes the gate flips this test instead of leaving it
+        // silently asserting the wrong thing.
+        assert_eq!(
+            prune_send_failure_is_penalised(PruneAuditSendFailure::Unanswered),
+            !GRACE_POSSESSION_AUDIT_TIMEOUTS,
+            "silence is penalised exactly when the rollout gate is off"
+        );
+    }
 
     fn peer_id_from_byte(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];

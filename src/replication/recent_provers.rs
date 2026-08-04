@@ -44,8 +44,9 @@ use crate::ant_protocol::XorName;
 
 /// Maximum number of cached provers per key.
 ///
-/// Sized at 2× `CLOSE_GROUP_SIZE = 8`, giving 8 slack slots for churn
-/// without unbounded growth. LRU-evicted within the cap.
+/// Comfortably above `CLOSE_GROUP_SIZE = 7` (a key has at most 7 responsible
+/// holders), leaving slack slots for churn without unbounded growth.
+/// LRU-evicted within the cap.
 pub const MAX_PROVERS_PER_KEY: usize = 16;
 
 /// Maximum age of a cached prover entry before it is considered stale.
@@ -310,6 +311,36 @@ mod tests {
         assert_eq!(cache.total_entries(), 1);
         assert!(!cache.is_credited_holder(&key(1), &peer(1), &hash(0xAB)));
         assert!(cache.is_credited_holder(&key(1), &peer(2), &hash(0xAB)));
+    }
+
+    #[test]
+    fn forget_peer_drops_credit_across_all_commitments() {
+        // A confirmed audit failure (e.g. a `ResponsiveBootstrap` on a stale pin
+        // H1) revokes ALL of the peer's holder credit, INCLUDING credit earned
+        // under a newer commitment H2: the contradiction is identity-level, not
+        // scoped to one key set. Another peer's credit is untouched.
+        let mut cache = RecentProvers::new();
+        let now = Instant::now();
+        let h1 = hash(0x11);
+        let h2 = hash(0x22);
+        cache.record_proof(key(1), peer(1), h1, now);
+        cache.record_proof(key(2), peer(1), h2, now);
+        cache.record_proof(key(1), peer(2), h1, now);
+
+        cache.forget_peer(&peer(1));
+
+        assert!(
+            !cache.is_credited_holder(&key(1), &peer(1), &h1),
+            "H1 credit dropped"
+        );
+        assert!(
+            !cache.is_credited_holder(&key(2), &peer(1), &h2),
+            "H2 credit dropped too (peer-wide, not pin-scoped)"
+        );
+        assert!(
+            cache.is_credited_holder(&key(1), &peer(2), &h1),
+            "another peer's credit is preserved"
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rand::Rng;
 
-use crate::ant_protocol::{CLOSE_GROUP_SIZE, MAX_CHUNK_SIZE};
+use crate::ant_protocol::CLOSE_GROUP_SIZE;
 
 // ---------------------------------------------------------------------------
 // Static constants (compile-time reference profile)
@@ -131,19 +131,21 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 
 /// Maximum number of concurrent in-flight audit-responder tasks.
 ///
-/// The responsible-chunk (audit #2), subtree (round 1), and byte (round 2)
-/// challenge handlers are all spawned off the serial replication message loop so
-/// their disk reads don't stall replication. This caps how many run at once
+/// The LIGHT audit-responder handlers — responsible-chunk audits and subtree
+/// slice (round 2) — are spawned off the serial replication message loop so their
+/// disk reads don't stall replication. (The HEAVY subtree round 1 has its own
+/// tighter pool, [`MAX_CONCURRENT_SUBTREE_ROUND1`].) This caps how many run at once
 /// across the engine, restoring backpressure: a peer flooding audit challenges
-/// cannot fan out unbounded `get_raw` reads or multi-MiB byte serves. When the
-/// cap is hit, the challenge is dropped and the caller's audit-specific timeout
-/// policy applies. The cap must therefore stay high enough for honest audit
-/// traffic while still throttling flooders.
+/// cannot fan out unbounded `get_raw` reads. When the cap is hit, the challenge
+/// is dropped and the caller's audit-specific timeout policy applies. The cap
+/// must therefore stay high enough for honest audit traffic while still
+/// throttling flooders.
 /// Sized to cover a handful of concurrent honest auditors (the per-peer
 /// gossip-audit cooldown is 30 min, so genuine concurrent audits are few) while
-/// bounding the byte round's worst-case resident bytes
-/// (`N × MAX_BYTE_CHALLENGE_KEYS × MAX_CHUNK_SIZE`).
-pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
+/// bounding the round-2 worst-case disk reads (each request reads at most
+/// `BYTE_SPOTCHECK_MAX` distinct chunks — the openings are coalesced and the
+/// distinct-key count is capped — to build its slice proofs).
+pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
 ///
@@ -156,6 +158,92 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
 /// gossip-triggered audit per peer per 30 min), so 4 in-flight per peer leaves
 /// headroom beyond the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 4;
+
+/// Dedicated global concurrency cap for the HEAVY subtree-audit round 1.
+///
+/// Round 1 hashes every leaf of the selected `sqrt(key_count)` subtree (up to
+/// ~1000 chunks × `MAX_CHUNK_SIZE` for a maximal commitment), far heavier than a
+/// responsible-chunk or slice (round-2) response. Giving it its own tiny pool —
+/// rather than sharing [`MAX_CONCURRENT_AUDIT_RESPONSES`] — keeps a burst of
+/// round-1 proofs from starving the light audits, and bounds concurrent
+/// multi-gigabyte hashing to this many at once. Two allows overlap without
+/// admitting many simultaneous full-subtree hashes; there is little benefit in
+/// more concurrent large LMDB scans against one disk.
+pub const MAX_CONCURRENT_SUBTREE_ROUND1: usize = 2;
+
+/// Per-peer concurrency cap for the heavy subtree-audit round 1. One in-flight
+/// round-1 proof per source at a time (an honest auditor never needs more).
+pub const MAX_SUBTREE_ROUND1_PER_PEER: u32 = 1;
+
+/// Per-peer responder-side cooldown between heavy subtree round-1 proofs.
+///
+/// An honest auditor already self-limits to one gossip-triggered subtree audit
+/// per peer per 30 min, so matching that as a responder-side floor costs honest
+/// traffic nothing while bounding the sustained round-1 work a single identity
+/// can extract (a concurrency cap alone lets a peer refill its slot forever).
+pub const SUBTREE_ROUND1_RESPONDER_COOLDOWN: Duration = Duration::from_secs(30 * 60);
+
+/// Lifetime of a single-use round-1 → round-2 session.
+///
+/// A round-2 slice challenge is only served if the same peer completed a matching
+/// round 1 within this window. Long enough for the auditor to verify round 1 and
+/// send round 2, far shorter than commitment retention; ephemeral, so a loss
+/// across a restart just
+/// drops that round to the (graced) timeout lane.
+pub const SUBTREE_SESSION_TTL: Duration = Duration::from_secs(2 * 60);
+
+/// Capacity backstop on the live round-1 session map (bounds memory if many
+/// peers open sessions; oldest are evicted past this).
+pub const MAX_SUBTREE_SESSIONS: usize = 4 * MAX_CONCURRENT_SUBTREE_ROUND1 * 256;
+
+/// Sustained rate at which the responder-wide round-1 work budget refills, in
+/// bytes of chunk content per second.
+///
+/// [`MAX_CONCURRENT_SUBTREE_ROUND1`] bounds how many round-1 proofs run at once
+/// and [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`] bounds how often one peer id may
+/// ask, but neither bounds sustained work: the cooldown is keyed by identity, so
+/// a party holding several identities refills its allowance by rotating between
+/// them and keeps the small pool permanently busy. This budget is keyed by
+/// nothing at all — it is charged for the bytes read and hashed no matter who
+/// asked — so identity count cannot buy more of it.
+///
+/// Sized to clear honest demand even at the worst commitment size, since
+/// starving honest audits would cost more than it saves. The 990-node run
+/// served about 24 audits per node per hour. At the `MAX_COMMITMENT_KEY_COUNT`
+/// cap one proof reads close to 4 GiB, so honest demand there is ~96 GiB/h,
+/// against the 225 GiB/h this allows — and a flooder is held to about twice
+/// honest load rather than to whatever the disk will bear. For the far more
+/// common mid-sized commitment, where a proof reads a few hundred MiB, the
+/// headroom is more than an order of magnitude.
+///
+/// Signed because the budget it refills carries debt when a proof costs more
+/// than is left.
+pub const SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC: i64 = 64 * 1024 * 1024;
+
+/// Burst capacity of the round-1 work budget, in bytes of chunk content.
+///
+/// Also its starting fill, so a freshly started node can serve audits at once.
+/// Two maximal proofs' worth, matching [`MAX_CONCURRENT_SUBTREE_ROUND1`], so a
+/// legitimate burst is never refused for arriving together — the budget limits
+/// the sustained rate, which is what a concurrency cap cannot do.
+pub const SUBTREE_ROUND1_WORK_BURST_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+
+/// Floor charged against the round-1 work budget per leaf attempted, in bytes.
+///
+/// The budget counts content bytes, which is the right unit for the hashing but
+/// misses what a leaf costs before its size is known: an LMDB point lookup with
+/// its retries, and a `spawn_blocking` dispatch and join. Nothing bounds a
+/// chunk from below, so a commitment made of a million tiny records would run a
+/// full subtree of reads and task round-trips per audit while charging almost
+/// nothing, and a leaf that fails to read charged nothing at all. Since the
+/// per-peer cooldown is escapable by rotating identity, the budget is the only
+/// bound that applies, so it has to see that cost.
+///
+/// Charged at the attempt, then topped up by whatever the content exceeds it
+/// by, so a leaf costs `max(bytes, this)`. At 4 KiB an honest chunk is almost
+/// always above it and pays exactly its bytes, which leaves the sizing of the
+/// refill rate above unchanged.
+pub const SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES: i64 = 4 * 1024;
 
 /// Concurrent fetches cap, derived from hardware thread count.
 ///
@@ -191,18 +279,15 @@ pub const AUDIT_TICK_INTERVAL_MAX: Duration = Duration::from_secs(AUDIT_TICK_INT
 /// for the round-1 proof, whose payload is hashes (KB-scale).
 const AUDIT_RESPONSE_FLOOR_SECS: u64 = 4;
 
-/// Floor on the round-2 BYTE-challenge deadline.
+/// Floor on the round-2 SLICE-challenge deadline.
 ///
-/// Unlike round 1 (KB of hashes), the byte challenge ships up to
-/// `MAX_BYTE_CHALLENGE_KEYS` full chunks (2 × 4 MiB = 8 MiB) back over the
-/// wire, so the envelope must also cover a cold QUIC handshake, the
-/// multi-MiB upload back to the auditor, and a busy honest peer's disk read.
-/// The round-1 4 s floor is still sized for a hashes-only reply; round 2 needs
-/// a larger base for the §4 byte-serving envelope. 5 s matches the
-/// cross-continent-RTT + handshake + 8 MiB transfer budget while keeping a relay
-/// that must fetch the bytes over a residential link outside it (the scaled
-/// term adds the per-byte estimate on top). Mirrors main's more generous
-/// byte-round base.
+/// The round-2 reply is only a few KB per opening (a 1 KiB block plus two short
+/// hash chains), but an honest responder still reads each opened chunk's full
+/// bytes from disk to build its Bao slice and nonced opening, so the floor must
+/// cover a cold QUIC handshake plus a busy honest peer's full-chunk disk read.
+/// The round-1 4 s floor is sized for a hashes-only reply; round 2 keeps a
+/// slightly larger 5 s base for the disk-read envelope, with the per-byte scaled
+/// term (one full chunk per opening) added on top.
 const BYTE_AUDIT_RESPONSE_FLOOR_SECS: u64 = 5;
 
 /// Conservative honest-responder read throughput, in bytes per second.
@@ -245,53 +330,134 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
-/// Protocol identifier for replication operations.
+/// Protocol identifier for core replication operations (fresh replication,
+/// neighbour sync, verification, fetch, repair, commitment fetch).
 ///
-/// Bumped to `v2` for the v12 storage-bound audit. That change extends the
-/// wire types (`NeighborSyncRequest`/`Response` carry an optional trailing
-/// `StorageCommitment`, and the gossip-triggered storage-commitment audit adds
-/// the `SubtreeAuditChallenge`/`SubtreeAuditResponse` and `SubtreeByteChallenge`/
-/// `SubtreeByteResponse` messages). The bump is for SEMANTIC interop, not
-/// decode failure: postcard tolerates the appended optional field (an old
-/// decoder reads the fields it knows and ignores the trailer — pinned by the
-/// `old_decoder_tolerates_new_neighbor_sync_*` tests in `protocol.rs`), but
-/// tolerating bytes is not interoperating. A v1 node cannot decode the NEW
-/// message variants at all (unknown enum discriminant) and never acts on a
-/// piggybacked commitment, so mixed-version replication would half-function —
-/// audit challenges unanswered, commitments silently dropped — and a v2 node
-/// could read that silence as misbehaviour. Rather than reason about each
-/// such case, we route v12 replication on a distinct protocol id: a node only
-/// delivers messages whose topic matches its own id (see the topic check in
-/// `mod.rs`), so v1 and v2 nodes simply do not exchange replication traffic
-/// during a mixed-version window. This is the rollout-safe behaviour: no
-/// half-interpreted exchange, no spurious eviction. Replication between
-/// matched-version peers is unaffected. (DHT routing/lookups are a separate
-/// protocol and continue to span both versions.)
+/// Kept at `v2`: none of these messages changed on the wire in the V2-685 slice
+/// audit, so v2 and v3 nodes interoperate on all of them. The two message
+/// families whose *semantics* changed each ride their own id
+/// ([`SUBTREE_AUDIT_PROTOCOL_ID`], [`POSSESSION_AUDIT_PROTOCOL_ID`]) so a version
+/// bump in either cannot partition core replication. A node filters inbound
+/// messages by exact topic match (see the dispatch in `mod.rs`).
 pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
+
+/// Protocol identifier for the digest-based possession audits.
+///
+/// Carries the `AuditChallenge`/`AuditResponse` pair shared by the
+/// responsible-chunk audit, the post-replication possession probe, and the
+/// prune-confirmation audit.
+///
+/// These messages keep their wire *shape*, but the digest they carry is now the
+/// domain-separated keyed construction
+/// ([`crate::replication::protocol::compute_audit_digest`]) rather than the
+/// earlier flat prefix hash, so a peer on the old construction and a peer on the
+/// new one compute different digests for the same bytes. Left on the shared core
+/// id, that difference would read as a *confirmed* `DigestMismatch` on every
+/// cross-version exchange, which carries [`AUDIT_FAILURE_TRUST_WEIGHT`] and runs
+/// the responsibility-confirmation path — a false-positive penalty on honest
+/// peers for the whole upgrade window.
+///
+/// Routing them on their own id converts that into a benign pause: a
+/// cross-version challenge is simply not answered, so it lands in the graced
+/// timeout lane instead of the confirmed-failure lane. The rollout effect is the
+/// same bounded one described on [`SUBTREE_AUDIT_PROTOCOL_ID`]: `saorsa-core`'s
+/// `send_request` still records a unit trust failure per unanswered request, and
+/// these lanes probe more often than the 30-minute subtree cooldown, so the dip
+/// is larger than the subtree lane's while still decaying back to neutral. That
+/// is strictly milder than a stream of weight-5 confirmed failures, and milder
+/// than bumping the shared id, which would also break sync, quorum, fetch,
+/// repair and commitment fetch.
+///
+/// `v2` here is the digest generation, not the message shape.
+pub const POSSESSION_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.possession-audit.v2";
+
+/// The id every digest lane asks on.
+///
+/// One function rather than three hand-written constants, because during the
+/// rollout window the id a challenge is sent on selects the digest construction
+/// it comes back in: a lane that asked on the core id would be asking for the
+/// superseded one, which is preprocessing-weak and is the reason it was
+/// replaced. A lane cannot get that wrong if it cannot choose. Pinned by
+/// `every_digest_lane_asks_on_the_dedicated_id`.
+#[must_use]
+pub const fn possession_challenge_protocol() -> &'static str {
+    POSSESSION_AUDIT_PROTOCOL_ID
+}
+
+/// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
+/// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
+/// `SubtreeSliceChallenge`/`Response` (round 2).
+///
+/// These are the only replication messages whose wire format changed for the
+/// slice audit (round 1's `SubtreeLeaf` now carries `content_len` + `nonced_root`
+/// instead of a flat `nonced_hash`; round 2 replaced full-byte responses with Bao
+/// verified slices). Routing them on their own id — instead of bumping the whole
+/// [`REPLICATION_PROTOCOL_ID`] — means a mixed-version fleet keeps doing fresh
+/// replication, neighbour sync, fetch and repair across versions; only
+/// cross-version subtree *audits* pause during the ~24 h auto-upgrade window.
+///
+/// Rollout effect is bounded, not zero: `saorsa-core`'s `send_request` records a
+/// unit trust failure on any unanswered request (before ant-node's graced-timeout
+/// policy), so a v3 auditor's subtree challenge to a still-v2 peer (and the
+/// reverse, where a v2 subtree audit is dropped by the id/body guard) each ding
+/// that peer's EMA trust once per 30-minute audit cooldown. Trust decays back to
+/// neutral (a worst-case dip recovers above the 0.35 routing-swap threshold in
+/// ~1 online day, and a successful audit after upgrade adds a unit success), and
+/// crossing 0.35 only makes a peer replaceable in a full bucket — it does not
+/// delete data or ban the peer. This is strictly milder than bumping the shared
+/// id, which would fail every cross-version request path (sync/quorum/prune/
+/// possession/repair/commitment-fetch) with no per-peer limiter. A truly
+/// zero-penalty rollout needs an upstream `send_request` that does not
+/// auto-report trust; tracked as a saorsa-core follow-up.
+pub const SUBTREE_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.subtree-audit.v1";
 
 /// 10 MiB — maximum replication wire message size (accommodates hint batches).
 const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
 
-/// Headroom reserved for the envelope (enum tags, ids, length prefixes) when
-/// sizing a round-2 byte-challenge batch against the wire cap.
-const BYTE_CHALLENGE_RESPONSE_HEADROOM: usize = 64 * 1024;
-
-/// Maximum keys per round-2 [`SubtreeByteChallenge`] (per-batch cap).
+/// Maximum wire size for a message on either audit protocol family.
 ///
-/// Sized so the WORST-CASE response (every requested chunk at
-/// `MAX_CHUNK_SIZE`) still encodes under [`MAX_REPLICATION_MESSAGE_SIZE`].
-/// The auditor splits its spot-check sample into batches of this size (one
-/// challenge per batch, same nonce/pin); the responder rejects any single
-/// challenge requesting more.
+/// The 10 MiB core ceiling is sized for hint batches, which no audit body
+/// carries. Applying it to the audit families would let a peer make this node
+/// allocate and decode megabytes of attacker-shaped collection before any
+/// family, session or admission check has run — those checks all read fields of
+/// the decoded body, so they cannot come first. Checking the encoded length
+/// against a family-appropriate ceiling can, because it needs nothing but the
+/// byte count.
 ///
-/// [`SubtreeByteChallenge`]: crate::replication::protocol::SubtreeByteChallenge
-pub const MAX_BYTE_CHALLENGE_KEYS: usize =
-    (MAX_REPLICATION_MESSAGE_SIZE - BYTE_CHALLENGE_RESPONSE_HEADROOM) / MAX_CHUNK_SIZE;
+/// Sized against the largest legitimate audit body, the round-1
+/// `SubtreeAuditResponse::Proof`: at the `MAX_COMMITMENT_KEY_COUNT` cap a
+/// subtree is at most 1,024 leaves of ~100 bytes each, plus the sibling cut
+/// hashes and the signed commitment, so ~110 KiB. Every other audit body —
+/// both challenges, the round-2 response — is far smaller. This leaves roughly
+/// 4x headroom over the worst legitimate case while cutting the pre-admission
+/// allocation ceiling by a factor of 20.
+pub const MAX_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
 const _: () = assert!(
-    MAX_BYTE_CHALLENGE_KEYS >= 1,
-    "wire cap must fit at least one max-size chunk per byte-challenge response"
+    MAX_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
+    "the audit-family ceiling must be tighter than the core one, or it is pointless"
+);
+
+/// Maximum block openings per round-2 [`SubtreeSliceChallenge`].
+///
+/// Each opening is a Bao verified slice (a 1 KiB block plus O(log n) BLAKE3
+/// parent hashes) plus a nonced block-tree sibling chain — a few KB, so even
+/// this many openings encode far under [`MAX_REPLICATION_MESSAGE_SIZE`] with no
+/// batching. The auditor draws up to *two* openings per sampled leaf — one
+/// fresh-random block (possession) and one at the claimed final block (a length
+/// pin: opening the final block forces Bao's EOF validation, which authenticates
+/// the true content length and defeats a forged-short `content_len` that would
+/// otherwise shrink the challenge space). With at most `BYTE_SPOTCHECK_MAX`
+/// leaves that is `2 × BYTE_SPOTCHECK_MAX` openings; this cap sits just above
+/// that, and the responder rejects any challenge requesting more (a forged-
+/// auditor guard: each opening forces one full chunk read to build its proof).
+///
+/// [`SubtreeSliceChallenge`]: crate::replication::protocol::SubtreeSliceChallenge
+pub const MAX_SLICE_OPENINGS: usize = 10;
+const _: () = assert!(
+    MAX_SLICE_OPENINGS >= 1,
+    "at least one block opening must be allowed per slice challenge"
 );
 
 /// Rollout gate for ADR-0004 quote-arithmetic enforcement.
@@ -420,6 +586,72 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
+
+/// ROLLOUT GATE (V2-685) — **temporary. Must be turned off in a follow-up.**
+///
+/// # Why this exists
+///
+/// The three digest-based audit lanes — the responsible-chunk audit, the
+/// post-replication possession probe, and prune confirmation — moved onto
+/// [`POSSESSION_AUDIT_PROTOCOL_ID`] because their digest construction changed.
+/// During the auto-upgrade window a v3 auditor's challenge to a still-v2 peer is
+/// therefore never answered, and an unanswered challenge times out.
+///
+/// Those three lanes report an `ApplicationFailure` carrying
+/// [`AUDIT_FAILURE_TRUST_WEIGHT`]
+/// on a timeout — weight 5, the confirmed-failure weight. Left alone, every
+/// honest peer on the other side of the version boundary would be penalised at
+/// confirmed-failure severity, repeatedly, for the entire window, for a skew
+/// that is not its fault. (The subtree lane already graces its timeouts and is
+/// unaffected; see `handle_subtree_failed_audit`.)
+///
+/// # What it does while `true`
+///
+/// The three lanes grace a timeout exactly as the subtree lane does: no
+/// application trust event and no holder-credit revocation. This is not a free
+/// pass — `saorsa-core`'s `send_request` still records its own unit transport
+/// failure for an unanswered request, so a peer that never answers still drifts
+/// down, just at weight 1 instead of 5.
+///
+/// The grace covers *silence only*. A peer that answers is being judged on what
+/// it said, so every confirmed outcome — digest mismatch, absent key, malformed
+/// reply, explicit rejection — is penalised throughout the window exactly as
+/// before. This is deliberately not an amnesty for cheating; it is only a
+/// refusal to read "did not reply" as "lost the data".
+///
+/// # FOLLOW-UP — required, do not ship this permanently
+///
+/// Once the fleet has upgraded past the possession-audit protocol move, set this
+/// to `false`, then delete the constant and inline the guarded branches so the
+/// timeout penalty is restored unconditionally. Until that lands, a peer that
+/// silently drops audit challenges is under-penalised. Tracked on V2-685.
+///
+/// The guarded code is gated by this constant rather than commented out on
+/// purpose: it stays compiled, type-checked, linted and covered by tests while
+/// disabled, so it cannot rot before it is switched back on.
+///
+/// # What this gate does NOT cover
+///
+/// It stops a peer being penalised for silence; it does not let anyone earn
+/// holder credit. Credit is written only by a completed two-round subtree audit
+/// and expires after
+/// [`PROVER_ENTRY_TTL`](crate::replication::recent_provers::PROVER_ENTRY_TTL),
+/// and the subtree lane has no legacy accommodation (its round-1 leaf changed
+/// shape, so answering an old asker would mean carrying both proof shapes). So
+/// across a version boundary neither side can refresh the other's credit, and 40
+/// minutes in, a peer on the other release counts as uncredited: its `Present`
+/// vote is downgraded to `Unresolved` in the presence quorum, and keys reach
+/// verification through the paid-list path or are retried. Pruning does not
+/// consult holder credit and is unaffected.
+///
+/// That failure is conservative by design and is left in place rather than
+/// suppressed — waiving the downgrade would count `Present` votes from peers that
+/// proved nothing, which can let a false claim stand in for a replica and
+/// suppress a repair. It does mean the mixed-version window should be kept short
+/// and watched rather than left open for days. ADR-0009 records the reasoning.
+///
+/// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
+pub const GRACE_POSSESSION_AUDIT_TIMEOUTS: bool = true;
 
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
@@ -618,6 +850,24 @@ pub struct ReplicationConfig {
     /// Upper bound of the possession-check delay window (ADR-0003). Defaults
     /// to [`POSSESSION_CHECK_DELAY_MAX`].
     pub possession_check_delay_max: Duration,
+    /// Per-peer responder-side cooldown between heavy subtree round-1 proofs.
+    /// Defaults to [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`]; tests set
+    /// it low so rapid back-to-back audits of one holder are not rate-dropped.
+    pub subtree_round1_responder_cooldown: Duration,
+    /// Global ceiling on concurrent heavy subtree round-1 proofs this node will
+    /// serve. Defaults to [`MAX_CONCURRENT_SUBTREE_ROUND1`].
+    ///
+    /// Exposed here rather than read straight from the constant because it is the
+    /// tightest bound the responder applies and the one with the least fleet
+    /// evidence behind its value: too low and honest auditors are capacity-dropped
+    /// (their audits land in the graced timeout lane, so coverage silently falls
+    /// without any peer being penalised), too high and concurrent full-subtree
+    /// hashing competes with serving real traffic. Making it configurable means a
+    /// fleet that lands on the wrong number can be retuned without cutting a
+    /// release. A value of 0 is clamped to 1 by
+    /// [`SubtreeRound1Limiter::new`](crate::replication) rather than disabling
+    /// round 1 outright.
+    pub subtree_round1_max_concurrent: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -645,6 +895,8 @@ impl Default for ReplicationConfig {
             bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
             possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
             possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
+            subtree_round1_responder_cooldown: SUBTREE_ROUND1_RESPONDER_COOLDOWN,
+            subtree_round1_max_concurrent: MAX_CONCURRENT_SUBTREE_ROUND1,
         }
     }
 }
@@ -824,12 +1076,11 @@ impl ReplicationConfig {
         // an honest HDD-backed peer at sqrt(N)=10 stored chunks could
         // miss the budget under load.
         let multiplied = total_bytes.saturating_mul(self.audit_response_honest_multiplier);
-        // Resolve the scaled term in MILLISECONDS, not seconds: at the
-        // byte-round sizes (MAX_BYTE_CHALLENGE_KEYS = 2 → 8 MiB) the per-second
-        // quotient `multiplied / bps` integer-truncates to 0, leaving only the
-        // floor. The §4 finding was that byte-serving challenges need the
-        // sub-second honest-read estimate (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms)
-        // instead of dropping it.
+        // Resolve the scaled term in MILLISECONDS, not seconds: at small
+        // sample sizes (e.g. a 2-key challenge → 8 MiB) the per-second quotient
+        // `multiplied / bps` integer-truncates to 0, leaving only the floor.
+        // Small challenges still need the sub-second honest-read estimate
+        // (e.g. 8 MiB × 5 / 50 MB/s ≈ 840 ms) instead of dropping it.
         let scaled_ms = multiplied.saturating_mul(1000) / bps;
         // saturating_add avoids a panic if the floor plus the scaled term would
         // overflow `Duration::MAX`.
@@ -837,20 +1088,33 @@ impl ReplicationConfig {
             .saturating_add(Duration::from_millis(scaled_ms))
     }
 
-    /// Deadline for the round-2 BYTE challenge serving `challenged_key_count`
-    /// full chunks back to the auditor.
+    /// Deadline for the round-2 SLICE challenge opening `openings` blocks.
     ///
-    /// Same per-byte scaling as [`Self::audit_response_timeout`] (so a relay
-    /// that must fetch the bytes over a residential link still blows it), but on
-    /// a higher floor (`BYTE_AUDIT_RESPONSE_FLOOR_SECS`) because the reply
-    /// carries up to
-    /// `MAX_BYTE_CHALLENGE_KEYS × MAX_CHUNK_SIZE` of chunk data — handshake +
-    /// multi-MiB upload + a busy honest disk read do not fit the hashes-only
-    /// round-1 floor (the §4 finding).
+    /// The reply itself is only a few KB per opening (a 1 KiB block plus two
+    /// short hash chains), but an honest responder still reads each opened
+    /// chunk's full bytes from disk to build its Bao slice and nonced opening. So
+    /// the deadline is sized to that honest full-chunk disk read (the same
+    /// per-byte scaling as [`Self::audit_response_timeout`], one full chunk per
+    /// opening), on the `BYTE_AUDIT_RESPONSE_FLOOR_SECS` floor to absorb the
+    /// handshake and a busy disk.
+    ///
+    /// The deadline is not a security parameter, and this is worth stating
+    /// precisely because an earlier version of this comment claimed more than
+    /// it should. The round-1 `nonced_root` is uncomputable without all the
+    /// bytes under a fresh nonce, but that binds only that SOMEONE holding them
+    /// computed it, not that the audited peer did: nonce, peer id and key are
+    /// all public, so a backend holding one copy can compute roots and openings
+    /// for any number of front-end identities, and only the compact proof
+    /// crosses the link. The old full-byte round 2 did not prevent that either
+    /// — it priced it, by forcing megabytes through the relay per audit, and a
+    /// tight deadline was part of that price. Both are gone here. So the
+    /// deadline exists only to bound how long the auditor waits for an honest
+    /// reply, and non-delegability is not a property either design provides;
+    /// see ADR-0009 for where that is left.
     #[must_use]
-    pub fn byte_audit_response_timeout(&self, challenged_key_count: usize) -> Duration {
+    pub fn slice_audit_response_timeout(&self, openings: usize) -> Duration {
         let scaled = self
-            .audit_response_timeout(challenged_key_count)
+            .audit_response_timeout(openings)
             .saturating_sub(self.audit_response_floor);
         Duration::from_secs(BYTE_AUDIT_RESPONSE_FLOOR_SECS).saturating_add(scaled)
     }
@@ -944,13 +1208,31 @@ mod tests {
     }
 
     #[test]
-    fn replication_protocol_id_is_v2() {
-        // The v12 storage-bound audit changes replication SEMANTICS. The
-        // protocol id MUST advance past v1 so v1 and v2 nodes never exchange
-        // replication traffic they can only half-interpret (rollout safety —
-        // see the const's doc). If this regresses to v1, mixed-version nodes
-        // would talk past each other and risk spurious penalties.
+    fn core_replication_id_stays_v2_changed_families_ride_their_own_ids() {
+        // Core replication stays on v2 (mixed-version fleets keep replicating).
+        // The two families whose semantics changed each ride their own id, so
+        // either can be bumped without partitioning core replication, and a
+        // message of one family never lands on another family's handler — see
+        // the id/body guard in `mod.rs`.
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
+        assert_eq!(
+            SUBTREE_AUDIT_PROTOCOL_ID,
+            "autonomi.ant.replication.subtree-audit.v1"
+        );
+        assert_eq!(
+            POSSESSION_AUDIT_PROTOCOL_ID,
+            "autonomi.ant.replication.possession-audit.v2"
+        );
+        let ids = [
+            REPLICATION_PROTOCOL_ID,
+            SUBTREE_AUDIT_PROTOCOL_ID,
+            POSSESSION_AUDIT_PROTOCOL_ID,
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in ids.iter().skip(i + 1) {
+                assert_ne!(a, b, "protocol ids must be pairwise distinct");
+            }
+        }
     }
 
     #[test]
