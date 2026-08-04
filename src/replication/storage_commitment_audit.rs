@@ -704,7 +704,7 @@ fn block_indices_for_leaf(content_len: u32) -> Vec<u32> {
 /// `openings` pairs each sampled leaf with the block index the auditor drew for
 /// it. `items` is what the responder returned. For each opening the auditor:
 ///   1. finds the responder's `Present` item for exactly this `(key, block_index)`
-///      (a missing / `Absent` / wrong-block item is a provable lie);
+///      (a missing, `Absent` or wrong-block item is a provable lie);
 ///   2. **Chain 1** — decodes the Bao slice against `leaf.bytes_hash` (the chunk
 ///      address), recovering the verified block bytes. This proves the block is
 ///      the real content at that offset, without the auditor holding the chunk.
@@ -714,10 +714,19 @@ fn block_indices_for_leaf(content_len: u32) -> Vec<u32> {
 ///      over the real content at round-1 time, so it held the bytes then.
 ///
 /// Both chains are over the SAME block bytes and the auditor holds none of the
-/// peer's chunks. Any missing/absent opening, a slice that fails to decode
-/// against the address, or a nonced opening that does not fold to the committed
-/// root, is a provable lie → confirmed [`AuditFailureReason::DigestMismatch`].
-/// All openings verifying → `Pass { checked }`.
+/// peer's chunks. Every failure here is a confirmed one, split by what the
+/// responder actually did so the audit log can tell them apart:
+///
+/// - an explicit `Absent` for a key committed in round 1 is an admitted loss →
+///   [`AuditFailureReason::KeyAbsent`] (`absent_keys`);
+/// - a missing item, a wrong block, a slice that fails to decode against the
+///   address, or a nonced opening that does not fold to the committed root, is a
+///   proof failure → [`AuditFailureReason::DigestMismatch`]
+///   (`digest_mismatch_keys`).
+///
+/// Both reasons take the same trust penalty, clear the bootstrap claim and
+/// revoke holder credit, so the split is diagnostic and not an enforcement
+/// change. All openings verifying → `Pass { checked }`.
 pub(crate) fn verify_slice_response(
     openings: &[(crate::replication::subtree::SubtreeLeaf, u32)],
     nonce: &[u8; 32],
@@ -777,8 +786,21 @@ pub(crate) fn verify_slice_response(
             SubtreeSliceItem::Absent { key } if key == &leaf.key => Some(None),
             _ => None,
         });
-        let Some(Some((bao_slice, nonced_siblings))) = served else {
-            return AuditVerdict::Fail(AuditFailureReason::DigestMismatch);
+        let (bao_slice, nonced_siblings) = match served {
+            Some(Some(opening)) => opening,
+            // The responder explicitly answered "I do not hold this key", for a
+            // key it committed to in round 1. That is an admitted loss, not a
+            // broken proof, and it is reported as `KeyAbsent` so the failure log
+            // line separates the two: `absent_keys` counts a peer that owned up
+            // to missing data, `digest_mismatch_keys` counts one whose proof did
+            // not verify. Both are confirmed failures and carry identical trust,
+            // bootstrap-claim and holder-credit effects, so this changes what an
+            // operator can see, not what the audit enforces.
+            Some(None) => return AuditVerdict::Fail(AuditFailureReason::KeyAbsent),
+            // No item at all for a solicited opening: the responder neither
+            // served the block nor admitted the key is gone, so nothing about
+            // possession was established. That stays a proof failure.
+            None => return AuditVerdict::Fail(AuditFailureReason::DigestMismatch),
         };
 
         // Chain 1: authenticate the block against the chunk address.
@@ -2051,7 +2073,8 @@ mod tests {
         // THE headline fix: a node whose round-1 proof is structurally perfect
         // but which has DELETED a committed chunk cannot serve its bytes. It
         // signals `Absent` for the sampled key → provable lie → confirmed
-        // failure. Crucially, the auditor holds NONE of the peer's chunks; the
+        // failure, reported as `KeyAbsent` because the peer admitted the loss.
+        // Crucially, the auditor holds NONE of the peer's chunks; the
         // verdict depends only on what the responder serves.
         let nonce = [9u8; 32];
         let (built, proof, peer) = honest(400, &nonce);
@@ -2065,14 +2088,17 @@ mod tests {
             *slot = SubtreeSliceItem::Absent { key: victim };
         }
         let v = verify_slice_response(&openings, &nonce, &peer, &items);
-        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::KeyAbsent));
     }
 
     #[test]
     fn omitted_committed_key_is_confirmed_failure() {
         // A responder that simply omits a sampled committed opening from its items
-        // (neither Present nor Absent) is treated identically to Absent: it
-        // committed to the key and won't serve it → confirmed failure.
+        // (neither Present nor Absent) is a confirmed failure just like Absent,
+        // but it never admitted the loss, so it is a proof failure rather than
+        // `KeyAbsent`. This is the counterpart to
+        // `deleter_absent_bytes_is_confirmed_failure`: together they pin that the
+        // two reasons stay distinguishable in the audit-failure log line.
         let nonce = [9u8; 32];
         let (built, proof, peer) = honest(400, &nonce);
         let s = sample(&proof, &nonce, built.commitment().key_count);
@@ -2159,7 +2185,51 @@ mod tests {
             .map(|(l, _)| SubtreeSliceItem::Absent { key: l.key })
             .collect();
         let v = verify_slice_response(&openings, &nonce, &peer, &items);
-        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::DigestMismatch));
+        assert_eq!(v, AuditVerdict::Fail(AuditFailureReason::KeyAbsent));
+    }
+
+    #[test]
+    fn admitted_absence_and_failed_proof_are_reported_separately() {
+        // ROLLOUT DIAGNOSTICS: the two ways a peer fails round 2 must stay
+        // distinguishable in the failure summary, because they mean different
+        // things operationally — a peer owning up to lost data versus one whose
+        // proof did not verify. Before this was split, both rolled up as
+        // `digest_mismatch_keys` and `absent_keys` was always 0, so a fleet-wide
+        // audit regression and a fleet-wide data loss looked identical.
+        let nonce = [0x33u8; 32];
+        let (built, proof, peer) = honest(256, &nonce);
+        let s = sample(&proof, &nonce, built.commitment().key_count);
+        let openings = openings_for(&s);
+
+        // Admitted loss → KeyAbsent → counted under `absent_keys`.
+        let absent_items: Vec<SubtreeSliceItem> = openings
+            .iter()
+            .map(|(l, _)| SubtreeSliceItem::Absent { key: l.key })
+            .collect();
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &peer, &absent_items),
+            AuditVerdict::Fail(AuditFailureReason::KeyAbsent),
+        );
+        let absent_summary = subtree_failure_summary(&AuditFailureReason::KeyAbsent);
+        assert_eq!(absent_summary.absent_keys, 1);
+        assert_eq!(absent_summary.digest_mismatch_keys, 0);
+
+        // Withheld without admission → DigestMismatch → `digest_mismatch_keys`.
+        let withheld: Vec<SubtreeSliceItem> = served_honest_items(&openings, &nonce, &peer)
+            .into_iter()
+            .skip(1)
+            .collect();
+        assert_eq!(
+            verify_slice_response(&openings, &nonce, &peer, &withheld),
+            AuditVerdict::Fail(AuditFailureReason::DigestMismatch),
+        );
+        let mismatch_summary = subtree_failure_summary(&AuditFailureReason::DigestMismatch);
+        assert_eq!(mismatch_summary.digest_mismatch_keys, 1);
+        assert_eq!(mismatch_summary.absent_keys, 0);
+
+        // Both are confirmed failures with identical enforcement, so the split is
+        // diagnostic only: it must not quietly soften what an absent key costs.
+        assert_eq!(absent_summary.failed_keys, mismatch_summary.failed_keys);
     }
 
     #[test]

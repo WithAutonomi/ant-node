@@ -224,6 +224,35 @@ no audit body contains.
 - The responsible-chunk audit now returns no verdict when it cannot check a
   challenged key against its own copy, so some ticks that previously recorded a
   pass now record nothing.
+- **The mixed-version window has a cost the grace gate does not cover, and it is
+  what bounds how long that window should be left open.** Gracing a timeout stops
+  a peer being penalised for silence; it does not let anyone earn holder credit.
+  Credit is written only by a completed two-round subtree audit and expires after
+  `PROVER_ENTRY_TTL` (40 minutes), and the subtree lane is the one lane with no
+  legacy accommodation, because unlike the two possession messages its round-1
+  leaf changed shape and its round 2 is a different proof entirely — answering an
+  old asker would mean carrying both proof shapes. So across a version boundary
+  neither side can refresh the other's credit, and 40 minutes in, a
+  commitment-capable peer on the other release is treated as uncredited for the
+  keys it holds.
+
+  What that costs is bounded and one-directional. The holder-credit check has a
+  single production consumer, the presence-quorum evaluation: a `Present` vote
+  from an uncredited peer is downgraded to `Unresolved`, so a key reaches
+  verification through the paid-list path instead of the presence quorum, or
+  stays pending and is retried. Pruning does not consult holder credit and is
+  unaffected. The direction of the failure is conservative — the network declines
+  to treat an unproven claim as proof, rather than acting on one — so the effects
+  are extra verification traffic and a reward-eligibility gap for cross-version
+  holders, not lost data.
+
+  It was deliberately not papered over. Suppressing the downgrade for the window
+  would have counted `Present` votes from peers that had proven nothing, which
+  can let a false claim stand in for a replica and suppress a repair. That
+  exchanges a conservative failure for an unsafe one, and a bounded reward gap is
+  the better trade. The operational consequence is that the mixed-version window
+  should be kept short and watched rather than allowed to run for days; it closes
+  on its own as the fleet converges.
 
 ### Neutral / Operational
 

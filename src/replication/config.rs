@@ -630,6 +630,26 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 /// purpose: it stays compiled, type-checked, linted and covered by tests while
 /// disabled, so it cannot rot before it is switched back on.
 ///
+/// # What this gate does NOT cover
+///
+/// It stops a peer being penalised for silence; it does not let anyone earn
+/// holder credit. Credit is written only by a completed two-round subtree audit
+/// and expires after
+/// [`PROVER_ENTRY_TTL`](crate::replication::recent_provers::PROVER_ENTRY_TTL),
+/// and the subtree lane has no legacy accommodation (its round-1 leaf changed
+/// shape, so answering an old asker would mean carrying both proof shapes). So
+/// across a version boundary neither side can refresh the other's credit, and 40
+/// minutes in, a peer on the other release counts as uncredited: its `Present`
+/// vote is downgraded to `Unresolved` in the presence quorum, and keys reach
+/// verification through the paid-list path or are retried. Pruning does not
+/// consult holder credit and is unaffected.
+///
+/// That failure is conservative by design and is left in place rather than
+/// suppressed — waiving the downgrade would count `Present` votes from peers that
+/// proved nothing, which can let a false claim stand in for a replica and
+/// suppress a repair. It does mean the mixed-version window should be kept short
+/// and watched rather than left open for days. ADR-0009 records the reasoning.
+///
 /// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
 pub const GRACE_POSSESSION_AUDIT_TIMEOUTS: bool = true;
 
@@ -834,6 +854,20 @@ pub struct ReplicationConfig {
     /// Defaults to [`SUBTREE_ROUND1_RESPONDER_COOLDOWN`]; tests set
     /// it low so rapid back-to-back audits of one holder are not rate-dropped.
     pub subtree_round1_responder_cooldown: Duration,
+    /// Global ceiling on concurrent heavy subtree round-1 proofs this node will
+    /// serve. Defaults to [`MAX_CONCURRENT_SUBTREE_ROUND1`].
+    ///
+    /// Exposed here rather than read straight from the constant because it is the
+    /// tightest bound the responder applies and the one with the least fleet
+    /// evidence behind its value: too low and honest auditors are capacity-dropped
+    /// (their audits land in the graced timeout lane, so coverage silently falls
+    /// without any peer being penalised), too high and concurrent full-subtree
+    /// hashing competes with serving real traffic. Making it configurable means a
+    /// fleet that lands on the wrong number can be retuned without cutting a
+    /// release. A value of 0 is clamped to 1 by
+    /// [`SubtreeRound1Limiter::new`](crate::replication) rather than disabling
+    /// round 1 outright.
+    pub subtree_round1_max_concurrent: usize,
 }
 
 impl Default for ReplicationConfig {
@@ -862,6 +896,7 @@ impl Default for ReplicationConfig {
             possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
             possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
             subtree_round1_responder_cooldown: SUBTREE_ROUND1_RESPONDER_COOLDOWN,
+            subtree_round1_max_concurrent: MAX_CONCURRENT_SUBTREE_ROUND1,
         }
     }
 }

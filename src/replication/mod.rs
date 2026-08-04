@@ -65,10 +65,10 @@ use crate::replication::commitment_state::{
 use crate::replication::config::{
     max_parallel_fetch, storage_admission_width, ReplicationConfig,
     GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_AUDIT_MESSAGE_SIZE, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
-    MAX_CONCURRENT_SUBTREE_ROUND1, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
-    POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID,
-    SUBTREE_ROUND1_WORK_BURST_BYTES, SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, MAX_SUBTREE_ROUND1_PER_PEER,
+    MAX_SUBTREE_SESSIONS, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
+    SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
+    SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
@@ -1488,7 +1488,10 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
-            subtree_round1: SubtreeRound1Limiter::new(config.subtree_round1_responder_cooldown),
+            subtree_round1: SubtreeRound1Limiter::new(
+                config.subtree_round1_responder_cooldown,
+                config.subtree_round1_max_concurrent,
+            ),
             fresh_write_rx: Some(fresh_write_rx),
             possession_check_tx,
             possession_check_rx: Some(possession_check_rx),
@@ -3236,6 +3239,10 @@ impl Round1WorkBudget {
 #[derive(Clone)]
 struct SubtreeRound1Limiter {
     semaphore: Arc<Semaphore>,
+    /// Global ceiling on concurrent round-1 proofs (config-driven;
+    /// [`MAX_CONCURRENT_SUBTREE_ROUND1`] in production). Held alongside the
+    /// semaphore because the per-peer admission helper needs the same number.
+    max_concurrent: usize,
     inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
     /// Per-peer minimum spacing between served round-1 proofs (config-driven;
@@ -3247,9 +3254,15 @@ struct SubtreeRound1Limiter {
 }
 
 impl SubtreeRound1Limiter {
-    fn new(cooldown_interval: Duration) -> Self {
+    /// `max_concurrent` of 0 would wedge the responder into refusing every
+    /// round-1 proof, which reads on the auditor side as a silent whole-fleet
+    /// audit outage. Clamp to at least one so a mis-set config degrades to slow
+    /// rather than to off.
+    fn new(cooldown_interval: Duration, max_concurrent: usize) -> Self {
+        let max_concurrent = max_concurrent.max(1);
         Self {
-            semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SUBTREE_ROUND1)),
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
             inflight: Arc::new(RwLock::new(HashMap::new())),
             cooldown: Arc::new(RwLock::new(HashMap::new())),
             cooldown_interval,
@@ -3276,7 +3289,7 @@ impl SubtreeRound1Limiter {
             &self.semaphore,
             &self.inflight,
             source,
-            MAX_CONCURRENT_SUBTREE_ROUND1,
+            self.max_concurrent,
             MAX_SUBTREE_ROUND1_PER_PEER,
         )
         .await
@@ -7149,7 +7162,10 @@ mod tests {
     // and single-use round-1 → round-2 sessions.
     #[tokio::test]
     async fn subtree_round1_limiter_cooldown_and_single_use_session() {
-        let limiter = SubtreeRound1Limiter::new(Duration::from_secs(3600));
+        let limiter = SubtreeRound1Limiter::new(
+            Duration::from_secs(3600),
+            config::MAX_CONCURRENT_SUBTREE_ROUND1,
+        );
         let peer = test_peer(1);
 
         // First round-1 is admitted; drop the guard so concurrency is free again.
@@ -7189,7 +7205,8 @@ mod tests {
     #[tokio::test]
     async fn round1_work_budget_is_not_refilled_by_a_fresh_identity() {
         // Cooldown disabled so only the work budget can refuse anything.
-        let limiter = SubtreeRound1Limiter::new(Duration::ZERO);
+        let limiter =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
         assert!(
             limiter.admit(&test_peer(1)).await.is_some(),
             "a node starts with budget in hand so it can serve audits at once"
@@ -7248,6 +7265,40 @@ mod tests {
         );
     }
 
+    // The heavy round-1 pool size is the tightest bound the responder applies and
+    // the one least backed by fleet measurement, so it is read from config rather
+    // than baked into the binary: a fleet that lands on the wrong number retunes
+    // instead of waiting for a release. These pin that the configured value is
+    // what actually gates admission, and that a 0 degrades to slow, not to off —
+    // a wedged-shut responder would read on every auditor as a graced timeout,
+    // i.e. a silent audit outage with nobody penalised and nothing in the logs.
+    #[tokio::test]
+    async fn round1_pool_size_comes_from_config() {
+        // Cooldown disabled so only concurrency can refuse anything.
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 1);
+        let held = limiter.admit(&test_peer(1)).await;
+        assert!(held.is_some(), "the single configured slot is admitted");
+        assert!(
+            limiter.admit(&test_peer(2)).await.is_none(),
+            "a second concurrent round 1 is refused at a configured pool of 1, \
+             proving admission follows config rather than the compiled-in default"
+        );
+        drop(held);
+        assert!(
+            limiter.admit(&test_peer(2)).await.is_some(),
+            "the slot is reusable once the first proof completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn round1_pool_size_of_zero_is_clamped_to_one() {
+        let limiter = SubtreeRound1Limiter::new(Duration::ZERO, 0);
+        assert!(
+            limiter.admit(&test_peer(1)).await.is_some(),
+            "a mis-set pool of 0 must still serve audits, not silently refuse every one"
+        );
+    }
+
     fn test_key(b: u8) -> crate::ant_protocol::XorName {
         let mut k = [0u8; 32];
         k[0] = b;
@@ -7283,7 +7334,8 @@ mod tests {
     async fn capacity_refused_slice_challenge_preserves_round1_session() {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
         let inflight = Arc::new(RwLock::new(HashMap::new()));
-        let round1 = SubtreeRound1Limiter::new(Duration::ZERO);
+        let round1 =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
         let peer = test_peer(0xB1);
         let (id, hash, nonce) = (77u64, [3u8; 32], [4u8; 32]);
         let challenge = slice_challenge(id, hash, nonce);
@@ -7331,7 +7383,8 @@ mod tests {
     async fn unsessioned_slice_challenge_releases_its_admission_slot() {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
         let inflight = Arc::new(RwLock::new(HashMap::new()));
-        let round1 = SubtreeRound1Limiter::new(Duration::ZERO);
+        let round1 =
+            SubtreeRound1Limiter::new(Duration::ZERO, config::MAX_CONCURRENT_SUBTREE_ROUND1);
         let peer = test_peer(0xB2);
         let challenge = slice_challenge(1, [0u8; 32], [0u8; 32]);
 
