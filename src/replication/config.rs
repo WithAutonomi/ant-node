@@ -494,7 +494,14 @@ const _: () = assert!(
 /// [`QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED`] for that, kept separate because
 /// the two have different ADR-0004 contracts (this one rejects with no trust
 /// action; that one reports a deterministic contradiction to the trust engine).
-pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = false;
+///
+/// Enabled after the observe-only canary came back clean on ant-prod-01. Over
+/// the 2026-07-29 to 2026-08-04 window the check ran against every quote in
+/// more than 70,000 verified bundles across 912 of 913 node instances and
+/// flagged nothing: no off-curve price, no invalid binding shape, no
+/// price/count mismatch. Honest traffic therefore sits exactly on the curve, so
+/// enforcing rejects nothing that is accepted today.
+pub const QUOTE_ARITHMETIC_RECHECK_ENABLED: bool = true;
 
 /// Rollout gate for ADR-0004 quote/commitment **mismatch** trust reporting.
 ///

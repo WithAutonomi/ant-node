@@ -3373,13 +3373,30 @@ mod tests {
         let (public_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
         let pub_key_bytes = public_key.as_bytes().to_vec();
         let peer_id = encoded_peer_id_for_pub_key(&pub_key_bytes);
+        // Derive the ADR-0004 binding from the price rather than hardcoding
+        // `(0, None)`: a quote priced at `calculate_price(n)` must also claim
+        // `committed_key_count = n`, or it charges as though it stored `n` keys
+        // while committing to nothing and is rejected by the arithmetic gate
+        // before the test's own assertion is reached. Prices that are not on
+        // the curve at all (`ZERO`, small literals) keep the baseline shape and
+        // stay off-curve, which is what the tests exercising bad prices want.
+        let (committed_key_count, commitment_pin) =
+            match PaymentVerifier::price_off_curve_diagnostics(&price) {
+                None => {
+                    let records = derive_records_stored_from_price(price);
+                    let count = u32::try_from(records).unwrap_or(u32::MAX);
+                    let pin = if count == 0 { None } else { Some([0xA5u8; 32]) };
+                    (count, pin)
+                }
+                Some(_) => (0, None),
+            };
         let mut quote = PaymentQuote {
             content: xor_name::XorName(xorname),
             timestamp: SystemTime::now(),
             price,
             rewards_address: RewardsAddress::new([rewards_seed; 20]),
-            committed_key_count: 0,
-            commitment_pin: None,
+            committed_key_count,
+            commitment_pin,
             pub_key: pub_key_bytes,
             signature: Vec::new(),
         };
@@ -4151,6 +4168,16 @@ mod tests {
         );
     }
 
+    /// A zero-priced median must never be admitted.
+    ///
+    /// Which check rejects it depends on the ADR-0004 rollout gate. `Amount::ZERO`
+    /// is not a point on the pricing curve (the curve's minimum is
+    /// `calculate_price(0)`), so with
+    /// [`crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED`] on, the
+    /// arithmetic gate rejects the bundle before median selection runs and the
+    /// dedicated zero-price check is no longer reachable for single-node quotes.
+    /// The gate subsumes it rather than replacing it, so both messages are
+    /// accepted here and the invariant under test stays "this is rejected".
     #[tokio::test]
     async fn test_legacy_zero_price_median_rejected() {
         let verifier = create_test_verifier();
@@ -4174,9 +4201,11 @@ mod tests {
             .await
             .expect_err("zero median must be rejected");
 
+        let msg = format!("{err}");
         assert!(
-            format!("{err}").contains("zero price"),
-            "Error should mention zero price: {err}"
+            msg.contains("zero price") || msg.contains("off-curve quote rejected"),
+            "Error must reject the zero-priced median, by either the zero-price \
+             check or the ADR-0004 arithmetic gate: {msg}"
         );
     }
 
@@ -4504,7 +4533,10 @@ mod tests {
         let quote = PaymentQuote {
             content: xor_name::XorName(wrong_xorname),
             timestamp: SystemTime::now(),
-            price: Amount::from(1u64),
+            // Baseline-priced so the quote is on-curve: this test is about the
+            // content binding, and an off-curve price would be rejected by the
+            // ADR-0004 arithmetic gate first, never reaching that check.
+            price: crate::payment::pricing::calculate_price(0),
             rewards_address: RewardsAddress::new([1u8; 20]),
             committed_key_count: 0,
             commitment_pin: None,
@@ -4553,7 +4585,13 @@ mod tests {
         PaymentQuote {
             content: xor_name::XorName(xorname),
             timestamp,
-            price: Amount::from(1u64),
+            // Baseline quote: `(committed_key_count = 0, commitment_pin = None)`
+            // must be priced at `calculate_price(0)` to satisfy the ADR-0004
+            // binding rule. An arbitrary placeholder price here is off-curve and
+            // is rejected outright once
+            // [`crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED`] is
+            // on, which would mask whatever a test actually means to assert.
+            price: crate::payment::pricing::calculate_price(0),
             rewards_address,
             committed_key_count: 0,
             commitment_pin: None,
@@ -4565,6 +4603,12 @@ mod tests {
     /// Helper: create a fake quote priced on-curve at `records` stored records
     /// (price = `calculate_price(records)`), reusing [`make_fake_quote`] for the
     /// remaining fields. Used by the ADR-0004 arithmetic-gate tests.
+    ///
+    /// Sets the whole binding, not just the price: ADR-0004 requires `price ==
+    /// calculate_price(committed_key_count)` AND the `(n > 0, Some(pin))` /
+    /// `(0, None)` shape, so pricing at `records` while leaving the count at `0`
+    /// produces a quote that claims to store nothing yet charges as though it
+    /// stored `records` keys. That is exactly what the gate rejects.
     fn make_fake_quote_at_records(
         xorname: [u8; 32],
         timestamp: SystemTime,
@@ -4573,6 +4617,14 @@ mod tests {
     ) -> evmlib::PaymentQuote {
         let mut quote = make_fake_quote(xorname, timestamp, rewards_address);
         quote.price = crate::payment::pricing::calculate_price(records);
+        quote.committed_key_count = u32::try_from(records).unwrap_or(u32::MAX);
+        quote.commitment_pin = if records == 0 {
+            None
+        } else {
+            // Any stable non-zero pin: these fixtures never resolve it to a real
+            // commitment, they only need the binding shape to be coherent.
+            Some([0xA5u8; 32])
+        };
         quote
     }
 
@@ -5188,7 +5240,11 @@ mod tests {
         std::array::from_fn::<_, CANDIDATES_PER_POOL, _>(|i| {
             let ml_dsa = MlDsa65::new();
             let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-            let price = evmlib::common::Amount::from(1024u64);
+            // Baseline candidate: `(committed_key_count = 0, commitment_pin =
+            // None)` below, so the price must be `calculate_price(0)` to satisfy
+            // the ADR-0004 binding rule. A placeholder price is off-curve and is
+            // rejected before the check each test actually exercises.
+            let price = crate::payment::pricing::calculate_price(0);
             #[allow(clippy::cast_possible_truncation)]
             let reward_address = RewardsAddress::new([i as u8; 20]);
             let msg = MerklePaymentCandidateNode::bytes_to_sign(
@@ -5401,12 +5457,21 @@ mod tests {
         verifier
     }
 
-    /// Per-node amount a depth-2 pool of 1024-priced candidates must settle
-    /// under parity: `median(1024) * 2^2 * 3 / 2`.
-    const MERKLE_PARITY_PER_NODE_DEPTH2: u64 = 6144;
+    /// Per-node amount a depth-2 pool of baseline-priced candidates must settle
+    /// under parity: `median * 2^2 * 3 / 2`, i.e. six times the candidate price.
+    ///
+    /// Derived from the curve rather than hardcoded: the candidates are priced
+    /// at `calculate_price(0)` so they satisfy the ADR-0004 binding rule, and a
+    /// literal would silently stop matching the formula if the curve moves.
+    fn merkle_parity_per_node_depth2() -> Amount {
+        crate::payment::pricing::calculate_price(0) * Amount::from(6u64)
+    }
 
-    /// The same pool's historic pre-parity amount: `median(1024) * 2^2 / 2`.
-    const MERKLE_LEGACY_PER_NODE_DEPTH2: u64 = 2048;
+    /// The same pool's historic pre-parity amount: `median * 2^2 / 2`, i.e.
+    /// twice the candidate price.
+    fn merkle_legacy_per_node_depth2() -> Amount {
+        crate::payment::pricing::calculate_price(0) * Amount::from(2u64)
+    }
 
     fn make_valid_merkle_proof_bytes() -> (
         [u8; 32],
@@ -5697,13 +5762,13 @@ mod tests {
                     (
                         RewardsAddress::new([0u8; 20]),
                         0,
-                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        merkle_parity_per_node_depth2(),
                     ),
                     // Second paid node: index 999 is way beyond CANDIDATES_PER_POOL (16)
                     (
                         RewardsAddress::new([1u8; 20]),
                         999,
-                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        merkle_parity_per_node_depth2(),
                     ),
                 ],
             };
@@ -5746,13 +5811,13 @@ mod tests {
                     (
                         RewardsAddress::new([0u8; 20]),
                         0,
-                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        merkle_parity_per_node_depth2(),
                     ),
                     // Index 1 with WRONG address — candidate 1's address is [0x01; 20]
                     (
                         RewardsAddress::new([0xFF; 20]),
                         1,
-                        Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                        merkle_parity_per_node_depth2(),
                     ),
                 ],
             };
@@ -5870,12 +5935,12 @@ mod tests {
                     (
                         RewardsAddress::new([0u8; 20]),
                         0,
-                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                        merkle_legacy_per_node_depth2(),
                     ),
                     (
                         RewardsAddress::new([1u8; 20]),
                         1,
-                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                        merkle_legacy_per_node_depth2(),
                     ),
                 ],
             };
@@ -5917,12 +5982,12 @@ mod tests {
                     (
                         RewardsAddress::new([0u8; 20]),
                         0,
-                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                        merkle_legacy_per_node_depth2(),
                     ),
                     (
                         RewardsAddress::new([1u8; 20]),
                         1,
-                        Amount::from(MERKLE_LEGACY_PER_NODE_DEPTH2),
+                        merkle_legacy_per_node_depth2(),
                     ),
                 ],
             };
@@ -5961,12 +6026,12 @@ mod tests {
                         (
                             RewardsAddress::new([0u8; 20]),
                             0,
-                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                            merkle_parity_per_node_depth2(),
                         ),
                         (
                             RewardsAddress::new([1u8; 20]),
                             1,
-                            Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                            merkle_parity_per_node_depth2(),
                         ),
                     ],
                 };
@@ -6059,12 +6124,12 @@ mod tests {
                 (
                     RewardsAddress::new([0u8; 20]),
                     0,
-                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    merkle_parity_per_node_depth2(),
                 ),
                 (
                     RewardsAddress::new([1u8; 20]),
                     1,
-                    Amount::from(MERKLE_PARITY_PER_NODE_DEPTH2),
+                    merkle_parity_per_node_depth2(),
                 ),
             ],
         }
@@ -6739,13 +6804,13 @@ mod tests {
     }
 
     /// Off-curve quote behaviour follows the rollout gate
-    /// [`QUOTE_ARITHMETIC_RECHECK_ENABLED`]. We assert the gate's current
-    /// observe-only stance: an off-curve quote is accepted with no error.
-    /// The enforcement-branch behaviour is exercised separately by
-    /// `adr0004_off_curve_diagnostics_yields_reject_payload` so both branches
-    /// of the const-gated split are covered in CI.
+    /// [`QUOTE_ARITHMETIC_RECHECK_ENABLED`]. The gate now ships enforcing, so
+    /// an off-curve quote must be rejected; the observe-only branch is kept so
+    /// the test still documents the semantics if the gate is ever rolled back.
+    /// The rejection payload itself is exercised separately by
+    /// `adr0004_off_curve_diagnostics_yields_reject_payload`.
     #[test]
-    fn adr0004_observe_only_does_not_reject_off_curve_quote() {
+    fn adr0004_off_curve_quote_follows_rollout_gate() {
         use evmlib::{EncodedPeerId, RewardsAddress};
 
         let mut quote = make_fake_quote_at_records(
@@ -6762,11 +6827,15 @@ mod tests {
             peer_quotes: vec![(EncodedPeerId::new(id), quote)],
         };
 
-        // This test is only meaningful in the observe-only configuration
-        // (which is the default at slice ship). If a future change flips the
-        // const, the assertion documents the regression instead of silently
-        // changing semantics.
-        if !crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+        // Both branches of the const-gated split are asserted, so the test
+        // keeps its meaning whichever way the gate is set rather than going
+        // silently vacuous when it flips.
+        if crate::replication::config::QUOTE_ARITHMETIC_RECHECK_ENABLED {
+            assert!(
+                PaymentVerifier::validate_quote_arithmetic(&payment).is_err(),
+                "enforcing rollout must reject off-curve quotes"
+            );
+        } else {
             assert!(
                 PaymentVerifier::validate_quote_arithmetic(&payment).is_ok(),
                 "observe-only rollout must not reject off-curve quotes"
@@ -6864,10 +6933,15 @@ mod tests {
         let mut candidates = make_candidate_nodes(timestamp);
 
         // Set every candidate price to calculate_price(500) so the pool is
-        // honestly on-curve to start.
+        // honestly on-curve to start. The binding must move with the price:
+        // ADR-0004 requires `price == calculate_price(committed_key_count)`, so
+        // repricing at 500 records while leaving the count at 0 would make the
+        // pool dishonest rather than honest.
         let on_curve = crate::payment::pricing::calculate_price(500);
         for c in &mut candidates {
             c.price = on_curve;
+            c.committed_key_count = 500;
+            c.commitment_pin = Some([0xA5u8; 32]);
         }
         let pool = MerklePaymentCandidatePool {
             midpoint_proof: fake_midpoint_proof(),
