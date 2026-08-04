@@ -40,6 +40,42 @@ pub const QUORUM_THRESHOLD: usize = 4; // floor(CLOSE_GROUP_SIZE / 2) + 1
 /// Maximum number of closest nodes tracking paid status for a key.
 pub const PAID_LIST_CLOSE_GROUP_SIZE: usize = 20;
 
+/// Maximum number of furthest paid-list close-group peers treated as churny
+/// edge voters.
+///
+/// Once the paid-list close group reaches [`PAID_LIST_CLOSE_GROUP_SIZE`], edge
+/// peers are queried, but a negative edge paid-list response does not count
+/// into the paid-list majority denominator. A positive edge response does
+/// count. This absorbs local routing-table disagreement at the boundary of the
+/// paid close group. Undersized groups keep their ordinary strict majority.
+///
+/// This is a **ceiling**, not a fixed width: the effective edge is scaled to
+/// the group by [`ReplicationConfig::paid_list_flex_edge_count`] so the discount stays
+/// proportionate. A fixed four peers is a fifth of the production width but
+/// would be four fifths of a configured width of five, collapsing the voting
+/// core to a single peer.
+pub const PAID_LIST_FLEX_EDGE_COUNT: usize = 4;
+
+/// Divisor fixing the edge as a proportion of the paid close group.
+///
+/// Five gives the production ratio: 20 / 5 = 4 edge voters, matching
+/// [`PAID_LIST_FLEX_EDGE_COUNT`] exactly, so default behaviour is unchanged.
+const PAID_LIST_FLEX_EDGE_DIVISOR: usize = 5;
+
+/// Minimum `Confirmed` paid-list votes required to authorize a key, whatever
+/// the flexible edge does to the denominator.
+///
+/// The edge discount shrinks the denominator, and with it the majority
+/// threshold. Without an absolute floor a sufficiently small or sufficiently
+/// silent group authorizes on a single confirmation — and `PaidListVerified`
+/// writes the paid list and enables repair fetches, so that is the gate
+/// deciding what a node fetches and retains. Three independent confirmations
+/// keeps a lone voter (honest or not) from being decisive; groups genuinely
+/// smaller than this fall back to their strict majority via the `min` in
+/// [`ReplicationConfig::paid_confirm_needed`], since a floor above the group
+/// size would make authorization impossible rather than merely strict.
+pub const PAID_LIST_ABSOLUTE_CONFIRM_FLOOR: usize = 3;
+
 /// Number of closest peers to self eligible for neighbor sync.
 pub const NEIGHBOR_SYNC_SCOPE: usize = 20;
 
@@ -145,7 +181,7 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// bounding the round-2 worst-case disk reads (each request reads at most
 /// `BYTE_SPOTCHECK_MAX` distinct chunks — the openings are coalesced and the
 /// distinct-key count is capped — to build its slice proofs).
-pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
+pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
 ///
@@ -158,6 +194,27 @@ pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
 /// gossip-triggered audit per peer per 30 min), so 4 in-flight per peer leaves
 /// headroom beyond the legitimate round-1 + round-2 overlap.
 pub const MAX_AUDIT_RESPONSES_PER_PEER: u32 = 4;
+
+/// Maximum concurrent digest-only `AuditChallenge` responses from any single
+/// source peer.
+///
+/// Digest challenges are KB-scale replies: at most
+/// `max_incoming_audit_keys(stored_chunks)` bounded disk reads plus BLAKE3
+/// digests. A higher per-source allowance absorbs the three legitimate issuer
+/// subsystems (responsible-chunk audit, prune confirmation, and possession
+/// checks) from one auditor without weakening the existing subtree/byte audit
+/// budget. The multi-MiB subtree and byte challenge paths intentionally keep
+/// [`MAX_AUDIT_RESPONSES_PER_PEER`] exactly unchanged.
+pub const MAX_DIGEST_AUDIT_RESPONSES_PER_PEER: u32 = 8;
+
+/// Cadence of audit-responder capacity and slow-processing summaries.
+///
+/// Each window is reset after logging, so the ranked origins describe current
+/// testnet load rather than being permanently dominated by an old burst.
+pub const AUDIT_RESPONDER_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Number of busiest source peers included in each responder summary window.
+pub const AUDIT_RESPONDER_TOP_ORIGINS: usize = 10;
 
 /// Dedicated global concurrency cap for the HEAVY subtree-audit round 1.
 ///
@@ -330,59 +387,14 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
-/// Protocol identifier for core replication operations (fresh replication,
-/// neighbour sync, verification, fetch, repair, commitment fetch).
+/// Protocol identifier for core replication operations, including the
+/// digest-based responsible-chunk, possession, and prune-confirmation audits.
 ///
-/// Kept at `v2`: none of these messages changed on the wire in the V2-685 slice
-/// audit, so v2 and v3 nodes interoperate on all of them. The two message
-/// families whose *semantics* changed each ride their own id
-/// ([`SUBTREE_AUDIT_PROTOCOL_ID`], [`POSSESSION_AUDIT_PROTOCOL_ID`]) so a version
-/// bump in either cannot partition core replication. A node filters inbound
-/// messages by exact topic match (see the dispatch in `mod.rs`).
+/// Kept at `v2`: the V2-685 work changes only the subtree-audit wire family.
+/// Fresh replication, neighbour sync, fetch, repair, verification, and the
+/// digest-based audit lanes therefore continue interoperating on this id. A node
+/// filters inbound messages by exact topic match (see the dispatch in `mod.rs`).
 pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
-
-/// Protocol identifier for the digest-based possession audits.
-///
-/// Carries the `AuditChallenge`/`AuditResponse` pair shared by the
-/// responsible-chunk audit, the post-replication possession probe, and the
-/// prune-confirmation audit.
-///
-/// These messages keep their wire *shape*, but the digest they carry is now the
-/// domain-separated keyed construction
-/// ([`crate::replication::protocol::compute_audit_digest`]) rather than the
-/// earlier flat prefix hash, so a peer on the old construction and a peer on the
-/// new one compute different digests for the same bytes. Left on the shared core
-/// id, that difference would read as a *confirmed* `DigestMismatch` on every
-/// cross-version exchange, which carries [`AUDIT_FAILURE_TRUST_WEIGHT`] and runs
-/// the responsibility-confirmation path — a false-positive penalty on honest
-/// peers for the whole upgrade window.
-///
-/// Routing them on their own id converts that into a benign pause: a
-/// cross-version challenge is simply not answered, so it lands in the graced
-/// timeout lane instead of the confirmed-failure lane. The rollout effect is the
-/// same bounded one described on [`SUBTREE_AUDIT_PROTOCOL_ID`]: `saorsa-core`'s
-/// `send_request` still records a unit trust failure per unanswered request, and
-/// these lanes probe more often than the 30-minute subtree cooldown, so the dip
-/// is larger than the subtree lane's while still decaying back to neutral. That
-/// is strictly milder than a stream of weight-5 confirmed failures, and milder
-/// than bumping the shared id, which would also break sync, quorum, fetch,
-/// repair and commitment fetch.
-///
-/// `v2` here is the digest generation, not the message shape.
-pub const POSSESSION_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.possession-audit.v2";
-
-/// The id every digest lane asks on.
-///
-/// One function rather than three hand-written constants, because during the
-/// rollout window the id a challenge is sent on selects the digest construction
-/// it comes back in: a lane that asked on the core id would be asking for the
-/// superseded one, which is preprocessing-weak and is the reason it was
-/// replaced. A lane cannot get that wrong if it cannot choose. Pinned by
-/// `every_digest_lane_asks_on_the_dedicated_id`.
-#[must_use]
-pub const fn possession_challenge_protocol() -> &'static str {
-    POSSESSION_AUDIT_PROTOCOL_ID
-}
 
 /// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
 /// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
@@ -416,10 +428,10 @@ const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
 
-/// Maximum wire size for a message on either audit protocol family.
+/// Maximum wire size for a message in the subtree-audit protocol family.
 ///
-/// The 10 MiB core ceiling is sized for hint batches, which no audit body
-/// carries. Applying it to the audit families would let a peer make this node
+/// The 10 MiB core ceiling is sized for hint batches, which no subtree-audit
+/// body carries. Applying it to the subtree family would let a peer make this node
 /// allocate and decode megabytes of attacker-shaped collection before any
 /// family, session or admission check has run — those checks all read fields of
 /// the decoded body, so they cannot come first. Checking the encoded length
@@ -429,14 +441,14 @@ pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1
 /// Sized against the largest legitimate audit body, the round-1
 /// `SubtreeAuditResponse::Proof`: at the `MAX_COMMITMENT_KEY_COUNT` cap a
 /// subtree is at most 1,024 leaves of ~100 bytes each, plus the sibling cut
-/// hashes and the signed commitment, so ~110 KiB. Every other audit body —
-/// both challenges, the round-2 response — is far smaller. This leaves roughly
+/// hashes and the signed commitment, so ~110 KiB. Every other subtree body is
+/// far smaller. This leaves roughly
 /// 4x headroom over the worst legitimate case while cutting the pre-admission
 /// allocation ceiling by a factor of 20.
-pub const MAX_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
+pub const MAX_SUBTREE_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
 const _: () = assert!(
-    MAX_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
-    "the audit-family ceiling must be tighter than the core one, or it is pointless"
+    MAX_SUBTREE_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
+    "the subtree-audit ceiling must be tighter than the core one, or it is pointless"
 );
 
 /// Maximum block openings per round-2 [`SubtreeSliceChallenge`].
@@ -574,6 +586,29 @@ const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(VERIFICATION_REQUEST_TIMEOUT_SECS);
 
+/// Maximum ready hints processed by one verification cycle.
+///
+/// The pending queue may be much larger. Each cycle takes a sender-fair bounded
+/// sample, retaining corroboration/age priority within each sender's share.
+/// This value keeps today's roughly 6k-chunk average bootstrap within one cycle
+/// while preventing a full emergency-cap queue from creating one enormous
+/// verification round.
+pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
+
+/// Maximum keys accepted in one incoming verification request.
+///
+/// Senders aggregate all keys for a peer into one request. Matching this limit
+/// to the cycle bound lets an honest round use one request per peer while still
+/// bounding the LMDB work performed on the responder's serial replication
+/// message path. Oversized requests are rejected as an empty, wire-compatible
+/// verification response.
+pub const MAX_INCOMING_VERIFICATION_KEYS: usize = MAX_VERIFICATION_KEYS_PER_CYCLE;
+
+/// Maximum simultaneous verification request/response exchanges.
+/// Larger rounds remain fully batched but wait for a permit instead of
+/// launching hundreds or thousands of network requests at once.
+pub const MAX_CONCURRENT_VERIFICATION_REQUESTS: usize = 32;
+
 /// Fetch request timeout.
 const FETCH_REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Fetch request timeout.
@@ -586,72 +621,6 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
-
-/// ROLLOUT GATE (V2-685) — **temporary. Must be turned off in a follow-up.**
-///
-/// # Why this exists
-///
-/// The three digest-based audit lanes — the responsible-chunk audit, the
-/// post-replication possession probe, and prune confirmation — moved onto
-/// [`POSSESSION_AUDIT_PROTOCOL_ID`] because their digest construction changed.
-/// During the auto-upgrade window a v3 auditor's challenge to a still-v2 peer is
-/// therefore never answered, and an unanswered challenge times out.
-///
-/// Those three lanes report an `ApplicationFailure` carrying
-/// [`AUDIT_FAILURE_TRUST_WEIGHT`]
-/// on a timeout — weight 5, the confirmed-failure weight. Left alone, every
-/// honest peer on the other side of the version boundary would be penalised at
-/// confirmed-failure severity, repeatedly, for the entire window, for a skew
-/// that is not its fault. (The subtree lane already graces its timeouts and is
-/// unaffected; see `handle_subtree_failed_audit`.)
-///
-/// # What it does while `true`
-///
-/// The three lanes grace a timeout exactly as the subtree lane does: no
-/// application trust event and no holder-credit revocation. This is not a free
-/// pass — `saorsa-core`'s `send_request` still records its own unit transport
-/// failure for an unanswered request, so a peer that never answers still drifts
-/// down, just at weight 1 instead of 5.
-///
-/// The grace covers *silence only*. A peer that answers is being judged on what
-/// it said, so every confirmed outcome — digest mismatch, absent key, malformed
-/// reply, explicit rejection — is penalised throughout the window exactly as
-/// before. This is deliberately not an amnesty for cheating; it is only a
-/// refusal to read "did not reply" as "lost the data".
-///
-/// # FOLLOW-UP — required, do not ship this permanently
-///
-/// Once the fleet has upgraded past the possession-audit protocol move, set this
-/// to `false`, then delete the constant and inline the guarded branches so the
-/// timeout penalty is restored unconditionally. Until that lands, a peer that
-/// silently drops audit challenges is under-penalised. Tracked on V2-685.
-///
-/// The guarded code is gated by this constant rather than commented out on
-/// purpose: it stays compiled, type-checked, linted and covered by tests while
-/// disabled, so it cannot rot before it is switched back on.
-///
-/// # What this gate does NOT cover
-///
-/// It stops a peer being penalised for silence; it does not let anyone earn
-/// holder credit. Credit is written only by a completed two-round subtree audit
-/// and expires after
-/// [`PROVER_ENTRY_TTL`](crate::replication::recent_provers::PROVER_ENTRY_TTL),
-/// and the subtree lane has no legacy accommodation (its round-1 leaf changed
-/// shape, so answering an old asker would mean carrying both proof shapes). So
-/// across a version boundary neither side can refresh the other's credit, and 40
-/// minutes in, a peer on the other release counts as uncredited: its `Present`
-/// vote is downgraded to `Unresolved` in the presence quorum, and keys reach
-/// verification through the paid-list path or are retried. Pruning does not
-/// consult holder credit and is unaffected.
-///
-/// That failure is conservative by design and is left in place rather than
-/// suppressed — waiving the downgrade would count `Present` votes from peers that
-/// proved nothing, which can let a false claim stand in for a replica and
-/// suppress a repair. It does mean the mixed-version window should be kept short
-/// and watched rather than left open for days. ADR-0009 records the reasoning.
-///
-/// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
-pub const GRACE_POSSESSION_AUDIT_TIMEOUTS: bool = true;
 
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
@@ -779,8 +748,22 @@ pub const AUDIT_SPOTCHECK_COUNT: u32 = 5;
 /// finish well within it.
 pub const SUBTREE_AUDIT_TIMEOUT_LEAF_HINT: usize = 1000;
 
-/// Maximum number of prune-confirmation audit challenges sent per prune pass.
-pub const MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS: usize = 64;
+/// Maximum mature records selected for prune-confirmation auditing per pass.
+///
+/// This bounds local digest/proof bookkeeping independently from the number
+/// of network requests. Keys for the same peer are batched below.
+pub const MAX_PRUNE_AUDIT_CANDIDATES_PER_PASS: usize = 1024;
+
+/// Maximum initial prune-confirmation audit requests sent per pass.
+///
+/// A request may contain multiple keys. Keeping this separate from the
+/// candidate cap prevents the old candidate-to-peer-edge accounting from
+/// limiting a production pass to roughly nine records.
+pub const MAX_PRUNE_AUDIT_REQUESTS_PER_PASS: usize = 256;
+
+/// Maximum mature records deleted through the complete width-20 fast path per
+/// pass.
+pub const MAX_FAST_PRUNE_DELETIONS_PER_PASS: usize = 2048;
 
 /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before proceeding
 /// with bootstrap sync. Covers bootstrap nodes with no peers to connect to.
@@ -919,10 +902,10 @@ impl ReplicationConfig {
                 self.quorum_threshold, self.close_group_size,
             ));
         }
-        if self.close_group_size > MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS {
+        if self.close_group_size > MAX_PRUNE_AUDIT_REQUESTS_PER_PASS {
             return Err(format!(
-                "close_group_size ({}) must be <= MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS ({})",
-                self.close_group_size, MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS,
+                "close_group_size ({}) must be <= MAX_PRUNE_AUDIT_REQUESTS_PER_PASS ({})",
+                self.close_group_size, MAX_PRUNE_AUDIT_REQUESTS_PER_PASS,
             ));
         }
         if self.paid_list_close_group_size == 0 {
@@ -983,6 +966,36 @@ impl ReplicationConfig {
         paid_group_size / 2 + 1
     }
 
+    /// Confirmations required to authorize a key, given the edge-discounted
+    /// denominator and the true (undiscounted) group size.
+    ///
+    /// The strict majority of the discounted group, raised to
+    /// [`PAID_LIST_ABSOLUTE_CONFIRM_FLOOR`] so a shrunken denominator cannot
+    /// make a single voter decisive — but never above `full_group_size`, which
+    /// would demand more confirmations than there are peers to give them.
+    #[must_use]
+    pub fn paid_confirm_needed(effective_group_size: usize, full_group_size: usize) -> usize {
+        Self::confirm_needed(effective_group_size)
+            .max(PAID_LIST_ABSOLUTE_CONFIRM_FLOOR.min(full_group_size))
+    }
+
+    /// Number of furthest peers treated as churny edge voters for a paid close
+    /// group of `paid_group_size`, when the group is at full configured width.
+    ///
+    /// Scaled to the group so the discount stays proportionate at every
+    /// configured width, and capped at [`PAID_LIST_FLEX_EDGE_COUNT`]. Returns
+    /// `0` for an undersized group, which keeps its ordinary strict majority.
+    #[must_use]
+    pub fn paid_list_flex_edge_count(
+        paid_group_size: usize,
+        configured_group_size: usize,
+    ) -> usize {
+        if paid_group_size < configured_group_size {
+            return 0;
+        }
+        PAID_LIST_FLEX_EDGE_COUNT.min(configured_group_size / PAID_LIST_FLEX_EDGE_DIVISOR)
+    }
+
     /// Returns a random duration in `[neighbor_sync_interval_min,
     /// neighbor_sync_interval_max]`.
     #[must_use]
@@ -991,6 +1004,30 @@ impl ReplicationConfig {
             self.neighbor_sync_interval_min,
             self.neighbor_sync_interval_max,
         )
+    }
+
+    /// Maximum age of an outstanding bootstrap capacity-rejection record.
+    ///
+    /// A source is revisited only after the round-robin loop has advanced
+    /// through every neighbor batch. Size the window from that full configured
+    /// cycle (including one request deadline per peer), the peer cooldown, and
+    /// one slow-cadence interval of slack. This prevents a live source near the
+    /// end of a 20-peer cycle from being expired before it can legitimately
+    /// re-deliver its rejected hints.
+    #[must_use]
+    pub fn capacity_rejected_max_age(&self) -> Duration {
+        let batch_size = self.neighbor_sync_peer_count.max(1);
+        let batch_count = self.neighbor_sync_scope.saturating_add(batch_size - 1) / batch_size;
+        let batch_count = u32::try_from(batch_count).unwrap_or(u32::MAX);
+        let peer_count = u32::try_from(self.neighbor_sync_scope).unwrap_or(u32::MAX);
+        let full_cycle = self
+            .neighbor_sync_interval_max
+            .saturating_mul(batch_count)
+            .saturating_add(self.verification_request_timeout.saturating_mul(peer_count));
+
+        full_cycle
+            .max(self.neighbor_sync_cooldown)
+            .saturating_add(self.neighbor_sync_interval_max)
     }
 
     /// Compute the number of keys to sample for an audit round, scaled
@@ -1208,31 +1245,15 @@ mod tests {
     }
 
     #[test]
-    fn core_replication_id_stays_v2_changed_families_ride_their_own_ids() {
-        // Core replication stays on v2 (mixed-version fleets keep replicating).
-        // The two families whose semantics changed each ride their own id, so
-        // either can be bumped without partitioning core replication, and a
-        // message of one family never lands on another family's handler — see
-        // the id/body guard in `mod.rs`.
+    fn core_replication_id_stays_v2_and_subtree_rides_its_own_id() {
+        // Core replication, including all digest audit lanes, stays on v2.
+        // Only the subtree family changed and therefore receives a separate id.
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
         assert_eq!(
             SUBTREE_AUDIT_PROTOCOL_ID,
             "autonomi.ant.replication.subtree-audit.v1"
         );
-        assert_eq!(
-            POSSESSION_AUDIT_PROTOCOL_ID,
-            "autonomi.ant.replication.possession-audit.v2"
-        );
-        let ids = [
-            REPLICATION_PROTOCOL_ID,
-            SUBTREE_AUDIT_PROTOCOL_ID,
-            POSSESSION_AUDIT_PROTOCOL_ID,
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            for b in ids.iter().skip(i + 1) {
-                assert_ne!(a, b, "protocol ids must be pairwise distinct");
-            }
-        }
+        assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
     }
 
     #[test]
@@ -1348,9 +1369,9 @@ mod tests {
     }
 
     #[test]
-    fn close_group_size_exceeding_prune_audit_budget_rejected() {
+    fn close_group_size_exceeding_prune_audit_request_budget_rejected() {
         let config = ReplicationConfig {
-            close_group_size: MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS + 1,
+            close_group_size: MAX_PRUNE_AUDIT_REQUESTS_PER_PASS + 1,
             quorum_threshold: QUORUM_THRESHOLD,
             ..ReplicationConfig::default()
         };
@@ -1358,7 +1379,7 @@ mod tests {
         let err = config.validate().unwrap_err();
 
         assert!(
-            err.contains("MAX_PRUNE_AUDIT_CHALLENGES_PER_PASS"),
+            err.contains("MAX_PRUNE_AUDIT_REQUESTS_PER_PASS"),
             "error should mention prune audit budget: {err}"
         );
     }
@@ -1380,6 +1401,46 @@ mod tests {
             ..ReplicationConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn capacity_rejection_expiry_covers_full_configured_sync_cycle() {
+        let config = ReplicationConfig {
+            // Keep the scope deliberately indivisible by the batch size so the
+            // expectation verifies that the final partial batch is included.
+            neighbor_sync_scope: 21,
+            neighbor_sync_peer_count: 4,
+            ..ReplicationConfig::default()
+        };
+        let batches = config
+            .neighbor_sync_scope
+            .div_ceil(config.neighbor_sync_peer_count);
+        let cycle_cadence = config.neighbor_sync_interval_max * u32::try_from(batches).unwrap();
+        let request_budget = config.verification_request_timeout
+            * u32::try_from(config.neighbor_sync_scope).unwrap();
+        let full_cycle = cycle_cadence + request_budget;
+
+        assert_eq!(
+            config.capacity_rejected_max_age(),
+            full_cycle + config.neighbor_sync_interval_max,
+        );
+        assert!(config.capacity_rejected_max_age() > Duration::from_secs(70 * 60));
+    }
+
+    #[test]
+    fn capacity_rejection_expiry_tracks_runtime_sync_configuration() {
+        let config = ReplicationConfig {
+            neighbor_sync_scope: 9,
+            neighbor_sync_peer_count: 2,
+            neighbor_sync_interval_max: Duration::from_secs(10),
+            neighbor_sync_cooldown: Duration::from_secs(100),
+            verification_request_timeout: Duration::from_secs(1),
+            ..ReplicationConfig::default()
+        };
+
+        // Five batches take 50s and their nine request budgets take 9s, so
+        // the 100s cooldown dominates; one 10s cadence interval is slack.
+        assert_eq!(config.capacity_rejected_max_age(), Duration::from_secs(110));
     }
 
     #[test]
@@ -1436,13 +1497,14 @@ mod tests {
         assert_eq!(ReplicationConfig::audit_sample_count(25), 5);
         assert_eq!(ReplicationConfig::audit_sample_count(100), 10);
         assert_eq!(ReplicationConfig::audit_sample_count(1_000), 31);
+        assert_eq!(ReplicationConfig::audit_sample_count(7_000), 83);
         assert_eq!(ReplicationConfig::audit_sample_count(10_000), 100);
         assert_eq!(ReplicationConfig::audit_sample_count(1_000_000), 1_000);
     }
 
     #[test]
     fn responsible_audit_key_limit_matches_audit_sample_count() {
-        for stored_keys in [0, 1, 3, 4, 25, 100, 1_000, 10_000, 1_000_000] {
+        for stored_keys in [0, 1, 3, 4, 25, 100, 1_000, 7_000, 10_000, 1_000_000] {
             assert_eq!(
                 ReplicationConfig::responsible_audit_key_limit(stored_keys),
                 ReplicationConfig::audit_sample_count(stored_keys),
@@ -1493,6 +1555,76 @@ mod tests {
         assert_eq!(ReplicationConfig::confirm_needed(3), 2);
         assert_eq!(ReplicationConfig::confirm_needed(4), 3);
         assert_eq!(ReplicationConfig::confirm_needed(20), 11);
+    }
+
+    /// The edge is a proportion of the group, not a fixed four peers.
+    ///
+    /// A fixed four is a fifth of the production width but four fifths of a
+    /// configured width of five, which collapsed the voting core to one peer.
+    #[test]
+    fn flex_edge_scales_with_the_configured_group() {
+        // Production width is unchanged: 20 / 5 == PAID_LIST_FLEX_EDGE_COUNT.
+        assert_eq!(
+            ReplicationConfig::paid_list_flex_edge_count(
+                PAID_LIST_CLOSE_GROUP_SIZE,
+                PAID_LIST_CLOSE_GROUP_SIZE
+            ),
+            PAID_LIST_FLEX_EDGE_COUNT,
+        );
+
+        // Small widths keep a majority-sized core rather than a single peer.
+        assert_eq!(ReplicationConfig::paid_list_flex_edge_count(5, 5), 1);
+        assert_eq!(ReplicationConfig::paid_list_flex_edge_count(10, 10), 2);
+        assert_eq!(ReplicationConfig::paid_list_flex_edge_count(15, 15), 3);
+
+        // Never more than the ceiling, however wide the group is configured.
+        assert_eq!(
+            ReplicationConfig::paid_list_flex_edge_count(100, 100),
+            PAID_LIST_FLEX_EDGE_COUNT,
+        );
+
+        // An undersized group keeps its ordinary strict majority.
+        assert_eq!(ReplicationConfig::paid_list_flex_edge_count(19, 20), 0);
+    }
+
+    /// A shrunken denominator must never make one voter decisive.
+    #[test]
+    fn paid_confirm_needed_applies_an_absolute_floor() {
+        // The floor binds where the discounted majority would be trivial.
+        assert_eq!(
+            ReplicationConfig::paid_confirm_needed(1, 5),
+            PAID_LIST_ABSOLUTE_CONFIRM_FLOOR
+        );
+        assert_eq!(
+            ReplicationConfig::paid_confirm_needed(2, 5),
+            PAID_LIST_ABSOLUTE_CONFIRM_FLOOR
+        );
+
+        // Above the floor the strict majority governs, unchanged.
+        assert_eq!(ReplicationConfig::paid_confirm_needed(16, 20), 9);
+        assert_eq!(ReplicationConfig::paid_confirm_needed(20, 20), 11);
+
+        // The floor never demands more confirmations than there are peers.
+        assert_eq!(ReplicationConfig::paid_confirm_needed(1, 1), 1);
+        assert_eq!(ReplicationConfig::paid_confirm_needed(2, 2), 2);
+    }
+
+    /// The reviewed collapse: at a configured width of five, four fixed edge
+    /// voters left a core of one, so a single `Confirmed` authorized the key.
+    #[test]
+    fn small_configured_group_cannot_authorize_on_one_vote() {
+        const SMALL_GROUP: usize = 5;
+
+        let edge = ReplicationConfig::paid_list_flex_edge_count(SMALL_GROUP, SMALL_GROUP);
+        let core = SMALL_GROUP - edge;
+        assert!(
+            core > 1,
+            "the voting core must not collapse to a single peer"
+        );
+        assert!(
+            ReplicationConfig::paid_confirm_needed(core, SMALL_GROUP) > 1,
+            "a lone confirmation must not authorize a key"
+        );
     }
 
     #[test]

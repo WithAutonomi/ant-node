@@ -112,22 +112,17 @@ const DOMAIN_BLOCK_NODE: &[u8] = b"autonomi.ant.audit.slice.block-node.v1";
 /// Domain-separation context for deriving the per-audit BLAKE3 key of the
 /// nonced block tree.
 ///
-/// Versioned alongside the subtree-audit protocol id, and distinct from the
-/// possession lane's [`AUDIT_DIGEST_KEY_CONTEXT`], so the two lanes cannot
-/// derive a colliding key from the same challenge material.
-///
-/// [`AUDIT_DIGEST_KEY_CONTEXT`]: crate::replication::protocol::AUDIT_DIGEST_KEY_CONTEXT
+/// Versioned alongside the subtree-audit protocol id and distinct from every
+/// other BLAKE3 use in the replication subsystem.
 const BLOCK_KEY_CONTEXT: &str = "autonomi.ant.audit.slice.block-key.v1";
 
 /// Per-audit keying material for the nonced block tree, derived from the fresh
 /// nonce, the challenged peer and the chunk key. Constant across a chunk's blocks.
 ///
-/// Uses BLAKE3's `derive_key` mode, the same construction as the possession
-/// lane's [`compute_audit_digest`] — that is what ADR-0009's "one freshness
-/// derivation across all audit lanes" means concretely. `derive_key` separates
-/// domains at the mode level (its own flag bits), so this key cannot collide
-/// with a plain or keyed hash of the same bytes; a plain hash over a domain
-/// prefix would separate only by convention.
+/// Uses BLAKE3's `derive_key` mode. `derive_key` separates domains at the mode
+/// level (its own flag bits), so this key cannot collide with a plain or keyed
+/// hash of the same bytes; a plain hash over a domain prefix would separate only
+/// by convention.
 ///
 /// The result is then used as a BLAKE3 **key**, not a message prefix. That is
 /// what forces every BLAKE3 chunk of a block leaf to depend on the nonce: keyed
@@ -139,7 +134,6 @@ const BLOCK_KEY_CONTEXT: &str = "autonomi.ant.audit.slice.block-key.v1";
 /// node store ~10.7% less than each block and still reconstruct the leaf for any
 /// fresh nonce.
 ///
-/// [`compute_audit_digest`]: crate::replication::protocol::compute_audit_digest
 #[must_use]
 fn nonced_block_key(nonce: &[u8; 32], peer: &[u8; 32], key: &XorName) -> [u8; 32] {
     let mut h = blake3::Hasher::new_derive_key(BLOCK_KEY_CONTEXT);
@@ -938,14 +932,10 @@ mod tests {
         }
     }
 
-    // ADR-0009 claims ONE freshness derivation across every audit lane. That is
-    // only true if this lane and the possession lane derive their key the same
-    // way: BLAKE3 `derive_key` mode over `nonce ‖ peer ‖ key`, under a
-    // per-lane context string. The slice lane previously used a plain hash with
-    // a domain prefix, which separates domains only by convention, so the two
-    // constructions did not actually match and the claim was overstated.
+    // The slice proof uses BLAKE3 `derive_key` mode over
+    // `nonce ‖ peer ‖ key` under a subtree-specific context string.
     #[test]
-    fn block_key_uses_the_same_derivation_as_the_possession_lane() {
+    fn block_key_uses_the_subtree_domain_separated_derivation() {
         let mut expected = blake3::Hasher::new_derive_key(BLOCK_KEY_CONTEXT);
         expected.update(&NONCE);
         expected.update(&PEER);
@@ -953,7 +943,7 @@ mod tests {
         assert_eq!(
             nonced_block_key(&NONCE, &PEER, &KEY),
             *expected.finalize().as_bytes(),
-            "block key must use derive_key mode, like compute_audit_digest"
+            "block key must use derive_key mode"
         );
 
         // Mode separation is the point: the same material under a plain hash,
@@ -967,22 +957,6 @@ mod tests {
             nonced_block_key(&NONCE, &PEER, &KEY),
             *plain.finalize().as_bytes(),
             "derive_key mode must not coincide with a plain domain-prefixed hash"
-        );
-
-        // The two lanes must never derive the SAME key from the same challenge
-        // material — that is what the distinct context strings buy.
-        assert_ne!(
-            nonced_block_key(&NONCE, &PEER, &KEY),
-            {
-                let mut other = blake3::Hasher::new_derive_key(
-                    crate::replication::protocol::AUDIT_DIGEST_KEY_CONTEXT,
-                );
-                other.update(&NONCE);
-                other.update(&PEER);
-                other.update(&KEY);
-                *other.finalize().as_bytes()
-            },
-            "the slice and possession lanes must derive different keys"
         );
     }
 

@@ -3,8 +3,8 @@
 //! After a node fresh-replicates a chunk, every close-group peer responsible
 //! for it is checked 5-15 minutes later for actual possession. The check is a
 //! single-key cryptographic
-//! [`AuditChallenge`]: the probed peer must return
-//! `compute_audit_digest(nonce, peer_id, key, bytes)` computed over the
+//! [`AuditChallenge`]: the probed
+//! peer must return `BLAKE3(nonce ‖ peer_id ‖ key ‖ bytes)` computed over the
 //! chunk it claims to hold. It cannot produce that digest without the bytes, so
 //! — unlike a self-reported presence flag — a peer cannot escape the check by
 //! falsely asserting possession. A peer that holds the chunk earns nothing —
@@ -15,17 +15,10 @@
 //! push is irrelevant: a peer the push never reached is still checked and
 //! penalised if it lacks the chunk.
 //!
-//! Peer-side malformed, rejected, or mismatched responses are audit failures. A
-//! matching bootstrap claim uses the shared bootstrap-claim grace/abuse tracker.
-//!
-//! A peer unreachable at check time would normally be penalised at audit
-//! severity too, matching the responsible-chunk `AuditChallenge` path, but that
-//! is currently suspended: this lane moved to its own protocol id, so a peer on
-//! the far side of the upgrade never answers, and
-//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] graces silence until the fleet has moved
-//! over. See `probe_outcome_is_penalised`.
-//!
-//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: crate::replication::config::GRACE_POSSESSION_AUDIT_TIMEOUTS
+//! A peer unreachable at check time is penalised immediately at audit severity,
+//! matching the responsible-chunk `AuditChallenge` path. A matching bootstrap
+//! claim uses the shared bootstrap-claim grace/abuse tracker; peer-side
+//! malformed, rejected, or mismatched responses are audit failures.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -37,10 +30,11 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::ant_protocol::XorName;
-use crate::logging::{debug, warn};
+use crate::logging::{debug, info, warn};
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
-    possession_challenge_protocol, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    GRACE_POSSESSION_AUDIT_TIMEOUTS,
+    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -55,6 +49,10 @@ use super::REPLICATION_TRUST_WEIGHT;
 /// budget is the audit-response timeout sized for a single chunk.
 const POSSESSION_PROBE_KEY_COUNT: usize = 1;
 
+pub(crate) fn possession_probe_response_timeout(config: &ReplicationConfig) -> Duration {
+    config.audit_response_timeout(POSSESSION_PROBE_KEY_COUNT)
+}
+
 /// A scheduled possession check for one freshly-replicated chunk.
 pub struct PossessionCheckEvent {
     /// Content-address of the chunk.
@@ -64,18 +62,16 @@ pub struct PossessionCheckEvent {
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
-#[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum ProbeOutcome {
     /// Peer returned a digest proving it holds the chunk's bytes.
     Present,
     /// Peer failed the audit challenge: absent sentinel, digest mismatch,
     /// rejection, mismatched challenge ID, wrong digest count, or malformed reply.
-    Failed,
-    /// No response (transport error / deadline). Penalised at audit-failure
-    /// severity — except while the rollout gate graces silence; see
-    /// [`probe_outcome_is_penalised`].
-    Timeout,
+    Failed(PossessionFailureReason),
+    /// No response. Penalised immediately at audit-failure severity; the class
+    /// is node-local observability only.
+    NoResponse(AuditFailureClass),
     /// Peer returned a matching bootstrap claim. Graced only through the shared
     /// bootstrap-claim tracker.
     BootstrapClaim,
@@ -83,28 +79,32 @@ enum ProbeOutcome {
     Inconclusive,
 }
 
-/// Whether a probe outcome is reported as an audit-severity failure.
-///
-/// `Failed` is the peer answering and being wrong — the absent sentinel, a
-/// digest that does not match, a rejection. That is evidence, and it is
-/// penalised throughout.
-///
-/// `Timeout` is silence, and while the [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]
-/// rollout gate is set it is graced: a peer on the far side of the
-/// possession-audit protocol move never answers this lane, so its silence says
-/// nothing about whether it holds the chunk. Penalising it would punish honest
-/// peers for a version skew for the whole upgrade window.
-///
-/// Exhaustive rather than a catch-all, so a new outcome cannot silently inherit
-/// "not penalised", and extracted as a predicate so the rollout decision can be
-/// asserted without driving a live probe.
-#[must_use]
-fn probe_outcome_is_penalised(outcome: ProbeOutcome) -> bool {
-    match outcome {
-        ProbeOutcome::Failed => true,
-        ProbeOutcome::Timeout => !GRACE_POSSESSION_AUDIT_TIMEOUTS,
-        // Proven, claimed-and-tracked, or never actually asked.
-        ProbeOutcome::Present | ProbeOutcome::BootstrapClaim | ProbeOutcome::Inconclusive => false,
+/// Exact reason a responsive peer failed a possession proof check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PossessionFailureReason {
+    ResponseDecode,
+    UnexpectedResponseType,
+    DigestChallengeIdMismatch,
+    DigestCountMismatch,
+    AbsentKey,
+    DigestMismatch,
+    BootstrapChallengeIdMismatch,
+    Rejected,
+}
+
+#[cfg(any(feature = "logging", test))]
+impl PossessionFailureReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResponseDecode => "response_decode",
+            Self::UnexpectedResponseType => "unexpected_response_type",
+            Self::DigestChallengeIdMismatch => "digest_challenge_id_mismatch",
+            Self::DigestCountMismatch => "digest_count_mismatch",
+            Self::AbsentKey => "absent_key",
+            Self::DigestMismatch => "digest_mismatch",
+            Self::BootstrapChallengeIdMismatch => "bootstrap_challenge_id_mismatch",
+            Self::Rejected => "rejected",
+        }
     }
 }
 
@@ -132,6 +132,7 @@ pub fn random_delay(min: Duration, max: Duration) -> Duration {
 ///
 /// A peer that fails to prove possession, including by timeout, is penalised at
 /// `AuditChallenge` severity immediately. A responsive peer is left unrewarded.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_possession_check(
     key: XorName,
     peers: Vec<PeerId>,
@@ -139,6 +140,7 @@ pub(crate) async fn run_possession_check(
     storage: &Arc<LmdbStorage>,
     config: &ReplicationConfig,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     shutdown: &CancellationToken,
 ) {
     let key_hex = hex::encode(key);
@@ -160,39 +162,35 @@ pub(crate) async fn run_possession_check(
     };
 
     // Single-key probe budget, matched to the audit response timeout's
-    // bandwidth-calibrated deadline: generous for an honest local-disk read, and
-    // a liveness bound rather than an anti-relay one — the reply is one digest,
-    // so no deadline prices a relay out of producing it (ADR-0009).
-    let probe_timeout = config.audit_response_timeout(POSSESSION_PROBE_KEY_COUNT);
+    // bandwidth-calibrated deadline (tight enough that a relay that must refetch
+    // the bytes blows it, generous for an honest local-disk read).
+    let probe_timeout = possession_probe_response_timeout(config);
 
     for peer in peers {
         if shutdown.is_cancelled() {
             return;
         }
-        match probe_once(&key, &local_bytes, &peer, p2p_node, probe_timeout).await {
+        match probe_once(
+            &key,
+            &local_bytes,
+            &peer,
+            p2p_node,
+            audit_challenge_coordinator,
+            probe_timeout,
+        )
+        .await
+        {
             ProbeOutcome::Present => {
                 debug!("Possession check: {peer} proved possession of {key_hex}");
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
             }
-            ProbeOutcome::Failed => {
+            ProbeOutcome::Failed(reason) => {
                 clear_possession_bootstrap_claim(&peer, sync_state).await;
-                report_possession_audit_failure(
-                    &peer,
-                    &key_hex,
-                    "failed to prove possession",
-                    p2p_node,
-                )
-                .await;
+                report_possession_confirmed_failure(&peer, &key_hex, reason, p2p_node).await;
             }
-            ProbeOutcome::Timeout => {
-                if probe_outcome_is_penalised(ProbeOutcome::Timeout) {
-                    report_possession_audit_failure(&peer, &key_hex, "timed out", p2p_node).await;
-                } else {
-                    debug!(
-                        "Possession check: {peer} timed out for {key_hex}; graced during the \
-                         possession-audit protocol rollout (not penalised)"
-                    );
-                }
+            ProbeOutcome::NoResponse(class) => {
+                audit_metrics::record_audit_no_response(AuditType::Possession, class);
+                report_possession_audit_failure(&peer, &key_hex, class, p2p_node).await;
             }
             ProbeOutcome::BootstrapClaim => {
                 handle_possession_bootstrap_claim(&peer, &key_hex, p2p_node, config, sync_state)
@@ -214,13 +212,45 @@ async fn clear_possession_bootstrap_claim(
     sync_state.write().await.clear_active_bootstrap_claim(peer);
 }
 
+async fn report_possession_confirmed_failure(
+    peer: &PeerId,
+    key_hex: &str,
+    failure_reason: PossessionFailureReason,
+    p2p_node: &Arc<P2PNode>,
+) {
+    warn!(
+        audit_type = AuditType::Possession.as_str(),
+        audit_failure_class = "confirmed",
+        possession_failure_reason = failure_reason.as_str(),
+        peer = %peer,
+        key = %key_hex,
+        trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
+        "Possession check: {peer} failed to prove possession for {key_hex} ({}); penalising at audit severity",
+        failure_reason.as_str()
+    );
+    p2p_node
+        .report_trust_event(
+            peer,
+            TrustEvent::ApplicationFailure(AUDIT_FAILURE_TRUST_WEIGHT),
+        )
+        .await;
+}
+
 async fn report_possession_audit_failure(
     peer: &PeerId,
     key_hex: &str,
-    reason: &str,
+    failure_class: AuditFailureClass,
     p2p_node: &Arc<P2PNode>,
 ) {
-    warn!("Possession check: {peer} {reason} for {key_hex}; penalising at audit severity");
+    warn!(
+        audit_type = AuditType::Possession.as_str(),
+        audit_failure_class = failure_class.as_str(),
+        peer = %peer,
+        key = %key_hex,
+        trust_weight = AUDIT_FAILURE_TRUST_WEIGHT,
+        "Possession check: {peer} {} for {key_hex}; penalising at audit severity",
+        failure_class.as_str()
+    );
     p2p_node
         .report_trust_event(
             peer,
@@ -290,11 +320,13 @@ async fn handle_possession_bootstrap_claim(
 /// matching bootstrap response is a `BootstrapClaim`; a local encode failure is
 /// `Inconclusive`; peer-side malformed, rejected, or mismatched replies are
 /// `Failed`.
+#[allow(clippy::too_many_lines)]
 async fn probe_once(
     key: &XorName,
     local_bytes: &[u8],
     peer: &PeerId,
     p2p_node: &Arc<P2PNode>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     probe_timeout: Duration,
 ) -> ProbeOutcome {
     // Fresh nonce per probe so a stored digest cannot be replayed, and bind the
@@ -323,33 +355,75 @@ async fn probe_once(
         return ProbeOutcome::Inconclusive;
     };
 
+    let Some(_slot) = audit_challenge_coordinator.acquire(*peer).await else {
+        warn!("Failed to acquire possession audit coordinator slot for {peer}");
+        return ProbeOutcome::Inconclusive;
+    };
+    info!(
+        target: "ant_node::replication::audit_requester",
+        event = "started",
+        audit_origin = AuditType::Possession.as_str(),
+        audit_round = "digest",
+        challenged_peer = %peer,
+        challenge_id,
+        work_items = 1,
+        timeout_ms = probe_timeout.as_millis(),
+        "Outbound audit request started"
+    );
+    let request_started = Instant::now();
     let response = match p2p_node
-        .send_request(
-            peer,
-            possession_challenge_protocol(),
-            encoded,
-            probe_timeout,
-        )
+        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
         .await
     {
-        Ok(response) => response,
+        Ok(response) => {
+            info!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Possession.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = 1,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "response",
+                "Outbound audit request completed"
+            );
+            response
+        }
         Err(e) => {
-            debug!("Possession probe to {peer} got no response: {e}");
-            return ProbeOutcome::Timeout;
+            let error = e.to_string();
+            let (send_error_class, audit_failure_class) =
+                audit_metrics::classify_audit_send_error(&error);
+            warn!(
+                target: "ant_node::replication::audit_requester",
+                event = "completed",
+                audit_origin = AuditType::Possession.as_str(),
+                audit_round = "digest",
+                challenged_peer = %peer,
+                challenge_id,
+                work_items = 1,
+                elapsed_ms = request_started.elapsed().as_millis(),
+                outcome = "no_response",
+                audit_type = AuditType::Possession.as_str(),
+                audit_failure_class = audit_failure_class.as_str(),
+                send_error_class,
+                "Possession probe to {peer} got no response: {e}"
+            );
+            return ProbeOutcome::NoResponse(audit_failure_class);
         }
     };
 
-    let decoded = match ReplicationMessage::decode_audit_response(&response.data) {
+    let decoded = match ReplicationMessage::decode(&response.data) {
         Ok(decoded) => decoded,
         Err(e) => {
             debug!("Failed to decode possession response from {peer}: {e}");
-            return ProbeOutcome::Failed;
+            return ProbeOutcome::Failed(PossessionFailureReason::ResponseDecode);
         }
     };
 
     let ReplicationMessageBody::AuditResponse(resp) = decoded.body else {
         debug!("Unexpected possession response type from {peer}");
-        return ProbeOutcome::Failed;
+        return ProbeOutcome::Failed(PossessionFailureReason::UnexpectedResponseType);
     };
 
     interpret_audit_response(
@@ -377,12 +451,15 @@ fn interpret_audit_response(
             challenge_id: resp_id,
             digests,
         } => {
-            if resp_id != challenge_id || digests.len() != 1 {
-                return ProbeOutcome::Failed;
+            if resp_id != challenge_id {
+                return ProbeOutcome::Failed(PossessionFailureReason::DigestChallengeIdMismatch);
+            }
+            if digests.len() != 1 {
+                return ProbeOutcome::Failed(PossessionFailureReason::DigestCountMismatch);
             }
             let received = digests[0];
             if received == ABSENT_KEY_DIGEST {
-                return ProbeOutcome::Failed;
+                return ProbeOutcome::Failed(PossessionFailureReason::AbsentKey);
             }
             let expected = compute_audit_digest(nonce, challenged_peer_id, key, local_bytes);
             if received == expected {
@@ -391,7 +468,7 @@ fn interpret_audit_response(
                 // A non-sentinel digest that does not match our canonical bytes
                 // proves the peer cannot reproduce the content — treat as absent
                 // (matches the audit's DigestMismatch handling).
-                ProbeOutcome::Failed
+                ProbeOutcome::Failed(PossessionFailureReason::DigestMismatch)
             }
         }
         AuditResponse::Bootstrapping {
@@ -400,10 +477,10 @@ fn interpret_audit_response(
             if resp_id == challenge_id {
                 ProbeOutcome::BootstrapClaim
             } else {
-                ProbeOutcome::Failed
+                ProbeOutcome::Failed(PossessionFailureReason::BootstrapChallengeIdMismatch)
             }
         }
-        AuditResponse::Rejected { .. } => ProbeOutcome::Failed,
+        AuditResponse::Rejected { .. } => ProbeOutcome::Failed(PossessionFailureReason::Rejected),
     }
 }
 
@@ -411,35 +488,6 @@ fn interpret_audit_response(
 mod tests {
     use super::*;
     use crate::replication::config::{POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN};
-
-    // The possession probe's half of the rollout-gate contract (dirvine, PR
-    // #181). Silence is graced while the gate is set; every outcome where the
-    // peer actually answered and was wrong stays penalised.
-    #[test]
-    fn possession_rollout_gate_graces_silence_but_never_a_bad_answer() {
-        assert!(
-            probe_outcome_is_penalised(ProbeOutcome::Failed),
-            "an absent sentinel or mismatched digest is evidence — always penalised"
-        );
-        assert_eq!(
-            probe_outcome_is_penalised(ProbeOutcome::Timeout),
-            !GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "silence is penalised exactly when the rollout gate is off"
-        );
-        // A proven holder, a tracked bootstrap claim, and a probe that never
-        // left this node are all not failures at all — the gate must not have
-        // made any of them one.
-        for outcome in [
-            ProbeOutcome::Present,
-            ProbeOutcome::BootstrapClaim,
-            ProbeOutcome::Inconclusive,
-        ] {
-            assert!(
-                !probe_outcome_is_penalised(outcome),
-                "{outcome:?} is not an audit failure"
-            );
-        }
-    }
 
     const PEER_ID: [u8; 32] = [0x42; 32];
     const NONCE: [u8; 32] = [0x7a; 32];
@@ -451,6 +499,36 @@ mod tests {
         AuditResponse::Digests {
             challenge_id,
             digests,
+        }
+    }
+
+    #[test]
+    fn possession_failure_reasons_have_stable_log_labels() {
+        let cases = [
+            (PossessionFailureReason::ResponseDecode, "response_decode"),
+            (
+                PossessionFailureReason::UnexpectedResponseType,
+                "unexpected_response_type",
+            ),
+            (
+                PossessionFailureReason::DigestChallengeIdMismatch,
+                "digest_challenge_id_mismatch",
+            ),
+            (
+                PossessionFailureReason::DigestCountMismatch,
+                "digest_count_mismatch",
+            ),
+            (PossessionFailureReason::AbsentKey, "absent_key"),
+            (PossessionFailureReason::DigestMismatch, "digest_mismatch"),
+            (
+                PossessionFailureReason::BootstrapChallengeIdMismatch,
+                "bootstrap_challenge_id_mismatch",
+            ),
+            (PossessionFailureReason::Rejected, "rejected"),
+        ];
+
+        for (reason, expected) in cases {
+            assert_eq!(reason.as_str(), expected);
         }
     }
 
@@ -487,7 +565,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![ABSENT_KEY_DIGEST]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::AbsentKey)
+        );
     }
 
     #[test]
@@ -505,7 +586,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![forged]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestMismatch)
+        );
     }
 
     #[test]
@@ -519,7 +603,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID.wrapping_add(1), vec![valid]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestChallengeIdMismatch)
+        );
     }
 
     #[test]
@@ -533,7 +620,10 @@ mod tests {
             CHALLENGE_ID,
             digests_response(CHALLENGE_ID, vec![valid, ABSENT_KEY_DIGEST]),
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::DigestCountMismatch)
+        );
     }
 
     #[test]
@@ -563,7 +653,10 @@ mod tests {
                 challenge_id: CHALLENGE_ID.wrapping_add(1),
             },
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::BootstrapChallengeIdMismatch)
+        );
     }
 
     #[tokio::test]
@@ -597,6 +690,9 @@ mod tests {
                 reason: "nope".to_string(),
             },
         );
-        assert_eq!(verdict, ProbeOutcome::Failed);
+        assert_eq!(
+            verdict,
+            ProbeOutcome::Failed(PossessionFailureReason::Rejected)
+        );
     }
 }

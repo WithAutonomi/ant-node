@@ -8,10 +8,10 @@
 use super::testnet::TestNetworkConfig;
 use super::TestHarness;
 use ant_node::client::compute_address;
+use ant_node::replication::audit_coordinator::AuditChallengeCoordinator;
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
 use ant_node::replication::config::{
-    storage_admission_width, K_BUCKET_SIZE, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
-    SUBTREE_AUDIT_PROTOCOL_ID,
+    storage_admission_width, K_BUCKET_SIZE, REPLICATION_PROTOCOL_ID,
 };
 use ant_node::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, FetchRequest, FetchResponse,
@@ -25,6 +25,7 @@ use ant_node::ReplicationConfig;
 use saorsa_core::identity::PeerId;
 use saorsa_core::{P2PNode, TrustEvent};
 use serial_test::serial;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -47,23 +48,28 @@ const FULL_NODE_SHUN_POSSESSION_DELAY_MAX: Duration = Duration::from_millis(500)
 const DUMMY_PAYMENT_PROOF_LEN: usize = 64;
 /// Dummy proof byte used when a test only needs to reach pre-payment gates.
 const DUMMY_PAYMENT_PROOF_BYTE: u8 = 0x01;
-
-/// The protocol id a body must be sent on for the receive guard to accept it.
-///
-/// Mirrors `body_matches_protocol` in `replication::mod`: subtree-audit bodies
-/// ride [`SUBTREE_AUDIT_PROTOCOL_ID`], the digest-based possession pair rides
-/// [`POSSESSION_AUDIT_PROTOCOL_ID`], everything else stays on the core id.
-/// Deriving it from the body — rather than hardcoding the core id — means a
-/// future family move cannot silently turn these tests into request timeouts.
-fn protocol_id_for(body: &ReplicationMessageBody) -> &'static str {
-    if body.is_subtree_audit() {
-        SUBTREE_AUDIT_PROTOCOL_ID
-    } else if body.is_possession_audit() {
-        POSSESSION_AUDIT_PROTOCOL_ID
-    } else {
-        REPLICATION_PROTOCOL_ID
-    }
-}
+/// Minimal paid-list repair close group used by the deterministic repair e2e.
+const PAID_REPAIR_GROUP_SIZE: usize = 5;
+/// Storage threshold configured above majority so one holder is below quorum.
+const PAID_REPAIR_STORAGE_THRESHOLD: usize = 4;
+/// Paid-list majority for a five-peer group.
+const PAID_REPAIR_CONFIRMING_NODES: usize = 3;
+/// Single node seeded with the record bytes before repair.
+const PAID_REPAIR_SOURCE_INDEX: usize = 0;
+/// Missing responsible node that must learn the paid-list entry and fetch.
+const PAID_REPAIR_TARGET_INDEX: usize = 4;
+/// Expected storage quorum for the five-peer repair group.
+const PAID_REPAIR_STORAGE_QUORUM: usize = 3;
+/// Timeout used by the repair e2e's verification requests.
+const PAID_REPAIR_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Timeout used by the repair e2e's fetch requests.
+const PAID_REPAIR_FETCH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Wait budget for asynchronous verification plus fetch completion.
+const PAID_REPAIR_SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Request-response timeout for seeding the replica hint.
+const PAID_REPAIR_HINT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Stable request id for the paid-list repair sync request.
+const PAID_REPAIR_HINT_REQUEST_ID: u64 = 2526;
 
 /// Send a replication request via saorsa-core's request-response mechanism
 /// and decode the response.
@@ -77,10 +83,9 @@ async fn send_replication_request(
     msg: ReplicationMessage,
     timeout: Duration,
 ) -> ReplicationMessage {
-    let protocol = protocol_id_for(&msg.body);
     let encoded = msg.encode().expect("encode replication request");
     let response = sender
-        .send_request(target, protocol, encoded, timeout)
+        .send_request(target, REPLICATION_PROTOCOL_ID, encoded, timeout)
         .await
         .expect("send_request");
     ReplicationMessage::decode(&response.data).expect("decode replication response")
@@ -90,7 +95,9 @@ fn prune_test_config(close_group_size: usize) -> ReplicationConfig {
     ReplicationConfig {
         close_group_size,
         quorum_threshold: 1,
-        paid_list_close_group_size: 1,
+        // Keep the width-20 view incomplete in the five-node harness so these
+        // tests exercise the remote-audit path rather than the fast path.
+        paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     }
@@ -936,6 +943,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
     let config = prune_test_config(close_group_size);
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -971,6 +979,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: false,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(blocked.records_pruned, 0);
@@ -998,6 +1007,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: false,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(blocked_again.records_pruned, 0);
@@ -1017,6 +1027,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(confirmed.records_audits_attempted, 1);
@@ -1052,6 +1063,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(incomplete.records_pruned, 0);
@@ -1082,6 +1094,7 @@ async fn test_prune_pass_requires_remote_confirmation_before_delete() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(complete.records_pruned, 1);
@@ -1113,6 +1126,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
     let config = prune_test_config(close_group_size);
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1168,6 +1182,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: Some(&committed),
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1199,6 +1214,7 @@ async fn test_prune_veto_for_committed_out_of_range_key() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1244,7 +1260,9 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     let pruner_idx = 3;
     let config = ReplicationConfig {
         close_group_size: PROD_CLOSE_GROUP_SIZE,
-        paid_list_close_group_size: 1,
+        // The ten-node harness cannot complete width 20, so this test remains
+        // specifically about the 6-of-7 remote-proof path.
+        paid_list_close_group_size: 20,
         prune_hysteresis_duration: Duration::ZERO,
         ..ReplicationConfig::default()
     };
@@ -1252,6 +1270,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
     // Deliberately empty and never populated: candidacy and target selection
     // must not depend on neighbor-sync repair hints.
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1299,6 +1318,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
             repair_proofs: &repair_proofs,
             allow_remote_prune_audits: true,
             commitment_state: None,
+            audit_challenge_coordinator: &audit_challenge_coordinator,
         })
         .await;
         assert_eq!(
@@ -1341,6 +1361,7 @@ async fn prune_deletes_at_proof_threshold_and_retains_below_it() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1376,6 +1397,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
     };
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1409,6 +1431,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(marked.records_marked_out_of_range, 1);
@@ -1430,6 +1453,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(pending.records_marked_out_of_range, 0);
@@ -1454,6 +1478,7 @@ async fn prune_marks_immediately_and_candidacy_waits_for_hysteresis() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(matured.records_candidates, 1);
@@ -1497,6 +1522,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
     };
     let sync_state = Arc::new(RwLock::new(NeighborSyncState::new_cycle(vec![])));
     let repair_proofs = Arc::new(RwLock::new(RepairProofs::new()));
+    let audit_challenge_coordinator = Arc::new(AuditChallengeCoordinator::new());
 
     let pruner = harness.test_node(pruner_idx).expect("pruner");
     let pruner_p2p = Arc::clone(pruner.p2p_node.as_ref().expect("pruner p2p"));
@@ -1528,6 +1554,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -1562,6 +1589,7 @@ async fn paid_prune_requires_paid_close_group_confirmations() {
         repair_proofs: &repair_proofs,
         allow_remote_prune_audits: true,
         commitment_state: None,
+        audit_challenge_coordinator: &audit_challenge_coordinator,
     })
     .await;
     assert_eq!(
@@ -2048,7 +2076,7 @@ async fn scenario_9_fetch_retry_uses_alternate_source() {
     let candidate = queues.dequeue_fetch().expect("dequeue");
 
     // Start in-flight with first source
-    queues.start_fetch(key, source_a, candidate.sources);
+    queues.start_dequeued_fetch(candidate, source_a);
 
     // First source fails -> retry should give source_b
     let next = queues.retry_fetch(&key);
@@ -2075,8 +2103,8 @@ async fn scenario_10_fetch_retry_exhaustion() {
 
     // Single source
     queues.enqueue_fetch(key, distance, vec![source]);
-    let _candidate = queues.dequeue_fetch().expect("dequeue");
-    queues.start_fetch(key, source, vec![source]);
+    let candidate = queues.dequeue_fetch().expect("dequeue");
+    queues.start_dequeued_fetch(candidate, source);
 
     // Source fails -> no alternates -> exhausted
     let next = queues.retry_fetch(&key);
@@ -2631,6 +2659,198 @@ async fn scenario_25_paid_list_convergence_via_verification() {
         confirmations >= min_confirmations,
         "Majority of queried peers should confirm paid status, got {confirmations}"
     );
+
+    harness.teardown().await.expect("teardown");
+}
+
+// =========================================================================
+// Section 18, Scenario #26: Paid-list majority authorises repair
+// =========================================================================
+
+/// A missing responsible replica is repaired when storage presence is below
+/// quorum but the paid-list close group still has a majority (Section 18 #26).
+///
+/// This drives the live path end-to-end:
+/// 1. one peer stores the bytes, which is below storage quorum;
+/// 2. three of five paid-list peers confirm the key;
+/// 3. the holder sends a replica hint to a missing responsible peer;
+/// 4. verification learns paid-list authorization and fetches the record.
+#[tokio::test]
+#[serial]
+async fn scenario_26_paid_list_majority_repairs_missing_replica_below_storage_quorum() {
+    let mut net_config = TestNetworkConfig::minimal();
+    net_config.replication_config = Some(ReplicationConfig {
+        close_group_size: PAID_REPAIR_GROUP_SIZE,
+        quorum_threshold: PAID_REPAIR_STORAGE_THRESHOLD,
+        paid_list_close_group_size: PAID_REPAIR_GROUP_SIZE,
+        verification_request_timeout: PAID_REPAIR_VERIFICATION_TIMEOUT,
+        fetch_request_timeout: PAID_REPAIR_FETCH_TIMEOUT,
+        ..ReplicationConfig::default()
+    });
+
+    let harness = TestHarness::setup_with_config(net_config)
+        .await
+        .expect("setup");
+    harness.warmup_dht().await.expect("warmup");
+
+    let source = harness.test_node(PAID_REPAIR_SOURCE_INDEX).expect("source");
+    let target = harness.test_node(PAID_REPAIR_TARGET_INDEX).expect("target");
+    let source_p2p = source.p2p_node.as_ref().expect("source p2p");
+    let target_p2p = target.p2p_node.as_ref().expect("target p2p");
+    let source_peer = *source_p2p.peer_id();
+    let target_peer = *target_p2p.peer_id();
+
+    let content = b"paid-list-majority-authorizes-missing-replica-repair";
+    let address = compute_address(content);
+
+    assert!(
+        target_p2p
+            .dht_manager()
+            .is_in_routing_table(&source_peer)
+            .await,
+        "precondition: target must accept inbound hints from source in LocalRT"
+    );
+    let storage_admission_peers: HashSet<PeerId> = target_p2p
+        .dht_manager()
+        .find_closest_nodes_local_with_self(
+            &address,
+            storage_admission_width(PAID_REPAIR_GROUP_SIZE),
+        )
+        .await
+        .iter()
+        .map(|node| node.peer_id)
+        .collect();
+    assert!(
+        storage_admission_peers.contains(&target_peer),
+        "precondition: target must be storage-admitted for the hinted key"
+    );
+    let paid_group = target_p2p
+        .dht_manager()
+        .find_closest_nodes_local_with_self(&address, PAID_REPAIR_GROUP_SIZE)
+        .await;
+    assert_eq!(
+        paid_group.len(),
+        PAID_REPAIR_GROUP_SIZE,
+        "precondition: deterministic paid-list majority needs a full five-peer group"
+    );
+    assert!(
+        paid_group.iter().any(|node| node.peer_id == target_peer),
+        "precondition: target must be in the paid-list close group"
+    );
+
+    let source_protocol = source.ant_protocol.as_ref().expect("source protocol");
+    source_protocol
+        .storage()
+        .put(&address, content)
+        .await
+        .expect("put source record");
+
+    for idx in 0..harness.node_count() {
+        if let Some(protocol) = harness
+            .test_node(idx)
+            .and_then(|node| node.ant_protocol.as_ref())
+        {
+            protocol.payment_verifier().cache_insert(address);
+        }
+    }
+
+    for idx in 0..PAID_REPAIR_CONFIRMING_NODES {
+        let engine = harness
+            .test_node(idx)
+            .and_then(|node| node.replication_engine.as_ref())
+            .expect("paid-list confirming engine");
+        engine
+            .paid_list()
+            .insert(&address)
+            .await
+            .expect("paid-list insert");
+    }
+
+    let mut seeded_storage_holders = 0usize;
+    for idx in 0..harness.node_count() {
+        if let Some(protocol) = harness
+            .test_node(idx)
+            .and_then(|node| node.ant_protocol.as_ref())
+        {
+            if protocol.storage().exists(&address).expect("exists check") {
+                seeded_storage_holders += 1;
+            }
+        }
+    }
+    assert_eq!(
+        seeded_storage_holders, 1,
+        "precondition: only the source should hold the record before repair"
+    );
+    assert!(
+        seeded_storage_holders < PAID_REPAIR_STORAGE_QUORUM,
+        "precondition: storage quorum must be impossible without paid-list authorization"
+    );
+
+    let target_protocol = target.ant_protocol.as_ref().expect("target protocol");
+    let target_engine = target.replication_engine.as_ref().expect("target engine");
+    assert!(
+        !target_protocol.storage().exists(&address).expect("exists"),
+        "precondition: target starts without the record"
+    );
+    assert!(
+        !target_engine
+            .paid_list()
+            .contains(&address)
+            .expect("contains"),
+        "precondition: target starts without local paid-list authorization"
+    );
+
+    let request = NeighborSyncRequest {
+        replica_hints: vec![address],
+        paid_hints: vec![],
+        bootstrapping: false,
+        commitment: None,
+    };
+    let response = send_replication_request(
+        source_p2p,
+        &target_peer,
+        ReplicationMessage {
+            request_id: PAID_REPAIR_HINT_REQUEST_ID,
+            body: ReplicationMessageBody::NeighborSyncRequest(request),
+        },
+        PAID_REPAIR_HINT_REQUEST_TIMEOUT,
+    )
+    .await;
+    match response.body {
+        ReplicationMessageBody::NeighborSyncResponse(_) => {}
+        other => panic!("expected NeighborSyncResponse, got: {other:?}"),
+    }
+
+    let deadline = tokio::time::Instant::now() + PAID_REPAIR_SETTLE_TIMEOUT;
+    let mut learned_paid = false;
+    let mut repaired_record = false;
+    while tokio::time::Instant::now() < deadline {
+        learned_paid = target_engine
+            .paid_list()
+            .contains(&address)
+            .expect("contains");
+        repaired_record = target_protocol.storage().exists(&address).expect("exists");
+        if learned_paid && repaired_record {
+            break;
+        }
+        tokio::time::sleep(PROPAGATION_POLL_INTERVAL).await;
+    }
+
+    assert!(
+        learned_paid,
+        "target should learn paid-list authorization from remote majority"
+    );
+    assert!(
+        repaired_record,
+        "paid-list majority should authorize fetching the missing replica"
+    );
+    let fetched = target_protocol
+        .storage()
+        .get(&address)
+        .await
+        .expect("read repaired record")
+        .expect("repaired record should be present");
+    assert_eq!(fetched, content, "target should store the fetched bytes");
 
     harness.teardown().await.expect("teardown");
 }

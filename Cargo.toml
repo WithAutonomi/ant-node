@@ -151,8 +151,7 @@ name = "poc_audit_handler_live"
 path = "tests/poc_audit_handler_live.rs"
 required-features = ["test-utils"]
 
-# Bootstrap-stall DoS regression marker (documents the unfixed attack; the
-# eventual fix must land with a follow-up test asserting bounded drain).
+# Bootstrap-stall regression coverage for source cleanup after peer removal.
 # Declared like the other PoC suites so CI invokes it explicitly.
 [[test]]
 name = "poc_bootstrap_stall"
@@ -165,6 +164,14 @@ required-features = ["test-utils"]
 [[test]]
 name = "poc_price_floor_live"
 path = "tests/poc_price_floor_live.rs"
+required-features = ["test-utils"]
+
+# Shutdown/LMDB-drain regression: `ReplicationEngine::shutdown()` must not
+# return while a detached LMDB blocking op is still running. Uses the
+# test-only storage put gate, so it requires the test-utils feature.
+[[test]]
+name = "poc_shutdown_lmdb_drain"
+path = "tests/poc_shutdown_lmdb_drain.rs"
 required-features = ["test-utils"]
 
 [features]

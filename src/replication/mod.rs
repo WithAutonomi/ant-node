@@ -16,6 +16,8 @@
 
 pub mod admission;
 pub mod audit;
+pub mod audit_coordinator;
+pub(crate) mod audit_metrics;
 pub mod bootstrap;
 pub mod commitment;
 pub mod commitment_state;
@@ -34,9 +36,10 @@ pub mod storage_commitment_audit;
 pub mod subtree;
 pub mod types;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -47,40 +50,52 @@ use std::pin::Pin;
 
 use crate::logging::{debug, error, info, warn};
 use futures::stream::FuturesUnordered;
-use futures::{Future, StreamExt};
+use futures::{future::join_all, Future, StreamExt};
+use parking_lot::Mutex;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, Notify, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::payment::{PaymentVerifier, VerificationContext};
+use crate::payment::{
+    PaymentVerifier, VerificationContext, MAX_PAYMENT_PROOF_SIZE_BYTES,
+    MIN_PAYMENT_PROOF_SIZE_BYTES,
+};
 use crate::replication::audit::AuditTickResult;
+use crate::replication::audit_coordinator::AuditChallengeCoordinator;
+use crate::replication::audit_metrics::{
+    AuditResponderClass, AuditResponderDropReason, AuditResponderMetrics,
+    ReplicationResponderClass, ResponderAdmissionCeiling,
+};
 use crate::replication::commitment::{commitment_hash, StorageCommitment};
 use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig,
-    GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_AUDIT_MESSAGE_SIZE, MAX_AUDIT_RESPONSES_PER_PEER,
-    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS, MAX_SUBTREE_ROUND1_PER_PEER,
-    MAX_SUBTREE_SESSIONS, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
-    SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
+    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
-    AuditDigestVersion, FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage,
-    ReplicationMessageBody, VerificationResponse,
+    FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
+    VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::scheduling::ReplicationQueues;
+use crate::replication::scheduling::{CapacityDisplacement, ReplicationQueues};
 use crate::replication::types::{
-    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence, HintPipeline,
-    NeighborSyncState, PeerSyncRecord, RepairProofs, VerificationEntry, VerificationState,
+    AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
+    NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
+    VerificationState,
 };
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::{NodeIdentity, PeerId};
@@ -187,6 +202,7 @@ fn first_audit_terminal_outcome(result: &AuditTickResult) -> FirstAuditTerminalO
                     reason: AuditFailureReason::Timeout,
                     ..
                 },
+            ..
         } => FirstAuditTerminalOutcome::Timeout,
         AuditTickResult::Failed { .. } => FirstAuditTerminalOutcome::Failed,
         AuditTickResult::BootstrapClaim { .. } => FirstAuditTerminalOutcome::BootstrapClaim,
@@ -953,19 +969,209 @@ impl FirstAuditScheduler {
 /// Prefix used by saorsa-core's request-response mechanism.
 const RR_PREFIX: &str = "/rr/";
 
+/// Bounded handoff from the P2P broadcast receiver to serial non-audit
+/// replication processing.
+///
+/// The receiver fast-paths digest `AuditChallenge`s immediately and queues
+/// bulk/non-audit messages here. If this fills, the message is **dropped** —
+/// `start_message_handler` must never block on a full queue, because a stalled
+/// receiver laps the P2P broadcast ring and silently loses messages it never
+/// observed. Every serial-lane class has protocol recovery, so a drop costs a
+/// retry rather than the message.
+///
+/// This bounds a message COUNT, but a queued item is an owned decoded message
+/// of up to [`config::MAX_REPLICATION_MESSAGE_SIZE`], so the resident worst
+/// case is 64 × 10 MiB = 640 MiB. That ceiling is acknowledged, not designed
+/// for: the lane carries small requests and challenges alongside
+/// `FreshReplicationOffer`, its one multi-MiB class, so no single count is
+/// right for both. Responses never reach here — `replication_payload_from_event`
+/// filters them out and their requesters correlate them. ADR-0005 decision 12
+/// records the trade and why byte accounting is the correct eventual fix.
+const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum fresh-replication offers processed concurrently, away from the
+/// serial non-audit loop.
+///
+/// Fresh offers can perform an on-chain payment verification and a 4 MiB LMDB
+/// write. Four workers keep that latency off the responder dispatch path while
+/// keeping concurrent EVM/storage pressure small and predictable.
+const FRESH_OFFER_WORKER_LIMIT: usize = 4;
+
+/// Maximum fresh offers admitted at once, counting both those running on a
+/// worker and those queued for one.
+///
+/// An admitted offer holds its payload until it completes, so this bounds
+/// memory rather than latency: at 4 MiB each, sixteen is a 64 MiB ceiling.
+/// Offers past the bound are refused rather than queued or handled inline —
+/// handling one on the message loop stalls every other non-audit message behind
+/// a payment verification and a multi-MiB write. A refusal is not free: the
+/// sender does not read it, so it resurfaces as a missing key at the delayed
+/// possession check (5-15 min, ADR-0003) and is charged to this node at audit
+/// severity. Only neighbor sync (10-20 min) actually refills the gap, so the
+/// bound is sized to make refusal rare rather than cheap.
+const FRESH_OFFER_MAX_OUTSTANDING: usize = 16;
+
+/// Distinct payment proofs queued for one fresh-offer key.
+///
+/// Duplicate offers for a key are routine rather than adversarial: a client PUT
+/// is confirmed by `CLOSE_GROUP_MAJORITY` nodes, and *each* of them fans the
+/// chunk out to the close group, so a receiver sees the same key from about that
+/// many senders. They differ only in their proof — the bytes are provably
+/// identical, since `fresh_offer_structural_rejection` has confirmed
+/// `key == BLAKE3(data)` before any of them is queued.
+///
+/// Sizing the queue to the number of legitimate senders is what lets a failing
+/// proof fall through to the next one instead of costing the node the record.
+///
+/// This is a **lifetime budget per entry**, not a queue depth: it counts proofs
+/// admitted, and a proof the handler has popped has spent its slot rather than
+/// returned it. That distinction is what bounds the work an attacker can buy —
+/// at most this many on-chain verifications per key, after which the entry
+/// refuses everyone until it closes. Gating on the queue's instantaneous length
+/// instead would let a stream of distinct sources refill each popped slot and
+/// run unbounded sequential verifications while holding one of the four worker
+/// slots. One attempt per source additionally means a single peer can only ever
+/// consume one of these.
+const MAX_FRESH_OFFER_ATTEMPTS_PER_KEY: usize = crate::ant_protocol::CLOSE_GROUP_MAJORITY;
+
+/// Fresh-offer slots kept reachable by sources that hold none.
+///
+/// The property worth guaranteeing is that one peer cannot *starve* others, not
+/// that any peer is held to a small quota. Expressing the bound as a reserve
+/// rather than a quota is what keeps those two apart.
+const FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES: usize = 4;
+
+/// Maximum fresh offers admitted from one source peer.
+///
+/// Without a per-source bound, one peer can hold every slot in the global pool
+/// and every honest offer arriving in that window is refused — and because a
+/// refusal is later read as absence by the sender's delayed possession check,
+/// those refusals land as audit-severity trust penalties on the *refuser*.
+/// That makes an unbounded global pool a targeted eviction primitive.
+///
+/// The bound is deliberately far looser than the other responder classes'
+/// (fetch 2, verification 1, neighbor sync 1), because the traffic pattern is
+/// the opposite shape. Those are request/response: a requester needs only a
+/// couple in flight, so a small quota costs it nothing. Fresh offers are a
+/// one-way bulk fan-out, and in the ordinary case a node's offers come almost
+/// entirely from ONE peer — whichever node took the client's PUT. A quota sized
+/// for request/response traffic therefore binds on completely legitimate
+/// uploads: at 2, an ordinary 48-chunk upload had offers refused (see
+/// `tests/e2e/fresh_offer_capacity.rs`), every one of them attributed to this
+/// ceiling and none to the global pool.
+///
+/// Sizing it as "the pool minus a reserve" keeps the anti-starvation guarantee
+/// exact — [`FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES`] slots always remain for a
+/// peer holding none — while leaving a single legitimate fan-out unthrottled.
+// The cast is from a compile-time constant difference of two small literals
+// (16 - 4), so truncation is impossible; deriving the share keeps the reserve
+// relationship visible in the code rather than only in a test.
+#[allow(clippy::cast_possible_truncation)]
+const FRESH_OFFER_MAX_OUTSTANDING_PER_PEER: u32 =
+    (FRESH_OFFER_MAX_OUTSTANDING - FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES) as u32;
+
+/// Maximum paid-list notifications served concurrently.
+///
+/// A `PaidNotify` runs the same on-chain proof verification as a fresh offer
+/// but stores only paid-list metadata, so it needs no chunk-write headroom.
+/// Two workers keep cross-peer progress without multiplying concurrent EVM
+/// and DHT lookup pressure.
+const PAID_NOTIFY_WORKER_LIMIT: usize = 2;
+
+/// Maximum paid-list notifications admitted across workers and their waiters.
+///
+/// Sized as a **memory** ceiling, not a fairness device, because `PaidNotify`
+/// is one-way: the protocol defines no response and the sender never retries,
+/// so a refused notify is information permanently lost to this node until a
+/// later verification cycle happens to re-derive the key's paid status from a
+/// paid-list quorum. A tight admission bound therefore does not shed load, it
+/// discards durable state — which is why the class's real protection is
+/// [`PAID_NOTIFY_WORKER_LIMIT`], bounding the concurrent EVM and DHT work that
+/// is actually expensive, rather than this queue depth.
+///
+/// A client PUT fans one notify per key out to the whole paid close group, so
+/// a single upload legitimately arrives as a burst of tens. At the 512 KiB
+/// `MAX_PAYMENT_PROOF_SIZE_BYTES` worst case, sixty-four outstanding is a
+/// 32 MiB ceiling — half the fresh-offer admission ceiling, for messages that
+/// carry no chunk payload.
+const PAID_NOTIFY_MAX_OUTSTANDING: usize = 64;
+
+/// Maximum admitted paid-list notifications from one source peer.
+///
+/// A quarter of the pool. One peer legitimately supplies a whole upload's
+/// worth of notifies, so this must comfortably exceed a typical file's chunk
+/// count in flight; it exists to stop a single source evicting every other
+/// peer's durable paid-list evidence, not to ration ordinary traffic.
+const PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER: u32 = 16;
+
+/// Maximum fetch responses served concurrently.
+///
+/// Each successful response can upload a 4 MiB chunk. Matching
+/// [`MAX_CONCURRENT_REPLICATION_SENDS`] keeps fetch serving to about 12 MiB of
+/// simultaneous chunk data, which avoids saturating typical home upload links.
+const FETCH_RESPONDER_WORKER_LIMIT: usize = 3;
+
+/// Maximum fetch requests admitted across workers and their bounded waiters.
+///
+/// Four worker waves absorb short bursts without retaining chunk bytes—the
+/// request contains only a key—while the dequeue deadline sheds work before a
+/// sustained flood can keep the node serving requests whose callers timed out.
+const FETCH_RESPONDER_MAX_OUTSTANDING: usize = FETCH_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted fetch requests from one source peer.
+///
+/// Two requests let one peer pipeline useful reads while leaving at least one
+/// of the three workers available to other peers under a single-source flood.
+const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
+
+/// Maximum verification batches served concurrently.
+///
+/// LMDB point lookups are fast, but a batch can contain 8,192 of them. Two
+/// workers isolate that synchronous work from message dispatch without turning
+/// large batches into an I/O fan-out throughput contest.
+const VERIFICATION_RESPONDER_WORKER_LIMIT: usize = 2;
+
+/// Maximum verification batches admitted across workers and bounded waiters.
+///
+/// Four worker waves absorb ordinary cross-peer bursts while the dequeue
+/// deadline prevents queued batches from consuming lookup capacity after their
+/// requesters have stopped waiting.
+const VERIFICATION_RESPONDER_MAX_OUTSTANDING: usize = VERIFICATION_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted verification batches from one source peer.
+///
+/// Senders already aggregate a peer's keys into one batch. One outstanding
+/// batch therefore preserves useful work while reserving the other worker and
+/// the bounded queue for different peers.
+const VERIFICATION_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
+
+/// Maximum neighbor-sync requests served concurrently across source peers.
+///
+/// Building a response scans local keys and performs DHT lookups, so two
+/// workers allow cross-peer progress without multiplying that expensive scan
+/// into broad network and storage contention.
+const NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT: usize = 2;
+
+/// Maximum neighbor-sync requests admitted across workers and bounded waiters.
+///
+/// Four worker waves cover ordinary cadence overlap while keeping retained sync
+/// payloads bounded; expired waiters are shed before any key scan begins.
+const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING: usize = NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT * 4;
+
+/// Maximum admitted neighbor-sync requests from one source peer.
+///
+/// Sync history must be updated before repair proofs for the same peer. A
+/// single slot preserves that ordering while independent peers remain parallel.
+const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
+
 /// Match an inbound topic against the replication protocol ids, in both the bare
 /// gossip form and the `/rr/<id>` request-response form.
 ///
-/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`],
-/// [`SUBTREE_AUDIT_PROTOCOL_ID`] or [`POSSESSION_AUDIT_PROTOCOL_ID`]) and
-/// whether it was the RR form. The matched id is carried into the handler so it
-/// can enforce that each message family only arrives on its own id.
+/// Returns the matched core or [`SUBTREE_AUDIT_PROTOCOL_ID`] id and whether it
+/// was the RR form. The matched id is carried into the handler so it can enforce
+/// that subtree messages only arrive on the subtree id.
 fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
-    for id in [
-        REPLICATION_PROTOCOL_ID,
-        SUBTREE_AUDIT_PROTOCOL_ID,
-        POSSESSION_AUDIT_PROTOCOL_ID,
-    ] {
+    for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
         if topic == id {
             return Some((id, false));
         }
@@ -979,91 +1185,24 @@ fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
 }
 
 /// Whether a decoded body belongs on the protocol id it arrived on:
-/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], possession-audit
-/// bodies on [`POSSESSION_AUDIT_PROTOCOL_ID`], every other body on
-/// [`REPLICATION_PROTOCOL_ID`].
+/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`] and every other body,
+/// including digest audits, on [`REPLICATION_PROTOCOL_ID`].
 ///
 /// The receive guard drops any mismatch (a cross-version or misrouted message);
 /// sharing this one predicate between the guard and its regression test means a
 /// change to the rule cannot pass the test unnoticed.
 fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    protocol == response_protocol_for(body) || is_legacy_possession_challenge(body, protocol)
-}
-
-/// A possession challenge from a peer that predates the family split, arriving
-/// on the core id.
-///
-/// ROLLOUT — paired with [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] and removed with
-/// it. That gate softens what THIS node concludes about a silent peer, which is
-/// only half the window: the other half is what an un-upgraded peer concludes
-/// about this one. Its binary sends responsible-chunk and prune-confirmation
-/// challenges on the core id, has no dedicated possession id to try, and turns
-/// the resulting timeout straight into an audit-severity failure. Dropping
-/// those challenges would therefore have every not-yet-upgraded neighbour
-/// penalise an upgraded node at confirmed-failure weight for the whole window,
-/// which is the release punishing the nodes that took it — and no constant in
-/// this binary can reach the auditor to stop it.
-///
-/// So they are answered, on the id they arrived on and in the digest
-/// construction that peer verifies with. The two possession messages are
-/// byte-identical to the previous release, so nothing is being reinterpreted;
-/// only the digest construction moved, and the responder picks it from the
-/// asker. Challenges only: this node always sends its own on the dedicated id,
-/// so a *response* on the core id is never one it asked for and stays refused.
-///
-/// What this costs, stated exactly, because it is a weakening and not only a
-/// shim. The legacy construction is the flat prefix hash this release replaced
-/// precisely because it is preprocessing-weak: a responder can keep BLAKE3
-/// chaining state instead of the record and still match. So an upgraded node
-/// answering an old auditor is no stronger than an old node answering it, which
-/// matters most in the prune lane, where a matching digest counts toward a
-/// quorum authorising deletion.
-///
-/// The bound is that this never goes below what is deployed today, and cannot be
-/// steered. The dialect is chosen by the ASKER, while the party that gains from
-/// the weak construction is the RESPONDER, so a malicious holder cannot elect to
-/// be asked weakly. Only a peer whose own binary already accepts nothing
-/// stronger asks that way — every lane on this release asks on the dedicated id,
-/// pinned by `every_digest_lane_asks_on_the_dedicated_id` — so the exposure is
-/// exactly the one that peer already has to every un-upgraded node it audits,
-/// and it ends when the gate does.
-fn is_legacy_possession_challenge(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    GRACE_POSSESSION_AUDIT_TIMEOUTS
-        && protocol == REPLICATION_PROTOCOL_ID
-        && matches!(body, ReplicationMessageBody::AuditChallenge(_))
-}
-
-/// The digest construction to answer a possession challenge in, and the id to
-/// answer it on, given where it arrived.
-///
-/// The dedicated id exists only on this release, so a challenge there is from a
-/// peer that shares this construction. Anything else is the legacy dialect, and
-/// [`is_legacy_possession_challenge`] has already refused the bodies that must
-/// not reach here.
-fn possession_reply_dialect(inbound_protocol: &str) -> (AuditDigestVersion, &'static str) {
-    if inbound_protocol == POSSESSION_AUDIT_PROTOCOL_ID {
-        (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID)
-    } else {
-        (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID)
-    }
+    protocol == response_protocol_for(body)
 }
 
 /// The protocol id a body belongs on — the single source of truth for BOTH
 /// directions: the receive guard ([`body_matches_protocol`]) and the outbound
 /// response selector in `send_replication_response_checked`.
 ///
-/// Sharing one function is what makes the family isolation symmetric. It also
-/// removes a dependency on transport behaviour: saorsa-core correlates an RR
-/// response by `(peer, msg_id)` rather than by protocol name, so a possession
-/// `AuditResponse` sent on the core id would still reach an auditor waiting on
-/// the possession id — but a bare (non-RR) response sent that way is dropped by
-/// the peer's own guard, and correlation is a detail this layer should not rely
-/// on.
+/// Sharing one function makes the subtree/core isolation symmetric.
 fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
     if body.is_subtree_audit() {
         SUBTREE_AUDIT_PROTOCOL_ID
-    } else if body.is_possession_audit() {
-        POSSESSION_AUDIT_PROTOCOL_ID
     } else {
         REPLICATION_PROTOCOL_ID
     }
@@ -1079,6 +1218,225 @@ fn paid_notify_payment_context() -> VerificationContext {
 
 /// Boxed future type for in-flight fetch tasks.
 type FetchFuture = Pin<Box<dyn Future<Output = (XorName, Option<FetchOutcome>)> + Send>>;
+
+/// Fresh-offer keys currently being handled, each with the proofs still to try.
+///
+/// Concurrent duplicates are routine: a client PUT is confirmed by
+/// `CLOSE_GROUP_MAJORITY` nodes and each of them fans the chunk out, so one key
+/// commonly arrives from several senders at once. Collapsing them onto one
+/// handler is what keeps a burst of PUTs from costing a permit, a worker slot,
+/// and an on-chain verification per copy.
+///
+/// What they collapse *onto* is the load-bearing part. Keeping only the key and
+/// refusing every later offer outright made the first arrival the only arrival:
+/// if its proof failed, the record was lost even though a valid proof for the
+/// same bytes was queued behind it, and the resulting absence was charged to
+/// this node by the delayed possession check. So the entry holds the bytes once
+/// and queues each sender's proof, and the handler works down that queue. A
+/// later offer therefore costs a proof, not a payload — sound only because
+/// `fresh_offer_structural_rejection` has confirmed `key == BLAKE3(data)` for
+/// every one of them before it is queued, which is what makes their bytes
+/// provably identical.
+///
+/// Entries are exact keys rather than hash shards. A node only receives offers
+/// for keys it is close to, so the accepted key set clusters tightly around its
+/// own ID — any index derived from the key would land nearly every offer on one
+/// shard and serialize unrelated keys behind each other. Exact keys keep them
+/// independent, and the map stays bounded by [`FRESH_OFFER_MAX_OUTSTANDING`],
+/// each entry by [`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY`].
+///
+/// The critical section is a map insert, pop, or remove and is never held across
+/// an await, so this is a blocking mutex rather than an async one.
+type FreshOfferInFlight = Arc<Mutex<HashMap<XorName, FreshOfferEntry>>>;
+
+/// One sender's unverified claim to have paid for a key already in flight.
+///
+/// Carries no payload: the bytes live once in [`FreshOfferEntryGuard`], and the
+/// content-address check ran before this attempt was queued.
+struct FreshOfferAttempt {
+    source: PeerId,
+    proof_of_payment: Vec<u8>,
+    request_id: u64,
+    rr_message_id: Option<String>,
+}
+
+/// Proofs still to try for one in-flight key, and who supplied them.
+///
+/// Deliberately holds neither the bytes nor an arrival time: both belong to the
+/// handler that owns the key, and live once in [`FreshOfferEntryGuard`].
+struct FreshOfferEntry {
+    /// Untried proofs in arrival order. The handler holds the current one.
+    pending: VecDeque<FreshOfferAttempt>,
+    /// Sources already represented, so one peer cannot fill the queue alone.
+    sources: HashSet<PeerId>,
+    /// Proofs admitted over this entry's whole life, **never decremented**.
+    ///
+    /// The budget has to be spent by admissions rather than held by the queue.
+    /// The handler pops a proof before verifying it, so gating on
+    /// `pending.len()` would let a fresh source refill the slot that pop just
+    /// freed, and a stream of distinct sources could then run unbounded
+    /// sequential payment verifications while holding one of only four worker
+    /// slots. Counting admissions makes the cap a lifetime budget instead.
+    admitted: usize,
+}
+
+/// How an arriving fresh offer joined the work already in flight for its key.
+enum FreshOfferAdmission {
+    /// Opened the entry. This offer's handler owns the key and drives every
+    /// queued proof, including proofs that arrive later.
+    Opened(Box<FreshOfferEntryGuard>),
+    /// Merged into an entry another offer opened; its handler reaches this proof
+    /// if the ones ahead of it fail.
+    Joined,
+    /// The entry already holds [`MAX_FRESH_OFFER_ATTEMPTS_PER_KEY`] proofs.
+    Full,
+    /// This source already has a proof queued for this key.
+    DuplicateSource,
+}
+
+// Gated on `logging` like `SerialQueueDropReason::as_str`: the only caller is a
+// `debug!`, which compiles to nothing without the feature.
+#[cfg(feature = "logging")]
+impl FreshOfferAdmission {
+    /// Why the offer added nothing to the work already queued for its key.
+    ///
+    /// Local logging only — the wire reason stays uniform so a probing peer
+    /// cannot tell a full queue from a repeat of its own proof.
+    const fn surplus_reason(&self) -> &'static str {
+        match self {
+            Self::DuplicateSource => "this source already has a proof queued",
+            Self::Full => "the key already holds its full complement of proofs",
+            Self::Opened(_) | Self::Joined => "not surplus",
+        }
+    }
+}
+
+/// RAII ownership of one in-flight fresh-offer key.
+///
+/// Clears the entry on drop, so an early return, an error, or a panic cannot
+/// strand a key as permanently in flight. Also owns the single copy of the
+/// offered bytes that every queued proof is tried against.
+struct FreshOfferEntryGuard {
+    in_flight: FreshOfferInFlight,
+    key: XorName,
+    /// The bytes every attempt for this key shares, held exactly once.
+    data: Vec<u8>,
+    /// Arrival of the offer that opened the entry.
+    received_at: Instant,
+    /// Cleared once the entry has been removed, so `drop` cannot delete an entry
+    /// a *later* offer has since opened for the same key.
+    holds_entry: bool,
+}
+
+impl FreshOfferEntryGuard {
+    /// Open an entry for this offer's key, or queue its proof behind the entry
+    /// already open.
+    ///
+    /// Takes the offer by value: on `Opened` its bytes move into the guard, and
+    /// on every other outcome they are dropped here rather than held for the
+    /// lifetime of the entry.
+    fn admit(
+        in_flight: &FreshOfferInFlight,
+        offer: protocol::FreshReplicationOffer,
+        source: PeerId,
+        request_id: u64,
+        rr_message_id: Option<String>,
+        received_at: Instant,
+    ) -> FreshOfferAdmission {
+        let key = offer.key;
+        let attempt = FreshOfferAttempt {
+            source,
+            proof_of_payment: offer.proof_of_payment,
+            request_id,
+            rr_message_id,
+        };
+
+        let mut in_flight_map = in_flight.lock();
+        if let Some(entry) = in_flight_map.get_mut(&key) {
+            if entry.sources.contains(&source) {
+                return FreshOfferAdmission::DuplicateSource;
+            }
+            // Lifetime budget, not queue depth: a proof the handler has already
+            // popped has spent its slot, not returned it.
+            if entry.admitted >= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
+                return FreshOfferAdmission::Full;
+            }
+            entry.admitted = entry.admitted.saturating_add(1);
+            entry.sources.insert(source);
+            entry.pending.push_back(attempt);
+            return FreshOfferAdmission::Joined;
+        }
+
+        let mut sources = HashSet::new();
+        sources.insert(source);
+        let mut pending = VecDeque::new();
+        pending.push_back(attempt);
+        in_flight_map.insert(
+            key,
+            FreshOfferEntry {
+                pending,
+                sources,
+                admitted: 1,
+            },
+        );
+        drop(in_flight_map);
+        FreshOfferAdmission::Opened(Box::new(Self {
+            in_flight: Arc::clone(in_flight),
+            key,
+            data: offer.data,
+            received_at,
+            holds_entry: true,
+        }))
+    }
+
+    /// The bytes every proof for this key is tried against.
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    /// When the first offer for this key arrived.
+    fn received_at(&self) -> Instant {
+        self.received_at
+    }
+
+    /// Take the next untried proof, releasing the key when none remain.
+    ///
+    /// Popping and releasing happen under one lock so a proof arriving exactly
+    /// as the queue empties is never silently discarded: it either lands in this
+    /// entry and is returned here, or finds no entry and opens its own.
+    fn next_attempt(&mut self) -> Option<FreshOfferAttempt> {
+        let mut in_flight = self.in_flight.lock();
+        let Some(entry) = in_flight.get_mut(&self.key) else {
+            self.holds_entry = false;
+            return None;
+        };
+        if let Some(attempt) = entry.pending.pop_front() {
+            return Some(attempt);
+        }
+        in_flight.remove(&self.key);
+        self.holds_entry = false;
+        None
+    }
+
+    /// Release the key and return the proofs that were never tried, so their
+    /// senders can be told the outcome the key reached without them.
+    fn release(&mut self) -> Vec<FreshOfferAttempt> {
+        let mut in_flight = self.in_flight.lock();
+        self.holds_entry = false;
+        in_flight
+            .remove(&self.key)
+            .map(|entry| entry.pending.into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for FreshOfferEntryGuard {
+    fn drop(&mut self) {
+        if self.holds_entry {
+            self.in_flight.lock().remove(&self.key);
+        }
+    }
+}
 
 /// Shared dependencies for one verification worker cycle.
 struct VerificationCycleContext<'a> {
@@ -1114,9 +1472,21 @@ const VERIFICATION_CYCLE_SLOW_LOG_MS: u128 = 500;
 /// and bootstrap claim abuse. Distinct from `AUDIT_FAILURE_TRUST_WEIGHT` which
 /// is reserved for confirmed audit failures.
 const REPLICATION_TRUST_WEIGHT: f64 = 1.0;
+/// Bound trust updates from one verification cycle. A malicious peer can
+/// advertise thousands of bad singleton keys at once; a few independent
+/// contradictions are enough for the trust engine without flooding it.
+const MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE: usize = 3;
 
 /// Bootstrap drain check interval in seconds.
 const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
+
+/// Grace period `shutdown()` waits for each long-lived background task to
+/// observe the cancellation token and terminate before aborting it.
+///
+/// Detached tasks are drained without a timeout because storage-capable work
+/// may be awaiting a `spawn_blocking` LMDB operation, which continues running
+/// if its async waiter is dropped.
+const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the responder rebuilds + rotates its storage commitment.
 ///
@@ -1387,6 +1757,49 @@ pub struct ReplicationEngine {
     /// per-peer cap guarantees no single source can hold more than its share,
     /// so a flood self-throttles without denying service to everyone else.
     audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Windowed per-origin capacity and processing-time telemetry for every
+    /// request sharing the audit responder pool.
+    audit_responder_metrics: Arc<AuditResponderMetrics>,
+    /// Shared auditor-side limiter for outbound digest `AuditChallenge`s.
+    ///
+    /// Responsible-chunk audits, prune confirmations, and possession checks
+    /// all use this before sending so local bursts wait instead of breaching
+    /// the responder's deployed per-source admission cap.
+    audit_challenge_coordinator: Arc<AuditChallengeCoordinator>,
+    /// Worker permits for bandwidth-bound fetch responses.
+    fetch_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding fetch workers and queued waiters together.
+    fetch_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source fetch responder counts for flood-fair admission.
+    fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Worker permits for lookup-heavy verification batches.
+    verification_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding verification workers and queued waiters.
+    verification_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source verification responder counts for flood-fair admission.
+    verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Worker permits for expensive inbound neighbor-sync requests.
+    neighbor_sync_responder_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding sync workers and queued waiters together.
+    neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
+    /// Per-source sync responder counts; capped at one to preserve ordering.
+    neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Bounded worker permits for expensive fresh-offer handling.
+    fresh_offer_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding offers running on a worker or queued for one.
+    fresh_offer_admission_semaphore: Arc<Semaphore>,
+    /// Per-source fresh-offer counts, so one sender cannot hold the whole pool
+    /// and turn honest senders' refusals into trust penalties on this node.
+    fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// Keys claimed by an in-flight fresh-offer handler, so concurrent
+    /// duplicates collapse onto one verification and one write.
+    fresh_offer_in_flight: FreshOfferInFlight,
+    /// Bounded worker permits for paid-list notification proof verification.
+    paid_notify_worker_semaphore: Arc<Semaphore>,
+    /// Admission permits bounding notifies on a worker or queued for one.
+    paid_notify_admission_semaphore: Arc<Semaphore>,
+    /// Per-source paid-notify counts for flood-fair admission.
+    paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     /// Resource controls for the HEAVY subtree-audit round 1: its own
     /// tight admission pool (so a burst of full-subtree hashing can't starve the
     /// light audits), a per-peer rate cooldown, and single-use round-1 → round-2
@@ -1422,6 +1835,13 @@ pub struct ReplicationEngine {
     shutdown: CancellationToken,
     /// Background task handles.
     task_handles: Vec<JoinHandle<()>>,
+    /// Tracks detached, short-lived work spawned by background producers.
+    ///
+    /// Fresh-offer and bounded responder workers, audit launches, per-fetch
+    /// tasks, and delayed possession checks may retain storage or P2P state
+    /// after their producer exits, so shutdown drains them before those
+    /// resources may be reopened.
+    detached_task_tracker: TaskTracker,
 }
 
 impl ReplicationEngine {
@@ -1488,6 +1908,36 @@ impl ReplicationEngine {
             send_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_REPLICATION_SENDS)),
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
+            audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
+            fetch_responder_worker_semaphore: Arc::new(Semaphore::new(
+                FETCH_RESPONDER_WORKER_LIMIT,
+            )),
+            fetch_responder_admission_semaphore: Arc::new(Semaphore::new(
+                FETCH_RESPONDER_MAX_OUTSTANDING,
+            )),
+            fetch_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            verification_responder_worker_semaphore: Arc::new(Semaphore::new(
+                VERIFICATION_RESPONDER_WORKER_LIMIT,
+            )),
+            verification_responder_admission_semaphore: Arc::new(Semaphore::new(
+                VERIFICATION_RESPONDER_MAX_OUTSTANDING,
+            )),
+            verification_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            neighbor_sync_responder_worker_semaphore: Arc::new(Semaphore::new(
+                NEIGHBOR_SYNC_RESPONDER_WORKER_LIMIT,
+            )),
+            neighbor_sync_responder_admission_semaphore: Arc::new(Semaphore::new(
+                NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            )),
+            neighbor_sync_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            fresh_offer_worker_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_WORKER_LIMIT)),
+            fresh_offer_admission_semaphore: Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING)),
+            fresh_offer_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
+            fresh_offer_in_flight: Arc::new(Mutex::new(HashMap::new())),
+            paid_notify_worker_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_WORKER_LIMIT)),
+            paid_notify_admission_semaphore: Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING)),
+            paid_notify_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             subtree_round1: SubtreeRound1Limiter::new(
                 config.subtree_round1_responder_cooldown,
                 config.subtree_round1_max_concurrent,
@@ -1500,6 +1950,7 @@ impl ReplicationEngine {
             first_audit_observability: Arc::new(FirstAuditObservability::default()),
             shutdown,
             task_handles: Vec::new(),
+            detached_task_tracker: TaskTracker::new(),
         };
         // ADR-0004 A1: reload persisted responder retention BEFORE any task
         // spawns, so an honest restarted node is answerable for its pre-restart
@@ -1583,6 +2034,19 @@ impl ReplicationEngine {
         self.ever_capable_peers.write().await.insert(*peer);
     }
 
+    /// Test-only: isolate a monetized first audit of `peer` from live gossip
+    /// audits. Suppresses new gossip lottery attempts for the current cooldown
+    /// window and clears any shared cooldown stamped by an earlier gossip
+    /// launch. The locks follow the production gossip-audit lock order.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn isolate_first_audit_for_test(&self, peer: &PeerId) {
+        let now = Instant::now();
+        let mut lottery_attempts = self.gossip_lottery_attempts.write().await;
+        let mut launched = self.audit_on_gossip_cooldown.write().await;
+        lottery_attempts.insert(*peer, now);
+        launched.remove(peer);
+    }
+
     /// Test-only: run ONE subtree audit against `peer` right now, pinned to the
     /// commitment this node has cached for it (from gossip), over the live wire.
     /// Returns the audit outcome so tests can assert honest-pass / adversary-fail
@@ -1648,9 +2112,36 @@ impl ReplicationEngine {
             &self.storage,
             &self.config,
             &self.sync_state,
+            &self.audit_challenge_coordinator,
             &self.shutdown,
         )
         .await;
+    }
+
+    /// Test-only: place `key` directly into the fetch queue as though a
+    /// verification cycle had just promoted it, with `sources` as its
+    /// verified holders. Returns whether the key was enqueued.
+    ///
+    /// Bypasses admission, verification, and the promotion-time
+    /// responsibility pre-filter, modelling a promotion decision that has
+    /// since gone stale (topology churn between promotion and download).
+    /// The only guard left standing is the per-attempt recheck inside
+    /// `execute_single_fetch` — exactly the gate e2e tests use this seam to
+    /// exercise.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn enqueue_fetch_for_test(&self, key: XorName, sources: Vec<PeerId>) -> bool {
+        let distance = crate::client::xor_distance(&key, self.p2p_node.peer_id().as_bytes());
+        self.queues
+            .write()
+            .await
+            .enqueue_fetch(key, distance, sources)
+    }
+
+    /// Test-only: whether `key` is still tracked in any fetch-pipeline stage
+    /// (pending verification, fetch queue, or in-flight fetch).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn fetch_pipeline_contains_for_test(&self, key: &XorName) -> bool {
+        self.queues.read().await.contains_key(key)
     }
 
     /// Start all background tasks.
@@ -1685,6 +2176,8 @@ impl ReplicationEngine {
         self.start_first_audit_drainer();
         // V2-623: periodic cumulative per-variant traffic accounting.
         self.start_traffic_summary_loop();
+        #[cfg(feature = "logging")]
+        self.start_audit_responder_summary_loop();
 
         info!(
             "Replication engine started with {} background tasks",
@@ -1727,19 +2220,74 @@ impl ReplicationEngine {
     /// This must be awaited before dropping the engine when the caller needs
     /// the `Arc<LmdbStorage>` references held by background tasks to be
     /// released (e.g. before reopening the same LMDB environment).
+    ///
+    /// When this returns, no engine-spawned task still holds
+    /// `Arc<LmdbStorage>` or `Arc<PaidList>`, and no LMDB blocking operation
+    /// (read or write, on either the chunk store or the paid-list
+    /// environment) is still running.  Engine tasks race their work against
+    /// the shutdown token; a dropped future may leave a `spawn_blocking`
+    /// LMDB transaction running detached, so this method additionally waits
+    /// for both storage layers to go quiescent before returning.
     pub async fn shutdown(&mut self) {
         self.shutdown.cancel();
         for (i, mut handle) in self.task_handles.drain(..).enumerate() {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), &mut handle).await {
+            match tokio::time::timeout(SHUTDOWN_TASK_DRAIN_TIMEOUT, &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) if e.is_cancelled() => {}
                 Ok(Err(e)) => warn!("Replication task {i} panicked during shutdown: {e}"),
                 Err(_) => {
-                    warn!("Replication task {i} did not stop within 10s, aborting");
+                    warn!(
+                        "Replication task {i} did not stop within {}s, aborting",
+                        SHUTDOWN_TASK_DRAIN_TIMEOUT.as_secs()
+                    );
                     handle.abort();
+                    // `abort` only requests cancellation. Await the handle so
+                    // synchronous sections finish and the task drops every
+                    // storage/P2P clone before we claim producer quiescence.
+                    match handle.await {
+                        Ok(()) => {}
+                        Err(e) if e.is_cancelled() => {}
+                        Err(e) => warn!("Replication task {i} panicked after abort: {e}"),
+                    }
                 }
             }
         }
+
+        // Close the responder worker pools. Detached tasks still queued for a
+        // worker take the `Err` arm of `acquire_owned()` and exit immediately
+        // rather than waiting for a slot that will never free up — without
+        // this, work admitted just before shutdown would queue behind the last
+        // in-flight batch and hold the drain below open for its full duration.
+        self.fresh_offer_worker_semaphore.close();
+        self.paid_notify_worker_semaphore.close();
+        self.fetch_responder_worker_semaphore.close();
+        self.verification_responder_worker_semaphore.close();
+        self.neighbor_sync_responder_worker_semaphore.close();
+
+        // All producers have stopped, so close and drain their detached work.
+        // A started storage operation must run to completion: dropping an async
+        // waiter does not cancel `spawn_blocking`, and would let shutdown return
+        // while an LMDB transaction still owns the environment.
+        //
+        // Deliberately unbounded: the LMDB contract requires every worker to
+        // release its `Arc<LmdbStorage>` before the caller may reopen the
+        // environment, and a timeout here could return with one still held.
+        // What makes that safe is that every detached task is now guaranteed to
+        // finish — the pools above are closed, stale work is shed at dequeue,
+        // and the one genuinely unbounded await (payment verification) races
+        // `self.shutdown` via `verify_payment_until_shutdown`.
+        self.detached_task_tracker.close();
+        self.detached_task_tracker.wait().await;
+
+        // Every producer is gone, but a select! racing the shutdown token may
+        // have dropped a future while it awaited an LMDB `spawn_blocking` op
+        // (fetch `storage.put`, prune `storage.delete` /
+        // `paid_list.remove_batch`, verification `paid_list.insert`).  The
+        // detached blocking closure owns a cloned `Env`; wait for both
+        // environments to go quiescent — bounded by one in-flight transaction
+        // per op — so the caller may reopen them.
+        self.storage.wait_idle().await;
+        self.paid_list.wait_idle().await;
     }
 
     /// Trigger an early neighbor sync round.
@@ -1828,10 +2376,8 @@ impl ReplicationEngine {
     ///
     /// Drains scheduled possession-check events and, for each, waits a
     /// randomised 5-15 minute settle delay before probing every responsible
-    /// peer for actual possession. A peer that cryptographically fails to prove
-    /// possession is penalised at `AuditChallenge` severity. A peer that simply
-    /// does not answer normally is too, but that is suspended for the
-    /// possession-audit protocol rollout — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`.
+    /// peer for actual possession. A peer that fails to prove possession or does
+    /// not answer is penalised at `AuditChallenge` severity.
     fn start_possession_check_scheduler(&mut self) {
         let Some(mut rx) = self.possession_check_rx.take() else {
             return;
@@ -1840,7 +2386,9 @@ impl ReplicationEngine {
         let storage = Arc::clone(&self.storage);
         let config = Arc::clone(&self.config);
         let sync_state = Arc::clone(&self.sync_state);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let shutdown = self.shutdown.clone();
+        let detached_task_tracker = self.detached_task_tracker.clone();
 
         let handle = tokio::spawn(async move {
             loop {
@@ -1855,14 +2403,31 @@ impl ReplicationEngine {
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
                         let sync_state = Arc::clone(&sync_state);
+                        let audit_challenge_coordinator = Arc::clone(&audit_challenge_coordinator);
                         let shutdown = shutdown.clone();
                         let delay_min = config.possession_check_delay_min;
                         let delay_max = config.possession_check_delay_max;
-                        tokio::spawn(async move {
+                        detached_task_tracker.spawn(async move {
                             let delay = possession::random_delay(delay_min, delay_max);
+                            // Race shutdown against the whole settle-then-probe
+                            // sequence, not just the sleep. Once a check starts it
+                            // may park on the per-target audit coordinator, which
+                            // has no deadline of its own: with the settle delay
+                            // inside the branch BODY the select is already resolved,
+                            // so those waiters would drain only at the probe timeout
+                            // (roughly `queued / per-target-limit` probes deep) while
+                            // `detached_task_tracker.wait()` — deliberately unbounded
+                            // for the LMDB contract — held shutdown open.
+                            //
+                            // Dropping this future mid-probe is safe and is the same
+                            // shape the neighbor-sync round uses: a parked coordinator
+                            // acquire releases its counted reference via
+                            // `ReferenceGuard`, and a dropped LMDB `spawn_blocking` is
+                            // covered by the storage-quiescence wait in `shutdown`.
                             tokio::select! {
                                 () = shutdown.cancelled() => {}
-                                () = tokio::time::sleep(delay) => {
+                                () = async {
+                                    tokio::time::sleep(delay).await;
                                     possession::run_possession_check(
                                         event.key,
                                         event.peers,
@@ -1870,10 +2435,11 @@ impl ReplicationEngine {
                                         &storage,
                                         &config,
                                         &sync_state,
+                                        &audit_challenge_coordinator,
                                         &shutdown,
                                     )
                                     .await;
-                                }
+                                } => {}
                             }
                         });
                     }
@@ -1903,6 +2469,7 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&self.sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            detached_task_tracker: self.detached_task_tracker.clone(),
             lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
         let shutdown = self.shutdown.clone();
@@ -2004,7 +2571,15 @@ impl ReplicationEngine {
                         );
                         let trigger = gossip_audit.clone();
                         let audit_observability = Arc::clone(&observability);
-                        tokio::spawn(async move {
+                        // Track the launch so `shutdown()`'s detached drain
+                        // covers it. This task outlives the drainer loop that
+                        // spawned it — the loop breaks on the shutdown token
+                        // while the audit is still awaiting its response — so a
+                        // bare spawn would let an in-flight subtree audit keep
+                        // running, and keep its `Arc<P2PNode>`, past the point
+                        // `shutdown()` claims every engine task has stopped.
+                        let tracker = trigger.detached_task_tracker.clone();
+                        tracker.spawn(async move {
                             // The jitter already elapsed as the reservation's
                             // timer; the slot is held for the audit's duration
                             // and released on drop (panic-safe).
@@ -2142,6 +2717,7 @@ impl ReplicationEngine {
         let shutdown = self.shutdown.clone();
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
         let sync_history = Arc::clone(&self.sync_history);
         let sync_cycle_epoch = Arc::clone(&self.sync_cycle_epoch);
         let repair_proofs = Arc::clone(&self.repair_proofs);
@@ -2156,6 +2732,29 @@ impl ReplicationEngine {
         let sync_state = Arc::clone(&self.sync_state);
         let audit_responder_semaphore = Arc::clone(&self.audit_responder_semaphore);
         let audit_responder_inflight = Arc::clone(&self.audit_responder_inflight);
+        let audit_responder_metrics = Arc::clone(&self.audit_responder_metrics);
+        let fetch_responder_worker_semaphore = Arc::clone(&self.fetch_responder_worker_semaphore);
+        let fetch_responder_admission_semaphore =
+            Arc::clone(&self.fetch_responder_admission_semaphore);
+        let fetch_responder_inflight = Arc::clone(&self.fetch_responder_inflight);
+        let verification_responder_worker_semaphore =
+            Arc::clone(&self.verification_responder_worker_semaphore);
+        let verification_responder_admission_semaphore =
+            Arc::clone(&self.verification_responder_admission_semaphore);
+        let verification_responder_inflight = Arc::clone(&self.verification_responder_inflight);
+        let neighbor_sync_responder_worker_semaphore =
+            Arc::clone(&self.neighbor_sync_responder_worker_semaphore);
+        let neighbor_sync_responder_admission_semaphore =
+            Arc::clone(&self.neighbor_sync_responder_admission_semaphore);
+        let neighbor_sync_responder_inflight = Arc::clone(&self.neighbor_sync_responder_inflight);
+        let fresh_offer_worker_semaphore = Arc::clone(&self.fresh_offer_worker_semaphore);
+        let fresh_offer_admission_semaphore = Arc::clone(&self.fresh_offer_admission_semaphore);
+        let fresh_offer_responder_inflight = Arc::clone(&self.fresh_offer_responder_inflight);
+        let fresh_offer_in_flight = Arc::clone(&self.fresh_offer_in_flight);
+        let paid_notify_worker_semaphore = Arc::clone(&self.paid_notify_worker_semaphore);
+        let paid_notify_admission_semaphore = Arc::clone(&self.paid_notify_admission_semaphore);
+        let paid_notify_responder_inflight = Arc::clone(&self.paid_notify_responder_inflight);
+        let detached_task_tracker = self.detached_task_tracker.clone();
         let subtree_round1 = self.subtree_round1.clone();
 
         // ADR-0002 gossip-audit trigger: bundled state so an ingested *changed*
@@ -2166,72 +2765,170 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&audit_on_gossip_cooldown),
+            detached_task_tracker: detached_task_tracker.clone(),
             lottery_attempts: Arc::clone(&gossip_lottery_attempts),
         };
+
+        let handler_context = ReplicationMessageHandlerContext {
+            p2p_node: Arc::clone(&p2p),
+            storage,
+            paid_list,
+            payment_verifier,
+            queues,
+            config: Arc::clone(&config),
+            is_bootstrapping,
+            bootstrap_state,
+            sync_history,
+            sync_cycle_epoch,
+            repair_proofs: Arc::clone(&repair_proofs),
+            last_commitment_by_peer: Arc::clone(&last_commitment_by_peer),
+            ever_capable_peers,
+            sig_verify_attempts: Arc::clone(&sig_verify_attempts),
+            my_commitment_state,
+            gossip_audit,
+            audit_responder_semaphore,
+            audit_responder_inflight,
+            audit_responder_metrics,
+            subtree_round1,
+            fetch_responder_worker_semaphore,
+            fetch_responder_admission_semaphore,
+            fetch_responder_inflight,
+            verification_responder_worker_semaphore,
+            verification_responder_admission_semaphore,
+            verification_responder_inflight,
+            neighbor_sync_responder_worker_semaphore,
+            neighbor_sync_responder_admission_semaphore,
+            neighbor_sync_responder_inflight,
+            fresh_offer_worker_semaphore,
+            fresh_offer_admission_semaphore,
+            fresh_offer_responder_inflight,
+            fresh_offer_in_flight,
+            paid_notify_worker_semaphore,
+            paid_notify_admission_semaphore,
+            paid_notify_responder_inflight,
+            shutdown: shutdown.clone(),
+            detached_task_tracker,
+        };
+
+        let (replication_tx, mut replication_rx) =
+            mpsc::channel::<InboundReplicationMessage>(INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY);
+        let serial_context = handler_context.clone();
+        let serial_shutdown = shutdown.clone();
+        let serial_handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = serial_shutdown.cancelled() => break,
+                    inbound = replication_rx.recv() => {
+                        let Some(inbound) = inbound else { break };
+                        let source = inbound.source;
+                        match handle_replication_message(
+                            &source,
+                            inbound.msg,
+                            &serial_context,
+                            inbound.received_at,
+                            inbound.rr_message_id.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => {
+                                debug!("Replication message from {source} error: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            debug!("Replication non-audit serial handler shut down");
+        });
+        self.task_handles.push(serial_handle);
 
         let handle = tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = shutdown.cancelled() => break,
                     event = p2p_events.recv() => {
-                        let Ok(event) = event else { continue };
-                        if let P2PEvent::Message {
-                            topic,
-                            source: Some(source),
-                            data,
-                            ..
-                        } = event {
-                            // Determine which replication protocol this message
-                            // rode (core or subtree-audit) and whether it arrived
-                            // via the /rr/ request-response path (which wraps
-                            // payloads in a RequestResponseEnvelope).
-                            let rr_info = match_replication_protocol(&topic).and_then(
-                                |(matched_id, is_rr)| {
-                                    if is_rr {
-                                        P2PNode::parse_request_envelope(&data)
-                                            .filter(|(_, is_resp, _)| !is_resp)
-                                            .map(|(msg_id, _, payload)| {
-                                                (matched_id, payload, Some(msg_id))
-                                            })
-                                    } else {
-                                        Some((matched_id, data.clone(), None))
-                                    }
-                                },
+                        let event = match event {
+                            Ok(event) => event,
+                            Err(error) => match handle_replication_event_recv_error(&error) {
+                                ControlFlow::Continue(()) => continue,
+                                ControlFlow::Break(()) => break,
+                            },
+                        };
+                        let Some((source, payload, inbound_protocol, rr_message_id)) =
+                            replication_payload_from_event(event)
+                        else {
+                            continue;
+                        };
+                        let received_at = Instant::now();
+                        let msg = match ReplicationMessage::decode(&payload) {
+                            Ok(msg) => msg,
+                            Err(e) => {
+                                debug!("Replication message from {source} decode error: {e}");
+                                continue;
+                            }
+                        };
+                        if !body_matches_protocol(&msg.body, inbound_protocol) {
+                            debug!(
+                                "Dropping replication body (variant {}) on protocol \
+                                 {inbound_protocol}: wrong id for its family \
+                                 (cross-version or misrouted)",
+                                msg.body.variant_index()
                             );
-                            if let Some((matched_id, payload, rr_message_id)) = rr_info {
-                                match handle_replication_message(
-                                    &source,
-                                    &payload,
-                                    matched_id,
-                                    &p2p,
-                                    &storage,
-                                    &paid_list,
-                                    &payment_verifier,
-                                    &queues,
-                                    &config,
-                                    &is_bootstrapping,
-                                    &bootstrap_state,
-                                    &sync_history,
-                                    &sync_cycle_epoch,
-                                    &repair_proofs,
-                                    &last_commitment_by_peer,
-                                    &ever_capable_peers,
-                                    &sig_verify_attempts,
-                                    &my_commitment_state,
-                                    &gossip_audit,
-                                    &audit_responder_semaphore,
-                                    &audit_responder_inflight,
-                                    &subtree_round1,
-                                    rr_message_id.as_deref(),
-                                ).await {
-                                    Ok(()) => {}
-                                    Err(e) => {
-                                        debug!(
-                                            "Replication message from {source} error: {e}"
-                                        );
-                                    }
+                            continue;
+                        }
+                        if let Some(class) = audit_responder_class(&msg.body) {
+                            handler_context
+                                .audit_responder_metrics
+                                .record_received(source, class);
+                        }
+                        let inbound = InboundReplicationMessage {
+                            source,
+                            msg,
+                            rr_message_id,
+                            received_at,
+                        };
+                        if matches!(
+                            inbound.msg.body,
+                            ReplicationMessageBody::AuditChallenge(_)
+                                | ReplicationMessageBody::SubtreeAuditChallenge(_)
+                                | ReplicationMessageBody::SubtreeSliceChallenge(_)
+                        ) {
+                            let source = inbound.source;
+                            match handle_replication_message(
+                                &source,
+                                inbound.msg,
+                                &handler_context,
+                                inbound.received_at,
+                                inbound.rr_message_id.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    debug!("Replication message from {source} error: {e}");
                                 }
                             }
+                            continue;
+                        }
+                        if let Err(dropped) = try_enqueue_serial_message(&replication_tx, inbound) {
+                            if dropped.audit_responder_class.is_some() {
+                                handler_context
+                                    .audit_responder_metrics
+                                    .record_serial_queue_drop(dropped.source);
+                            }
+                            // Every serial-lane class has protocol recovery: syncs rerun,
+                            // fetches retry, verification re-asks, and a dropped fresh
+                            // offer is refilled by neighbor sync (the possession check
+                            // penalises the absence but never re-offers). Responses are
+                            // covered by their requester's deadline/retry path. Never run
+                            // a bulk handler here: event receipt must remain non-blocking.
+                            warn!(
+                                message_class = dropped.message_class,
+                                source = %dropped.source,
+                                queue_depth = dropped.queue_depth,
+                                reason = dropped.reason.as_str(),
+                                "Replication serial-queue message dropped"
+                            );
                         }
                     }
                     // Gap 4: Topology churn handling (Section 13).
@@ -2242,7 +2939,64 @@ impl ReplicationEngine {
                     // previous approach of checking every PeerConnected /
                     // PeerDisconnected event against the close group.
                     dht_event = dht_events.recv() => {
-                        let Ok(dht_event) = dht_event else { continue };
+                        let dht_event = match dht_event {
+                            Ok(event) => event,
+                            Err(RecvError::Lagged(missed)) => {
+                                // Under heavy churn the broadcast buffer can overflow
+                                // and drop routing-table events — the moment
+                                // convergence matters most. A dropped
+                                // KClosestPeersChanged means its entrants were never
+                                // queued and its departures were never pruned, so
+                                // draining priority_order cannot recover either.
+                                // Resync from ground truth instead: snapshot the
+                                // current close-peer set, prune pending peers that
+                                // left it during the lost window (retain_sync_peers,
+                                // as the normal topology-change path does), and queue
+                                // every member. Dedup (queue_priority_peers) and
+                                // per-peer cooldown (select_next_sync_peer) drop peers
+                                // already queued or recently synced, so only genuine
+                                // entrants surface.
+                                warn!(
+                                    "Missed {missed} DHT routing events (broadcast lag); resynchronizing close-peer set for neighbor sync"
+                                );
+                                let self_id = *p2p.peer_id();
+                                let neighbors = neighbor_sync::snapshot_close_neighbors(
+                                    &p2p,
+                                    &self_id,
+                                    config.neighbor_sync_scope,
+                                )
+                                .await;
+                                let neighbor_set =
+                                    neighbors.iter().copied().collect::<HashSet<_>>();
+                                let (requeued, sync_removals) = {
+                                    let mut state = sync_state.write().await;
+                                    let sync_removals =
+                                        state.retain_sync_peers(&neighbor_set);
+                                    let requeued = state.queue_priority_peers(neighbors);
+                                    (requeued, sync_removals)
+                                };
+                                if sync_removals > 0 {
+                                    debug!(
+                                        "Resync after broadcast lag pruned {sync_removals} departed pending sync entries"
+                                    );
+                                }
+                                if requeued > 0 {
+                                    debug!(
+                                        "Resync after broadcast lag queued {requeued} close peers for priority neighbor sync"
+                                    );
+                                    sync_trigger.notify_one();
+                                }
+                                continue;
+                            }
+                            Err(RecvError::Closed) => {
+                                // A closed broadcast channel never yields again;
+                                // continuing would spin the select! loop forever.
+                                warn!(
+                                    "DHT event stream closed on replication branch; stopping message handler"
+                                );
+                                break;
+                            }
+                        };
                         match dht_event {
                             DhtNetworkEvent::KClosestPeersChanged { old, new } => {
                                 let old_peers = old
@@ -2283,6 +3037,14 @@ impl ReplicationEngine {
                             DhtNetworkEvent::PeerRemoved { peer_id } => {
                                 sync_state.write().await.remove_peer(&peer_id);
                                 repair_proofs.write().await.remove_peer(&peer_id);
+                                update_bootstrap_after_peer_removed(
+                                    &peer_id,
+                                    &handler_context.bootstrap_state,
+                                    &handler_context.queues,
+                                    &handler_context.is_bootstrapping,
+                                    &bootstrap_complete_notify,
+                                )
+                                .await;
                                 // v12: drop the commitment bytes and the
                                 // recent-prover credit so a churn / sybil
                                 // attacker cannot leave behind one
@@ -2331,6 +3093,8 @@ impl ReplicationEngine {
         let last_commitment_by_peer = Arc::clone(&self.last_commitment_by_peer);
         let ever_capable_peers = Arc::clone(&self.ever_capable_peers);
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
+        let detached_task_tracker = self.detached_task_tracker.clone();
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -2341,17 +3105,28 @@ impl ReplicationEngine {
             recent_provers: Arc::clone(&self.recent_provers),
             sync_state: Arc::clone(&sync_state),
             cooldown: Arc::clone(&self.audit_on_gossip_cooldown),
+            detached_task_tracker,
             lottery_attempts: Arc::clone(&self.gossip_lottery_attempts),
         };
 
         let handle = tokio::spawn(async move {
             loop {
-                let interval = config.random_neighbor_sync_interval();
-                tokio::select! {
-                    () = shutdown.cancelled() => break,
-                    () = tokio::time::sleep(interval) => {}
-                    () = sync_trigger.notified() => {
-                        debug!("Neighbor sync triggered by topology change");
+                // Park for the periodic tick or an explicit trigger ONLY when no
+                // priority (topology-change) peers are queued. `sync_trigger` is a
+                // coalescing `Notify`, so a churn burst that queues many entrants
+                // produces a single wakeup; parking after draining one batch would
+                // leave the rest waiting up to a full periodic tick. `priority_order`
+                // is the durable record of pending work, so drain it back-to-back —
+                // each round removes the peers it selects (`select_next_sync_peer`),
+                // so the drain terminates once the queue empties.
+                if !sync_state.read().await.has_priority_peers() {
+                    let interval = config.random_neighbor_sync_interval();
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(interval) => {}
+                        () = sync_trigger.notified() => {
+                            debug!("Neighbor sync triggered by topology change");
+                        }
                     }
                 }
                 // Wrap the sync round in a select so shutdown cancels
@@ -2375,6 +3150,7 @@ impl ReplicationEngine {
                         &last_commitment_by_peer,
                         &ever_capable_peers,
                         &sig_verify_attempts,
+                        &audit_challenge_coordinator,
                         &gossip_audit,
                     ) => {}
                 }
@@ -2423,6 +3199,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let sync_state = Arc::clone(&self.sync_state);
+        let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
 
         let handle = tokio::spawn(async move {
             // Invariant 19: wait for bootstrap to drain before starting audits.
@@ -2451,6 +3228,7 @@ impl ReplicationEngine {
                         &config,
                         &history,
                         &repair_proofs,
+                        &audit_challenge_coordinator,
                         current_sync_epoch,
                         bootstrapping,
                     )
@@ -2475,6 +3253,7 @@ impl ReplicationEngine {
                                 &config,
                                 &history,
                                 &repair_proofs,
+                                &audit_challenge_coordinator,
                                 current_sync_epoch,
                                 bootstrapping,
                             )
@@ -2624,10 +3403,46 @@ impl ReplicationEngine {
                         protocol::log_traffic_summary();
                         protocol::log_served_peers_summary();
                         protocol::log_audit_outcome_summary();
+                        audit_metrics::log_responder_admission_summary();
                     }
                 }
             }
             debug!("Replication traffic summary loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Periodically rank remote peers using the shared audit responder pool and
+    /// report handler-only versus end-to-end latency. Windowed values make a
+    /// burst visible even after a long-running node has accumulated traffic.
+    #[cfg(feature = "logging")]
+    fn start_audit_responder_summary_loop(&mut self) {
+        let shutdown = self.shutdown.clone();
+        let metrics = Arc::clone(&self.audit_responder_metrics);
+        let semaphore = Arc::clone(&self.audit_responder_semaphore);
+        let handle = tokio::spawn(async move {
+            let mut window_started = Instant::now();
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => {
+                        log_audit_responder_summary(
+                            &metrics,
+                            &semaphore,
+                            window_started.elapsed(),
+                        );
+                        break;
+                    }
+                    () = tokio::time::sleep(config::AUDIT_RESPONDER_SUMMARY_INTERVAL) => {
+                        log_audit_responder_summary(
+                            &metrics,
+                            &semaphore,
+                            window_started.elapsed(),
+                        );
+                        window_started = Instant::now();
+                    }
+                }
+            }
+            debug!("Audit responder summary loop shut down");
         });
         self.task_handles.push(handle);
     }
@@ -2642,6 +3457,7 @@ impl ReplicationEngine {
         let bootstrap_state = Arc::clone(&self.bootstrap_state);
         let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
         let bootstrap_complete_notify = Arc::clone(&self.bootstrap_complete_notify);
+        let detached_task_tracker = self.detached_task_tracker.clone();
         let concurrency = max_parallel_fetch();
 
         info!("Fetch worker concurrency set to {concurrency} (hardware threads)");
@@ -2659,22 +3475,31 @@ impl ReplicationEngine {
                         let Some(candidate) = q.dequeue_fetch() else {
                             break;
                         };
+                        let fetch_key = candidate.key;
                         let Some(&source) = candidate.sources.first() else {
                             warn!(
-                                "Fetch candidate {} has no sources — dropping",
-                                hex::encode(candidate.key)
+                                "Fetch candidate {} has no sources; requeueing for verification",
+                                hex::encode(fetch_key)
+                            );
+                            let _ = q.requeue_candidate_for_verification(
+                                candidate,
+                                config.verification_request_timeout,
                             );
                             continue;
                         };
-                        q.start_fetch(candidate.key, source, candidate.sources.clone());
+                        q.start_dequeued_fetch(candidate, source);
 
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
                         let token = shutdown.clone();
-                        let fetch_key = candidate.key;
+                        let tracker = detached_task_tracker.clone();
                         in_flight.push(Box::pin(async move {
-                            let handle = tokio::spawn(async move {
+                            // Tracked so shutdown() still awaits the task if
+                            // this awaiter is dropped (e.g. the worker is
+                            // aborted): it holds Arc<LmdbStorage> and must
+                            // not outlive the engine.
+                            let handle = tracker.spawn(async move {
                                 // Cancel-aware: abort when the engine shuts down.
                                 tokio::select! {
                                     () = token.cancelled() => FetchOutcome {
@@ -2716,53 +3541,57 @@ impl ReplicationEngine {
                     Some((key, maybe_outcome)) = in_flight.next() => {
                         let mut q = queues.write().await;
                         let terminal = if let Some(outcome) = maybe_outcome {
-                            match outcome.result {
-                                FetchResult::Stored => {
-                                    q.complete_fetch(&key);
-                                    true
-                                }
-                                FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
-                                    if let Some(next_peer) = q.retry_fetch(&key) {
-                                        // Spawn a new fetch task for the next source.
-                                        let p2p = Arc::clone(&p2p);
-                                        let storage = Arc::clone(&storage);
-                                        let config = Arc::clone(&config);
-                                        let token = shutdown.clone();
-                                        let fetch_key = key;
-                                        in_flight.push(Box::pin(async move {
-                                            let handle = tokio::spawn(async move {
-                                                tokio::select! {
-                                                    () = token.cancelled() => FetchOutcome {
-                                                        key: fetch_key,
-                                                        result: FetchResult::SourceFailed,
-                                                    },
-                                                    outcome = execute_single_fetch(
-                                                        p2p, storage, config, fetch_key, next_peer,
-                                                    ) => outcome,
-                                                }
-                                            });
-                                            match handle.await {
-                                                Ok(outcome) => (outcome.key, Some(outcome)),
-                                                Err(e) => {
-                                                    error!(
-                                                        "Fetch task for {} panicked: {e}",
-                                                        hex::encode(fetch_key)
-                                                    );
-                                                    (fetch_key, None)
-                                                }
+                            match apply_fetch_result(
+                                &mut q,
+                                &key,
+                                &outcome.result,
+                                config.verification_request_timeout,
+                            ) {
+                                FetchFollowUp::Terminal => true,
+                                FetchFollowUp::RequeuedForVerification => false,
+                                FetchFollowUp::RetryFrom(next_peer) => {
+                                    // Spawn a new fetch task for the next source.
+                                    let p2p = Arc::clone(&p2p);
+                                    let storage = Arc::clone(&storage);
+                                    let config = Arc::clone(&config);
+                                    let token = shutdown.clone();
+                                    let tracker = detached_task_tracker.clone();
+                                    let fetch_key = key;
+                                    in_flight.push(Box::pin(async move {
+                                        // Tracked for the same reason as the
+                                        // initial fetch spawn above.
+                                        let handle = tracker.spawn(async move {
+                                            tokio::select! {
+                                                () = token.cancelled() => FetchOutcome {
+                                                    key: fetch_key,
+                                                    result: FetchResult::SourceFailed,
+                                                },
+                                                outcome = execute_single_fetch(
+                                                    p2p, storage, config, fetch_key, next_peer,
+                                                ) => outcome,
                                             }
-                                        }));
-                                        false
-                                    } else {
-                                        q.complete_fetch(&key);
-                                        true
-                                    }
+                                        });
+                                        match handle.await {
+                                            Ok(outcome) => (outcome.key, Some(outcome)),
+                                            Err(e) => {
+                                                error!(
+                                                    "Fetch task for {} panicked: {e}",
+                                                    hex::encode(fetch_key)
+                                                );
+                                                (fetch_key, None)
+                                            }
+                                        }
+                                    }));
+                                    false
                                 }
                             }
                         } else {
-                            // Task panicked — reclaim the in-flight slot.
-                            q.complete_fetch(&key);
-                            true
+                            // Task panicked — retry verification when this was
+                            // a verified repair, otherwise reclaim the slot.
+                            !q.requeue_fetch_for_verification(
+                                &key,
+                                config.verification_request_timeout,
+                            )
                         };
 
                         // Shrink bootstrap pending set on terminal exit.
@@ -2918,36 +3747,41 @@ impl ReplicationEngine {
                 )
                 .await;
 
-                for peer in batch {
-                    if shutdown.is_cancelled() {
-                        break;
+                // Keep the batch outstanding until every response has been
+                // admitted and bootstrap accounting is updated. The verification
+                // worker uses this counter as a batch barrier, so it cannot race
+                // the source aggregation below.
+                bootstrap::increment_pending_requests(&bootstrap_state, batch.len()).await;
+                let bootstrapping = *is_bootstrapping.read().await;
+
+                let sync_futures = batch.iter().map(|peer| {
+                    let peer = *peer;
+                    let hints = hints_by_peer.remove(&peer).unwrap_or_default();
+                    // Atomically snapshot + mark-gossiped for each emitted
+                    // bootstrap request so we remain answerable for it.
+                    let commitment = my_commitment_state
+                        .current_for_gossip()
+                        .map(|binding| binding.commitment().clone());
+                    let p2p = &p2p;
+                    let config = &config;
+                    async move {
+                        let outcome = neighbor_sync::sync_with_peer_with_hints(
+                            &peer,
+                            p2p,
+                            config,
+                            bootstrapping,
+                            hints,
+                            commitment,
+                        )
+                        .await;
+                        (peer, outcome)
                     }
+                });
+                let completed = join_all(sync_futures).await;
 
-                    // Re-read on each iteration so peers see current state.
-                    let bootstrapping = *is_bootstrapping.read().await;
-
-                    bootstrap::increment_pending_requests(&bootstrap_state, 1).await;
-
-                    let hints = hints_by_peer.remove(peer).unwrap_or_default();
-                    let outcome = neighbor_sync::sync_with_peer_with_hints(
-                        peer,
-                        &p2p,
-                        &config,
-                        bootstrapping,
-                        hints,
-                        // Atomically snapshot + mark-gossiped: emitted in the
-                        // bootstrap-sync request, so we stay answerable for it
-                        // (ADR-0002). One critical section avoids a TOCTOU where a
-                        // concurrent retire/rotate drops the slot between read and
-                        // mark.
-                        my_commitment_state
-                            .current_for_gossip()
-                            .map(|b| b.commitment().clone()),
-                    )
-                    .await;
-
-                    bootstrap::decrement_pending_requests(&bootstrap_state, 1).await;
-
+                // Process response metadata before exposing any of this batch's
+                // hints to verification.
+                for (peer, outcome) in &completed {
                     if let Some(outcome) = outcome {
                         // Ingest the peer's piggybacked commitment from the
                         // response (same verification as the request path).
@@ -2981,41 +3815,66 @@ impl ReplicationEngine {
                                 &sync_cycle_epoch,
                             )
                             .await;
-                            // Admit hints into verification pipeline.
-                            let outcome = admit_and_queue_hints(
+                        }
+                    }
+                }
+
+                let pending_keys: HashSet<XorName> = {
+                    let q = queues.read().await;
+                    q.pending_keys().into_iter().collect()
+                };
+                let admission_futures = completed.iter().map(|(_, outcome)| async {
+                    match outcome {
+                        Some(outcome) if !outcome.response.bootstrapping => Some(
+                            admission::admit_hints(
                                 &self_id,
-                                peer,
                                 &outcome.response.replica_hints,
                                 &outcome.response.paid_hints,
                                 &p2p,
                                 &config,
                                 &storage,
                                 &paid_list,
-                                &queues,
+                                &pending_keys,
                             )
-                            .await;
-
-                            // Track discovered keys for drain detection.
-                            if !outcome.discovered.is_empty() {
-                                bootstrap::track_discovered_keys(
-                                    &bootstrap_state,
-                                    &outcome.discovered,
-                                )
-                                .await;
-                            }
-
-                            // Record / retire capacity rejections so the
-                            // drain check correctly reflects whether each
-                            // source still owes us re-hinted work after
-                            // queue overflow.
-                            if outcome.capacity_rejected_count > 0 {
-                                bootstrap::note_capacity_rejected(&bootstrap_state, *peer).await;
-                            } else {
-                                bootstrap::clear_capacity_rejected(&bootstrap_state, peer).await;
-                            }
-                        }
+                            .await,
+                        ),
+                        _ => None,
                     }
-                }
+                });
+                let admitted = join_all(admission_futures).await;
+
+                // Queue every peer's admitted hints under one write lock. Once
+                // released, source-count ordering sees the complete batch.
+                let (batch_outcomes, batch_discovered) = {
+                    let mut q = queues.write().await;
+                    let outcomes = completed
+                        .iter()
+                        .zip(admitted)
+                        .filter_map(|((peer, _), admitted)| {
+                            admitted.map(|admitted| {
+                                (
+                                    *peer,
+                                    queue_admitted_hints(peer, admitted, &storage, &mut q),
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let live_discovered = outcomes
+                        .iter()
+                        .flat_map(|(_, outcome)| outcome.discovered.iter().copied())
+                        .filter(|key| q.contains_key(key))
+                        .collect::<HashSet<_>>();
+                    (outcomes, live_discovered)
+                };
+
+                publish_bootstrap_admission_outcomes(
+                    &bootstrap_state,
+                    &batch_outcomes,
+                    &batch_discovered,
+                )
+                .await;
+
+                bootstrap::decrement_pending_requests(&bootstrap_state, batch.len()).await;
             }
 
             // Check drain condition.
@@ -3036,6 +3895,84 @@ impl ReplicationEngine {
 // Free functions for background tasks
 // ===========================================================================
 
+#[cfg(feature = "logging")]
+fn log_audit_responder_summary(
+    metrics: &AuditResponderMetrics,
+    semaphore: &Semaphore,
+    window: Duration,
+) {
+    let snapshot = metrics.take_snapshot();
+    if snapshot.origins.is_empty() {
+        return;
+    }
+
+    let total = snapshot.total;
+    let [digest_received, subtree_received, byte_received, commitment_pin_received] =
+        total.received_by_class;
+    let global_inflight =
+        MAX_CONCURRENT_AUDIT_RESPONSES.saturating_sub(semaphore.available_permits());
+    info!(
+        target: "ant_node::replication::audit_responder",
+        window_ms = window.as_millis(),
+        source_count = snapshot.origins.len(),
+        received = total.received(),
+        digest_received,
+        subtree_received,
+        byte_received,
+        commitment_pin_received,
+        admitted = total.admitted,
+        global_pool_drops = total.global_pool_drops,
+        per_peer_cap_drops = total.per_peer_cap_drops,
+        serial_queue_drops = total.serial_queue_drops,
+        completed = total.completed,
+        send_failures = total.send_failures,
+        processing_avg_ms = total.processing_avg_ms(),
+        processing_max_ms = total.processing_max_ms,
+        total_avg_ms = total.total_avg_ms(),
+        total_max_ms = total.total_max_ms,
+        global_inflight,
+        global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+        peak_global_inflight = total.peak_global_inflight,
+        "Audit responder summary"
+    );
+
+    for (index, origin) in snapshot
+        .origins
+        .iter()
+        .take(config::AUDIT_RESPONDER_TOP_ORIGINS)
+        .enumerate()
+    {
+        let Some(source) = origin.source else {
+            continue;
+        };
+        let [digest_received, subtree_received, byte_received, commitment_pin_received] =
+            origin.received_by_class;
+        info!(
+            target: "ant_node::replication::audit_responder",
+            rank = index + 1,
+            source = %source,
+            received = origin.received(),
+            digest_received,
+            subtree_received,
+            byte_received,
+            commitment_pin_received,
+            admitted = origin.admitted,
+            global_pool_drops = origin.global_pool_drops,
+            per_peer_cap_drops = origin.per_peer_cap_drops,
+            serial_queue_drops = origin.serial_queue_drops,
+            completed = origin.completed,
+            send_failures = origin.send_failures,
+            processing_avg_ms = origin.processing_avg_ms(),
+            processing_max_ms = origin.processing_max_ms,
+            total_avg_ms = origin.total_avg_ms(),
+            total_max_ms = origin.total_max_ms,
+            peak_global_inflight = origin.peak_global_inflight,
+            peak_peer_inflight = origin.peak_peer_inflight,
+            "Audit responder top origin"
+        );
+    }
+}
+
 /// Which ceiling rejected an audit-responder admission attempt.
 ///
 /// Stable, machine-readable so a production log-scrape can bucket drops by
@@ -3051,7 +3988,7 @@ impl ReplicationEngine {
 /// responsible (fast-path) challenge from the heavier subtree/byte ones. If a
 /// dedicated slow pool is later split out, add its variants here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AuditResponderRejectReason {
+enum ResponderRejectReason {
     /// The global [`MAX_CONCURRENT_AUDIT_RESPONSES`] semaphore had no permit
     /// free; the per-peer cap was not the binding constraint.
     GlobalPoolFull,
@@ -3060,7 +3997,7 @@ enum AuditResponderRejectReason {
     PerPeerCapFull,
 }
 
-impl AuditResponderRejectReason {
+impl ResponderRejectReason {
     /// Stable token emitted as `reason=<token>` in drop logs. Keep these values
     /// frozen — production log tooling greps for them.
     fn as_str(self) -> &'static str {
@@ -3071,6 +4008,80 @@ impl AuditResponderRejectReason {
     }
 }
 
+impl From<ResponderRejectReason> for AuditResponderDropReason {
+    fn from(reason: ResponderRejectReason) -> Self {
+        match reason {
+            ResponderRejectReason::GlobalPoolFull => Self::GlobalPoolFull,
+            ResponderRejectReason::PerPeerCapFull => Self::PerPeerCapFull,
+        }
+    }
+}
+
+impl From<ResponderRejectReason> for ResponderAdmissionCeiling {
+    fn from(reason: ResponderRejectReason) -> Self {
+        match reason {
+            ResponderRejectReason::GlobalPoolFull => Self::GlobalPool,
+            ResponderRejectReason::PerPeerCapFull => Self::PerPeerShare,
+        }
+    }
+}
+
+/// Cumulative fresh-offer admission refusals in this process.
+///
+/// **Expected value in healthy operation is zero.** A node that refuses a
+/// legitimate fresh offer does not merely shed load: the sender transmits
+/// offers one-way and never reads the refusal, so the chunk's absence
+/// resurfaces at the sender's delayed possession check and is charged to the
+/// refusing node at audit severity (ADR-0003). Reaching this ceiling therefore
+/// means the node is either under-provisioned for its offered load or its
+/// admission share is mis-sized — and is accruing unearned trust damage either
+/// way. Operators should alarm on any sustained non-zero rate.
+///
+/// Process-global rather than per-engine, which is exactly right in production
+/// (one node per process) and adequate in multi-node test harnesses, where the
+/// useful assertion is that *no* node in the fleet refused.
+#[must_use]
+pub fn fresh_offer_admission_refusals() -> u64 {
+    audit_metrics::responder_admission_drops(ReplicationResponderClass::FreshOffer)
+}
+
+/// Cumulative paid-list notification admission refusals in this process.
+///
+/// As with [`fresh_offer_admission_refusals`], zero is the expected value.
+/// `PaidNotify` is one-way with no retry, so a refusal discards durable
+/// paid-list evidence outright rather than pushing work back onto a requester.
+#[must_use]
+pub fn paid_notify_admission_refusals() -> u64 {
+    audit_metrics::responder_admission_drops(ReplicationResponderClass::PaidNotify)
+}
+
+/// Fresh-offer refusals caused by the class-wide pool being exhausted.
+///
+/// Split from [`fresh_offer_refusals_per_peer_share`] because the two indict
+/// different things: this one says the node was saturated across all sources
+/// and is genuinely under-provisioned for its offered load.
+#[must_use]
+pub fn fresh_offer_refusals_global_pool() -> u64 {
+    audit_metrics::responder_admission_drops_by_ceiling(
+        ReplicationResponderClass::FreshOffer,
+        ResponderAdmissionCeiling::GlobalPool,
+    )
+}
+
+/// Fresh-offer refusals caused by one source exhausting its per-peer share.
+///
+/// For fresh offers this usually indicts the *share's size* rather than the
+/// sender: the legitimate traffic pattern is bulk from a single peer — the one
+/// node handling a client's PUT and fanning it out — so a share sized for
+/// request/response traffic will refuse ordinary uploads.
+#[must_use]
+pub fn fresh_offer_refusals_per_peer_share() -> u64 {
+    audit_metrics::responder_admission_drops_by_ceiling(
+        ReplicationResponderClass::FreshOffer,
+        ResponderAdmissionCeiling::PerPeerShare,
+    )
+}
+
 /// Why an audit-responder admission attempt failed, with the decision-time
 /// capacity counters that let a drop be logged with full context.
 ///
@@ -3079,8 +4090,8 @@ impl AuditResponderRejectReason {
 /// are not a single atomic view), but they are exact enough to tell a saturated
 /// node from a single self-throttling flooder.
 #[derive(Debug, Clone, Copy)]
-struct AuditResponderAdmissionFailure {
-    reason: AuditResponderRejectReason,
+struct ResponderAdmissionFailure {
+    reason: ResponderRejectReason,
     /// Global permits in use across the whole engine at decision time.
     global_inflight: usize,
     /// Configured global ceiling ([`MAX_CONCURRENT_AUDIT_RESPONSES`]).
@@ -3091,7 +4102,7 @@ struct AuditResponderAdmissionFailure {
     peer_limit: u32,
 }
 
-impl fmt::Display for AuditResponderAdmissionFailure {
+impl fmt::Display for ResponderAdmissionFailure {
     /// Renders the stable `reason=... global_inflight=... global_limit=...
     /// peer_inflight=... peer_limit=...` suffix appended to every drop log.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -3111,13 +4122,221 @@ impl fmt::Display for AuditResponderAdmissionFailure {
 /// on drop, decrements the PER-PEER in-flight count. Moving this into the
 /// spawned task ties both bounds to the task's exact lifetime — no manual
 /// decrement to forget on an early return or panic.
-struct AuditResponderGuard {
+struct ResponderGuard {
     _permit: tokio::sync::OwnedSemaphorePermit,
+    _peer_slot: PeerResponderSlot,
+    global_inflight: usize,
+    peer_inflight: u32,
+}
+
+type AuditResponderGuard = ResponderGuard;
+type AuditResponderAdmissionFailure = ResponderAdmissionFailure;
+
+/// Provisional or admitted per-peer responder slot.
+///
+/// The slot is claimed before the global permit is attempted. Keeping that
+/// claim under RAII means cancellation while rolling a failed admission back
+/// cannot strand a peer at its cap. Once admission succeeds this guard moves
+/// into [`ResponderGuard`] and remains held for the worker's exact lifetime.
+struct PeerResponderSlot {
     inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
     peer: PeerId,
 }
 
-impl Drop for AuditResponderGuard {
+#[derive(Clone)]
+struct ReplicationMessageHandlerContext {
+    p2p_node: Arc<P2PNode>,
+    storage: Arc<LmdbStorage>,
+    paid_list: Arc<PaidList>,
+    payment_verifier: Arc<PaymentVerifier>,
+    queues: Arc<RwLock<ReplicationQueues>>,
+    config: Arc<ReplicationConfig>,
+    is_bootstrapping: Arc<RwLock<bool>>,
+    bootstrap_state: Arc<RwLock<BootstrapState>>,
+    sync_history: Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
+    sync_cycle_epoch: Arc<RwLock<u64>>,
+    repair_proofs: Arc<RwLock<RepairProofs>>,
+    last_commitment_by_peer: Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
+    ever_capable_peers: Arc<RwLock<HashSet<PeerId>>>,
+    sig_verify_attempts: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    my_commitment_state: Arc<ResponderCommitmentState>,
+    gossip_audit: GossipAuditTrigger,
+    audit_responder_semaphore: Arc<Semaphore>,
+    audit_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    audit_responder_metrics: Arc<AuditResponderMetrics>,
+    subtree_round1: SubtreeRound1Limiter,
+    fetch_responder_worker_semaphore: Arc<Semaphore>,
+    fetch_responder_admission_semaphore: Arc<Semaphore>,
+    fetch_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    verification_responder_worker_semaphore: Arc<Semaphore>,
+    verification_responder_admission_semaphore: Arc<Semaphore>,
+    verification_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    neighbor_sync_responder_worker_semaphore: Arc<Semaphore>,
+    neighbor_sync_responder_admission_semaphore: Arc<Semaphore>,
+    neighbor_sync_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    fresh_offer_worker_semaphore: Arc<Semaphore>,
+    fresh_offer_admission_semaphore: Arc<Semaphore>,
+    fresh_offer_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    fresh_offer_in_flight: FreshOfferInFlight,
+    paid_notify_worker_semaphore: Arc<Semaphore>,
+    paid_notify_admission_semaphore: Arc<Semaphore>,
+    paid_notify_responder_inflight: Arc<RwLock<HashMap<PeerId, u32>>>,
+    /// The engine's shutdown token, for detached responder work.
+    ///
+    /// Workers on [`Self::detached_task_tracker`] race this around their
+    /// *network* phase only — never around an LMDB `spawn_blocking` await,
+    /// where dropping the awaiter would detach a live transaction. This is
+    /// what lets `shutdown()` keep its unbounded `tracker.wait()` and still
+    /// terminate: the wait stays safe because it is now guaranteed finite.
+    shutdown: CancellationToken,
+    /// Shared tracker for detached work so `shutdown()` can await release of
+    /// storage and P2P resources after all producer tasks have stopped.
+    detached_task_tracker: TaskTracker,
+}
+
+struct InboundReplicationMessage {
+    source: PeerId,
+    msg: ReplicationMessage,
+    rr_message_id: Option<String>,
+    received_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialQueueDropReason {
+    Full,
+    Closed,
+}
+
+#[cfg(feature = "logging")]
+impl SerialQueueDropReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(any(feature = "logging", test)), allow(dead_code))]
+struct SerialQueueDrop {
+    source: PeerId,
+    message_class: &'static str,
+    audit_responder_class: Option<AuditResponderClass>,
+    queue_depth: usize,
+    reason: SerialQueueDropReason,
+}
+
+fn try_enqueue_serial_message(
+    sender: &mpsc::Sender<InboundReplicationMessage>,
+    inbound: InboundReplicationMessage,
+) -> std::result::Result<(), SerialQueueDrop> {
+    let source = inbound.source;
+    let message_class = replication_message_class(&inbound.msg.body);
+    let audit_responder_class = audit_responder_class(&inbound.msg.body);
+    let queue_depth = sender.max_capacity().saturating_sub(sender.capacity());
+    sender.try_send(inbound).map_err(|error| {
+        let (reason, dropped) = match error {
+            mpsc::error::TrySendError::Full(dropped) => (SerialQueueDropReason::Full, dropped),
+            mpsc::error::TrySendError::Closed(dropped) => (SerialQueueDropReason::Closed, dropped),
+        };
+        audit_metrics::record_serial_queue_overflow_drop(&dropped.msg.body);
+        SerialQueueDrop {
+            source,
+            message_class,
+            audit_responder_class,
+            queue_depth,
+            reason,
+        }
+    })
+}
+
+const fn replication_message_class(body: &ReplicationMessageBody) -> &'static str {
+    match body {
+        ReplicationMessageBody::FreshReplicationOffer(_) => "fresh_offer",
+        ReplicationMessageBody::FreshReplicationResponse(_) => "fresh_response",
+        ReplicationMessageBody::PaidNotify(_) => "paid_notify",
+        ReplicationMessageBody::NeighborSyncRequest(_) => "neighbor_sync_request",
+        ReplicationMessageBody::NeighborSyncResponse(_) => "neighbor_sync_response",
+        ReplicationMessageBody::VerificationRequest(_) => "verification_request",
+        ReplicationMessageBody::VerificationResponse(_) => "verification_response",
+        ReplicationMessageBody::FetchRequest(_) => "fetch_request",
+        ReplicationMessageBody::FetchResponse(_) => "fetch_response",
+        ReplicationMessageBody::AuditChallenge(_) => "audit_challenge",
+        ReplicationMessageBody::AuditResponse(_) => "audit_response",
+        ReplicationMessageBody::SubtreeAuditChallenge(_) => "subtree_audit_challenge",
+        ReplicationMessageBody::SubtreeAuditResponse(_) => "subtree_audit_response",
+        ReplicationMessageBody::SubtreeSliceChallenge(_) => "subtree_slice_challenge",
+        ReplicationMessageBody::SubtreeSliceResponse(_) => "subtree_slice_response",
+        ReplicationMessageBody::GetCommitmentByPin(_) => "commitment_pin_request",
+        ReplicationMessageBody::GetCommitmentByPinResponse(_) => "commitment_pin_response",
+    }
+}
+
+const fn audit_responder_class(body: &ReplicationMessageBody) -> Option<AuditResponderClass> {
+    match body {
+        ReplicationMessageBody::AuditChallenge(_) => Some(AuditResponderClass::Digest),
+        ReplicationMessageBody::SubtreeAuditChallenge(_) => Some(AuditResponderClass::Subtree),
+        ReplicationMessageBody::SubtreeSliceChallenge(_) => Some(AuditResponderClass::Byte),
+        ReplicationMessageBody::GetCommitmentByPin(_) => Some(AuditResponderClass::CommitmentPin),
+        _ => None,
+    }
+}
+
+impl AuditResponderClass {
+    const fn per_peer_limit(self) -> u32 {
+        match self {
+            Self::Digest => MAX_DIGEST_AUDIT_RESPONSES_PER_PEER,
+            Self::Subtree | Self::Byte | Self::CommitmentPin => MAX_AUDIT_RESPONSES_PER_PEER,
+        }
+    }
+}
+
+fn handle_replication_event_recv_error(error: &RecvError) -> ControlFlow<()> {
+    match error {
+        RecvError::Lagged(missed) => {
+            audit_metrics::record_replication_event_lagged(*missed);
+            warn!(
+                "Missed {missed} P2P events on replication branch (broadcast lag); \
+                 replication messages may have been dropped before dispatch"
+            );
+            ControlFlow::Continue(())
+        }
+        RecvError::Closed => {
+            // A closed broadcast channel never yields again, so the branch
+            // would otherwise be immediately ready on every select! iteration.
+            warn!("P2P event stream closed on replication branch; stopping message handler");
+            ControlFlow::Break(())
+        }
+    }
+}
+
+fn replication_payload_from_event(
+    event: P2PEvent,
+) -> Option<(PeerId, Vec<u8>, &'static str, Option<String>)> {
+    let P2PEvent::Message {
+        topic,
+        source: Some(source),
+        data,
+        ..
+    } = event
+    else {
+        return None;
+    };
+
+    let (matched_id, is_rr) = match_replication_protocol(&topic)?;
+    if !is_rr {
+        return Some((source, data, matched_id, None));
+    }
+    if is_rr {
+        return P2PNode::parse_request_envelope(&data)
+            .filter(|(_, is_resp, _)| !is_resp)
+            .map(|(msg_id, _, payload)| (source, payload, matched_id, Some(msg_id)));
+    }
+    None
+}
+
+impl Drop for PeerResponderSlot {
     fn drop(&mut self) {
         // Decrement (and prune to keep the map bounded) without blocking the
         // async runtime: a short lock on a tiny map.
@@ -3150,6 +4369,58 @@ impl Drop for AuditResponderGuard {
             });
         }
     }
+}
+
+/// Try to admit one bounded responder task for `source`: claim a per-peer slot
+/// and then a global permit. The limits are parameters so independent responder
+/// classes can reuse the same flood-fair admission and cancellation semantics.
+async fn admit_bounded_responder(
+    semaphore: &Arc<Semaphore>,
+    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
+    source: &PeerId,
+    global_limit: usize,
+    peer_limit: u32,
+) -> std::result::Result<ResponderGuard, ResponderAdmissionFailure> {
+    let global_inflight = |sem: &Semaphore| global_limit.saturating_sub(sem.available_permits());
+
+    let admitted_peer_inflight = {
+        let mut map = inflight.write().await;
+        let entry = map.entry(*source).or_insert(0);
+        if *entry >= peer_limit {
+            let peer_inflight = *entry;
+            drop(map);
+            return Err(ResponderAdmissionFailure {
+                reason: ResponderRejectReason::PerPeerCapFull,
+                global_inflight: global_inflight(semaphore),
+                global_limit,
+                peer_inflight,
+                peer_limit,
+            });
+        }
+        *entry += 1;
+        *entry
+    };
+
+    let peer_slot = PeerResponderSlot {
+        inflight: Arc::clone(inflight),
+        peer: *source,
+    };
+    let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
+        return Err(ResponderAdmissionFailure {
+            reason: ResponderRejectReason::GlobalPoolFull,
+            global_inflight: global_inflight(semaphore),
+            global_limit,
+            peer_inflight: admitted_peer_inflight.saturating_sub(1),
+            peer_limit,
+        });
+    };
+
+    Ok(ResponderGuard {
+        _permit: permit,
+        _peer_slot: peer_slot,
+        global_inflight: global_inflight(semaphore),
+        peer_inflight: admitted_peer_inflight,
+    })
 }
 
 /// A live round-1 → round-2 subtree-audit session: proof of a matching round 1.
@@ -3285,7 +4556,7 @@ impl SubtreeRound1Limiter {
     /// drops the challenge (the remote auditor applies its own graced-timeout
     /// policy).
     async fn admit(&self, source: &PeerId) -> Option<AuditResponderGuard> {
-        let guard = admit_audit_responder_with_limits(
+        let guard = admit_bounded_responder(
             &self.semaphore,
             &self.inflight,
             source,
@@ -3413,10 +4684,11 @@ async fn admit_slice_challenge(
     source: &PeerId,
     challenge: &protocol::SubtreeSliceChallenge,
 ) -> SliceAdmission {
-    let guard = match admit_audit_responder(semaphore, inflight, source).await {
-        Ok(guard) => guard,
-        Err(failure) => return SliceAdmission::Capacity(failure),
-    };
+    let guard =
+        match admit_audit_responder(semaphore, inflight, source, AuditResponderClass::Byte).await {
+            Ok(guard) => guard,
+            Err(failure) => return SliceAdmission::Capacity(failure),
+        };
     if !round1
         .consume_session(
             source,
@@ -3446,80 +4718,11 @@ async fn admit_audit_responder(
     semaphore: &Arc<Semaphore>,
     inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
     source: &PeerId,
+    class: AuditResponderClass,
 ) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
-    admit_audit_responder_with_limits(
-        semaphore,
-        inflight,
-        source,
-        MAX_CONCURRENT_AUDIT_RESPONSES,
-        MAX_AUDIT_RESPONSES_PER_PEER,
-    )
-    .await
-}
-
-/// Admission core shared by the light audit pool ([`admit_audit_responder`]) and
-/// the tight heavy subtree round-1 pool: take a global permit AND a per-peer slot
-/// under the given limits.
-async fn admit_audit_responder_with_limits(
-    semaphore: &Arc<Semaphore>,
-    inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
-    source: &PeerId,
-    global_limit: usize,
-    peer_limit: u32,
-) -> std::result::Result<AuditResponderGuard, AuditResponderAdmissionFailure> {
-    // `available_permits()` is a cheap atomic load; `global_limit - available`
-    // is the best-effort in-flight count at decision time. Not synchronized with
-    // the per-peer lock, so it is a snapshot, not a single atomic view.
-    let global_inflight = |sem: &Semaphore| global_limit.saturating_sub(sem.available_permits());
-
-    // Per-peer cap first (cheap, and the fairness-critical bound), committed
-    // under the write lock so concurrent challenges from the same peer can't
-    // both slip past the cap.
-    {
-        let mut map = inflight.write().await;
-        let entry = map.entry(*source).or_insert(0);
-        if *entry >= peer_limit {
-            let peer_inflight = *entry;
-            drop(map); // release before the (unrelated) semaphore read
-            return Err(AuditResponderAdmissionFailure {
-                reason: AuditResponderRejectReason::PerPeerCapFull,
-                global_inflight: global_inflight(semaphore),
-                global_limit,
-                peer_inflight,
-                peer_limit,
-            });
-        }
-        *entry += 1;
-    }
-    // Then the global ceiling. If it's exhausted, give back the per-peer slot we
-    // just claimed so it isn't leaked.
-    let Ok(permit) = Arc::clone(semaphore).try_acquire_owned() else {
-        let peer_inflight = {
-            let mut map = inflight.write().await;
-            map.remove(source).map_or(0, |n| {
-                // Report the per-peer occupancy AFTER releasing our rolled-back
-                // slot: the share still held by this source's other in-flight
-                // tasks (below the cap, since the per-peer check passed).
-                let remaining = n.saturating_sub(1);
-                if remaining > 0 {
-                    map.insert(*source, remaining);
-                }
-                remaining
-            })
-        };
-        return Err(AuditResponderAdmissionFailure {
-            reason: AuditResponderRejectReason::GlobalPoolFull,
-            global_inflight: global_inflight(semaphore),
-            global_limit,
-            peer_inflight,
-            peer_limit,
-        });
-    };
-    Ok(AuditResponderGuard {
-        _permit: permit,
-        inflight: Arc::clone(inflight),
-        peer: *source,
-    })
+    let global_limit = MAX_CONCURRENT_AUDIT_RESPONSES;
+    let peer_limit = class.per_peer_limit();
+    admit_bounded_responder(semaphore, inflight, source, global_limit, peer_limit).await
 }
 
 /// Handle an incoming replication protocol message.
@@ -3527,113 +4730,31 @@ async fn admit_audit_responder_with_limits(
 /// When `rr_message_id` is `Some`, the request arrived via the `/rr/`
 /// request-response path and the response must be sent via `send_response`
 /// so saorsa-core can route it back to the waiting `send_request` caller.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_lines)]
 async fn handle_replication_message(
     source: &PeerId,
-    data: &[u8],
-    inbound_protocol: &str,
-    p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
-    payment_verifier: &Arc<PaymentVerifier>,
-    queues: &Arc<RwLock<ReplicationQueues>>,
-    config: &ReplicationConfig,
-    is_bootstrapping: &Arc<RwLock<bool>>,
-    bootstrap_state: &Arc<RwLock<BootstrapState>>,
-    sync_history: &Arc<RwLock<HashMap<PeerId, PeerSyncRecord>>>,
-    sync_cycle_epoch: &Arc<RwLock<u64>>,
-    repair_proofs: &Arc<RwLock<RepairProofs>>,
-    last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
-    ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
-    sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
-    my_commitment_state: &Arc<ResponderCommitmentState>,
-    gossip_audit: &GossipAuditTrigger,
-    audit_responder_semaphore: &Arc<Semaphore>,
-    audit_responder_inflight: &Arc<RwLock<HashMap<PeerId, u32>>>,
-    subtree_round1: &SubtreeRound1Limiter,
+    msg: ReplicationMessage,
+    ctx: &ReplicationMessageHandlerContext,
+    received_at: Instant,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // Size guard BEFORE decoding, keyed on the BODY's family — not on the id the
-    // message arrived on.
-    //
-    // Every later check — protocol family, live round-1 session, responder
-    // admission — reads fields of the decoded body, so none of them can run
-    // first. Decoding is therefore the first thing an unknown peer can make this
-    // node do, and the audit bodies carry variable-length collections, so under
-    // the 10 MiB core ceiling a sessionless peer could force multi-megabyte
-    // allocation and decode work per message with nothing spent on its side.
-    // Audit bodies are ~110 KiB at worst (see `MAX_AUDIT_MESSAGE_SIZE`), so a
-    // tighter family ceiling costs honest traffic nothing.
-    //
-    // Selecting that ceiling from `inbound_protocol` did NOT close the path it
-    // claimed to: an audit body addressed to the CORE id skipped the audit
-    // ceiling entirely, was decoded under the 10 MiB allowance, and only then
-    // dropped by `body_matches_protocol` — after its collections had been
-    // allocated. A `SubtreeSliceChallenge` carrying 200,000 openings encodes to
-    // ~6.6 MB and sailed through. The ceiling has to follow the body, and the
-    // body's discriminant is readable from the first few bytes without decoding
-    // anything attacker-sized, so it can be read first.
-    //
-    // A prefix too malformed to classify gets the strict ceiling: a message we
-    // cannot classify is not one to decode generously.
-    let peeked_family = protocol::peek_variant_index(data).map(protocol::family_of_variant);
-    let is_audit_body = peeked_family.map_or(true, protocol::BodyFamily::is_audit);
-    if is_audit_body && data.len() > MAX_AUDIT_MESSAGE_SIZE {
-        debug!(
-            "Dropping oversized audit-family message from {source} on {inbound_protocol}: \
-             {} bytes > {MAX_AUDIT_MESSAGE_SIZE}",
-            data.len()
-        );
-        return Ok(());
-    }
-
-    let msg = ReplicationMessage::decode(data)
-        .map_err(|e| Error::Protocol(format!("Failed to decode replication message: {e}")))?;
-
-    // Symmetric id/body guard: subtree-audit bodies are valid ONLY on the audit
-    // id, and core bodies ONLY on the core id. postcard::from_bytes ignores
-    // trailing bytes, so a mixed-version peer's message could otherwise decode
-    // into a valid-looking but wrong body (e.g. an old round-1 `Proof` on the
-    // core id misreading its bytes as the new `content_len`/`nonced_root`). The
-    // outer enum discriminants are unchanged across versions, so this drop by
-    // (id, is_subtree_audit) is exact.
-    if !body_matches_protocol(&msg.body, inbound_protocol) {
-        debug!(
-            "Dropping replication body (variant {}) on protocol {inbound_protocol}: \
-             wrong id for its family (cross-version or misrouted)",
-            msg.body.variant_index()
-        );
-        return Ok(());
-    }
-
     match msg.body {
-        ReplicationMessageBody::FreshReplicationOffer(ref offer) => {
-            handle_fresh_offer(
-                source,
+        ReplicationMessageBody::FreshReplicationOffer(offer) => {
+            dispatch_fresh_offer(
+                *source,
                 offer,
-                storage,
-                paid_list,
-                payment_verifier,
-                p2p_node,
-                config,
+                ctx,
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
         }
-        ReplicationMessageBody::PaidNotify(ref notify) => {
-            handle_paid_notify(
-                source,
-                notify,
-                paid_list,
-                payment_verifier,
-                p2p_node,
-                config,
-            )
-            .await
+        ReplicationMessageBody::PaidNotify(notify) => {
+            dispatch_paid_notify(*source, notify, ctx, received_at).await
         }
-        ReplicationMessageBody::NeighborSyncRequest(ref request) => {
-            let bootstrapping = *is_bootstrapping.read().await;
+        ReplicationMessageBody::NeighborSyncRequest(request) => {
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
             // Phase-3 storage-bound audit: store the sender's
             // commitment for use as `expected_commitment_hash` in
             // future audits. Verify signature before storing so a peer
@@ -3641,57 +4762,49 @@ async fn handle_replication_message(
             if let Some(target) = ingest_peer_commitment(
                 source,
                 request.commitment.as_ref(),
-                p2p_node,
-                last_commitment_by_peer,
-                ever_capable_peers,
-                sig_verify_attempts,
+                &ctx.p2p_node,
+                &ctx.last_commitment_by_peer,
+                &ctx.ever_capable_peers,
+                &ctx.sig_verify_attempts,
             )
             .await
             {
-                maybe_trigger_gossip_audit(gossip_audit, source, target).await;
+                maybe_trigger_gossip_audit(&ctx.gossip_audit, source, target).await;
             }
-            handle_neighbor_sync_request(
-                source,
+            dispatch_neighbor_sync_request(
+                *source,
                 request,
-                p2p_node,
-                storage,
-                paid_list,
-                queues,
-                config,
+                ctx,
                 bootstrapping,
-                bootstrap_state,
-                sync_history,
-                sync_cycle_epoch,
-                repair_proofs,
                 // Atomically snapshot + mark-gossiped: emitted in the sync
                 // response, so we must stay answerable for it (ADR-0002).
-                my_commitment_state
+                ctx.my_commitment_state
                     .current_for_gossip()
                     .map(|b| b.commitment().clone()),
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
         }
-        ReplicationMessageBody::VerificationRequest(ref request) => {
-            handle_verification_request(
-                source,
+        ReplicationMessageBody::VerificationRequest(request) => {
+            dispatch_verification_request(
+                *source,
                 request,
-                storage,
-                paid_list,
-                p2p_node,
+                ctx,
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
         }
-        ReplicationMessageBody::FetchRequest(ref request) => {
-            handle_fetch_request(
-                source,
+        ReplicationMessageBody::FetchRequest(request) => {
+            dispatch_fetch_request(
+                *source,
                 request,
-                storage,
-                p2p_node,
+                ctx,
                 msg.request_id,
+                received_at,
                 rr_message_id,
             )
             .await
@@ -3708,41 +4821,86 @@ async fn handle_replication_message(
             // block all other replication traffic until its digests complete
             // (head-of-line blocking). The same flood-fair admission applies: a
             // global ceiling AND a per-peer cap, dropping the challenge if either
-            // is hit. A dropped challenge reads as a timeout to the auditor, and
-            // once the rollout gate is removed that is penalised again by the
-            // caller, so the caps must remain high enough for honest audit load;
+            // is hit. A dropped challenge reads as a penalised timeout to the
+            // auditor, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
+            let class = AuditResponderClass::Digest;
             let guard = match admit_audit_responder(
-                audit_responder_semaphore,
-                audit_responder_inflight,
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
                 source,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
                     protocol::record_audit_drop(protocol::AuditDropKind::Responsible);
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
                     warn!(
-                        "Audit challenge reply not sent: kind=responsible response=dropped \
-                         source={source} {failure}"
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "responsible",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = challenge.challenge_id,
+                        key_count = challenge.keys.len(),
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
                     );
                     return Ok(());
                 }
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "responsible",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                key_count = challenge.keys.len(),
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let dispatch_latency = received_at.elapsed();
+            audit_metrics::record_digest_dispatch_latency(dispatch_latency);
+            debug!(
+                audit_type = "digest_responder",
+                dispatch_latency_ms = dispatch_latency.as_millis(),
+                source = %source,
+                "Audit challenge dispatch latency measured"
+            );
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            // Answer in the asker's dialect, on the id it asked over. During
-            // the rollout window both can be the previous release's. Resolved
-            // here because both halves are `Copy` and `'static`, so the
-            // inbound protocol's borrow does not have to outlive this frame.
-            let (digest_version, reply_protocol) = possession_reply_dialect(inbound_protocol);
-            tokio::spawn(async move {
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
+            ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
-                if let Err(e) = handle_audit_challenge_msg(
+                let worker_started = Instant::now();
+                match handle_audit_challenge_msg(
                     &source,
                     &challenge,
                     &storage,
@@ -3751,13 +4909,26 @@ async fn handle_replication_message(
                     ReplyRoute {
                         request_id,
                         rr_message_id: rr_message_id.as_deref(),
-                        protocol: reply_protocol,
+                        protocol: REPLICATION_PROTOCOL_ID,
                     },
-                    digest_version,
                 )
                 .await
                 {
-                    debug!("Audit challenge from {source} error: {e}");
+                    Ok(completion) => log_audit_responder_completion(
+                        &responder_metrics,
+                        source,
+                        class,
+                        "responsible",
+                        challenge.challenge_id,
+                        challenge.keys.len(),
+                        completion.response_kind,
+                        completion.sent,
+                        received_at,
+                        worker_started,
+                        completion.processing,
+                        completion.response_send,
+                    ),
+                    Err(e) => debug!("Audit challenge from {source} error: {e}"),
                 }
             });
             Ok(())
@@ -3775,6 +4946,7 @@ async fn handle_replication_message(
             // non-responses, so capacity drops throttle flooders without turning
             // into trust penalties (and one source cannot starve other peers,
             // since its share is capped per-peer).
+            let class = AuditResponderClass::Subtree;
             info!(
                 "Audit challenge received: kind=subtree source={source} request_response={}",
                 rr_message_id.is_some(),
@@ -3783,24 +4955,57 @@ async fn handle_replication_message(
             // so it uses its own tight admission pool + per-peer rate cooldown,
             // separate from the light responsible/slice audits, and a miss silently
             // drops (subtree auditors grace timeouts).
-            let Some(guard) = subtree_round1.admit(source).await else {
+            let Some(guard) = ctx.subtree_round1.admit(source).await else {
                 protocol::record_audit_drop(protocol::AuditDropKind::Subtree);
                 warn!(
-                    "Audit challenge reply not sent: kind=subtree response=dropped \
-                     source={source} (heavy round-1 pool full or per-peer cooldown)"
+                    target: "ant_node::replication::audit_responder",
+                    event = "admission_dropped",
+                    kind = "subtree",
+                    responder_class = class.as_str(),
+                    source = %source,
+                    challenge_id = challenge.challenge_id,
+                    request_response = rr_message_id.is_some(),
+                    dispatch_ms = received_at.elapsed().as_millis(),
+                    reason = "heavy_pool_cooldown_or_work_budget",
+                    "Audit responder admission dropped"
                 );
                 return Ok(());
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
-            let my_commitment_state = Arc::clone(my_commitment_state);
-            let subtree_round1 = subtree_round1.clone();
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "subtree",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = ctx.subtree_round1.max_concurrent,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = MAX_SUBTREE_ROUND1_PER_PEER,
+                "Audit responder request admitted"
+            );
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
+            let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            tokio::spawn(async move {
-                let _guard = guard; // heavy permit + per-peer slot, held until done
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
+            let subtree_round1 = ctx.subtree_round1.clone();
+            ctx.detached_task_tracker.spawn(async move {
+                let _guard = guard; // global permit + per-peer slot, held until done
+                let worker_started = Instant::now();
+                let processing_started = Instant::now();
                 let storage_commitment_audit::Round1Work {
                     response,
                     content_bytes,
@@ -3812,6 +5017,7 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                let processing = processing_started.elapsed();
                 // Charge the work actually done, on EVERY outcome.
                 //
                 // This used to charge only the `Proof` arm, reasoning that the
@@ -3842,6 +5048,8 @@ async fn handle_replication_message(
                         .await;
                 }
                 let response_kind = subtree_audit_response_kind(&response);
+                let work_items = subtree_audit_response_work_items(&response);
+                let response_send_started = Instant::now();
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
@@ -3851,52 +5059,66 @@ async fn handle_replication_message(
                     None,
                 )
                 .await;
-                if sent {
-                    info!(
-                        "Audit challenge reply sent: kind=subtree response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                } else {
-                    warn!(
-                        "Audit challenge reply not sent: kind=subtree response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                }
+                let response_send = response_send_started.elapsed();
+                log_audit_responder_completion(
+                    &responder_metrics,
+                    source,
+                    class,
+                    "subtree",
+                    challenge.challenge_id,
+                    work_items,
+                    response_kind,
+                    sent,
+                    received_at,
+                    worker_started,
+                    processing,
+                    response_send,
+                );
             });
             Ok(())
         }
         ReplicationMessageBody::SubtreeSliceChallenge(challenge) => {
             // Round 2 of the storage audit (ADR-0002 / V2-685): open one 1 KiB
-            // block of each of the auditor's spot-check keys with a Bao verified
-            // slice + nonced block-tree opening, or signal `Absent` for a
-            // committed key we can no longer produce. Reads chunk bytes from disk
-            // to build the proofs, so likewise spawned off the serial loop
-            // under the same flood-fair admission (a global ceiling plus a
-            // per-peer cap).
+            // block of each auditor-selected spot-check key with a Bao verified
+            // slice + nonced block-tree opening. Reads chunk bytes from disk to
+            // build the proofs, so it runs off the serial loop under the light
+            // audit pool's global and per-peer ceilings.
+            let class = AuditResponderClass::Byte;
             info!(
                 "Audit challenge received: kind=slice source={source} request_response={}",
                 rr_message_id.is_some(),
             );
             let guard = match admit_slice_challenge(
-                audit_responder_semaphore,
-                audit_responder_inflight,
-                subtree_round1,
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
+                &ctx.subtree_round1,
                 source,
                 &challenge,
             )
             .await
             {
                 SliceAdmission::Admitted(guard) => guard,
-                // Capacity drop: same silent-shed contract as the other two audit
-                // handlers. The session is still live, so the auditor's retry once
-                // load clears can still be served.
                 SliceAdmission::Capacity(failure) => {
                     protocol::record_audit_drop(protocol::AuditDropKind::Slice);
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
                     warn!(
-                        "Audit challenge reply not sent: kind=slice response=dropped \
-                         source={source} {failure}"
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "byte",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = challenge.challenge_id,
+                        key_count = challenge.openings.len(),
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
                     );
                     return Ok(());
                 }
@@ -3918,7 +5140,7 @@ async fn handle_replication_message(
                     );
                     send_replication_response_checked(
                         source,
-                        p2p_node,
+                        &ctx.p2p_node,
                         msg.request_id,
                         ReplicationMessageBody::SubtreeSliceResponse(
                             protocol::SubtreeSliceResponse::Rejected {
@@ -3934,15 +5156,41 @@ async fn handle_replication_message(
                     return Ok(());
                 }
             };
-            let bootstrapping = *is_bootstrapping.read().await;
-            let storage = Arc::clone(storage);
-            let p2p_node = Arc::clone(p2p_node);
-            let my_commitment_state = Arc::clone(my_commitment_state);
+            let admission_global_inflight = guard.global_inflight;
+            let admission_peer_inflight = guard.peer_inflight;
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                admission_global_inflight,
+                admission_peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "byte",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = challenge.challenge_id,
+                key_count = challenge.openings.len(),
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = admission_global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = admission_peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
+            let bootstrapping = *ctx.is_bootstrapping.read().await;
+            let storage = Arc::clone(&ctx.storage);
+            let p2p_node = Arc::clone(&ctx.p2p_node);
+            let my_commitment_state = Arc::clone(&ctx.my_commitment_state);
             let source = *source;
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
-            tokio::spawn(async move {
+            let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
+            ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
+                let worker_started = Instant::now();
+                let processing_started = Instant::now();
                 let response = storage_commitment_audit::handle_subtree_slice_challenge(
                     &challenge,
                     &storage,
@@ -3951,7 +5199,9 @@ async fn handle_replication_message(
                     Some(&my_commitment_state),
                 )
                 .await;
+                let processing = processing_started.elapsed();
                 let response_kind = subtree_slice_response_kind(&response);
+                let response_send_started = Instant::now();
                 let sent = send_replication_response_checked(
                     &source,
                     &p2p_node,
@@ -3961,19 +5211,21 @@ async fn handle_replication_message(
                     None,
                 )
                 .await;
-                if sent {
-                    info!(
-                        "Audit challenge reply sent: kind=slice response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                } else {
-                    warn!(
-                        "Audit challenge reply not sent: kind=slice response={response_kind} \
-                         source={source} request_response={}",
-                        rr_message_id.is_some(),
-                    );
-                }
+                let response_send = response_send_started.elapsed();
+                log_audit_responder_completion(
+                    &responder_metrics,
+                    source,
+                    class,
+                    "byte",
+                    challenge.challenge_id,
+                    challenge.openings.len(),
+                    response_kind,
+                    sent,
+                    received_at,
+                    worker_started,
+                    processing,
+                    response_send,
+                );
             });
             Ok(())
         }
@@ -3989,33 +5241,95 @@ async fn handle_replication_message(
             // cap) so a flood of fetches cannot drive unbounded commitment
             // clone/encode/send work; over-limit is dropped, which the fetching
             // peer graces exactly like a missed audit response.
-            let _guard = match admit_audit_responder(
-                audit_responder_semaphore,
-                audit_responder_inflight,
+            let class = AuditResponderClass::CommitmentPin;
+            let guard = match admit_audit_responder(
+                &ctx.audit_responder_semaphore,
+                &ctx.audit_responder_inflight,
                 source,
+                class,
             )
             .await
             {
                 Ok(guard) => guard,
                 Err(failure) => {
-                    debug!("GetCommitmentByPin from {source} dropped: {failure}");
+                    audit_metrics::record_admission_drop(class);
+                    ctx.audit_responder_metrics
+                        .record_drop(*source, failure.reason.into());
+                    warn!(
+                        target: "ant_node::replication::audit_responder",
+                        event = "admission_dropped",
+                        kind = "commitment_pin",
+                        responder_class = class.as_str(),
+                        source = %source,
+                        challenge_id = msg.request_id,
+                        request_response = rr_message_id.is_some(),
+                        dispatch_ms = received_at.elapsed().as_millis(),
+                        reason = failure.reason.as_str(),
+                        global_inflight = failure.global_inflight,
+                        global_limit = failure.global_limit,
+                        peer_inflight = failure.peer_inflight,
+                        peer_limit = failure.peer_limit,
+                        "Audit responder admission dropped"
+                    );
                     return Ok(());
                 }
             };
-            let response = my_commitment_state.lookup_by_hash(&request.pin).map_or(
+            ctx.audit_responder_metrics.record_admitted(
+                *source,
+                guard.global_inflight,
+                guard.peer_inflight,
+            );
+            info!(
+                target: "ant_node::replication::audit_responder",
+                event = "admitted",
+                kind = "commitment_pin",
+                responder_class = class.as_str(),
+                source = %source,
+                challenge_id = msg.request_id,
+                request_response = rr_message_id.is_some(),
+                dispatch_ms = received_at.elapsed().as_millis(),
+                global_inflight = guard.global_inflight,
+                global_limit = MAX_CONCURRENT_AUDIT_RESPONSES,
+                peer_inflight = guard.peer_inflight,
+                peer_limit = class.per_peer_limit(),
+                "Audit responder request admitted"
+            );
+            let worker_started = Instant::now();
+            let processing_started = Instant::now();
+            let response = ctx.my_commitment_state.lookup_by_hash(&request.pin).map_or(
                 protocol::GetCommitmentByPinResponse::NotRetained { pin: request.pin },
                 |built| protocol::GetCommitmentByPinResponse::Found {
                     commitment: built.commitment().clone(),
                 },
             );
-            send_replication_response(
+            let processing = processing_started.elapsed();
+            let response_kind = commitment_pin_response_kind(&response);
+            let response_send_started = Instant::now();
+            let sent = send_replication_response_checked(
                 source,
-                p2p_node,
+                &ctx.p2p_node,
                 msg.request_id,
                 ReplicationMessageBody::GetCommitmentByPinResponse(response),
                 rr_message_id,
+                None,
             )
             .await;
+            let response_send = response_send_started.elapsed();
+            log_audit_responder_completion(
+                &ctx.audit_responder_metrics,
+                *source,
+                class,
+                "commitment_pin",
+                msg.request_id,
+                1,
+                response_kind,
+                sent,
+                received_at,
+                worker_started,
+                processing,
+                response_send,
+            );
+            drop(guard);
             Ok(())
         }
         // Response messages are handled by their respective request initiators.
@@ -4034,101 +5348,589 @@ async fn handle_replication_message(
 // Per-message-type handlers
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-async fn handle_fresh_offer(
-    source: &PeerId,
-    offer: &protocol::FreshReplicationOffer,
-    storage: &Arc<LmdbStorage>,
-    paid_list: &Arc<PaidList>,
+/// Verify a payment proof, yielding early if the engine is shutting down.
+///
+/// Returns `None` when shutdown won the race, meaning no verdict was reached
+/// and the caller must abandon the message without storing or penalising.
+///
+/// Payment verification is pure network I/O — an EVM round trip and, on the
+/// merkle path, an iterative Kademlia lookup bounded only by the verifier's
+/// own `CLOSENESS_LOOKUP_TIMEOUT`. Racing it against the shutdown token is
+/// what keeps `ReplicationEngine::shutdown()`'s deliberately unbounded
+/// `detached_task_tracker.wait()` finite: the wait may block only on work that
+/// is guaranteed to end.
+///
+/// Deliberately NOT applied to `storage.put`: that awaits `spawn_blocking`, so
+/// dropping its awaiter would detach a live LMDB transaction and break the
+/// very contract the unbounded wait exists to uphold.
+async fn verify_payment_until_shutdown(
     payment_verifier: &Arc<PaymentVerifier>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    request_id: u64,
-    rr_message_id: Option<&str>,
-) -> Result<()> {
-    let self_id = *p2p_node.peer_id();
+    key: &XorName,
+    proof_of_payment: &[u8],
+    context: VerificationContext,
+    shutdown: &CancellationToken,
+) -> Option<Result<crate::payment::PaymentStatus>> {
+    tokio::select! {
+        () = shutdown.cancelled() => None,
+        result = payment_verifier.verify_payment(key, Some(proof_of_payment), context) => {
+            Some(result)
+        }
+    }
+}
 
-    // Rule 5: reject if PoP is missing.
-    if offer.proof_of_payment.is_empty() {
-        send_replication_response(
-            source,
-            p2p_node,
-            request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: "Missing proof of payment".to_string(),
-            }),
-            rr_message_id,
-        )
-        .await;
-        return Ok(());
+/// A fresh offer rejected on payload shape alone.
+struct FreshOfferRejection {
+    /// Wire-visible reason returned to the sender.
+    reason: String,
+    /// Whether the sender is charged for it. Reserved for offers no honest
+    /// node would construct, so an ordinary capacity refusal stays free.
+    penalise: bool,
+}
+
+/// Reject a fresh offer on payload shape, or return `None` to admit it.
+///
+/// Pure and non-blocking by construction: these are the checks answerable from
+/// the payload alone, run on the serial message loop *before* the in-flight
+/// claim and the admission permit, so a malformed offer can neither lock an
+/// honest offer out of its key nor occupy one of the scarce
+/// [`FRESH_OFFER_MAX_OUTSTANDING`] slots for the duration of a payment
+/// verification. Anything needing I/O — routing lookups, capacity checks, proof
+/// verification — stays on the worker.
+///
+/// The content-address hash is deliberately included despite costing real CPU
+/// on the loop: it is what makes the entry below *earned* rather than merely
+/// asserted. Its cost is self-limiting — BLAKE3 runs at GB/s while offers
+/// arrive at link speed, so a flooder can never make this loop hash faster than
+/// it can deliver the bytes, and delivering them already cost it more than the
+/// hash costs us. The receive path has in any case already deserialised the
+/// same buffer.
+///
+/// Every rejection here is penalised. These are the conditions no honest sender
+/// can produce — an absent, undersized, oversized, or non-matching payload — as
+/// distinct from a capacity refusal, which is this node's own state and stays
+/// free. Payment *outcomes* are deliberately not judged here or anywhere: a
+/// proof that fails to verify may simply have been read against a lagging chain
+/// view, and penalising that would charge honest senders in correlated bursts.
+fn fresh_offer_structural_rejection(
+    key: &XorName,
+    data: &[u8],
+    proof_of_payment: &[u8],
+) -> Option<FreshOfferRejection> {
+    // Rule 5: reject if PoP is missing. An honest sender always attaches one,
+    // and an absent proof is the cheapest possible slot-filler, so this is the
+    // first thing checked.
+    if proof_of_payment.is_empty() {
+        return Some(FreshOfferRejection {
+            reason: "Missing proof of payment".to_string(),
+            penalise: true,
+        });
+    }
+
+    // Bound the proof before it can be queued. The verifier applies the same
+    // limits, but only once the offer reaches a worker — too late here, because
+    // an entry retains a proof per queued sender, and a proof is capped on the
+    // wire only by MAX_REPLICATION_MESSAGE_SIZE. Without this an offer carrying
+    // a byte of data and a 10 MiB "proof" would be admitted, and
+    // MAX_FRESH_OFFER_ATTEMPTS_PER_KEY of them per key across
+    // FRESH_OFFER_MAX_OUTSTANDING keys would dwarf the payload ceiling the
+    // admission bound exists to enforce.
+    if proof_of_payment.len() < MIN_PAYMENT_PROOF_SIZE_BYTES {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Proof of payment {} is below the minimum {MIN_PAYMENT_PROOF_SIZE_BYTES} bytes",
+                proof_of_payment.len(),
+            ),
+            penalise: true,
+        });
+    }
+    if proof_of_payment.len() > MAX_PAYMENT_PROOF_SIZE_BYTES {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Proof of payment {} exceeds the maximum {MAX_PAYMENT_PROOF_SIZE_BYTES} bytes",
+                proof_of_payment.len(),
+            ),
+            penalise: true,
+        });
     }
 
     // Enforce chunk size invariant: the normal PUT path rejects data larger
     // than MAX_CHUNK_SIZE; the replication receive path must do the same to
     // prevent peers from pushing oversized records through replication.
-    if offer.data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+    if data.len() > crate::ant_protocol::MAX_CHUNK_SIZE {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Data size {} exceeds maximum chunk size {}",
+                data.len(),
+                crate::ant_protocol::MAX_CHUNK_SIZE,
+            ),
+            penalise: true,
+        });
+    }
+
+    // Mirror the normal PUT path: the advertised key must be the content
+    // address of the supplied bytes. Ordered last so an oversized payload is
+    // refused without being hashed.
+    //
+    // This is the check that makes the entry safe to open, and safe for later
+    // offers to be folded into. Until it passes, the sender has only *asserted*
+    // an association between the key and the bytes. Opening an entry on an
+    // assertion would let any peer that knows a key — every recipient of its
+    // `PaidNotify`, not just the close group — seize it with junk; folding a
+    // later offer into an entry on an assertion would be worse still, since the
+    // handler tries each queued proof against the *opener's* bytes and would be
+    // storing bytes nobody offered for that proof.
+    let computed_key = crate::client::compute_address(data);
+    if computed_key != *key {
+        return Some(FreshOfferRejection {
+            reason: format!(
+                "Content address mismatch: expected {}, computed {}",
+                hex::encode(key),
+                hex::encode(computed_key),
+            ),
+            penalise: true,
+        });
+    }
+
+    None
+}
+
+/// Tell `source` its offer for `key` was not taken.
+///
+/// Note the sender does not currently read this: `fresh::replicate_fresh` uses
+/// one-way `send_message`, so the refusal is observed only as a later absence by
+/// the delayed possession check. Recorded in ADR-0005 as a known gap.
+async fn refuse_fresh_offer(
+    source: &PeerId,
+    key: XorName,
+    reason: String,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    send_replication_response(
+        source,
+        &ctx.p2p_node,
+        request_id,
+        ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
+            key,
+            reason,
+        }),
+        rr_message_id,
+    )
+    .await;
+}
+
+/// Refuse an offer that failed [`fresh_offer_structural_rejection`], charging
+/// the sender when the defect is one no honest node could produce.
+///
+/// Kept apart from the capacity refusal in `dispatch_fresh_offer` because the
+/// two say opposite things: this is the sender's fault, that one is ours.
+async fn refuse_malformed_fresh_offer(
+    source: &PeerId,
+    key: XorName,
+    rejection: FreshOfferRejection,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    rr_message_id: Option<&str>,
+) {
+    if rejection.penalise {
         warn!(
-            "Rejecting fresh offer for key {}: data size {} exceeds MAX_CHUNK_SIZE {}",
-            hex::encode(offer.key),
-            offer.data.len(),
-            crate::ant_protocol::MAX_CHUNK_SIZE,
+            "Rejecting fresh offer for key {} from {source}: {}",
+            hex::encode(key),
+            rejection.reason
         );
-        p2p_node
+        ctx.p2p_node
             .report_trust_event(
                 source,
                 TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
             )
             .await;
-        send_replication_response(
-            source,
-            p2p_node,
+    } else {
+        debug!(
+            "Fresh offer for {} from {source} refused before admission: {}",
+            hex::encode(key),
+            rejection.reason
+        );
+    }
+    refuse_fresh_offer(
+        source,
+        key,
+        rejection.reason,
+        ctx,
+        request_id,
+        rr_message_id,
+    )
+    .await;
+}
+
+/// Tell senders whose proofs joined an entry that was torn down before a handler
+/// ever ran for it.
+///
+/// Only reachable in the window between opening an entry and failing to take an
+/// admission permit. Their proofs are answered rather than dropped with the
+/// entry, so the refusal count reflects what actually happened.
+async fn refuse_stranded_fresh_offers(
+    key: XorName,
+    stranded: Vec<FreshOfferAttempt>,
+    ctx: &ReplicationMessageHandlerContext,
+) {
+    for attempt in stranded {
+        refuse_fresh_offer(
+            &attempt.source,
+            key,
+            "Receiver at fresh-offer capacity".to_string(),
+            ctx,
+            attempt.request_id,
+            attempt.rr_message_id.as_deref(),
+        )
+        .await;
+    }
+}
+
+/// Admit a fresh offer for handling on a worker, or refuse it.
+///
+/// This runs on the serial non-audit message loop, so it must stay cheap: every
+/// path here is a set insert, a permit try, or a small response send. The offer
+/// itself — an on-chain payment verification and a multi-MiB LMDB write — always
+/// runs on a tracked worker task, never inline, because stalling this loop backs
+/// up the inbound queue and ultimately drops replication messages wholesale.
+///
+/// Admission is bounded **per source** as well as globally
+/// ([`FRESH_OFFER_MAX_OUTSTANDING_PER_PEER`]). Without that share one peer can
+/// hold every slot, and since a refusal is later read as absence by the
+/// sender's delayed possession check, the resulting refusals land as
+/// audit-severity penalties on this node rather than on the flooder.
+///
+/// The structurally-invalid checks run **before** the entry is opened and before
+/// the permit is taken, so junk can neither seize a key nor occupy a slot for
+/// the duration of a payment verification.
+///
+/// Only the offer that *opens* an entry costs a permit and a worker. Later
+/// offers for the same key contribute their proof and are answered by whatever
+/// the opener's handler concludes, which is what keeps the routine
+/// `CLOSE_GROUP_MAJORITY`-way duplication of a client PUT down to one permit and
+/// one verification per key.
+async fn dispatch_fresh_offer(
+    source: PeerId,
+    offer: protocol::FreshReplicationOffer,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    if let Some(rejection) =
+        fresh_offer_structural_rejection(&offer.key, &offer.data, &offer.proof_of_payment)
+    {
+        refuse_malformed_fresh_offer(
+            &source,
+            offer.key,
+            rejection,
+            ctx,
             request_id,
-            ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: format!(
-                    "Data size {} exceeds maximum chunk size {}",
-                    offer.data.len(),
-                    crate::ant_protocol::MAX_CHUNK_SIZE,
-                ),
-            }),
             rr_message_id,
         )
         .await;
         return Ok(());
     }
 
-    // Mirror the normal PUT path: the advertised key must be the content
-    // address of the supplied bytes before any expensive payment verification.
-    let computed_key = crate::client::compute_address(&offer.data);
-    if computed_key != offer.key {
-        warn!(
-            "Rejecting fresh offer for key {}: content address mismatch, computed {}",
-            hex::encode(offer.key),
-            hex::encode(computed_key),
-        );
-        p2p_node
-            .report_trust_event(
-                source,
-                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+    // Join the work already in flight for this key before taking an admission
+    // permit, so the duplicates a single client PUT produces cost one permit
+    // between them rather than one each.
+    //
+    // Reaching this point means `fresh_offer_structural_rejection` has confirmed
+    // `key == BLAKE3(data)`, so this offer's bytes are provably identical to any
+    // already held for the key. That is what lets its payload be dropped here
+    // and only its proof retained: the handler will try that proof against the
+    // bytes it already has.
+    let key = offer.key;
+    let admission_outcome = FreshOfferEntryGuard::admit(
+        &ctx.fresh_offer_in_flight,
+        offer,
+        source,
+        request_id,
+        rr_message_id.map(ToOwned::to_owned),
+        received_at,
+    );
+    let mut entry = match admission_outcome {
+        FreshOfferAdmission::Opened(entry) => entry,
+        FreshOfferAdmission::Joined => {
+            // No response yet: this proof has not been judged. The handler that
+            // owns the key answers every queued sender once it settles.
+            debug!(
+                "Fresh offer for {} from {source} queued behind the handler already \
+                 holding the key",
+                hex::encode(key)
+            );
+            return Ok(());
+        }
+        // Surplus, not suspect: the proofs already queued are enough to place
+        // the record, so neither case is charged as misbehaviour.
+        surplus => {
+            debug!(
+                "Fresh offer for {} from {source} refused: {}",
+                hex::encode(key),
+                surplus.surplus_reason()
+            );
+            refuse_fresh_offer(
+                &source,
+                key,
+                "Duplicate offer already in flight".to_string(),
+                ctx,
+                request_id,
+                rr_message_id,
             )
             .await;
+            return Ok(());
+        }
+    };
+
+    let admission = match admit_bounded_responder(
+        &ctx.fresh_offer_admission_semaphore,
+        &ctx.fresh_offer_responder_inflight,
+        &source,
+        FRESH_OFFER_MAX_OUTSTANDING,
+        FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::FreshOffer,
+                failure.reason.into(),
+            );
+            // WARN, not DEBUG: a healthy node should never refuse a legitimate
+            // fresh offer. The sender does not read this refusal, so it
+            // resurfaces as a missing key at the delayed possession check and
+            // is charged to US at audit severity. Log the binding ceiling
+            // locally; the wire reason stays generic so a probing peer cannot
+            // map out this node's live occupancy.
+            warn!(
+                responder_class = "fresh_offer",
+                source = %source,
+                key = %hex::encode(key),
+                "Fresh offer refused at admission — this node will be penalised                  for the resulting absence: {failure}"
+            );
+            // Release the key explicitly rather than on drop, so the next offer
+            // opens a fresh entry rather than queueing behind a handler that was
+            // never spawned — and so any proof that joined in the window between
+            // opening the entry and failing here is answered rather than
+            // discarded with it.
+            let stranded = entry.release();
+            refuse_fresh_offer(
+                &source,
+                key,
+                "Receiver at fresh-offer capacity".to_string(),
+                ctx,
+                request_id,
+                rr_message_id,
+            )
+            .await;
+            refuse_stranded_fresh_offers(key, stranded, ctx).await;
+            return Ok(());
+        }
+    };
+
+    let ctx = ctx.clone();
+    // Track the worker so `ReplicationEngine::shutdown()` can await it: it holds
+    // an `Arc<LmdbStorage>` while writing, and the shutdown contract requires
+    // those references be released before the caller reopens the environment.
+    ctx.detached_task_tracker
+        .clone()
+        .spawn(run_fresh_offer_worker(key, entry, ctx, admission));
+    Ok(())
+}
+
+/// Body of one tracked fresh-offer worker: drive one key to a verdict.
+///
+/// Split out so `dispatch_fresh_offer` stays a readable admission decision.
+/// A started handler is never cancelled: `storage.put()` awaits
+/// `spawn_blocking`, and dropping that awaiter would detach the live LMDB
+/// transaction. Shutdown responsiveness comes from the closed worker semaphore
+/// and from `handle_fresh_offer` racing the token around payment verification.
+///
+/// Works down the key's queued proofs rather than judging the key on the first
+/// one. A proof that fails to establish payment disqualifies its *sender*, not
+/// the record: the bytes are content-addressed and identical across every offer,
+/// so the next sender's proof is tried against the copy already in hand — no
+/// second payload, no second permit, no refetch. Only when a failure is about
+/// the key itself (not responsible, no capacity, shutting down) does rotating
+/// become pointless, because every remaining proof would meet the same wall.
+async fn run_fresh_offer_worker(
+    key: XorName,
+    mut entry: Box<FreshOfferEntryGuard>,
+    ctx: ReplicationMessageHandlerContext,
+    admission: ResponderGuard,
+) {
+    // The admission permit is released on completion, freeing the payload's
+    // memory budget and the opening source's per-peer share. The entry releases
+    // the key itself, either as the queue empties or on drop.
+    let _admission = admission;
+    let received_at = entry.received_at();
+    // Wait for a worker slot here rather than in the caller. The worker bound
+    // caps concurrent EVM and storage pressure; making the message loop wait on
+    // it is what put that pressure back on the loop.
+    //
+    // The semaphore is closed by `shutdown()`, so this arm is the prompt exit
+    // path for offers still queued behind a worker when the engine stops — not
+    // dead code.
+    let Ok(_worker) = Arc::clone(&ctx.fresh_offer_worker_semaphore)
+        .acquire_owned()
+        .await
+    else {
+        debug!(
+            "Fresh offer for {} dropped: worker pool shut down",
+            hex::encode(key)
+        );
+        return;
+    };
+    // Fresh offers are fire-and-forget (`send_message`), so there is no
+    // requester deadline to honour and a late store is still genuinely useful.
+    // The threshold is the point past which the offer has already cost us what
+    // it was going to cost: the possession check (ADR-0003) has run by then and
+    // charged the absence to this node, and it does not re-offer the key —
+    // repair comes later from neighbor sync. Shedding here trades a copy that
+    // would have arrived after the penalty for the multi-MiB payload it is
+    // holding, and keeps a backlog from outliving its own admission bound.
+    //
+    // Note this is a memory-pressure decision, not a redundancy one: the copy
+    // is late, not useless, so on a node with headroom finishing it would still
+    // beat waiting for neighbor sync.
+    if request_is_stale(received_at, ctx.config.possession_check_delay_min) {
+        debug!(
+            responder_class = "fresh_offer",
+            key = %hex::encode(key),
+            request_age_ms = received_at.elapsed().as_millis(),
+            "Superseded fresh offer shed at dequeue"
+        );
+        return;
+    }
+
+    let mut verdict = FreshOfferOutcome::Abandoned;
+    while let Some(attempt) = entry.next_attempt() {
+        match handle_fresh_offer(&key, entry.data(), &attempt, &ctx).await {
+            Ok(outcome) => {
+                verdict = outcome;
+                match outcome {
+                    // Settled: the record is down and every remaining sender
+                    // wanted exactly that. Abandoned: the key cannot be placed
+                    // by anyone right now, so the proofs behind this one would
+                    // fail identically. Either way there is nothing left to try.
+                    FreshOfferOutcome::Settled | FreshOfferOutcome::Abandoned => break,
+                    // This sender's claim to have paid did not hold up. Say so
+                    // to that sender alone and try the next proof.
+                    FreshOfferOutcome::ProofRejected => {}
+                }
+            }
+            Err(e) => {
+                debug!(
+                    "Fresh replication offer for {} from {} error: {e}",
+                    hex::encode(key),
+                    attempt.source
+                );
+                verdict = FreshOfferOutcome::Abandoned;
+                break;
+            }
+        }
+    }
+
+    // Answer the senders whose proofs were never reached. A stored record is
+    // what they were asking for, so it is an acceptance even though their own
+    // proof went untested.
+    let unreached = entry.release();
+    if unreached.is_empty() {
+        return;
+    }
+    let response = match verdict {
+        FreshOfferOutcome::Settled => FreshReplicationResponse::Accepted { key },
+        FreshOfferOutcome::ProofRejected | FreshOfferOutcome::Abandoned => {
+            FreshReplicationResponse::Rejected {
+                key,
+                reason: "Record could not be stored from any offered proof".to_string(),
+            }
+        }
+    };
+    for attempt in unreached {
+        send_replication_response(
+            &attempt.source,
+            &ctx.p2p_node,
+            attempt.request_id,
+            ReplicationMessageBody::FreshReplicationResponse(response.clone()),
+            attempt.rr_message_id.as_deref(),
+        )
+        .await;
+    }
+}
+
+/// What one proof concluded, and whether another proof for the same key is worth
+/// trying.
+///
+/// The distinction the worker acts on is *what the failure was about*. A
+/// rejected proof is a statement about its sender; anything else is a statement
+/// about the key or this node, which no other sender's proof can change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshOfferOutcome {
+    /// The record is stored. The key is done.
+    Settled,
+    /// This proof did not establish payment. A different sender's proof for the
+    /// same bytes may still succeed.
+    ProofRejected,
+    /// Nothing about this key can succeed right now — not responsible, no disk,
+    /// shutting down, or a write that failed. Rotating repeats the failure.
+    Abandoned,
+}
+
+// A linear sequence of protocol steps — structural recheck, responsibility,
+// capacity, payment, write — each with its own refusal response. Splitting it
+// would scatter one decision across several functions.
+#[allow(clippy::too_many_lines)]
+async fn handle_fresh_offer(
+    key: &XorName,
+    data: &[u8],
+    attempt: &FreshOfferAttempt,
+    ctx: &ReplicationMessageHandlerContext,
+) -> Result<FreshOfferOutcome> {
+    let source = &attempt.source;
+    let request_id = attempt.request_id;
+    let rr_message_id = attempt.rr_message_id.as_deref();
+    let p2p_node = &ctx.p2p_node;
+    let config = &ctx.config;
+    let self_id = *p2p_node.peer_id();
+
+    // Defence in depth: `dispatch_fresh_offer` already applied these — missing
+    // proof, bad proof size, oversized payload, content-address mismatch —
+    // before opening the entry or taking an admission permit, so nothing
+    // reaching a worker should trip them. Kept so the handler is correct in
+    // isolation. Note this re-checks the *pairing* actually being used: these
+    // bytes against this attempt's proof.
+    if let Some(rejection) = fresh_offer_structural_rejection(key, data, &attempt.proof_of_payment)
+    {
+        if rejection.penalise {
+            warn!(
+                "Rejecting fresh offer for key {}: {}",
+                hex::encode(key),
+                rejection.reason
+            );
+            p2p_node
+                .report_trust_event(
+                    source,
+                    TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                )
+                .await;
+        }
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
-                reason: format!(
-                    "Content address mismatch: expected {}, computed {}",
-                    hex::encode(offer.key),
-                    hex::encode(computed_key),
-                ),
+                key: *key,
+                reason: rejection.reason,
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // Structurally invalid is a fact about this attempt, not the key.
+        return Ok(FreshOfferOutcome::ProofRejected);
     }
 
     // Rule 7: check storage admission. Fresh chunk receivers accept across the
@@ -4139,26 +5941,22 @@ async fn handle_fresh_offer(
     // outside the narrow window in its own view; the wider accept window absorbs
     // that transient skew so the chunk still lands. Retention (pruning) stays at
     // `storage_admission_width`, so steady-state replication is unchanged.
-    if !admission::is_responsible(
-        &self_id,
-        &offer.key,
-        p2p_node,
-        config.paid_list_close_group_size,
-    )
-    .await
+    if !admission::is_responsible(&self_id, key, p2p_node, config.paid_list_close_group_size).await
     {
         send_replication_response(
             source,
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
+                key: *key,
                 reason: "Not in storage-admission range for this key".to_string(),
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // About the key and this node's place in the routing table, not about
+        // the sender: every queued proof would be refused identically.
+        return Ok(FreshOfferOutcome::Abandoned);
     }
 
     // Disk-space pre-check — mirror the PUT handler (V2-411). A full node can
@@ -4167,10 +5965,10 @@ async fn handle_fresh_offer(
     // and only then failing at `storage.put` below. Reuses the cached capacity
     // check (passing results only, so freed space is detected promptly), and the
     // store path keeps its own check as defence-in-depth.
-    if let Err(e) = storage.check_capacity() {
+    if let Err(e) = ctx.storage.check_capacity() {
         info!(
             target: "ant_node::storage::disk_precheck",
-            key = %hex::encode(offer.key),
+            key = %hex::encode(key),
             "Rejecting fresh replication offer before payment verification: {e}"
         );
         send_replication_response(
@@ -4178,13 +5976,14 @@ async fn handle_fresh_offer(
             p2p_node,
             request_id,
             ReplicationMessageBody::FreshReplicationResponse(FreshReplicationResponse::Rejected {
-                key: offer.key,
+                key: *key,
                 reason: e.to_string(),
             }),
             rr_message_id,
         )
         .await;
-        return Ok(());
+        // A full disk is this node's condition, not the sender's.
+        return Ok(FreshOfferOutcome::Abandoned);
     }
 
     // Gap 1: Validate PoP via PaymentVerifier. Fresh replication is still
@@ -4195,76 +5994,98 @@ async fn handle_fresh_offer(
     // issuer K-closeness checks for single-node proofs, merkle candidate
     // closeness for merkle proofs, and the same price-floor policy — the
     // distinct context only labels price-floor telemetry.
-    match payment_verifier
-        .verify_payment(
-            &offer.key,
-            Some(&offer.proof_of_payment),
-            fresh_offer_payment_context(),
-        )
-        .await
-    {
+    let Some(verification) = verify_payment_until_shutdown(
+        &ctx.payment_verifier,
+        key,
+        &attempt.proof_of_payment,
+        fresh_offer_payment_context(),
+        &ctx.shutdown,
+    )
+    .await
+    else {
+        debug!(
+            "Fresh offer for {} from {source} abandoned: engine shutting down \
+             during payment verification",
+            hex::encode(key)
+        );
+        return Ok(FreshOfferOutcome::Abandoned);
+    };
+    match verification {
         Ok(status) if status.can_store() => {
-            debug!(
-                "PoP validated for fresh offer key {}",
-                hex::encode(offer.key)
-            );
+            debug!("PoP validated for fresh offer key {}", hex::encode(key));
         }
+        // The chain has no record of this payment. That is a statement about
+        // *this sender's* proof, so the key rotates to the next one rather than
+        // being written off — the whole point of queueing them.
+        //
+        // Deliberately unpenalised. `PaymentRequired` means "no payment found",
+        // not "definitively unpaid", so a lagging or reorganising chain view
+        // renders honest senders indistinguishable from forgers, and penalising
+        // would land on the entire close group at once. The structural checks in
+        // `fresh_offer_structural_rejection` are where misbehaviour is charged,
+        // because those cannot be produced by an honest sender at all.
         Ok(_) => {
+            debug!(
+                "Fresh offer for {} from {source}: no payment found for this proof",
+                hex::encode(key)
+            );
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: "Payment verification failed: payment required".to_string(),
                     },
                 ),
                 rr_message_id,
             )
             .await;
-            return Ok(());
+            return Ok(FreshOfferOutcome::ProofRejected);
         }
+        // A verification *error* is usually ours — an unreachable or failing EVM
+        // endpoint — so it is neither penalised nor treated as this sender's
+        // fault. Another proof still gets its turn, since the next call may well
+        // succeed against a recovered endpoint.
         Err(e) => {
-            warn!(
-                "PoP verification error for key {}: {e}",
-                hex::encode(offer.key)
-            );
+            warn!("PoP verification error for key {}: {e}", hex::encode(key));
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: format!("Payment verification error: {e}"),
                     },
                 ),
                 rr_message_id,
             )
             .await;
-            return Ok(());
+            return Ok(FreshOfferOutcome::ProofRejected);
         }
     }
 
     // Rule 6: add to PaidForList.
-    if let Err(e) = paid_list.insert(&offer.key).await {
+    if let Err(e) = ctx.paid_list.insert(key).await {
         warn!("Failed to add key to PaidForList: {e}");
     }
 
     // Store the record.
-    match storage.put(&offer.key, &offer.data).await {
+    match ctx.storage.put(key, data).await {
         Ok(_) => {
             send_replication_response(
                 source,
                 p2p_node,
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
-                    FreshReplicationResponse::Accepted { key: offer.key },
+                    FreshReplicationResponse::Accepted { key: *key },
                 ),
                 rr_message_id,
             )
             .await;
+            Ok(FreshOfferOutcome::Settled)
         }
         Err(e) => {
             send_replication_response(
@@ -4273,15 +6094,113 @@ async fn handle_fresh_offer(
                 request_id,
                 ReplicationMessageBody::FreshReplicationResponse(
                     FreshReplicationResponse::Rejected {
-                        key: offer.key,
+                        key: *key,
                         reason: e.to_string(),
                     },
                 ),
                 rr_message_id,
             )
             .await;
+            // The payment was good and the write still failed, so this is local
+            // storage trouble that another proof cannot get around.
+            Ok(FreshOfferOutcome::Abandoned)
         }
     }
+}
+
+/// Admit a paid-list notification for handling on a worker, or drop it.
+///
+/// `PaidNotify` used to be handled inline on the serial non-audit loop, which
+/// meant one message could park every other non-audit message behind a full
+/// payment verification. That verification is not a bounded local computation:
+/// on the merkle path it performs an iterative Kademlia lookup capped only by
+/// the verifier's `CLOSENESS_LOOKUP_TIMEOUT`, so a single notify could stall
+/// the loop for minutes while the bounded inbound queue behind it overflowed
+/// and dropped unrelated replication traffic wholesale.
+///
+/// It now follows the same detached-responder pattern as neighbor sync and
+/// verification (ADR-0005 decision 2): bounded globally and per source, shed
+/// when stale, and run on a tracked worker.
+///
+/// `PaidNotify` is one-way — the protocol defines no response variant — so a
+/// refused notify is simply dropped. The sender's own paid-list convergence
+/// (periodic neighbor sync and the verification cycle's paid-list quorum) is
+/// the recovery path, exactly as for a notify lost in transit.
+async fn dispatch_paid_notify(
+    source: PeerId,
+    notify: protocol::PaidNotify,
+    ctx: &ReplicationMessageHandlerContext,
+    received_at: Instant,
+) -> Result<()> {
+    let admission = match admit_bounded_responder(
+        &ctx.paid_notify_admission_semaphore,
+        &ctx.paid_notify_responder_inflight,
+        &source,
+        PAID_NOTIFY_MAX_OUTSTANDING,
+        PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::PaidNotify,
+                failure.reason.into(),
+            );
+            // WARN for the same reason as fresh offers: PaidNotify is one-way,
+            // so a refusal discards durable paid-list evidence outright rather
+            // than pushing work back onto a requester.
+            warn!(
+                responder_class = "paid_notify",
+                source = %source,
+                key = %hex::encode(notify.key),
+                "Paid notify dropped at admission — paid-list evidence lost                  until a verification cycle re-derives it: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let ctx = ctx.clone();
+    let worker_semaphore = Arc::clone(&ctx.paid_notify_worker_semaphore);
+    // Deliberately NOT the verification request deadline used by the
+    // request/response responders. Nobody is waiting on a notify, and shedding
+    // one discards durable paid-list evidence rather than a reply a requester
+    // has already given up on. The threshold is instead the point at which the
+    // pull path would have learned the same fact anyway: one slow-cadence
+    // neighbor-sync interval, after which the verification cycle's paid-list
+    // quorum makes this notify genuinely redundant.
+    let queue_max_age = ctx.config.neighbor_sync_interval_max;
+    ctx.detached_task_tracker.clone().spawn(async move {
+        let _admission = admission;
+        // Closed by `shutdown()`, so this is the prompt exit path for notifies
+        // still queued behind a worker when the engine stops.
+        let Ok(_worker) = worker_semaphore.acquire_owned().await else {
+            debug!("Paid notify from {source} dropped: worker pool shut down");
+            return;
+        };
+        if request_is_stale(received_at, queue_max_age) {
+            debug!(
+                responder_class = "paid_notify",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Redundant paid notify shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_paid_notify(
+            &source,
+            &notify,
+            &ctx.paid_list,
+            &ctx.payment_verifier,
+            &ctx.p2p_node,
+            &ctx.config,
+            &ctx.shutdown,
+        )
+        .await
+        {
+            debug!("Paid notify from {source} error: {e}");
+        }
+    });
 
     Ok(())
 }
@@ -4293,6 +6212,7 @@ async fn handle_paid_notify(
     payment_verifier: &Arc<PaymentVerifier>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
+    shutdown: &CancellationToken,
 ) -> Result<()> {
     let self_id = *p2p_node.peer_id();
 
@@ -4317,14 +6237,23 @@ async fn handle_paid_notify(
     // paid-list metadata, so local paid-list close-group membership was checked
     // above before proof work. The verifier then runs the same payment proof
     // checks as ClientPut while writing a paid-list-strength cache entry.
-    match payment_verifier
-        .verify_payment(
-            &notify.key,
-            Some(&notify.proof_of_payment),
-            paid_notify_payment_context(),
-        )
-        .await
-    {
+    let Some(verification) = verify_payment_until_shutdown(
+        payment_verifier,
+        &notify.key,
+        &notify.proof_of_payment,
+        paid_notify_payment_context(),
+        shutdown,
+    )
+    .await
+    else {
+        debug!(
+            "Paid notify for {} abandoned: engine shutting down during payment \
+             verification",
+            hex::encode(notify.key)
+        );
+        return Ok(());
+    };
+    match verification {
         Ok(status) if status.can_store() => {
             debug!(
                 "PoP validated for paid notify key {}",
@@ -4350,6 +6279,99 @@ async fn handle_paid_notify(
     if let Err(e) = paid_list.insert(&notify.key).await {
         warn!("Failed to add paid notify key to PaidForList: {e}");
     }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_neighbor_sync_request(
+    source: PeerId,
+    request: protocol::NeighborSyncRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    is_bootstrapping: bool,
+    my_commitment: Option<StorageCommitment>,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.neighbor_sync_responder_admission_semaphore,
+        &ctx.neighbor_sync_responder_inflight,
+        &source,
+        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+        NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::NeighborSync,
+                failure.reason.into(),
+            );
+            warn!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                "Neighbor-sync response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.neighbor_sync_responder_worker_semaphore);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let storage = Arc::clone(&ctx.storage);
+    let paid_list = Arc::clone(&ctx.paid_list);
+    let queues = Arc::clone(&ctx.queues);
+    let config = Arc::clone(&ctx.config);
+    let bootstrap_state = Arc::clone(&ctx.bootstrap_state);
+    let sync_history = Arc::clone(&ctx.sync_history);
+    let sync_cycle_epoch = Arc::clone(&ctx.sync_cycle_epoch);
+    let repair_proofs = Arc::clone(&ctx.repair_proofs);
+    let request_timeout = ctx.config.verification_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                "Neighbor-sync responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::NeighborSync);
+            debug!(
+                responder_class = "neighbor_sync",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale neighbor-sync request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_neighbor_sync_request(
+            &source,
+            &request,
+            &p2p_node,
+            &storage,
+            &paid_list,
+            &queues,
+            &config,
+            is_bootstrapping,
+            &bootstrap_state,
+            &sync_history,
+            &sync_cycle_epoch,
+            &repair_proofs,
+            my_commitment,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Neighbor-sync request handling failed: {e}");
+        }
+    });
 
     Ok(())
 }
@@ -4446,14 +6468,9 @@ async fn handle_neighbor_sync_request(
     // hints keep this source on the "not yet drained" list until its next
     // sync re-admits them; a clean cycle clears the source.
     if is_bootstrapping {
-        if !outcome.discovered.is_empty() {
-            bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
-        }
-        if outcome.capacity_rejected_count > 0 {
-            bootstrap::note_capacity_rejected(bootstrap_state, *source).await;
-        } else {
-            bootstrap::clear_capacity_rejected(bootstrap_state, source).await;
-        }
+        let live_discovered = outcome.discovered.clone();
+        let outcomes = [(*source, outcome)];
+        publish_bootstrap_admission_outcomes(bootstrap_state, &outcomes, &live_discovered).await;
     }
 
     Ok(())
@@ -4468,13 +6485,40 @@ async fn handle_verification_request(
     request_id: u64,
     rr_message_id: Option<&str>,
 ) -> Result<()> {
-    // No per-request key count limit: the wire message size limit
-    // (MAX_REPLICATION_MESSAGE_SIZE) already caps the payload. Verification
-    // does cheap storage lookups per key, not expensive computation like
-    // audit digest generation.
+    #[derive(Clone, Copy)]
+    enum CachedPaidLookup {
+        NotChecked,
+        Checked(Option<bool>),
+    }
 
-    #[allow(clippy::cast_possible_truncation)]
-    let keys_len = request.keys.len() as u32;
+    #[derive(Clone, Copy)]
+    struct CachedVerificationLookup {
+        present: Option<bool>,
+        paid: CachedPaidLookup,
+    }
+
+    if verification_request_exceeds_limit(request.keys.len()) {
+        warn!(
+            "Verification request from {source} has {} keys, exceeding max {MAX_INCOMING_VERIFICATION_KEYS}; rejecting batch",
+            request.keys.len(),
+        );
+        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        return Ok(());
+    }
+
+    let requested_keys = request.keys.as_slice();
+
+    if request.paid_list_check_indices.len() > request.keys.len() {
+        warn!(
+            "Verification request from {source} has {} paid-list indices for {} keys; rejecting batch",
+            request.paid_list_check_indices.len(),
+            request.keys.len(),
+        );
+        send_verification_results(source, p2p_node, request_id, Vec::new(), rr_message_id).await;
+        return Ok(());
+    }
+
+    let keys_len = u32::try_from(requested_keys.len()).unwrap_or(u32::MAX);
     let paid_check_set: HashSet<u32> = request
         .paid_list_check_indices
         .iter()
@@ -4483,7 +6527,7 @@ async fn handle_verification_request(
             if idx >= keys_len {
                 warn!(
                     "Verification request from {source}: paid_list_check_index {idx} out of bounds (keys.len() = {})",
-                    request.keys.len(),
+                    requested_keys.len(),
                 );
                 false
             } else {
@@ -4492,21 +6536,152 @@ async fn handle_verification_request(
         })
         .collect();
 
-    let mut results = Vec::with_capacity(request.keys.len());
-    for (i, key) in request.keys.iter().enumerate() {
-        let present = storage.exists(key).unwrap_or(false);
-        let paid = if paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX)) {
-            Some(paid_list.contains(key).unwrap_or(false))
+    let mut results = Vec::with_capacity(requested_keys.len());
+    let mut lookup_cache: HashMap<XorName, CachedVerificationLookup> = HashMap::new();
+    for (i, key) in requested_keys.iter().enumerate() {
+        let needs_paid = paid_check_set.contains(&u32::try_from(i).unwrap_or(u32::MAX));
+        let cached = lookup_cache.entry(*key).or_insert_with(|| {
+            let present = match storage.exists(key) {
+                Ok(present) => Some(present),
+                Err(e) => {
+                    warn!(
+                        "Verification request from {source}: failed to check storage for {}: {e}",
+                        hex::encode(key)
+                    );
+                    None
+                }
+            };
+            CachedVerificationLookup {
+                present,
+                paid: CachedPaidLookup::NotChecked,
+            }
+        });
+
+        if needs_paid && matches!(cached.paid, CachedPaidLookup::NotChecked) {
+            cached.paid = CachedPaidLookup::Checked(match paid_list.contains(key) {
+                Ok(paid) => Some(paid),
+                Err(e) => {
+                    warn!(
+                        "Verification request from {source}: failed to check paid-list for {}: {e}",
+                        hex::encode(key)
+                    );
+                    None
+                }
+            });
+        }
+
+        let paid = if needs_paid {
+            match cached.paid {
+                CachedPaidLookup::Checked(paid) => paid,
+                CachedPaidLookup::NotChecked => None,
+            }
         } else {
             None
         };
+
+        if cached.present.is_none() && paid.is_none() {
+            continue;
+        }
+
         results.push(protocol::KeyVerificationResult {
             key: *key,
-            present,
+            present: cached.present.unwrap_or(false),
             paid,
         });
     }
 
+    send_verification_results(source, p2p_node, request_id, results, rr_message_id).await;
+
+    Ok(())
+}
+
+async fn dispatch_verification_request(
+    source: PeerId,
+    request: protocol::VerificationRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.verification_responder_admission_semaphore,
+        &ctx.verification_responder_inflight,
+        &source,
+        VERIFICATION_RESPONDER_MAX_OUTSTANDING,
+        VERIFICATION_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::Verification,
+                failure.reason.into(),
+            );
+            warn!(
+                responder_class = "verification",
+                source = %source,
+                "Verification response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.verification_responder_worker_semaphore);
+    let storage = Arc::clone(&ctx.storage);
+    let paid_list = Arc::clone(&ctx.paid_list);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let request_timeout = ctx.config.verification_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "verification",
+                source = %source,
+                "Verification responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::Verification);
+            debug!(
+                responder_class = "verification",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale verification request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_verification_request(
+            &source,
+            &request,
+            &storage,
+            &paid_list,
+            &p2p_node,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Verification request handling failed: {e}");
+        }
+    });
+
+    Ok(())
+}
+
+const fn verification_request_exceeds_limit(key_count: usize) -> bool {
+    key_count > MAX_INCOMING_VERIFICATION_KEYS
+}
+
+async fn send_verification_results(
+    source: &PeerId,
+    p2p_node: &Arc<P2PNode>,
+    request_id: u64,
+    results: Vec<protocol::KeyVerificationResult>,
+    rr_message_id: Option<&str>,
+) {
     send_replication_response(
         source,
         p2p_node,
@@ -4515,8 +6690,84 @@ async fn handle_verification_request(
         rr_message_id,
     )
     .await;
+}
+
+async fn dispatch_fetch_request(
+    source: PeerId,
+    request: protocol::FetchRequest,
+    ctx: &ReplicationMessageHandlerContext,
+    request_id: u64,
+    received_at: Instant,
+    rr_message_id: Option<&str>,
+) -> Result<()> {
+    let guard = match admit_bounded_responder(
+        &ctx.fetch_responder_admission_semaphore,
+        &ctx.fetch_responder_inflight,
+        &source,
+        FETCH_RESPONDER_MAX_OUTSTANDING,
+        FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(failure) => {
+            audit_metrics::record_responder_admission_drop(
+                ReplicationResponderClass::Fetch,
+                failure.reason.into(),
+            );
+            warn!(
+                responder_class = "fetch",
+                source = %source,
+                "Fetch response dropped at admission: {failure}"
+            );
+            return Ok(());
+        }
+    };
+
+    let worker_semaphore = Arc::clone(&ctx.fetch_responder_worker_semaphore);
+    let storage = Arc::clone(&ctx.storage);
+    let p2p_node = Arc::clone(&ctx.p2p_node);
+    let request_timeout = ctx.config.fetch_request_timeout;
+    let rr_message_id = rr_message_id.map(ToOwned::to_owned);
+    ctx.detached_task_tracker.spawn(async move {
+        let _guard = guard;
+        let Ok(_worker_permit) = worker_semaphore.acquire_owned().await else {
+            debug!(
+                responder_class = "fetch",
+                source = %source,
+                "Fetch responder worker pool closed before dequeue"
+            );
+            return;
+        };
+        if request_is_stale(received_at, request_timeout) {
+            audit_metrics::record_responder_staleness_shed(ReplicationResponderClass::Fetch);
+            debug!(
+                responder_class = "fetch",
+                source = %source,
+                request_age_ms = received_at.elapsed().as_millis(),
+                "Stale fetch request shed at dequeue"
+            );
+            return;
+        }
+        if let Err(e) = handle_fetch_request(
+            &source,
+            &request,
+            &storage,
+            &p2p_node,
+            request_id,
+            rr_message_id.as_deref(),
+        )
+        .await
+        {
+            debug!(source = %source, "Fetch request handling failed: {e}");
+        }
+    });
 
     Ok(())
+}
+
+fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
+    received_at.elapsed() >= timeout
 }
 
 async fn handle_fetch_request(
@@ -4554,6 +6805,13 @@ async fn handle_fetch_request(
 /// Responder for an incoming `AuditChallenge` (responsible-chunk audit #2, and
 /// the prune-confirmation audit, which reuses the same wire message): reply with
 /// per-key possession digests.
+struct AuditResponderCompletion {
+    response_kind: &'static str,
+    sent: bool,
+    processing: Duration,
+    response_send: Duration,
+}
+
 async fn handle_audit_challenge_msg(
     source: &PeerId,
     challenge: &protocol::AuditChallenge,
@@ -4561,8 +6819,7 @@ async fn handle_audit_challenge_msg(
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
     reply: ReplyRoute<'_>,
-    digest_version: AuditDigestVersion,
-) -> Result<()> {
+) -> Result<AuditResponderCompletion> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
     info!(
@@ -4572,17 +6829,19 @@ async fn handle_audit_challenge_msg(
         reply.rr_message_id.is_some(),
     );
 
+    let processing_started = Instant::now();
     let response = audit::handle_audit_challenge(
         challenge,
         storage,
         p2p_node.peer_id(),
         is_bootstrapping,
         stored_chunks,
-        digest_version,
     )
     .await;
+    let processing = processing_started.elapsed();
     let response_kind = audit_response_kind(&response);
 
+    let response_send_started = Instant::now();
     let sent = send_replication_response_checked(
         source,
         p2p_node,
@@ -4592,23 +6851,69 @@ async fn handle_audit_challenge_msg(
         Some(reply.protocol),
     )
     .await;
+    let response_send = response_send_started.elapsed();
+
+    Ok(AuditResponderCompletion {
+        response_kind,
+        sent,
+        processing,
+        response_send,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_audit_responder_completion(
+    metrics: &AuditResponderMetrics,
+    source: PeerId,
+    class: AuditResponderClass,
+    kind: &'static str,
+    challenge_id: u64,
+    work_items: usize,
+    response_kind: &'static str,
+    sent: bool,
+    received_at: Instant,
+    worker_started: Instant,
+    processing: Duration,
+    response_send: Duration,
+) {
+    let dispatch = worker_started.saturating_duration_since(received_at);
+    let total = received_at.elapsed();
+    metrics.record_completed(source, processing, total, sent);
     if sent {
         info!(
-            "Audit challenge reply sent: kind=responsible response={} keys={} request_response={}",
-            response_kind,
-            challenge.keys.len(),
-            reply.rr_message_id.is_some(),
+            target: "ant_node::replication::audit_responder",
+            event = "completed",
+            kind,
+            responder_class = class.as_str(),
+            source = %source,
+            challenge_id,
+            work_items,
+            response = response_kind,
+            sent,
+            dispatch_ms = dispatch.as_millis(),
+            processing_ms = processing.as_millis(),
+            response_send_ms = response_send.as_millis(),
+            total_ms = total.as_millis(),
+            "Audit responder request completed"
         );
     } else {
         warn!(
-            "Audit challenge reply not sent: kind=responsible response={} keys={} request_response={}",
-            response_kind,
-            challenge.keys.len(),
-            reply.rr_message_id.is_some(),
+            target: "ant_node::replication::audit_responder",
+            event = "completed",
+            kind,
+            responder_class = class.as_str(),
+            source = %source,
+            challenge_id,
+            work_items,
+            response = response_kind,
+            sent,
+            dispatch_ms = dispatch.as_millis(),
+            processing_ms = processing.as_millis(),
+            response_send_ms = response_send.as_millis(),
+            total_ms = total.as_millis(),
+            "Audit responder request completed without sending a reply"
         );
     }
-
-    Ok(())
 }
 
 /// Where a reply goes and how it is addressed.
@@ -4643,11 +6948,26 @@ fn subtree_audit_response_kind(response: &protocol::SubtreeAuditResponse) -> &'s
     }
 }
 
+fn subtree_audit_response_work_items(response: &protocol::SubtreeAuditResponse) -> usize {
+    match response {
+        protocol::SubtreeAuditResponse::Proof { proof, .. } => proof.leaves.len(),
+        protocol::SubtreeAuditResponse::Bootstrapping { .. }
+        | protocol::SubtreeAuditResponse::Rejected { .. } => 0,
+    }
+}
+
 fn subtree_slice_response_kind(response: &protocol::SubtreeSliceResponse) -> &'static str {
     match response {
         protocol::SubtreeSliceResponse::Items { .. } => "items",
         protocol::SubtreeSliceResponse::Bootstrapping { .. } => "bootstrapping",
         protocol::SubtreeSliceResponse::Rejected { .. } => "rejected",
+    }
+}
+
+fn commitment_pin_response_kind(response: &protocol::GetCommitmentByPinResponse) -> &'static str {
+    match response {
+        protocol::GetCommitmentByPinResponse::Found { .. } => "found",
+        protocol::GetCommitmentByPinResponse::NotRetained { .. } => "not_retained",
     }
 }
 
@@ -4773,6 +7093,7 @@ async fn run_neighbor_sync_round(
     last_commitment_by_peer: &Arc<RwLock<HashMap<PeerId, PeerCommitmentRecord>>>,
     ever_capable_peers: &Arc<RwLock<HashSet<PeerId>>>,
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
+    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
 ) {
     let self_id = *p2p_node.peer_id();
@@ -4812,6 +7133,7 @@ async fn run_neighbor_sync_round(
             repair_proofs,
             allow_remote_prune_audits,
             commitment_state: Some(commitment_state),
+            audit_challenge_coordinator,
         })
         .await;
 
@@ -5089,14 +7411,10 @@ async fn handle_sync_response(
         // rejected hints keep this source on the "not yet drained" list
         // until its next sync replays them; a clean cycle clears it.
         if bootstrapping {
-            if !outcome.discovered.is_empty() {
-                bootstrap::track_discovered_keys(bootstrap_state, &outcome.discovered).await;
-            }
-            if outcome.capacity_rejected_count > 0 {
-                bootstrap::note_capacity_rejected(bootstrap_state, *peer).await;
-            } else {
-                bootstrap::clear_capacity_rejected(bootstrap_state, peer).await;
-            }
+            let live_discovered = outcome.discovered.clone();
+            let outcomes = [(*peer, outcome)];
+            publish_bootstrap_admission_outcomes(bootstrap_state, &outcomes, &live_discovered)
+                .await;
         }
     }
 }
@@ -5108,14 +7426,69 @@ async fn handle_sync_response(
 #[allow(clippy::too_many_arguments)]
 /// Outcome of [`admit_and_queue_hints`].
 ///
-/// `capacity_rejected_count` is non-zero when one or more legitimately
-/// admissible hints were dropped because `pending_verify`'s global or
-/// per-source bound was hit. Callers that care about completeness
-/// (bootstrap drain accounting) MUST NOT treat their work as complete while
-/// this is > 0 — the source will need to re-hint after capacity frees up.
+/// `capacity_rejected_count` tracks incoming hints for which no fair slot was
+/// available; that source is kept outstanding until it re-hints. `displaced`
+/// tracks older borrowed hints reclaimed for another sender; only the key is
+/// dropped from bootstrap tracking — the former owner's standing is untouched
+/// (see [`publish_bootstrap_admission_outcomes`]).
 struct AdmissionOutcome {
     discovered: HashSet<XorName>,
     capacity_rejected_count: usize,
+    displaced: Vec<CapacityDisplacement>,
+}
+
+/// Publish one atomic admission unit into bootstrap drain accounting.
+///
+/// Only sources that were themselves capacity-rejected are kept outstanding.
+/// A fairness displacement forfeits the displaced *key* but never stamps its
+/// former owner: reclaiming a borrowed slot is this node's own fairness
+/// decision, so charging it to the victim would let a sustained flooder wedge
+/// our bootstrap drain open through an unrelated honest peer. Clean sources
+/// are cleared only after every outcome in the unit is known, so peer
+/// iteration order cannot falsely clear a rejection recorded later in the same
+/// bootstrap batch.
+async fn publish_bootstrap_admission_outcomes(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    outcomes: &[(PeerId, AdmissionOutcome)],
+    live_discovered: &HashSet<XorName>,
+) {
+    let mut rejected_sources = HashSet::new();
+    let mut clean_sources = HashSet::new();
+    let mut displaced_keys = HashSet::new();
+
+    for (source, outcome) in outcomes {
+        if outcome.capacity_rejected_count > 0 {
+            rejected_sources.insert(*source);
+        } else {
+            clean_sources.insert(*source);
+        }
+        // Only the *key* of a fairness displacement is forfeited here, never
+        // its owner's standing. Reclaiming a borrowed slot is our own fairness
+        // decision, not a failure by the peer that held it: stamping the victim
+        // would let a sustained flooder block our bootstrap drain through an
+        // unrelated honest peer that never overflowed us. The displaced key
+        // falls to the same post-bootstrap neighbor-sync and audit/repair
+        // recovery path that TTL expiry already relies on.
+        for displacement in &outcome.displaced {
+            displaced_keys.insert(displacement.key);
+        }
+    }
+    clean_sources.retain(|source| !rejected_sources.contains(source));
+
+    let now = Instant::now();
+    let mut state = bootstrap_state.write().await;
+    for key in displaced_keys {
+        state.remove_key(&key);
+    }
+    state.pending_keys.extend(live_discovered);
+    for source in clean_sources {
+        state.capacity_rejected_sources.remove(&source);
+    }
+    for source in rejected_sources {
+        // First-seen: a source that keeps overflowing us must not keep its own
+        // record fresh, or bootstrap never drains and auditing stays off.
+        state.note_capacity_rejected(source, now);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5147,9 +7520,19 @@ async fn admit_and_queue_hints(
     )
     .await;
 
+    let mut q = queues.write().await;
+    queue_admitted_hints(source_peer, admitted, storage, &mut q)
+}
+
+fn queue_admitted_hints(
+    source_peer: &PeerId,
+    admitted: admission::AdmissionResult,
+    storage: &LmdbStorage,
+    q: &mut ReplicationQueues,
+) -> AdmissionOutcome {
     let mut discovered = HashSet::new();
     let mut capacity_rejected_count: usize = 0;
-    let mut q = queues.write().await;
+    let mut displaced = Vec::new();
     let now = Instant::now();
 
     for key in admitted.replica_keys {
@@ -5158,11 +7541,14 @@ async fn admit_and_queue_hints(
                 key,
                 VerificationEntry {
                     state: VerificationState::PendingVerify,
-                    pipeline: HintPipeline::Replica,
                     verified_sources: Vec::new(),
                     tried_sources: HashSet::new(),
                     created_at: now,
-                    hint_sender: *source_peer,
+                    next_verify_at: now,
+                    hint_sources: HashSet::from([*source_peer]),
+                    // Non-empty: this peer claimed possession, so it is a
+                    // fetch-source candidate. Derives HintPipeline::Replica.
+                    replica_hint_sources: HashSet::from([*source_peer]),
                 },
             );
             match result {
@@ -5182,11 +7568,14 @@ async fn admit_and_queue_hints(
             key,
             VerificationEntry {
                 state: VerificationState::PendingVerify,
-                pipeline: HintPipeline::PaidOnly,
                 verified_sources: Vec::new(),
                 tried_sources: HashSet::new(),
                 created_at: now,
-                hint_sender: *source_peer,
+                next_verify_at: now,
+                hint_sources: HashSet::from([*source_peer]),
+                // Empty: a paid hint makes no possession claim, so this peer is
+                // not a fetch source. Derives HintPipeline::PaidOnly.
+                replica_hint_sources: HashSet::new(),
             },
         );
         match result {
@@ -5207,9 +7596,12 @@ async fn admit_and_queue_hints(
         );
     }
 
+    displaced.extend(q.take_capacity_displacements());
+
     AdmissionOutcome {
         discovered,
         capacity_rejected_count,
+        displaced,
     }
 }
 
@@ -5235,16 +7627,54 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         recent_provers,
     } = ctx;
 
+    // Self-heal the bootstrap drain before any early-return below: abandoned
+    // capacity-rejection records must expire, and a drain condition that
+    // became true without a triggering event must still be observed. Pending
+    // peer requests legitimately block the drain check itself, but not this.
+    expire_and_recheck_bootstrap_drain(
+        bootstrap_state,
+        queues,
+        is_bootstrapping,
+        bootstrap_complete_notify,
+        config.capacity_rejected_max_age(),
+    )
+    .await;
+
+    // Bootstrap admits one concurrent neighbor batch as an atomic source
+    // aggregation unit. Do not select newly queued keys until that batch's
+    // hints and drain accounting have both been published.
+    if bootstrap_state.read().await.pending_peer_requests > 0 {
+        return;
+    }
+
     // Evict stale entries that have been pending too long (e.g. unreachable
     // verification targets during a network partition).
-    {
+    let stale_pending_keys = {
         let mut q = queues.write().await;
-        q.evict_stale(config::PENDING_VERIFY_MAX_AGE);
+        q.evict_stale(config::PENDING_VERIFY_MAX_AGE)
+    };
+    if !stale_pending_keys.is_empty() {
+        update_bootstrap_after_verification(
+            &stale_pending_keys,
+            bootstrap_state,
+            queues,
+            is_bootstrapping,
+            bootstrap_complete_notify,
+        )
+        .await;
     }
 
     let pending_keys = {
-        let q = queues.read().await;
-        q.pending_keys()
+        let mut q = queues.write().await;
+        // Re-check while holding the queue write lock used by fair selection.
+        // This closes the race
+        // where a bootstrap batch starts after the early check: the batch
+        // cannot publish its hints under the queue write lock until this
+        // selection either returns or declines to run.
+        if bootstrap_state.read().await.pending_peer_requests > 0 {
+            return;
+        }
+        q.select_ready_pending_keys(Instant::now(), MAX_VERIFICATION_KEYS_PER_CYCLE)
     };
 
     if pending_keys.is_empty() {
@@ -5255,34 +7685,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     let self_id = *p2p_node.peer_id();
 
     // Step 1: Check local PaidForList for fast-path authorization (Section 9,
-    // step 4).
-    let mut local_paid_presence_probe_keys = Vec::new();
-    let mut local_paid_paid_only_keys = Vec::new();
+    // step 4). Paid-list membership settles *validity* — the key is known-paid,
+    // so no quorum round is needed. It says nothing about whether we must hold
+    // the bytes; that is decided below.
+    let mut local_paid_keys = Vec::new();
     let mut keys_needing_network = Vec::new();
     let mut terminal_keys: Vec<XorName> = Vec::new();
     {
         let mut q = queues.write().await;
         for key in &pending_keys {
             if paid_list.contains(key).unwrap_or(false) {
-                if let Some(pipeline) =
-                    q.set_pending_state(key, VerificationState::PaidListVerified)
-                {
-                    match pipeline {
-                        HintPipeline::PaidOnly => {
-                            // Paid-only + local paid state needs one more
-                            // storage-admission check outside this lock: if we
-                            // are also in the close group plus storage margin,
-                            // the hint can repair a missing replica.
-                            local_paid_paid_only_keys.push(*key);
-                        }
-                        HintPipeline::Replica => {
-                            // Local paid-list membership authorizes the key.
-                            // We still need a presence probe to discover fetch
-                            // sources, but we must not require remote paid
-                            // majority or presence quorum.
-                            local_paid_presence_probe_keys.push(*key);
-                        }
-                    }
+                if q.set_pending_state(key, VerificationState::PaidListVerified) {
+                    local_paid_keys.push(*key);
                 }
             } else {
                 keys_needing_network.push(*key);
@@ -5290,28 +7704,30 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
     }
 
-    if !local_paid_paid_only_keys.is_empty() {
-        let mut terminal_paid_only = Vec::new();
-        for key in local_paid_paid_only_keys {
+    // Storage responsibility is a live routing question, decided identically
+    // for every known-paid key regardless of how the advertising peer labelled
+    // its hint — a replica hint is a possession *claim* by the sender, never
+    // permission for us to store. Held outside the queue lock: `is_responsible`
+    // awaits into the DHT manager.
+    let mut local_paid_presence_probe_keys = Vec::new();
+    if !local_paid_keys.is_empty() {
+        let mut terminal_paid = Vec::new();
+        for key in local_paid_keys {
             if storage.exists(&key).unwrap_or(false) {
-                terminal_paid_only.push(key);
-            } else if admission::is_responsible(
-                &self_id,
-                &key,
-                p2p_node,
-                storage_admission_width(config.close_group_size),
-            )
-            .await
-            {
+                terminal_paid.push(key);
+            } else if is_storage_admitted(&self_id, &key, p2p_node, config).await {
+                // We carry storage responsibility and lack the bytes. The
+                // presence probe below discovers holders to fetch from; it is
+                // source discovery, not re-verification.
                 local_paid_presence_probe_keys.push(key);
             } else {
-                terminal_paid_only.push(key);
+                terminal_paid.push(key);
             }
         }
 
-        if !terminal_paid_only.is_empty() {
+        if !terminal_paid.is_empty() {
             let mut q = queues.write().await;
-            for key in terminal_paid_only {
+            for key in terminal_paid {
                 q.remove_pending(&key);
                 terminal_keys.push(key);
             }
@@ -5347,17 +7763,18 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 terminal_keys.push(key);
                 continue;
             }
-            let sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
+            let mut sources = evidence.get(&key).map_or_else(Vec::new, |ev| {
                 quorum::present_sources_for_key(&key, ev, &targets)
             });
+            if let Some(entry) = q.get_pending(&key) {
+                add_replica_hint_sources(&mut sources, &entry.replica_hint_sources);
+            }
             if sources.is_empty() {
-                // Terminal failure: remove pending and report. No fetch path.
-                q.remove_pending(&key);
                 warn!(
-                    "Locally paid key {} has no responding holders (possible data loss)",
+                    "Locally paid key {} has no responding holders yet; deferring retry",
                     hex::encode(key)
                 );
-                terminal_keys.push(key);
+                q.defer_pending(&key, config.verification_request_timeout);
             } else {
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
@@ -5455,16 +7872,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             provers_snapshot.is_credited_holder(key, peer, hash)
         };
 
-        let mut evaluated: Vec<(XorName, KeyVerificationOutcome, HintPipeline)> = Vec::new();
+        let mut evaluated: Vec<(XorName, KeyVerificationOutcome)> = Vec::new();
         {
             let q = queues.read().await;
             for key in &keys_needing_network {
                 let Some(ev) = evidence.get(key) else {
                     continue;
                 };
-                let Some(entry) = q.get_pending(key) else {
+                if q.get_pending(key).is_none() {
                     continue;
-                };
+                }
                 let outcome = quorum::evaluate_key_evidence_with_holder_check(
                     key,
                     ev,
@@ -5472,13 +7889,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     config,
                     holder_credit,
                 );
-                evaluated.push((*key, outcome, entry.pipeline));
+                evaluated.push((*key, outcome));
             }
         } // read lock released
 
         // Step 4: Insert verified keys into PaidForList (no lock held).
         let mut paid_insert_keys: Vec<XorName> = Vec::new();
-        for (key, outcome, _) in &evaluated {
+        for (key, outcome) in &evaluated {
             if matches!(
                 outcome,
                 KeyVerificationOutcome::QuorumVerified { .. }
@@ -5493,65 +7910,95 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
         }
 
-        // Paid-only hints normally update PaidForList only. If this node is
-        // also within the storage-admission group for the key, a verified
-        // paid-only hint can safely repair a missing replica using sources
-        // from the same verification round.
-        let mut paid_only_fetch_keys: HashSet<XorName> = HashSet::new();
-        for (key, outcome, pipeline) in &evaluated {
-            if *pipeline == HintPipeline::PaidOnly
-                && matches!(
-                    outcome,
-                    KeyVerificationOutcome::QuorumVerified { .. }
-                        | KeyVerificationOutcome::PaidListVerified { .. }
-                )
-                && !storage.exists(key).unwrap_or(false)
-                && admission::is_responsible(
-                    &self_id,
-                    key,
-                    p2p_node,
-                    storage_admission_width(config.close_group_size),
-                )
-                .await
+        // Verification established validity; the paid-list insert above records
+        // it. Downloading the bytes is a separate duty, owed only by the
+        // storage-admission group, asked on the same terms for every verified
+        // key — the advertising peer's replica/paid labelling is a claim about
+        // itself and carries no authority over what we store. This check is a
+        // cheap pre-filter that keeps never-responsible keys out of the fetch
+        // queue entirely; the authoritative gate is the per-attempt recheck in
+        // `execute_single_fetch`, because a key can wait in the nearest-first
+        // fetch queue long enough for this promotion-time answer to go stale.
+        let mut fetch_allowed_keys: HashSet<XorName> = HashSet::new();
+        for (key, outcome) in &evaluated {
+            if matches!(
+                outcome,
+                KeyVerificationOutcome::QuorumVerified { .. }
+                    | KeyVerificationOutcome::PaidListVerified { .. }
+            ) && !storage.exists(key).unwrap_or(false)
+                && is_storage_admitted(&self_id, key, p2p_node, config).await
             {
-                paid_only_fetch_keys.insert(*key);
+                fetch_allowed_keys.insert(*key);
             }
         }
 
         // Step 5: Update queues with the evaluated outcomes.
+        let mut bad_singleton_hints: HashMap<PeerId, usize> = HashMap::new();
         let mut q = queues.write().await;
-        for (key, outcome, pipeline) in evaluated {
+        for (key, outcome) in evaluated {
+            let replica_hint_sources = q
+                .get_pending(&key)
+                .map(|entry| entry.replica_hint_sources.clone())
+                .unwrap_or_default();
+            if let Some(ev) = evidence.get(&key) {
+                if let Some(source) =
+                    punishable_singleton_replica_hint_source(&replica_hint_sources, &outcome, ev)
+                {
+                    *bad_singleton_hints.entry(source).or_insert(0) += 1;
+                }
+            }
             match outcome {
                 KeyVerificationOutcome::QuorumVerified { sources }
                 | KeyVerificationOutcome::PaidListVerified { sources } => {
-                    let fetch_eligible =
-                        pipeline == HintPipeline::Replica || paid_only_fetch_keys.contains(&key);
-                    if fetch_eligible && !sources.is_empty() {
+                    let mut fetch_sources = sources;
+                    add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
+                    let fetch_eligible = fetch_allowed_keys.contains(&key);
+                    if fetch_eligible && !fetch_sources.is_empty() {
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                         // Atomic remove+enqueue: on fetch_queue capacity miss
                         // the pending entry is preserved so this verified key
                         // is retried on the next cycle (no silent drop).
-                        let _ = q.promote_pending_to_fetch(key, distance, sources);
+                        let _ = q.promote_pending_to_fetch(key, distance, fetch_sources);
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
-                    } else if fetch_eligible && sources.is_empty() {
+                    } else if fetch_eligible && fetch_sources.is_empty() {
                         warn!(
-                            "Verified storage-admitted key {} has no holders (possible data loss)",
+                            "Verified storage-admitted key {} has no holders yet; deferring retry",
                             hex::encode(key)
                         );
-                        q.remove_pending(&key);
-                        terminal_keys.push(key);
+                        q.defer_pending(&key, config.verification_request_timeout);
                     } else {
                         q.remove_pending(&key);
                         terminal_keys.push(key);
                     }
                 }
-                KeyVerificationOutcome::QuorumFailed
-                | KeyVerificationOutcome::QuorumInconclusive => {
+                KeyVerificationOutcome::QuorumFailed => {
                     q.remove_pending(&key);
                     terminal_keys.push(key);
                 }
+                KeyVerificationOutcome::QuorumInconclusive => {
+                    q.set_pending_state(&key, VerificationState::QuorumInconclusive);
+                    q.defer_pending(&key, config.verification_request_timeout);
+                }
+            }
+        }
+        drop(q);
+
+        for (peer, bad_hint_count) in bad_singleton_hints {
+            let reports = bad_hint_count.min(MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE);
+            warn!(
+                "Peer {peer} submitted {bad_hint_count} rejected or self-contradicting \
+                 sole-source replica hints; \
+                 reporting {reports} bounded trust failure(s)"
+            );
+            for _ in 0..reports {
+                p2p_node
+                    .report_trust_event(
+                        &peer,
+                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                    )
+                    .await;
             }
         }
     }
@@ -5591,6 +8038,39 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     }
 }
 
+/// Add peers that claimed possession as fallback fetch sources.
+///
+/// Paid-only advertisers make no possession claim and are absent from
+/// `replica_hint_sources` by construction, so they are never added.
+fn add_replica_hint_sources(sources: &mut Vec<PeerId>, replica_hint_sources: &HashSet<PeerId>) {
+    for source in replica_hint_sources {
+        if !sources.contains(source) {
+            sources.push(*source);
+        }
+    }
+}
+
+/// Return the sole replica advertiser when either the close group definitively
+/// rejects the key or the advertiser explicitly denies possessing it.
+/// Paid-only advertisements, corroborated replica hints, and inconclusive
+/// rounds without that direct contradiction are deliberately non-penalizing.
+fn punishable_singleton_replica_hint_source(
+    replica_hint_sources: &HashSet<PeerId>,
+    outcome: &KeyVerificationOutcome,
+    evidence: &crate::replication::types::KeyVerificationEvidence,
+) -> Option<PeerId> {
+    // A paid-only advertiser leaves this set empty, so the sole-source lane is
+    // reserved for peers that actually claimed possession.
+    if replica_hint_sources.len() != 1 {
+        return None;
+    }
+    let source = *replica_hint_sources.iter().next()?;
+    let rejected_by_close_group = matches!(outcome, KeyVerificationOutcome::QuorumFailed);
+    let denied_possession = evidence.presence.get(&source) == Some(&PresenceEvidence::Absent);
+
+    (rejected_by_close_group || denied_possession).then_some(source)
+}
+
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
 /// bootstrap pending set and transition out of bootstrapping when drained.
 async fn update_bootstrap_after_verification(
@@ -5609,6 +8089,63 @@ async fn update_bootstrap_after_verification(
             bs.remove_key(key);
         }
     }
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
+    }
+}
+
+/// Retire bootstrap work owed by a peer that permanently left the routing
+/// table, then immediately re-check drain so this removal can complete
+/// bootstrap without waiting for an unrelated pipeline event.
+async fn update_bootstrap_after_peer_removed(
+    peer: &PeerId,
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+) {
+    let orphaned_keys = queues.write().await.remove_hint_source(peer);
+    let cleared_rejection = bootstrap::clear_capacity_rejected(bootstrap_state, peer).await;
+
+    if !orphaned_keys.is_empty() {
+        let mut state = bootstrap_state.write().await;
+        for key in &orphaned_keys {
+            state.remove_key(key);
+        }
+    }
+
+    if orphaned_keys.is_empty() && !cleared_rejection {
+        return;
+    }
+    let q = queues.read().await;
+    if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
+        complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
+    }
+}
+
+/// Periodic bootstrap-drain self-healing, run on every verification worker
+/// tick until bootstrap drains.
+///
+/// Two liveness gaps make this necessary. A `PeerRemoved` that races the
+/// recording of a capacity rejection leaves an entry no future event can
+/// clear — `max_age` expiry is its only exit. And a clean-cycle
+/// `clear_capacity_rejected` never triggers its own drain re-check, so on a
+/// quiet node the drain condition can become true with nothing left to
+/// observe it. Expiry must run even while `pending_peer_requests` blocks the
+/// drain itself, so this is invoked before `run_verification_cycle`'s
+/// early-returns.
+async fn expire_and_recheck_bootstrap_drain(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    queues: &Arc<RwLock<ReplicationQueues>>,
+    is_bootstrapping: &Arc<RwLock<bool>>,
+    bootstrap_complete_notify: &Arc<Notify>,
+    max_age: Duration,
+) {
+    if bootstrap_state.read().await.is_drained() {
+        return;
+    }
+    bootstrap::expire_capacity_rejected(bootstrap_state, max_age).await;
     let q = queues.read().await;
     if bootstrap::check_bootstrap_drained(bootstrap_state, &q).await {
         complete_bootstrap(is_bootstrapping, bootstrap_complete_notify).await;
@@ -5637,6 +8174,11 @@ enum FetchResult {
     IntegrityFailed,
     /// Source failed (network error or non-success response) — retryable.
     SourceFailed,
+    /// Live routing state no longer places this node in the storage-admission
+    /// group for the key — terminal, exactly like [`Self::Stored`]. The duty
+    /// the fetch was serving has lapsed, so no alternate source is tried and
+    /// no trust event is reported: the source did nothing wrong.
+    NoLongerResponsible,
 }
 
 /// Outcome produced by [`execute_single_fetch`] and consumed by the fetch
@@ -5646,12 +8188,91 @@ struct FetchOutcome {
     result: FetchResult,
 }
 
+/// What the fetch worker must do next for a key whose fetch attempt resolved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchFollowUp {
+    /// The key terminally left the fetch pipeline (its in-flight entry is
+    /// removed and any verification retry-slot reservation released); the
+    /// caller must run bootstrap accounting for it.
+    Terminal,
+    /// The key returned to `pending_verify` for a later verification round.
+    RequeuedForVerification,
+    /// Retry immediately from this next untried verified source.
+    RetryFrom(PeerId),
+}
+
+/// Apply a resolved [`FetchResult`] to the queues and report the follow-up.
+///
+/// Split out of the fetch-worker loop so the per-variant queue transitions
+/// are unit-testable without a live network. The caller holds the queues
+/// write lock. [`FetchResult::NoLongerResponsible`] deliberately shares
+/// [`FetchResult::Stored`]'s terminal path: `complete_fetch` releases the
+/// retry-slot reservation, and the caller's terminal handling shrinks the
+/// bootstrap pending set — dropping the key without that accounting would
+/// stall bootstrap drain forever.
+///
+/// The nursery `option_if_let_else` rewrite is impossible here: both
+/// `map_or_else` closures would need `&mut *q` simultaneously.
+#[allow(clippy::option_if_let_else)]
+fn apply_fetch_result(
+    q: &mut ReplicationQueues,
+    key: &XorName,
+    result: &FetchResult,
+    verification_retry_after: Duration,
+) -> FetchFollowUp {
+    match result {
+        FetchResult::Stored | FetchResult::NoLongerResponsible => {
+            q.complete_fetch(key);
+            FetchFollowUp::Terminal
+        }
+        FetchResult::IntegrityFailed | FetchResult::SourceFailed => {
+            if let Some(next_peer) = q.retry_fetch(key) {
+                FetchFollowUp::RetryFrom(next_peer)
+            } else if q.requeue_fetch_for_verification(key, verification_retry_after) {
+                FetchFollowUp::RequeuedForVerification
+            } else {
+                FetchFollowUp::Terminal
+            }
+        }
+    }
+}
+
+/// Whether this node currently sits inside the storage-admission group for
+/// `key`, per live local routing state.
+///
+/// This is the one question every storage decision in this module asks; see
+/// [`admission::is_responsible`]. A purely local routing-table lookup — no
+/// network I/O — but it awaits into the DHT manager, so callers must not
+/// hold the queues lock across it.
+async fn is_storage_admitted(
+    self_id: &PeerId,
+    key: &XorName,
+    p2p_node: &Arc<P2PNode>,
+    config: &ReplicationConfig,
+) -> bool {
+    admission::is_responsible(
+        self_id,
+        key,
+        p2p_node,
+        storage_admission_width(config.close_group_size),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 /// Execute a single fetch request against `source` for `key`.
 ///
 /// Handles encoding, network I/O, integrity checking, storage, and trust
 /// event reporting.  Returns a [`FetchOutcome`] so the caller can update
 /// queue state without holding any locks during the network round-trip.
+///
+/// This is the authoritative storage-responsibility gate: each attempt —
+/// including every per-source retry, which re-enters here — rechecks live
+/// routing state before spending bandwidth, and once more before writing
+/// bytes that arrived after a round-trip. The verification-time check that
+/// promoted the key into the fetch queue is only a pre-filter; the queue is
+/// nearest-first and deep, so a promotion decision can go stale under
+/// topology churn before the key is ever dequeued.
 async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
     storage: Arc<LmdbStorage>,
@@ -5659,6 +8280,18 @@ async fn execute_single_fetch(
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
+    let self_id = *p2p_node.peer_id();
+    if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
+        debug!(
+            "Skipping fetch for {}: no longer in the storage-admission group",
+            hex::encode(key)
+        );
+        return FetchOutcome {
+            key,
+            result: FetchResult::NoLongerResponsible,
+        };
+    }
+
     let request = protocol::FetchRequest { key };
     let msg = ReplicationMessage {
         request_id: rand::thread_rng().gen::<u64>(),
@@ -5766,6 +8399,23 @@ async fn execute_single_fetch(
                         return FetchOutcome {
                             key,
                             result: FetchResult::IntegrityFailed,
+                        };
+                    }
+
+                    // Responsibility can lapse during the network round-trip.
+                    // The bandwidth is already spent; declining the write is
+                    // what still avoids the disk write and the later
+                    // fetch→store→prune churn. Edge flapping is dampened by
+                    // the margin `storage_admission_width` adds over
+                    // `close_group_size`.
+                    if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
+                        debug!(
+                            "Fetched {} but responsibility lapsed in transit; not storing",
+                            hex::encode(key)
+                        );
+                        return FetchOutcome {
+                            key,
+                            result: FetchResult::NoLongerResponsible,
                         };
                     }
 
@@ -5945,7 +8595,10 @@ async fn handle_subtree_audit_result(
                 )
                 .await;
         }
-        AuditTickResult::Failed { evidence } => {
+        AuditTickResult::Failed {
+            evidence,
+            no_response_class,
+        } => {
             if let FailureEvidence::AuditFailure {
                 challenged_peer,
                 confirmed_failed_keys,
@@ -5958,8 +8611,10 @@ async fn handle_subtree_audit_result(
                 // Rich diagnostics (from main's audit-failure logging) + the
                 // first-failed-key correlation handle.
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
+                let audit_failure_class = no_response_class.unwrap_or("confirmed");
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    "Audit failure for {challenged_peer}: reason={reason:?}, audit_failure_class={}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    audit_failure_class,
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
@@ -6029,30 +8684,10 @@ async fn handle_subtree_audit_result(
 /// bootstrapping); every confirmed storage-integrity reason does.
 ///
 /// Responsible-chunk `AuditChallenge` failures use this directly: timeouts keep
-/// the bootstrap claim, matching the pre-ADR-0002 behaviour. Whether a timeout
-/// is also *penalised* is a separate question — see
-/// [`audit_failure_reports_trust_penalty`].
+/// the bootstrap claim, matching the pre-ADR-0002 behaviour, while every failure
+/// still reports the normal audit trust penalty.
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
-}
-
-/// Whether an audit failure with this reason reports an application trust event
-/// at [`AUDIT_FAILURE_TRUST_WEIGHT`](config::AUDIT_FAILURE_TRUST_WEIGHT).
-///
-/// ROLLOUT GATE — see [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]. While that gate is
-/// set, a `Timeout` on the digest lanes is graced, because a peer on the other
-/// side of the possession-audit protocol move never answers and its silence is
-/// not evidence about its storage. Every other reason is a confirmed failure and
-/// is always penalised. When the gate is removed this becomes `true` for every
-/// reason, restoring the unconditional penalty.
-///
-/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: config::GRACE_POSSESSION_AUDIT_TIMEOUTS
-fn audit_failure_reports_trust_penalty(reason: &AuditFailureReason) -> bool {
-    if config::GRACE_POSSESSION_AUDIT_TIMEOUTS {
-        !matches!(reason, AuditFailureReason::Timeout)
-    } else {
-        true
-    }
 }
 
 /// Handle the result of a responsible-chunk audit tick (audit #2): emit trust
@@ -6062,6 +8697,7 @@ fn audit_failure_reports_trust_penalty(reason: &AuditFailureReason) -> bool {
 /// responsible-chunk `AuditChallenge` `Failed` result reports
 /// `ApplicationFailure` immediately for every reason, including `Timeout`,
 /// restoring the pre-ADR-0002 behaviour.
+#[allow(clippy::too_many_lines)]
 async fn handle_audit_result(
     result: &AuditTickResult,
     p2p_node: &Arc<P2PNode>,
@@ -6086,7 +8722,10 @@ async fn handle_audit_result(
                 )
                 .await;
         }
-        AuditTickResult::Failed { evidence } => {
+        AuditTickResult::Failed {
+            evidence,
+            no_response_class,
+        } => {
             if let FailureEvidence::AuditFailure {
                 challenged_peer,
                 confirmed_failed_keys,
@@ -6097,8 +8736,10 @@ async fn handle_audit_result(
             {
                 protocol::record_audit_fail(protocol::AuditOutcomeKind::Responsible, reason);
                 let first_failed_key = first_failed_key_label(confirmed_failed_keys);
+                let audit_failure_class = no_response_class.unwrap_or("confirmed");
                 error!(
-                    "Audit failure for {challenged_peer}: reason={reason:?}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    "Audit failure for {challenged_peer}: reason={reason:?}, audit_failure_class={}, confirmed_failed_keys={}, challenged_keys={}, absent_keys={}, digest_mismatch_keys={}, first_failed_key={first_failed_key}",
+                    audit_failure_class,
                     confirmed_failed_keys.len(),
                     summary.challenged_keys,
                     summary.absent_keys,
@@ -6110,19 +8751,12 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                if audit_failure_reports_trust_penalty(reason) {
-                    p2p_node
-                        .report_trust_event(
-                            challenged_peer,
-                            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                        )
-                        .await;
-                } else {
-                    debug!(
-                        "Audit timeout for {challenged_peer} graced during the possession-audit \
-                         protocol rollout (no confirmed-failure penalty)"
-                    );
-                }
+                p2p_node
+                    .report_trust_event(
+                        challenged_peer,
+                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                    )
+                    .await;
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -6215,6 +8849,7 @@ struct GossipAuditTrigger {
     /// only when a real audit is about to be sent — never by a losing lottery
     /// ticket — so gossip traffic alone can never suppress a paid first audit.
     cooldown: Arc<RwLock<HashMap<PeerId, Instant>>>,
+    detached_task_tracker: TaskTracker,
     /// Gossip-private lottery attempt window: stamped on every roll (win or
     /// lose) so a gossip flood cannot re-roll the lottery within the window.
     /// The first-audit scheduler never reads this map.
@@ -6358,19 +8993,21 @@ async fn maybe_trigger_gossip_audit(
         }
     }
 
+    let detached_task_tracker = trigger.detached_task_tracker.clone();
     let trigger = trigger.clone();
     let peer = *peer;
-    tokio::spawn(async move {
+    detached_task_tracker.spawn(async move {
         let credit = storage_commitment_audit::AuditCredit {
             recent_provers: &trigger.recent_provers,
         };
-        let result = storage_commitment_audit::run_subtree_audit(
+        let result = storage_commitment_audit::run_subtree_audit_with_origin(
             &trigger.p2p_node,
             &trigger.config,
             &peer,
             target.pin_hash,
             target.key_count,
             Some(&credit),
+            storage_commitment_audit::SubtreeAuditOrigin::Gossip,
         )
         .await;
         handle_subtree_audit_result(
@@ -6947,215 +9584,279 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn match_replication_protocol_accepts_both_ids_bare_and_rr() {
-        // Core id, bare gossip form and /rr/ request-response form.
+    fn match_replication_protocol_accepts_core_and_subtree_bare_and_rr() {
+        for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
+            assert_eq!(match_replication_protocol(id), Some((id, false)));
+            assert_eq!(
+                match_replication_protocol(&format!("{RR_PREFIX}{id}")),
+                Some((id, true))
+            );
+        }
         assert_eq!(
-            match_replication_protocol(REPLICATION_PROTOCOL_ID),
-            Some((REPLICATION_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{REPLICATION_PROTOCOL_ID}")),
-            Some((REPLICATION_PROTOCOL_ID, true))
-        );
-        // Subtree-audit id, both forms.
-        assert_eq!(
-            match_replication_protocol(SUBTREE_AUDIT_PROTOCOL_ID),
-            Some((SUBTREE_AUDIT_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{SUBTREE_AUDIT_PROTOCOL_ID}")),
-            Some((SUBTREE_AUDIT_PROTOCOL_ID, true))
-        );
-        // Possession-audit id, both forms.
-        assert_eq!(
-            match_replication_protocol(POSSESSION_AUDIT_PROTOCOL_ID),
-            Some((POSSESSION_AUDIT_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{POSSESSION_AUDIT_PROTOCOL_ID}")),
-            Some((POSSESSION_AUDIT_PROTOCOL_ID, true))
-        );
-        // Foreign topics (incl. a bare /rr/ and an unrelated protocol) don't match.
-        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
-        assert_eq!(match_replication_protocol(RR_PREFIX), None);
-        assert_eq!(
-            match_replication_protocol("autonomi.ant.replication.v3"),
+            match_replication_protocol("autonomi.ant.replication.possession-audit.v2"),
             None
         );
+        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
+        assert_eq!(match_replication_protocol(RR_PREFIX), None);
     }
 
-    // The receive guard drops a body whose family disagrees with the id it rode:
-    // subtree-audit bodies only on the subtree id, possession-audit bodies only on
-    // the possession id, core bodies only on the core id. This is what stops a
-    // mixed-version peer's message from being honoured on the wrong handler after
-    // a postcard misdecode. The test drives the SAME `body_matches_protocol` the
-    // production guard uses, over real bodies, so a regression in the rule fails
-    // here.
     #[test]
-    fn body_matches_protocol_is_symmetric_over_real_bodies() {
+    fn body_matches_protocol_is_symmetric_over_core_and_subtree_bodies() {
         use crate::replication::protocol::{
             AuditChallenge, AuditResponse, FreshReplicationOffer, ReplicationMessageBody,
             SubtreeSliceChallenge,
         };
-        // A subtree-audit body (models a v2 SubtreeByteChallenge, which decodes to
-        // this variant 13 under the new enum), a possession-audit body, and a
-        // core body.
-        let audit = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+
+        let subtree = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
             challenge_id: 1,
             nonce: [0u8; 32],
             challenged_peer_id: [0u8; 32],
             expected_commitment_hash: [0u8; 32],
             openings: vec![],
         });
-        let possession = ReplicationMessageBody::AuditChallenge(AuditChallenge {
+        let digest_challenge = ReplicationMessageBody::AuditChallenge(AuditChallenge {
             challenge_id: 1,
             nonce: [0u8; 32],
             challenged_peer_id: [0u8; 32],
             keys: vec![[0u8; 32]],
         });
+        let digest_response =
+            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 });
         let core = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
             key: [0u8; 32],
             data: vec![],
             proof_of_payment: vec![],
         });
-        // Correct routing is kept.
-        assert!(body_matches_protocol(&audit, SUBTREE_AUDIT_PROTOCOL_ID));
-        assert!(body_matches_protocol(
-            &possession,
-            POSSESSION_AUDIT_PROTOCOL_ID
-        ));
-        assert!(body_matches_protocol(&core, REPLICATION_PROTOCOL_ID));
-        // Every cross-routing is dropped, with one deliberate exception below.
-        for (body, wrong) in [
-            (&audit, REPLICATION_PROTOCOL_ID),
-            (&audit, POSSESSION_AUDIT_PROTOCOL_ID),
-            (&possession, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&core, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&core, POSSESSION_AUDIT_PROTOCOL_ID),
-        ] {
-            assert!(
-                !body_matches_protocol(body, wrong),
-                "body must not be accepted on {wrong}"
-            );
+
+        assert!(body_matches_protocol(&subtree, SUBTREE_AUDIT_PROTOCOL_ID));
+        assert!(!body_matches_protocol(&subtree, REPLICATION_PROTOCOL_ID));
+
+        for body in [&digest_challenge, &digest_response, &core] {
+            assert!(body_matches_protocol(body, REPLICATION_PROTOCOL_ID));
+            assert!(!body_matches_protocol(body, SUBTREE_AUDIT_PROTOCOL_ID));
         }
 
-        // The exception: a possession CHALLENGE on the core id, which is where a
-        // peer that predates the family split still sends it.
-        //
-        // This used to be dropped, reasoning that answering with a digest from a
-        // different generation would score as a confirmed mismatch against an
-        // honest peer. True, but it weighed only one side. Dropping it does not
-        // make the old peer neutral — its binary turns the resulting timeout
-        // straight into an audit-severity failure, and no constant here can
-        // reach it. So silence costs the honest upgraded node exactly what a
-        // mismatch would, and the release would penalise the nodes that took it.
-        // Answered in the asker's dialect, neither happens.
-        assert_eq!(
-            body_matches_protocol(&possession, REPLICATION_PROTOCOL_ID),
-            GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "a legacy possession challenge is answered exactly while the rollout gate is set"
-        );
-
-        // A possession RESPONSE on the core id stays refused either way: this
-        // node always asks on the dedicated id, so a reply there is not one it
-        // asked for.
-        let possession_reply =
-            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 });
-        assert!(
-            !body_matches_protocol(&possession_reply, REPLICATION_PROTOCOL_ID),
-            "an unsolicited possession response on the core id must never be accepted"
-        );
-
-        // Send and receive must agree. A RESPONSE is routed by the same rule, so
-        // the id a body is sent on is always an id the peer's guard accepts.
-        // Before this was shared, possession responses went out on the core id
-        // and only worked because saorsa-core correlates RR replies by
-        // (peer, msg_id) rather than by protocol name — a bare possession
-        // response was dropped by the receiving guard.
-        for (body, expected) in [
-            (&audit, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&possession, POSSESSION_AUDIT_PROTOCOL_ID),
-            (&core, REPLICATION_PROTOCOL_ID),
-        ] {
-            assert_eq!(
-                response_protocol_for(body),
-                expected,
-                "a response must be sent on the family's own id"
-            );
-            assert!(
-                body_matches_protocol(body, response_protocol_for(body)),
-                "the id we send on must be one the receive guard accepts"
-            );
+        for body in [&subtree, &digest_challenge, &digest_response, &core] {
+            assert!(body_matches_protocol(body, response_protocol_for(body)));
         }
-
-        // The possession RESPONSE body (not just the challenge) routes to the
-        // possession id too — that is the direction that was actually wrong.
-        let possession_response = ReplicationMessageBody::AuditResponse(
-            crate::replication::protocol::AuditResponse::Digests {
-                challenge_id: 1,
-                digests: vec![[0u8; 32]],
-            },
-        );
-        assert_eq!(
-            response_protocol_for(&possession_response),
-            POSSESSION_AUDIT_PROTOCOL_ID
-        );
-    }
-
-    // A challenge is answered in the dialect it was asked in, on the id it was
-    // asked over. Getting either half wrong during the rollout window costs an
-    // honest node an audit-severity failure: the wrong digest reads as a
-    // mismatch, and the wrong id never reaches the asker at all.
-    #[test]
-    fn a_possession_challenge_is_answered_in_the_dialect_it_was_asked_in() {
-        assert_eq!(
-            possession_reply_dialect(POSSESSION_AUDIT_PROTOCOL_ID),
-            (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID),
-            "a peer on the dedicated id shares this release's construction"
-        );
-        assert_eq!(
-            possession_reply_dialect(REPLICATION_PROTOCOL_ID),
-            (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID),
-            "a peer still on the core id verifies with the previous construction"
-        );
-    }
-
-    // The legacy construction is preprocessing-weak — that is why it was
-    // replaced — so being answered in it is a real weakening. It is bounded by
-    // the fact that the ASKER picks the dialect while the RESPONDER is the one
-    // who gains from a weak one: a malicious holder cannot elect to be asked
-    // weakly, and only a peer that already accepts nothing stronger asks that
-    // way. That holds exactly while no lane on this release asks on the core id,
-    // which is what this pins. All three route through one function so a new
-    // lane cannot pick an id by hand.
-    //
-    // FLIPS IF: a digest lane is given its own protocol id again, or the shared
-    // one is pointed at the core id.
-    #[test]
-    fn every_digest_lane_asks_on_the_dedicated_id() {
-        use crate::replication::config::possession_challenge_protocol;
-
-        let (dialect, reply_on) = possession_reply_dialect(possession_challenge_protocol());
-        assert_eq!(
-            dialect,
-            AuditDigestVersion::Keyed,
-            "what this release asks on must be answered in the current construction"
-        );
-        assert_eq!(
-            reply_on, POSSESSION_AUDIT_PROTOCOL_ID,
-            "and answered on the dedicated id"
-        );
-        assert_ne!(
-            possession_challenge_protocol(),
-            REPLICATION_PROTOCOL_ID,
-            "asking on the core id would be asking for the superseded digest"
-        );
     }
 
     fn test_peer(b: u8) -> PeerId {
         let mut bytes = [0u8; 32];
         bytes[0] = b;
         PeerId::from_bytes(bytes)
+    }
+
+    /// A structurally valid offer for `data`: real content address, a proof of
+    /// the minimum accepted size, distinguished by `proof_marker` so a test can
+    /// tell whose proof came back out of the queue.
+    fn test_fresh_offer(data: Vec<u8>, proof_marker: u8) -> protocol::FreshReplicationOffer {
+        protocol::FreshReplicationOffer {
+            key: crate::client::compute_address(&data),
+            data,
+            proof_of_payment: vec![proof_marker; MIN_PAYMENT_PROOF_SIZE_BYTES],
+        }
+    }
+
+    fn admit_test_offer(
+        in_flight: &FreshOfferInFlight,
+        offer: protocol::FreshReplicationOffer,
+        source: PeerId,
+    ) -> FreshOfferAdmission {
+        FreshOfferEntryGuard::admit(in_flight, offer, source, 0, None, Instant::now())
+    }
+
+    #[test]
+    fn fresh_offer_entry_queues_one_proof_per_source_then_frees_the_key_on_drop() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x11u8; 64];
+
+        let opened = admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 1), test_peer(1));
+        let FreshOfferAdmission::Opened(entry) = opened else {
+            panic!("first offer for a key should open the entry")
+        };
+
+        // A second sender contributes its proof instead of being turned away:
+        // its bytes are provably the same, so only the proof is worth keeping.
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 2), test_peer(2)),
+                FreshOfferAdmission::Joined
+            ),
+            "a duplicate from a new source should queue its proof"
+        );
+        // The same peer twice is not extra evidence, just extra work.
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 3), test_peer(1)),
+                FreshOfferAdmission::DuplicateSource
+            ),
+            "one source should hold at most one queued proof per key"
+        );
+
+        // An entry that outlived its handler would bar the key forever.
+        drop(entry);
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 4), test_peer(3)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "a released key should be openable again"
+        );
+    }
+
+    #[test]
+    fn fresh_offer_entries_are_independent_across_keys_sharing_a_prefix() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+
+        // A node only receives offers for keys close to its own ID, so accepted
+        // keys share a long prefix. Any prefix-derived shard index would have
+        // funnelled these two onto one lock and serialized them.
+        let _first = admit_test_offer(&in_flight, test_fresh_offer(vec![1u8; 8], 1), test_peer(1));
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(vec![2u8; 8], 1), test_peer(1)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "distinct keys should never block each other"
+        );
+    }
+
+    /// The regression that motivated queueing proofs at all.
+    ///
+    /// A sender whose proof does not verify must cost the network its own
+    /// attempt and nothing more. Refusing every later offer outright made the
+    /// first arrival the only arrival, so one bad proof lost the record — and
+    /// the delayed possession check then charged that absence to this node.
+    #[test]
+    fn a_failing_proof_hands_the_key_to_the_next_sender() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x5Au8; 128];
+        let forger = test_peer(0xF0);
+        let genuine = test_peer(0x0F);
+
+        let FreshOfferAdmission::Opened(mut entry) =
+            admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0xBA), forger)
+        else {
+            panic!("the first offer should open the entry");
+        };
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0x60), genuine),
+                FreshOfferAdmission::Joined
+            ),
+            "the genuine sender must not be turned away by the forger"
+        );
+
+        let first = entry
+            .next_attempt()
+            .expect("the opener's proof comes first");
+        assert_eq!(first.source, forger);
+
+        // Treat the forger's proof as failed: the next one is still reachable,
+        // and it is tried against the bytes already held rather than a refetch.
+        let second = entry
+            .next_attempt()
+            .expect("a failed proof must not consume the key");
+        assert_eq!(second.source, genuine);
+        assert_eq!(
+            second.proof_of_payment,
+            vec![0x60u8; MIN_PAYMENT_PROOF_SIZE_BYTES]
+        );
+        assert_eq!(
+            entry.data(),
+            data.as_slice(),
+            "every proof is tried against the one copy of the bytes"
+        );
+
+        // Draining the queue releases the key rather than stranding it.
+        assert!(entry.next_attempt().is_none());
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 0x70), test_peer(9)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "an exhausted entry should release its key"
+        );
+    }
+
+    /// The cap has to be a lifetime budget, not a queue depth.
+    ///
+    /// The handler pops a proof before verifying it, so gating admission on the
+    /// *instantaneous* queue length lets a fresh source refill the slot that pop
+    /// just freed. Each refill is another on-chain payment verification, run
+    /// sequentially while the entry holds its admission permit and a worker
+    /// slot, so a stream of distinct sources could keep one key's handler — and
+    /// one of only four workers — busy indefinitely.
+    #[test]
+    fn refilling_a_popped_slot_cannot_extend_a_keys_attempt_budget() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x3Du8; 32];
+
+        let FreshOfferAdmission::Opened(mut entry) =
+            admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(0))
+        else {
+            panic!("the first offer should open the entry")
+        };
+
+        // Drive pop-then-admit with a fresh source every time, exactly as a
+        // sybil stream would. The budget must be spent by admissions, not
+        // returned by pops.
+        let mut admitted = 1;
+        for i in 1..u8::try_from(MAX_FRESH_OFFER_ATTEMPTS_PER_KEY * 4).unwrap_or(u8::MAX) {
+            let _ = entry.next_attempt();
+            if matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(i)),
+                FreshOfferAdmission::Joined
+            ) {
+                admitted += 1;
+            }
+        }
+
+        assert!(
+            admitted <= MAX_FRESH_OFFER_ATTEMPTS_PER_KEY,
+            "a key accepted {admitted} proofs over its lifetime, but the budget is \
+             {MAX_FRESH_OFFER_ATTEMPTS_PER_KEY}: popping a proof must not return its slot"
+        );
+    }
+
+    #[test]
+    fn a_fresh_offer_entry_queues_no_more_proofs_than_the_close_group_can_send() {
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        let data = vec![0x2Cu8; 32];
+
+        // The opener occupies the first slot, so the cap is reached after
+        // MAX_FRESH_OFFER_ATTEMPTS_PER_KEY distinct sources in total.
+        let _entry = admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), test_peer(0));
+        for i in 1..MAX_FRESH_OFFER_ATTEMPTS_PER_KEY {
+            let source = test_peer(u8::try_from(i).unwrap_or(u8::MAX));
+            assert!(
+                matches!(
+                    admit_test_offer(&in_flight, test_fresh_offer(data.clone(), 0), source),
+                    FreshOfferAdmission::Joined
+                ),
+                "sender {i} is within the legitimate close-group fan-out"
+            );
+        }
+
+        let surplus = test_peer(0xEE);
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(data, 0), surplus),
+                FreshOfferAdmission::Full
+            ),
+            "past the cap a proof is surplus: enough are already queued to place the record"
+        );
+    }
+
+    #[test]
+    fn verification_receiver_accepts_a_full_cycle_and_rejects_more() {
+        assert!(!verification_request_exceeds_limit(
+            config::MAX_VERIFICATION_KEYS_PER_CYCLE
+        ));
+        assert!(verification_request_exceeds_limit(
+            config::MAX_VERIFICATION_KEYS_PER_CYCLE + 1
+        ));
     }
 
     // The heavy round-1 limiter enforces the per-peer rate cooldown
@@ -7305,6 +10006,68 @@ mod tests {
         k
     }
 
+    #[test]
+    fn bad_hint_penalty_rejects_or_directly_contradicts_sole_replica_source() {
+        let source = test_peer(0x91);
+        let corroborator = test_peer(0x92);
+        let mut evidence = types::KeyVerificationEvidence {
+            presence: HashMap::from([(source, PresenceEvidence::Absent)]),
+            paid_list: HashMap::new(),
+        };
+        let failed = KeyVerificationOutcome::QuorumFailed;
+
+        assert_eq!(
+            punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
+            Some(source)
+        );
+        assert_eq!(
+            punishable_singleton_replica_hint_source(
+                &HashSet::from([source, corroborator]),
+                &failed,
+                &evidence,
+            ),
+            None,
+            "corroborated hints must not use the sole-source penalty lane"
+        );
+        assert_eq!(
+            punishable_singleton_replica_hint_source(&HashSet::new(), &failed, &evidence),
+            None,
+            "paid-list advertisements do not claim possession, so they leave the \
+             replica-hint source set empty and cannot be penalized"
+        );
+
+        evidence
+            .presence
+            .insert(source, PresenceEvidence::Unresolved);
+        assert_eq!(
+            punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
+            Some(source),
+            "definitive close-group rejection is punishable without direct contradiction"
+        );
+        assert_eq!(
+            punishable_singleton_replica_hint_source(
+                &HashSet::from([source]),
+                &KeyVerificationOutcome::QuorumInconclusive,
+                &evidence,
+            ),
+            None,
+            "timeouts and inconclusive evidence are neutral"
+        );
+
+        evidence.presence.insert(source, PresenceEvidence::Absent);
+        assert_eq!(
+            punishable_singleton_replica_hint_source(
+                &HashSet::from([source]),
+                &KeyVerificationOutcome::QuorumVerified {
+                    sources: vec![corroborator],
+                },
+                &evidence,
+            ),
+            Some(source),
+            "an explicit denial is punishable regardless of the overall outcome"
+        );
+    }
+
     /// Build a round-2 slice challenge matching an open session. `openings` is
     /// empty: these tests exercise admission and session handling only, which
     /// run before any block is opened.
@@ -7345,7 +10108,9 @@ mod tests {
         // Saturate this peer's share so the next admission must be refused.
         let mut hold = Vec::new();
         for _ in 0..MAX_AUDIT_RESPONSES_PER_PEER {
-            match admit_audit_responder(&semaphore, &inflight, &peer).await {
+            match admit_audit_responder(&semaphore, &inflight, &peer, AuditResponderClass::Byte)
+                .await
+            {
                 Ok(guard) => hold.push(guard),
                 Err(err) => panic!("unexpected admission failure below the cap: {err:?}"),
             }
@@ -7410,35 +10175,8 @@ mod tests {
         );
     }
 
-    // The rollout gate must grace exactly ONE thing — a timeout — and nothing
-    // else. A confirmed storage-integrity failure is still penalised while the
-    // gate is set, otherwise moving the possession lanes onto their own protocol
-    // id would have handed cheating peers an amnesty for the upgrade window.
-    //
-    // FOLLOW-UP: when `GRACE_POSSESSION_AUDIT_TIMEOUTS` is set to false and the
-    // gate deleted, the timeout expectation below flips to `true`. That is the
-    // intended end state, and this test is where the flip is reflected.
     #[test]
-    fn rollout_gate_graces_only_timeouts() {
-        for reason in [
-            AuditFailureReason::DigestMismatch,
-            AuditFailureReason::KeyAbsent,
-            AuditFailureReason::MalformedResponse,
-            AuditFailureReason::Rejected,
-        ] {
-            assert!(
-                audit_failure_reports_trust_penalty(&reason),
-                "{reason:?} is a confirmed failure and must be penalised even during rollout"
-            );
-        }
-        assert_eq!(
-            audit_failure_reports_trust_penalty(&AuditFailureReason::Timeout),
-            !config::GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "a timeout is penalised exactly when the rollout gate is off"
-        );
-
-        // Holder credit is a separate axis that was already timeout-safe; the
-        // gate must not have disturbed it.
+    fn holder_credit_revocation_distinguishes_timeout_from_confirmed_failure() {
         assert!(!audit_failure_revokes_holder_credit(
             &AuditFailureReason::Timeout
         ));
@@ -7455,16 +10193,20 @@ mod tests {
 
         let mut guards = Vec::new();
         for _ in 0..MAX_AUDIT_RESPONSES_PER_PEER {
-            match admit_audit_responder(&semaphore, &inflight, &peer).await {
+            match admit_audit_responder(&semaphore, &inflight, &peer, AuditResponderClass::Subtree)
+                .await
+            {
                 Ok(guard) => guards.push(guard),
                 Err(err) => panic!("unexpected admission failure before peer cap: {err:?}"),
             }
         }
 
-        let Err(err) = admit_audit_responder(&semaphore, &inflight, &peer).await else {
+        let Err(err) =
+            admit_audit_responder(&semaphore, &inflight, &peer, AuditResponderClass::Subtree).await
+        else {
             panic!("admission should fail once per-peer cap is full");
         };
-        assert_eq!(err.reason, AuditResponderRejectReason::PerPeerCapFull);
+        assert_eq!(err.reason, ResponderRejectReason::PerPeerCapFull);
         assert_eq!(err.peer_inflight, MAX_AUDIT_RESPONSES_PER_PEER);
         assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
         assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
@@ -7487,16 +10229,564 @@ mod tests {
             );
         }
 
-        let Err(err) = admit_audit_responder(&semaphore, &inflight, &peer).await else {
+        let Err(err) =
+            admit_audit_responder(&semaphore, &inflight, &peer, AuditResponderClass::Subtree).await
+        else {
             panic!("admission should fail once global pool is full");
         };
-        assert_eq!(err.reason, AuditResponderRejectReason::GlobalPoolFull);
+        assert_eq!(err.reason, ResponderRejectReason::GlobalPoolFull);
         assert_eq!(err.global_inflight, MAX_CONCURRENT_AUDIT_RESPONSES);
         assert_eq!(err.global_limit, MAX_CONCURRENT_AUDIT_RESPONSES);
         assert_eq!(err.peer_inflight, 0);
         assert_eq!(err.peer_limit, MAX_AUDIT_RESPONSES_PER_PEER);
 
         drop(held_global_permits);
+    }
+
+    #[tokio::test]
+    async fn bounded_responder_guard_releases_global_and_peer_slots_on_drop() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA3);
+
+        let guard = admit_bounded_responder(&semaphore, &inflight, &peer, 1, 1)
+            .await
+            .expect("first responder should be admitted");
+        assert_eq!(semaphore.available_permits(), 0);
+        assert_eq!(inflight.read().await.get(&peer), Some(&1));
+
+        drop(guard);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(!inflight.read().await.contains_key(&peer));
+    }
+
+    #[tokio::test]
+    async fn cancelled_bounded_responder_wait_does_not_leak_a_peer_slot() {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let peer = test_peer(0xA4);
+        let held_map = inflight.write().await;
+
+        let waiting = admit_bounded_responder(&semaphore, &inflight, &peer, 1, 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), waiting)
+                .await
+                .is_err(),
+            "admission should still be waiting for the peer map"
+        );
+
+        drop(held_map);
+        assert_eq!(semaphore.available_permits(), 1);
+        assert!(!inflight.read().await.contains_key(&peer));
+    }
+
+    #[test]
+    fn responder_staleness_sheds_expired_requests_but_serves_fresh_ones() {
+        let timeout = Duration::from_secs(1);
+        let old_received_at = Instant::now()
+            .checked_sub(timeout)
+            .unwrap_or_else(Instant::now);
+
+        assert!(request_is_stale(old_received_at, timeout));
+        assert!(!request_is_stale(Instant::now(), timeout));
+    }
+
+    #[tokio::test]
+    async fn neighbor_sync_admission_serializes_each_peer_but_allows_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let first_peer = test_peer(0xB3);
+        let second_peer = test_peer(0xB4);
+
+        let first_guard = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &first_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await
+        .expect("first sync from a peer should be admitted");
+        let duplicate = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &first_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        let other_peer = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &second_peer,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING,
+            NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+
+        assert!(matches!(
+            duplicate,
+            Err(ResponderAdmissionFailure {
+                reason: ResponderRejectReason::PerPeerCapFull,
+                ..
+            })
+        ));
+        assert!(other_peer.is_ok());
+        drop(first_guard);
+        drop(other_peer);
+    }
+
+    /// One flooding peer must not be able to hold every fresh-offer slot.
+    ///
+    /// This is the eviction primitive the per-peer share closes: with only a
+    /// global bound, a single source occupies the pool, every honest offer in
+    /// that window is refused, and because a refusal reads as absence to the
+    /// sender's delayed possession check those refusals land as
+    /// audit-severity penalties on *this* node.
+    #[tokio::test]
+    async fn fresh_offer_admission_reserves_capacity_for_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(FRESH_OFFER_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let flooder = test_peer(0xC1);
+        let honest = test_peer(0xC2);
+
+        let mut held = Vec::new();
+        for _ in 0..FRESH_OFFER_MAX_OUTSTANDING_PER_PEER {
+            held.push(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    FRESH_OFFER_MAX_OUTSTANDING,
+                    FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await
+                .expect("offers within the per-peer share are admitted"),
+            );
+        }
+
+        let flooder_excess = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &flooder,
+            FRESH_OFFER_MAX_OUTSTANDING,
+            FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        assert!(
+            matches!(
+                flooder_excess,
+                Err(ResponderAdmissionFailure {
+                    reason: ResponderRejectReason::PerPeerCapFull,
+                    ..
+                })
+            ),
+            "one source must not exceed its fresh-offer share"
+        );
+
+        let honest_offer = admit_bounded_responder(
+            &semaphore,
+            &inflight,
+            &honest,
+            FRESH_OFFER_MAX_OUTSTANDING,
+            FRESH_OFFER_MAX_OUTSTANDING_PER_PEER,
+        )
+        .await;
+        assert!(
+            honest_offer.is_ok(),
+            "an honest sender must still be admitted while another peer floods"
+        );
+
+        assert!(
+            usize::try_from(FRESH_OFFER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX)
+                < FRESH_OFFER_MAX_OUTSTANDING,
+            "the per-peer share must leave room for other sources"
+        );
+
+        drop(held);
+        drop(honest_offer);
+    }
+
+    /// Paid notifies get the same per-source treatment as every other class.
+    #[tokio::test]
+    async fn paid_notify_admission_reserves_capacity_for_other_peers() {
+        let semaphore = Arc::new(Semaphore::new(PAID_NOTIFY_MAX_OUTSTANDING));
+        let inflight = Arc::new(RwLock::new(HashMap::new()));
+        let flooder = test_peer(0xC3);
+        let honest = test_peer(0xC4);
+
+        let mut held = Vec::new();
+        for _ in 0..PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER {
+            held.push(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    PAID_NOTIFY_MAX_OUTSTANDING,
+                    PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await
+                .expect("notifies within the per-peer share are admitted"),
+            );
+        }
+
+        assert!(
+            matches!(
+                admit_bounded_responder(
+                    &semaphore,
+                    &inflight,
+                    &flooder,
+                    PAID_NOTIFY_MAX_OUTSTANDING,
+                    PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+                )
+                .await,
+                Err(ResponderAdmissionFailure {
+                    reason: ResponderRejectReason::PerPeerCapFull,
+                    ..
+                })
+            ),
+            "one source must not exceed its paid-notify share"
+        );
+        assert!(
+            admit_bounded_responder(
+                &semaphore,
+                &inflight,
+                &honest,
+                PAID_NOTIFY_MAX_OUTSTANDING,
+                PAID_NOTIFY_MAX_OUTSTANDING_PER_PEER,
+            )
+            .await
+            .is_ok(),
+            "an honest sender must still be admitted while another peer floods"
+        );
+
+        drop(held);
+    }
+
+    /// The fresh-offer per-source bound must guarantee headroom for a peer
+    /// holding nothing, without throttling a single legitimate fan-out.
+    ///
+    /// Sized as a quota rather than a reserve, this bound refused offers during
+    /// an ordinary upload (see `tests/e2e/fresh_offer_capacity.rs`), and every
+    /// refusal is charged to THIS node at audit severity because the sender
+    /// never reads it.
+    #[test]
+    fn fresh_offer_share_reserves_headroom_without_throttling_one_sender() {
+        let share = usize::try_from(FRESH_OFFER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX);
+
+        assert_eq!(
+            FRESH_OFFER_MAX_OUTSTANDING - share,
+            FRESH_OFFER_RESERVED_FOR_OTHER_SOURCES,
+            "a source holding none must always find a free slot"
+        );
+        assert!(
+            share < FRESH_OFFER_MAX_OUTSTANDING,
+            "one peer must not be able to take the whole pool"
+        );
+        // The failure this pins: a share sized like the request/response
+        // classes (fetch 2, verification 1, neighbor sync 1) binds on ordinary
+        // one-way bulk traffic.
+        assert!(
+            share > usize::try_from(FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER).unwrap_or(usize::MAX),
+            "fresh offers are one-way bulk, not request/response — their share \
+             must not be sized like the request classes'"
+        );
+    }
+
+    /// A malformed offer must be refused before it can occupy an admission
+    /// slot, so junk cannot hold capacity for the length of a verification.
+    #[test]
+    fn structurally_invalid_fresh_offers_are_rejected_before_admission() {
+        let key = test_key(0xC5);
+
+        let valid_proof = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES];
+
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &[])
+            .expect("an offer with no proof must be refused");
+        assert!(
+            rejection.penalise,
+            "an honest sender always attaches a proof"
+        );
+
+        // A proof is retained per queued sender, so its size has to be bounded
+        // here rather than at the verifier, which only sees it on a worker.
+        let undersized = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES - 1];
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &undersized)
+            .expect("an undersized proof must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an undersized proof"
+        );
+        let oversized_proof = vec![1u8; MAX_PAYMENT_PROOF_SIZE_BYTES + 1];
+        let rejection = fresh_offer_structural_rejection(&key, &[0u8; 1], &oversized_proof)
+            .expect("an oversized proof must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an oversized proof"
+        );
+
+        let rejection = fresh_offer_structural_rejection(
+            &key,
+            &vec![0u8; crate::ant_protocol::MAX_CHUNK_SIZE + 1],
+            &valid_proof,
+        )
+        .expect("an oversized offer must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender constructs an oversized offer"
+        );
+
+        let data = vec![0u8; 1];
+        assert!(
+            fresh_offer_structural_rejection(
+                &crate::client::compute_address(&data),
+                &data,
+                &valid_proof
+            )
+            .is_none(),
+            "a well-formed offer must reach admission"
+        );
+    }
+
+    /// Knowing a key must not be enough to enter its entry.
+    ///
+    /// Opening an entry on an unverified key/bytes association would let a peer
+    /// that has only *learned* the key — every recipient of its `PaidNotify`,
+    /// not just the close group that gets the chunk — seize it with junk.
+    /// Joining one would be worse: the handler tries each queued proof against
+    /// the *opener's* bytes, so an unchecked joiner could have its proof spent
+    /// on bytes it never offered.
+    #[test]
+    fn a_fresh_offer_cannot_enter_an_entry_for_bytes_it_lacks() {
+        let genuine_data = vec![0x5Au8; 128];
+        let key = crate::client::compute_address(&genuine_data);
+        let valid_proof = vec![1u8; MIN_PAYMENT_PROOF_SIZE_BYTES];
+
+        let rejection = fresh_offer_structural_rejection(&key, &[0xFFu8; 1], &valid_proof)
+            .expect("bytes that do not hash to the advertised key must be refused");
+        assert!(
+            rejection.penalise,
+            "no honest sender offers bytes that do not hash to the advertised key"
+        );
+
+        // Dispatch reaches the entry only past that rejection, so the forged
+        // offer never touched the key and the genuine one still opens it.
+        assert!(
+            fresh_offer_structural_rejection(&key, &genuine_data, &valid_proof).is_none(),
+            "the offer that actually carries the key's bytes must reach the entry"
+        );
+
+        let in_flight: FreshOfferInFlight = Arc::new(Mutex::new(HashMap::new()));
+        assert!(
+            matches!(
+                admit_test_offer(&in_flight, test_fresh_offer(genuine_data, 1), test_peer(1)),
+                FreshOfferAdmission::Opened(_)
+            ),
+            "an offer refused on payload shape must leave the key openable"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_removed_clears_capacity_rejection_and_completes_bootstrap() {
+        let peer = test_peer(0xA5);
+        let key = test_key(0xA5);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
+        let is_bootstrapping = Arc::new(RwLock::new(true));
+        let bootstrap_complete_notify = Arc::new(Notify::new());
+
+        let now = Instant::now();
+        queues.write().await.add_pending_verify(
+            key,
+            VerificationEntry {
+                state: VerificationState::PendingVerify,
+                verified_sources: Vec::new(),
+                tried_sources: HashSet::new(),
+                created_at: now,
+                next_verify_at: now,
+                hint_sources: HashSet::from([peer]),
+                replica_hint_sources: HashSet::from([peer]),
+            },
+        );
+        super::bootstrap::track_discovered_keys(&bootstrap_state, &HashSet::from([key])).await;
+        super::bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
+        {
+            let q = queues.read().await;
+            assert!(
+                !super::bootstrap::check_bootstrap_drained(&bootstrap_state, &q).await,
+                "capacity rejection should initially block bootstrap drain"
+            );
+        }
+
+        update_bootstrap_after_peer_removed(
+            &peer,
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+        )
+        .await;
+
+        let state = bootstrap_state.read().await;
+        assert!(state.capacity_rejected_sources.is_empty());
+        assert!(state.pending_keys.is_empty());
+        assert!(state.is_drained());
+        drop(state);
+        assert!(!*is_bootstrapping.read().await);
+    }
+
+    /// A fairness displacement forfeits the key but must not stamp its former
+    /// owner: the owner did nothing wrong, and stamping it lets a flooding
+    /// source block bootstrap drain through an unrelated honest peer.
+    #[tokio::test]
+    async fn fairness_displacement_does_not_stamp_its_victim() {
+        let displaced_owner = test_peer(0xB1);
+        let incoming_source = test_peer(0xB2);
+        let displaced_key = test_key(0xB1);
+        let admitted_key = test_key(0xB2);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        {
+            let mut state = bootstrap_state.write().await;
+            state.pending_keys.insert(displaced_key);
+            state
+                .capacity_rejected_sources
+                .insert(incoming_source, Instant::now());
+        }
+        let outcomes = [(
+            incoming_source,
+            AdmissionOutcome {
+                discovered: HashSet::from([admitted_key]),
+                capacity_rejected_count: 0,
+                displaced: vec![CapacityDisplacement {
+                    key: displaced_key,
+                    owner: displaced_owner,
+                }],
+            },
+        )];
+
+        publish_bootstrap_admission_outcomes(
+            &bootstrap_state,
+            &outcomes,
+            &HashSet::from([admitted_key]),
+        )
+        .await;
+
+        let state = bootstrap_state.read().await;
+        assert!(!state.pending_keys.contains(&displaced_key));
+        assert!(state.pending_keys.contains(&admitted_key));
+        assert!(
+            !state
+                .capacity_rejected_sources
+                .contains_key(&displaced_owner),
+            "the displaced owner must not be charged for our own fairness reclaim"
+        );
+        assert!(!state
+            .capacity_rejected_sources
+            .contains_key(&incoming_source));
+    }
+
+    /// A source that keeps overflowing us must not keep its own record fresh.
+    ///
+    /// This is the wedge the first-seen stamp closes: with refresh-on-every-
+    /// rejection the debt could never age out, so `check_bootstrap_drained`
+    /// stayed false forever and auditing never started (Invariant 19).
+    #[tokio::test]
+    async fn repeat_capacity_rejection_keeps_the_first_seen_stamp() {
+        const REJECTION_ROUNDS: usize = 5;
+
+        let source = test_peer(0xB3);
+        let key = test_key(0xB3);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+
+        let first_seen = {
+            let outcomes = [(
+                source,
+                AdmissionOutcome {
+                    discovered: HashSet::new(),
+                    capacity_rejected_count: 1,
+                    displaced: Vec::new(),
+                },
+            )];
+            publish_bootstrap_admission_outcomes(&bootstrap_state, &outcomes, &HashSet::new())
+                .await;
+            bootstrap_state
+                .read()
+                .await
+                .capacity_rejected_sources
+                .get(&source)
+                .copied()
+                .expect("first rejection recorded")
+        };
+
+        for _ in 0..REJECTION_ROUNDS {
+            let outcomes = [(
+                source,
+                AdmissionOutcome {
+                    discovered: HashSet::from([key]),
+                    capacity_rejected_count: 1,
+                    displaced: Vec::new(),
+                },
+            )];
+            publish_bootstrap_admission_outcomes(
+                &bootstrap_state,
+                &outcomes,
+                &HashSet::from([key]),
+            )
+            .await;
+        }
+
+        let recorded = bootstrap_state
+            .read()
+            .await
+            .capacity_rejected_sources
+            .get(&source)
+            .copied()
+            .expect("debt still outstanding");
+        assert_eq!(
+            recorded, first_seen,
+            "repeat rejections must not restart the expiry clock"
+        );
+    }
+
+    /// The verification-worker tick's self-heal path: a capacity rejection
+    /// recorded after the peer's `PeerRemoved` cleanup (the TOCTOU orphan)
+    /// blocks drain until the TTL expires it, at which point the same tick
+    /// completes bootstrap without any external event.
+    #[tokio::test]
+    async fn drain_self_heal_expires_orphaned_rejection_and_completes_bootstrap() {
+        let peer = test_peer(0xA6);
+        let bootstrap_state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = Arc::new(RwLock::new(ReplicationQueues::new()));
+        let is_bootstrapping = Arc::new(RwLock::new(true));
+        let bootstrap_complete_notify = Arc::new(Notify::new());
+
+        // PeerRemoved was fully processed before the rejection landed, so no
+        // future event will ever clear this entry.
+        super::bootstrap::note_capacity_rejected(&bootstrap_state, peer).await;
+
+        // Within the TTL the tick keeps waiting for re-delivery.
+        expire_and_recheck_bootstrap_drain(
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+            ReplicationConfig::default().capacity_rejected_max_age(),
+        )
+        .await;
+        assert!(!bootstrap_state.read().await.is_drained());
+        assert!(*is_bootstrapping.read().await);
+
+        // Past the TTL the tick expires the orphan and completes bootstrap.
+        expire_and_recheck_bootstrap_drain(
+            &bootstrap_state,
+            &queues,
+            &is_bootstrapping,
+            &bootstrap_complete_notify,
+            Duration::ZERO,
+        )
+        .await;
+        assert!(bootstrap_state.read().await.is_drained());
+        assert!(!*is_bootstrapping.read().await);
     }
 
     #[test]
@@ -7514,6 +10804,7 @@ mod tests {
                 summary: crate::replication::types::AuditFailureSummary::default(),
                 reason: AuditFailureReason::Timeout,
             },
+            no_response_class: Some("timeout"),
         };
 
         assert_eq!(
@@ -8848,9 +12139,171 @@ mod tests {
         ));
         // Older than the window -> skipped (pin may have aged out).
         assert!(!quote_within_audit_window(
-            now - GOSSIP_ANSWERABILITY_TTL,
+            now - commitment_state::GOSSIP_ANSWERABILITY_TTL,
             now
         ));
+    }
+
+    #[tokio::test]
+    async fn replication_branch_lagged_events_are_counted() {
+        let before = audit_metrics::replication_event_lagged_total();
+        let flow = handle_replication_event_recv_error(
+            &tokio::sync::broadcast::error::RecvError::Lagged(3),
+        );
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+        let after = audit_metrics::replication_event_lagged_total();
+        assert_eq!(after.saturating_sub(before), 3);
+    }
+
+    #[tokio::test]
+    async fn replication_branch_closed_events_stop_the_loop() {
+        let flow =
+            handle_replication_event_recv_error(&tokio::sync::broadcast::error::RecvError::Closed);
+        assert_eq!(flow, std::ops::ControlFlow::Break(()));
+    }
+
+    #[tokio::test]
+    async fn full_serial_queue_drops_instead_of_running_the_message_inline() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let dropped_body =
+            ReplicationMessageBody::VerificationRequest(protocol::VerificationRequest {
+                keys: Vec::new(),
+                paid_list_check_indices: Vec::new(),
+            });
+        let overflow_before = audit_metrics::serial_queue_overflow_drops_total(&dropped_body);
+        let first = InboundReplicationMessage {
+            source: test_peer(0xC1),
+            msg: ReplicationMessage {
+                request_id: 1,
+                body: ReplicationMessageBody::FetchRequest(protocol::FetchRequest {
+                    key: test_key(1),
+                }),
+            },
+            rr_message_id: None,
+            received_at: Instant::now(),
+        };
+        let second = InboundReplicationMessage {
+            source: test_peer(0xC2),
+            msg: ReplicationMessage {
+                request_id: 2,
+                body: dropped_body.clone(),
+            },
+            rr_message_id: None,
+            received_at: Instant::now(),
+        };
+
+        assert!(try_enqueue_serial_message(&sender, first).is_ok());
+        let dropped = try_enqueue_serial_message(&sender, second)
+            .expect_err("a full serial queue must refuse the second message");
+        assert_eq!(dropped.reason, SerialQueueDropReason::Full);
+        assert_eq!(dropped.message_class, "verification_request");
+        assert_eq!(dropped.queue_depth, 1);
+        let overflow_after = audit_metrics::serial_queue_overflow_drops_total(&dropped_body);
+        assert_eq!(overflow_after.saturating_sub(overflow_before), 1);
+
+        let queued = receiver
+            .recv()
+            .await
+            .expect("first message should remain queued");
+        assert_eq!(queued.msg.request_id, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn digest_admission_gets_higher_per_peer_cap_subtree_stays_at_two() {
+        let peer = test_peer(0x44);
+        let semaphore = Arc::new(Semaphore::new(config::MAX_CONCURRENT_AUDIT_RESPONSES));
+
+        let digest_inflight = Arc::new(RwLock::new(HashMap::new()));
+        let mut digest_guards = Vec::new();
+        for _ in 0..config::MAX_DIGEST_AUDIT_RESPONSES_PER_PEER {
+            let guard = admit_audit_responder(
+                &semaphore,
+                &digest_inflight,
+                &peer,
+                AuditResponderClass::Digest,
+            )
+            .await;
+            assert!(guard.is_ok());
+            digest_guards.push(guard);
+        }
+        assert!(
+            admit_audit_responder(
+                &semaphore,
+                &digest_inflight,
+                &peer,
+                AuditResponderClass::Digest,
+            )
+            .await
+            .is_err(),
+            "digest class must stop at its documented per-source cap"
+        );
+        drop(digest_guards);
+
+        let subtree_inflight = Arc::new(RwLock::new(HashMap::new()));
+        let mut subtree_guards = Vec::new();
+        for _ in 0..config::MAX_AUDIT_RESPONSES_PER_PEER {
+            let guard = admit_audit_responder(
+                &semaphore,
+                &subtree_inflight,
+                &peer,
+                AuditResponderClass::Subtree,
+            )
+            .await;
+            assert!(guard.is_ok());
+            subtree_guards.push(guard);
+        }
+        assert!(
+            admit_audit_responder(
+                &semaphore,
+                &subtree_inflight,
+                &peer,
+                AuditResponderClass::Subtree,
+            )
+            .await
+            .is_err(),
+            "subtree class must retain the deployed cap of two"
+        );
+        drop(subtree_guards);
+    }
+
+    #[test]
+    fn in_scope_audit_deadlines_share_one_formula() {
+        let config = config::ReplicationConfig::default();
+        for key_count in [1, 4, 16] {
+            assert_eq!(
+                audit::responsible_audit_response_timeout(&config, key_count),
+                config.audit_response_timeout(key_count)
+            );
+            assert_eq!(
+                pruning::prune_audit_response_timeout(&config, key_count),
+                config.audit_response_timeout(key_count)
+            );
+        }
+        assert_eq!(
+            possession::possession_probe_response_timeout(&config),
+            config.audit_response_timeout(1)
+        );
+    }
+
+    #[test]
+    fn replica_hint_sources_are_added_as_fallback_fetch_sources() {
+        const EXISTING_SOURCE_ID: u8 = 1;
+        const HINT_SENDER_ID: u8 = 2;
+
+        let existing_source = test_peer(EXISTING_SOURCE_ID);
+        let hint_sender = test_peer(HINT_SENDER_ID);
+        let mut sources = vec![existing_source];
+
+        let hint_sources = HashSet::from([hint_sender]);
+        add_replica_hint_sources(&mut sources, &hint_sources);
+        add_replica_hint_sources(&mut sources, &hint_sources);
+
+        // A paid-only advertiser leaves the claim set empty (see
+        // `queue_admitted_hints`), so it contributes no fetch source.
+        add_replica_hint_sources(&mut sources, &HashSet::new());
+
+        assert_eq!(sources, vec![existing_source, hint_sender]);
     }
 
     #[test]
@@ -9167,5 +12620,145 @@ mod tests {
             first_failed_key_label(&[first, second]),
             format!("0x{}", hex::encode(&first[..8]))
         );
+    }
+
+    // -- apply_fetch_result --------------------------------------------------
+    //
+    // The worker's disposition of a fetch outcome. Note there is no trust
+    // handle in `apply_fetch_result`'s signature: the worker cannot report a
+    // trust event for ANY outcome, and `execute_single_fetch` returns
+    // `NoLongerResponsible` before its trust-reporting paths — the source did
+    // nothing wrong when this node's own responsibility lapsed.
+
+    /// Route `key` through the real pipeline stages (pending → promoted →
+    /// dequeued → in-flight) so it carries a verification retry-slot
+    /// reservation, exactly as a worker-dequeued key does. Returns the
+    /// in-flight source.
+    fn drive_key_in_flight(
+        q: &mut ReplicationQueues,
+        key: XorName,
+        sources: Vec<PeerId>,
+    ) -> PeerId {
+        let hinter = sources.first().copied().unwrap_or_else(|| test_peer(0x01));
+        let now = Instant::now();
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: now,
+            next_verify_at: now,
+            hint_sources: HashSet::from([hinter]),
+            replica_hint_sources: HashSet::from([hinter]),
+        };
+        assert!(q.add_pending_verify(key, entry).admitted());
+        assert!(q.promote_pending_to_fetch(key, key, sources));
+        let candidate = q.dequeue_fetch().expect("promoted key must dequeue");
+        let source = *candidate.sources.first().expect("candidate has a source");
+        q.start_dequeued_fetch(candidate, source);
+        source
+    }
+
+    #[test]
+    fn no_longer_responsible_is_terminal_and_releases_the_retry_slot() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xAB);
+        drive_key_in_flight(&mut q, key, vec![test_peer(0x01), test_peer(0x02)]);
+        assert_eq!(q.retry_reserved_slot_count(), 1);
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::NoLongerResponsible, RETRY_AFTER);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::Terminal,
+            "lapsed responsibility must run the caller's terminal bootstrap accounting"
+        );
+        assert!(
+            !q.contains_key(&key),
+            "the key must leave every pipeline stage — alternate sources included"
+        );
+        assert_eq!(
+            q.pending_count(),
+            0,
+            "a lapsed-responsibility key must not be requeued for verification"
+        );
+        assert_eq!(
+            q.retry_reserved_slot_count(),
+            0,
+            "terminal exit must release the verification retry-slot reservation"
+        );
+    }
+
+    #[test]
+    fn no_longer_responsible_shares_the_stored_terminal_path() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        // Both variants must walk the identical terminal gate so the
+        // battle-tested Stored accounting (retry-slot release + bootstrap
+        // pending-set shrink in the caller) covers lapsed responsibility too.
+        for result in [FetchResult::Stored, FetchResult::NoLongerResponsible] {
+            let mut q = ReplicationQueues::new();
+            let key = test_key(0xCD);
+            drive_key_in_flight(&mut q, key, vec![test_peer(0x03)]);
+
+            let follow_up = apply_fetch_result(&mut q, &key, &result, RETRY_AFTER);
+
+            assert_eq!(follow_up, FetchFollowUp::Terminal);
+            assert!(!q.contains_key(&key));
+            assert_eq!(q.retry_reserved_slot_count(), 0);
+        }
+    }
+
+    #[test]
+    fn source_failure_walks_alternate_sources_then_requeues_for_verification() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0xEF);
+        let first = test_peer(0x04);
+        let second = test_peer(0x05);
+        drive_key_in_flight(&mut q, key, vec![first, second]);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RetryFrom(second),
+            "a failed source must not abandon the remaining verified sources"
+        );
+        assert_eq!(q.in_flight_count(), 1, "retry keeps the key in flight");
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RequeuedForVerification,
+            "exhausted sources must restore the reserved verification entry"
+        );
+        assert_eq!(q.pending_count(), 1);
+        assert_eq!(
+            q.retry_reserved_slot_count(),
+            0,
+            "the reservation converts back into the pending entry itself"
+        );
+    }
+
+    #[test]
+    fn source_failure_without_retry_metadata_is_terminal() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        // Direct enqueue (no pending entry) models a fetch with no
+        // verification retry reservation to restore.
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x1F);
+        let source = test_peer(0x06);
+        assert!(q.enqueue_fetch(key, key, vec![source]));
+        let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
+        q.start_dequeued_fetch(candidate, source);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::SourceFailed, RETRY_AFTER);
+
+        assert_eq!(follow_up, FetchFollowUp::Terminal);
+        assert!(!q.contains_key(&key));
     }
 }

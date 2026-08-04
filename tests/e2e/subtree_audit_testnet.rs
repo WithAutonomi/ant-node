@@ -266,6 +266,11 @@ async fn first_audit_drainer_launches_and_passes_remote_monetized_pin() {
         .as_ref()
         .expect("b engine");
 
+    // The harness also runs live commitment gossip, whose probabilistic audit
+    // shares the first-audit cooldown. Isolate this assertion from a gossip
+    // launch that may have won that cooldown during setup.
+    b_engine.isolate_first_audit_for_test(&a_peer).await;
+
     b_engine
         .monetized_pin_sender()
         .try_send(MonetizedPinEvent {

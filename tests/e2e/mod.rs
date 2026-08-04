@@ -67,7 +67,16 @@ mod security_attacks;
 mod subtree_audit_testnet;
 
 #[cfg(test)]
+mod fetch_responsibility_recheck;
+
+#[cfg(test)]
 mod first_audit_ab;
+
+#[cfg(test)]
+mod fresh_offer_capacity;
+
+#[cfg(test)]
+mod verify_storage_gate;
 
 pub use anvil::TestAnvil;
 pub use harness::TestHarness;

@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::logging::{debug, info, warn};
 use tokio::sync::RwLock;
@@ -122,12 +122,14 @@ pub async fn check_bootstrap_drained(
         return false;
     }
 
-    // Hints capacity-rejected at the pending_verify bounds during bootstrap
-    // must be re-delivered by the originating source before drain can be
-    // claimed; otherwise we'd silently mark ourselves complete with
-    // outstanding work the source still owes us.
-    // The set retires per-source as each source's next admission cycle
-    // completes with zero rejections — see `clear_capacity_rejected`.
+    // Hints rejected at capacity, or displaced when another sender reclaims a
+    // borrowed slot, must be re-delivered by the originating source before
+    // drain can be claimed; otherwise we'd silently mark ourselves complete
+    // with outstanding work the source still owes us.
+    // Entries retire per-source as each source's next admission cycle
+    // completes with zero rejections — see `clear_capacity_rejected` — or
+    // expire once the source has been silent past the re-delivery TTL — see
+    // `expire_capacity_rejected`.
     if !state.capacity_rejected_sources.is_empty() {
         let n = state.capacity_rejected_sources.len();
         debug!("Bootstrap NOT drained: {n} source(s) have outstanding capacity-rejected hints");
@@ -143,19 +145,23 @@ pub async fn check_bootstrap_drained(
     }
 }
 
-/// Record that `source` had one or more hints capacity-rejected this cycle.
+/// Record that `source` had one or more hints rejected at capacity this cycle.
 ///
-/// Idempotent: tracks a set of sources, not a counter. Bootstrap cannot
-/// drain while this source is in the set; cleared by
-/// [`clear_capacity_rejected`] when the same source's next admission cycle
-/// completes with zero rejections (i.e. the source successfully
-/// re-delivered everything that previously overflowed).
+/// Tracks each source's **first** rejection time, not a counter and not the
+/// most recent time: a repeat rejection re-asserts the debt but does not
+/// restart the expiry clock (see
+/// [`BootstrapState::capacity_rejected_sources`]). Bootstrap cannot drain
+/// while this source has an entry; cleared by [`clear_capacity_rejected`] when
+/// the same source's next admission cycle completes with zero rejections (i.e.
+/// the source successfully re-delivered everything that previously
+/// overflowed), or expired by [`expire_capacity_rejected`] once the debt has
+/// stood past the re-delivery TTL.
 pub async fn note_capacity_rejected(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     source: saorsa_core::identity::PeerId,
 ) {
     let mut state = bootstrap_state.write().await;
-    if state.capacity_rejected_sources.insert(source) {
+    if state.note_capacity_rejected(source, Instant::now()) {
         let n = state.capacity_rejected_sources.len();
         debug!(
             "Bootstrap: source {source} now has outstanding capacity-rejected hints \
@@ -169,19 +175,54 @@ pub async fn note_capacity_rejected(
 /// Called whenever `source` completes an admission cycle with zero
 /// capacity rejections: the source successfully re-delivered any hints
 /// that previously overflowed, so its contribution to "bootstrap not
-/// drained" is retired. No-op if the source had no outstanding rejections.
+/// drained" is retired. Returns whether an outstanding entry was removed.
 pub async fn clear_capacity_rejected(
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
     source: &saorsa_core::identity::PeerId,
-) {
+) -> bool {
     let mut state = bootstrap_state.write().await;
-    if state.capacity_rejected_sources.remove(source) {
+    if state.capacity_rejected_sources.remove(source).is_some() {
         let n = state.capacity_rejected_sources.len();
         debug!(
             "Bootstrap: cleared outstanding capacity rejections for {source} \
              ({n} sources still outstanding)"
         );
+        true
+    } else {
+        false
     }
+}
+
+/// Expire capacity-rejection records whose most recent rejection is older
+/// than `max_age`, returning how many sources were expired.
+///
+/// A source that has not re-delivered within `max_age` has abandoned its
+/// owed re-hints — or departed in a race with its own `PeerRemoved` cleanup,
+/// leaving a record that no admission cycle or removal event can ever clear.
+/// Expiry forfeits the keys that source still owed so bootstrap can drain;
+/// the post-bootstrap neighbor-sync and audit/repair pipeline recover them
+/// (see `BootstrapState::capacity_rejected_sources`).
+pub async fn expire_capacity_rejected(
+    bootstrap_state: &Arc<RwLock<BootstrapState>>,
+    max_age: Duration,
+) -> usize {
+    let now = Instant::now();
+    let mut state = bootstrap_state.write().await;
+    let before = state.capacity_rejected_sources.len();
+    state
+        .capacity_rejected_sources
+        .retain(|source, rejected_at| {
+            let expired = now.duration_since(*rejected_at) >= max_age;
+            if expired {
+                warn!(
+                    "Bootstrap: expiring capacity-rejection record for {source} — the source \
+                 abandoned re-delivery (or departed mid-admission) and the hints it still \
+                 owed are forfeited"
+                );
+            }
+            !expired
+        });
+    before - state.capacity_rejected_sources.len()
 }
 
 /// Record a set of discovered keys into the bootstrap state for drain tracking.
@@ -223,18 +264,7 @@ pub async fn decrement_pending_requests(
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use tokio::sync::RwLock;
-
-    use std::time::Instant;
-
     use super::*;
-    use crate::replication::scheduling::ReplicationQueues;
-    use crate::replication::types::{
-        BootstrapState, HintPipeline, VerificationEntry, VerificationState,
-    };
 
     fn xor_name_from_byte(b: u8) -> XorName {
         [b; 32]
@@ -246,7 +276,7 @@ mod tests {
             drained: true,
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: std::collections::HashMap::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -262,7 +292,7 @@ mod tests {
             drained: false,
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: std::collections::HashMap::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -278,7 +308,7 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: std::collections::HashMap::new(),
         }));
         let queues = ReplicationQueues::new();
 
@@ -293,18 +323,22 @@ mod tests {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: std::collections::HashMap::new(),
         }));
         let mut queues = ReplicationQueues::new();
 
         // Put the bootstrap key into the pending-verify queue.
-        let entry = VerificationEntry {
-            state: VerificationState::PendingVerify,
-            pipeline: HintPipeline::Replica,
+        let now = Instant::now();
+        let entry = crate::replication::types::VerificationEntry {
+            state: crate::replication::types::VerificationState::PendingVerify,
             verified_sources: Vec::new(),
             tried_sources: HashSet::new(),
-            created_at: Instant::now(),
-            hint_sender: saorsa_core::identity::PeerId::from_bytes([0u8; 32]),
+            created_at: now,
+            next_verify_at: now,
+            hint_sources: HashSet::from([saorsa_core::identity::PeerId::from_bytes([0u8; 32])]),
+            replica_hint_sources: HashSet::from([saorsa_core::identity::PeerId::from_bytes(
+                [0u8; 32],
+            )]),
         };
         queues.add_pending_verify(xor_name_from_byte(0x01), entry);
 
@@ -405,5 +439,156 @@ mod tests {
 
         clear_capacity_rejected(&state, &source_b).await;
         assert!(check_bootstrap_drained(&state, &queues).await);
+    }
+
+    /// A source rejected within the TTL still blocks drain: expiry must not
+    /// forfeit re-delivery the source may legitimately still perform.
+    #[tokio::test]
+    async fn capacity_rejected_within_ttl_still_blocks_drain() {
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let source = saorsa_core::identity::PeerId::from_bytes([0xC1; 32]);
+
+        note_capacity_rejected(&state, source).await;
+        assert_eq!(
+            expire_capacity_rejected(&state, Duration::from_secs(3600)).await,
+            0,
+            "a fresh rejection must survive expiry with a generous max_age"
+        );
+        assert!(
+            !check_bootstrap_drained(&state, &queues).await,
+            "a within-TTL rejection must keep drain blocked"
+        );
+    }
+
+    /// The orphaned-entry escape hatch: once a source's rejection record
+    /// expires, drain is no longer blocked by it.
+    #[tokio::test]
+    async fn capacity_rejected_expiry_unblocks_drain() {
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let source = saorsa_core::identity::PeerId::from_bytes([0xC2; 32]);
+
+        note_capacity_rejected(&state, source).await;
+        assert!(!check_bootstrap_drained(&state, &queues).await);
+
+        assert_eq!(expire_capacity_rejected(&state, Duration::ZERO).await, 1);
+        assert!(
+            check_bootstrap_drained(&state, &queues).await,
+            "drain must complete once the abandoned rejection expires"
+        );
+    }
+
+    /// Expiry is per-source: dropping a stale source must not forfeit a
+    /// fresh source's owed re-delivery.
+    #[tokio::test]
+    async fn capacity_rejected_expiry_is_per_source() {
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let stale_source = saorsa_core::identity::PeerId::from_bytes([0xC3; 32]);
+        let fresh_source = saorsa_core::identity::PeerId::from_bytes([0xC4; 32]);
+        let max_age = Duration::from_secs(60);
+        let stale_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
+
+        state
+            .write()
+            .await
+            .capacity_rejected_sources
+            .insert(stale_source, stale_rejected_at);
+        note_capacity_rejected(&state, fresh_source).await;
+
+        assert_eq!(expire_capacity_rejected(&state, max_age).await, 1);
+        assert!(
+            state
+                .read()
+                .await
+                .capacity_rejected_sources
+                .contains_key(&fresh_source),
+            "the fresh source must survive another source's expiry"
+        );
+        assert!(
+            !check_bootstrap_drained(&state, &queues).await,
+            "the fresh source must still block drain"
+        );
+    }
+
+    /// A repeat rejection re-asserts the debt but must NOT restart the expiry
+    /// clock.
+    ///
+    /// Refreshing on every rejection is what wedged bootstrap open: a source
+    /// that keeps overflowing the queue keeps its own record permanently
+    /// fresh, `check_bootstrap_drained` never returns true, and auditing stays
+    /// off for the lifetime of the pressure (Invariant 19).
+    #[tokio::test]
+    async fn repeat_capacity_rejection_does_not_refresh_timestamp() {
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let source = saorsa_core::identity::PeerId::from_bytes([0xC5; 32]);
+        let max_age = Duration::from_secs(60);
+        let first_rejected_at = Instant::now().checked_sub(max_age * 2).unwrap();
+
+        state
+            .write()
+            .await
+            .capacity_rejected_sources
+            .insert(source, first_rejected_at);
+        note_capacity_rejected(&state, source).await;
+
+        let recorded_at = state
+            .read()
+            .await
+            .capacity_rejected_sources
+            .get(&source)
+            .copied()
+            .unwrap();
+        assert_eq!(
+            recorded_at, first_rejected_at,
+            "a repeat rejection must leave the first-seen time alone"
+        );
+        assert_eq!(
+            expire_capacity_rejected(&state, max_age).await,
+            1,
+            "an aged debt must still expire even though the source keeps \
+             re-overflowing the queue"
+        );
+    }
+
+    /// Sustained pressure cannot hold bootstrap open past the TTL.
+    ///
+    /// Drives the production accounting shape — repeated rejections arriving
+    /// faster than the TTL — and asserts the node still drains.
+    #[tokio::test]
+    async fn sustained_capacity_rejection_still_drains_after_ttl() {
+        const REJECTION_ROUNDS: usize = 8;
+
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        let queues = ReplicationQueues::new();
+        let source = saorsa_core::identity::PeerId::from_bytes([0xC6; 32]);
+        let max_age = Duration::from_secs(60);
+
+        for _ in 0..REJECTION_ROUNDS {
+            note_capacity_rejected(&state, source).await;
+            assert!(
+                !check_bootstrap_drained(&state, &queues).await,
+                "an outstanding debt must block drain while it is inside the TTL"
+            );
+        }
+
+        // Age the (unrefreshed) first-seen stamp past the TTL.
+        let aged = Instant::now().checked_sub(max_age * 2).unwrap();
+        state
+            .write()
+            .await
+            .capacity_rejected_sources
+            .insert(source, aged);
+
+        assert_eq!(
+            expire_capacity_rejected(&state, max_age).await,
+            1,
+            "the debt must expire once the FIRST rejection is older than the TTL"
+        );
+        assert!(
+            check_bootstrap_drained(&state, &queues).await,
+            "bootstrap must drain once the expired debt is forfeited"
+        );
     }
 }

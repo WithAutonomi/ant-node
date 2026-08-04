@@ -83,8 +83,6 @@ pub enum HintPipeline {
 pub struct VerificationEntry {
     /// Current state in the verification FSM.
     pub state: VerificationState,
-    /// Which pipeline admitted this key.
-    pub pipeline: HintPipeline,
     /// Peers that responded `Present` during verification (verified fetch
     /// sources).
     pub verified_sources: Vec<PeerId>,
@@ -92,38 +90,76 @@ pub struct VerificationEntry {
     pub tried_sources: HashSet<PeerId>,
     /// When this entry was created.
     pub created_at: Instant,
-    /// The peer that originally hinted this key (for source tracking).
-    pub hint_sender: PeerId,
+    /// Earliest time this key should be included in another verification
+    /// round.
+    pub next_verify_at: Instant,
+    /// Routing-table peers that advertised this key and have not subsequently
+    /// departed. Duplicate hints add to this set instead of being discarded.
+    pub hint_sources: HashSet<PeerId>,
+    /// Subset of [`Self::hint_sources`] that advertised a replica hint and
+    /// therefore claimed chunk possession. Paid-only advertisers are excluded.
+    pub replica_hint_sources: HashSet<PeerId>,
+}
+
+impl VerificationEntry {
+    /// Which pipeline this key arrived on.
+    ///
+    /// Derived from [`Self::replica_hint_sources`] rather than stored: the
+    /// pipeline *is* "did any peer claim to hold this key", so a stored copy
+    /// can only drift from its own definition as advertisers are merged in and
+    /// departed peers are pruned out.
+    ///
+    /// This describes hint *provenance*, not authorization. It selects fetch
+    /// sources (only a peer claiming possession is worth fetching from) and
+    /// scopes sole-source trust penalties. It must never gate storage:
+    /// possession claims come from the sender, so treating one as permission to
+    /// store lets a peer conscript a node that carries no responsibility for
+    /// the key. Storage responsibility is decided separately, against live
+    /// routing state, by `is_responsible(storage_admission_width)` at the point
+    /// of download.
+    #[must_use]
+    pub fn pipeline(&self) -> HintPipeline {
+        if self.replica_hint_sources.is_empty() {
+            HintPipeline::PaidOnly
+        } else {
+            HintPipeline::Replica
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Fetch queue candidate
+// Fetch queue
 // ---------------------------------------------------------------------------
 
-/// A candidate queued for fetch, ordered by relevance (nearest-first).
+/// Heap-ordering key for the fetch queue, ordered by relevance
+/// (nearest-first).
+///
+/// Carries **only** the two fields the ordering reads, and both are fixed for
+/// as long as a key stays queued. The mutable half of a queued fetch lives in
+/// [`FetchPayload`], outside the heap, so that merging a newly-discovered
+/// source into an already-queued key cannot disturb heap order — and therefore
+/// needs no heap rebuild.
 ///
 /// Implements [`Ord`] with *reversed* distance comparison so that a
 /// [`BinaryHeap`](std::collections::BinaryHeap) (max-heap) dequeues the
 /// nearest key first.
-#[derive(Debug, Clone)]
-pub struct FetchCandidate {
+#[derive(Debug, Clone, Copy)]
+pub struct FetchOrder {
     /// The key to fetch.
     pub key: XorName,
     /// XOR distance from self to key (for priority ordering).
     pub distance: XorName,
-    /// Verified source peers that responded `Present`.
-    pub sources: Vec<PeerId>,
 }
 
-impl Eq for FetchCandidate {}
+impl Eq for FetchOrder {}
 
-impl PartialEq for FetchCandidate {
+impl PartialEq for FetchOrder {
     fn eq(&self, other: &Self) -> bool {
         self.distance == other.distance && self.key == other.key
     }
 }
 
-impl Ord for FetchCandidate {
+impl Ord for FetchOrder {
     fn cmp(&self, other: &Self) -> Ordering {
         // Reverse ordering: smaller distance = higher priority (BinaryHeap is
         // max-heap).  Tie-break on key for consistency with PartialEq.
@@ -134,10 +170,40 @@ impl Ord for FetchCandidate {
     }
 }
 
-impl PartialOrd for FetchCandidate {
+impl PartialOrd for FetchOrder {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
+}
+
+/// The mutable half of a queued fetch, held outside the priority heap.
+///
+/// Neither field participates in [`FetchOrder`]'s ordering, and both are read
+/// only once the key is dequeued. Holding them in a key-indexed map is what
+/// lets a further source be merged into an already-queued key in O(1) instead
+/// of costing a full rebuild of the fetch heap.
+#[derive(Debug, Clone)]
+pub struct FetchPayload {
+    /// Verified source peers that responded `Present`.
+    pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
+}
+
+/// A candidate dequeued for fetch: a [`FetchOrder`] rejoined with its
+/// [`FetchPayload`].
+#[derive(Debug, Clone)]
+pub struct FetchCandidate {
+    /// The key to fetch.
+    pub key: XorName,
+    /// XOR distance from self to key.
+    pub distance: XorName,
+    /// Verified source peers that responded `Present`.
+    pub sources: Vec<PeerId>,
+    /// Pending-verification entry to restore if every fetch source is
+    /// exhausted before the chunk is recovered.
+    pub retry_verification: Option<VerificationEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -659,6 +725,17 @@ impl NeighborSyncState {
     pub fn is_cycle_complete(&self) -> bool {
         self.priority_order.is_empty() && self.cursor >= self.order.len()
     }
+
+    /// Whether topology-change (priority) peers are still queued.
+    ///
+    /// The neighbor-sync loop drains these back-to-back rather than parking on
+    /// the periodic tick, so a churn burst converges at round-trip speed. The
+    /// `sync_trigger` `Notify` coalesces multiple wakeups into one, so it cannot
+    /// be the sole signal for pending work — this queue is the source of truth.
+    #[must_use]
+    pub fn has_priority_peers(&self) -> bool {
+        !self.priority_order.is_empty()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -675,17 +752,47 @@ pub struct BootstrapState {
     /// Keys discovered during bootstrap that are still in the verification /
     /// fetch pipeline.
     pub pending_keys: HashSet<XorName>,
-    /// Peers whose last bootstrap admission cycle had one or more hints
-    /// silently dropped at the `pending_verify` capacity bounds. Each entry
-    /// represents "this source still owes us at least one re-hinted key
-    /// after the queues drain". `check_bootstrap_drained` refuses to claim
-    /// the node fully drained while this set is non-empty: a source's
-    /// presence is cleared by its next admission cycle that completes with
-    /// zero capacity rejections (i.e. the source successfully re-delivered
-    /// everything that previously overflowed). Tracking per-source instead
-    /// of a global counter prevents one peer's rejection from being
-    /// "cleared" by an unrelated peer's clean cycle.
-    pub capacity_rejected_sources: HashSet<PeerId>,
+    /// Peers whose bootstrap admission unit had one or more hints rejected at
+    /// capacity, mapped to the time of their **first** such rejection. Each
+    /// entry means "this source still owes us at least one re-hinted key after
+    /// the queues drain".
+    /// `check_bootstrap_drained` refuses to claim the node fully drained
+    /// while this map is non-empty: a source's presence is cleared by its
+    /// next admission cycle that completes with zero capacity rejections
+    /// (i.e. the source successfully re-delivered everything that
+    /// previously overflowed). Tracking per-source instead of a global
+    /// counter prevents one peer's rejection from being "cleared" by an
+    /// unrelated peer's clean cycle.
+    ///
+    /// The recorded time is **first-seen and never refreshed** (see
+    /// [`Self::note_capacity_rejected`]). A repeat rejection re-asserts that
+    /// the source still owes work, but it must not restart the expiry clock:
+    /// a source that keeps overflowing the queue would otherwise keep its own
+    /// record permanently fresh and wedge bootstrap open forever, which
+    /// disables auditing (Invariant 19) for the lifetime of the pressure.
+    /// First-seen semantics bound the wedge at
+    /// `ReplicationConfig::capacity_rejected_max_age` regardless of how a
+    /// source behaves.
+    ///
+    /// Entries expire once that first-rejection time is older than
+    /// `capacity_rejected_max_age` (see
+    /// `super::bootstrap::expire_capacity_rejected`): the source either
+    /// abandoned re-delivery, is overflowing us faster than it can re-deliver,
+    /// or its `PeerRemoved` cleanup raced the recording of the rejection and
+    /// left an entry no future event can clear. Expiring an entry means
+    /// bootstrap may drain without ever admitting keys that source
+    /// advertised. This is acceptable and consistent with
+    /// `update_bootstrap_after_peer_removed`, which already forfeits a
+    /// departed source's owed work wholesale — post-bootstrap periodic
+    /// neighbor sync and the audit/repair pipeline are the recovery path for
+    /// missed keys.
+    ///
+    /// Sources whose key was *displaced* by another sender reclaiming a
+    /// borrowed slot are deliberately NOT recorded here: fairness reclamation
+    /// is our decision, not a failure of theirs, and stamping the victim lets
+    /// a third party block our drain through an unrelated honest peer. The
+    /// displaced key is forfeited to the same post-bootstrap recovery path.
+    pub capacity_rejected_sources: HashMap<PeerId, Instant>,
 }
 
 impl BootstrapState {
@@ -696,8 +803,24 @@ impl BootstrapState {
             drained: false,
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
-            capacity_rejected_sources: HashSet::new(),
+            capacity_rejected_sources: HashMap::new(),
         }
+    }
+
+    /// Record that `source` had one or more hints rejected at capacity.
+    ///
+    /// First-seen semantics: a repeat rejection re-asserts the debt but leaves
+    /// the original timestamp alone, so the expiry clock in
+    /// `super::bootstrap::expire_capacity_rejected` measures how long the
+    /// source has owed us work rather than how recently it last overflowed us.
+    /// See [`Self::capacity_rejected_sources`] for why refreshing wedges
+    /// bootstrap open.
+    ///
+    /// Returns whether this was the source's first outstanding rejection.
+    pub fn note_capacity_rejected(&mut self, source: PeerId, now: Instant) -> bool {
+        let first = !self.capacity_rejected_sources.contains_key(&source);
+        self.capacity_rejected_sources.entry(source).or_insert(now);
+        first
     }
 
     /// Check if bootstrap is drained.
@@ -733,8 +856,6 @@ impl Default for BootstrapState {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BinaryHeap;
-
     use super::*;
 
     /// Helper: build a `PeerId` from a single byte (zero-padded to 32 bytes).
@@ -752,35 +873,33 @@ mod tests {
         (hinted_at, now)
     }
 
-    // -- FetchCandidate ordering -------------------------------------------
+    // -- FetchOrder ordering -----------------------------------------------
 
     #[test]
-    fn fetch_candidate_nearest_key_has_highest_priority() {
-        let near = FetchCandidate {
+    fn fetch_order_nearest_key_has_highest_priority() {
+        let near = FetchOrder {
             key: [1u8; 32],
             distance: [
                 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0,
             ],
-            sources: vec![peer_id_from_byte(1)],
         };
 
-        let far = FetchCandidate {
+        let far = FetchOrder {
             key: [2u8; 32],
             distance: [
                 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                 0, 0, 0, 0, 0,
             ],
-            sources: vec![peer_id_from_byte(2)],
         };
 
         // In a max-heap the "greatest" element pops first.
         // Our reversed Ord makes smaller-distance candidates greater.
         assert!(near > far, "nearer candidate should compare greater");
 
-        let mut heap = BinaryHeap::new();
-        heap.push(far.clone());
-        heap.push(near.clone());
+        let mut heap = std::collections::BinaryHeap::new();
+        heap.push(far);
+        heap.push(near);
 
         assert_eq!(heap.len(), 2, "heap should contain both candidates");
 
@@ -802,17 +921,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_candidate_same_distance_and_key_is_equal() {
-        let a = FetchCandidate {
+    fn fetch_order_same_distance_and_key_is_equal() {
+        let a = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
         };
 
-        let b = FetchCandidate {
+        let b = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
         };
 
         assert_eq!(
@@ -824,17 +941,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_candidate_same_distance_different_key_is_deterministic() {
-        let a = FetchCandidate {
+    fn fetch_order_same_distance_different_key_is_deterministic() {
+        let a = FetchOrder {
             key: [1u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
         };
 
-        let b = FetchCandidate {
+        let b = FetchOrder {
             key: [2u8; 32],
             distance: [5u8; 32],
-            sources: vec![],
         };
 
         assert_ne!(
@@ -1251,6 +1366,31 @@ mod tests {
 
         assert_eq!(state.queue_priority_peers([peer, peer]), 1);
         assert_eq!(state.priority_order.len(), 1);
+    }
+
+    #[test]
+    fn neighbor_sync_has_priority_peers_tracks_queue_and_drain() {
+        // The neighbor-sync loop drains the priority queue back-to-back and only
+        // parks once `has_priority_peers` reports false. Draining removes each
+        // queued peer (as `select_next_sync_peer` does via `remove_peer`), so the
+        // signal must flip to false once every entrant is consumed — this is the
+        // loop's termination guarantee.
+        let first = peer_id_from_byte(6);
+        let second = peer_id_from_byte(7);
+        let mut state = NeighborSyncState::new_cycle(Vec::new());
+        assert!(!state.has_priority_peers());
+
+        assert_eq!(state.queue_priority_peers([first, second]), 2);
+        assert!(state.has_priority_peers());
+
+        assert!(state.remove_peer(&first));
+        assert!(state.has_priority_peers(), "one entrant still pending");
+
+        assert!(state.remove_peer(&second));
+        assert!(
+            !state.has_priority_peers(),
+            "drained queue must let the loop park"
+        );
     }
 
     #[test]
