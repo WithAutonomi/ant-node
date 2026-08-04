@@ -49,10 +49,28 @@ impl ReplicationMessage {
         let bytes = postcard::to_stdvec(self)
             .map_err(|e| ReplicationProtocolError::SerializationFailed(e.to_string()))?;
 
-        if bytes.len() > MAX_REPLICATION_MESSAGE_SIZE {
+        // The same family ceiling the decoder applies, from the same table and
+        // with the same arms, including the unclassified case. Every receiver
+        // drops a subtree-audit body over that ceiling before decoding it, so
+        // encoding one and putting it on the wire produces a message nobody can
+        // read, and the responder is then scored for the resulting silence.
+        // Failing here turns that into a local, attributable error at the point
+        // the oversized body was built.
+        //
+        // Matching `decode` exactly also means a body added later without a
+        // family entry is measured against the same limit at both ends, so it
+        // cannot become traffic that encodes here and is dropped there. It fails
+        // loudly only if it exceeds the strict ceiling; a small unclassified body
+        // still encodes, which is fine, because the receiver applies the same
+        // ceiling and will accept it too. No legitimate body reaches the ceiling:
+        // the largest is a round-1 proof at the commitment
+        // key-count cap, pinned under it with headroom by
+        // `max_round1_proof_fits_the_audit_family_ceiling`.
+        let max_size = ceiling_for(family_of_variant(self.body.variant_index()));
+        if bytes.len() > max_size {
             return Err(ReplicationProtocolError::MessageTooLarge {
                 size: bytes.len(),
-                max_size: MAX_REPLICATION_MESSAGE_SIZE,
+                max_size,
             });
         }
 
@@ -85,10 +103,10 @@ impl ReplicationMessage {
         // A prefix too malformed to classify takes the strict ceiling too: it
         // cannot be a legitimate message of any family, so it is not one to
         // decode generously.
-        let max_size = match peek_variant_index(data).map(family_of_variant) {
-            Some(family) if !family.is_audit() => MAX_REPLICATION_MESSAGE_SIZE,
-            _ => MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
-        };
+        // `and_then`, not `map`: an index no variant declares classifies as
+        // nothing, and `ceiling_for` gives nothing the strict ceiling exactly
+        // like an unparseable prefix rather than the core allowance.
+        let max_size = ceiling_for(peek_variant_index(data).and_then(family_of_variant));
         if data.len() > max_size {
             return Err(ReplicationProtocolError::MessageTooLarge {
                 size: data.len(),
@@ -266,7 +284,7 @@ impl ReplicationMessageBody {
     /// [`REPLICATION_PROTOCOL_ID`]: crate::replication::config::REPLICATION_PROTOCOL_ID
     #[must_use]
     pub fn is_subtree_audit(&self) -> bool {
-        family_of_variant(self.variant_index()) == BodyFamily::SubtreeAudit
+        family_of_variant(self.variant_index()) == Some(BodyFamily::SubtreeAudit)
     }
 }
 
@@ -305,11 +323,38 @@ impl BodyFamily {
 ///
 /// Indices match [`ReplicationMessageBody::variant_index`], which is declaration
 /// order and postcard-stable.
+///
+/// `None` for an index that is not a variant of this enum. That is not the same
+/// as "core": an index nothing declares cannot be a legitimate message of any
+/// family, so callers selecting a wire ceiling must give it the strict audit one
+/// rather than the generous core allowance. Postcard rejects an unknown outer
+/// discriminant before decoding any trailing collection, so this is closing the
+/// invariant rather than a demonstrated hole — but the rule "failing to classify
+/// means do not decode generously" should hold everywhere, not just for a prefix
+/// too malformed to parse.
 #[must_use]
-pub(crate) fn family_of_variant(index: usize) -> BodyFamily {
+pub(crate) fn family_of_variant(index: usize) -> Option<BodyFamily> {
     match index {
-        11..=14 => BodyFamily::SubtreeAudit,
-        _ => BodyFamily::Core,
+        11..=14 => Some(BodyFamily::SubtreeAudit),
+        0..=10 | 15 | 16 => Some(BodyFamily::Core),
+        _ => None,
+    }
+}
+
+/// The wire ceiling a body of this family takes.
+///
+/// One definition for both directions: `encode` measures what it produced
+/// against it, `decode` measures what arrived before allocating anything. They
+/// were duplicated matches that had to be kept in step by hand, which is the
+/// kind of pair that silently drifts.
+///
+/// `None` — an index no declared variant uses — takes the STRICT ceiling.
+/// Failing to classify must never mean "decode generously".
+#[must_use]
+pub(crate) fn ceiling_for(family: Option<BodyFamily>) -> usize {
+    match family {
+        Some(family) if !family.is_audit() => MAX_REPLICATION_MESSAGE_SIZE,
+        _ => MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
     }
 }
 
@@ -1439,14 +1484,21 @@ mod tests {
                 },
             }),
         };
-        let encoded = msg
-            .encode()
-            .expect("worst-case round-1 proof must fit the wire cap");
+        // Measure without going through `encode`, which now enforces this very
+        // ceiling: encoding first would turn a regression into an opaque
+        // `MessageTooLarge` from the guard instead of the explicit, diagnosable
+        // assertion below.
+        let encoded = postcard::to_stdvec(&msg).expect("serialize");
         assert!(
             encoded.len() <= MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
             "worst legitimate round-1 proof is {} bytes, over the audit ceiling of \
              {MAX_SUBTREE_AUDIT_MESSAGE_SIZE}",
             encoded.len()
+        );
+        // And it must genuinely pass the guard, not merely fit the number.
+        assert!(
+            msg.encode().is_ok(),
+            "the worst legitimate round-1 proof must still be encodable"
         );
     }
 
@@ -1592,12 +1644,26 @@ mod tests {
                 })
                 .collect(),
         };
-        let encoded = ReplicationMessage {
+        // Serialised directly rather than through `encode`, which now refuses to
+        // emit an audit body over the audit ceiling. That guard protects honest
+        // senders; it says nothing about what arrives, since a hostile peer does
+        // not run our encoder. Building the bytes the way an attacker would is
+        // what keeps this a test of the RECEIVE path.
+        let encoded = postcard::to_stdvec(&ReplicationMessage {
             request_id: 1,
             body: ReplicationMessageBody::SubtreeSliceChallenge(challenge),
-        }
-        .encode()
-        .expect("encode");
+        })
+        .expect("serialize");
+        // Pin BOTH bounds. Going through `encode` used to imply the upper one;
+        // asserting it keeps the reproduction meaningful, since a body over the
+        // core ceiling would be refused by size alone and would no longer
+        // demonstrate that classification is what catches it.
+        assert!(
+            encoded.len() < crate::replication::config::MAX_REPLICATION_MESSAGE_SIZE,
+            "the reproduction must sit UNDER the core ceiling, or it proves \
+             nothing about family classification; got {} bytes",
+            encoded.len()
+        );
 
         assert!(
             encoded.len() > crate::replication::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
@@ -1605,7 +1671,7 @@ mod tests {
             encoded.len()
         );
         // The classification the receive path performs, before any decode.
-        let family = peek_variant_index(&encoded).map(family_of_variant);
+        let family = peek_variant_index(&encoded).and_then(family_of_variant);
         assert_eq!(family, Some(BodyFamily::SubtreeAudit));
         assert!(
             family.map_or(true, BodyFamily::is_audit),
@@ -1620,9 +1686,116 @@ mod tests {
     fn family_table_agrees_with_the_body_predicates() {
         for body in all_bodies() {
             let family = family_of_variant(body.variant_index());
+            // Every DECLARED variant must classify. `None` is reserved for an
+            // index no variant uses; a real body landing there would silently
+            // take the strict ceiling on both encode and decode.
+            let family = family.expect("every declared variant must have a family");
             assert_eq!(body.is_subtree_audit(), family == BodyFamily::SubtreeAudit);
             assert_eq!(family.is_audit(), body.is_subtree_audit());
         }
+    }
+
+    /// The encoder applies the same family ceiling the decoder does. Without
+    /// this, an audit body that outgrew the audit ceiling would serialise
+    /// happily and then be dropped pre-decode by every peer that received it —
+    /// and since the drop is silent, the sender would be scored for the
+    /// resulting non-answer rather than told its message was unsendable.
+    ///
+    /// No legitimate body reaches the ceiling today; this is about where the
+    /// failure surfaces if one ever does.
+    ///
+    /// FLIPS IF: `encode` goes back to checking only the core ceiling.
+    #[test]
+    fn the_encoder_refuses_an_audit_body_over_the_audit_ceiling() {
+        let z = [0u8; 32];
+        let oversized = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+                challenge_id: 1,
+                nonce: z,
+                challenged_peer_id: z,
+                expected_commitment_hash: z,
+                openings: (0..200_000u32)
+                    .map(|i| SubtreeSliceOpening {
+                        key: z,
+                        block_index: i,
+                    })
+                    .collect(),
+            }),
+        };
+        // Sits under the core ceiling, so only the family-aware check can catch
+        // it — this is the exact gap, not merely an enormous message.
+        let raw = postcard::to_stdvec(&oversized).expect("serialize");
+        assert!(raw.len() > MAX_SUBTREE_AUDIT_MESSAGE_SIZE);
+        assert!(raw.len() < MAX_REPLICATION_MESSAGE_SIZE);
+
+        match oversized.encode() {
+            Err(ReplicationProtocolError::MessageTooLarge { max_size, .. }) => {
+                assert_eq!(
+                    max_size, MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
+                    "an audit body must be measured against the audit ceiling"
+                );
+            }
+            // Report only the length on the success arm: debug-printing the body
+            // would dump megabytes of payload into the failure output.
+            other => panic!(
+                "expected the audit ceiling to refuse this, got {:?}",
+                other.map(|bytes| bytes.len())
+            ),
+        }
+
+        // A core body of the same size still encodes: the tighter ceiling is
+        // scoped to the audit families and must not shrink core traffic, which
+        // legitimately carries a whole chunk.
+        let core = ReplicationMessage {
+            request_id: 1,
+            body: ReplicationMessageBody::FetchResponse(FetchResponse::Success {
+                key: z,
+                data: vec![0u8; MAX_SUBTREE_AUDIT_MESSAGE_SIZE * 2],
+            }),
+        };
+        assert!(core.encode().is_ok(), "core bodies keep the core allowance");
+    }
+
+    /// An index no variant declares classifies as nothing, and "nothing" takes
+    /// the strict audit ceiling rather than the generous core allowance on both
+    /// sides of the wire. Postcard rejects an unknown outer discriminant before
+    /// decoding any trailing collection, so this closes the invariant rather than
+    /// a demonstrated hole — but the rule has to hold uniformly, or a later
+    /// variant added without a family entry would quietly inherit 10 MiB.
+    ///
+    /// FLIPS IF: the family table regains a catch-all that answers `Core`.
+    #[test]
+    fn an_undeclared_variant_index_classifies_as_nothing() {
+        let declared = all_bodies().len();
+        assert_eq!(
+            declared, 17,
+            "update this test's bounds when a variant is added or removed"
+        );
+        for index in [declared, declared + 1, 99, usize::MAX] {
+            assert_eq!(
+                family_of_variant(index),
+                None,
+                "index {index} is not a declared variant and must not classify"
+            );
+        }
+        // Call the REAL selector both wire paths use. Restating its arms here, or
+        // asserting a property that `None` satisfies vacuously, would pass no
+        // matter how the production selection changed.
+        assert_eq!(
+            ceiling_for(family_of_variant(declared)),
+            MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
+            "an unclassifiable variant must take the strict audit ceiling, not \
+             the generous core allowance"
+        );
+        // And a declared core body still takes the generous one, so the
+        // assertion above is about being unclassifiable rather than about the
+        // selector returning one answer for everything.
+        assert_eq!(
+            ceiling_for(family_of_variant(0)),
+            MAX_REPLICATION_MESSAGE_SIZE,
+            "core bodies keep the core allowance"
+        );
     }
 
     // `is_subtree_audit()` classifies exactly the four subtree-audit variants
