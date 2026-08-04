@@ -205,12 +205,22 @@ fn build_valid_merkle_proof() -> ValidMerkleProof {
     }
 }
 
+/// The price every fabricated candidate carries.
+///
+/// It must be a real point on the pricing curve for the binding these
+/// candidates declare below (`committed_key_count: 0`, `commitment_pin: None`),
+/// or the ADR-0004 arithmetic gate rejects the pool outright and the attack
+/// tests never reach the check they are actually asserting.
+fn candidate_price() -> Amount {
+    ant_node::payment::pricing::calculate_price(0)
+}
+
 /// Build 16 validly-signed ML-DSA-65 candidate nodes for a merkle proof.
 fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
     std::array::from_fn(|i| {
         let ml_dsa = MlDsa65::new();
         let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-        let price = Amount::from(1024u64);
+        let price = candidate_price();
         #[allow(clippy::cast_possible_truncation)]
         let reward_address = RewardsAddress::new([i as u8; 20]);
         let msg =
@@ -574,10 +584,12 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         .first()
         .expect("pool has candidates")
         .merkle_payment_timestamp;
-    // 4-leaf tree → depth 2 (log2(4)). Prices are all 1024 in
-    // build_candidate_nodes, so per-node payment = 1024 * 2^2 / 2 = 2048.
+    // 4-leaf tree → depth 2 (log2(4)). Every candidate carries
+    // `candidate_price()`, so per-node payment = price * 2^2. Derived from the
+    // price rather than hardcoded: a literal silently stops matching the
+    // formula the moment the pricing curve moves.
     let depth: u8 = 2;
-    let per_node = Amount::from(4096u64);
+    let per_node = candidate_price() * Amount::from(4u64);
     let paid_node_addresses = vec![
         (RewardsAddress::new([0u8; 20]), 0usize, per_node),
         (RewardsAddress::new([1u8; 20]), 1usize, per_node),
