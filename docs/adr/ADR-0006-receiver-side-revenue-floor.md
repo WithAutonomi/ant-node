@@ -59,7 +59,10 @@ The enforceable invariant is the receiver's own reservation price.
 2. Carry witness/completeness evidence in the proof — rejected: witnessing is
    deliberately client-side selection, not proof material.
 3. Receiver-side floor from the receiver's committed responsible key count,
-   shadow-first — chosen.
+   shadow-first — chosen originally, **withdrawn after production measurement**
+   (see "Amendment 1" below).
+4. Receiver-side floor from the close group's MEDIAN committed key count —
+   chosen.
 
 ## Decision
 
@@ -68,22 +71,40 @@ replication), the receiver additionally requires, alongside the existing
 `settled >= 3 x median` check:
 
 ```text
-settled_amount >= 3 x tolerance% x calculate_price(receiver's current
-                                                   committed responsible key count)
+settled_amount >= 3 x tolerance% x calculate_price(median committed key count
+                                                   over the receiver's close group)
 ```
 
-- **Pricing basis.** The floor reads the SAME live commitment the receiver's
-  own `QuoteGenerator` prices from, via a non-mutating snapshot
-  (`CommitmentSource::current_binding_snapshot`). Never the on-disk record
-  count; never the answerability-refreshing quote path.
+- **Pricing basis.** The floor prices against the MEDIAN of the close group's
+  committed key counts, not the receiver's own. The sample is this node's own
+  live commitment (via the non-mutating
+  `CommitmentSource::current_binding_snapshot`) plus the TTL-fresh gossiped
+  commitments of the K peers closest to the chunk in this node's routing
+  table. Never the on-disk record count; never the answerability-refreshing
+  quote path.
+- **Why the median.** A client pays `3x` the MEDIAN of the quotes it
+  collected. Pricing the floor against a single node's own price compares a
+  median to one draw from a distribution that spans ~4x across the fleet, so
+  the fullest receivers reject honest payments while the emptiest admit deep
+  underpayment. Both failures are the same defect. Comparing median to median
+  removes it. See Amendment 1 for the production numbers.
+- **Reference is local-only.** Nothing in the payment bundle feeds the
+  reference: a client cannot pad, prune or reorder quotes to move it. The
+  remaining lever is gossiping a false commitment, and a median only moves if
+  a MAJORITY of the group does so, while commitments stay signed and audited.
+- **Too thin a view SKIPS.** Below `PRICE_FLOOR_MIN_GROUP_SAMPLE` fresh
+  commitments the floor does not evaluate. A settled payment cannot be
+  refunded, so guessing a reference from one or two peers would burn user
+  money during a startup or post-churn window. A node that can suppress its
+  neighbours' gossip can therefore disable a receiver's floor, but cannot make
+  it reject honest traffic; that asymmetry is deliberate.
 - **Settled amount, not quote price.** An honest client may overpay a cheap
   quote to clear stricter receivers.
-- **No commitment = baseline.** A fresh, retired, or restarting receiver
-  prices the floor at `calculate_price(0)`. Every on-curve honest quote clears
-  a baseline floor at a 3x settlement, so this is not an availability
-  regression. (Only an off-curve sub-baseline quote — which the ADR-0004
-  arithmetic gate rejects once enforced — could fall below it, an economic
-  decline rather than an outage.)
+- **No group view = skip.** A fresh, retired, or restarting receiver, or one
+  with no gossip cache wired, does not evaluate the floor at all. This
+  replaces the original "price at `calculate_price(0)`" rule: the same
+  availability outcome by a clearer route, and no longer dependent on the
+  baseline happening to sit below every honest settlement.
 - **Scope.** Applies to `ClientPut` and `FreshReplication` (a below-floor
   proof must not fan out through one cheap accepting node). Never applies to
   paid-list admission, later repair, cache hits, or merkle-batch proofs: no
@@ -96,10 +117,10 @@ settled_amount >= 3 x tolerance% x calculate_price(receiver's current
   (target `ant_node::payment::price_floor`) on every evaluated admission,
   never enforced. Enforcement is a per-node opt-in via
   `ANT_PRICE_FLOOR_ENFORCE=1`, tolerance via
-  `ANT_PRICE_FLOOR_TOLERANCE_PERCENT` (default 50%). Canary nodes enforce
-  first; clients need 4-of-20 successful stores, so sparse enforcement
-  cannot fail honest uploads while telemetry calibrates the tolerance.
-  Unsetting the variable is the kill switch.
+  `ANT_PRICE_FLOOR_TOLERANCE_PERCENT` (default 65%, derived in Amendment 1).
+  Canary nodes enforce first; clients need 4-of-20 successful stores, so
+  sparse enforcement cannot fail honest uploads while telemetry calibrates the
+  tolerance. Unsetting the variable is the kill switch.
 
 This amends ADR-0004's stated contract "a node may always charge less" to:
 a quote may always charge less, but a receiver may refuse the resulting
@@ -139,15 +160,79 @@ payment when it settles below the receiver's own commitment-priced floor.
   floor; the tolerance must absorb honest quote-to-PUT drift, which
   telemetry measures directly.
 
+## Amendment 1 (2026-08-04): price against the group median, not your own price
+
+The original decision priced the floor against the receiver's own commitment.
+Shadow telemetry from ant-prod-01 (2026-07-29..08-04, 70,078 evaluations
+across 912 of 913 node instances) showed that reference does not work, and
+that no tolerance setting rescues it.
+
+**Honest stores were rejected.** `below_floor=true` fired 264 times (0.377%),
+against zero across ~350k staging evaluations. The rejections were systematic,
+not noise: they landed on the fullest nodes (rejecter median committed count
+5,365 against a fleet median of 3,091) and missed narrowly (median
+`settled/required` 0.909). Enforcing at the then-default 50% over that window
+would have cost 229 of 18,258 chunks at least one replica, and refused 16
+chunks at every node that evaluated them — upload failures after the client
+had already paid, with no refund path.
+
+**And the attack still got through.** The underpayment the floor targets (pay
+`3x` the cheapest of ~20 quotes rather than `3x` the median) underpays by only
+1.69x, while receiver prices span 4.1x because committed counts span roughly
+1,700 to 6,300. The signal is smaller than the noise:
+
+| tolerance | honest rejected | underpayment admitted |
+|-----------|-----------------|-----------------------|
+| 50%       | 0.377%          | 62.9% of receivers    |
+| 40%       | 0.061%          | 74.4%                 |
+| 30%       | 0.010%          | 89.8%                 |
+| 25%       | 0.000%          | 94.6%                 |
+
+Replaying the floor formula over all 70,078 records reproduced the nodes' own
+264 `below_floor=true` decisions exactly, so the honest-rejection column is
+measured rather than modelled. The admission column is a model assuming the
+cheapest of ~20 quotes sits near the 5th percentile of the fleet price spread.
+
+**The fix is the reference, not the threshold.** Against the group median,
+honest payments land at the reference by construction and the underpayment
+lands near 0.55x of it. Replaying the fleet's real price distribution with a
+pessimistic 50% routing-view overlap between the paying client and the
+receiver:
+
+| tolerance | honest rejected | underpayment caught |
+|-----------|-----------------|---------------------|
+| 50%       | 0.000%          | 10.4%               |
+| 65%       | 0.005%          | 89.3%               |
+| 75%       | 0.730%          | 97.4%               |
+| 85%       | 3.405%          | 99.8%               |
+
+65% is the shipped default: it sits below the 1st percentile of honest
+payments (0.772x the reference even at that overlap) while catching the large
+majority of underpayment attempts. Both directions improve against the
+original design — roughly 75x fewer honest rejections AND detection rising
+from 37% to 89%.
+
+**Caveat on the evidence.** 67,892 of the 70,078 evaluations (97%) come from
+2026-08-03 alone; the rest of the week was near idle. This is one day of
+representative traffic, not a week, which is why the default stays shadow.
+
 ## Validation
 
 - Unit gates (ant-node #176): a 3x-baseline settlement against a fuller
   receiver is rejected under enforcement on both admission contexts;
   exactly-at-floor passes; shadow mode never rejects; no-commitment
   receivers stay vacuous; paid-list admission is never repriced.
+- Unit gates (Amendment 1): the reference equals the group median and is
+  unmoved by this node's own extreme count; an honest median payment is
+  admitted by a receiver far above that median (the production
+  false-rejection shape); a cheapest-of-group settlement is rejected; a bundle
+  padded with cheap quotes does not move the reference; a thin or fully stale
+  group view skips rather than rejects; a minority of understated commitments
+  does not disarm the floor.
 - Shadow telemetry: distribution of `settled / (3 x tolerance% x
-  local_price)` on honest traffic; projected rejection rate must be ~0 at
-  the chosen tolerance before any canary enforces.
+  reference_price)` on honest traffic, plus the `skipped=true` rate showing
+  how often the group reference is unavailable; projected rejection rate must
+  be ~0 at the chosen tolerance before any canary enforces.
 - Canary enforcement: zero honest-upload failures at 4-of-20 store quorum
   while enforcing nodes reject synthetic cheapest-of-K proofs.
 - Review trigger: enabling enforcement fleet-wide, changing the default
