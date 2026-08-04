@@ -292,6 +292,14 @@ impl TestNetworkConfig {
             node_count: SMALL_NODE_COUNT,
             bootstrap_count: DEFAULT_BOOTSTRAP_COUNT,
             stabilization_timeout: Duration::from_secs(SMALL_STABILIZATION_TIMEOUT_SECS),
+            // The heavy subtree round-1 responder cooldown defaults to 30 min for
+            // production rate-limiting; tests audit the same holder repeatedly in
+            // quick succession, so drop it to near-zero so audits are not
+            // rate-dropped (a dropped round-1 would surface as a timeout).
+            replication_config: Some(ReplicationConfig {
+                subtree_round1_responder_cooldown: Duration::from_millis(1),
+                ..ReplicationConfig::default()
+            }),
             ..Default::default()
         }
     }

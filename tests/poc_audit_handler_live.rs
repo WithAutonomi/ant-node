@@ -25,13 +25,14 @@
 use std::sync::Arc;
 
 use ant_node::replication::commitment_state::{BuiltCommitment, ResponderCommitmentState};
-use ant_node::replication::config::MAX_BYTE_CHALLENGE_KEYS;
+use ant_node::replication::config::{MAX_SLICE_OPENINGS, SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES};
 use ant_node::replication::protocol::{
-    SubtreeAuditChallenge, SubtreeAuditResponse, SubtreeByteChallenge, SubtreeByteItem,
-    SubtreeByteResponse,
+    SubtreeAuditChallenge, SubtreeAuditResponse, SubtreeSliceChallenge, SubtreeSliceItem,
+    SubtreeSliceOpening, SubtreeSliceResponse,
 };
+use ant_node::replication::slice::{nonced_block_root, verify_block_slice, verify_nonced_block};
 use ant_node::replication::storage_commitment_audit::{
-    handle_subtree_byte_challenge, handle_subtree_challenge,
+    handle_subtree_challenge, handle_subtree_challenge_measured, handle_subtree_slice_challenge,
 };
 use ant_node::replication::subtree::{verify_subtree_proof, StructureVerdict};
 use ant_node::storage::{LmdbStorage, LmdbStorageConfig};
@@ -335,48 +336,267 @@ async fn committed_key_with_missing_bytes_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Round 2 (byte challenge): honest serve + oversize-request rejection
+// 5b. Partial round-1 work is charged even when the response is a rejection
 // ---------------------------------------------------------------------------
 
-/// Round-2 happy path: a byte challenge pinned to the responder's retained
-/// commitment, for keys it committed to and still stores, returns `Items` with
-/// the ORIGINAL bytes (`Present`) for every requested key.
+/// A successful proof reports what it read and hashed, at a floor per leaf.
+/// Anchors the rejection case below: it fixes what the measurement means.
 ///
-/// FLIPS IF: the responder stops serving original bytes for committed keys —
-/// the auditor would then see byte-verification failures for honest nodes.
+/// A leaf costs more than its bytes — an LMDB lookup and a blocking-task round
+/// trip are owed whatever its size — and nothing bounds a chunk from below, so
+/// the charge is `max(content, floor)` per leaf. These test records are 1 KiB,
+/// well under the floor, which is the case that used to be nearly free: the
+/// charge here is therefore the floor times the leaf count, not the content.
 #[tokio::test]
-async fn byte_challenge_serves_original_bytes_for_committed_keys() {
+async fn round1_proof_reports_the_content_it_read() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let challenge = challenge_for(&r, r.current_hash(), [0x11u8; 32]);
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    let SubtreeAuditResponse::Proof { ref proof, .. } = work.response else {
+        panic!("expected Proof, got {:?}", work.response);
+    };
+    let from_proof: i64 = proof
+        .leaves
+        .iter()
+        .map(|leaf| i64::from(leaf.content_len).max(SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES))
+        .sum();
+    assert_eq!(
+        work.content_bytes, from_proof,
+        "reported work must equal the floored content the proof covers"
+    );
+    assert!(work.content_bytes > 0, "a real proof reads real bytes");
+
+    // The floor is what makes a tiny-record commitment cost something. Without
+    // it these leaves would charge a quarter of what they do.
+    let unfloored: i64 = proof
+        .leaves
+        .iter()
+        .map(|leaf| i64::from(leaf.content_len))
+        .sum();
+    assert!(
+        work.content_bytes > unfloored,
+        "sub-floor records must not be charged at their byte count alone"
+    );
+}
+
+/// Regression (dirvine, PR #181): round 1 reads and hashes leaf by leaf, so a
+/// commitment holding ONE unreadable key still costs a full run of reads and
+/// keyed-BLAKE3 passes over every leaf before it — and then rejects.
+///
+/// The responder used to charge its work budget only on the `Proof` arm, so
+/// that run was free. An attacker who found such a commitment could replay
+/// subtrees over it indefinitely at no cost, and the per-peer cooldown does not
+/// help because it is escapable by rotating identity — the responder-wide budget
+/// is the only bound that applies to this, so it has to see the work.
+///
+/// FLIPS IF: the accounting goes back to charging only successful proofs.
+#[tokio::test]
+async fn rejected_round1_still_reports_the_work_it_spent() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+
+    // Find a nonce whose selected subtree spans more than one leaf, then delete
+    // the bytes behind its LAST leaf only. Everything before it is readable, so
+    // the responder does real work and then hits the hole.
+    let challenge = challenge_for(&r, pin, [0x11u8; 32]);
+    let baseline =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+    let SubtreeAuditResponse::Proof { ref proof, .. } = baseline.response else {
+        panic!("expected a baseline Proof, got {:?}", baseline.response);
+    };
+    assert!(
+        proof.leaves.len() > 1,
+        "need a multi-leaf subtree for partial work to exist; got {}",
+        proof.leaves.len()
+    );
+    let last_leaf = proof.leaves.last().expect("non-empty");
+    // What the deleted leaf contributed to the baseline charge. It is still
+    // ATTEMPTED in the rejecting run — the lookup happens and fails — so only
+    // the part above the floor comes off.
+    let last_leaf_charge = i64::from(last_leaf.content_len);
+    let deleted_len = (last_leaf_charge - SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES).max(0);
+    let last = last_leaf.key;
+    let baseline_bytes = baseline.content_bytes;
+    storage.delete(&last).await.expect("delete last leaf chunk");
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match work.response {
+        SubtreeAuditResponse::Rejected { ref reason, .. } => {
+            assert!(
+                reason.contains("missing bytes for committed key"),
+                "expected the missing-bytes rejection, got: {reason}"
+            );
+        }
+        ref other => panic!("expected Rejected(missing bytes), got {other:?}"),
+    }
+    assert!(
+        work.content_bytes > 0,
+        "the leaves read before the hole must be charged, not written off"
+    );
+    // Everything except the deleted leaf was read, and the deleted one was
+    // still attempted, so the charge is the baseline minus only that leaf's
+    // content above the floor.
+    assert_eq!(
+        work.content_bytes,
+        baseline_bytes - deleted_len,
+        "charge must cover every leaf attempted, at the floor for the failed one"
+    );
+}
+
+/// Follow-up (dirvine, PR #181): a round 1 that fails on its FIRST leaf returns
+/// no bytes and hashes nothing, but it is not free — the lookup ran, with its
+/// retries and backoffs behind it. Charging only content left that case at
+/// exactly zero, so a commitment whose first selected leaf is unreadable could
+/// be replayed indefinitely without touching the responder-wide budget, and the
+/// per-peer cooldown does not help because it is escapable by rotating identity.
+///
+/// The attempt itself is now charged, so the floor is the floor: not the bytes
+/// that came back, but the work owed before knowing whether any would.
+///
+/// FLIPS IF: the charge moves back behind a successful read.
+#[tokio::test]
+async fn a_round1_failing_on_its_first_leaf_still_reports_the_attempt() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+
+    // Take a baseline to learn which leaf this nonce selects first, then delete
+    // exactly that one so the responder fails before reading any bytes at all.
+    let challenge = challenge_for(&r, pin, [0x11u8; 32]);
+    let baseline =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+    let SubtreeAuditResponse::Proof { ref proof, .. } = baseline.response else {
+        panic!("expected a baseline Proof, got {:?}", baseline.response);
+    };
+    let first = proof.leaves.first().expect("non-empty").key;
+    storage
+        .delete(&first)
+        .await
+        .expect("delete first leaf chunk");
+
+    let work =
+        handle_subtree_challenge_measured(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match work.response {
+        SubtreeAuditResponse::Rejected { ref reason, .. } => {
+            assert!(
+                reason.contains("missing bytes for committed key"),
+                "expected the missing-bytes rejection, got: {reason}"
+            );
+        }
+        ref other => panic!("expected Rejected(missing bytes), got {other:?}"),
+    }
+    assert_eq!(
+        work.content_bytes, SUBTREE_ROUND1_LEAF_WORK_FLOOR_BYTES,
+        "a first-leaf failure must cost the attempt, and exactly the attempt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Round 2 (slice challenge): honest open + oversize-request rejection
+// ---------------------------------------------------------------------------
+
+/// Round-2 happy path: a slice challenge pinned to the responder's retained
+/// commitment, for keys it committed to and still stores, returns `Items` with a
+/// `Present` verified opening for every requested key. The opening is fully
+/// verified here — the Bao slice decodes against the chunk address to the real
+/// block, and the nonced opening folds to the honest nonced root — so this FAILS
+/// if the responder produces a malformed or non-possessing proof.
+///
+/// FLIPS IF: the responder stops opening valid slices for committed keys — the
+/// auditor would then see verification failures for honest nodes.
+#[tokio::test]
+async fn slice_challenge_opens_valid_blocks_for_committed_keys() {
     let (storage, _t) = test_storage().await;
     let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
     let pin = r.current_hash();
+    let nonce = [0x22u8; 32];
 
-    let keys = vec![Responder::address(1), Responder::address(2)];
-    let challenge = SubtreeByteChallenge {
+    let openings = vec![
+        SubtreeSliceOpening {
+            key: Responder::address(1),
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: Responder::address(2),
+            block_index: 0,
+        },
+    ];
+    let challenge = SubtreeSliceChallenge {
         challenge_id: 43,
-        nonce: [0x22u8; 32],
+        nonce,
         challenged_peer_id: r.peer_id_bytes,
         expected_commitment_hash: pin,
-        keys: keys.clone(),
+        openings: openings.clone(),
     };
 
     let resp =
-        handle_subtree_byte_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
             .await;
 
     match resp {
-        SubtreeByteResponse::Items {
+        SubtreeSliceResponse::Items {
             challenge_id,
             items,
         } => {
             assert_eq!(challenge_id, 43);
-            assert_eq!(items.len(), keys.len(), "one item per requested key");
-            for (item, (i, key)) in items.iter().zip([1u8, 2].into_iter().zip(keys)) {
+            assert_eq!(
+                items.len(),
+                openings.len(),
+                "one item per requested opening"
+            );
+            for (item, (i, opening)) in items.iter().zip([1u8, 2].into_iter().zip(openings)) {
                 match item {
-                    SubtreeByteItem::Present { key: k, bytes } => {
-                        assert_eq!(*k, key);
-                        assert_eq!(*bytes, chunk_content(i), "must serve the ORIGINAL bytes");
+                    SubtreeSliceItem::Present {
+                        key: k,
+                        block_index,
+                        bao_slice,
+                        nonced_siblings,
+                    } => {
+                        assert_eq!(*k, opening.key);
+                        assert_eq!(*block_index, 0);
+                        let content = chunk_content(i);
+                        let bytes_hash = *blake3::hash(&content).as_bytes();
+                        // Chain 1: the Bao slice decodes against the address to
+                        // the real block (a 1024-byte chunk is a single block).
+                        let block =
+                            verify_block_slice(bao_slice, &bytes_hash, content.len() as u64, 0)
+                                .expect("bao slice must verify against the chunk address");
+                        assert_eq!(block, content, "opened block must be the ORIGINAL bytes");
+                        // Chain 2: the nonced opening folds to the honest nonced
+                        // root over the real content under this audit's nonce.
+                        let root =
+                            nonced_block_root(&nonce, &r.peer_id_bytes, &opening.key, &content);
+                        assert!(
+                            verify_nonced_block(
+                                &nonce,
+                                &r.peer_id_bytes,
+                                &opening.key,
+                                0,
+                                &block,
+                                nonced_siblings,
+                                &root,
+                                ant_node::replication::slice::block_count(content.len() as u64),
+                            ),
+                            "nonced opening must fold to the honest nonced root"
+                        );
                     }
-                    other @ SubtreeByteItem::Absent { .. } => {
+                    other @ SubtreeSliceItem::Absent { .. } => {
                         panic!("expected Present for stored committed key, got {other:?}")
                     }
                 }
@@ -386,43 +606,291 @@ async fn byte_challenge_serves_original_bytes_for_committed_keys() {
     }
 }
 
-/// A byte challenge requesting more than `MAX_BYTE_CHALLENGE_KEYS` keys is
-/// rejected up front: an honest auditor batches its sample to that cap so the
-/// worst-case response (all chunks at max size) fits the replication wire cap;
-/// anything larger is a forged/over-size request the responder must not try to
-/// serve (the response could not encode, and reading the chunks first would be
-/// disk-read amplification).
+/// Coalescing at the live responder boundary: a challenge carrying DUPLICATE and
+/// interleaved openings for the same `(key, block_index)` returns one `Present`
+/// item per DISTINCT opening, not one per raw opening. This is the contract that
+/// lets `serve_committed_key_openings` (via `ChunkOpener`) read and hash each
+/// committed chunk once instead of re-reading it per repeated opening, so a
+/// forged auditor cannot amplify responder disk/CPU work by repeating openings
+/// while staying under the total-openings cap.
 ///
-/// FLIPS IF: the per-challenge key cap is removed from the responder.
+/// FLIPS IF: the responder stops deduplicating openings (item count would grow
+/// with the raw request) or drops/duplicates a distinct identity.
 #[tokio::test]
-async fn oversize_byte_challenge_is_rejected() {
+async fn slice_challenge_coalesces_duplicate_and_interleaved_openings() {
+    let (storage, _t) = test_storage().await;
+    let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
+    let pin = r.current_hash();
+    let nonce = [0x55u8; 32];
+
+    let k1 = Responder::address(1);
+    let k2 = Responder::address(2);
+    // Five raw openings, interleaved, over only TWO distinct (key, block) pairs.
+    let openings = vec![
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k2,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k2,
+            block_index: 0,
+        },
+        SubtreeSliceOpening {
+            key: k1,
+            block_index: 0,
+        },
+    ];
+    assert!(openings.len() <= MAX_SLICE_OPENINGS);
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 46,
+        nonce,
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings,
+    };
+
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match resp {
+        SubtreeSliceResponse::Items {
+            challenge_id,
+            items,
+        } => {
+            assert_eq!(challenge_id, 46);
+            // Coalesced: one item per DISTINCT (key, block_index), not per raw opening.
+            assert_eq!(
+                items.len(),
+                2,
+                "duplicate openings must not multiply response items"
+            );
+            let mut seen: Vec<([u8; 32], u32)> = Vec::new();
+            for item in &items {
+                match item {
+                    SubtreeSliceItem::Present {
+                        key, block_index, ..
+                    } => {
+                        assert!(
+                            !seen.contains(&(*key, *block_index)),
+                            "each (key, block) identity must appear at most once"
+                        );
+                        seen.push((*key, *block_index));
+                    }
+                    other @ SubtreeSliceItem::Absent { .. } => {
+                        panic!("expected Present for a stored committed key, got {other:?}")
+                    }
+                }
+            }
+            seen.sort_unstable();
+            let mut want = vec![(k1, 0u32), (k2, 0u32)];
+            want.sort_unstable();
+            assert_eq!(
+                seen, want,
+                "both distinct openings must be served exactly once, order-independent"
+            );
+        }
+        other => panic!("expected Items, got {other:?}"),
+    }
+}
+
+/// Multi-block coverage: open a DEEP block of a genuinely large (multi-block)
+/// chunk end-to-end through the live handler. The single-block happy-path test
+/// above cannot exercise the Bao parent-hash chain or the multi-level nonced
+/// tree; this one does — it stores a ~100 KB chunk (98 blocks), opens block 50,
+/// and verifies both chains against that exact block.
+///
+/// FLIPS IF: the Bao slice or nonced opening for a non-trivial tree is malformed
+/// (e.g. wrong offset, wrong sibling ordering).
+#[tokio::test]
+async fn slice_challenge_opens_a_deep_block_of_a_large_chunk() {
+    use ant_node::replication::commitment::commitment_hash;
+    use ant_node::replication::slice::block_count;
+
+    let (storage, _t) = test_storage().await;
+
+    // One large chunk: ~100 KB => 98 one-KiB blocks.
+    let content: Vec<u8> = (0..100_000u32)
+        .map(|n| (n.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let addr = LmdbStorage::compute_address(&content);
+    storage.put(&addr, &content).await.expect("put chunk");
+    let bytes_hash = *blake3::hash(&content).as_bytes();
+
+    let (pk, sk) = keypair();
+    let peer_id_bytes = *blake3::hash(&pk.to_bytes()).as_bytes();
+    let peer_id = PeerId::from_bytes(peer_id_bytes);
+    let built = BuiltCommitment::build(
+        vec![(addr, bytes_hash)],
+        &peer_id_bytes,
+        &sk,
+        &pk.to_bytes(),
+    )
+    .expect("build");
+    let pin = commitment_hash(built.commitment()).unwrap();
+    let state = Arc::new(ResponderCommitmentState::new());
+    state.rotate(built);
+
+    let count = block_count(content.len() as u64);
+    assert!(
+        count > 64,
+        "test needs a genuinely multi-block chunk, got {count} blocks"
+    );
+    let block_index = 50u32;
+    let nonce = [0x5Au8; 32];
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 77,
+        nonce,
+        challenged_peer_id: peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings: vec![SubtreeSliceOpening {
+            key: addr,
+            block_index,
+        }],
+    };
+
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &peer_id, false, Some(&state)).await;
+
+    let SubtreeSliceResponse::Items { items, .. } = resp else {
+        panic!("expected Items, got {resp:?}");
+    };
+    let Some(SubtreeSliceItem::Present {
+        block_index: bi,
+        bao_slice,
+        nonced_siblings,
+        ..
+    }) = items.first()
+    else {
+        panic!("expected a single Present opening, got {items:?}");
+    };
+    assert_eq!(*bi, block_index);
+
+    // Chain 1: the Bao slice decodes against the address to exactly block 50.
+    let block = verify_block_slice(bao_slice, &bytes_hash, content.len() as u64, block_index)
+        .expect("deep-block bao slice must verify");
+    let start = block_index as usize * 1024;
+    assert_eq!(
+        block,
+        content[start..start + 1024],
+        "opened block must be block 50's bytes"
+    );
+
+    // Chain 2: the nonced opening folds up the multi-level tree to the honest root.
+    let root = nonced_block_root(&nonce, &peer_id_bytes, &addr, &content);
+    assert!(
+        verify_nonced_block(
+            &nonce,
+            &peer_id_bytes,
+            &addr,
+            block_index,
+            &block,
+            nonced_siblings,
+            &root,
+            ant_node::replication::slice::block_count(content.len() as u64)
+        ),
+        "deep-block nonced opening must fold to the honest root"
+    );
+    // And the proof is genuinely small — a slice, not the whole 100 KB chunk.
+    assert!(
+        bao_slice.len() < content.len() / 4,
+        "the slice ({} bytes) must be far smaller than the chunk ({} bytes)",
+        bao_slice.len(),
+        content.len()
+    );
+}
+
+/// A slice challenge requesting more than `MAX_SLICE_OPENINGS` openings is
+/// rejected up front: an honest auditor opens at most that many blocks; anything
+/// larger is a forged/over-size request the responder must not try to serve
+/// (each opening forces a full chunk read to build its proof — disk-read
+/// amplification).
+///
+/// FLIPS IF: the per-challenge openings cap is removed from the responder.
+#[tokio::test]
+async fn oversize_slice_challenge_is_rejected() {
     let (storage, _t) = test_storage().await;
     let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
     let pin = r.current_hash();
 
-    let keys: Vec<[u8; 32]> = (0..=MAX_BYTE_CHALLENGE_KEYS)
-        .map(|i| [u8::try_from(i % 251).unwrap_or(0); 32])
+    let openings: Vec<SubtreeSliceOpening> = (0..=MAX_SLICE_OPENINGS)
+        .map(|i| SubtreeSliceOpening {
+            key: [u8::try_from(i % 251).unwrap_or(0); 32],
+            block_index: 0,
+        })
         .collect();
-    assert!(keys.len() > MAX_BYTE_CHALLENGE_KEYS);
-    let challenge = SubtreeByteChallenge {
+    assert!(openings.len() > MAX_SLICE_OPENINGS);
+    let challenge = SubtreeSliceChallenge {
         challenge_id: 44,
         nonce: [0x33u8; 32],
         challenged_peer_id: r.peer_id_bytes,
         expected_commitment_hash: pin,
-        keys,
+        openings,
     };
 
     let resp =
-        handle_subtree_byte_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
             .await;
 
     match resp {
-        SubtreeByteResponse::Rejected { reason, .. } => {
+        SubtreeSliceResponse::Rejected { reason, .. } => {
             assert!(
                 reason.contains("max"),
-                "expected per-challenge key-cap rejection, got: {reason}"
+                "expected per-challenge openings-cap rejection, got: {reason}"
             );
         }
         other => panic!("expected Rejected(oversize), got {other:?}"),
+    }
+}
+
+/// A slice challenge spanning more DISTINCT keys than the honest spot-check sample
+/// is rejected even when it stays under the total-openings cap. Coalescing saves
+/// work only when keys repeat, so a forged auditor could otherwise force a full
+/// chunk read per distinct key (up to ~40 MiB) without exceeding `MAX_SLICE_OPENINGS`.
+///
+/// FLIPS IF: the distinct-key cap is removed from the responder.
+#[tokio::test]
+async fn slice_challenge_with_too_many_distinct_keys_is_rejected() {
+    let (storage, _t) = test_storage().await;
+    let r = Responder::new(&storage, &[1, 2, 3, 4]).await;
+    let pin = r.current_hash();
+
+    // 6 distinct keys × 1 opening = 6 openings: under MAX_SLICE_OPENINGS (10) but
+    // over the honest BYTE_SPOTCHECK_MAX (5) distinct-key sample.
+    let openings: Vec<SubtreeSliceOpening> = (0..6u8)
+        .map(|i| SubtreeSliceOpening {
+            key: [i + 1; 32],
+            block_index: 0,
+        })
+        .collect();
+    assert!(openings.len() <= MAX_SLICE_OPENINGS);
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 45,
+        nonce: [0x44u8; 32],
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings,
+    };
+
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match resp {
+        SubtreeSliceResponse::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("distinct keys"),
+                "expected distinct-key rejection, got: {reason}"
+            );
+        }
+        other => panic!("expected Rejected(distinct keys), got {other:?}"),
     }
 }

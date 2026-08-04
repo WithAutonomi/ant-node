@@ -13,10 +13,10 @@ use rand::Rng;
 use crate::ant_protocol::XorName;
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
-use crate::replication::config::{ReplicationConfig, REPLICATION_PROTOCOL_ID};
+use crate::replication::config::{possession_challenge_protocol, ReplicationConfig};
 use crate::replication::protocol::{
-    compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
-    ReplicationMessageBody, ABSENT_KEY_DIGEST,
+    compute_audit_digest, compute_audit_digest_as, AuditChallenge, AuditDigestVersion,
+    AuditResponse, ReplicationMessage, ReplicationMessageBody, ABSENT_KEY_DIGEST,
 };
 use crate::replication::types::{
     AuditFailureReason, AuditFailureSummary, FailureEvidence, PeerSyncRecord, RepairProofs,
@@ -66,7 +66,11 @@ pub enum AuditTickResult {
         /// The peer claiming bootstrap status.
         peer: PeerId,
     },
-    /// No eligible peers for audit this tick.
+    /// No eligible peers for audit this tick, OR the auditor could not run a
+    /// meaningful check (the responsible-chunk audit found a challenged key's
+    /// own local copy unreadable). Nothing was proven either way: no holder
+    /// credit, no trust event, no penalty. The audit simply did not happen this
+    /// tick, exactly like having no peer to audit.
     Idle,
     /// Audit skipped (not enough local keys).
     InsufficientKeys,
@@ -247,7 +251,7 @@ pub async fn audit_tick_with_repair_proofs(
     let response = match p2p_node
         .send_request(
             &challenged_peer,
-            REPLICATION_PROTOCOL_ID,
+            possession_challenge_protocol(),
             encoded,
             audit_timeout,
         )
@@ -324,8 +328,8 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
-    // Step 7: Parse response.
-    let resp_msg = match ReplicationMessage::decode(&response.data) {
+    // Step 7: Parse response, under the audit ceiling rather than the core one.
+    let resp_msg = match ReplicationMessage::decode_audit_response(&response.data) {
         Ok(m) => m,
         Err(e) => {
             warn!("Audit: failed to decode response from {challenged_peer}: {e}");
@@ -566,63 +570,155 @@ async fn verify_digests(
     }
 
     let challenged_peer_bytes = challenged_peer.as_bytes();
-    let mut failed_keys = Vec::new();
+    let mut checks = Vec::with_capacity(keys.len());
 
     for (i, key) in keys.iter().enumerate() {
-        let received_digest = &digests[i];
-
-        // Check for absent sentinel.
-        if *received_digest == ABSENT_KEY_DIGEST {
-            failed_keys.push(AuditKeyFailure::absent(*key));
-            continue;
-        }
-
-        // Recompute expected digest from local copy.
+        // Read the auditor's own copy (logging the gone-vs-error distinction),
+        // then classify the peer's digest against it.
         let local_bytes = match storage.get_raw(key).await {
-            Ok(Some(bytes)) => bytes,
+            Ok(Some(bytes)) => Some(bytes),
             Ok(None) => {
                 // We should hold this key (we sampled it), but it's gone.
                 warn!(
                     "Audit: local key {} disappeared during audit",
                     hex::encode(key)
                 );
-                continue;
+                None
             }
             Err(e) => {
                 warn!("Audit: failed to read local key {}: {e}", hex::encode(key));
-                continue;
+                None
             }
         };
+        checks.push(classify_local_digest(
+            &digests[i],
+            key,
+            nonce,
+            challenged_peer_bytes,
+            local_bytes.as_deref(),
+        ));
+    }
 
-        let expected = compute_audit_digest(nonce, challenged_peer_bytes, key, &local_bytes);
-        if *received_digest != expected {
-            failed_keys.push(AuditKeyFailure::digest_mismatch(*key));
+    match aggregate_digest_checks(challenged_peer, checks, keys.len()) {
+        // Nothing provably failed: Passed (everything verified) or Idle (a skip).
+        Ok(verdict) => verdict,
+        // Step 9: Responsibility confirmation for failed keys.
+        Err(failed_keys) => {
+            handle_classified_audit_failure(
+                challenged_peer,
+                challenge_id,
+                &failed_keys,
+                AuditFailureReason::DigestMismatch,
+                keys.len(),
+                None,
+                p2p_node,
+                config,
+            )
+            .await
         }
     }
+}
 
-    if failed_keys.is_empty() {
-        info!(
-            "Audit: peer {challenged_peer} passed (all {} keys verified)",
-            keys.len()
-        );
-        return AuditTickResult::Passed {
-            challenged_peer: *challenged_peer,
-            keys_checked: keys.len(),
-        };
+/// Outcome of checking one challenged key's digest against the auditor's own copy.
+#[cfg_attr(test, derive(Debug))]
+enum DigestCheck {
+    /// The peer's digest matches the digest recomputed from local bytes.
+    Verified,
+    /// The auditor's own copy was unreadable, so the peer's digest for this key
+    /// could not be checked. Not the peer's fault, and not a pass either.
+    Skipped,
+    /// A provable failure: the absent sentinel, or a digest that disagrees with
+    /// the local copy.
+    Failed(AuditKeyFailure),
+}
+
+/// Classify one challenged key's response against the auditor's local copy.
+///
+/// `local_bytes` is `None` when the auditor's own copy is unreadable (gone or a
+/// read error). The peer's digest is then unverifiable, so the key is
+/// [`DigestCheck::Skipped`] and never silently treated as a pass. The absent
+/// sentinel is the peer's own admission and stays a provable failure even then.
+fn classify_local_digest(
+    received_digest: &[u8; 32],
+    key: &XorName,
+    nonce: &[u8; 32],
+    challenged_peer_bytes: &[u8; 32],
+    local_bytes: Option<&[u8]>,
+) -> DigestCheck {
+    if *received_digest == ABSENT_KEY_DIGEST {
+        return DigestCheck::Failed(AuditKeyFailure::absent(*key));
     }
+    let Some(bytes) = local_bytes else {
+        return DigestCheck::Skipped;
+    };
+    if *received_digest == compute_audit_digest(nonce, challenged_peer_bytes, key, bytes) {
+        DigestCheck::Verified
+    } else {
+        DigestCheck::Failed(AuditKeyFailure::digest_mismatch(*key))
+    }
+}
 
-    // Step 9: Responsibility confirmation for failed keys.
-    handle_classified_audit_failure(
-        challenged_peer,
-        challenge_id,
-        &failed_keys,
-        AuditFailureReason::DigestMismatch,
-        keys.len(),
-        None,
-        p2p_node,
-        config,
-    )
-    .await
+/// Fold per-key [`DigestCheck`] outcomes into the responsible-audit result.
+///
+/// `Ok` when no key provably failed: `Passed` iff every key verified, else
+/// `Idle` (see [`no_failure_verdict`]). `Err(failed_keys)` when at least one key
+/// failed, for the caller's responsibility-confirmation path.
+///
+/// Pure, so the security-relevant fold — a skipped key must count as `skipped`,
+/// never as `verified` — is unit-testable without a live `P2PNode`.
+fn aggregate_digest_checks(
+    challenged_peer: &PeerId,
+    checks: Vec<DigestCheck>,
+    challenged: usize,
+) -> Result<AuditTickResult, Vec<AuditKeyFailure>> {
+    let mut verified = 0usize;
+    let mut skipped = 0usize;
+    let mut failed_keys = Vec::new();
+    for check in checks {
+        match check {
+            DigestCheck::Verified => verified += 1,
+            DigestCheck::Skipped => skipped += 1,
+            DigestCheck::Failed(failure) => failed_keys.push(failure),
+        }
+    }
+    if failed_keys.is_empty() {
+        Ok(no_failure_verdict(
+            challenged_peer,
+            challenged,
+            verified,
+            skipped,
+        ))
+    } else {
+        Err(failed_keys)
+    }
+}
+
+/// Decide the verdict when no key provably failed.
+///
+/// A `Passed` here means "the whole response was verified against local bytes".
+/// If any key was skipped because the auditor's own copy was unreadable, the
+/// response was not fully verified, so the tick yields no verdict (`Idle`: no
+/// success trust event, no penalty) rather than a pass that reflects only the
+/// keys that happened to be readable. `verified == 0` is the same no-verdict
+/// case.
+fn no_failure_verdict(
+    challenged_peer: &PeerId,
+    challenged: usize,
+    verified: usize,
+    skipped: usize,
+) -> AuditTickResult {
+    if skipped > 0 || verified == 0 {
+        warn!(
+            "Audit: {skipped} of {challenged} challenged keys for {challenged_peer} were \
+             locally unverifiable; audit did not conclude this tick (Idle, no verdict)"
+        );
+        return AuditTickResult::Idle;
+    }
+    info!("Audit: peer {challenged_peer} passed (all {verified} keys verified)");
+    AuditTickResult::Passed {
+        challenged_peer: *challenged_peer,
+        keys_checked: verified,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -757,12 +853,18 @@ async fn handle_audit_timeout(
 /// and returns the response.  Rejects challenges where
 /// `challenged_peer_id` does not match `self_peer_id` to prevent an oracle
 /// attack where a malicious challenger forges digests for a different peer.
+///
+/// `digest_version` is the asker's dialect, taken from the protocol id the
+/// challenge arrived on, not from what this node would use itself: a peer
+/// verifies with the construction its own binary knows, so answering in the
+/// wrong one is a mismatch and reads as a confirmed failure.
 pub async fn handle_audit_challenge(
     challenge: &AuditChallenge,
     storage: &LmdbStorage,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     stored_chunks: usize,
+    digest_version: AuditDigestVersion,
 ) -> AuditResponse {
     if is_bootstrapping {
         return AuditResponse::Bootstrapping {
@@ -803,7 +905,8 @@ pub async fn handle_audit_challenge(
     for key in &challenge.keys {
         match storage.get_raw(key).await {
             Ok(Some(data)) => {
-                let digest = compute_audit_digest(
+                let digest = compute_audit_digest_as(
+                    digest_version,
                     &challenge.nonce,
                     &challenge.challenged_peer_id,
                     key,
@@ -923,6 +1026,97 @@ mod tests {
         PeerId::from_bytes(bytes)
     }
 
+    // -- classify_local_digest / no-verdict fold ------------------------------
+
+    #[test]
+    fn classify_local_digest_verified_on_matching_local_bytes() {
+        let (key, nonce, peer, bytes) = ([1u8; 32], [2u8; 32], [3u8; 32], b"chunk-bytes");
+        let good = compute_audit_digest(&nonce, &peer, &key, bytes);
+        assert!(matches!(
+            classify_local_digest(&good, &key, &nonce, &peer, Some(bytes)),
+            DigestCheck::Verified
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_skipped_when_local_copy_unreadable() {
+        // An unreadable own copy means the peer's digest cannot be checked, so
+        // the outcome is Skipped (never Verified) whatever the digest value is.
+        let (key, nonce, peer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        assert!(matches!(
+            classify_local_digest(&[0xAB; 32], &key, &nonce, &peer, None),
+            DigestCheck::Skipped
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_failed_on_digest_mismatch() {
+        let (key, nonce, peer, bytes) = ([1u8; 32], [2u8; 32], [3u8; 32], b"chunk-bytes");
+        assert!(matches!(
+            classify_local_digest(&[0xCD; 32], &key, &nonce, &peer, Some(bytes)),
+            DigestCheck::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn classify_local_digest_absent_sentinel_fails_even_when_local_unreadable() {
+        // Precedence: the peer's own admission of absence stays a provable
+        // failure and must not be downgraded to Skipped just because the
+        // auditor's copy is also unreadable.
+        let (key, nonce, peer) = ([1u8; 32], [2u8; 32], [3u8; 32]);
+        match classify_local_digest(&ABSENT_KEY_DIGEST, &key, &nonce, &peer, None) {
+            DigestCheck::Failed(f) => assert_eq!(f.kind, AuditKeyFailureKind::Absent),
+            other => panic!("absent sentinel must fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_verified_yields_passed_with_the_verified_count() {
+        let peer = PeerId::from_bytes([9u8; 32]);
+        let checks = vec![DigestCheck::Verified, DigestCheck::Verified];
+        match aggregate_digest_checks(&peer, checks, 2) {
+            Ok(AuditTickResult::Passed { keys_checked, .. }) => assert_eq!(keys_checked, 2),
+            other => panic!("expected Passed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn any_skipped_key_yields_idle_not_a_partial_pass() {
+        // The security-relevant fold: a response that was only partly checkable
+        // must not mint a pass reflecting just the readable keys.
+        let peer = PeerId::from_bytes([9u8; 32]);
+        let checks = vec![DigestCheck::Verified, DigestCheck::Skipped];
+        match aggregate_digest_checks(&peer, checks, 2) {
+            Ok(AuditTickResult::Idle) => {}
+            other => panic!("expected Idle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_skipped_yields_idle_not_a_vacuous_pass() {
+        let peer = PeerId::from_bytes([9u8; 32]);
+        let checks = vec![DigestCheck::Skipped, DigestCheck::Skipped];
+        match aggregate_digest_checks(&peer, checks, 2) {
+            Ok(AuditTickResult::Idle) => {}
+            other => panic!("expected Idle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_key_still_routes_to_the_failure_path_despite_skips() {
+        // A provable failure outranks a skip: the caller must still run
+        // responsibility confirmation rather than fall into the Idle lane.
+        let peer = PeerId::from_bytes([9u8; 32]);
+        let checks = vec![
+            DigestCheck::Skipped,
+            DigestCheck::Failed(AuditKeyFailure::digest_mismatch([7u8; 32])),
+        ];
+        match aggregate_digest_checks(&peer, checks, 2) {
+            Err(failed) => assert_eq!(failed.len(), 1),
+            Ok(other) => panic!("expected the failure path, got {other:?}"),
+        }
+    }
+
     // -- handle_audit_challenge: present keys ---------------------------------
 
     #[tokio::test]
@@ -943,8 +1137,15 @@ mod tests {
         let challenge = make_challenge(42, nonce, peer_id, vec![addr_a, addr_b]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -980,8 +1181,15 @@ mod tests {
         let challenge = make_challenge(99, nonce, peer_id, vec![absent_key]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -1020,8 +1228,15 @@ mod tests {
         let challenge = make_challenge(7, nonce, peer_id, vec![addr_present, addr_absent]);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests { digests, .. } => {
@@ -1053,8 +1268,15 @@ mod tests {
         let challenge = make_challenge(55, [0x00; 32], [0x01; 32], vec![[0x02; 32]]);
         let self_id = peer_id_from_bytes([0x01; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Bootstrapping { challenge_id } => {
@@ -1078,8 +1300,15 @@ mod tests {
         let challenge = make_challenge(100, [0x10; 32], [0x20; 32], vec![]);
         let self_id = peer_id_from_bytes([0x20; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests {
@@ -1205,8 +1434,15 @@ mod tests {
         let challenge = make_challenge(200, [0xCC; 32], [0xDD; 32], vec![addr]);
         let self_id = peer_id_from_bytes([0xDD; 32]);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         assert!(
             matches!(response, AuditResponse::Bootstrapping { challenge_id: 200 }),
@@ -1247,8 +1483,15 @@ mod tests {
         };
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
 
         match response {
             AuditResponse::Digests { digests, .. } => {
@@ -1298,8 +1541,15 @@ mod tests {
         };
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         match response {
             AuditResponse::Digests { digests, .. } => {
                 assert_eq!(digests.len(), 3);
@@ -1634,8 +1884,15 @@ mod tests {
         let challenge = make_challenge(300, nonce, peer_id, keys);
         let self_id = peer_id_from_bytes(peer_id);
 
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         match response {
             AuditResponse::Digests { digests, .. } => {
                 assert_eq!(
@@ -1689,8 +1946,15 @@ mod tests {
         let self_id = peer_id_from_bytes([0x29; 32]);
 
         // Responder is bootstrapping → Bootstrapping response, NOT Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         assert!(
             matches!(
                 response,
@@ -1700,8 +1964,15 @@ mod tests {
         );
 
         // Responder is NOT bootstrapping → normal Digests.
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, false, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         assert!(
             matches!(response, AuditResponse::Digests { .. }),
             "drained node should compute digests normally"
@@ -1784,36 +2055,60 @@ mod tests {
 
         // Challenge with 1 key.
         let challenge1 = make_challenge(3201, nonce, peer_id, vec![addrs[0]]);
-        let resp1 =
-            handle_audit_challenge(&challenge1, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp1 = handle_audit_challenge(
+            &challenge1,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp1 {
             assert_eq!(digests.len(), 1, "|PeerKeySet| = 1 → 1 digest");
         }
 
         // Challenge with 3 keys.
         let challenge3 = make_challenge(3203, nonce, peer_id, addrs[0..3].to_vec());
-        let resp3 =
-            handle_audit_challenge(&challenge3, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp3 = handle_audit_challenge(
+            &challenge3,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp3 {
             assert_eq!(digests.len(), 3, "|PeerKeySet| = 3 → 3 digests");
         }
 
         // Challenge with all 5 keys.
         let challenge5 = make_challenge(3205, nonce, peer_id, addrs.clone());
-        let resp5 =
-            handle_audit_challenge(&challenge5, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp5 = handle_audit_challenge(
+            &challenge5,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp5 {
             assert_eq!(digests.len(), 5, "|PeerKeySet| = 5 → 5 digests");
         }
 
         // Challenge with 0 keys (idle equivalent — no work).
         let challenge0 = make_challenge(3200, nonce, peer_id, vec![]);
-        let resp0 =
-            handle_audit_challenge(&challenge0, &storage, &self_id, false, TEST_STORED_CHUNKS)
-                .await;
+        let resp0 = handle_audit_challenge(
+            &challenge0,
+            &storage,
+            &self_id,
+            false,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         if let AuditResponse::Digests { digests, .. } = resp0 {
             assert!(digests.is_empty(), "|PeerKeySet| = 0 → 0 digests (idle)");
         }
@@ -1837,8 +2132,15 @@ mod tests {
         let self_id = peer_id_from_bytes([0x47; 32]);
 
         // Bootstrapping peer → Bootstrapping response (grace period start).
-        let response =
-            handle_audit_challenge(&challenge, &storage, &self_id, true, TEST_STORED_CHUNKS).await;
+        let response = handle_audit_challenge(
+            &challenge,
+            &storage,
+            &self_id,
+            true,
+            TEST_STORED_CHUNKS,
+            AuditDigestVersion::Keyed,
+        )
+        .await;
         let challenge_id = match response {
             AuditResponse::Bootstrapping { challenge_id } => challenge_id,
             AuditResponse::Digests { .. } => {
