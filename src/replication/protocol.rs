@@ -13,8 +13,8 @@ use crate::ant_protocol::XorName;
 
 use super::types::AuditFailureReason;
 
-use super::config::MAX_AUDIT_MESSAGE_SIZE;
 pub use super::config::MAX_REPLICATION_MESSAGE_SIZE;
+use super::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE;
 
 /// Sentinel digest value indicating the challenged key is absent from storage.
 ///
@@ -87,7 +87,7 @@ impl ReplicationMessage {
         // decode generously.
         let max_size = match peek_variant_index(data).map(family_of_variant) {
             Some(family) if !family.is_audit() => MAX_REPLICATION_MESSAGE_SIZE,
-            _ => MAX_AUDIT_MESSAGE_SIZE,
+            _ => MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
         };
         if data.len() > max_size {
             return Err(ReplicationProtocolError::MessageTooLarge {
@@ -105,33 +105,31 @@ impl ReplicationMessage {
         Ok(message)
     }
 
-    /// Decode a reply to an audit challenge, under the audit family ceiling.
+    /// Decode a reply to a subtree-audit challenge under the subtree-family ceiling.
     ///
     /// The pre-decode ceiling on the receive path bounds what an auditor can
     /// make a responder decode. This is that same bound in the other direction.
-    /// A challenge costs a few hundred bytes to send, so without it a challenged
+    /// A subtree challenge costs a few hundred bytes to send, so without it a challenged
     /// peer could answer with up to [`MAX_REPLICATION_MESSAGE_SIZE`] and make
     /// the auditor allocate and decode all of it — the cheap side of the
     /// exchange paying for the expensive one, which is the shape the responder
-    /// ceiling exists to prevent. Audit bodies are ~110 KiB at worst (see
-    /// [`MAX_AUDIT_MESSAGE_SIZE`]), so this costs an honest responder nothing.
+    /// ceiling exists to prevent. Subtree-audit bodies are ~110 KiB at worst (see
+    /// [`MAX_SUBTREE_AUDIT_MESSAGE_SIZE`]), so this costs an honest responder nothing.
     ///
     /// No discriminant peek is needed here, unlike the receive path: the auditor
-    /// asked the question, so it already knows the reply belongs to an audit
+    /// asked the question, so it already knows the reply belongs to the subtree
     /// family, and a body that turns out not to be the expected one is rejected
-    /// by the lane's own matching afterwards.
+    /// by the subtree lane's own matching afterwards.
     ///
     /// # Errors
     ///
-    /// Returns [`ReplicationProtocolError::MessageTooLarge`] above the audit
-    /// ceiling, which every audit lane already reads as a malformed answer
-    /// rather than as silence: a peer that answers at all is on this protocol,
-    /// so the rollout grace does not cover it.
-    pub fn decode_audit_response(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
-        if data.len() > MAX_AUDIT_MESSAGE_SIZE {
+    /// Returns [`ReplicationProtocolError::MessageTooLarge`] above the subtree
+    /// audit ceiling.
+    pub fn decode_subtree_audit_response(data: &[u8]) -> Result<Self, ReplicationProtocolError> {
+        if data.len() > MAX_SUBTREE_AUDIT_MESSAGE_SIZE {
             return Err(ReplicationProtocolError::MessageTooLarge {
                 size: data.len(),
-                max_size: MAX_AUDIT_MESSAGE_SIZE,
+                max_size: MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
             });
         }
         Self::decode(data)
@@ -270,30 +268,14 @@ impl ReplicationMessageBody {
     pub fn is_subtree_audit(&self) -> bool {
         family_of_variant(self.variant_index()) == BodyFamily::SubtreeAudit
     }
-
-    /// Whether this body is a digest-based possession audit message.
-    ///
-    /// One wire pair (`AuditChallenge`/`AuditResponse`) serves three callers:
-    /// the responsible-chunk audit, the post-replication possession probe, and
-    /// the prune-confirmation audit. They ride [`POSSESSION_AUDIT_PROTOCOL_ID`]
-    /// because the digest they carry is keyed by the challenge material, so a
-    /// peer on an older digest generation must not be answered on this lane at
-    /// all rather than be scored as a confirmed mismatch.
-    ///
-    /// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
-    #[must_use]
-    pub fn is_possession_audit(&self) -> bool {
-        family_of_variant(self.variant_index()) == BodyFamily::PossessionAudit
-    }
 }
 
 /// Which protocol family a body belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyFamily {
-    /// Core replication: everything that is not an audit.
+    /// Core replication, including digest-based responsible, possession, and
+    /// prune-confirmation audits.
     Core,
-    /// The digest-based possession pair (`AuditChallenge`/`AuditResponse`).
-    PossessionAudit,
     /// The four subtree storage-commitment audit bodies, both rounds.
     SubtreeAudit,
 }
@@ -302,7 +284,7 @@ impl BodyFamily {
     /// Whether this family takes the tighter audit wire ceiling.
     #[must_use]
     pub(crate) fn is_audit(self) -> bool {
-        matches!(self, Self::PossessionAudit | Self::SubtreeAudit)
+        matches!(self, Self::SubtreeAudit)
     }
 }
 
@@ -315,9 +297,8 @@ impl BodyFamily {
 /// [`peek_variant_index`]).
 ///
 /// Everything that classifies a body reads this one table —
-/// [`ReplicationMessageBody::is_subtree_audit`],
-/// [`ReplicationMessageBody::is_possession_audit`], the outbound response
-/// routing, the post-decode family guard, and the pre-decode ceiling — so the
+/// [`ReplicationMessageBody::is_subtree_audit`], outbound response routing, the
+/// post-decode family guard, and the pre-decode ceiling — so the
 /// pre- and post-decode views of "which family is this" cannot drift apart. A
 /// drift is exactly what let an audit body sent on the core id skip the audit
 /// ceiling and decode under the 10 MiB core allowance.
@@ -327,7 +308,6 @@ impl BodyFamily {
 #[must_use]
 pub(crate) fn family_of_variant(index: usize) -> BodyFamily {
     match index {
-        9 | 10 => BodyFamily::PossessionAudit,
         11..=14 => BodyFamily::SubtreeAudit,
         _ => BodyFamily::Core,
     }
@@ -1261,27 +1241,11 @@ pub enum SubtreeSliceResponse {
 // Audit digest helper
 // ---------------------------------------------------------------------------
 
-/// Domain-separation context for the audit digest key derivation.
+/// Compute `AuditKeyDigest(K_i) = BLAKE3(nonce || challenged_peer_id || K_i || record_bytes_i)`.
 ///
-/// Versioned alongside the possession-audit protocol id so no other BLAKE3 use
-/// in this codebase, and no future revision of this digest, can derive a
-/// colliding key from the same challenge material.
-pub const AUDIT_DIGEST_KEY_CONTEXT: &str =
-    "autonomi.ant.replication.possession-audit.v2.digest-key";
-
-/// Compute the possession digest for one challenged key.
-///
-/// `BLAKE3_keyed(BLAKE3_derive_key(ctx, nonce || challenged_peer_id || K_i), record_bytes_i)`,
-/// with `ctx` the versioned [`AUDIT_DIGEST_KEY_CONTEXT`]. Returns the 32-byte
-/// digest binding the nonce, peer identity, key, and record content together so
-/// a peer cannot produce it without holding the actual data.
-///
-/// The challenge material enters as the BLAKE3 *key*, not as an input prefix.
-/// In keyed mode the key replaces the IV of every block's compression, so the
-/// whole digest depends on the fresh per-audit nonce rather than only its
-/// leading bytes. This matches the construction the subtree audit already uses
-/// for its per-leaf commitments, so every audit lane binds the nonce the same
-/// way.
+/// This is the existing digest construction used by the core responsible-chunk,
+/// post-replication possession, and prune-confirmation audit lanes. The subtree
+/// slice audit has its own proof-specific keyed construction in `slice.rs`.
 #[must_use]
 pub fn compute_audit_digest(
     nonce: &[u8; 32],
@@ -1289,57 +1253,12 @@ pub fn compute_audit_digest(
     key: &XorName,
     record_bytes: &[u8],
 ) -> [u8; 32] {
-    let mut key_hasher = blake3::Hasher::new_derive_key(AUDIT_DIGEST_KEY_CONTEXT);
-    key_hasher.update(nonce);
-    key_hasher.update(challenged_peer_id);
-    key_hasher.update(key);
-    let digest_key = *key_hasher.finalize().as_bytes();
-    *blake3::keyed_hash(&digest_key, record_bytes).as_bytes()
-}
-
-/// Which construction a possession digest is built with.
-///
-/// Two exist only during the upgrade window. A peer verifies a digest with the
-/// construction its own binary knows, so the responder has to answer in the
-/// asker's dialect or the answer reads as a mismatch — which is a confirmed
-/// failure, strictly worse for the honest responder than silence.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuditDigestVersion {
-    /// The construction on the previous release: a plain BLAKE3 over
-    /// `nonce || peer || key || bytes`. Answered only to a challenge that
-    /// arrived on the core protocol id, which is where a peer that has not
-    /// upgraded still sends them.
-    Legacy,
-    /// This release: a domain-separated key derived from
-    /// `nonce || peer || key`, then a keyed hash over the content.
-    Keyed,
-}
-
-/// The digest a given peer will verify against.
-///
-/// [`compute_audit_digest`] is the construction this node uses everywhere it
-/// asks; this is only for answering, where the asker picks the dialect.
-#[must_use]
-pub fn compute_audit_digest_as(
-    version: AuditDigestVersion,
-    nonce: &[u8; 32],
-    challenged_peer_id: &[u8; 32],
-    key: &XorName,
-    record_bytes: &[u8],
-) -> [u8; 32] {
-    match version {
-        AuditDigestVersion::Keyed => {
-            compute_audit_digest(nonce, challenged_peer_id, key, record_bytes)
-        }
-        AuditDigestVersion::Legacy => {
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(nonce);
-            hasher.update(challenged_peer_id);
-            hasher.update(key);
-            hasher.update(record_bytes);
-            *hasher.finalize().as_bytes()
-        }
-    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(nonce);
+    hasher.update(challenged_peer_id);
+    hasher.update(key);
+    hasher.update(record_bytes);
+    *hasher.finalize().as_bytes()
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,7 +1391,7 @@ mod tests {
         assert!(encoded.len() <= 1024 * 1024);
         assert!(encoded.len() <= MAX_REPLICATION_MESSAGE_SIZE);
         assert!(
-            encoded.len() <= crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            encoded.len() <= crate::replication::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
             "round 2 must fit the tighter audit-family ceiling"
         );
     }
@@ -1488,7 +1407,7 @@ mod tests {
     #[test]
     fn max_round1_proof_fits_the_audit_family_ceiling() {
         use crate::replication::commitment::{StorageCommitment, MAX_COMMITMENT_KEY_COUNT};
-        use crate::replication::config::MAX_AUDIT_MESSAGE_SIZE;
+        use crate::replication::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE;
         use crate::replication::subtree::{max_subtree_leaves, SubtreeLeaf, SubtreeProof};
 
         let leaf_count = max_subtree_leaves(MAX_COMMITMENT_KEY_COUNT) as usize;
@@ -1524,9 +1443,9 @@ mod tests {
             .encode()
             .expect("worst-case round-1 proof must fit the wire cap");
         assert!(
-            encoded.len() <= MAX_AUDIT_MESSAGE_SIZE,
+            encoded.len() <= MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
             "worst legitimate round-1 proof is {} bytes, over the audit ceiling of \
-             {MAX_AUDIT_MESSAGE_SIZE}",
+             {MAX_SUBTREE_AUDIT_MESSAGE_SIZE}",
             encoded.len()
         );
     }
@@ -1681,7 +1600,7 @@ mod tests {
         .expect("encode");
 
         assert!(
-            encoded.len() > crate::replication::config::MAX_AUDIT_MESSAGE_SIZE,
+            encoded.len() > crate::replication::config::MAX_SUBTREE_AUDIT_MESSAGE_SIZE,
             "the reproduction must exceed the audit ceiling to be meaningful; got {} bytes",
             encoded.len()
         );
@@ -1702,24 +1621,15 @@ mod tests {
         for body in all_bodies() {
             let family = family_of_variant(body.variant_index());
             assert_eq!(body.is_subtree_audit(), family == BodyFamily::SubtreeAudit);
-            assert_eq!(
-                body.is_possession_audit(),
-                family == BodyFamily::PossessionAudit
-            );
-            assert_eq!(
-                family.is_audit(),
-                body.is_subtree_audit() || body.is_possession_audit()
-            );
+            assert_eq!(family.is_audit(), body.is_subtree_audit());
         }
     }
 
     // `is_subtree_audit()` classifies exactly the four subtree-audit variants
     // (both rounds), and NOTHING else — crucially not the digest-based
-    // `AuditChallenge`/`AuditResponse` pair, which rides its own
-    // `POSSESSION_AUDIT_PROTOCOL_ID` via `is_possession_audit()`. The receive
-    // guard and the response-routing both key off this one predicate, so it
-    // must be exact: a body that answers `true` here is required to arrive on
-    // the subtree id, and is dropped on any other.
+    // `AuditChallenge`/`AuditResponse` pair, which remains on the core protocol.
+    // The receive guard and response routing key off this predicate, so it must
+    // be exact.
     #[test]
     fn is_subtree_audit_covers_both_rounds_only() {
         let z = [0u8; 32];
@@ -1757,9 +1667,7 @@ mod tests {
                 data: vec![],
                 proof_of_payment: vec![],
             }),
-            // Periodic possession audit — NOT the subtree audit. It rides the
-            // possession id, not the core one; what matters here is only that
-            // `is_subtree_audit()` does not claim it.
+            // Periodic possession audit — core replication, not subtree audit.
             ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 }),
         ];
         for body in &core {
@@ -2267,16 +2175,16 @@ mod tests {
     // audit reply while still being a legal core message.
     #[test]
     fn an_audit_reply_above_the_audit_ceiling_is_refused_before_decode() {
-        let between_the_ceilings = vec![0u8; MAX_AUDIT_MESSAGE_SIZE + 1];
+        let between_the_ceilings = vec![0u8; MAX_SUBTREE_AUDIT_MESSAGE_SIZE + 1];
         assert!(between_the_ceilings.len() < MAX_REPLICATION_MESSAGE_SIZE);
 
-        let err = ReplicationMessage::decode_audit_response(&between_the_ceilings)
+        let err = ReplicationMessage::decode_subtree_audit_response(&between_the_ceilings)
             .expect_err("an audit reply over the audit ceiling must not be decoded");
         assert!(
             matches!(
                 err,
                 ReplicationProtocolError::MessageTooLarge { max_size, .. }
-                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+                    if max_size == MAX_SUBTREE_AUDIT_MESSAGE_SIZE
             ),
             "expected the audit ceiling to be the one reported, got {err:?}"
         );
@@ -2302,7 +2210,7 @@ mod tests {
         .expect("a small audit body encodes");
         // Postcard ignores trailing bytes, so padding keeps this a decodable
         // audit body while pushing it between the two ceilings.
-        oversized_audit_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        oversized_audit_body.resize(MAX_SUBTREE_AUDIT_MESSAGE_SIZE + 1, 0);
         assert!(oversized_audit_body.len() < MAX_REPLICATION_MESSAGE_SIZE);
 
         let err = ReplicationMessage::decode(&oversized_audit_body)
@@ -2311,7 +2219,7 @@ mod tests {
             matches!(
                 err,
                 ReplicationProtocolError::MessageTooLarge { max_size, .. }
-                    if max_size == MAX_AUDIT_MESSAGE_SIZE
+                    if max_size == MAX_SUBTREE_AUDIT_MESSAGE_SIZE
             ),
             "the audit ceiling must be the one applied, got {err:?}"
         );
@@ -2324,69 +2232,26 @@ mod tests {
         }
         .encode()
         .expect("a small core body encodes");
-        core_body.resize(MAX_AUDIT_MESSAGE_SIZE + 1, 0);
+        core_body.resize(MAX_SUBTREE_AUDIT_MESSAGE_SIZE + 1, 0);
         assert!(
             ReplicationMessage::decode(&core_body).is_ok(),
             "a core body must keep the core allowance"
         );
     }
 
-    // Regression (dirvine, PR #181): the reviewed reproduction, verbatim. A
-    // solicited reply is delivered straight to the `send_request` caller, so it
-    // never passes the receive path's guard; every audit lane decoded it under
-    // the core allowance. A challenged peer could answer a few-hundred-byte
-    // challenge with a *valid* `AuditResponse::Digests` carrying 200,000
-    // digests, and have all 6.4 MB allocated before the lane looked at the
-    // count. Prune confirmation can have up to 32 of these in flight.
-    //
-    // FLIPS IF: the family ceiling stops applying to replies.
-    #[test]
-    fn an_oversized_digest_reply_is_refused_before_its_collection_is_allocated() {
-        let encoded = ReplicationMessage {
-            request_id: 1,
-            body: ReplicationMessageBody::AuditResponse(AuditResponse::Digests {
-                challenge_id: 1,
-                digests: vec![[0xAB; 32]; 200_000],
-            }),
-        }
-        .encode()
-        .expect("the reproduction must be a legal core-sized message to be interesting");
-
-        assert!(
-            encoded.len() > MAX_AUDIT_MESSAGE_SIZE,
-            "reproduction must exceed the audit ceiling"
-        );
-        assert!(
-            encoded.len() < MAX_REPLICATION_MESSAGE_SIZE,
-            "and sit under the core one, which is what let it through"
-        );
-
-        // Refused by the lane's own decoder...
-        assert!(
-            ReplicationMessage::decode_audit_response(&encoded).is_err(),
-            "an audit lane must not decode an oversized reply"
-        );
-        // ...and by the general decoder, since the body's family says audit.
-        // Both, so neither is load-bearing alone.
-        assert!(
-            ReplicationMessage::decode(&encoded).is_err(),
-            "and the family ceiling must catch it even without lane context"
-        );
-    }
-
-    // The tighter ceiling must not clip a legitimate reply. Round 1's `Proof` is
-    // the largest audit body there is, and `MAX_AUDIT_MESSAGE_SIZE` is sized
-    // against it; this checks the auditor accepts what a responder may send.
+    // The tighter ceiling must not clip a legitimate subtree reply. Round 1's
+    // `Proof` is the largest subtree-audit body, and `MAX_SUBTREE_AUDIT_MESSAGE_SIZE` is
+    // sized against it; this checks the auditor accepts a small valid reply.
     #[test]
     fn a_legitimate_audit_reply_still_decodes_under_the_audit_ceiling() {
         let msg = ReplicationMessage {
             request_id: 7,
-            body: ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping {
-                challenge_id: 42,
-            }),
+            body: ReplicationMessageBody::SubtreeAuditResponse(
+                SubtreeAuditResponse::Bootstrapping { challenge_id: 42 },
+            ),
         };
         let encoded = msg.encode().expect("encode should succeed");
-        let decoded = ReplicationMessage::decode_audit_response(&encoded)
+        let decoded = ReplicationMessage::decode_subtree_audit_response(&encoded)
             .expect("a small audit reply must decode");
         assert_eq!(decoded.request_id, 7);
     }
@@ -2428,86 +2293,21 @@ mod tests {
     // === Audit digest computation ===
 
     #[test]
-    fn audit_digest_is_the_domain_separated_keyed_construction() {
-        // Pin the exact KEYED construction: the challenge material enters as the
-        // BLAKE3 key (via `derive_key`, mixed into every block's compression),
-        // never as an input prefix. A regression to a flat
-        // `BLAKE3(nonce || peer || key || bytes)` produces a different digest and
-        // fails this exact-equality check. The context comes from the single
-        // source of truth so the test cannot drift from the implementation.
-        // A multi-block record exercises the key mixing past the first block.
+    fn audit_digest_matches_core_replication_construction() {
         let nonce = [0x01; 32];
         let peer_id = [0x02; 32];
         let key: XorName = [0x03; 32];
         let record_bytes = vec![0x5A; 8 * 1024];
 
-        let mut key_hasher = blake3::Hasher::new_derive_key(AUDIT_DIGEST_KEY_CONTEXT);
-        key_hasher.update(&nonce);
-        key_hasher.update(&peer_id);
-        key_hasher.update(&key);
-        let digest_key = *key_hasher.finalize().as_bytes();
-        let expected = *blake3::keyed_hash(&digest_key, &record_bytes).as_bytes();
-
+        let mut expected = blake3::Hasher::new();
+        expected.update(&nonce);
+        expected.update(&peer_id);
+        expected.update(&key);
+        expected.update(&record_bytes);
         assert_eq!(
             compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
-            expected,
-            "digest must be BLAKE3_keyed(derive_key(ctx, nonce||peer||key), bytes)"
-        );
-
-        // And it must NOT be the superseded flat prefix hash.
-        let mut flat = blake3::Hasher::new();
-        flat.update(&nonce);
-        flat.update(&peer_id);
-        flat.update(&key);
-        flat.update(&record_bytes);
-        assert_ne!(
-            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
-            *flat.finalize().as_bytes(),
-            "keyed digest must differ from the flat prefix construction"
-        );
-    }
-
-    // The legacy dialect is not ours to choose: it is what a peer on the
-    // previous release computes and compares against. Pin it to that exact
-    // construction, because a drift here is invisible locally and shows up in
-    // the field as honest upgraded nodes failing old peers' audits.
-    #[test]
-    fn the_legacy_dialect_is_the_previous_release_construction() {
-        let nonce = [0x11; 32];
-        let peer_id = [0x22; 32];
-        let key: XorName = [0x33; 32];
-        let record_bytes = vec![0xA5; 8 * 1024];
-
-        let mut flat = blake3::Hasher::new();
-        flat.update(&nonce);
-        flat.update(&peer_id);
-        flat.update(&key);
-        flat.update(&record_bytes);
-
-        assert_eq!(
-            compute_audit_digest_as(
-                AuditDigestVersion::Legacy,
-                &nonce,
-                &peer_id,
-                &key,
-                &record_bytes
-            ),
-            *flat.finalize().as_bytes(),
-            "the legacy dialect must stay BLAKE3(nonce || peer || key || bytes)"
-        );
-
-        // And the keyed selector must still be this release's construction, so
-        // the two cannot be swapped by a careless edit.
-        assert_eq!(
-            compute_audit_digest_as(
-                AuditDigestVersion::Keyed,
-                &nonce,
-                &peer_id,
-                &key,
-                &record_bytes
-            ),
-            compute_audit_digest(&nonce, &peer_id, &key, &record_bytes),
-            "the keyed dialect must be the construction this release asks in"
+            *expected.finalize().as_bytes(),
+            "digest must remain BLAKE3(nonce || peer || key || bytes)"
         );
     }
 

@@ -77,18 +77,17 @@ use crate::replication::commitment_state::{
     PeerCommitmentRecord, PersistedRetention, ResponderCommitmentState, GOSSIP_ANSWERABILITY_TTL,
 };
 use crate::replication::config::{
-    max_parallel_fetch, storage_admission_width, ReplicationConfig,
-    GRACE_POSSESSION_AUDIT_TIMEOUTS, MAX_AUDIT_RESPONSES_PER_PEER, MAX_CONCURRENT_AUDIT_RESPONSES,
-    MAX_CONCURRENT_REPLICATION_SENDS, MAX_DIGEST_AUDIT_RESPONSES_PER_PEER,
-    MAX_INCOMING_VERIFICATION_KEYS, MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS,
-    MAX_VERIFICATION_KEYS_PER_CYCLE, POSSESSION_AUDIT_PROTOCOL_ID, REPLICATION_PROTOCOL_ID,
-    SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
+    max_parallel_fetch, storage_admission_width, ReplicationConfig, MAX_AUDIT_RESPONSES_PER_PEER,
+    MAX_CONCURRENT_AUDIT_RESPONSES, MAX_CONCURRENT_REPLICATION_SENDS,
+    MAX_DIGEST_AUDIT_RESPONSES_PER_PEER, MAX_INCOMING_VERIFICATION_KEYS,
+    MAX_SUBTREE_ROUND1_PER_PEER, MAX_SUBTREE_SESSIONS, MAX_VERIFICATION_KEYS_PER_CYCLE,
+    REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID, SUBTREE_ROUND1_WORK_BURST_BYTES,
     SUBTREE_ROUND1_WORK_REFILL_BYTES_PER_SEC, SUBTREE_SESSION_TTL,
 };
 use crate::replication::paid_list::PaidList;
 use crate::replication::protocol::{
-    AuditDigestVersion, FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage,
-    ReplicationMessageBody, VerificationResponse,
+    FreshReplicationResponse, NeighborSyncResponse, ReplicationMessage, ReplicationMessageBody,
+    VerificationResponse,
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
@@ -1168,16 +1167,11 @@ const NEIGHBOR_SYNC_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 1;
 /// Match an inbound topic against the replication protocol ids, in both the bare
 /// gossip form and the `/rr/<id>` request-response form.
 ///
-/// Returns the matched id (core [`REPLICATION_PROTOCOL_ID`],
-/// [`SUBTREE_AUDIT_PROTOCOL_ID`] or [`POSSESSION_AUDIT_PROTOCOL_ID`]) and
-/// whether it was the RR form. The matched id is carried into the handler so it
-/// can enforce that each message family only arrives on its own id.
+/// Returns the matched core or [`SUBTREE_AUDIT_PROTOCOL_ID`] id and whether it
+/// was the RR form. The matched id is carried into the handler so it can enforce
+/// that subtree messages only arrive on the subtree id.
 fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
-    for id in [
-        REPLICATION_PROTOCOL_ID,
-        SUBTREE_AUDIT_PROTOCOL_ID,
-        POSSESSION_AUDIT_PROTOCOL_ID,
-    ] {
+    for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
         if topic == id {
             return Some((id, false));
         }
@@ -1191,91 +1185,24 @@ fn match_replication_protocol(topic: &str) -> Option<(&'static str, bool)> {
 }
 
 /// Whether a decoded body belongs on the protocol id it arrived on:
-/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`], possession-audit
-/// bodies on [`POSSESSION_AUDIT_PROTOCOL_ID`], every other body on
-/// [`REPLICATION_PROTOCOL_ID`].
+/// subtree-audit bodies on [`SUBTREE_AUDIT_PROTOCOL_ID`] and every other body,
+/// including digest audits, on [`REPLICATION_PROTOCOL_ID`].
 ///
 /// The receive guard drops any mismatch (a cross-version or misrouted message);
 /// sharing this one predicate between the guard and its regression test means a
 /// change to the rule cannot pass the test unnoticed.
 fn body_matches_protocol(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    protocol == response_protocol_for(body) || is_legacy_possession_challenge(body, protocol)
-}
-
-/// A possession challenge from a peer that predates the family split, arriving
-/// on the core id.
-///
-/// ROLLOUT — paired with [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] and removed with
-/// it. That gate softens what THIS node concludes about a silent peer, which is
-/// only half the window: the other half is what an un-upgraded peer concludes
-/// about this one. Its binary sends responsible-chunk and prune-confirmation
-/// challenges on the core id, has no dedicated possession id to try, and turns
-/// the resulting timeout straight into an audit-severity failure. Dropping
-/// those challenges would therefore have every not-yet-upgraded neighbour
-/// penalise an upgraded node at confirmed-failure weight for the whole window,
-/// which is the release punishing the nodes that took it — and no constant in
-/// this binary can reach the auditor to stop it.
-///
-/// So they are answered, on the id they arrived on and in the digest
-/// construction that peer verifies with. The two possession messages are
-/// byte-identical to the previous release, so nothing is being reinterpreted;
-/// only the digest construction moved, and the responder picks it from the
-/// asker. Challenges only: this node always sends its own on the dedicated id,
-/// so a *response* on the core id is never one it asked for and stays refused.
-///
-/// What this costs, stated exactly, because it is a weakening and not only a
-/// shim. The legacy construction is the flat prefix hash this release replaced
-/// precisely because it is preprocessing-weak: a responder can keep BLAKE3
-/// chaining state instead of the record and still match. So an upgraded node
-/// answering an old auditor is no stronger than an old node answering it, which
-/// matters most in the prune lane, where a matching digest counts toward a
-/// quorum authorising deletion.
-///
-/// The bound is that this never goes below what is deployed today, and cannot be
-/// steered. The dialect is chosen by the ASKER, while the party that gains from
-/// the weak construction is the RESPONDER, so a malicious holder cannot elect to
-/// be asked weakly. Only a peer whose own binary already accepts nothing
-/// stronger asks that way — every lane on this release asks on the dedicated id,
-/// pinned by `every_digest_lane_asks_on_the_dedicated_id` — so the exposure is
-/// exactly the one that peer already has to every un-upgraded node it audits,
-/// and it ends when the gate does.
-fn is_legacy_possession_challenge(body: &ReplicationMessageBody, protocol: &str) -> bool {
-    GRACE_POSSESSION_AUDIT_TIMEOUTS
-        && protocol == REPLICATION_PROTOCOL_ID
-        && matches!(body, ReplicationMessageBody::AuditChallenge(_))
-}
-
-/// The digest construction to answer a possession challenge in, and the id to
-/// answer it on, given where it arrived.
-///
-/// The dedicated id exists only on this release, so a challenge there is from a
-/// peer that shares this construction. Anything else is the legacy dialect, and
-/// [`is_legacy_possession_challenge`] has already refused the bodies that must
-/// not reach here.
-fn possession_reply_dialect(inbound_protocol: &str) -> (AuditDigestVersion, &'static str) {
-    if inbound_protocol == POSSESSION_AUDIT_PROTOCOL_ID {
-        (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID)
-    } else {
-        (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID)
-    }
+    protocol == response_protocol_for(body)
 }
 
 /// The protocol id a body belongs on — the single source of truth for BOTH
 /// directions: the receive guard ([`body_matches_protocol`]) and the outbound
 /// response selector in `send_replication_response_checked`.
 ///
-/// Sharing one function is what makes the family isolation symmetric. It also
-/// removes a dependency on transport behaviour: saorsa-core correlates an RR
-/// response by `(peer, msg_id)` rather than by protocol name, so a possession
-/// `AuditResponse` sent on the core id would still reach an auditor waiting on
-/// the possession id — but a bare (non-RR) response sent that way is dropped by
-/// the peer's own guard, and correlation is a detail this layer should not rely
-/// on.
+/// Sharing one function makes the subtree/core isolation symmetric.
 fn response_protocol_for(body: &ReplicationMessageBody) -> &'static str {
     if body.is_subtree_audit() {
         SUBTREE_AUDIT_PROTOCOL_ID
-    } else if body.is_possession_audit() {
-        POSSESSION_AUDIT_PROTOCOL_ID
     } else {
         REPLICATION_PROTOCOL_ID
     }
@@ -2449,10 +2376,8 @@ impl ReplicationEngine {
     ///
     /// Drains scheduled possession-check events and, for each, waits a
     /// randomised 5-15 minute settle delay before probing every responsible
-    /// peer for actual possession. A peer that cryptographically fails to prove
-    /// possession is penalised at `AuditChallenge` severity. A peer that simply
-    /// does not answer normally is too, but that is suspended for the
-    /// possession-audit protocol rollout — see `GRACE_POSSESSION_AUDIT_TIMEOUTS`.
+    /// peer for actual possession. A peer that fails to prove possession or does
+    /// not answer is penalised at `AuditChallenge` severity.
     fn start_possession_check_scheduler(&mut self) {
         let Some(mut rx) = self.possession_check_rx.take() else {
             return;
@@ -2899,7 +2824,6 @@ impl ReplicationEngine {
                         match handle_replication_message(
                             &source,
                             inbound.msg,
-                            inbound.inbound_protocol,
                             &serial_context,
                             inbound.received_at,
                             inbound.rr_message_id.as_deref(),
@@ -2960,16 +2884,19 @@ impl ReplicationEngine {
                         let inbound = InboundReplicationMessage {
                             source,
                             msg,
-                            inbound_protocol,
                             rr_message_id,
                             received_at,
                         };
-                        if audit_responder_class(&inbound.msg.body).is_some() {
+                        if matches!(
+                            inbound.msg.body,
+                            ReplicationMessageBody::AuditChallenge(_)
+                                | ReplicationMessageBody::SubtreeAuditChallenge(_)
+                                | ReplicationMessageBody::SubtreeSliceChallenge(_)
+                        ) {
                             let source = inbound.source;
                             match handle_replication_message(
                                 &source,
                                 inbound.msg,
-                                inbound.inbound_protocol,
                                 &handler_context,
                                 inbound.received_at,
                                 inbound.rr_message_id.as_deref(),
@@ -4270,7 +4197,6 @@ struct ReplicationMessageHandlerContext {
 struct InboundReplicationMessage {
     source: PeerId,
     msg: ReplicationMessage,
-    inbound_protocol: &'static str,
     rr_message_id: Option<String>,
     received_at: Instant,
 }
@@ -4808,7 +4734,6 @@ async fn admit_audit_responder(
 async fn handle_replication_message(
     source: &PeerId,
     msg: ReplicationMessage,
-    inbound_protocol: &'static str,
     ctx: &ReplicationMessageHandlerContext,
     received_at: Instant,
     rr_message_id: Option<&str>,
@@ -4896,9 +4821,8 @@ async fn handle_replication_message(
             // block all other replication traffic until its digests complete
             // (head-of-line blocking). The same flood-fair admission applies: a
             // global ceiling AND a per-peer cap, dropping the challenge if either
-            // is hit. A dropped challenge reads as a timeout to the auditor, and
-            // once the rollout gate is removed that is penalised again by the
-            // caller, so the caps must remain high enough for honest audit load;
+            // is hit. A dropped challenge reads as a penalised timeout to the
+            // auditor, so the caps must remain high enough for honest audit load;
             // the per-peer share still prevents one flooder from starving others.
             let class = AuditResponderClass::Digest;
             let guard = match admit_audit_responder(
@@ -4973,11 +4897,6 @@ async fn handle_replication_message(
             let request_id = msg.request_id;
             let rr_message_id = rr_message_id.map(ToOwned::to_owned);
             let responder_metrics = Arc::clone(&ctx.audit_responder_metrics);
-            // Answer in the asker's dialect, on the id it asked over. During
-            // the rollout window both can be the previous release's. Resolved
-            // here because both halves are `Copy` and `'static`, so the
-            // inbound protocol's borrow does not have to outlive this frame.
-            let (digest_version, reply_protocol) = possession_reply_dialect(inbound_protocol);
             ctx.detached_task_tracker.spawn(async move {
                 let _guard = guard; // global permit + per-peer slot, held until done
                 let worker_started = Instant::now();
@@ -4990,9 +4909,8 @@ async fn handle_replication_message(
                     ReplyRoute {
                         request_id,
                         rr_message_id: rr_message_id.as_deref(),
-                        protocol: reply_protocol,
+                        protocol: REPLICATION_PROTOCOL_ID,
                     },
-                    digest_version,
                 )
                 .await
                 {
@@ -6901,7 +6819,6 @@ async fn handle_audit_challenge_msg(
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
     reply: ReplyRoute<'_>,
-    digest_version: AuditDigestVersion,
 ) -> Result<AuditResponderCompletion> {
     #[allow(clippy::cast_possible_truncation)]
     let stored_chunks = storage.current_chunks().map_or(0, |c| c as usize);
@@ -6919,7 +6836,6 @@ async fn handle_audit_challenge_msg(
         p2p_node.peer_id(),
         is_bootstrapping,
         stored_chunks,
-        digest_version,
     )
     .await;
     let processing = processing_started.elapsed();
@@ -8768,30 +8684,10 @@ async fn handle_subtree_audit_result(
 /// bootstrapping); every confirmed storage-integrity reason does.
 ///
 /// Responsible-chunk `AuditChallenge` failures use this directly: timeouts keep
-/// the bootstrap claim, matching the pre-ADR-0002 behaviour. Whether a timeout
-/// is also *penalised* is a separate question — see
-/// [`audit_failure_reports_trust_penalty`].
+/// the bootstrap claim, matching the pre-ADR-0002 behaviour, while every failure
+/// still reports the normal audit trust penalty.
 fn audit_failure_clears_bootstrap_claim(reason: &AuditFailureReason) -> bool {
     !matches!(reason, AuditFailureReason::Timeout)
-}
-
-/// Whether an audit failure with this reason reports an application trust event
-/// at [`AUDIT_FAILURE_TRUST_WEIGHT`](config::AUDIT_FAILURE_TRUST_WEIGHT).
-///
-/// ROLLOUT GATE — see [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]. While that gate is
-/// set, a `Timeout` on the digest lanes is graced, because a peer on the other
-/// side of the possession-audit protocol move never answers and its silence is
-/// not evidence about its storage. Every other reason is a confirmed failure and
-/// is always penalised. When the gate is removed this becomes `true` for every
-/// reason, restoring the unconditional penalty.
-///
-/// [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: config::GRACE_POSSESSION_AUDIT_TIMEOUTS
-fn audit_failure_reports_trust_penalty(reason: &AuditFailureReason) -> bool {
-    if config::GRACE_POSSESSION_AUDIT_TIMEOUTS {
-        !matches!(reason, AuditFailureReason::Timeout)
-    } else {
-        true
-    }
 }
 
 /// Handle the result of a responsible-chunk audit tick (audit #2): emit trust
@@ -8855,19 +8751,12 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                if audit_failure_reports_trust_penalty(reason) {
-                    p2p_node
-                        .report_trust_event(
-                            challenged_peer,
-                            TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                        )
-                        .await;
-                } else {
-                    debug!(
-                        "Audit timeout for {challenged_peer} graced during the possession-audit \
-                         protocol rollout (no confirmed-failure penalty)"
-                    );
-                }
+                p2p_node
+                    .report_trust_event(
+                        challenged_peer,
+                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
+                    )
+                    .await;
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -9695,209 +9584,61 @@ mod tests {
     use std::time::SystemTime;
 
     #[test]
-    fn match_replication_protocol_accepts_both_ids_bare_and_rr() {
-        // Core id, bare gossip form and /rr/ request-response form.
+    fn match_replication_protocol_accepts_core_and_subtree_bare_and_rr() {
+        for id in [REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID] {
+            assert_eq!(match_replication_protocol(id), Some((id, false)));
+            assert_eq!(
+                match_replication_protocol(&format!("{RR_PREFIX}{id}")),
+                Some((id, true))
+            );
+        }
         assert_eq!(
-            match_replication_protocol(REPLICATION_PROTOCOL_ID),
-            Some((REPLICATION_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{REPLICATION_PROTOCOL_ID}")),
-            Some((REPLICATION_PROTOCOL_ID, true))
-        );
-        // Subtree-audit id, both forms.
-        assert_eq!(
-            match_replication_protocol(SUBTREE_AUDIT_PROTOCOL_ID),
-            Some((SUBTREE_AUDIT_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{SUBTREE_AUDIT_PROTOCOL_ID}")),
-            Some((SUBTREE_AUDIT_PROTOCOL_ID, true))
-        );
-        // Possession-audit id, both forms.
-        assert_eq!(
-            match_replication_protocol(POSSESSION_AUDIT_PROTOCOL_ID),
-            Some((POSSESSION_AUDIT_PROTOCOL_ID, false))
-        );
-        assert_eq!(
-            match_replication_protocol(&format!("{RR_PREFIX}{POSSESSION_AUDIT_PROTOCOL_ID}")),
-            Some((POSSESSION_AUDIT_PROTOCOL_ID, true))
-        );
-        // Foreign topics (incl. a bare /rr/ and an unrelated protocol) don't match.
-        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
-        assert_eq!(match_replication_protocol(RR_PREFIX), None);
-        assert_eq!(
-            match_replication_protocol("autonomi.ant.replication.v3"),
+            match_replication_protocol("autonomi.ant.replication.possession-audit.v2"),
             None
         );
+        assert_eq!(match_replication_protocol("autonomi.ant.dht.v1"), None);
+        assert_eq!(match_replication_protocol(RR_PREFIX), None);
     }
 
-    // The receive guard drops a body whose family disagrees with the id it rode:
-    // subtree-audit bodies only on the subtree id, possession-audit bodies only on
-    // the possession id, core bodies only on the core id. This is what stops a
-    // mixed-version peer's message from being honoured on the wrong handler after
-    // a postcard misdecode. The test drives the SAME `body_matches_protocol` the
-    // production guard uses, over real bodies, so a regression in the rule fails
-    // here.
     #[test]
-    fn body_matches_protocol_is_symmetric_over_real_bodies() {
+    fn body_matches_protocol_is_symmetric_over_core_and_subtree_bodies() {
         use crate::replication::protocol::{
             AuditChallenge, AuditResponse, FreshReplicationOffer, ReplicationMessageBody,
             SubtreeSliceChallenge,
         };
-        // A subtree-audit body (models a v2 SubtreeByteChallenge, which decodes to
-        // this variant 13 under the new enum), a possession-audit body, and a
-        // core body.
-        let audit = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
+
+        let subtree = ReplicationMessageBody::SubtreeSliceChallenge(SubtreeSliceChallenge {
             challenge_id: 1,
             nonce: [0u8; 32],
             challenged_peer_id: [0u8; 32],
             expected_commitment_hash: [0u8; 32],
             openings: vec![],
         });
-        let possession = ReplicationMessageBody::AuditChallenge(AuditChallenge {
+        let digest_challenge = ReplicationMessageBody::AuditChallenge(AuditChallenge {
             challenge_id: 1,
             nonce: [0u8; 32],
             challenged_peer_id: [0u8; 32],
             keys: vec![[0u8; 32]],
         });
+        let digest_response =
+            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 });
         let core = ReplicationMessageBody::FreshReplicationOffer(FreshReplicationOffer {
             key: [0u8; 32],
             data: vec![],
             proof_of_payment: vec![],
         });
-        // Correct routing is kept.
-        assert!(body_matches_protocol(&audit, SUBTREE_AUDIT_PROTOCOL_ID));
-        assert!(body_matches_protocol(
-            &possession,
-            POSSESSION_AUDIT_PROTOCOL_ID
-        ));
-        assert!(body_matches_protocol(&core, REPLICATION_PROTOCOL_ID));
-        // Every cross-routing is dropped, with one deliberate exception below.
-        for (body, wrong) in [
-            (&audit, REPLICATION_PROTOCOL_ID),
-            (&audit, POSSESSION_AUDIT_PROTOCOL_ID),
-            (&possession, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&core, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&core, POSSESSION_AUDIT_PROTOCOL_ID),
-        ] {
-            assert!(
-                !body_matches_protocol(body, wrong),
-                "body must not be accepted on {wrong}"
-            );
+
+        assert!(body_matches_protocol(&subtree, SUBTREE_AUDIT_PROTOCOL_ID));
+        assert!(!body_matches_protocol(&subtree, REPLICATION_PROTOCOL_ID));
+
+        for body in [&digest_challenge, &digest_response, &core] {
+            assert!(body_matches_protocol(body, REPLICATION_PROTOCOL_ID));
+            assert!(!body_matches_protocol(body, SUBTREE_AUDIT_PROTOCOL_ID));
         }
 
-        // The exception: a possession CHALLENGE on the core id, which is where a
-        // peer that predates the family split still sends it.
-        //
-        // This used to be dropped, reasoning that answering with a digest from a
-        // different generation would score as a confirmed mismatch against an
-        // honest peer. True, but it weighed only one side. Dropping it does not
-        // make the old peer neutral — its binary turns the resulting timeout
-        // straight into an audit-severity failure, and no constant here can
-        // reach it. So silence costs the honest upgraded node exactly what a
-        // mismatch would, and the release would penalise the nodes that took it.
-        // Answered in the asker's dialect, neither happens.
-        assert_eq!(
-            body_matches_protocol(&possession, REPLICATION_PROTOCOL_ID),
-            GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "a legacy possession challenge is answered exactly while the rollout gate is set"
-        );
-
-        // A possession RESPONSE on the core id stays refused either way: this
-        // node always asks on the dedicated id, so a reply there is not one it
-        // asked for.
-        let possession_reply =
-            ReplicationMessageBody::AuditResponse(AuditResponse::Bootstrapping { challenge_id: 1 });
-        assert!(
-            !body_matches_protocol(&possession_reply, REPLICATION_PROTOCOL_ID),
-            "an unsolicited possession response on the core id must never be accepted"
-        );
-
-        // Send and receive must agree. A RESPONSE is routed by the same rule, so
-        // the id a body is sent on is always an id the peer's guard accepts.
-        // Before this was shared, possession responses went out on the core id
-        // and only worked because saorsa-core correlates RR replies by
-        // (peer, msg_id) rather than by protocol name — a bare possession
-        // response was dropped by the receiving guard.
-        for (body, expected) in [
-            (&audit, SUBTREE_AUDIT_PROTOCOL_ID),
-            (&possession, POSSESSION_AUDIT_PROTOCOL_ID),
-            (&core, REPLICATION_PROTOCOL_ID),
-        ] {
-            assert_eq!(
-                response_protocol_for(body),
-                expected,
-                "a response must be sent on the family's own id"
-            );
-            assert!(
-                body_matches_protocol(body, response_protocol_for(body)),
-                "the id we send on must be one the receive guard accepts"
-            );
+        for body in [&subtree, &digest_challenge, &digest_response, &core] {
+            assert!(body_matches_protocol(body, response_protocol_for(body)));
         }
-
-        // The possession RESPONSE body (not just the challenge) routes to the
-        // possession id too — that is the direction that was actually wrong.
-        let possession_response = ReplicationMessageBody::AuditResponse(
-            crate::replication::protocol::AuditResponse::Digests {
-                challenge_id: 1,
-                digests: vec![[0u8; 32]],
-            },
-        );
-        assert_eq!(
-            response_protocol_for(&possession_response),
-            POSSESSION_AUDIT_PROTOCOL_ID
-        );
-    }
-
-    // A challenge is answered in the dialect it was asked in, on the id it was
-    // asked over. Getting either half wrong during the rollout window costs an
-    // honest node an audit-severity failure: the wrong digest reads as a
-    // mismatch, and the wrong id never reaches the asker at all.
-    #[test]
-    fn a_possession_challenge_is_answered_in_the_dialect_it_was_asked_in() {
-        assert_eq!(
-            possession_reply_dialect(POSSESSION_AUDIT_PROTOCOL_ID),
-            (AuditDigestVersion::Keyed, POSSESSION_AUDIT_PROTOCOL_ID),
-            "a peer on the dedicated id shares this release's construction"
-        );
-        assert_eq!(
-            possession_reply_dialect(REPLICATION_PROTOCOL_ID),
-            (AuditDigestVersion::Legacy, REPLICATION_PROTOCOL_ID),
-            "a peer still on the core id verifies with the previous construction"
-        );
-    }
-
-    // The legacy construction is preprocessing-weak — that is why it was
-    // replaced — so being answered in it is a real weakening. It is bounded by
-    // the fact that the ASKER picks the dialect while the RESPONDER is the one
-    // who gains from a weak one: a malicious holder cannot elect to be asked
-    // weakly, and only a peer that already accepts nothing stronger asks that
-    // way. That holds exactly while no lane on this release asks on the core id,
-    // which is what this pins. All three route through one function so a new
-    // lane cannot pick an id by hand.
-    //
-    // FLIPS IF: a digest lane is given its own protocol id again, or the shared
-    // one is pointed at the core id.
-    #[test]
-    fn every_digest_lane_asks_on_the_dedicated_id() {
-        use crate::replication::config::possession_challenge_protocol;
-
-        let (dialect, reply_on) = possession_reply_dialect(possession_challenge_protocol());
-        assert_eq!(
-            dialect,
-            AuditDigestVersion::Keyed,
-            "what this release asks on must be answered in the current construction"
-        );
-        assert_eq!(
-            reply_on, POSSESSION_AUDIT_PROTOCOL_ID,
-            "and answered on the dedicated id"
-        );
-        assert_ne!(
-            possession_challenge_protocol(),
-            REPLICATION_PROTOCOL_ID,
-            "asking on the core id would be asking for the superseded digest"
-        );
     }
 
     fn test_peer(b: u8) -> PeerId {
@@ -10434,35 +10175,8 @@ mod tests {
         );
     }
 
-    // The rollout gate must grace exactly ONE thing — a timeout — and nothing
-    // else. A confirmed storage-integrity failure is still penalised while the
-    // gate is set, otherwise moving the possession lanes onto their own protocol
-    // id would have handed cheating peers an amnesty for the upgrade window.
-    //
-    // FOLLOW-UP: when `GRACE_POSSESSION_AUDIT_TIMEOUTS` is set to false and the
-    // gate deleted, the timeout expectation below flips to `true`. That is the
-    // intended end state, and this test is where the flip is reflected.
     #[test]
-    fn rollout_gate_graces_only_timeouts() {
-        for reason in [
-            AuditFailureReason::DigestMismatch,
-            AuditFailureReason::KeyAbsent,
-            AuditFailureReason::MalformedResponse,
-            AuditFailureReason::Rejected,
-        ] {
-            assert!(
-                audit_failure_reports_trust_penalty(&reason),
-                "{reason:?} is a confirmed failure and must be penalised even during rollout"
-            );
-        }
-        assert_eq!(
-            audit_failure_reports_trust_penalty(&AuditFailureReason::Timeout),
-            !config::GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "a timeout is penalised exactly when the rollout gate is off"
-        );
-
-        // Holder credit is a separate axis that was already timeout-safe; the
-        // gate must not have disturbed it.
+    fn holder_credit_revocation_distinguishes_timeout_from_confirmed_failure() {
         assert!(!audit_failure_revokes_holder_credit(
             &AuditFailureReason::Timeout
         ));
@@ -10470,6 +10184,7 @@ mod tests {
             &AuditFailureReason::DigestMismatch
         ));
     }
+
     #[tokio::test]
     async fn audit_responder_admission_reports_per_peer_cap_full() {
         let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES));
@@ -12464,7 +12179,6 @@ mod tests {
                     key: test_key(1),
                 }),
             },
-            inbound_protocol: REPLICATION_PROTOCOL_ID,
             rr_message_id: None,
             received_at: Instant::now(),
         };
@@ -12474,7 +12188,6 @@ mod tests {
                 request_id: 2,
                 body: dropped_body.clone(),
             },
-            inbound_protocol: REPLICATION_PROTOCOL_ID,
             rr_message_id: None,
             received_at: Instant::now(),
         };

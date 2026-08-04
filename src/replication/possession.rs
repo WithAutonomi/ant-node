@@ -3,8 +3,8 @@
 //! After a node fresh-replicates a chunk, every close-group peer responsible
 //! for it is checked 5-15 minutes later for actual possession. The check is a
 //! single-key cryptographic
-//! [`AuditChallenge`]: the probed peer must return
-//! `compute_audit_digest(nonce, peer_id, key, bytes)` computed over the
+//! [`AuditChallenge`]: the probed
+//! peer must return `BLAKE3(nonce ‖ peer_id ‖ key ‖ bytes)` computed over the
 //! chunk it claims to hold. It cannot produce that digest without the bytes, so
 //! — unlike a self-reported presence flag — a peer cannot escape the check by
 //! falsely asserting possession. A peer that holds the chunk earns nothing —
@@ -15,17 +15,10 @@
 //! push is irrelevant: a peer the push never reached is still checked and
 //! penalised if it lacks the chunk.
 //!
-//! Peer-side malformed, rejected, or mismatched responses are audit failures. A
-//! matching bootstrap claim uses the shared bootstrap-claim grace/abuse tracker.
-//!
-//! A peer unreachable at check time would normally be penalised at audit
-//! severity too, matching the responsible-chunk `AuditChallenge` path, but that
-//! is currently suspended: this lane moved to its own protocol id, so a peer on
-//! the far side of the upgrade never answers, and
-//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`] graces silence until the fleet has moved
-//! over. See `probe_outcome_is_penalised`.
-//!
-//! [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]: crate::replication::config::GRACE_POSSESSION_AUDIT_TIMEOUTS
+//! A peer unreachable at check time is penalised immediately at audit severity,
+//! matching the responsible-chunk `AuditChallenge` path. A matching bootstrap
+//! claim uses the shared bootstrap-claim grace/abuse tracker; peer-side
+//! malformed, rejected, or mismatched responses are audit failures.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,8 +34,7 @@ use crate::logging::{debug, info, warn};
 use crate::replication::audit_coordinator::AuditChallengeCoordinator;
 use crate::replication::audit_metrics::{self, AuditFailureClass, AuditType};
 use crate::replication::config::{
-    possession_challenge_protocol, ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT,
-    GRACE_POSSESSION_AUDIT_TIMEOUTS,
+    ReplicationConfig, AUDIT_FAILURE_TRUST_WEIGHT, REPLICATION_PROTOCOL_ID,
 };
 use crate::replication::protocol::{
     compute_audit_digest, AuditChallenge, AuditResponse, ReplicationMessage,
@@ -70,7 +62,6 @@ pub struct PossessionCheckEvent {
 }
 
 /// Verdict of cryptographically probing a single peer for possession of a chunk.
-#[derive(Clone, Copy)]
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 enum ProbeOutcome {
     /// Peer returned a digest proving it holds the chunk's bytes.
@@ -78,8 +69,8 @@ enum ProbeOutcome {
     /// Peer failed the audit challenge: absent sentinel, digest mismatch,
     /// rejection, mismatched challenge ID, wrong digest count, or malformed reply.
     Failed(PossessionFailureReason),
-    /// No response (transport error / deadline). The class is node-local
-    /// observability; the rollout gate controls whether silence is penalised.
+    /// No response. Penalised immediately at audit-failure severity; the class
+    /// is node-local observability only.
     NoResponse(AuditFailureClass),
     /// Peer returned a matching bootstrap claim. Graced only through the shared
     /// bootstrap-claim tracker.
@@ -117,31 +108,6 @@ impl PossessionFailureReason {
     }
 }
 
-/// Whether a probe outcome is reported as an audit-severity failure.
-///
-/// `Failed` is the peer answering and being wrong — the absent sentinel, a
-/// digest that does not match, a rejection. That is evidence, and it is
-/// penalised throughout.
-///
-/// `NoResponse` is silence, and while the [`GRACE_POSSESSION_AUDIT_TIMEOUTS`]
-/// rollout gate is set it is graced: a peer on the far side of the
-/// possession-audit protocol move never answers this lane, so its silence says
-/// nothing about whether it holds the chunk. Penalising it would punish honest
-/// peers for a version skew for the whole upgrade window.
-///
-/// Exhaustive rather than a catch-all, so a new outcome cannot silently inherit
-/// "not penalised", and extracted as a predicate so the rollout decision can be
-/// asserted without driving a live probe.
-#[must_use]
-fn probe_outcome_is_penalised(outcome: ProbeOutcome) -> bool {
-    match outcome {
-        ProbeOutcome::Failed(_) => true,
-        ProbeOutcome::NoResponse(_) => !GRACE_POSSESSION_AUDIT_TIMEOUTS,
-        // Proven, claimed-and-tracked, or never actually asked.
-        ProbeOutcome::Present | ProbeOutcome::BootstrapClaim | ProbeOutcome::Inconclusive => false,
-    }
-}
-
 /// Pick a randomised delay in `[min, max]` to wait before a possession check
 /// runs. The bounds come from `ReplicationConfig` (defaulting to
 /// `POSSESSION_CHECK_DELAY_MIN`/`MAX`) so tests can shorten them.
@@ -164,9 +130,8 @@ pub fn random_delay(min: Duration, max: Duration) -> Duration {
 /// PUT. If the checker no longer holds it (e.g. pruned), the check is moot and
 /// is skipped without penalising anyone.
 ///
-/// A peer that responds with a failed proof is penalised at `AuditChallenge`
-/// severity immediately. Silence is graced only while the possession-audit
-/// protocol rollout gate is active. A responsive peer is left unrewarded.
+/// A peer that fails to prove possession, including by timeout, is penalised at
+/// `AuditChallenge` severity immediately. A responsive peer is left unrewarded.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_possession_check(
     key: XorName,
@@ -197,9 +162,8 @@ pub(crate) async fn run_possession_check(
     };
 
     // Single-key probe budget, matched to the audit response timeout's
-    // bandwidth-calibrated deadline: generous for an honest local-disk read, and
-    // a liveness bound rather than an anti-relay one — the reply is one digest,
-    // so no deadline prices a relay out of producing it (ADR-0009).
+    // bandwidth-calibrated deadline (tight enough that a relay that must refetch
+    // the bytes blows it, generous for an honest local-disk read).
     let probe_timeout = possession_probe_response_timeout(config);
 
     for peer in peers {
@@ -226,14 +190,7 @@ pub(crate) async fn run_possession_check(
             }
             ProbeOutcome::NoResponse(class) => {
                 audit_metrics::record_audit_no_response(AuditType::Possession, class);
-                if probe_outcome_is_penalised(ProbeOutcome::NoResponse(class)) {
-                    report_possession_audit_failure(&peer, &key_hex, class, p2p_node).await;
-                } else {
-                    debug!(
-                        "Possession check: {peer} timed out for {key_hex}; graced during the \
-                         possession-audit protocol rollout (not penalised)"
-                    );
-                }
+                report_possession_audit_failure(&peer, &key_hex, class, p2p_node).await;
             }
             ProbeOutcome::BootstrapClaim => {
                 handle_possession_bootstrap_claim(&peer, &key_hex, p2p_node, config, sync_state)
@@ -359,7 +316,7 @@ async fn handle_possession_bootstrap_claim(
 /// response. The peer proves possession by returning
 /// `compute_audit_digest(nonce, peer, key, bytes)`; absence is proven by the
 /// [`ABSENT_KEY_DIGEST`] sentinel or any digest that does not match the
-/// checker's canonical copy. A transport failure / deadline is a `NoResponse`; a
+/// checker's canonical copy. A transport failure / deadline is a `Timeout`; a
 /// matching bootstrap response is a `BootstrapClaim`; a local encode failure is
 /// `Inconclusive`; peer-side malformed, rejected, or mismatched replies are
 /// `Failed`.
@@ -415,12 +372,7 @@ async fn probe_once(
     );
     let request_started = Instant::now();
     let response = match p2p_node
-        .send_request(
-            peer,
-            possession_challenge_protocol(),
-            encoded,
-            probe_timeout,
-        )
+        .send_request(peer, REPLICATION_PROTOCOL_ID, encoded, probe_timeout)
         .await
     {
         Ok(response) => {
@@ -461,7 +413,7 @@ async fn probe_once(
         }
     };
 
-    let decoded = match ReplicationMessage::decode_audit_response(&response.data) {
+    let decoded = match ReplicationMessage::decode(&response.data) {
         Ok(decoded) => decoded,
         Err(e) => {
             debug!("Failed to decode possession response from {peer}: {e}");
@@ -536,37 +488,6 @@ fn interpret_audit_response(
 mod tests {
     use super::*;
     use crate::replication::config::{POSSESSION_CHECK_DELAY_MAX, POSSESSION_CHECK_DELAY_MIN};
-
-    // The possession probe's half of the rollout-gate contract (dirvine, PR
-    // #181). Silence is graced while the gate is set; every outcome where the
-    // peer actually answered and was wrong stays penalised.
-    #[test]
-    fn possession_rollout_gate_graces_silence_but_never_a_bad_answer() {
-        assert!(
-            probe_outcome_is_penalised(ProbeOutcome::Failed(
-                PossessionFailureReason::DigestMismatch,
-            )),
-            "an absent sentinel or mismatched digest is evidence — always penalised"
-        );
-        assert_eq!(
-            probe_outcome_is_penalised(ProbeOutcome::NoResponse(AuditFailureClass::Timeout)),
-            !GRACE_POSSESSION_AUDIT_TIMEOUTS,
-            "silence is penalised exactly when the rollout gate is off"
-        );
-        // A proven holder, a tracked bootstrap claim, and a probe that never
-        // left this node are all not failures at all — the gate must not have
-        // made any of them one.
-        for outcome in [
-            ProbeOutcome::Present,
-            ProbeOutcome::BootstrapClaim,
-            ProbeOutcome::Inconclusive,
-        ] {
-            assert!(
-                !probe_outcome_is_penalised(outcome),
-                "{outcome:?} is not an audit failure"
-            );
-        }
-    }
 
     const PEER_ID: [u8; 32] = [0x42; 32];
     const NONCE: [u8; 32] = [0x7a; 32];

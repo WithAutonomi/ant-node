@@ -181,7 +181,7 @@ pub const MAX_CONCURRENT_REPLICATION_SENDS: usize = 3;
 /// bounding the round-2 worst-case disk reads (each request reads at most
 /// `BYTE_SPOTCHECK_MAX` distinct chunks — the openings are coalesced and the
 /// distinct-key count is capped — to build its slice proofs).
-pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 16;
+pub const MAX_CONCURRENT_AUDIT_RESPONSES: usize = 32;
 
 /// Maximum concurrent in-flight audit-responder tasks from any SINGLE peer.
 ///
@@ -387,59 +387,14 @@ const PRUNE_HYSTERESIS_DURATION_SECS: u64 = 3 * 24 * 60 * 60; // 3 days
 /// Minimum continuous out-of-range duration before pruning a key.
 pub const PRUNE_HYSTERESIS_DURATION: Duration = Duration::from_secs(PRUNE_HYSTERESIS_DURATION_SECS);
 
-/// Protocol identifier for core replication operations (fresh replication,
-/// neighbour sync, verification, fetch, repair, commitment fetch).
+/// Protocol identifier for core replication operations, including the
+/// digest-based responsible-chunk, possession, and prune-confirmation audits.
 ///
-/// Kept at `v2`: none of these messages changed on the wire in the V2-685 slice
-/// audit, so v2 and v3 nodes interoperate on all of them. The two message
-/// families whose *semantics* changed each ride their own id
-/// ([`SUBTREE_AUDIT_PROTOCOL_ID`], [`POSSESSION_AUDIT_PROTOCOL_ID`]) so a version
-/// bump in either cannot partition core replication. A node filters inbound
-/// messages by exact topic match (see the dispatch in `mod.rs`).
+/// Kept at `v2`: the V2-685 work changes only the subtree-audit wire family.
+/// Fresh replication, neighbour sync, fetch, repair, verification, and the
+/// digest-based audit lanes therefore continue interoperating on this id. A node
+/// filters inbound messages by exact topic match (see the dispatch in `mod.rs`).
 pub const REPLICATION_PROTOCOL_ID: &str = "autonomi.ant.replication.v2";
-
-/// Protocol identifier for the digest-based possession audits.
-///
-/// Carries the `AuditChallenge`/`AuditResponse` pair shared by the
-/// responsible-chunk audit, the post-replication possession probe, and the
-/// prune-confirmation audit.
-///
-/// These messages keep their wire *shape*, but the digest they carry is now the
-/// domain-separated keyed construction
-/// ([`crate::replication::protocol::compute_audit_digest`]) rather than the
-/// earlier flat prefix hash, so a peer on the old construction and a peer on the
-/// new one compute different digests for the same bytes. Left on the shared core
-/// id, that difference would read as a *confirmed* `DigestMismatch` on every
-/// cross-version exchange, which carries [`AUDIT_FAILURE_TRUST_WEIGHT`] and runs
-/// the responsibility-confirmation path — a false-positive penalty on honest
-/// peers for the whole upgrade window.
-///
-/// Routing them on their own id converts that into a benign pause: a
-/// cross-version challenge is simply not answered, so it lands in the graced
-/// timeout lane instead of the confirmed-failure lane. The rollout effect is the
-/// same bounded one described on [`SUBTREE_AUDIT_PROTOCOL_ID`]: `saorsa-core`'s
-/// `send_request` still records a unit trust failure per unanswered request, and
-/// these lanes probe more often than the 30-minute subtree cooldown, so the dip
-/// is larger than the subtree lane's while still decaying back to neutral. That
-/// is strictly milder than a stream of weight-5 confirmed failures, and milder
-/// than bumping the shared id, which would also break sync, quorum, fetch,
-/// repair and commitment fetch.
-///
-/// `v2` here is the digest generation, not the message shape.
-pub const POSSESSION_AUDIT_PROTOCOL_ID: &str = "autonomi.ant.replication.possession-audit.v2";
-
-/// The id every digest lane asks on.
-///
-/// One function rather than three hand-written constants, because during the
-/// rollout window the id a challenge is sent on selects the digest construction
-/// it comes back in: a lane that asked on the core id would be asking for the
-/// superseded one, which is preprocessing-weak and is the reason it was
-/// replaced. A lane cannot get that wrong if it cannot choose. Pinned by
-/// `every_digest_lane_asks_on_the_dedicated_id`.
-#[must_use]
-pub const fn possession_challenge_protocol() -> &'static str {
-    POSSESSION_AUDIT_PROTOCOL_ID
-}
 
 /// Protocol identifier for the subtree storage-commitment audit (ADR-0002 /
 /// V2-685), both rounds: `SubtreeAuditChallenge`/`Response` (round 1) and
@@ -473,10 +428,10 @@ const REPLICATION_MESSAGE_SIZE_MIB: usize = 10;
 /// Maximum replication wire message size.
 pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1024 * 1024;
 
-/// Maximum wire size for a message on either audit protocol family.
+/// Maximum wire size for a message in the subtree-audit protocol family.
 ///
-/// The 10 MiB core ceiling is sized for hint batches, which no audit body
-/// carries. Applying it to the audit families would let a peer make this node
+/// The 10 MiB core ceiling is sized for hint batches, which no subtree-audit
+/// body carries. Applying it to the subtree family would let a peer make this node
 /// allocate and decode megabytes of attacker-shaped collection before any
 /// family, session or admission check has run — those checks all read fields of
 /// the decoded body, so they cannot come first. Checking the encoded length
@@ -486,14 +441,14 @@ pub const MAX_REPLICATION_MESSAGE_SIZE: usize = REPLICATION_MESSAGE_SIZE_MIB * 1
 /// Sized against the largest legitimate audit body, the round-1
 /// `SubtreeAuditResponse::Proof`: at the `MAX_COMMITMENT_KEY_COUNT` cap a
 /// subtree is at most 1,024 leaves of ~100 bytes each, plus the sibling cut
-/// hashes and the signed commitment, so ~110 KiB. Every other audit body —
-/// both challenges, the round-2 response — is far smaller. This leaves roughly
+/// hashes and the signed commitment, so ~110 KiB. Every other subtree body is
+/// far smaller. This leaves roughly
 /// 4x headroom over the worst legitimate case while cutting the pre-admission
 /// allocation ceiling by a factor of 20.
-pub const MAX_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
+pub const MAX_SUBTREE_AUDIT_MESSAGE_SIZE: usize = 512 * 1024;
 const _: () = assert!(
-    MAX_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
-    "the audit-family ceiling must be tighter than the core one, or it is pointless"
+    MAX_SUBTREE_AUDIT_MESSAGE_SIZE < MAX_REPLICATION_MESSAGE_SIZE,
+    "the subtree-audit ceiling must be tighter than the core one, or it is pointless"
 );
 
 /// Maximum block openings per round-2 [`SubtreeSliceChallenge`].
@@ -666,72 +621,6 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
-
-/// ROLLOUT GATE (V2-685) — **temporary. Must be turned off in a follow-up.**
-///
-/// # Why this exists
-///
-/// The three digest-based audit lanes — the responsible-chunk audit, the
-/// post-replication possession probe, and prune confirmation — moved onto
-/// [`POSSESSION_AUDIT_PROTOCOL_ID`] because their digest construction changed.
-/// During the auto-upgrade window a v3 auditor's challenge to a still-v2 peer is
-/// therefore never answered, and an unanswered challenge times out.
-///
-/// Those three lanes report an `ApplicationFailure` carrying
-/// [`AUDIT_FAILURE_TRUST_WEIGHT`]
-/// on a timeout — weight 5, the confirmed-failure weight. Left alone, every
-/// honest peer on the other side of the version boundary would be penalised at
-/// confirmed-failure severity, repeatedly, for the entire window, for a skew
-/// that is not its fault. (The subtree lane already graces its timeouts and is
-/// unaffected; see `handle_subtree_failed_audit`.)
-///
-/// # What it does while `true`
-///
-/// The three lanes grace a timeout exactly as the subtree lane does: no
-/// application trust event and no holder-credit revocation. This is not a free
-/// pass — `saorsa-core`'s `send_request` still records its own unit transport
-/// failure for an unanswered request, so a peer that never answers still drifts
-/// down, just at weight 1 instead of 5.
-///
-/// The grace covers *silence only*. A peer that answers is being judged on what
-/// it said, so every confirmed outcome — digest mismatch, absent key, malformed
-/// reply, explicit rejection — is penalised throughout the window exactly as
-/// before. This is deliberately not an amnesty for cheating; it is only a
-/// refusal to read "did not reply" as "lost the data".
-///
-/// # FOLLOW-UP — required, do not ship this permanently
-///
-/// Once the fleet has upgraded past the possession-audit protocol move, set this
-/// to `false`, then delete the constant and inline the guarded branches so the
-/// timeout penalty is restored unconditionally. Until that lands, a peer that
-/// silently drops audit challenges is under-penalised. Tracked on V2-685.
-///
-/// The guarded code is gated by this constant rather than commented out on
-/// purpose: it stays compiled, type-checked, linted and covered by tests while
-/// disabled, so it cannot rot before it is switched back on.
-///
-/// # What this gate does NOT cover
-///
-/// It stops a peer being penalised for silence; it does not let anyone earn
-/// holder credit. Credit is written only by a completed two-round subtree audit
-/// and expires after
-/// [`PROVER_ENTRY_TTL`](crate::replication::recent_provers::PROVER_ENTRY_TTL),
-/// and the subtree lane has no legacy accommodation (its round-1 leaf changed
-/// shape, so answering an old asker would mean carrying both proof shapes). So
-/// across a version boundary neither side can refresh the other's credit, and 40
-/// minutes in, a peer on the other release counts as uncredited: its `Present`
-/// vote is downgraded to `Unresolved` in the presence quorum, and keys reach
-/// verification through the paid-list path or are retried. Pruning does not
-/// consult holder credit and is unaffected.
-///
-/// That failure is conservative by design and is left in place rather than
-/// suppressed — waiving the downgrade would count `Present` votes from peers that
-/// proved nothing, which can let a false claim stand in for a replica and
-/// suppress a repair. It does mean the mixed-version window should be kept short
-/// and watched rather than left open for days. ADR-0009 records the reasoning.
-///
-/// [`POSSESSION_AUDIT_PROTOCOL_ID`]: crate::replication::config::POSSESSION_AUDIT_PROTOCOL_ID
-pub const GRACE_POSSESSION_AUDIT_TIMEOUTS: bool = true;
 
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
@@ -1356,31 +1245,15 @@ mod tests {
     }
 
     #[test]
-    fn core_replication_id_stays_v2_changed_families_ride_their_own_ids() {
-        // Core replication stays on v2 (mixed-version fleets keep replicating).
-        // The two families whose semantics changed each ride their own id, so
-        // either can be bumped without partitioning core replication, and a
-        // message of one family never lands on another family's handler — see
-        // the id/body guard in `mod.rs`.
+    fn core_replication_id_stays_v2_and_subtree_rides_its_own_id() {
+        // Core replication, including all digest audit lanes, stays on v2.
+        // Only the subtree family changed and therefore receives a separate id.
         assert_eq!(REPLICATION_PROTOCOL_ID, "autonomi.ant.replication.v2");
         assert_eq!(
             SUBTREE_AUDIT_PROTOCOL_ID,
             "autonomi.ant.replication.subtree-audit.v1"
         );
-        assert_eq!(
-            POSSESSION_AUDIT_PROTOCOL_ID,
-            "autonomi.ant.replication.possession-audit.v2"
-        );
-        let ids = [
-            REPLICATION_PROTOCOL_ID,
-            SUBTREE_AUDIT_PROTOCOL_ID,
-            POSSESSION_AUDIT_PROTOCOL_ID,
-        ];
-        for (i, a) in ids.iter().enumerate() {
-            for b in ids.iter().skip(i + 1) {
-                assert_ne!(a, b, "protocol ids must be pairwise distinct");
-            }
-        }
+        assert_ne!(REPLICATION_PROTOCOL_ID, SUBTREE_AUDIT_PROTOCOL_ID);
     }
 
     #[test]

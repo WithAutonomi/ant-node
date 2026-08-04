@@ -1,4 +1,4 @@
-# ADR-0009: Audit proof shape and protocol families
+# ADR-0009: Subtree-audit proof shape and protocol family
 
 - **Status:** Proposed
 - **Date:** 2026-07-29
@@ -6,281 +6,178 @@
 - **Reviewers:** <pending>
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ADR-0002 (gossip-triggered contiguous-subtree audit), ADR-0003 (possession verification), ant-node #181, V2-685
+- **Related:** ADR-0002 (gossip-triggered contiguous-subtree audit), ant-node #181, V2-685
 
 ## Context
 
-ADR-0002 recorded the gossip-triggered subtree audit with a round 2 that returns
-the audited chunks' original bytes. Fleet measurement showed that round-2
-response to be one of the largest steady-state replication traffic sources: on a
-same-network control cohort the mean response was 6.19 MB, and production
-sampling agreed at 5.79 to 6.15 MB across four separate days. The cost is paid
-per audit event regardless of how often audits fire, so frequency caps alone
-cannot bound it.
+ADR-0002 records a gossip-triggered subtree audit whose second round returns the
+audited chunks' original bytes. Fleet measurement showed that response to be one
+of the largest steady-state replication traffic sources: on a same-network
+control cohort the mean response was 6.19 MB, and production sampling agreed at
+5.79 to 6.15 MB across four separate days. The cost is paid per audit event
+regardless of how often audits fire, so frequency caps alone cannot bound it.
 
-Separately, the node has four audit lanes that each ask a peer to prove it holds
-specific bytes:
+The V2-685 change is intentionally scoped to this subtree audit. The core
+replication protocol also carries the periodic responsible-chunk audit, the
+post-replication possession probe, and prune-confirmation challenges through the
+existing `AuditChallenge`/`AuditResponse` pair. Their wire format, digest
+construction, timeout accounting, and protocol id are not changed by this
+decision.
 
-1. the subtree storage-commitment audit (ADR-0002),
-2. the periodic responsible-chunk audit,
-3. the post-replication possession probe (ADR-0003),
-4. the prune-confirmation audit.
-
-Lanes 2, 3 and 4 are digest-based and share one wire message pair. Lane 1 built
-its own per-leaf commitment. The lanes did not derive their per-audit freshness
-the same way, which meant a change to one left the others on a different
-footing. Keeping several different answers to the same question is a maintenance
-and review hazard independent of any single lane's strength.
-
-ADR-0002 is not amended by this decision. It records what was decided then; this
-ADR records what replaces its round-2 proof shape and how the freshness
-derivation is unified.
+ADR-0002 is not amended. It records what was decided then; this ADR records the
+replacement for the subtree audit's round-2 proof shape and the wire isolation
+needed to roll that replacement out.
 
 ## Decision Drivers
 
-- Egress reduction is the primary goal; the audit must stop moving whole chunks
-  to prove they exist.
-- One freshness construction across all audit lanes, not one per lane.
-- A mixed-version fleet must keep replicating during the auto-upgrade window.
-  Partitioning core replication to ship an audit change is too blunt.
-- A version skew must never be scored as a peer's fault.
+- Reduce subtree round-2 egress from whole chunks to bounded verified slices.
+- Preserve the security-relevant binding between round 1 and the bytes opened in
+  round 2.
+- Keep core replication and its digest-audit lanes interoperable throughout a
+  mixed-version rollout.
+- Bound subtree responder CPU, disk, memory, and pre-admission decode work.
+- Avoid changing unrelated replication, possession, and pruning behavior.
 
 ## Considered Options
 
-1. Keep full-chunk round-2 responses and rely on frequency caps alone.
-2. Return a verified slice for round 2, and leave the other lanes as they were.
-3. Return a verified slice for round 2, unify the freshness derivation across all
-   four lanes, and give each changed message family its own protocol id.
-4. As option 3, but advance the single shared replication protocol id instead of
-   introducing per-family ids.
+1. Keep full-chunk subtree round-2 responses and rely on frequency caps.
+2. Replace subtree round 2 with verified slices and give the changed subtree
+   message family a dedicated protocol id.
+3. Replace subtree round 2 with verified slices and advance the shared core
+   replication protocol id.
 
 ## Decision
 
-We will take option 3.
+We take option 2.
 
-**Round-2 proof shape.** A chunk's address is its BLAKE3 root, and BLAKE3 is
-internally a Merkle tree over 1 KiB blocks, so the responder returns a verified
-slice for an opened block rather than the chunk. Because the address is public,
-authenticity alone would not show possession, so round 1 additionally commits a
-per-leaf root over the same blocks derived from the fresh per-audit nonce, and
-round 2 checks both chains over the same block bytes. The block to open is drawn
-with fresh randomness after the round-1 commitment arrives. The auditor also
-anchors the responder's claimed content length against the address rather than
-trusting it.
+### Round-2 proof shape
 
-**Freshness derivation.** All four lanes derive their per-audit freshness the
-same way: the challenge material (nonce, challenged peer, key) is used to derive
-a BLAKE3 key under a versioned domain-separation context, and the content is
-hashed under that key. Deriving a key rather than prefixing the challenge means
-the whole proof depends on the fresh nonce rather than only its leading bytes.
+A chunk's address is its BLAKE3 root, and BLAKE3 is internally a Merkle tree over
+1 KiB blocks. The responder therefore returns a verified slice for an opened
+block rather than the entire chunk.
 
-**Protocol families.** Core replication keeps its existing id. The subtree audit
-rides its own id, and the three digest-based lanes (one shared message pair)
-ride a second one. A symmetric guard drops any message whose family disagrees
-with the id it arrived on.
+Because the public chunk address proves authenticity but not fresh possession,
+round 1 additionally commits a per-leaf nonced block-tree root over the same
+blocks. Round 2 verifies both the Bao address proof and the nonced-tree opening
+against the same block bytes. The auditor draws the block after receiving the
+round-1 commitment and anchors the claimed content length against the address.
 
-**Unanswered round 2.** Because round 2 names the blocks to open only after the
-round-1 roots are committed, a responder learns the draw before it decides
-whether to reply. An unanswered round 2 that follows a valid round-1 proof
-therefore revokes the holder credit carried by the commitment under audit,
-scoped to that commitment. It stays in the graced timeout lane and takes no
-trust penalty: honest peers drop replies, and version-skewed peers never reach
-this state because they cannot complete the new round 1. What it removes is the
-option of holding credit without ever completing a possession check.
+The subtree-specific key derivation uses a versioned BLAKE3 `derive_key`
+context over the nonce, challenged peer, and chunk key. This construction belongs
+to the subtree proof only; it does not replace the digest helper used by the core
+responsible, possession, or pruning lanes.
 
-**Round-1 work bounds.** A single round-1 challenge selects a fixed-depth block
-of the commitment tree sized to about the square root of the key count, so the
-nonce cannot steer a responder into reading its whole store. Round 1 has its own
-small admission pool, a per-peer responder cooldown, and its hashing runs off the
-async executor. Round 2 is bound to a single-use session opened by a matching
-round 1 from the same peer.
+### Protocol family
 
-Those bounds are all keyed by peer identity or by concurrency, and neither
-bounds sustained work: a concurrency cap can be refilled the moment a slot frees,
-and a per-peer cooldown can be refilled by presenting a different peer id. Round
-1 is therefore also charged against a responder-wide budget over the chunk bytes
-it reads and hashes, refilled at a fixed rate and keyed by nothing at all. The
-budget carries debt, so an expensive proof is admitted proportionally less often
-than a cheap one, and the sustained rate settles at the refill rate whatever the
-caller's identity. It is sized above honest demand at the largest commitment the
-system allows, so it costs honest auditing nothing.
+Core replication keeps `autonomi.ant.replication.v2`. The four subtree bodies
+(round-one challenge/response and round-two slice challenge/response) ride
+`autonomi.ant.replication.subtree-audit.v1`.
 
-**Pre-admission bounds.** Family, session and admission checks all read fields of
-a decoded message, so none of them can run before decoding. The audit families
-therefore take their own wire-size ceiling, checked against the encoded length
-before any parsing, sized against the largest legitimate audit body — the round-1
-proof at the commitment key-count cap. This keeps the work an unknown peer can
-demand before admission proportional to what an audit can legitimately carry
-rather than to the core replication ceiling, which is sized for hint batches that
-no audit body contains.
+Inbound dispatch accepts the core and subtree ids in both bare and
+request-response forms. A symmetric body/id guard accepts subtree bodies only on
+the subtree id and every other replication body—including
+`AuditChallenge`/`AuditResponse`—only on the core id. Responses use the same
+mapping.
+
+This isolates the wire-incompatible subtree proof without partitioning fresh
+replication, neighbour sync, fetch, repair, verification, responsible audits,
+post-replication possession probes, or prune confirmation.
+
+### Unanswered round 2
+
+Because round 2 names blocks only after the round-1 roots have been committed, a
+responder learns the draw before deciding whether to reply. An unanswered round
+2 following a valid round-1 proof revokes the holder credit associated with the
+commitment under audit. It remains in the subtree audit's existing graced timeout
+lane: ordinary reply loss is not a confirmed integrity failure, but the peer
+cannot retain proof-derived credit without completing possession checks.
+
+This subtree timeout rule does not alter timeout penalties in any core
+digest-audit lane.
+
+### Responder work bounds
+
+Round 1 selects a fixed-depth block of the commitment tree sized to about the
+square root of the key count, so the nonce cannot steer the responder into
+reading its entire store. It has:
+
+- A small dedicated global admission pool.
+- A one-request-per-peer concurrency limit and responder cooldown.
+- Hashing work off the async executor.
+- A responder-wide byte budget that cannot be bypassed by rotating peer ids.
+- A single-use, TTL-bounded round-one session required for round two.
+
+The work budget carries debt, so an expensive proof is admitted proportionally
+less often than a cheap one. Its refill and burst sizes are set above measured
+honest demand at the maximum supported commitment size.
+
+### Wire and decode bounds
+
+Subtree family messages take a tighter wire ceiling than core replication. The
+limit is selected from the encoded body discriminant before deserializing
+attacker-controlled collections and is sized above the largest legitimate
+round-one proof at the commitment key-count cap.
+
+Core messages retain the existing core ceiling. In particular,
+`AuditChallenge` and `AuditResponse` remain core messages and are not
+reclassified by this ADR.
 
 ## Consequences
 
 ### Positive
 
-- Round-2 responses fall from megabytes to kilobytes. A 990-node run measured
-  14.49 KB over 69,903 responses against 6.19 MB on a simultaneous same-network
-  control cohort — a reduction of about 427x in decimal units.
-- The cost per audit event is bounded regardless of audit rate, which frequency
-  caps cannot achieve on their own.
-- One freshness construction across all four lanes instead of one per lane.
-- Core replication is not partitioned by an audit change. A mixed-version run
-  measured 736/736 and 135/135 transfers with no failures, and the older cohort
-  continued to accept and store paid chunks throughout.
-- A version skew on an audit lane produces no answer rather than a wrong answer,
-  so it lands in the timeout lane instead of the confirmed-failure lane. The
-  subtree lane already graces timeouts. The three digest lanes did not — they
-  reported a confirmed-failure trust event on a timeout — so a temporary rollout
-  gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) graces them for the upgrade window.
-  See the trade-offs below: that gate must be removed in a follow-up.
+- Round-2 subtree responses fall from megabytes to kilobytes. A 990-node run
+  measured 14.49 KB over 69,903 responses against 6.19 MB on a simultaneous
+  same-network control cohort, about a 427x reduction in decimal units.
+- Subtree egress per audit event becomes bounded independently of audit cadence.
+- Core replication and all existing digest-audit lanes retain their behavior and
+  wire compatibility.
+- A mixed-version subtree exchange cannot be misdecoded as a core message.
+- Heavy round-one work and round-two access are bounded independently from the
+  core replication responder path.
 
 ### Negative / Trade-offs
 
-- Round 2 now proves a sampled block rather than a whole chunk, so per-response
-  coverage is narrower and the guarantee rests on repeated sampling over time.
-  Stated precisely, because it is the load-bearing trade-off: the auditor holds
-  none of the audited bytes, so it cannot distinguish a correct nonced root from
-  a responder-chosen one. A peer retaining a fraction `p` of a chunk's blocks can
-  commit a root with genuine leaves for what it kept and arbitrary leaves for
-  what it dropped, and passes whenever every draw lands on a kept block —
-  roughly `p^leaves` per audit over the 3..=5 sampled leaves. The mandatory
-  final-block opening anchors the claimed length but adds no detection, since a
-  partial holder keeps the final block. The full-byte round 2 this replaces
-  caught any missing byte of a sampled chunk with certainty.
-
-  The exchange is deliberate, and the comparison should be stated in both
-  directions. Against a node under-storing **in bulk** — the realistic case, a
-  node dropping data to save disk — detection is close to what the full-byte
-  audit gave, at roughly 1/430 of the egress; the fleet run caught a
-  256 MB in-place corruption on the first audit that reached the node, by three
-  independent auditors, against zero false positives across ~43,000 audits in
-  the preceding 5.5 hours. Against a **fine-grained** partial deleter, one
-  shaving a little off every chunk, it is strictly weaker per audit than serving
-  every byte. The compensating lever is audit *frequency*, which is what the cost
-  reduction buys: the old shape made frequent auditing unaffordable. If a future
-  threat model needs sharper per-audit detection, the knob is openings per leaf,
-  at linear egress cost.
-- **The proof is delegable, and cheaper to delegate than what it replaces.**
-  Every input to both rounds is public — the nonce, the challenged peer id and
-  the key — so a backend holding one copy of the data can compute round-1 roots
-  and round-2 openings on behalf of any number of front-end identities. What the
-  proof binds is that *someone* holding the bytes computed it under a fresh
-  nonce, not that the audited peer did. This is not introduced here: the
-  full-byte round 2 was equally delegable, it merely priced it, by forcing the
-  whole chunk through the relay per audit under a deadline sized to a disk read.
-  This design removes that price — a few KB and a generous deadline — so a
-  warehouse backing many replica identities is materially cheaper to run than
-  before, which weakens replication multiplicity rather than possession itself.
-  Nothing at this layer fixes it: non-delegability needs either peer-specific
-  encoding committed at rest, or an economic bound that makes a passed audit
-  worth less than the storage it stands in for. Recorded here as a known gap,
-  owned with the payment-provenance work.
-
-  This supersedes the claim in ADR-0002 that a relay is priced out by the
-  round-2 deadline. That was true of the full-byte shape ADR-0002 described and
-  is not true of this one. ADR-0002 is left unedited, as accepted ADRs are; this
-  paragraph is where the correction lives.
-- Three protocol ids to reason about instead of one.
-- A temporary rollout gate (`GRACE_POSSESSION_AUDIT_TIMEOUTS`) suppresses the
-  timeout penalty on the three digest lanes so a version skew cannot punish an
-  honest peer at confirmed-failure weight for the upgrade window. While it is
-  set, a peer that silently drops audit challenges is under-penalised: it still
-  takes the upstream unit transport decrement, but not the audit-severity one.
-  The guarded branches stay compiled rather than commented out so they cannot rot
-  while disabled.
-
-  **Removal is owed, on an objective criterion.** Owner: Anselme (@grumbach),
-  the decision owner for this ADR. The gate exists only to cover peers that have
-  not yet upgraded, so the criterion is a fleet-version one: once the released
-  version carrying this change accounts for at least 99% of nodes seen in the
-  routing table over a seven-day window, and no supported release still on the
-  old audit protocol remains in the field, set the constant to `false`, delete
-  it, and inline the guarded branches. Until that is done, the timeout penalty on
-  those three lanes is suppressed for everyone, not only for old peers, so this
-  is a live weakening and not merely a compatibility shim. It should be tracked
-  as an open follow-up rather than closed with this change.
-- Cross-version audits pause during the auto-upgrade window. Unanswered requests
-  still register a unit trust decrement upstream, which decays back to neutral;
-  the possession lanes probe more often than the subtree lane, so their dip is
-  larger. This is milder than either a stream of confirmed failures or a fleet
-  wide replication partition, but it is not zero.
-- The grace gate covers only one direction, so a second temporary accommodation
-  is paired with it: an inbound possession **challenge** on the core id is
-  answered there, in the digest construction the asker verifies with. The gate
-  softens what a node on this release concludes about a silent peer; it cannot
-  reach the other side. A peer on the previous release sends its
-  responsible-chunk and prune-confirmation challenges on the core id, has no
-  dedicated possession id to try, and converts the resulting timeout directly
-  into an audit-severity failure. Refusing those challenges would therefore have
-  every not-yet-upgraded neighbour penalise an upgraded node at
-  confirmed-failure weight for the whole window — the release penalising its own
-  adopters, and worst exactly when the upgraded population is smallest. The two
-  possession messages are byte-identical across the two releases, so nothing is
-  reinterpreted; only the digest construction moved, and the responder selects
-  it from the id the challenge arrived on. Challenges only: this node always
-  asks on the dedicated id, so a possession *response* on the core id is never
-  one it solicited and stays refused. This is removed together with the gate,
-  under the same criterion.
-- The responsible-chunk audit now returns no verdict when it cannot check a
-  challenged key against its own copy, so some ticks that previously recorded a
-  pass now record nothing.
-- **The mixed-version window has a cost the grace gate does not cover, and it is
-  what bounds how long that window should be left open.** Gracing a timeout stops
-  a peer being penalised for silence; it does not let anyone earn holder credit.
-  Credit is written only by a completed two-round subtree audit and expires after
-  `PROVER_ENTRY_TTL` (40 minutes), and the subtree lane is the one lane with no
-  legacy accommodation, because unlike the two possession messages its round-1
-  leaf changed shape and its round 2 is a different proof entirely — answering an
-  old asker would mean carrying both proof shapes. So across a version boundary
-  neither side can refresh the other's credit, and 40 minutes in, a
-  commitment-capable peer on the other release is treated as uncredited for the
-  keys it holds.
-
-  What that costs is bounded and one-directional. The holder-credit check has a
-  single production consumer, the presence-quorum evaluation: a `Present` vote
-  from an uncredited peer is downgraded to `Unresolved`, so a key reaches
-  verification through the paid-list path instead of the presence quorum, or
-  stays pending and is retried. Pruning does not consult holder credit and is
-  unaffected. The direction of the failure is conservative — the network declines
-  to treat an unproven claim as proof, rather than acting on one — so the effects
-  are extra verification traffic and a reward-eligibility gap for cross-version
-  holders, not lost data.
-
-  It was deliberately not papered over. Suppressing the downgrade for the window
-  would have counted `Present` votes from peers that had proven nothing, which
-  can let a false claim stand in for a replica and suppress a repair. That
-  exchanges a conservative failure for an unsafe one, and a bounded reward gap is
-  the better trade. The operational consequence is that the mixed-version window
-  should be kept short and watched rather than allowed to run for days; it closes
-  on its own as the fleet converges.
+- Round 2 samples blocks rather than returning a whole chunk. A peer retaining a
+  fraction `p` of a chunk's blocks can pass when every draw lands on retained
+  blocks, roughly `p^leaves` for the configured 3..=5 sampled leaves. The final
+  block anchors length but does not add random detection. Repeated sampling and
+  the much lower per-audit cost are the compensating mechanisms.
+- The proof is delegable. All challenge inputs are public, so a backend holding
+  one copy can compute roots and openings for multiple front-end identities. The
+  previous full-byte response was also delegable but imposed much higher relay
+  egress. Fixing non-delegability requires peer-specific encoding at rest or an
+  economic mechanism outside this proof.
+- Cross-version subtree audits pause during rollout because their proof shapes
+  are incompatible. Core replication and core digest audits do not pause.
+  Unanswered subtree requests may still incur the transport layer's ordinary
+  liveness accounting.
+- The replication subsystem has two protocol ids instead of one.
+- Recently proved holder credit cannot be refreshed across the subtree version
+  boundary. Once existing credit expires, cross-version claims are treated
+  conservatively as unproven until both sides run the new subtree audit.
 
 ### Neutral / Operational
 
-- The wire counter for the round-2 response keeps its original name so the
-  measurement is directly comparable across versions.
-- Each protocol family can be versioned independently from here on.
+- Existing traffic-counter field names for round-two responses are retained so
+  before/after fleet measurements remain comparable.
+- The subtree protocol can be versioned independently from core replication.
+- Round-one concurrency and cooldown are configurable for testnet tuning.
 
 ## Validation
 
-- Focused unit tests pin the proof construction, the freshness derivation, the
-  canonical proof geometry, and the length anchoring.
-- Attack proof-of-concept suites cover fabrication, substitution, replay, and
-  data-deletion behaviour against the responder.
-- A real-QUIC multi-node end-to-end test covers an honest node passing, a
-  data-deleting node being caught, and repeated audits producing no false
-  positives.
-- Routing tests assert that each message family is accepted only on its own
-  protocol id, in both directions.
-- Unit tests pin the round-2 credit boundary (which outcomes revoke the pinned
-  commitment's credit, and that the revocation is scoped to that commitment),
-  that the round-1 work budget is not refilled by a fresh peer id and recovers at
-  its configured rate, and that the worst legitimate round-1 proof fits the
-  audit-family wire ceiling.
-- Fleet evidence: response size against a same-network control cohort,
-  detection parity, false-positive rate, mixed-version transfer success,
-  round-1 CPU and memory against baseline, and node stability.
-- Re-validation trigger: any change to the freshness derivation, the sampling
-  rule, the round-1 selection bound, or the set of protocol families.
+- Unit tests pin Bao slice authenticity, nonced opening verification, content
+  length anchoring, canonical geometry, session use, and work-budget accounting.
+- Attack proof-of-concept tests cover fabrication, substitution, replay,
+  under-storage, malformed proofs, and resource-bound bypass attempts.
+- Real-QUIC end-to-end tests cover honest subtree audits, data-deleting nodes,
+  repeated audits without false positives, and protocol-family isolation.
+- Routing tests assert that subtree bodies are accepted only on the subtree id
+  while core and digest-audit bodies remain on the core id.
+- Size tests prove the largest legitimate subtree response fits its ceiling and
+  oversized subtree collections are rejected before allocation.
+- Re-validation is required for changes to subtree key derivation, sampling,
+  round-one selection, session rules, or the subtree protocol family.
 
 ## Notes for AI-assisted work
 

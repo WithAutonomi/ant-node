@@ -464,8 +464,6 @@ Rules:
 
 ## 15. Storage Audit Protocol (Anti-Outsourcing)
 
-Protocol families: the audit message families do not ride the core replication protocol id. The digest-based lanes described in this section (responsible-chunk audit, post-replication possession probe, prune confirmation) share one possession-audit id, and the gossip-triggered subtree audit has its own. Core replication keeps its id unchanged, so an audit-protocol change never partitions replication across a mixed-version fleet. A receive guard MUST drop any message whose family disagrees with the id it arrived on, and responses MUST be sent on the same id the guard would accept them on. See ADR-0009.
-
 Challenge-response for claimed holders:
 
 1. Challenger creates unique challenge id + nonce.
@@ -475,7 +473,7 @@ Challenge-response for claimed holders:
 5. If `PeerKeySet` is empty, the audit tick is idle.
 6. Challenger sends `challenged_peer_id` an ordered challenge key set equal to `PeerKeySet(challenged_peer_id)`.
 7. Target responds with either per-key `AuditKeyDigest` values or a bootstrapping claim:
-    a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = keyed_H(key = derive_key(context, nonce || challenged_peer_id || K_i), record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`, `derive_key` is BLAKE3 key-derivation mode and `context` is a versioned domain-separation string. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
+    a. Per-key digests: for each challenged key `K_i` (in challenge order), target computes `AuditKeyDigest(K_i) = H(nonce || challenged_peer_id || K_i || record_bytes_i)`, where `record_bytes_i` is the full raw bytes of the record for `K_i`. Target returns the ordered list of per-key digests. If the target does not hold a challenged key, it MUST signal absence for that position (e.g., a sentinel/empty digest); it MUST NOT omit the position silently.
     b. Bootstrapping claim: target asserts it is still bootstrapping. Challenger applies the bootstrap-claim grace logic (Section 6.2 rule 4b): record `BootstrapClaimFirstSeen` if first observation, accept without penalty within the one-time `BOOTSTRAP_CLAIM_GRACE_PERIOD`, emit `BootstrapClaimAbuse` evidence if past grace period or if this is a repeated claim after the peer previously stopped claiming bootstrap. Audit tick ends (no digest verification).
 8. On per-key digest response, challenger recomputes the expected `AuditKeyDigest(K_i)` for each challenged key from local copies and verifies equality per key before deadline. Each key is independently classified as passed (digest matches) or failed (mismatch, absent, or malformed).
 9. On any per-key audit failures (timeout, malformed response, or one or more `AuditKeyDigest` mismatches/absences), challenger MUST perform a responsibility confirmation for each failed key before emitting penalty evidence:
@@ -488,7 +486,7 @@ Audit-proof requirements:
 
 1. Challenger MUST hold a local copy of each challenged record to recompute per-key digests. Audit selection is therefore limited to records the challenger stores.
 2. Records are opaque bytes for replication; digest construction MUST operate over raw record bytes (no schema dependency) and be deterministic.
-3. Each `AuditKeyDigest(K_i)` MUST be computed as `keyed_H(key = derive_key(context, nonce || challenged_peer_id || K_i), record_bytes_i)`. Including `K_i` in the derived key binds each digest to its specific key and prevents digest reordering attacks. The challenge material MUST enter as the hash key, not as a prefix to the hashed stream: a prefix binds only the leading bytes of the record, leaving the remainder independent of the nonce, whereas a derived key makes every compression of the record depend on it.
+3. Each `AuditKeyDigest(K_i)` input MUST be exactly: `H(nonce || challenged_peer_id || K_i || record_bytes_i)`. Including `K_i` binds each digest to its specific key and prevents digest reordering attacks.
 4. Each `AuditKeyDigest` MUST include full record bytes; key-only digests are invalid.
 5. Nodes that advertise audit support MUST produce valid responses within `AUDIT_RESPONSE_TIMEOUT`.
 6. Responses MUST include exactly one digest entry per challenged key in challenge order. A response is invalid if it has fewer or more entries than challenged keys.
@@ -500,8 +498,7 @@ Audit challenge bound:
 
 Failure conditions:
 
-- Malformed response or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 9) before penalty.
-- Timeout — also subject to responsibility confirmation, but see the rollout gate below: for as long as a protocol-family change is rolling out across the fleet, the digest-based lanes MUST NOT penalise a timeout, because a peer on the older family cannot answer at all and its silence is not its fault. A response that arrives is judged on what it says throughout: mismatch, absence, malformed reply and explicit rejection are all penalised while the gate is set. The gate MUST be removed once the fleet has upgraded (see ADR-0009 for the criterion and owner), restoring the timeout penalty on these lanes.
+- Timeout, malformed response, or per-key `AuditKeyDigest` mismatch/absence — subject to responsibility confirmation (step 9) before penalty.
 - Bootstrapping claim past `BOOTSTRAP_CLAIM_GRACE_PERIOD`, or repeated after the peer previously stopped claiming bootstrap (emits `BootstrapClaimAbuse`, not `AuditFailure`).
 
 Audit trigger and target selection:
