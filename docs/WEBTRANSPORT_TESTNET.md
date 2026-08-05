@@ -16,6 +16,7 @@ cargo run --features webtransport-poc --bin ant-devnet -- \
   --webtransport \
   --webtransport-base-port 24000 \
   --serve-port 25000 \
+  --enable-evm \
   --enable-logging
 ```
 
@@ -28,6 +29,7 @@ The services are:
 | Native devnet manifest | http://127.0.0.1:25000/api/devnet-manifest.json |
 | Browser bootstrap manifest | http://127.0.0.1:25000/api/browser-manifest.json |
 | Manifest service metadata | http://127.0.0.1:25000/api/info |
+| Local Anvil JSON-RPC | printed at startup (random loopback port) |
 
 When `--serve-port` is omitted with `--webtransport`, port 25000 is used. Pass
 `--public-file /path/to/file` to replace the built-in
@@ -43,6 +45,14 @@ the DataMap and file bytes are read from storage nodes over WebTransport.
 Each address string is serialized directly from `saorsa_core::MultiAddr`; the
 node does not maintain a browser-specific multiaddress codec.
 
+`--webtransport` requires an explicit payment network. For this local test,
+`--enable-evm` starts Anvil and startup prints a **Funded wallet private key**. This
+is a disposable local Anvil key for browser upload testing. The browser manifest
+contains only public RPC/token/vault configuration and never contains the
+key.
+If `HELLO.payment.rpc_url` shows `https://arb1.arbitrum.io/rpc`, the devnet was
+started without local Anvil; stop it and restart with the command above.
+
 ## Start the browser client
 
 In `ant-client-web-support/web`:
@@ -53,6 +63,12 @@ npm run dev
 ```
 
 Open `http://127.0.0.1:5173`. The app automatically loads the browser manifest.
+To upload, choose a file, paste the funded private key printed by ant-devnet,
+and use **Pay and upload file**. The page self-encrypts locally, verifies node
+quotes, signs the approval/payment locally, and sends only encrypted records
+and public payment proof to nodes. The key field is cleared immediately. The
+result address is placed into the download field automatically.
+
 Use **Download and save file** to fetch the public DataMap and every encrypted
 file chunk directly, reconstruct the complete file, validate its whole-file
 BLAKE3 hash, and save it under its original filename.
@@ -63,11 +79,12 @@ BLAKE3 hash, and save it under its original filename.
 cargo test --features webtransport-poc --test webtransport_devnet -- --ignored
 ```
 
-This starts the five-node network, self-encrypts and publishes a public file
-through normal PUT admission with devnet-prepaid cache entries, extracts a
-generated certificate pin from the advertised multiaddress, retrieves the
-DataMap and encrypted chunks from direct endpoints, and reconstructs the exact
-original bytes.
+This starts Anvil and the five-node network, self-encrypts and publishes a
+default public file through normal PUT admission with devnet-prepaid cache
+entries, extracts a generated certificate pin from the advertised
+multiaddress, retrieves and reconstructs it, then obtains a real signed quote,
+pays it on-chain, uploads a fresh record through paid `PUT_CHUNK`, and reads it
+back through WebTransport.
 
 ## LAN testing
 

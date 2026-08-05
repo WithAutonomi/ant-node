@@ -3,10 +3,14 @@
 use ant_node::devnet::{Devnet, DevnetConfig};
 use ant_node::BrowserEndpoint;
 use bytes::Bytes;
+use evmlib::common::{Amount, QuoteHash};
+use evmlib::wallet::Wallet;
+use evmlib::RewardsAddress;
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io;
+use std::str::FromStr;
 use tokio::io::AsyncReadExt;
 use wtransport::endpoint::ConnectOptions;
 use wtransport::tls::Sha256Digest;
@@ -16,9 +20,17 @@ const TEST_ORIGIN: &str = "http://127.0.0.1:5173";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]
+#[serial_test::serial]
 #[allow(clippy::too_many_lines)]
-async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<(), Box<dyn Error>> {
+async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoints(
+) -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
+    let evm_testnet = evmlib::testnet::Testnet::new().await?;
+    let evm_network = evm_testnet.to_network();
+    let wallet = Wallet::new_from_private_key(
+        evm_network.clone(),
+        &evm_testnet.default_wallet_private_key()?,
+    )?;
     let mut config = DevnetConfig::minimal();
     config.base_port = 0;
     config.webtransport = true;
@@ -26,6 +38,7 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     config.webtransport_allowed_origins = vec![TEST_ORIGIN.to_string()];
     config.data_dir = temp.path().join("browser-devnet");
     config.spawn_delay = std::time::Duration::from_millis(20);
+    config.evm_network = Some(evm_network);
 
     let mut devnet = Devnet::new(config).await?;
     devnet.start().await?;
@@ -49,14 +62,19 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     let (hello, hello_content) = rpc(
         &endpoint.endpoint,
         json!({
-            "version": 2,
+            "version": 3,
             "request_id": 5,
             "type": "hello",
         }),
+        &[],
     )
     .await?;
     assert_eq!(hello["status"], "ok");
-    assert_eq!(hello["protocol"], "autonomi.web.poc.v2");
+    assert_eq!(hello["protocol"], "autonomi.web.poc.v3");
+    assert_eq!(
+        hello["payment"]["rpc_url"].as_str(),
+        Some(evm_testnet.to_network().rpc_url().as_str())
+    );
     assert_eq!(hello["peer_id"], parsed_endpoint.peer_id.to_hex());
     assert_eq!(
         hello["endpoint"]["multiaddr"],
@@ -67,12 +85,13 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     let (closest, closest_content) = rpc(
         &endpoint.endpoint,
         json!({
-            "version": 2,
+            "version": 3,
             "request_id": 6,
             "type": "find_node",
             "target": public_file.address,
             "count": 20,
         }),
+        &[],
     )
     .await?;
     assert_eq!(closest["status"], "ok");
@@ -96,11 +115,12 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     let (header, data_map_bytes) = rpc(
         &download_endpoint.endpoint,
         json!({
-            "version": 2,
+            "version": 3,
             "request_id": 7,
             "type": "get_chunk",
             "address": public_file.address,
         }),
+        &[],
     )
     .await?;
 
@@ -117,11 +137,12 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
         let (chunk_header, chunk_bytes) = rpc(
             &download_endpoint.endpoint,
             json!({
-                "version": 2,
+                "version": 3,
                 "request_id": request_id,
                 "type": "get_chunk",
                 "address": chunk.dst_hash,
             }),
+            &[],
         )
         .await?;
         assert_eq!(chunk_header["status"], "ok");
@@ -133,13 +154,82 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     let decrypted = self_encryption::decrypt(&data_map, &encrypted_chunks)?;
     assert_eq!(decrypted, content.as_slice());
 
+    let upload_content = b"paid browser WebTransport upload";
+    let upload_address = hex::encode(blake3::hash(upload_content).as_bytes());
+    let (quote_header, quote_content) = rpc(
+        &download_endpoint.endpoint,
+        json!({
+            "version": 3,
+            "request_id": 50,
+            "type": "quote_chunk",
+            "address": upload_address,
+            "size": upload_content.len(),
+        }),
+        &[],
+    )
+    .await?;
+    assert_eq!(quote_header["status"], "ok");
+    assert_eq!(quote_header["type"], "storage_quote");
+    assert_eq!(quote_header["already_stored"], false);
+    assert!(quote_content.is_empty());
+    let quote = quote_header["quote"].clone();
+    let quote_hash = QuoteHash::from_str(required_string(&quote, "quote_hash")?)?;
+    let rewards_address = RewardsAddress::from_str(required_string(&quote, "rewards_address")?)?;
+    let price = Amount::from_str(required_string(&quote, "price")?)?;
+    let (payments, _) = wallet
+        .pay_for_quotes([(quote_hash, rewards_address, price * Amount::from(3))])
+        .await
+        .map_err(|error| io::Error::other(format!("storage payment failed: {error:?}")))?;
+    let transaction_hash = payments
+        .get(&quote_hash)
+        .ok_or_else(|| io::Error::other("payment returned no transaction hash for quote"))?;
+
+    let (put_header, put_content) = rpc(
+        &download_endpoint.endpoint,
+        json!({
+            "version": 3,
+            "request_id": 51,
+            "type": "put_chunk",
+            "address": upload_address,
+            "quote": quote,
+            "transaction_hash": format!("{transaction_hash:?}"),
+        }),
+        upload_content,
+    )
+    .await?;
+    assert_eq!(put_header["status"], "ok");
+    assert_eq!(put_header["type"], "chunk_stored");
+    assert_eq!(put_header["address"], upload_address);
+    assert!(put_content.is_empty());
+
+    let (uploaded_header, uploaded_content) = rpc(
+        &download_endpoint.endpoint,
+        json!({
+            "version": 3,
+            "request_id": 52,
+            "type": "get_chunk",
+            "address": upload_address,
+        }),
+        &[],
+    )
+    .await?;
+    assert_eq!(uploaded_header["status"], "ok");
+    assert_eq!(uploaded_content, upload_content);
+
     devnet.shutdown().await?;
     Ok(())
 }
 
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, io::Error> {
+    value[field]
+        .as_str()
+        .ok_or_else(|| io::Error::other(format!("quote omitted {field}")))
+}
+
 async fn rpc(
     endpoint: &BrowserEndpoint,
-    request: Value,
+    mut request: Value,
+    content: &[u8],
 ) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
     let parsed = endpoint.parse().map_err(io::Error::other)?;
     let hashes = parsed.certificate_hashes.into_iter().map(Sha256Digest::new);
@@ -153,7 +243,12 @@ async fn rpc(
         .build();
     let connection = endpoint.connect(options).await?;
     let (mut send, mut recv) = connection.open_bi().await?.await?;
-    send.write_all(&serde_json::to_vec(&request)?).await?;
+    request["content_length"] = json!(content.len());
+    let request_header = serde_json::to_vec(&request)?;
+    let request_header_len = u32::try_from(request_header.len())?;
+    send.write_all(&request_header_len.to_be_bytes()).await?;
+    send.write_all(&request_header).await?;
+    send.write_all(content).await?;
     send.finish().await?;
 
     let mut frame = Vec::new();
