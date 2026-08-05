@@ -306,16 +306,24 @@ address, its ML-DSA-65 signature, and the on-chain settlement — which must be
 at least 3× the median **and recorded for the quote's own rewards address**, so
 a client cannot redirect the money to itself and still be admitted.
 
-Two limits of that check, both current behaviour:
+ADR-0004's `price == calculate_price(committed_key_count)` recheck **is
+enforced**, over every quote in the bundle rather than the paid one alone. A
+quote whose signed price is not exactly the curve value for its own signed
+count is rejected, as is a quote whose binding shape is invalid. The gate is
+reject-only: an off-curve quote produces no trust evidence and schedules no
+audit.
+
+Two limits of that check remain, both current behaviour:
 
 - **Non-paid quotes are not fully re-verified.** They position the median but
   their signatures and content addresses are not checked, so a bad signature on
   an unpaid quote is accepted (`test_legacy_unpaid_quote_bad_signature_accepted`
   pins this). They still influence which quote gets paid.
-- **The on-curve price check is off.** ADR-0004's
-  `price == calculate_price(committed_key_count)` recheck over every quote is
-  rollout-gated by `QUOTE_ARITHMETIC_RECHECK_ENABLED`, which is `false`; today
-  off-curve quotes are only logged.
+- **The signed count is not resolved against the peer's own commitment.** The
+  arithmetic gate forces the price to the count the quoter signed, but a quoter
+  can still sign a count it does not store. Resolving the pin and reporting the
+  contradiction is `QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED`, which is `false`;
+  today such mismatches are only logged.
 
 Merkle proofs are checked against the pool's on-chain record: every candidate's
 signature, the pool's closeness to the midpoint, the tree proofs, and each paid
@@ -349,7 +357,7 @@ and a node that was actually paid is nominated for a first audit.
 | Client resolve-before-pay quote binding | **enforced** |
 | Node re-verification of the **paid median** quote (signature, content, K-closeness, settlement, payee address) | **enforced** |
 | Node re-verification of **non-paid** quotes in the bundle | not done (bad signature on an unpaid quote is accepted) |
-| Node rejection of off-curve quotes (`QUOTE_ARITHMETIC_RECHECK_ENABLED`) | off (telemetry only) |
+| Node rejection of off-curve quotes (`QUOTE_ARITHMETIC_RECHECK_ENABLED`) | **enforced**, on every quote in the bundle |
 | Quote/commitment mismatch reported to trust | off (telemetry only) |
 | Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 50% tolerance) |
 | Payee eligibility gate (ADR-0005) | **not merged**; observe-only on its branch (`ADR5_ENFORCE`) |

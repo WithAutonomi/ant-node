@@ -1589,25 +1589,23 @@ impl PaymentVerifier {
     /// ADR-0004: enforce that every quoted price lies exactly on the public
     /// pricing curve.
     ///
-    /// **Scope** (this slice): canonicality only. The gate proves the price is
-    /// some `calculate_price(n)` for a non-negative integer `n`; it does NOT
-    /// yet prove `n` matches a signed commitment, because `PaymentQuote` lives
-    /// in evmlib (crates.io) and has no `claimed_key_count` / `commitment_pin`
-    /// fields yet. A future slice will bind `n` to a signed commitment once
-    /// the evmlib quote payload is extended. Until then, an attacker can still
-    /// quote `calculate_price(fake_n)` for any fake count and pass this gate;
-    /// what dies here is the strictly weaker attack of picking a price *off*
-    /// the curve altogether.
+    /// **Scope**: the price is forced by the quote's own signed
+    /// `committed_key_count`, not merely required to be *somewhere* on the
+    /// curve. `PaymentQuote` now carries `committed_key_count` and
+    /// `commitment_pin`, both covered by the quote signature and the quote
+    /// hash, so [`Self::binding_violation`] can hold the price to the count the
+    /// quoter committed to. What this gate does not do is resolve the pin
+    /// against the commitment the peer actually gossiped — a quoter can still
+    /// commit to a count it does not store and price consistently with it.
+    /// That cross-check is [`Self::cross_check_quotes`], gated separately by
+    /// [`crate::replication::config::QUOTE_COMMITMENT_MISMATCH_TRUST_ENABLED`]
+    /// because it carries a trust penalty rather than being reject-only.
     ///
-    /// **Check**: exact recomputation, never price-inversion. We derive the
-    /// candidate `n` for which `quote.price` would be the curve value (using
-    /// the existing inverse `derive_records_stored_from_price`, which floors),
-    /// then recompute `calculate_price(n)` and require strict equality.
-    /// On-curve prices round-trip exactly; off-curve prices floor to a smaller
-    /// `n` whose recomputed value is strictly less than `quote.price` and so
-    /// are rejected. Floor-then-equality is the canonicality test the ADR
-    /// specifies; price inversion alone would silently accept any value
-    /// between two curve points.
+    /// **Check**: exact recomputation, never price-inversion. The price is
+    /// compared against `calculate_price(committed_key_count)` recomputed from
+    /// the signed count. Inverting the price to a count would silently accept
+    /// any value between two curve points, and would also let a quote price
+    /// itself off one count while committing to another.
     ///
     /// **Where it runs**: in every [`VerificationContext`] over **every**
     /// quote in **both** quote types — all 7 single-node quotes
