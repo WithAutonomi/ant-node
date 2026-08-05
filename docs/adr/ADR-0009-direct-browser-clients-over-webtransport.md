@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
-- **Last amended:** 2026-08-04
+- **Last amended:** 2026-08-05
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -13,11 +13,12 @@
 
 ## Context
 
-Web applications must be able to act as full read clients: they perform the
-iterative closest-node lookup themselves and download immutable chunks from
-storage nodes. A node must not perform a whole-network lookup or proxy chunk
-bytes on the browser's behalf. Ordinary bootstrap peers and end-to-end
-transport relays remain allowed; application gateways do not.
+Web applications must be able to act as full immutable-data clients: they
+perform iterative closest-node lookup, download chunks, obtain and verify
+storage quotes, pay, and upload chunks themselves. A node must not perform a
+whole-network lookup, proxy chunk bytes, or hold a browser user's wallet key.
+Ordinary bootstrap peers and end-to-end transport relays remain allowed;
+application gateways do not.
 
 The native node endpoint cannot be used by an unmodified browser. It speaks a
 Saorsa-specific QUIC application protocol with ML-KEM/ML-DSA raw-public-key
@@ -32,9 +33,9 @@ Internet.
 
 This ADR records the intended production architecture and defines a smaller,
 explicitly non-production proof of concept. The proof of concept validates
-browser interoperability, request framing, local DHT access, and chunk
-downloads; signed endpoint dissemination and relayed WebTransport are later
-implementation slices.
+browser interoperability, request framing, local DHT access, chunk downloads,
+and paid immutable uploads; signed endpoint dissemination and relayed
+WebTransport are later implementation slices.
 
 ## Decision Drivers
 
@@ -44,7 +45,10 @@ implementation slices.
 - Operators must not need to obtain DNS names or public CA certificates.
 - The existing post-quantum node-to-node port and wire protocols remain
   unchanged.
-- A public browser protocol must be narrow, versioned, bounded, and read-only.
+- A public browser protocol must be narrow, versioned, bounded, and limited to
+  immutable reads plus quote/payment-verified immutable writes.
+- Wallet secrets remain inside the browser; nodes receive only normal signed
+  quote artifacts, transaction hashes, and encrypted records.
 - NATed nodes need an end-to-end relay path without exposing plaintext to the
   relay.
 - A 4 MiB chunk needs reliable streaming and backpressure.
@@ -81,7 +85,8 @@ implementation slices.
 We will add a separate, opt-in WebTransport-over-HTTP/3 listener to nodes.
 Production browser-capable nodes will publish an owner-signed browser endpoint
 record. Browser clients will use those records to connect directly, perform
-one-hop `FIND_NODE` RPCs iteratively, and download chunks with `GET_CHUNK`.
+one-hop `FIND_NODE` RPCs iteratively, download chunks with `GET_CHUNK`, and
+store paid chunks with the same quote and payment checks as native clients.
 
 ### Transport and certificates
 
@@ -94,8 +99,9 @@ one-hop `FIND_NODE` RPCs iteratively, and download chunks with `GET_CHUNK`.
   `serverCertificateHashes`.
 - Production nodes maintain overlapping current and next certificates because
   hash-pinned WebTransport certificates may be valid for at most two weeks.
-- The listener is read-only and has independent connection, stream, request,
-  timeout, and byte limits.
+- The listener has independent connection, stream, request, timeout, and byte
+  limits. Its write surface accepts only content-addressed chunks accompanied
+  by a verifiable native payment proof.
 - The native ML-KEM/ML-DSA transport remains the node-to-node transport and is
   not downgraded or replaced.
 
@@ -185,15 +191,29 @@ one response. The initial methods are:
 - `FIND_NODE`: return up to the local DHT K value, ordered by XOR distance.
   It never initiates a network lookup on the server.
 - `GET_CHUNK`: return a locally stored chunk, `not_found`, or a bounded error.
+- `QUOTE_CHUNK`: return the node's ordinary ML-DSA-signed storage quote and,
+  when present, its commitment sidecar. The browser verifies peer binding,
+  quote signature, forced price, commitment signature, and commitment pin
+  before paying. Its canonical signed fields use the native byte encoding;
+  the EVM-facing `PaymentQuote::hash()` is Keccak-256 over those bytes followed
+  by the public key and signature. This must not be confused with the BLAKE3
+  hashes used for ANT identities, content addresses, and commitment pins.
+- `PUT_CHUNK`: accept raw chunk bytes, the previously verified signed quote,
+  and the payment transaction hash. The listener reconstructs the native
+  single-node `PaymentProof` and routes the request through the ordinary PUT
+  handler, including content-address and on-chain payment verification.
 - `PING`: optional liveness method after the proof of concept.
 
-Messages have an explicit version and length framing. Chunk bytes are binary,
-not JSON/base64. The browser recomputes BLAKE3 and rejects content whose hash
-does not equal the requested address.
+Requests and responses use a four-byte big-endian JSON-header length, a
+bounded versioned JSON header, and an optional raw binary body. Chunk bytes are
+never JSON/base64. Both sides recompute BLAKE3 and reject content whose hash
+does not equal its address.
 
-Browser sessions are anonymous read clients and are not inserted into node
-routing tables. PUT, payment, quoting, replication, arbitrary topic
-forwarding, and native DHT messages are not exposed.
+Browser sessions are not inserted into node routing tables. Wallet secrets,
+replication controls, arbitrary topic forwarding, and native DHT messages are
+not exposed. Payment happens against the public EVM RPC and contracts: the
+browser signs locally, and only the resulting public proof crosses
+WebTransport.
 
 ### Lookup behavior
 
@@ -233,13 +253,16 @@ provides:
 - native `saorsa-transport::TransportAddr` and `saorsa-core::MultiAddr`
   parsing, formatting, validation, and serialization for that address;
 - exact path and Origin checks;
-- bounded JSON requests on one bidirectional stream per RPC;
-- a length-prefixed JSON response header followed by optional raw chunk bytes;
-- `HELLO`, local `FIND_NODE`, and local `GET_CHUNK`;
+- bounded length-prefixed JSON headers on one bidirectional stream per RPC,
+  followed by optional raw chunk bytes in either direction;
+- `HELLO`, local `FIND_NODE`, local `GET_CHUNK`, `QUOTE_CHUNK`, and paid
+  `PUT_CHUNK`;
 - a browser application that extracts and pins the certificate from the
   multiaddress, performs the lookup loop,
-  downloads public file records, reconstructs the complete file, and verifies
-  both chunk and whole-file BLAKE3 hashes.
+  downloads public file records, reconstructs complete files, self-encrypts
+  uploads, verifies signed storage quotes and commitments, signs EVM payments
+  locally, uploads encrypted records, and verifies both chunk and whole-file
+  BLAKE3 hashes.
 
 The PoC endpoint descriptors are not yet ML-DSA-signed or disseminated through
 the DHT. Peers lacking a browser descriptor remain visible but cannot be
@@ -261,29 +284,33 @@ publishes every record through each candidate node's ordinary PUT handler. It
 pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active. A read-only HTTP bootstrap
-manifest exposes bootstrap multiaddresses, public-file metadata, and the
-resolved public root DataMap needed by this local client; it never performs
-lookup or carries file bytes.
+manifest exposes bootstrap multiaddresses, public-file metadata, public EVM
+RPC and contract addresses, and the resolved public root DataMap needed by
+this local client; it never performs lookup or carries file bytes. Wallet
+secrets are never included in the manifest.
 
 The companion JavaScript client and test site live in the `web/` package of the
 `ant-client-web-support` repository. It fetches the public DataMap and every
 encrypted data chunk directly, applies the native BLAKE3 KDF,
-ChaCha20-Poly1305 authentication, and Brotli decompression, verifies the
-reconstructed file, and exposes it through the browser save flow.
+ChaCha20-Poly1305 authentication, and Brotli compression/decompression. It can
+verify and save reconstructed files, or obtain quotes, make one batched vault
+payment, upload the generated records to closest nodes, and immediately
+download the newly published file.
 
 ## Consequences
 
 ### Positive
 
-- Browsers can become application-level full read clients without a lookup or
-  download gateway.
+- Browsers can become application-level full immutable-data clients without a
+  lookup, payment, upload, or download gateway.
 - Operators do not manage DNS names or CA certificate issuance.
 - Community clients configure one self-contained bootstrap multiaddress per
   seed instead of separate URLs and certificate hashes.
 - Rust producers and consumers share the network's native `MultiAddr` codec;
   browser JavaScript implements the same canonical wire syntax.
 - Existing PQ node networking and compatibility remain isolated.
-- Reliable WebTransport streams match large immutable chunk downloads.
+- Reliable WebTransport streams match large immutable chunk downloads and
+  uploads.
 - Endpoint records explicitly bind browser TLS to the node's PQ identity.
 - The same transport can run end-to-end through a generic UDP relay.
 
@@ -309,7 +336,7 @@ reconstructed file, and exposes it through the browser save flow.
 - Origin is policy input, not client authentication. Public deployments still
   need per-IP/session request and byte quotas.
 - Bootstrap peers remain necessary, as they are for native clients, but do not
-  perform lookup or proxy downloads.
+  perform lookup or proxy uploads/downloads.
 
 ## Validation
 
@@ -323,6 +350,9 @@ The decision advances beyond PoC only after all of the following are covered:
   convergence, retries, and unavailable endpoints.
 - Successful streamed downloads at 0 bytes, typical sizes, and 4 MiB, with
   BLAKE3 verification and cancellation/backpressure measurements.
+- Paid-upload tests covering quote/commitment tampering, wrong peers, wrong
+  content, missing/failed payments, replay/idempotence, wallet rejection, and
+  successful native-client retrieval of browser-created files.
 - Certificate current/next rotation, stale-record, replay, wrong-peer,
   wrong-network, and hash-mismatch tests.
 - Connection floods, stream floods, slow readers, request amplification, and

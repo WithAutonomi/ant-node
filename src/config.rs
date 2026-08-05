@@ -190,7 +190,10 @@ pub struct WebTransportConfig {
     #[serde(default = "default_webtransport_max_connections")]
     pub max_connections: usize,
 
-    /// Maximum JSON request size, in bytes.
+    /// Maximum JSON request-header size, in bytes.
+    ///
+    /// Binary PUT content has a separate [`crate::ant_protocol::MAX_CHUNK_SIZE`]
+    /// limit and is never JSON/base64 encoded.
     #[serde(default = "default_webtransport_max_request_bytes")]
     pub max_request_bytes: usize,
 }
@@ -238,7 +241,7 @@ const fn default_webtransport_max_connections() -> usize {
 }
 
 const fn default_webtransport_max_request_bytes() -> usize {
-    16 * 1024
+    64 * 1024
 }
 
 /// Auto-upgrade configuration.

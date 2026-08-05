@@ -65,7 +65,8 @@ pub use ant_protocol::{
 };
 pub use browser::{
     BrowserBootstrapNode, BrowserChunkInfo, BrowserDevnetManifest, BrowserEndpoint,
-    BrowserPublicFile, ParsedBrowserEndpoint, BROWSER_MANIFEST_VERSION, BROWSER_WEBTRANSPORT_PATH,
+    BrowserPaymentNetwork, BrowserPublicFile, ParsedBrowserEndpoint, BROWSER_MANIFEST_VERSION,
+    BROWSER_WEBTRANSPORT_PATH,
 };
 pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,

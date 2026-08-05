@@ -543,10 +543,12 @@ impl RunningNode {
         if self.config.webtransport.enabled {
             let endpoint_catalog =
                 Arc::new(crate::web_transport::BrowserEndpointCatalog::default());
+            let evm_network = self.config.payment.evm_network.clone().into_evm_network();
             match crate::web_transport::spawn(
                 &self.config.webtransport,
                 Arc::clone(&self.p2p_node),
                 self.ant_protocol.clone(),
+                &evm_network,
                 self.shutdown.clone(),
                 endpoint_catalog,
             ) {

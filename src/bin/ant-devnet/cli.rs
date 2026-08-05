@@ -1,12 +1,16 @@
 //! CLI definition for ant-devnet.
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 use std::path::PathBuf;
 
 /// Local devnet runner for ant-node.
 #[derive(Parser, Debug)]
 #[command(name = "ant-devnet")]
 #[command(author, version, about, long_about = None)]
+#[command(group(
+    ArgGroup::new("evm-payment")
+        .args(["enable_evm", "evm_network"])
+))]
 #[allow(clippy::struct_excessive_bools)]
 pub struct Cli {
     /// Node count to spawn.
@@ -48,7 +52,7 @@ pub struct Cli {
     /// Enable one direct-browser WebTransport listener per devnet node.
     ///
     /// The binary must be built with `--features webtransport-poc`.
-    #[arg(long)]
+    #[arg(long, requires = "evm-payment")]
     pub webtransport: bool,
 
     /// First UDP port assigned to devnet WebTransport listeners (0 = allocate).
@@ -167,6 +171,7 @@ mod tests {
         let cli = Cli::parse_from([
             "ant-devnet",
             "--webtransport",
+            "--enable-evm",
             "--webtransport-base-port",
             "22000",
             "--public-file",
@@ -174,5 +179,15 @@ mod tests {
         ]);
         assert!(cli.webtransport);
         assert_eq!(cli.webtransport_base_port, Some(22_000));
+    }
+
+    #[test]
+    fn browser_uploads_require_an_explicit_payment_network() {
+        let result = Cli::try_parse_from(["ant-devnet", "--webtransport"]);
+        assert!(result.is_err());
+        let rendered = result
+            .err()
+            .map_or_else(String::new, |error| error.to_string());
+        assert!(rendered.contains("--enable-evm") || rendered.contains("--evm-network"));
     }
 }
