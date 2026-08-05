@@ -194,27 +194,81 @@ measured rather than modelled. The admission column is a model assuming the
 cheapest of ~20 quotes sits near the 5th percentile of the fleet price spread.
 
 **The fix is the reference, not the threshold.** Against the group median,
-honest payments land at the reference by construction and the underpayment
-lands near 0.55x of it. Replaying the fleet's real price distribution with a
-pessimistic 50% routing-view overlap between the paying client and the
-receiver:
+honest payments land near the reference and the underpayment well below it.
+Replaying the fleet's real price distribution, with the client paying `3x` the
+median of a `CLOSE_GROUP_SIZE`-quote bundle and the receiver holding the
+minimum permitted view (15 neighbours plus its own commitment):
 
 | tolerance | honest rejected | underpayment caught |
 |-----------|-----------------|---------------------|
-| 50%       | 0.000%          | 10.4%               |
-| 65%       | 0.005%          | 89.3%               |
-| 75%       | 0.730%          | 97.4%               |
-| 85%       | 3.405%          | 99.8%               |
+| 50%       | 0.000%          | 6.4%                |
+| 65%       | 0.140%          | 89.8%               |
+| 70%       | 0.338%          | 96.0%               |
+| 75%       | 1.175%          | 98.1%               |
 
-65% is the shipped default: it sits below the 1st percentile of honest
-payments (0.772x the reference even at that overlap) while catching the large
-majority of underpayment attempts. Both directions improve against the
-original design — roughly 75x fewer honest rejections AND detection rising
-from 37% to 89%.
+65% is the shipped default: it improves on the own-price floor's measured
+0.377% honest-rejection rate while raising detection from 37.1% to ~90%.
 
-**Caveat on the evidence.** 67,892 of the 70,078 evaluations (97%) come from
-2026-08-03 alone; the rest of the week was near idle. This is one day of
-representative traffic, not a week, which is why the default stays shadow.
+**Both axes improve, but by roughly 2.7x on rejections, not the order of
+magnitude an earlier draft of this amendment claimed.** That draft modelled the
+client as paying the median of 20 quotes; the proof bundle actually carries at
+most `CLOSE_GROUP_SIZE` (7), and a 7-sample median is far noisier than a
+20-sample one. The correction does not change the direction of the decision,
+only its size.
+
+**Sample size is a safety parameter, not a detail.** The reference is a median,
+and a median over a small sample of a distribution this wide is unstable. Below
+about 11 known neighbours the group-median floor is *worse* than the own-price
+reference it replaces:
+
+| fresh neighbours | honest rejected | underpayment caught |
+|------------------|-----------------|---------------------|
+| 3                | 2.022%          | 70.9%               |
+| 7                | 0.618%          | 84.0%               |
+| 11               | 0.217%          | 88.6%               |
+| 15               | 0.105%          | 89.9%               |
+
+Hence the gate at 15 of the 20 closest, and hence the lower median rather than
+the upper one on even samples: the upper median rounds the reference up, and at
+the smallest permitted sample that alone moves honest rejections from 2.2% to
+17.3%.
+
+**Caveat on the evidence.** 67,892 of the 70,078 production evaluations (97%)
+come from 2026-08-03 alone; the rest of the week was near idle. This is one day
+of representative traffic, not a week. The tolerance and sample tables above are
+simulations over the measured price distribution, not measurements. Both are
+reasons the default stays shadow.
+
+## Amendment 1 residual risks
+
+Stated plainly, because two of them are new with this design.
+
+**A false commitment cuts both ways, and the dangerous direction is up.**
+Understating drags the reference down and weakens the floor, costing a missed
+underpayment. **Overstating drags it up and makes a receiver reject settled,
+honest payments** — the attacker spends nothing and destroys someone else's
+money. Moving a median needs roughly half the sample, so the mitigations are the
+sample gate, and dropping any gossiped count above `MAX_COMMITMENT_KEY_COUNT`
+(gossip ingest authenticates the sender but does not bound the count, while
+quote validation does). Neither is a proof: an attacker holding half a close
+group defeats this, and address grinding into a close group is a known adjacent
+problem. A signature establishes who said a number, never that it is true.
+
+**One-quote liveness is in tension with any floor.** ADR-0006's context assumes
+a client may legitimately pay against a single quote when only one peer
+answered. Such a client pays `3x` a possibly-cheap quote, and the proof carries
+no evidence distinguishing "only one node answered" from "I chose the cheapest
+of twenty". A populated receiver will reject it exactly as it rejects the
+attack. This is inherent to floors rather than to this reference, but the group
+median makes it bite more often than the own-price version did on empty
+receivers. The tolerance headroom is the only thing absorbing it, which is a
+further reason to read shadow telemetry before enforcing.
+
+**Availability of the reference is unmeasured.** The gate assumes a settled node
+normally knows most of its neighbours' commitments, which follows from the
+gossip TTL being hours against a much shorter sweep, but no production telemetry
+confirms it. If the skip rate turns out high, the floor is safe but useless. The
+`skipped=true` / `group_sample` fields exist to measure exactly this.
 
 ## Validation
 
