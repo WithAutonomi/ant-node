@@ -90,12 +90,15 @@ settled_amount >= 3 x tolerance% x calculate_price(median committed key count
   removes it. See Amendment 1 for the production numbers.
 - **Reference is local-only.** Nothing in the payment bundle feeds the
   reference: a client cannot pad, prune or reorder quotes to move it. The
-  remaining lever is gossiping a false commitment, and a median only moves if
-  a MAJORITY of the group does so, while commitments stay signed and audited.
-- **Too thin a view SKIPS.** Below `PRICE_FLOOR_MIN_GROUP_SAMPLE` fresh
-  commitments the floor does not evaluate. A settled payment cannot be
-  refunded, so guessing a reference from one or two peers would burn user
-  money during a startup or post-churn window. A node that can suppress its
+  remaining lever is gossiping a false commitment. That does NOT require a
+  majority: each liar shifts the order statistic by one rank, and the floor only
+  needs the reference to move past the tolerance headroom, so roughly a QUARTER
+  of the sample suffices in either direction. See the residual risks in
+  Amendment 1 — this is the bound enforcement is blocked on.
+- **Too thin a view SKIPS.** Below `PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`
+  (15 of the 20 closest) the floor does not evaluate. A settled payment cannot
+  be refunded, and a median over a small sample of a 4x-wide distribution is
+  unstable enough to be worse than the reference it replaces. A node that can suppress its
   neighbours' gossip can therefore disable a receiver's floor, but cannot make
   it reject honest traffic; that asymmetry is deliberate.
 - **Settled amount, not quote price.** An honest client may overpay a cheap
@@ -130,8 +133,12 @@ payment when it settles below the receiver's own commitment-priced floor.
 
 ### Positive
 
-- Restores an economic floor without sacrificing one-quote liveness, and
-  with the false-rejection cause of the old floor removed by construction.
+- Restores an economic floor while keeping the 1..=7 bundle shape, with the
+  false-rejection cause of the old floor removed by construction. This is NOT
+  full one-quote liveness under enforcement, though: an honest client that could
+  only reach one cheap quoter is indistinguishable from the attack, so the
+  Decision Drivers' "one-quote liveness must be preserved" holds under shadow
+  mode but is in tension with enforcement. See Amendment 1's residual risks.
 - The cheapest-of-K omission strategy stops working against enforcing
   receivers: the sole quote no longer sets the whole price.
 - Telemetry quantifies the honest settled/floor ratio distribution before a
@@ -228,10 +235,14 @@ reference it replaces:
 | 11               | 0.217%          | 88.6%               |
 | 15               | 0.105%          | 89.9%               |
 
-Hence the gate at 15 of the 20 closest, and hence the lower median rather than
-the upper one on even samples: the upper median rounds the reference up, and at
-the smallest permitted sample that alone moves honest rejections from 2.2% to
-17.3%.
+Hence the gate at 15 of the 20 closest. (The 0.105% here and the 0.140% in the
+tolerance table above are the same scenario measured in two simulation runs that
+differ only by seed; treat ~0.1% as the figure and the third significant digit
+as noise.)
+
+Hence also the lower median rather than the upper one on even samples: the upper
+median rounds the reference up, and at the smallest sample the code once
+permitted that alone moved honest rejections from 2.2% to 17.3%.
 
 **Caveat on the evidence.** 67,892 of the 70,078 production evaluations (97%)
 come from 2026-08-03 alone; the rest of the week was near idle. This is one day
@@ -247,12 +258,36 @@ Stated plainly, because two of them are new with this design.
 Understating drags the reference down and weakens the floor, costing a missed
 underpayment. **Overstating drags it up and makes a receiver reject settled,
 honest payments** — the attacker spends nothing and destroys someone else's
-money. Moving a median needs roughly half the sample, so the mitigations are the
-sample gate, and dropping any gossiped count above `MAX_COMMITMENT_KEY_COUNT`
-(gossip ingest authenticates the sender but does not bound the count, while
-quote validation does). Neither is a proof: an attacker holding half a close
-group defeats this, and address grinding into a close group is a known adjacent
-problem. A signature establishes who said a number, never that it is true.
+money.
+
+**The cardinality bound is about a quarter of the sample, not a majority.** An
+earlier draft of this amendment said a median only moves under majority control.
+That is wrong, and the correction is the single most important line here: the
+floor does not need the median to reach the liars' value, only to move past the
+tolerance headroom. Each liar shifts the order statistic by one rank, one rank is
+worth roughly 15% of price on the measured fleet spread, and a 65% tolerance buys
+1.54x. Measured on this crate's own fixture:
+
+* **4 of 15** overstating neighbours reject an honest payment sitting at the true
+  group median (griefing: the attacker spends nothing, the victim's money is
+  already gone).
+* **4 of 15** understating neighbours, placed above the median where an attacker
+  would put them, admit the cheapest-of-K underpayment the floor exists to
+  reject (disarming).
+
+Both are pinned by tests, including one that deliberately asserts the disarming
+case so the limit is a fact in the suite rather than a claim in a comment.
+
+The mitigations are the sample gate and dropping any gossiped count above
+`MAX_COMMITMENT_KEY_COUNT` (gossip ingest authenticates the sender but does not
+bound the count, while quote validation does — closing that at ingest rather
+than at every consumer is a worthwhile follow-up). Neither changes the ~25%
+bound. Address grinding into a close group is a known adjacent problem. A
+signature establishes who said a number, never that it is true.
+
+**This bound is the reason enforcement stays off.** It is not a reason to
+withhold the change: shadow mode cannot reject, and the telemetry it produces is
+what the enforcement decision needs.
 
 **One-quote liveness is in tension with any floor.** ADR-0006's context assumes
 a client may legitimately pay against a single quote when only one peer

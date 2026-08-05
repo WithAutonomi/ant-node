@@ -11,6 +11,7 @@ use crate::payment::pricing::{calculate_price, derive_records_stored_from_price}
 use crate::payment::proof::{
     deserialize_merkle_proof, deserialize_single_node_proof, detect_proof_type, ProofType,
 };
+use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::storage::lmdb::LmdbStorage;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
@@ -72,29 +73,16 @@ const PAID_QUOTE_ISSUER_CLOSENESS_WIDTH: usize = K_BUCKET_SIZE;
 /// reference and the underpayment lands well below it, so a tolerance separates
 /// them.
 ///
-/// Replaying the fleet's real price distribution, with the client paying `3x`
-/// the median of a [`CLOSE_GROUP_SIZE`]-quote bundle and the receiver holding
-/// the minimum permitted view (15 neighbours plus its own commitment):
+/// At the minimum permitted view, 65% rejects 0.140% of honest payments while
+/// catching ~90% of underpayment, against the own-price floor's measured 0.377%
+/// and 37.1%. Both axes improve, by roughly 2.7x on rejections rather than the
+/// order of magnitude an earlier revision claimed. 60% is the conservative
+/// alternative: 5x safer on honest traffic, at 66% detection.
 ///
-/// | tolerance | honest rejected | underpayment caught |
-/// |-----------|-----------------|---------------------|
-/// | 50%       | 0.000%          | 6.4%                |
-/// | 60%       | 0.025%          | 66.3%               |
-/// | 65%       | 0.140%          | 89.8%               |
-/// | 70%       | 0.338%          | 96.0%               |
-/// | 75%       | 1.175%          | 98.1%               |
-///
-/// 65% is the shipped default: it improves on the own-price floor's measured
-/// 0.377% honest-rejection rate while raising detection from 37.1% to ~90%.
-/// Both axes improve, but by roughly 2.7x on rejections rather than the order of
-/// magnitude an earlier revision of this comment claimed — that figure came from
-/// a simulation that wrongly modelled the client as paying the median of 20
-/// quotes rather than a 7-quote bundle, which understates the variance the
-/// tolerance has to absorb.
-///
-/// 60% is the more conservative option if shadow telemetry shows real rejections
-/// above the simulated rate: it costs detection but is 5x safer on honest
-/// traffic. Tighten or loosen only from observed telemetry, never speculatively.
+/// The full sweep, the sample-size table and the simulation's assumptions live
+/// in ADR-0006 Amendment 1 — deliberately in one place, because the same tables
+/// duplicated here and in the ADR had already drifted apart once. Tighten or
+/// loosen only from observed shadow telemetry, never speculatively.
 const PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT: u64 = 65;
 
 /// Minimum number of fresh NEIGHBOUR commitments (this node's own is counted
@@ -106,36 +94,90 @@ const PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT: u64 = 65;
 /// underpayment, whereas guessing from a handful of peers rejects honest stores
 /// whose payment already settled on-chain and cannot be refunded.
 ///
-/// The value is not a round number chosen by feel — a median over a small sample
-/// of a distribution this wide is badly unstable, and the floor is *more*
-/// dangerous than the own-price reference it replaces until the sample is large.
-/// Replaying the fleet's real price distribution, with the client paying `3x`
-/// the median of a [`CLOSE_GROUP_SIZE`]-quote bundle and this node referencing
-/// the lower median of what it knows:
-///
-/// | fresh neighbours | honest rejected | underpayment caught |
-/// |------------------|-----------------|---------------------|
-/// | 3                | 2.022%          | 70.9%               |
-/// | 7                | 0.618%          | 84.0%               |
-/// | 11               | 0.217%          | 88.6%               |
-/// | 15               | 0.105%          | 89.9%               |
-/// | 19               | 0.065%          | 90.5%               |
-///
-/// For reference the own-price floor this replaces rejected 0.377% of honest
-/// stores in production. Anything below ~11 neighbours is therefore a
-/// regression on the very metric this policy exists to improve, so the gate sits
-/// at 15 of the [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest.
+/// The value is not a round number chosen by feel. A median over a small sample
+/// of a distribution this wide is unstable, and the floor is *more* dangerous
+/// than the own-price reference it replaces until the sample is large: at 3
+/// neighbours it rejects 2.0% of honest stores, at 7 it rejects 0.6%, and only
+/// past about 11 does it beat the 0.377% the own-price floor measured in
+/// production. The gate therefore sits at 15 of the
+/// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest, with the full table in
+/// ADR-0006 Amendment 1.
 ///
 /// Availability cost is expected to be small — the gossip TTL is hours against a
 /// much shorter sweep, so a settled node should normally know most of its
-/// neighbours — but that is an assumption, not a measurement. The `skipped=true`
-/// / `group_sample` telemetry exists to measure it in shadow mode before anyone
-/// enforces.
+/// neighbours — but that is an assumption, not a measurement, and the sample is
+/// drawn from peers close to the CHUNK while the cache is filled from peers
+/// close to THIS NODE, so edge-of-range chunks will skip more often. The
+/// `skipped=true` / `skip_reason` telemetry exists to measure that in shadow
+/// mode before anyone enforces.
 ///
 /// A node that could suppress its neighbours' gossip can therefore disable this
 /// receiver's floor, but cannot make it reject honest traffic. That asymmetry is
 /// deliberate.
 const PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS: usize = 15;
+
+/// Why a price-floor evaluation did not produce a reference price.
+///
+/// Shadow mode exists to calibrate
+/// [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] from real deployments, and these
+/// three causes call for completely different responses: a mid-rotation node is
+/// expected and self-correcting, an unwired cache is a startup-order bug, and a
+/// persistently thin sample means the gate is set above what the network can
+/// supply. Collapsing them into one counter would make the telemetry unable to
+/// answer the only question it is there to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkipReason {
+    /// This node has no live commitment of its own.
+    NoOwnCommitment,
+    /// The gossip commitment cache is not attached.
+    NoCommitmentCache,
+    /// Fewer fresh neighbour commitments than the gate requires.
+    ThinSample,
+}
+
+impl SkipReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::NoOwnCommitment => "no_own_commitment",
+            Self::NoCommitmentCache => "no_commitment_cache",
+            Self::ThinSample => "thin_sample",
+        }
+    }
+}
+
+/// What the price floor could see of the close group on one admission.
+///
+/// `neighbours` is the quantity the gate actually tests; `total` includes this
+/// node's own commitment and is what the median is taken over. Both are logged
+/// because reporting only the total makes `group_sample=15, skipped=true` look
+/// like a contradiction when it is simply 14 neighbours plus self.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupSample {
+    neighbours: usize,
+    total: usize,
+    skip_reason: Option<SkipReason>,
+}
+
+impl GroupSample {
+    const fn none(reason: SkipReason) -> Self {
+        Self {
+            neighbours: 0,
+            total: 0,
+            skip_reason: Some(reason),
+        }
+    }
+
+    const fn skipped(self, reason: SkipReason) -> Self {
+        Self {
+            skip_reason: Some(reason),
+            ..self
+        }
+    }
+
+    fn skip_reason_str(self) -> &'static str {
+        self.skip_reason.map_or("none", SkipReason::as_str)
+    }
+}
 
 /// Environment variable enabling price-floor ENFORCEMENT (`1`/`true`).
 ///
@@ -1471,14 +1513,24 @@ impl PaymentVerifier {
     ///   spent and cannot be refunded, so a griefer would be spending nothing to
     ///   destroy someone else's payment.
     ///
-    /// Moving a median needs roughly half the sample, so the defence is to keep
-    /// the sample large: at [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] a couple of
-    /// liars cannot shift it. Counts above `MAX_COMMITMENT_KEY_COUNT` are
-    /// dropped outright, since gossip ingest authenticates the sender without
-    /// bounding the count. Both are mitigations, not proofs: an attacker holding
-    /// half of a close group defeats this, and address grinding into a close
-    /// group is a known adjacent problem. A signature proves who said a number,
-    /// never that the number is true.
+    /// The bound is NOT "a majority of the group", and it is worth stating
+    /// precisely because it is what an enforcement decision rests on. The floor
+    /// does not need the median to reach the liars' value — only to move past
+    /// the tolerance headroom. Each liar shifts the order statistic by one rank,
+    /// and on the measured fleet spread one rank is worth roughly 15% of price
+    /// while a 65% tolerance buys 1.54x. So **about a quarter of the sample**
+    /// suffices in either direction: measured on this crate's own fixture, 4 of
+    /// 15 overstating neighbours reject an honest payment sitting at the true
+    /// median, and 4 of 15 understating ones (placed above the median, where an
+    /// attacker would put them) admit a cheapest-of-K underpayment.
+    ///
+    /// Counts above `MAX_COMMITMENT_KEY_COUNT` are dropped outright, since
+    /// gossip ingest authenticates the sender without bounding the count. That
+    /// caps how far a single liar can reach but does not change the cardinality
+    /// bound above. A signature proves who said a number, never that the number
+    /// is true, and address grinding into a close group is a known adjacent
+    /// problem. This is why the policy ships shadow-only: the ~25% bound is a
+    /// reason not to enforce yet, not a property to rely on.
     ///
     /// Returns the reference price only when at least
     /// [`PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`] neighbour commitments are
@@ -1487,7 +1539,7 @@ impl PaymentVerifier {
     /// price means "do not evaluate".
     ///
     /// [`GOSSIP_ANSWERABILITY_TTL`]: crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
-    async fn group_reference_price(&self, xorname: &XorName) -> (Option<Amount>, usize) {
+    async fn group_reference_price(&self, xorname: &XorName) -> (Option<Amount>, GroupSample) {
         // This node's own live commitment. It is in the group whenever it is
         // being asked to store the chunk, so it belongs in the sample. Bound to
         // a local first so the source lock is released before the awaits below.
@@ -1503,14 +1555,15 @@ impl PaymentVerifier {
         // would itself have quoted. Skip, which is also what ADR-0006 says a
         // receiver in this state does.
         let Some(own) = own_source.and_then(|source| source.current_binding_snapshot()) else {
-            return (None, 0);
+            return (None, GroupSample::none(SkipReason::NoOwnCommitment));
         };
 
-        let closest = self.local_k_closest_peer_ids(xorname).await;
-
+        // Cache first: a node with no cache attached is going to skip, so it
+        // should not pay for a routing-table scan it will discard.
         let Some(cache) = self.commitment_cache.read().as_ref().map(Arc::clone) else {
-            return (None, 0);
+            return (None, GroupSample::none(SkipReason::NoCommitmentCache));
         };
+        let closest = self.local_k_closest_peer_ids(xorname).await;
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
         let mut key_counts: Vec<u32> = {
@@ -1525,52 +1578,49 @@ impl PaymentVerifier {
                     if now.saturating_duration_since(record.received_at) >= ttl {
                         return None;
                     }
-                    let key_count = record.last_commitment().map(|c| c.key_count)?;
-                    // Gossip ingest authenticates the sender but does not bound
-                    // the count, while quote validation rejects anything above
-                    // MAX_COMMITMENT_KEY_COUNT. Without this filter a neighbour
-                    // could sign a commitment for u32::MAX and drive every
-                    // receiver's floor to an unpayable number, turning the floor
-                    // into a way to reject other people's settled payments.
-                    // Drop the value rather than clamping it: a count no honest
-                    // node could hold is not evidence of anything.
-                    if key_count > crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT {
-                        return None;
-                    }
-                    Some(key_count)
+                    record
+                        .last_commitment()
+                        .map(|c| c.key_count)
+                        .filter(|count| *count <= MAX_COMMITMENT_KEY_COUNT)
                 })
                 .collect()
         };
 
         let neighbours_known = key_counts.len();
-        key_counts.push(own.key_count);
-        let sample_size = key_counts.len();
+        // Own count is held to the same cap as a neighbour's. Unreachable today
+        // (the local builder refuses to build over-cap), but an asymmetry here
+        // is the kind that quietly becomes a hole later.
+        if own.key_count <= MAX_COMMITMENT_KEY_COUNT {
+            key_counts.push(own.key_count);
+        }
+        let sample = GroupSample {
+            neighbours: neighbours_known,
+            total: key_counts.len(),
+            skip_reason: None,
+        };
 
         if neighbours_known < PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS {
-            return (None, sample_size);
+            return (None, sample.skipped(SkipReason::ThinSample));
         }
 
         // Median of the PRICES, via the median key count. `calculate_price` is
         // monotonic in the key count, so the two orderings agree and taking the
         // median count avoids averaging two U256 prices.
         //
-        // The LOWER median on even samples, deliberately. The upper median
+        // The LOWER median on even samples, deliberately: the upper median
         // rounds the reference UP, and a reference that is too high rejects
         // honest payments that have already settled on-chain and cannot be
-        // refunded. Simulated against the fleet's real price distribution, the
-        // upper median rejects 17.3% of honest stores at the smallest permitted
-        // sample against 2.2% for the lower one, because this node's own count
-        // is in the sample and the nodes this floor most often misjudges are
-        // exactly those sitting above their own group. (The merkle settlement
-        // path deliberately uses the UPPER median instead: there it must match
-        // the on-chain contract's formula, not choose a safe direction.)
+        // refunded. (The merkle settlement path deliberately uses the UPPER
+        // median instead: there it must match the on-chain contract's formula,
+        // not choose a safe direction.) ADR-0006 Amendment 1 carries the
+        // measured difference.
         key_counts.sort_unstable();
         let median_key_count = key_counts
-            .get((sample_size - 1) / 2)
+            .get((sample.total.saturating_sub(1)) / 2)
             .copied()
             .unwrap_or_default();
         let reference = calculate_price(usize::try_from(median_key_count).unwrap_or_default());
-        (Some(reference), sample_size)
+        (Some(reference), sample)
     }
 
     /// Receiver-side price floor for single-node store admissions.
@@ -1610,17 +1660,20 @@ impl PaymentVerifier {
         let (reference, group_sample) = self.group_reference_price(xorname).await;
         let Some(reference_price) = reference else {
             // Not enough of the close group is known to price anything. Skip
-            // rather than guess: see `group_reference_price`. `group_sample` is
-            // still logged so shadow telemetry can tell "cache unwired" from
-            // "one commitment short of the gate", which is what calibrates
-            // `PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`.
+            // rather than guess: see `group_reference_price`. The reason and
+            // both counts are logged because shadow telemetry has to separate a
+            // mid-rotation node from an unwired cache from a gate set above what
+            // the network can supply — three causes with three different fixes.
             info!(
                 target: "ant_node::payment::price_floor",
                 "Price floor: context={context:?}, xorname={}, paid_price={paid_price}, \
-                 settled={settled_amount}, group_sample={group_sample}, reference_price=0, \
+                 settled={settled_amount}, neighbours={}, group_sample={}, reference_price=0, \
                  tolerance_percent={tolerance_percent}, required=0, below_floor=false, \
-                 skipped=true, enforce={}",
+                 skipped=true, skip_reason={}, enforce={}",
                 hex::encode(xorname),
+                group_sample.neighbours,
+                group_sample.total,
+                group_sample.skip_reason_str(),
                 floor.enforce,
             );
             return Ok(());
@@ -1638,11 +1691,13 @@ impl PaymentVerifier {
         info!(
             target: "ant_node::payment::price_floor",
             "Price floor: context={context:?}, xorname={}, paid_price={paid_price}, \
-             settled={settled_amount}, group_sample={group_sample}, \
+             settled={settled_amount}, neighbours={}, group_sample={}, \
              reference_price={reference_price}, tolerance_percent={tolerance_percent}, \
              required={required_amount}, below_floor={below_floor}, skipped=false, \
-             enforce={}",
+             skip_reason=none, enforce={}",
             hex::encode(xorname),
+            group_sample.neighbours,
+            group_sample.total,
             floor.enforce,
         );
 
@@ -1650,7 +1705,8 @@ impl PaymentVerifier {
             return Err(Error::Payment(format!(
                 "Settled payment {settled_amount} is below the close-group price floor \
                  {required_amount} ({PAID_QUOTE_PAYMENT_MULTIPLIER}x {tolerance_percent}% of \
-                 the group median price {reference_price}, taken over {group_sample} peers)"
+                 the group median price {reference_price}, taken over {} peers)",
+                group_sample.total
             )));
         }
 
@@ -4212,6 +4268,33 @@ mod tests {
         price * Amount::from(PAID_QUOTE_PAYMENT_MULTIPLIER)
     }
 
+    /// Overwrite the signed key count on cached commitments for `peer_ids`.
+    ///
+    /// Models a modified node: the honest builder refuses to construct a
+    /// commitment at these counts, and building real ones at the protocol cap
+    /// costs about a second and 200 MB apiece. The signature no longer matches,
+    /// which is fine — the floor reads the cached count and never re-verifies.
+    async fn forge_key_counts(verifier: &PaymentVerifier, peer_ids: &[[u8; 32]], key_count: u32) {
+        use crate::replication::commitment_state::PeerCommitmentRecord;
+
+        let cache = verifier
+            .commitment_cache
+            .read()
+            .as_ref()
+            .map(Arc::clone)
+            .expect("commitment cache must be attached before forging counts");
+        let mut guard = cache.write().await;
+        for raw in peer_ids {
+            if let Some(record) = guard.get_mut(&PeerId::from_bytes(*raw)) {
+                if let Some(mut forged) = record.last_commitment().cloned() {
+                    forged.key_count = key_count;
+                    *record =
+                        PeerCommitmentRecord::from_verified(forged, std::time::Instant::now());
+                }
+            }
+        }
+    }
+
     #[test]
     fn store_admission_contexts_cover_puts_and_fresh_replication_only() {
         assert!(VerificationContext::ClientPut.is_store_admission());
@@ -4234,9 +4317,18 @@ mod tests {
         let reference = reference.expect("a fully populated group must produce a reference");
 
         assert_eq!(
-            sample,
+            sample.neighbours,
+            GROUP_TEST_KEY_COUNTS.len(),
+            "the gated count is neighbours only"
+        );
+        assert_eq!(
+            sample.total,
             GROUP_TEST_KEY_COUNTS.len() + 1,
-            "the sample must include this node's own commitment"
+            "the median is taken over the neighbours plus this node's own commitment"
+        );
+        assert!(
+            sample.skip_reason.is_none(),
+            "a fully populated group must not report a skip reason"
         );
         assert_eq!(
             reference,
@@ -4491,8 +4583,11 @@ mod tests {
         // The honest builder refuses to construct an over-cap commitment, so
         // forge one the way a modified node would: build a valid commitment and
         // overwrite the signed count. Dropping it leaves the sample one short of
-        // the gate, so the floor skips. If it were counted, the reference would
-        // be astronomic and the honest settlement below would be rejected.
+        // the gate, so the floor skips — that cardinality change is what this
+        // test detects if the filter is removed. One over-cap value alone would
+        // NOT move a 16-sample median; inflating the reference that way needs
+        // about a quarter of the sample, which is the cardinality bound on
+        // `group_reference_price` rather than something this filter fixes.
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
         let over_cap = crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT + 1;
@@ -4536,6 +4631,44 @@ mod tests {
         );
     }
 
+    /// Pins the KNOWN LIMIT, so it is a fact in the test suite rather than a
+    /// claim in a comment: four of fifteen understating neighbours DISARM the
+    /// floor, admitting the cheapest-of-K underpayment it exists to reject.
+    ///
+    /// This test asserts a weakness on purpose. It is the concrete reason
+    /// enforcement stays off, and if a future change improves the bound this
+    /// test will fail and must be re-derived rather than quietly deleted.
+    #[tokio::test]
+    async fn group_median_is_disarmed_by_four_understated_commitments() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xDFu8; 32];
+        let mut counts: Vec<u32> = GROUP_TEST_KEY_COUNTS.to_vec();
+        for slot in counts.iter_mut().rev().take(4) {
+            *slot = 1;
+        }
+        let neighbours = attach_group_commitments(&verifier, &counts, std::time::Duration::ZERO);
+
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            0,
+            three_times(price_at_records(0)),
+            &neighbours,
+        );
+
+        let result = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await;
+
+        assert_eq!(
+            result.expect(
+                "KNOWN LIMIT: four understated neighbours disarm the floor. If this now \
+                 rejects, the bound improved — re-derive it and update the docs."
+            ),
+            PaymentStatus::PaymentVerified
+        );
+    }
+
     /// The griefing direction: a small minority gossiping OVERSTATED
     /// commitments must not push the reference up far enough to make this node
     /// reject an honest, already settled payment.
@@ -4555,13 +4688,12 @@ mod tests {
     async fn group_median_resists_a_small_minority_of_overstated_commitments() {
         let verifier = floor_test_verifier(true);
         let xorname = [0xDDu8; 32];
-        // Three of fifteen neighbours claim the protocol maximum.
-        let mut counts: Vec<u32> = GROUP_TEST_KEY_COUNTS.to_vec();
-        let cap = crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
-        for slot in counts.iter_mut().take(3) {
-            *slot = cap;
-        }
-        let neighbours = attach_group_commitments(&verifier, &counts, std::time::Duration::ZERO);
+        // Three of fifteen neighbours claim the protocol maximum. Forged by
+        // overwriting the signed count rather than building real 1,000,000-leaf
+        // commitments, which cost about a second and 200 MB each.
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
+        forge_key_counts(&verifier, &neighbours[..3], MAX_COMMITMENT_KEY_COUNT).await;
 
         // An honest payment at the TRUE group median must still be admitted.
         let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize));
@@ -4636,8 +4768,12 @@ mod tests {
         let fresh =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
 
-        // Stale: cheap counts, added to the same cache under distinct ids.
-        let stale_counts = [1u32, 1, 1, 1, 1];
+        // Stale: enough cheap counts that COUNTING them would drag the median
+        // down far enough to admit the settlement below. Sizing matters here —
+        // five stale entries against fifteen fresh ones move the median only
+        // 2_600 -> 2_000, which still rejects, so a smaller fixture would pass
+        // with the TTL filter deleted and prove nothing.
+        let stale_counts = [1u32; 15];
         let stale_received = std::time::Instant::now()
             .checked_sub(stale_age)
             .expect("test clock must support the TTL offset");
@@ -4679,17 +4815,23 @@ mod tests {
         assert!(format!("{err}").contains("below the close-group price floor"));
     }
 
-    /// A minority gossiping understated commitments cannot pull the reference
-    /// down: that is the property a median buys over a mean or a minimum.
+    /// Understated commitments pull the reference DOWN and weaken the floor.
+    ///
+    /// Three adversarially-placed liars leave it standing; four disarm it. The
+    /// placement matters and is easy to get wrong: understating a peer that was
+    /// already below the median changes nothing, so a test that rewrites the
+    /// CHEAPEST entries passes while testing nothing. These rewrite the DEAREST
+    /// ones, which is where an attacker would sit, and the count is set to the
+    /// largest that still holds rather than to an aspirational majority.
     #[tokio::test]
-    async fn group_median_resists_a_minority_of_understated_commitments() {
+    async fn group_median_resists_three_understated_commitments() {
         let verifier = floor_test_verifier(true);
         let xorname = [0xD6u8; 32];
-        // Four of fifteen neighbours claim to store almost nothing. `1`, not
+        // Three of fifteen neighbours claim to store almost nothing. `1`, not
         // `0`: a commitment over an empty key set cannot be built at all, so one
         // key is the least a peer can honestly (or dishonestly) commit to.
         let mut counts: Vec<u32> = GROUP_TEST_KEY_COUNTS.to_vec();
-        for slot in counts.iter_mut().take(4) {
+        for slot in counts.iter_mut().rev().take(3) {
             *slot = 1;
         }
         let neighbours = attach_group_commitments(&verifier, &counts, std::time::Duration::ZERO);
