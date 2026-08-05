@@ -215,7 +215,7 @@ fn default_webtransport_bind() -> SocketAddr {
 }
 
 fn default_webtransport_path() -> String {
-    "/autonomi/webtransport/v1".to_string()
+    crate::browser::BROWSER_WEBTRANSPORT_PATH.to_string()
 }
 
 fn default_webtransport_origins() -> Vec<String> {

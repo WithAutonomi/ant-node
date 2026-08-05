@@ -5,13 +5,13 @@
 //! the production endpoint-record or certificate-rotation implementation.
 
 use crate::ant_protocol::MAX_CHUNK_SIZE;
-use crate::browser::BrowserEndpoint;
+use crate::browser::{BrowserEndpoint, BROWSER_WEBTRANSPORT_PATH};
 use crate::config::WebTransportConfig;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::storage::AntProtocol;
 use parking_lot::RwLock;
-use saorsa_core::P2PNode;
+use saorsa_core::{P2PNode, PeerId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -25,8 +25,8 @@ use wtransport::endpoint::IncomingSession;
 use wtransport::stream::{RecvStream, SendStream};
 use wtransport::{Endpoint, Identity, ServerConfig};
 
-const PROTOCOL_VERSION: u16 = 1;
-const PROTOCOL_NAME: &str = "autonomi.web.poc.v1";
+const PROTOCOL_VERSION: u16 = 2;
+const PROTOCOL_NAME: &str = "autonomi.web.poc.v2";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -40,22 +40,22 @@ const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// available.
 #[derive(Default)]
 pub struct BrowserEndpointCatalog {
-    endpoints: RwLock<HashMap<String, BrowserEndpoint>>,
+    endpoints: RwLock<HashMap<PeerId, BrowserEndpoint>>,
 }
 
 impl BrowserEndpointCatalog {
-    fn insert(&self, peer_id: String, endpoint: BrowserEndpoint) {
+    fn insert(&self, peer_id: PeerId, endpoint: BrowserEndpoint) {
         self.endpoints.write().insert(peer_id, endpoint);
     }
 
-    fn get(&self, peer_id: &str) -> Option<BrowserEndpoint> {
+    fn get(&self, peer_id: &PeerId) -> Option<BrowserEndpoint> {
         self.endpoints.read().get(peer_id).cloned()
     }
 }
 
 /// A running browser listener and the endpoint clients use to reach it.
 pub struct WebTransportServer {
-    /// Direct endpoint and certificate pin.
+    /// Direct endpoint with its certificate pin embedded in the multiaddress.
     pub endpoint: BrowserEndpoint,
     /// Listener background task.
     pub task: JoinHandle<()>,
@@ -78,7 +78,7 @@ pub fn spawn(
         .as_slice()
         .first()
         .ok_or_else(|| Error::Startup("WebTransport identity has no certificate".to_string()))?;
-    let certificate_sha256 = hex::encode(certificate.hash().as_ref());
+    let certificate_sha256 = *certificate.hash().as_ref();
 
     let server_config = ServerConfig::builder()
         .with_bind_address(config.bind)
@@ -95,11 +95,10 @@ pub fn spawn(
     })?;
     let advertised_url = advertised_url(config, local_addr);
 
-    let browser_endpoint = BrowserEndpoint {
-        url: advertised_url.clone(),
-        certificate_sha256: certificate_sha256.clone(),
-    };
-    endpoint_catalog.insert(p2p.peer_id().to_hex(), browser_endpoint.clone());
+    let peer_id = *p2p.peer_id();
+    let browser_endpoint = BrowserEndpoint::new(&advertised_url, &peer_id, &[certificate_sha256])
+        .map_err(Error::Config)?;
+    endpoint_catalog.insert(peer_id, browser_endpoint.clone());
 
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -112,8 +111,7 @@ pub fn spawn(
 
     info!(
         bind = %local_addr,
-        url = %advertised_url,
-        certificate_sha256 = %certificate_sha256,
+        multiaddr = %browser_endpoint.multiaddr,
         "ADR-0009 WebTransport PoC listening"
     );
 
@@ -127,10 +125,10 @@ pub fn spawn(
 }
 
 fn validate_config(config: &WebTransportConfig) -> Result<()> {
-    if !config.path.starts_with('/') {
-        return Err(Error::Config(
-            "webtransport.path must start with '/'".to_string(),
-        ));
+    if config.path != BROWSER_WEBTRANSPORT_PATH {
+        return Err(Error::Config(format!(
+            "webtransport.path must be {BROWSER_WEBTRANSPORT_PATH}"
+        )));
     }
     if config.allowed_origins.is_empty() {
         return Err(Error::Config(
@@ -362,7 +360,7 @@ async fn process_find_node(
         .map(|node| {
             let peer_id = node.peer_id.to_hex();
             BrowserNode {
-                webtransport: state.endpoint_catalog.get(&peer_id),
+                webtransport: state.endpoint_catalog.get(&node.peer_id),
                 peer_id,
                 native_addresses: node
                     .addresses_by_priority()
@@ -607,7 +605,7 @@ mod tests {
     #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
-            r#"{"version":1,"request_id":7,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
+            r#"{"version":2,"request_id":7,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
         )
         .expect("valid request");
 
@@ -646,7 +644,7 @@ mod tests {
             3,
         );
         let value = serde_json::to_value(response).expect("serialize response");
-        assert_eq!(value["version"], 1);
+        assert_eq!(value["version"], 2);
         assert_eq!(value["request_id"], 42);
         assert_eq!(value["status"], "ok");
         assert_eq!(value["content_length"], 3);
