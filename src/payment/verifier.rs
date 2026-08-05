@@ -80,7 +80,7 @@ const PAID_QUOTE_ISSUER_CLOSENESS_WIDTH: usize = K_BUCKET_SIZE;
 /// alternative: 5x safer on honest traffic, at 66% detection.
 ///
 /// The full sweep, the sample-size table and the simulation's assumptions live
-/// in ADR-0010 — deliberately in one place, because the same tables
+/// in ADR-0006 — deliberately in one place, because the same tables
 /// duplicated here and in the ADR had already drifted apart once. Tighten or
 /// loosen only from observed shadow telemetry, never speculatively.
 const PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT: u64 = 65;
@@ -101,7 +101,7 @@ const PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT: u64 = 65;
 /// past about 11 does it beat the 0.377% the own-price floor measured in
 /// production. The gate therefore sits at 15 of the
 /// [`PAID_QUOTE_ISSUER_CLOSENESS_WIDTH`] closest, with the full table in
-/// ADR-0010.
+/// ADR-0006.
 ///
 /// Availability cost is expected to be small — the gossip TTL is hours against a
 /// much shorter sweep, so a settled node should normally know most of its
@@ -602,7 +602,7 @@ pub struct PaymentVerifier {
     /// LMDB storage handle, attached post-construction. Retained for
     /// store-backed verifier checks that need the authoritative on-disk record
     /// count without depending on a side counter that may drift from
-    /// replication/repair/prune paths. NOTE: the ADR-0010 price floor does NOT
+    /// replication/repair/prune paths. NOTE: the ADR-0006 price floor does NOT
     /// read this — it is bound to the live storage commitment via
     /// [`Self::local_commitment_source`], not the on-disk count (the old floor
     /// compared unlike counts and false-rejected honest quotes). `None` in unit
@@ -875,7 +875,7 @@ impl PaymentVerifier {
     /// Attach the node's [`LmdbStorage`] handle for store-backed verifier
     /// checks that read the authoritative on-disk record count.
     ///
-    /// NOTE: the ADR-0010 price floor does NOT depend on this handle — it is
+    /// NOTE: the ADR-0006 price floor does NOT depend on this handle — it is
     /// priced from the close group's gossiped commitments plus this node's own
     /// ([`Self::attach_local_commitment_source`]), and a missing commitment
     /// makes the floor skip rather than reject. So a node without storage
@@ -1569,7 +1569,7 @@ impl PaymentVerifier {
         // No own commitment means fresh, retired, or mid-rotation. Such a node
         // prices its OWN quotes at baseline, so letting it hold an incoming
         // payment to its neighbours' (higher) median would reject settlements it
-        // would itself have quoted. Skip, which is also what ADR-0010 says a
+        // would itself have quoted. Skip, which is also what ADR-0006 says a
         // receiver in this state does.
         let Some(own) = own_source.and_then(|source| source.current_binding_snapshot()) else {
             return (None, GroupSample::none(SkipReason::NoOwnCommitment));
@@ -1622,7 +1622,7 @@ impl PaymentVerifier {
         // honest payments that have already settled on-chain and cannot be
         // refunded. (The merkle settlement path deliberately uses the UPPER
         // median instead: there it must match the on-chain contract's formula,
-        // not choose a safe direction.) ADR-0010 carries the
+        // not choose a safe direction.) ADR-0006 carries the
         // measured difference.
         key_counts.sort_unstable();
         let median_key_count = key_counts
