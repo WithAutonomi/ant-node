@@ -127,10 +127,12 @@ const PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS: usize = 15;
 /// answer the only question it is there to answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SkipReason {
-    /// This node has no live commitment of its own.
-    NoOwnCommitment,
     /// The gossip commitment cache is not attached.
     NoCommitmentCache,
+    /// No local routing view of the close group (no P2P handle attached).
+    NoRoutingView,
+    /// This node has no live commitment of its own.
+    NoOwnCommitment,
     /// Fewer fresh neighbour commitments than the gate requires.
     ThinSample,
 }
@@ -138,8 +140,9 @@ enum SkipReason {
 impl SkipReason {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::NoOwnCommitment => "no_own_commitment",
             Self::NoCommitmentCache => "no_commitment_cache",
+            Self::NoRoutingView => "no_routing_view",
+            Self::NoOwnCommitment => "no_own_commitment",
             Self::ThinSample => "thin_sample",
         }
     }
@@ -1548,6 +1551,20 @@ impl PaymentVerifier {
         // "how much of the group do I actually know", and answering that with a
         // number that includes yourself overstates it by one, which matters most
         // exactly when the view is thinnest.
+        // Wiring faults are reported before state faults, so a startup-order bug
+        // is never mistaken for "this node is mid-rotation" or for "the gate is
+        // above what the network supplies". Those three have three different
+        // fixes and shadow mode exists to tell them apart.
+        let Some(cache) = self.commitment_cache.read().as_ref().map(Arc::clone) else {
+            return (None, GroupSample::none(SkipReason::NoCommitmentCache));
+        };
+        // Cache is checked first so a node without one does not pay for a
+        // routing-table scan it will discard.
+        let closest = self.local_k_closest_peer_ids(xorname).await;
+        if closest.is_empty() {
+            return (None, GroupSample::none(SkipReason::NoRoutingView));
+        }
+
         let own_source = self.local_commitment_source.read().as_ref().map(Arc::clone);
         // No own commitment means fresh, retired, or mid-rotation. Such a node
         // prices its OWN quotes at baseline, so letting it hold an incoming
@@ -1557,13 +1574,6 @@ impl PaymentVerifier {
         let Some(own) = own_source.and_then(|source| source.current_binding_snapshot()) else {
             return (None, GroupSample::none(SkipReason::NoOwnCommitment));
         };
-
-        // Cache first: a node with no cache attached is going to skip, so it
-        // should not pay for a routing-table scan it will discard.
-        let Some(cache) = self.commitment_cache.read().as_ref().map(Arc::clone) else {
-            return (None, GroupSample::none(SkipReason::NoCommitmentCache));
-        };
-        let closest = self.local_k_closest_peer_ids(xorname).await;
         let now = std::time::Instant::now();
         let ttl = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL;
         let mut key_counts: Vec<u32> = {
@@ -4274,25 +4284,43 @@ mod tests {
     /// commitment at these counts, and building real ones at the protocol cap
     /// costs about a second and 200 MB apiece. The signature no longer matches,
     /// which is fine — the floor reads the cached count and never re-verifies.
-    async fn forge_key_counts(verifier: &PaymentVerifier, peer_ids: &[[u8; 32]], key_count: u32) {
+    ///
+    /// Asserts that every requested mutation landed. Callers assert ADMISSION,
+    /// so a helper that silently no-opped would make those tests pass without
+    /// ever forging anything.
+    async fn forge_key_counts(
+        verifier: &PaymentVerifier,
+        peer_ids: Option<&[[u8; 32]]>,
+        key_count: u32,
+    ) {
         use crate::replication::commitment_state::PeerCommitmentRecord;
 
+        let peer_ids = peer_ids.expect("caller must supply a valid peer id slice");
         let cache = verifier
             .commitment_cache
             .read()
             .as_ref()
             .map(Arc::clone)
             .expect("commitment cache must be attached before forging counts");
-        let mut guard = cache.write().await;
-        for raw in peer_ids {
-            if let Some(record) = guard.get_mut(&PeerId::from_bytes(*raw)) {
-                if let Some(mut forged) = record.last_commitment().cloned() {
-                    forged.key_count = key_count;
-                    *record =
-                        PeerCommitmentRecord::from_verified(forged, std::time::Instant::now());
+        let mut mutated = 0usize;
+        {
+            let mut guard = cache.write().await;
+            for raw in peer_ids {
+                if let Some(record) = guard.get_mut(&PeerId::from_bytes(*raw)) {
+                    if let Some(mut forged) = record.last_commitment().cloned() {
+                        forged.key_count = key_count;
+                        *record =
+                            PeerCommitmentRecord::from_verified(forged, std::time::Instant::now());
+                        mutated += 1;
+                    }
                 }
             }
         }
+        assert_eq!(
+            mutated,
+            peer_ids.len(),
+            "every forged count must land, or the test asserting admission proves nothing"
+        );
     }
 
     #[test]
@@ -4631,6 +4659,43 @@ mod tests {
         );
     }
 
+    /// Pins the other KNOWN LIMIT: four of fifteen OVERSTATING neighbours push
+    /// the reference up far enough to reject an honest payment sitting at the
+    /// true group median.
+    ///
+    /// This is the griefing direction, and the more serious of the two: the
+    /// attacker spends nothing and the victim's money is already settled and
+    /// unrefundable. Like its understating sibling this test asserts a weakness
+    /// deliberately. If a future change improves the bound it will fail and must
+    /// be re-derived rather than deleted.
+    #[tokio::test]
+    async fn group_median_is_griefed_by_four_overstated_commitments() {
+        let verifier = floor_test_verifier(true);
+        let xorname = [0xE0u8; 32];
+        let neighbours =
+            attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
+        forge_key_counts(&verifier, neighbours.get(..4), MAX_COMMITMENT_KEY_COUNT).await;
+
+        // A completely honest payment, priced at the TRUE group median.
+        let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize));
+        let proof_bytes = group_floor_proof(
+            &verifier,
+            xorname,
+            GROUP_TEST_MEDIAN_KEY_COUNT as usize,
+            honest,
+            &neighbours,
+        );
+
+        let err = verifier
+            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
+            .await
+            .expect_err(
+                "KNOWN LIMIT: four overstated neighbours reject an honest at-median payment. \
+                 If this now succeeds, the bound improved — re-derive it and update the docs.",
+            );
+        assert!(format!("{err}").contains("below the close-group price floor"));
+    }
+
     /// Pins the KNOWN LIMIT, so it is a fact in the test suite rather than a
     /// claim in a comment: four of fifteen understating neighbours DISARM the
     /// floor, admitting the cheapest-of-K underpayment it exists to reject.
@@ -4678,14 +4743,22 @@ mod tests {
     /// and the attacker spends nothing to do it.
     ///
     /// The bound is real but partial, and worth stating precisely rather than
-    /// claiming immunity: each liar shifts the order statistic up by one rank,
+    /// claiming immunity. Each liar shifts the order statistic up by one rank,
     /// so what protects the payment is the tolerance headroom, not the median
-    /// itself. In this fixture three liars leave an honest median payment
-    /// clearing the floor; four move the reference two ranks and a zero-margin
-    /// payment starts to fail. Systematically griefing a group needs roughly
-    /// half of it, which is a broader compromise than pricing.
+    /// itself. In this fixture three liars move the reference `2_600` ->
+    /// `3_500` and an at-median payment still clears, by only 1.9%; four move it
+    /// to `3_800`
+    /// and the same payment is REJECTED (pinned by
+    /// `group_median_is_griefed_by_four_overstated_commitments`). The griefing
+    /// bound is therefore about a quarter of the sample, the same as the
+    /// disarming one — NOT "roughly half", which was the incorrect claim this
+    /// policy originally rested on.
+    ///
+    /// Estimator coverage: this case fails under a 25th percentile, and its
+    /// disarming sibling fails under a mean and under the upper median, so the
+    /// pair pins the estimator jointly. Neither does so alone.
     #[tokio::test]
-    async fn group_median_resists_a_small_minority_of_overstated_commitments() {
+    async fn group_median_resists_three_overstated_commitments() {
         let verifier = floor_test_verifier(true);
         let xorname = [0xDDu8; 32];
         // Three of fifteen neighbours claim the protocol maximum. Forged by
@@ -4693,7 +4766,7 @@ mod tests {
         // commitments, which cost about a second and 200 MB each.
         let neighbours =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
-        forge_key_counts(&verifier, &neighbours[..3], MAX_COMMITMENT_KEY_COUNT).await;
+        forge_key_counts(&verifier, neighbours.get(..3), MAX_COMMITMENT_KEY_COUNT).await;
 
         // An honest payment at the TRUE group median must still be admitted.
         let honest = three_times(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize));
@@ -4752,9 +4825,14 @@ mod tests {
     ///
     /// The all-stale test above collapses to the sample gate, so it would still
     /// pass if the TTL filter let stale counts through whenever enough fresh
-    /// ones existed. This one pins the filter itself: the stale entries are the
-    /// cheap ones, so counting them would drag the reference down and admit the
-    /// underpayment that must be rejected.
+    /// ones existed. This one pins the filter itself, and asserts on the
+    /// reference directly rather than end-to-end.
+    ///
+    /// Going through `verify_payment` would need enough stale entries to move
+    /// the median past the tolerance — more neighbours than production can ever
+    /// present, since the K-closest scan returns at most 20 including self. The
+    /// reference and the gated neighbour count are the precise observations
+    /// anyway: if the TTL filter were removed, both would change.
     #[tokio::test]
     async fn price_floor_excludes_only_the_stale_entries_from_a_mixed_cache() {
         use crate::replication::commitment_state::PeerCommitmentRecord;
@@ -4764,16 +4842,13 @@ mod tests {
         let stale_age = crate::replication::commitment_state::GOSSIP_ANSWERABILITY_TTL
             + std::time::Duration::from_secs(60);
 
-        // Fresh: the full dear fixture, enough to clear the gate on its own.
+        // Fresh: the full fixture, exactly on the gate.
         let fresh =
             attach_group_commitments(&verifier, &GROUP_TEST_KEY_COUNTS, std::time::Duration::ZERO);
 
-        // Stale: enough cheap counts that COUNTING them would drag the median
-        // down far enough to admit the settlement below. Sizing matters here —
-        // five stale entries against fifteen fresh ones move the median only
-        // 2_600 -> 2_000, which still rejects, so a smaller fixture would pass
-        // with the TTL filter deleted and prove nothing.
-        let stale_counts = [1u32; 15];
+        // Stale: four cheap counts, keeping the total within the 19 neighbours a
+        // real routing view can supply.
+        let stale_counts = [1u32; 4];
         let stale_received = std::time::Instant::now()
             .checked_sub(stale_age)
             .expect("test clock must support the TTL offset");
@@ -4798,21 +4873,21 @@ mod tests {
                 );
             }
         }
+        verifier.set_paid_quote_k_closest_for_tests(all);
 
-        // Underpayment that only the stale cheap entries could have justified.
-        let proof_bytes = group_floor_proof(
-            &verifier,
-            xorname,
-            0,
-            three_times(price_at_records(0)),
-            &all,
+        let (reference, sample) = verifier.group_reference_price(&xorname).await;
+
+        assert_eq!(
+            sample.neighbours,
+            GROUP_TEST_KEY_COUNTS.len(),
+            "stale entries must not count toward the gate"
         );
-
-        let err = verifier
-            .verify_payment(&xorname, Some(&proof_bytes), VerificationContext::ClientPut)
-            .await
-            .expect_err("stale cheap entries must not drag the reference down");
-        assert!(format!("{err}").contains("below the close-group price floor"));
+        assert_eq!(
+            reference,
+            Some(price_at_records(GROUP_TEST_MEDIAN_KEY_COUNT as usize)),
+            "the reference must be the fresh-only median; counting the stale cheap \
+             entries would drag it below"
+        );
     }
 
     /// Understated commitments pull the reference DOWN and weaken the floor.

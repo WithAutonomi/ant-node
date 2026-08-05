@@ -96,11 +96,16 @@ settled_amount >= 3 x tolerance% x calculate_price(median committed key count
   of the sample suffices in either direction. See the residual risks in
   Amendment 1 — this is the bound enforcement is blocked on.
 - **Too thin a view SKIPS.** Below `PRICE_FLOOR_MIN_NEIGHBOUR_COMMITMENTS`
-  (15 of the 20 closest) the floor does not evaluate. A settled payment cannot
-  be refunded, and a median over a small sample of a 4x-wide distribution is
-  unstable enough to be worse than the reference it replaces. A node that can suppress its
-  neighbours' gossip can therefore disable a receiver's floor, but cannot make
-  it reject honest traffic; that asymmetry is deliberate.
+  (15) the floor does not evaluate. A settled payment cannot be refunded, and a
+  median over a small sample of a 4x-wide distribution is unstable enough to be
+  worse than the reference it replaces.
+
+  Headroom is tighter than "15 of 20" suggests: the K-closest scan returns at
+  most 20 entries *including self*, and the gossip cache never holds self, so
+  the ceiling is 19 neighbours. The gate tolerates 4 unknown or stale
+  neighbours, not 5. A node that can suppress its neighbours' gossip can
+  therefore disable a receiver's floor, but cannot make it reject honest
+  traffic; that asymmetry is deliberate.
 - **Settled amount, not quote price.** An honest client may overpay a cheap
   quote to clear stricter receivers.
 - **No group view = skip.** A fresh, retired, or restarting receiver, or one
@@ -127,7 +132,7 @@ settled_amount >= 3 x tolerance% x calculate_price(median committed key count
 
 This amends ADR-0004's stated contract "a node may always charge less" to:
 a quote may always charge less, but a receiver may refuse the resulting
-payment when it settles below the receiver's own commitment-priced floor.
+payment when it settles below the close group's median-priced floor.
 
 ## Consequences
 
@@ -149,8 +154,9 @@ payment when it settles below the receiver's own commitment-priced floor.
 - Committed counts still legitimately diverge across a close group
   (rotation windows, churned responsibility sets, baseline-priced fresh
   nodes), so the tolerance is a real dial: too tight rejects honest
-  settlements that are already paid and irrecoverable. Hence shadow-first
-  and the loose 50% starting point.
+  settlements that are already paid and irrecoverable. Hence shadow-first,
+  and hence the group median rather than any single node's price — the
+  divergence is exactly what the old reference could not absorb.
 - As an ingress-only rule, a below-floor chunk accepted elsewhere can still
   reach an enforcing node later via repair. Accepted: repair replays no
   fresh economic decision.
@@ -275,8 +281,9 @@ worth roughly 15% of price on the measured fleet spread, and a 65% tolerance buy
   would put them, admit the cheapest-of-K underpayment the floor exists to
   reject (disarming).
 
-Both are pinned by tests, including one that deliberately asserts the disarming
-case so the limit is a fact in the suite rather than a claim in a comment.
+Both are pinned by tests that deliberately assert the weakness, so the limits
+are facts in the suite rather than claims in a comment. If a future change
+improves either bound those tests fail and must be re-derived.
 
 The mitigations are the sample gate and dropping any gossiped count above
 `MAX_COMMITMENT_KEY_COUNT` (gossip ingest authenticates the sender but does not
@@ -316,11 +323,16 @@ confirms it. If the skip rate turns out high, the floor is safe but useless. The
   admitted by a receiver far above that median (the production
   false-rejection shape); a cheapest-of-group settlement is rejected; a bundle
   padded with cheap quotes does not move the reference; a thin or fully stale
-  group view skips rather than rejects; a minority of understated commitments
-  does not disarm the floor.
+  group view skips rather than rejects; a mixed cache prices against the fresh
+  entries only; three of fifteen understated commitments do not disarm the
+  floor, and four DO — pinned deliberately, as is the matching four-overstated
+  griefing case.
 - Shadow telemetry: distribution of `settled / (3 x tolerance% x
-  reference_price)` on honest traffic, plus the `skipped=true` rate showing
-  how often the group reference is unavailable; projected rejection rate must
+  reference_price)` on honest traffic, plus the `skipped=true` rate broken down
+  by `skip_reason` (`no_commitment_cache`, `no_routing_view`,
+  `no_own_commitment`, `thin_sample`) — the first two are wiring bugs, the last
+  is the signal that the gate exceeds what the network supplies; projected
+  rejection rate must
   be ~0 at the chosen tolerance before any canary enforces.
 - Canary enforcement: zero honest-upload failures at 4-of-20 store quorum
   while enforcing nodes reject synthetic cheapest-of-K proofs.
