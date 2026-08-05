@@ -1,6 +1,7 @@
 //! Live ADR-0009 local-devnet protocol test.
 
 use ant_node::devnet::{Devnet, DevnetConfig};
+use ant_node::BrowserEndpoint;
 use bytes::Bytes;
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
@@ -44,26 +45,29 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     let endpoint = endpoints
         .first()
         .ok_or_else(|| io::Error::other("browser-enabled devnet returned no direct endpoints"))?;
+    let parsed_endpoint = endpoint.endpoint.parse().map_err(io::Error::other)?;
     let (hello, hello_content) = rpc(
-        &endpoint.endpoint.url,
-        &endpoint.endpoint.certificate_sha256,
+        &endpoint.endpoint,
         json!({
-            "version": 1,
+            "version": 2,
             "request_id": 5,
             "type": "hello",
         }),
     )
     .await?;
     assert_eq!(hello["status"], "ok");
-    assert_eq!(hello["protocol"], "autonomi.web.poc.v1");
-    assert_eq!(hello["peer_id"], endpoint.peer_id);
+    assert_eq!(hello["protocol"], "autonomi.web.poc.v2");
+    assert_eq!(hello["peer_id"], parsed_endpoint.peer_id.to_hex());
+    assert_eq!(
+        hello["endpoint"]["multiaddr"],
+        endpoint.endpoint.multiaddr.to_string()
+    );
     assert!(hello_content.is_empty());
 
     let (closest, closest_content) = rpc(
-        &endpoint.endpoint.url,
-        &endpoint.endpoint.certificate_sha256,
+        &endpoint.endpoint,
         json!({
-            "version": 1,
+            "version": 2,
             "request_id": 6,
             "type": "find_node",
             "target": public_file.address,
@@ -82,13 +86,17 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
         .ok_or_else(|| io::Error::other("FIND_NODE returned no browser endpoint"))?;
     let download_endpoint = endpoints
         .iter()
-        .find(|candidate| candidate.peer_id == discovered_peer)
+        .find(|candidate| {
+            candidate
+                .endpoint
+                .parse()
+                .is_ok_and(|parsed| parsed.peer_id.to_hex() == discovered_peer)
+        })
         .ok_or_else(|| io::Error::other("discovered endpoint was not in the devnet catalog"))?;
     let (header, data_map_bytes) = rpc(
-        &download_endpoint.endpoint.url,
-        &download_endpoint.endpoint.certificate_sha256,
+        &download_endpoint.endpoint,
         json!({
-            "version": 1,
+            "version": 2,
             "request_id": 7,
             "type": "get_chunk",
             "address": public_file.address,
@@ -107,10 +115,9 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
     for (index, chunk) in public_file.chunks.iter().enumerate() {
         let request_id = u64::try_from(index)?.saturating_add(10);
         let (chunk_header, chunk_bytes) = rpc(
-            &download_endpoint.endpoint.url,
-            &download_endpoint.endpoint.certificate_sha256,
+            &download_endpoint.endpoint,
             json!({
-                "version": 1,
+                "version": 2,
                 "request_id": request_id,
                 "type": "get_chunk",
                 "address": chunk.dst_hash,
@@ -131,25 +138,17 @@ async fn seeded_public_file_downloads_over_a_direct_node_endpoint() -> Result<()
 }
 
 async fn rpc(
-    url: &str,
-    certificate_sha256: &str,
+    endpoint: &BrowserEndpoint,
     request: Value,
 ) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
-    let hash: [u8; 32] =
-        hex::decode(certificate_sha256)?
-            .try_into()
-            .map_err(|bytes: Vec<u8>| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("certificate hash has {} bytes", bytes.len()),
-                )
-            })?;
+    let parsed = endpoint.parse().map_err(io::Error::other)?;
+    let hashes = parsed.certificate_hashes.into_iter().map(Sha256Digest::new);
     let client_config = ClientConfig::builder()
         .with_bind_default()
-        .with_server_certificate_hashes([Sha256Digest::new(hash)])
+        .with_server_certificate_hashes(hashes)
         .build();
     let endpoint = Endpoint::client(client_config)?;
-    let options = ConnectOptions::builder(url)
+    let options = ConnectOptions::builder(&parsed.url)
         .add_header("origin", TEST_ORIGIN)
         .build();
     let connection = endpoint.connect(options).await?;

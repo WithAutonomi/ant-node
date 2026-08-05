@@ -65,7 +65,7 @@ pub use ant_protocol::{
 };
 pub use browser::{
     BrowserBootstrapNode, BrowserChunkInfo, BrowserDevnetManifest, BrowserEndpoint,
-    BrowserPublicFile, BROWSER_MANIFEST_VERSION,
+    BrowserPublicFile, ParsedBrowserEndpoint, BROWSER_MANIFEST_VERSION, BROWSER_WEBTRANSPORT_PATH,
 };
 pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,
@@ -86,6 +86,6 @@ pub mod core {
     pub use saorsa_core::identity::{NodeIdentity, PeerId};
     pub use saorsa_core::{
         IPDiversityConfig, MlDsa65, MultiAddr, NodeConfig as CoreNodeConfig, NodeMode, P2PEvent,
-        P2PNode,
+        P2PNode, WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
     };
 }

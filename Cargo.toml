@@ -87,6 +87,7 @@ color-eyre = "0.6"
 # Serialization
 rmp-serde = "1"
 hex = "0.4"
+url = "2"
 
 # Utilities
 bytes = "1"
@@ -190,6 +191,10 @@ test-utils = []
 # Non-production direct-browser interoperability proof from ADR-0009.
 # This enables a second HTTP/3/WebTransport UDP listener and requires Rust 1.88.
 webtransport-poc = ["dep:self_encryption", "dep:wtransport"]
+
+[patch.crates-io]
+saorsa-core = { path = "../saorsa-core-web-support" }
+saorsa-transport = { path = "../saorsa-transport-web-support" }
 
 [profile.release]
 lto = true

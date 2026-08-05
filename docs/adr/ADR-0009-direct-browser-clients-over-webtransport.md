@@ -2,6 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-03
+- **Last amended:** 2026-08-04
 - **Decision owners:** <pending>
 - **Reviewers:** <pending>
 - **Supersedes:** none
@@ -87,7 +88,9 @@ one-hop `FIND_NODE` RPCs iteratively, and download chunks with `GET_CHUNK`.
 - WebTransport uses a separate UDP socket and port from native Saorsa QUIC.
 - Node software generates P-256 X.509v3 certificates automatically. Operators
   do not obtain public CA certificates.
-- The browser supplies the certificate's SHA-256 DER hash through
+- Each node embeds the certificate's SHA-256 DER multihash in its advertised
+  WebTransport multiaddress. Applications supply only the multiaddress; the
+  browser client extracts the digest and passes it internally through
   `serverCertificateHashes`.
 - Production nodes maintain overlapping current and next certificates because
   hash-pinned WebTransport certificates may be valid for at most two weeks.
@@ -107,9 +110,7 @@ BrowserEndpointRecord {
     peer_id,
     sequence,
     expires_at,
-    webtransport_urls,
-    current_certificate_hashes,
-    next_certificate_hashes,
+    webtransport_multiaddrs,
     capabilities,
     protocol_versions,
     max_chunk_size,
@@ -117,6 +118,51 @@ BrowserEndpointRecord {
     ml_dsa_signature
 }
 ```
+
+The canonical direct address form is:
+
+```text
+/ip4/<address>/udp/<port>/quic-v1/webtransport
+  /certhash/<current-sha2-256-multihash>
+  [/certhash/<next-sha2-256-multihash>]
+  /p2p/<ant-peer-id>
+```
+
+`ip6`, `dns`, `dns4`, and `dns6` host components are also valid. Certificate
+multihashes use unpadded base64url multibase (`u`) and must contain exactly a
+32-byte SHA-256 digest. Implementations accept at most the current and next
+hash. The `/webtransport` component maps to the fixed
+`/autonomi/webtransport/v1` HTTPS session path.
+
+This is represented by the network's native address types rather than an
+application-owned string. `saorsa-transport` stores the transport component as
+`TransportAddr::WebTransport(WebTransportAddr)`, including the validated host,
+port, and certificate hashes. `saorsa-core::MultiAddr` wraps that transport
+component and owns the `/p2p/<ant-peer-id>` suffix. Its canonical `Display`,
+`FromStr`, and string-based Serde implementations are the single Rust codec
+used by endpoint records, manifests, `HELLO`, and `FIND_NODE`. `ant-node` must
+not maintain a second WebTransport multiaddress parser or certificate-hash
+codec.
+
+The native Saorsa QUIC dialer deliberately does not treat a WebTransport
+address as a native QUIC dialing candidate. It is a first-class advertised
+transport address whose browser HTTP/3 stack remains separate from the PQ
+node-to-node transport.
+
+The multiaddress is the complete dialing input: no separate URL, certificate
+hash, or peer-ID argument is accepted by the browser client. This prevents the
+three values from being accidentally mixed between nodes. A certificate hash
+authenticates the ephemeral TLS key, while `/p2p` identifies the expected
+persistent ANT identity. The endpoint-record signature binds the whole address
+to that identity. An address received through an unauthenticated channel is not
+made trustworthy merely by containing a hash; initial bootstrap addresses are
+application trust anchors, and discovered addresses require owner signatures.
+
+During rotation, nodes advertise current and next hashes in the same address,
+switch certificates only after the next hash has propagated, then replace the
+retired hash with a newly generated next hash. Cached addresses must expire no
+later than their last certificate. Rotation and address publication are node
+software responsibilities, not operator or web-application configuration.
 
 The ML-DSA signature covers a canonical, domain-separated encoding. The
 browser verifies the public-key-to-peer-ID binding, signature, network ID,
@@ -182,12 +228,16 @@ The repository PoC is intentionally feature-gated and disabled by default. It
 provides:
 
 - a separate WebTransport listener;
-- an automatically generated short-lived P-256 certificate and printed hash;
+- an automatically generated short-lived P-256 certificate and a self-contained
+  `/webtransport/certhash/.../p2p/...` multiaddress;
+- native `saorsa-transport::TransportAddr` and `saorsa-core::MultiAddr`
+  parsing, formatting, validation, and serialization for that address;
 - exact path and Origin checks;
 - bounded JSON requests on one bidirectional stream per RPC;
 - a length-prefixed JSON response header followed by optional raw chunk bytes;
 - `HELLO`, local `FIND_NODE`, and local `GET_CHUNK`;
-- a browser application that pins the certificate, performs the lookup loop,
+- a browser application that extracts and pins the certificate from the
+  multiaddress, performs the lookup loop,
   downloads public file records, reconstructs the complete file, and verifies
   both chunk and whole-file BLAKE3 hashes.
 
@@ -200,9 +250,10 @@ not evidence that partial fleet deployment is sufficient.
 
 The in-process `ant-devnet` launcher can enable a listener on every node. The
 listeners share an in-memory endpoint catalog, allowing each local `FIND_NODE`
-answer to attach the direct URL and certificate hash of every browser-enabled
-peer in its routing view. This catalog is explicitly a local replacement for
-the future signed DHT endpoint record, not a production discovery mechanism.
+answer to attach the self-contained WebTransport multiaddress of every
+browser-enabled peer in its routing view. This catalog is explicitly a local
+replacement for the future signed DHT endpoint record, not a production
+discovery mechanism.
 
 At startup the launcher uses `self_encryption 0.36` to produce encrypted file
 chunks and the same public MessagePack `DataMap` used by `ant-client`. It
@@ -210,9 +261,9 @@ publishes every record through each candidate node's ordinary PUT handler. It
 pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active. A read-only HTTP bootstrap
-manifest exposes endpoint pins, public-file metadata, and the resolved public
-root DataMap needed by this local client; it never performs lookup or carries
-file bytes.
+manifest exposes bootstrap multiaddresses, public-file metadata, and the
+resolved public root DataMap needed by this local client; it never performs
+lookup or carries file bytes.
 
 The companion JavaScript client and test site live in the `web/` package of the
 `ant-client-web-support` repository. It fetches the public DataMap and every
@@ -227,6 +278,10 @@ reconstructed file, and exposes it through the browser save flow.
 - Browsers can become application-level full read clients without a lookup or
   download gateway.
 - Operators do not manage DNS names or CA certificate issuance.
+- Community clients configure one self-contained bootstrap multiaddress per
+  seed instead of separate URLs and certificate hashes.
+- Rust producers and consumers share the network's native `MultiAddr` codec;
+  browser JavaScript implements the same canonical wire syntax.
 - Existing PQ node networking and compatibility remain isolated.
 - Reliable WebTransport streams match large immutable chunk downloads.
 - Endpoint records explicitly bind browser TLS to the node's PQ identity.

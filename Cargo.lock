@@ -871,6 +871,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "url",
  "wtransport",
  "xor_name",
  "zip",
@@ -4968,8 +4969,6 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "454529f8a72b4cf22f7d9c3b009ad9d4ba78520e11f6444ae460795d55c002da"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5083,12 +5082,11 @@ dependencies = [
 [[package]]
 name = "saorsa-transport"
 version = "0.35.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3284026c300f642077315b782462b22558e24d621265a8deeae23287b1c5542"
 dependencies = [
  "anyhow",
  "async-trait",
  "aws-lc-rs",
+ "base64",
  "blake3",
  "bytes",
  "chrono",

@@ -569,10 +569,7 @@ impl Devnet {
             .filter_map(|node| {
                 node.browser_endpoint
                     .clone()
-                    .map(|endpoint| BrowserBootstrapNode {
-                        peer_id: node.peer_id.to_hex(),
-                        endpoint,
-                    })
+                    .map(|endpoint| BrowserBootstrapNode { endpoint })
             })
             .collect()
     }
