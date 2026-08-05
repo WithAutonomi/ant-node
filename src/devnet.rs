@@ -31,7 +31,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(feature = "webtransport-poc")]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
 #[cfg(feature = "webtransport-poc")]
-use crate::browser::{BrowserBootstrapNode, BrowserPublicFile};
+use crate::browser::{BrowserBootstrapNode, BrowserPaymentNetwork, BrowserPublicFile};
 #[cfg(feature = "webtransport-poc")]
 use crate::config::WebTransportConfig;
 #[cfg(feature = "webtransport-poc")]
@@ -723,6 +723,18 @@ impl Devnet {
         Ok(published)
     }
 
+    /// Public EVM configuration advertised to direct browser clients.
+    #[cfg(feature = "webtransport-poc")]
+    #[must_use]
+    pub fn browser_payment_network(&self) -> BrowserPaymentNetwork {
+        let network = self
+            .config
+            .evm_network
+            .as_ref()
+            .unwrap_or(&EvmNetwork::ArbitrumOne);
+        BrowserPaymentNetwork::from_evm_network(network)
+    }
+
     #[cfg(feature = "webtransport-poc")]
     async fn publish_browser_record(&self, address: [u8; 32], content: &Bytes) -> Result<usize> {
         let mut replicas = 0usize;
@@ -1032,6 +1044,10 @@ impl Devnet {
                 &webtransport_config,
                 p2p,
                 node.ant_protocol.clone(),
+                self.config
+                    .evm_network
+                    .as_ref()
+                    .unwrap_or(&EvmNetwork::ArbitrumOne),
                 self.shutdown.clone(),
                 Arc::clone(&self.browser_endpoint_catalog),
             )

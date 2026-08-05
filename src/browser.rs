@@ -1,7 +1,9 @@
 //! Shared browser-client discovery types.
 //!
-//! These types deliberately describe only public read capabilities. Native
-//! node addresses and payment/write APIs remain outside the browser surface.
+//! These types describe the public read and paid immutable-write capabilities
+//! exposed by browser-enabled nodes. Wallet secrets never form part of these
+//! records: browsers sign EVM transactions locally and send only payment
+//! receipts to nodes.
 
 use saorsa_core::{
     MultiAddr, PeerId, WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
@@ -10,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use url::{Host, Url};
 
 /// Version of the local browser bootstrap manifest.
-pub const BROWSER_MANIFEST_VERSION: u16 = 3;
+pub const BROWSER_MANIFEST_VERSION: u16 = 4;
 
 /// Fixed HTTPS path represented by an Autonomi `/webtransport` multiaddress.
 pub const BROWSER_WEBTRANSPORT_PATH: &str = "/autonomi/webtransport/v1";
@@ -149,6 +151,33 @@ pub struct BrowserChunkInfo {
     pub src_size: usize,
 }
 
+/// Public EVM configuration required to pay for immutable browser uploads.
+///
+/// This deliberately excludes wallet keys. A browser obtains a key from its
+/// user at runtime and must never transmit it to a storage node or manifest
+/// server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserPaymentNetwork {
+    /// HTTP JSON-RPC endpoint used to submit and inspect transactions.
+    pub rpc_url: String,
+    /// ERC-20 ANT token contract address.
+    pub payment_token_address: String,
+    /// Payment vault contract that accepts quote payments.
+    pub payment_vault_address: String,
+}
+
+impl BrowserPaymentNetwork {
+    /// Convert the node's concrete EVM network into browser-safe public data.
+    #[must_use]
+    pub fn from_evm_network(network: &evmlib::Network) -> Self {
+        Self {
+            rpc_url: network.rpc_url().to_string(),
+            payment_token_address: format!("{:?}", network.payment_token_address()),
+            payment_vault_address: format!("{:?}", network.payment_vault_address()),
+        }
+    }
+}
+
 /// Local-devnet handoff consumed by the browser application.
 ///
 /// This manifest is intentionally a local testnet bootstrap artifact. The
@@ -164,6 +193,8 @@ pub struct BrowserDevnetManifest {
     pub created_at: String,
     /// Direct node endpoints available as initial browser contacts.
     pub endpoints: Vec<BrowserBootstrapNode>,
+    /// Public payment contracts and RPC used by browser uploads.
+    pub payment: BrowserPaymentNetwork,
     /// Immutable files published when the devnet started.
     pub files: Vec<BrowserPublicFile>,
 }
@@ -175,6 +206,7 @@ impl BrowserDevnetManifest {
         network_id: String,
         created_at: String,
         endpoints: Vec<BrowserBootstrapNode>,
+        payment: BrowserPaymentNetwork,
         files: Vec<BrowserPublicFile>,
     ) -> Self {
         Self {
@@ -182,6 +214,7 @@ impl BrowserDevnetManifest {
             network_id,
             created_at,
             endpoints,
+            payment,
             files,
         }
     }

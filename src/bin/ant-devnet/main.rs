@@ -116,7 +116,10 @@ async fn main() -> color_eyre::Result<()> {
     } else if let Some(host) = cli.host {
         config.webtransport_allowed_origins = vec![format!("http://{host}:5173")];
     }
-    let evm_info = resolve_evm_info(
+    let ResolvedEvm {
+        manifest: evm_info,
+        local_testnet: _local_evm_testnet,
+    } = resolve_evm_info(
         cli.evm_network.as_deref(),
         cli.enable_evm,
         cli.host,
@@ -140,6 +143,7 @@ async fn main() -> color_eyre::Result<()> {
             network_id,
             created_at.clone(),
             devnet.browser_endpoints(),
+            devnet.browser_payment_network(),
             vec![public_file],
         ))
     } else {
@@ -262,12 +266,19 @@ async fn load_public_file(
 /// an **external** network (`--evm-network`, e.g. Arbitrum Sepolia verified
 /// against the real deployed contracts, no embedded wallet key); a **local
 /// Anvil** chain (`--enable-evm`); or **none**. External takes precedence.
+struct ResolvedEvm {
+    manifest: Option<DevnetEvmInfo>,
+    // Retain ownership until main exits so the Anvil child is terminated on
+    // normal shutdown instead of being orphaned.
+    local_testnet: Option<evmlib::testnet::Testnet>,
+}
+
 async fn resolve_evm_info(
     evm_network: Option<&str>,
     enable_evm: bool,
     host: Option<std::net::Ipv4Addr>,
     config: &mut DevnetConfig,
-) -> color_eyre::Result<Option<DevnetEvmInfo>> {
+) -> color_eyre::Result<ResolvedEvm> {
     if let Some(net_name) = evm_network {
         let network = match net_name {
             "arbitrum-sepolia" => evmlib::Network::ArbitrumSepoliaTest,
@@ -284,12 +295,15 @@ async fn resolve_evm_info(
             "Using external EVM network {net_name}: rpc={rpc_url} token={token_addr} vault={vault_addr}"
         );
         config.evm_network = Some(network);
-        Ok(Some(DevnetEvmInfo {
-            rpc_url,
-            wallet_private_key: String::new(),
-            payment_token_address: token_addr,
-            payment_vault_address: vault_addr,
-        }))
+        Ok(ResolvedEvm {
+            manifest: Some(DevnetEvmInfo {
+                rpc_url,
+                wallet_private_key: String::new(),
+                payment_token_address: token_addr,
+                payment_vault_address: vault_addr,
+            }),
+            local_testnet: None,
+        })
     } else if enable_evm {
         // Anvil binds — and evmlib publishes in the manifest's `rpc_url` —
         // the address in `ANVIL_IP_ADDR`, defaulting to localhost. A LAN
@@ -331,18 +345,20 @@ async fn resolve_evm_info(
         ant_node::logging::info!("Anvil blockchain running at {rpc_url}");
         ant_node::logging::info!("Funded wallet private key: {wallet_key}");
 
-        // Keep testnet alive by leaking it (it will be cleaned up on process exit)
-        // This is necessary because AnvilInstance stops Anvil when dropped
-        std::mem::forget(testnet);
-
-        Ok(Some(DevnetEvmInfo {
-            rpc_url,
-            wallet_private_key: wallet_key,
-            payment_token_address: token_addr,
-            payment_vault_address: vault_addr,
-        }))
+        Ok(ResolvedEvm {
+            manifest: Some(DevnetEvmInfo {
+                rpc_url,
+                wallet_private_key: wallet_key,
+                payment_token_address: token_addr,
+                payment_vault_address: vault_addr,
+            }),
+            local_testnet: Some(testnet),
+        })
     } else {
-        Ok(None)
+        Ok(ResolvedEvm {
+            manifest: None,
+            local_testnet: None,
+        })
     }
 }
 
