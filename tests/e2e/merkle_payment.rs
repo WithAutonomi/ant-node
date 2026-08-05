@@ -205,12 +205,76 @@ fn build_valid_merkle_proof() -> ValidMerkleProof {
     }
 }
 
+/// The price every fabricated candidate carries.
+///
+/// It must be a real point on the pricing curve for the binding these
+/// candidates declare below (`committed_key_count: 0`, `commitment_pin: None`),
+/// or the ADR-0004 arithmetic gate rejects the pool outright and the attack
+/// tests never reach the check they are actually asserting.
+fn candidate_price() -> Amount {
+    ant_node::payment::pricing::calculate_price(0)
+}
+
+/// Per-node settlement the verifier requires for a merkle proof of `depth`.
+///
+/// Mirrors the contract formula the verifier applies, including both terms:
+/// `multiplier * median16(candidate prices) * 2^depth / depth`. Every
+/// fabricated candidate carries `candidate_price()`, so the median is that
+/// price. The trailing `/ depth` split is the part a bare `price * 2^depth`
+/// misses.
+///
+/// The multiplier is the ADR-0008 parity `3x` that a receipt stamped at or
+/// after `MERKLE_PARITY_ENFORCED_FROM_UNIX` must settle at. Fixtures stamp
+/// their receipts at `now`, so they land on that side of the boundary. The
+/// verifier only rejects *under*payment, so the parity amount also clears the
+/// legacy `1x` expectation, and a fixture funded here is correct on both sides
+/// of the boundary without the test having to pin it.
+///
+/// Derived from the price rather than hardcoded: a literal silently stops
+/// matching the formula the moment the pricing curve moves.
+fn parity_per_node_payment(depth: u8) -> Amount {
+    /// Mirrors the verifier's private `PAID_QUOTE_PAYMENT_MULTIPLIER`.
+    const PARITY_MULTIPLIER: u64 = 3;
+
+    let Some(leaves) = 1u64.checked_shl(u32::from(depth)) else {
+        return Amount::ZERO;
+    };
+    let Some(nodes_paid) = std::num::NonZeroU64::new(u64::from(depth)) else {
+        // Depth 0 pays nobody, matching the verifier's own short-circuit.
+        return Amount::ZERO;
+    };
+    let total = candidate_price()
+        .saturating_mul(Amount::from(PARITY_MULTIPLIER))
+        .saturating_mul(Amount::from(leaves));
+    total / Amount::from(nodes_paid.get())
+}
+
+/// Pin the depth-2 settlement the attack fixtures fund at.
+///
+/// The previous fixture paid `price * 2^depth` and dropped the `/ depth` term,
+/// which happened to be neither the legacy `1x` nor the parity `3x` amount. It
+/// stayed green only because candidate closeness is checked before settlement,
+/// so the fixture had quietly stopped isolating the check it claims to isolate.
+/// This restates the depth-2 case as literals so an error in the general helper
+/// fails here rather than silently re-arming that trap.
+#[test]
+fn parity_per_node_payment_matches_the_contract_formula_at_depth_two() {
+    let price = candidate_price();
+    // 3 * price * 2^2 / 2 == 6 * price.
+    assert_eq!(parity_per_node_payment(2), price * Amount::from(6u64));
+    // And it clears the legacy 1x expectation (price * 2^2 / 2), which the
+    // verifier still applies to receipts stamped before the parity boundary.
+    assert!(parity_per_node_payment(2) >= price * Amount::from(2u64));
+    // Depth 0 pays nobody, matching the verifier's short-circuit.
+    assert_eq!(parity_per_node_payment(0), Amount::ZERO);
+}
+
 /// Build 16 validly-signed ML-DSA-65 candidate nodes for a merkle proof.
 fn build_candidate_nodes(timestamp: u64) -> [MerklePaymentCandidateNode; CANDIDATES_PER_POOL] {
     std::array::from_fn(|i| {
         let ml_dsa = MlDsa65::new();
         let (pub_key, secret_key) = ml_dsa.generate_keypair().expect("keygen");
-        let price = Amount::from(1024u64);
+        let price = candidate_price();
         #[allow(clippy::cast_possible_truncation)]
         let reward_address = RewardsAddress::new([i as u8; 20]);
         let msg =
@@ -574,10 +638,14 @@ async fn test_attack_merkle_pay_yourself_fabricated_pool() -> Result<(), Box<dyn
         .first()
         .expect("pool has candidates")
         .merkle_payment_timestamp;
-    // 4-leaf tree → depth 2 (log2(4)). Prices are all 1024 in
-    // build_candidate_nodes, so per-node payment = 1024 * 2^2 / 2 = 2048.
+    // 4-leaf tree → depth 2 (log2(4)). The verifier settles
+    // `multiplier * median16(price) * 2^depth / depth`, so at depth 2 the
+    // parity multiplier makes this `3 * price * 4 / 2` = `6 * price`. Funding
+    // at the parity amount keeps the fixture's isolation invariant intact on
+    // both sides of the parity boundary: settlement can never be the reason
+    // this proof is rejected, so closeness stays the only check that can fire.
     let depth: u8 = 2;
-    let per_node = Amount::from(4096u64);
+    let per_node = parity_per_node_payment(depth);
     let paid_node_addresses = vec![
         (RewardsAddress::new([0u8; 20]), 0usize, per_node),
         (RewardsAddress::new([1u8; 20]), 1usize, per_node),

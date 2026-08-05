@@ -20,9 +20,10 @@ already specifies.
 non-negative integer `n`, by exact recomputation, on every quote in every
 payment bundle (all 7 single-node quotes and all 16 merkle candidates), in
 every `VerificationContext`. Reject-only when enforced; no trust evidence.
-Rollout-gated by `QUOTE_ARITHMETIC_RECHECK_ENABLED` (defaults to `false` —
-observe-only). Telemetry runs only after ML-DSA-65 signature verification has
-passed, so unauthenticated peers cannot poison rollout logs.
+Rollout-gated by `QUOTE_ARITHMETIC_RECHECK_ENABLED`, now `true` after a clean
+observe-only canary on ant-prod-01. Telemetry runs only after ML-DSA-65
+signature verification has passed, so unauthenticated peers cannot poison
+rollout logs.
 
 **Why first:** needs no evmlib change, no new state, no new wire types, no
 new gossip; it is the ADR's "every storer re-runs the
