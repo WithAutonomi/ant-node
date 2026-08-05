@@ -35,11 +35,13 @@ When `--serve-port` is omitted with `--webtransport`, port 25000 is used. Pass
 necessarily reconstructs multiple storage records. A custom file may be up to
 64 MiB in this local in-memory launcher.
 
-The browser manifest contains every node's peer ID, direct HTTPS URL,
-certificate SHA-256 pin, the public DataMap address, the plaintext file hash,
-and resolved reconstruction metadata. The HTTP server provides bootstrap
-metadata only; the DataMap and file bytes are read from storage nodes over
-WebTransport.
+The browser manifest contains every node's self-contained WebTransport
+multiaddress, with its certificate SHA-256 multihash and peer ID embedded,
+plus the public DataMap address, plaintext file hash, and resolved
+reconstruction metadata. The HTTP server provides bootstrap metadata only;
+the DataMap and file bytes are read from storage nodes over WebTransport.
+Each address string is serialized directly from `saorsa_core::MultiAddr`; the
+node does not maintain a browser-specific multiaddress codec.
 
 ## Start the browser client
 
@@ -62,9 +64,10 @@ cargo test --features webtransport-poc --test webtransport_devnet -- --ignored
 ```
 
 This starts the five-node network, self-encrypts and publishes a public file
-through normal PUT admission with devnet-prepaid cache entries, pins a generated
-certificate, retrieves the DataMap and encrypted chunks from direct endpoints,
-and reconstructs the exact original bytes.
+through normal PUT admission with devnet-prepaid cache entries, extracts a
+generated certificate pin from the advertised multiaddress, retrieves the
+DataMap and encrypted chunks from direct endpoints, and reconstructs the exact
+original bytes.
 
 ## LAN testing
 
