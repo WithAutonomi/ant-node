@@ -138,6 +138,9 @@ enum SkipReason {
 }
 
 impl SkipReason {
+    /// Only ever called from the price-floor telemetry, which compiles to
+    /// nothing without the `logging` feature.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     const fn as_str(self) -> &'static str {
         match self {
             Self::NoCommitmentCache => "no_commitment_cache",
@@ -177,6 +180,9 @@ impl GroupSample {
         }
     }
 
+    /// Only ever called from the price-floor telemetry, which compiles to
+    /// nothing without the `logging` feature.
+    #[cfg_attr(not(feature = "logging"), allow(dead_code))]
     fn skip_reason_str(self) -> &'static str {
         self.skip_reason.map_or("none", SkipReason::as_str)
     }
