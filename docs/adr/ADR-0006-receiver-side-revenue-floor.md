@@ -70,9 +70,11 @@ evaluations across 912 of 913 node instances**, `enforce` never set.
   on the busiest day.
 
 **Root cause: node size difference.** Committed key counts across the fleet
-span roughly **1,700 to 6,300**, which is a **~4x spread in price**. A client
+span roughly **1,700 to 6,300**. On the pinned quadratic pricing curve that is
+a **6.3x spread end to end**, and **4.1x between the 5th and 95th percentiles**
+of what nodes actually charge, which is the range most payments meet. A client
 pays `3x` the **median** of the quotes it collected, so the original rule
-compared a median against a single draw from a 4x-wide distribution. The
+compared a median against a single draw from that spread. The
 fullest nodes therefore rejected honest payments while the emptiest admitted
 deep underpayment. Both failures are the same defect.
 

@@ -898,7 +898,9 @@ impl PaymentVerifier {
     /// the floor and this node's own quotes read one pricing basis by
     /// construction. Read via the non-mutating snapshot only. Idempotent.
     /// Absent (unit tests, storage disabled, pre-replication startup), the
-    /// floor evaluates against the baseline price — vacuous, never an outage.
+    /// floor SKIPS the admission entirely with `skip_reason=no_own_commitment`
+    /// rather than pricing against anything, so a node in that state never
+    /// rejects.
     pub fn attach_local_commitment_source(
         &self,
         source: Arc<dyn crate::payment::quote::CommitmentSource>,
@@ -1408,9 +1410,9 @@ impl PaymentVerifier {
 
     /// Fully validate one median-priced candidate. On success returns the
     /// settled on-chain amount for the candidate's quote hash, which the
-    /// price-floor policy compares against the receiver's own commitment
-    /// price (the settled amount, not the quoted price, so an honest client
-    /// may overpay a cheap quote to clear stricter receivers).
+    /// price-floor policy compares against the close group's median
+    /// commitment price (the settled amount, not the quoted price, so an
+    /// honest client may overpay a cheap quote to clear stricter receivers).
     async fn verify_legacy_median_candidate(
         &self,
         xorname: &XorName,
@@ -1651,9 +1653,10 @@ impl PaymentVerifier {
     /// P2P handle, no gossip cache — the floor SKIPS the admission rather than
     /// falling back to this node's own price. Falling back is what the previous
     /// revision did, and it is precisely the comparison that rejected honest
-    /// stores on the fullest nodes. A skipped evaluation is logged with
-    /// `group_sample=0` so shadow telemetry can measure how often the reference
-    /// is unavailable.
+    /// stores on the fullest nodes. A skipped evaluation is logged with its
+    /// real `neighbours` / `group_sample` counts and a `skip_reason`, so shadow
+    /// telemetry can separate an unwired node from one whose gate simply sits
+    /// above what the network supplies.
     ///
     /// Always emits one telemetry line per evaluated admission (target
     /// `ant_node::payment::price_floor`) so shadow mode measures the exact

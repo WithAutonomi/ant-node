@@ -351,7 +351,7 @@ and a node that was actually paid is nominated for a first audit.
 | Node re-verification of **non-paid** quotes in the bundle | not done (bad signature on an unpaid quote is accepted) |
 | Node rejection of off-curve quotes (`QUOTE_ARITHMETIC_RECHECK_ENABLED`) | off (telemetry only) |
 | Quote/commitment mismatch reported to trust | off (telemetry only) |
-| Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 50% tolerance) |
+| Receiver-side price floor (ADR-0006) | shadow (`ANT_PRICE_FLOOR_ENFORCE`, 65% tolerance), priced against the **close group's median** committed count, not the receiver's own; the own-price basis was withdrawn after canary measurement |
 | Payee eligibility gate (ADR-0005) | **not merged**; observe-only on its branch (`ADR5_ENFORCE`) |
 | Client pays the 3× multiplier on the merkle path | **enforced** by the published client, immediately and unconditionally (no flag, no date) |
 | Storer requires it (`MERKLE_PARITY_ENFORCED_FROM_UNIX`) | **enforced** by upgraded nodes, for receipts stamped from 2026-08-04 15:00 UTC onward |
