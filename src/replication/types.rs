@@ -793,6 +793,16 @@ pub struct BootstrapState {
     /// a third party block our drain through an unrelated honest peer. The
     /// displaced key is forfeited to the same post-bootstrap recovery path.
     pub capacity_rejected_sources: HashMap<PeerId, Instant>,
+    /// Wall-clock moment bootstrap drain tracking began. Set in [`Self::new`].
+    /// `check_bootstrap_drained` force-drains after `bootstrap_drain_deadline`
+    /// has elapsed since this moment, bounding total bootstrap stall even if
+    /// per-source expiry alone would not resolve the wedge.
+    pub bootstrap_started_at: Instant,
+    /// Hard ceiling on total bootstrap stall. Once `bootstrap_started_at` is
+    /// older than this, `check_bootstrap_drained` forces drain with a `warn!`
+    /// log. Wired from `ReplicationConfig::bootstrap_drain_deadline` by the
+    /// replication engine; defaults to the 30-minute ceiling.
+    pub bootstrap_drain_deadline: Duration,
 }
 
 impl BootstrapState {
@@ -804,6 +814,8 @@ impl BootstrapState {
             pending_peer_requests: 0,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(30 * 60),
         }
     }
 

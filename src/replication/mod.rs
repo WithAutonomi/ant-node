@@ -1894,7 +1894,11 @@ impl ReplicationEngine {
             gossip_lottery_attempts: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
-            bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
+            bootstrap_state: {
+                let mut bs = BootstrapState::new();
+                bs.bootstrap_drain_deadline = config.bootstrap_drain_deadline;
+                Arc::new(RwLock::new(bs))
+            },
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
             bootstrap_complete_notify: Arc::new(Notify::new()),

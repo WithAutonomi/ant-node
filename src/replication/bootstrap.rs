@@ -118,6 +118,28 @@ pub async fn check_bootstrap_drained(
         return true;
     }
 
+    // (d) Overall force-drain backstop — unconditional ceiling. Placed first
+    // so it fires regardless of pending peer requests, capacity-rejected
+    // sources, or undiscovered keys. Bounds total bootstrap stall even when
+    // per-source expiry alone would not resolve the wedge (e.g. multiple
+    // coordinated over-cap sources, or a `pending_keys` path that never
+    // empties after a disk-full restart). Aligned with `PENDING_VERIFY_MAX_AGE`
+    // so by the deadline stale `pending_verify` entries have already been
+    // evicted, leaving minimal genuine residual work.
+    let now = Instant::now();
+    if now.duration_since(state.bootstrap_started_at) >= state.bootstrap_drain_deadline {
+        warn!(
+            "Bootstrap force-drain: {:?} stall ceiling reached, draining with \
+             possibly-outstanding work (rejects={}, pending_peer_requests={}, pending_keys={})",
+            state.bootstrap_drain_deadline,
+            state.capacity_rejected_sources.len(),
+            state.pending_peer_requests,
+            state.pending_keys.len(),
+        );
+        state.drained = true;
+        return true;
+    }
+
     if state.pending_peer_requests > 0 {
         return false;
     }
@@ -277,6 +299,8 @@ mod tests {
             pending_peer_requests: 5,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: std::collections::HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(1800),
         }));
         let queues = ReplicationQueues::new();
 
@@ -293,6 +317,8 @@ mod tests {
             pending_peer_requests: 2,
             pending_keys: HashSet::new(),
             capacity_rejected_sources: std::collections::HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(1800),
         }));
         let queues = ReplicationQueues::new();
 
@@ -309,6 +335,8 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
             capacity_rejected_sources: std::collections::HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(1800),
         }));
         let queues = ReplicationQueues::new();
 
@@ -324,6 +352,8 @@ mod tests {
             pending_peer_requests: 0,
             pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
             capacity_rejected_sources: std::collections::HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(1800),
         }));
         let mut queues = ReplicationQueues::new();
 
@@ -589,6 +619,65 @@ mod tests {
         assert!(
             check_bootstrap_drained(&state, &queues).await,
             "bootstrap must drain once the expired debt is forfeited"
+        );
+    }
+
+    /// (d) Force-drain backstop: past the overall drain deadline, drain is
+    /// forced even with outstanding peer requests, capacity-rejected sources,
+    /// and pending keys. This is the unconditional ceiling that bounds total
+    /// bootstrap stall regardless of any per-source or per-key state.
+    #[tokio::test]
+    async fn force_drain_after_overall_deadline() {
+        let state = Arc::new(RwLock::new(BootstrapState {
+            drained: false,
+            pending_peer_requests: 3,
+            pending_keys: std::iter::once(xor_name_from_byte(0x01)).collect(),
+            capacity_rejected_sources: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    saorsa_core::identity::PeerId::from_bytes([0xAA; 32]),
+                    Instant::now(),
+                );
+                m
+            },
+            // Backdate bootstrap start past the 60s deadline.
+            bootstrap_started_at: Instant::now() - Duration::from_secs(61),
+            bootstrap_drain_deadline: Duration::from_secs(60),
+        }));
+        let queues = ReplicationQueues::new();
+
+        assert!(
+            check_bootstrap_drained(&state, &queues).await,
+            "force-drain must fire after the overall deadline despite all outstanding work"
+        );
+        assert!(
+            state.read().await.drained,
+            "drained flag must be set by force-drain"
+        );
+    }
+
+    /// (d) Within the deadline, outstanding state still blocks drain: the
+    /// force-drain ceiling must NOT fire early and mask genuine in-progress
+    /// bootstrap work.
+    #[tokio::test]
+    async fn force_drain_does_not_fire_within_deadline() {
+        let state = Arc::new(RwLock::new(BootstrapState {
+            drained: false,
+            pending_peer_requests: 1,
+            pending_keys: HashSet::new(),
+            capacity_rejected_sources: std::collections::HashMap::new(),
+            bootstrap_started_at: Instant::now(),
+            bootstrap_drain_deadline: Duration::from_secs(1800),
+        }));
+        let queues = ReplicationQueues::new();
+
+        assert!(
+            !check_bootstrap_drained(&state, &queues).await,
+            "within the deadline, pending peer requests must still block drain"
+        );
+        assert!(
+            !state.read().await.drained,
+            "force-drain must not fire before the deadline"
         );
     }
 }
