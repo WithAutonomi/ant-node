@@ -28,6 +28,7 @@ use saorsa_core::identity::node_identity::peer_id_from_public_key_bytes;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
 use std::collections::HashMap;
+use std::env::VarError;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Instant;
@@ -193,10 +194,18 @@ impl GroupSample {
 /// Absent or any other value means shadow mode: the floor is computed and
 /// logged, never enforced. Per-node so enforcement can roll out canary-first;
 /// unsetting it (and restarting) is the kill switch.
+///
+/// Not sufficient on its own: [`PRICE_FLOOR_TOLERANCE_ENV`] must also name a
+/// valid tolerance, or [`PriceFloorConfig::from_env`] stays in shadow mode.
 pub const PRICE_FLOOR_ENFORCE_ENV: &str = "ANT_PRICE_FLOOR_ENFORCE";
 
-/// Environment variable overriding the price-floor tolerance percentage
-/// (`0..=100`). Invalid or absent values use the default.
+/// Environment variable setting the price-floor tolerance percentage
+/// (`0..=100`).
+///
+/// Required to enforce, optional to measure. In shadow mode an absent or
+/// unreadable value falls back to the default so telemetry still has a number.
+/// Under [`PRICE_FLOOR_ENFORCE_ENV`] there is no fallback: an absent or
+/// unreadable value fails closed to shadow mode.
 pub const PRICE_FLOOR_TOLERANCE_ENV: &str = "ANT_PRICE_FLOOR_TOLERANCE_PERCENT";
 
 /// Receiver-side price floor for single-node store admissions.
@@ -244,46 +253,67 @@ impl PriceFloorConfig {
     /// Build from the environment (see [`PRICE_FLOOR_ENFORCE_ENV`] and
     /// [`PRICE_FLOOR_TOLERANCE_ENV`]). Never panics.
     ///
-    /// An unset tolerance uses the default. A tolerance that is *present but
-    /// invalid* (unparseable or `> 100`) is an operator error: rather than
-    /// silently enforce at the default, this **fails closed to shadow mode**
-    /// (`enforce = false`) and logs a prominent error, so a fat-fingered
-    /// tolerance can never enforce an unintended floor against real payments.
+    /// **Enforcement requires an explicitly specified, valid tolerance.**
+    /// Anything else (unset, unparseable, `> 100`, or not readable as Unicode)
+    /// **fails closed to shadow mode** (`enforce = false`) and logs a prominent
+    /// error. Shadow mode still evaluates, at the default tolerance, because its
+    /// whole job is to produce telemetry.
+    ///
+    /// The tolerance is not a formatting detail, it is the policy: it decides
+    /// which already-settled, unrefundable payments get refused. Its meaning also
+    /// depends on what the floor is priced against, and that reference has
+    /// changed once already, so a node carrying an older enforcement opt-in must
+    /// not silently start enforcing a newer rule at a default nobody chose for
+    /// it. Requiring the operator to name a tolerance is what makes enabling
+    /// enforcement a deliberate act under the rule that is actually in force.
     #[must_use]
     pub fn from_env() -> Self {
         let enforce_requested = std::env::var(PRICE_FLOOR_ENFORCE_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "True"));
 
-        let tolerance_raw = std::env::var(PRICE_FLOOR_TOLERANCE_ENV).ok();
+        // `var` separates three cases and only ONE of them means the operator
+        // said nothing. A value that is set but not readable as Unicode is still
+        // a value someone set, so it must not be mistaken for an absent one:
+        // reading it through `.ok()` would collapse it onto "unset" and hand it
+        // the default.
+        let tolerance_raw = std::env::var(PRICE_FLOOR_TOLERANCE_ENV);
+        let tolerance_unset = matches!(tolerance_raw, Err(VarError::NotPresent));
         let valid_tolerance = tolerance_raw
             .as_deref()
+            .ok()
             .map(str::trim)
             .and_then(|s| s.parse::<u64>().ok())
             .filter(|percent| *percent <= 100);
-        // A tolerance that is set but does not parse to `0..=100` is an operator
-        // error. Fail CLOSED: never enforce a tolerance the operator did not
-        // actually specify.
-        let tolerance_present_but_invalid = tolerance_raw.is_some() && valid_tolerance.is_none();
 
-        if tolerance_present_but_invalid {
+        // Name WHICH unusable state the tolerance is in, as a value rather than
+        // as duplicated log arms. The two states take different fixes (set it
+        // versus correct it), and telling an operator it is unset when they did
+        // set it, to something this process cannot read, sends them to the wrong
+        // one.
+        let tolerance_problem = match (valid_tolerance.is_some(), tolerance_unset) {
+            (true, _) => None,
+            (false, true) => Some("is unset"),
+            (false, false) => Some("is not readable as an integer in 0..=100"),
+        };
+
+        if let Some(problem) = tolerance_problem {
             if enforce_requested {
                 crate::logging::error!(
-                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
-                     refusing to enforce the price floor with an unspecified tolerance. \
-                     Price-floor enforcement DISABLED (shadow mode). Fix the value and restart \
-                     to enable enforcement."
+                    "Price-floor enforcement was requested but {PRICE_FLOOR_TOLERANCE_ENV} \
+                     {problem}; refusing to enforce a tolerance nobody specified. Price-floor \
+                     enforcement DISABLED (shadow mode). Set {PRICE_FLOOR_TOLERANCE_ENV} to an \
+                     integer in 0..=100 and restart to enable enforcement."
                 );
-            } else {
+            } else if !tolerance_unset {
                 crate::logging::warn!(
-                    "{PRICE_FLOOR_TOLERANCE_ENV}={tolerance_raw:?} is not an integer in 0..=100; \
-                     using the default {PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT}% for shadow-mode \
-                     telemetry."
+                    "{PRICE_FLOOR_TOLERANCE_ENV} {problem}; using the default \
+                     {PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT}% for shadow-mode telemetry."
                 );
             }
         }
 
         Self {
-            enforce: enforce_requested && !tolerance_present_but_invalid,
+            enforce: enforce_requested && valid_tolerance.is_some(),
             tolerance_percent: valid_tolerance.unwrap_or(PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT),
         }
     }
@@ -5139,6 +5169,59 @@ mod tests {
         std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, "loose");
         let cfg = PriceFloorConfig::from_env();
         assert!(!cfg.enforce);
+
+        // Enforce on, tolerance UNSET: disabled too. This is the upgrade case —
+        // a node carrying an enforcement opt-in from an older release, where the
+        // floor was priced against a different reference, must not resume
+        // enforcing under the current rule at a default it never chose.
+        std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
+        let cfg = PriceFloorConfig::from_env();
+        assert!(
+            !cfg.enforce,
+            "enforcement must require an explicitly specified tolerance, not inherit a default"
+        );
+        assert_eq!(
+            cfg.tolerance_percent, PRICE_FLOOR_DEFAULT_TOLERANCE_PERCENT,
+            "shadow mode still needs a number to measure with"
+        );
+
+        // Enforce on, tolerance set but NOT READABLE as Unicode: disabled too.
+        //
+        // Stated precisely, because the stronger claim is tempting and wrong:
+        // requiring a valid tolerance ALREADY covers this, since an unreadable
+        // value cannot parse and so is not valid. This case is not what makes
+        // enforcement safe here; it pins that the unreadable path stays on the
+        // fail-closed side if the "explicitly specified" rule is ever relaxed
+        // back toward a default, which is when `NotUnicode` collapsing onto
+        // `NotPresent` would start deciding the outcome again. The value of
+        // separating them TODAY is the operator-facing message: telling someone
+        // the tolerance is unset when they did set it, to something this process
+        // cannot read, sends them to the wrong fix.
+        //
+        // Kept inside this test rather than beside it: this test owns the
+        // `PRICE_FLOOR_*` variables, and a sibling test setting them would race
+        // its cleanup rather than measure anything.
+        #[cfg(unix)]
+        {
+            use std::ffi::OsStr;
+            use std::os::unix::ffi::OsStrExt;
+
+            // Lone continuation byte: a real value, and not valid UTF-8.
+            std::env::set_var(PRICE_FLOOR_TOLERANCE_ENV, OsStr::from_bytes(&[0x80]));
+            assert!(
+                std::env::var_os(PRICE_FLOOR_TOLERANCE_ENV).is_some(),
+                "the value must really be set for this case to discriminate"
+            );
+            assert!(
+                std::env::var(PRICE_FLOOR_TOLERANCE_ENV).is_err(),
+                "and it must really be unreadable as Unicode"
+            );
+            let cfg = PriceFloorConfig::from_env();
+            assert!(
+                !cfg.enforce,
+                "an unreadable tolerance is a SET value, not an absent one, and must fail closed"
+            );
+        }
 
         std::env::remove_var(PRICE_FLOOR_ENFORCE_ENV);
         std::env::remove_var(PRICE_FLOOR_TOLERANCE_ENV);
