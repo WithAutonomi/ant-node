@@ -111,12 +111,31 @@ The work budget carries debt, so an expensive proof is admitted proportionally
 less often than a cheap one. Its refill and burst sizes are set above measured
 honest demand at the maximum supported commitment size.
 
+Round two may open only the leaves round one proved, not any key in the pinned
+commitment. Membership of the commitment is the weaker property: it would let a
+cheap round one over small records authorise openings against large records
+elsewhere, so round two's cost would not be bounded by the work the caller had
+already paid for. The authorised set is recomputed from the pinned tree and the
+audit nonce, both of which the session already fixes, so it costs one tree walk
+with no chunk reads. A challenge naming any key outside the proved subtree is
+refused whole, before any chunk is read. An honest auditor cannot reach that
+case: it samples only the leaves round one returned, and it holds no committed
+block-tree root or content length to verify an answer for anything else against.
+
 ### Wire and decode bounds
 
 Subtree family messages take a tighter wire ceiling than core replication. The
 limit is selected from the encoded body discriminant before deserializing
 attacker-controlled collections and is sized above the largest legitimate
 round-one proof at the commitment key-count cap.
+
+One selector serves both directions. Encoding measures the body it produced
+against the same family ceiling the decoder applies, so an audit body that
+outgrew that ceiling fails at the sender rather than being dropped, before
+decode and without diagnosis, by every peer that receives it. A discriminant no
+declared variant uses classifies as no family at all, and no family takes the
+strict ceiling on both paths, matching how a prefix too malformed to parse is
+already treated. Failing to classify never means decoding generously.
 
 Core messages retain the existing core ceiling. In particular,
 `AuditChallenge` and `AuditResponse` remain core messages and are not
@@ -175,7 +194,12 @@ reclassified by this ADR.
 - Routing tests assert that subtree bodies are accepted only on the subtree id
   while core and digest-audit bodies remain on the core id.
 - Size tests prove the largest legitimate subtree response fits its ceiling and
-  oversized subtree collections are rejected before allocation.
+  oversized subtree collections are rejected before allocation, on the encode
+  path as well as the decode path.
+- Live-responder tests drive one round one and then assert both halves of the
+  round-two scope rule from its result: a proved leaf is still served, and a
+  committed key outside the proved subtree is refused whether or not its bytes
+  are on disk.
 - Re-validation is required for changes to subtree key derivation, sampling,
   round-one selection, session rules, or the subtree protocol family.
 
