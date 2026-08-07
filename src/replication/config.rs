@@ -635,7 +635,7 @@ pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_
 /// paths. Aligned with `PENDING_VERIFY_MAX_AGE` so by the deadline stale
 /// `pending_verify` entries have already been evicted.
 const BOOTSTRAP_DRAIN_DEADLINE_SECS: u64 = 30 * 60;
-/// Hard ceiling on total bootstrap stall (see [`BOOTSTRAP_DRAIN_DEADLINE_SECS`]).
+/// Hard ceiling on total bootstrap stall (30 minutes).
 pub const BOOTSTRAP_DRAIN_DEADLINE: Duration = Duration::from_secs(BOOTSTRAP_DRAIN_DEADLINE_SECS);
 
 /// Trust event weight for confirmed audit failures.
