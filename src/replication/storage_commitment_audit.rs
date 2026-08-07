@@ -1538,10 +1538,13 @@ fn build_slice_items_for_key(
 /// produce the bytes it returns [`SubtreeSliceItem::Absent`], which the auditor
 /// counts as a provable failure.
 ///
-/// A key the responder never committed to (not in the pinned tree) is also
-/// returned `Absent`: the auditor only ever samples keys it saw in round 1, so
-/// in practice this guards against a malformed/forged challenge rather than an
-/// honest mismatch.
+/// Openings are authorised against the subtree round 1 actually proved, not
+/// merely against the pinned commitment. A challenge naming any key outside that
+/// subtree is refused whole, before any chunk is read, so the work this round can
+/// cost is bounded by the work the caller already paid for in round 1. An honest
+/// auditor cannot trip this: it samples only the leaves round 1 returned, and
+/// without that leaf's `nonced_root` and `content_len` it has nothing to verify
+/// an answer against.
 pub async fn handle_subtree_slice_challenge(
     challenge: &SubtreeSliceChallenge,
     storage: &LmdbStorage,
@@ -1631,17 +1634,54 @@ pub async fn handle_subtree_slice_challenge(
         };
     }
 
+    // Round 2 may open ONLY the leaves round 1 actually proved, not the whole
+    // pinned commitment. Membership of the pinned tree is the weaker property:
+    // it would let a cheap round 1 over small records authorise openings against
+    // large records elsewhere in the commitment, so the work this round costs
+    // would not be bounded by the work the caller paid for in round 1.
+    //
+    // The authorised set is recomputed from `(tree, nonce)` rather than carried
+    // in the round-1 session. The subtree is a pure function of those two, both
+    // of which are already pinned — the nonce was matched against the session
+    // before this handler ran — so recomputing costs one tree walk with no chunk
+    // reads, while storing the key list would cost up to a full subtree of keys
+    // per live session.
+    let plan = match subtree_plan(built.tree(), &challenge.nonce) {
+        Ok(plan) => plan,
+        // The tree is ours and round 1 already walked it, so a failure here is
+        // local inconsistency rather than anything the caller did. Transient
+        // routes the auditor to the graced timeout lane instead of branding this
+        // node with a confirmed failure it did not earn.
+        Err(e) => {
+            warn!("Subtree slice audit: cannot rebuild the round-1 subtree plan: {e:?}");
+            return SubtreeSliceResponse::Rejected {
+                challenge_id: challenge.challenge_id,
+                kind: RejectKind::Transient,
+                reason: "cannot rebuild the audited subtree".to_string(),
+            };
+        }
+    };
+    let authorised: HashSet<XorName> = plan.leaf_keys.iter().copied().collect();
+
+    // Refuse the whole challenge before touching storage, matching how an
+    // over-broad challenge is handled above. An honest auditor cannot reach this:
+    // it samples only the leaves round 1 returned, and it has no `nonced_root` or
+    // `content_len` to verify an answer for anything else against, so an opening
+    // outside the subtree could not tell it anything even if served.
+    if let Some(outside) = key_order.iter().find(|key| !authorised.contains(*key)) {
+        return SubtreeSliceResponse::Rejected {
+            challenge_id: challenge.challenge_id,
+            kind: RejectKind::Protocol,
+            reason: format!(
+                "slice challenge opens {} which is outside the audited subtree",
+                hex::encode(outside)
+            ),
+        };
+    }
+
     let mut items = Vec::with_capacity(challenge.openings.len());
     for key in key_order {
         let indices = indices_by_key.remove(&key).unwrap_or_default();
-        // Open ONLY keys committed under this pin. A key not in the pinned tree
-        // is `Absent` — never served from local storage just because we happen to
-        // hold it (§15: serving an uncommitted-but-held key would let a forged
-        // challenge harvest data and muddy the possession proof for THIS commit).
-        if built.proof_for(&key).is_none() {
-            items.push(SubtreeSliceItem::Absent { key });
-            continue;
-        }
         match serve_committed_key_openings(challenge, storage, key, indices).await {
             KeyServe::Items(mut built_items) => items.append(&mut built_items),
             KeyServe::Absent => items.push(SubtreeSliceItem::Absent { key }),

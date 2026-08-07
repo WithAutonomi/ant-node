@@ -19,7 +19,12 @@
     clippy::expect_used,
     clippy::panic,
     clippy::missing_panics_doc,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    // These drive a live responder end to end: build a store, run round 1, then
+    // assert on round 2. Splitting one scenario to satisfy a line count would
+    // mean re-running the setup and losing the guarantee that both halves see
+    // the SAME proof.
+    clippy::too_many_lines
 )]
 
 use std::sync::Arc;
@@ -108,6 +113,19 @@ impl Responder {
 
     fn address(i: u8) -> [u8; 32] {
         LmdbStorage::compute_address(&chunk_content(i))
+    }
+}
+
+/// Describe a slice response by variant only, for failure messages.
+///
+/// A served response carries a full Bao slice per opening, so debug-printing one
+/// dumps kilobytes here and megabytes at the opening cap over full-size chunks.
+/// Assertions that can fail on a SERVED response report through this.
+fn response_kind(resp: &SubtreeSliceResponse) -> String {
+    match resp {
+        SubtreeSliceResponse::Rejected { reason, .. } => format!("Rejected({reason})"),
+        SubtreeSliceResponse::Items { items, .. } => format!("Items({} entries)", items.len()),
+        SubtreeSliceResponse::Bootstrapping { .. } => "Bootstrapping".to_string(),
     }
 }
 
@@ -892,5 +910,231 @@ async fn slice_challenge_with_too_many_distinct_keys_is_rejected() {
             );
         }
         other => panic!("expected Rejected(distinct keys), got {other:?}"),
+    }
+}
+
+/// Round 2 may open only the leaves round 1 proved, not any key in the pinned
+/// commitment. Otherwise a cheap round 1 over a small subtree would authorise
+/// openings against arbitrary other records, so the work round 2 costs would not
+/// be bounded by the work the caller paid for in round 1.
+///
+/// Both halves are asserted from one live round 1 so they cannot drift: a key
+/// inside the proved subtree is served, and a key that is genuinely committed
+/// and whose bytes are present on disk is refused purely for being outside it.
+///
+/// FLIPS IF: the responder goes back to authorising round 2 against the whole
+/// pinned commitment (a `contains_key`/`proof_for` membership test) instead of
+/// against the round-1 subtree.
+#[tokio::test]
+async fn slice_challenge_outside_the_audited_subtree_is_refused() {
+    let (storage, _t) = test_storage().await;
+    // 64 committed leaves select a strictly smaller subtree, so committed keys
+    // outside it definitely exist.
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+    let nonce = [0x51u8; 32];
+
+    // Round 1 decides the authorised subtree; take its leaves as ground truth
+    // rather than recomputing the selection in the test.
+    let proof = match handle_subtree_challenge(
+        &challenge_for(&r, pin, nonce),
+        &storage,
+        &r.peer_id,
+        false,
+        Some(&r.state),
+    )
+    .await
+    {
+        SubtreeAuditResponse::Proof { proof, .. } => proof,
+        other => panic!("expected Proof, got {other:?}"),
+    };
+    let inside: Vec<[u8; 32]> = proof.leaves.iter().map(|l| l.key).collect();
+    assert!(!inside.is_empty(), "round 1 must prove at least one leaf");
+
+    // A committed key that round 1 did NOT prove, whose bytes are on disk — so
+    // serving it would succeed, and a refusal can only be the scope check.
+    let outside = indices
+        .iter()
+        .map(|i| Responder::address(*i))
+        .find(|addr| !inside.contains(addr))
+        .expect("64 leaves must leave a committed key outside the subtree");
+    assert!(
+        storage.get_raw(&outside).await.expect("read").is_some(),
+        "the out-of-subtree key's bytes must be present, so the refusal is about \
+         scope and not about missing data"
+    );
+
+    let slice_challenge = |key: [u8; 32]| SubtreeSliceChallenge {
+        challenge_id: 51,
+        nonce,
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings: vec![SubtreeSliceOpening {
+            key,
+            block_index: 0,
+        }],
+    };
+
+    let first_inside = *inside.first().expect("round 1 proved at least one leaf");
+
+    // Inside the proved subtree: served.
+    let in_resp = handle_subtree_slice_challenge(
+        &slice_challenge(first_inside),
+        &storage,
+        &r.peer_id,
+        false,
+        Some(&r.state),
+    )
+    .await;
+    match in_resp {
+        SubtreeSliceResponse::Items { items, .. } => {
+            assert!(
+                matches!(items.as_slice(), [SubtreeSliceItem::Present { .. }]),
+                "a leaf round 1 proved must still be openable, got {items:?}"
+            );
+        }
+        other => panic!(
+            "expected Items for an in-subtree key, got {}",
+            response_kind(&other)
+        ),
+    }
+
+    // Outside it: refused whole, and NOT as `Absent`. Here the bytes are
+    // present, so serving would have succeeded; the sibling test repeats this
+    // with the bytes deleted and still expects `Rejected`, which together pin
+    // that the refusal is decided by scope and not by storage contents.
+    let out_resp = handle_subtree_slice_challenge(
+        &slice_challenge(outside),
+        &storage,
+        &r.peer_id,
+        false,
+        Some(&r.state),
+    )
+    .await;
+    match out_resp {
+        SubtreeSliceResponse::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("outside the audited subtree"),
+                "expected an out-of-subtree rejection, got: {reason}"
+            );
+        }
+        other => panic!(
+            "a committed-but-unproved key must be refused, not served or reported \
+             absent; got {}",
+            response_kind(&other)
+        ),
+    }
+
+    // A challenge MIXING an authorised key with an unauthorised one must be
+    // refused whole. Without this, an implementation that served the inside key
+    // and marked the outside one `Absent` would satisfy the two cases above
+    // while still doing the work the scope check exists to prevent.
+    let mixed = SubtreeSliceChallenge {
+        challenge_id: 52,
+        nonce,
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings: vec![
+            SubtreeSliceOpening {
+                key: first_inside,
+                block_index: 0,
+            },
+            SubtreeSliceOpening {
+                key: outside,
+                block_index: 0,
+            },
+        ],
+    };
+    let mixed_resp =
+        handle_subtree_slice_challenge(&mixed, &storage, &r.peer_id, false, Some(&r.state)).await;
+    assert!(
+        matches!(mixed_resp, SubtreeSliceResponse::Rejected { .. }),
+        "one unauthorised opening must refuse the whole challenge, not just its \
+         own entry; got {mixed_resp:?}"
+    );
+}
+
+/// The scope refusal must not depend on what storage holds, which is what makes
+/// it a work bound rather than only an authorisation rule.
+///
+/// The key here is committed, outside the proved subtree, and its bytes are
+/// DELETED. An implementation that consulted storage and reported what it found
+/// would answer `Absent`; this one still answers `Rejected`, the same as when the
+/// bytes are present in the sibling test above. So the refusal is decided
+/// entirely by scope.
+///
+/// Stated precisely, because the stronger claim is tempting and wrong: this
+/// cannot prove no read occurred. An implementation that read the bytes and then
+/// rejected anyway would also pass. What it pins is that the ANSWER does not vary
+/// with storage contents, which is the property the two tests together establish
+/// and the one a per-key `Absent` degradation would break.
+///
+/// FLIPS IF: the scope check degrades to per-key `Absent` handling, or the
+/// refusal starts depending on what storage holds.
+#[tokio::test]
+async fn an_out_of_subtree_key_is_refused_without_consulting_storage() {
+    let (storage, _t) = test_storage().await;
+    let indices: Vec<u8> = (1..=64u8).collect();
+    let r = Responder::new(&storage, &indices).await;
+    let pin = r.current_hash();
+    let nonce = [0x53u8; 32];
+
+    let proof = match handle_subtree_challenge(
+        &challenge_for(&r, pin, nonce),
+        &storage,
+        &r.peer_id,
+        false,
+        Some(&r.state),
+    )
+    .await
+    {
+        SubtreeAuditResponse::Proof { proof, .. } => proof,
+        other => panic!("expected Proof, got {other:?}"),
+    };
+    let inside: Vec<[u8; 32]> = proof.leaves.iter().map(|l| l.key).collect();
+
+    // Committed, outside the proved subtree, and its bytes are then DELETED.
+    let outside = indices
+        .iter()
+        .map(|i| Responder::address(*i))
+        .find(|addr| !inside.contains(addr))
+        .expect("a committed key outside the subtree must exist");
+    storage.delete(&outside).await.expect("delete bytes");
+    assert!(
+        storage.get_raw(&outside).await.expect("read").is_none(),
+        "the bytes must really be gone for this test to discriminate"
+    );
+
+    let challenge = SubtreeSliceChallenge {
+        challenge_id: 53,
+        nonce,
+        challenged_peer_id: r.peer_id_bytes,
+        expected_commitment_hash: pin,
+        openings: vec![SubtreeSliceOpening {
+            key: outside,
+            block_index: 0,
+        }],
+    };
+    let resp =
+        handle_subtree_slice_challenge(&challenge, &storage, &r.peer_id, false, Some(&r.state))
+            .await;
+
+    match resp {
+        SubtreeSliceResponse::Rejected { reason, .. } => {
+            assert!(
+                reason.contains("outside the audited subtree"),
+                "expected the scope refusal, got: {reason}"
+            );
+        }
+        // `Absent` here would mean the refusal reported what storage holds rather
+        // than that the key is out of scope.
+        other => {
+            panic!(
+                "the refusal must not depend on storage contents; expected \
+                 Rejected as with the bytes present, got {}",
+                response_kind(&other)
+            )
+        }
     }
 }

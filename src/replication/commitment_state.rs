@@ -592,15 +592,22 @@ impl ResponderCommitmentState {
     /// could still pin a recently gossiped root and open this key's blocks in a
     /// round-2 slice challenge.
     ///
-    /// This is the SAME predicate the round-2 responder uses to decide a key is
-    /// "committed" (`handle_subtree_slice_challenge` calls `built.proof_for(key)`
-    /// on the pinned slot, which is committed iff `contains_key`), folded over
-    /// every retained slot. The pruner consults it before deleting an
-    /// out-of-range key, so "the pruner will not delete it" and "the responder
-    /// still owes an answer for it" are provably the same boolean and cannot
-    /// drift. `slots` holds at most `RETAINED_GOSSIPED_COMMITMENTS` + 1
-    /// commitments, and `contains_key` is an allocation-free binary search, so
-    /// this is a short, allocation-free read.
+    /// This is `contains_key` on the pinned slot, folded over every retained
+    /// slot, and it is a strict UPPER bound on what the round-2 responder can be
+    /// asked to open. `handle_subtree_slice_challenge` authorises an opening only
+    /// if its key is in the subtree round 1 actually proved, which is one
+    /// nonce-selected block of the pinned tree rather than all of it. The bound
+    /// holds in the direction the pruner needs: every key the responder may owe
+    /// an answer for is committed under some retained slot, so a key this returns
+    /// `false` for can never be opened. The pruner consults it before deleting an
+    /// out-of-range key, so it keeps at least what is still answerable, and over
+    /// a given nonce it keeps more. Narrowing this predicate toward the
+    /// responder's would be unsound: the nonce is not known when the pruner runs,
+    /// so every committed key is reachable by some future challenge.
+    ///
+    /// `slots` holds at most `RETAINED_GOSSIPED_COMMITMENTS` + 1 commitments, and
+    /// `contains_key` is an allocation-free binary search, so this is a short,
+    /// allocation-free read.
     #[must_use]
     pub fn is_held(&self, key: &XorName) -> bool {
         self.inner.read().slots.iter().any(|c| c.contains_key(key))
@@ -1202,9 +1209,10 @@ mod tests {
         // ANY retained slot (current + any root gossiped within the TTL) must
         // read held. It stops reading held once its commitment ages out BY TTL —
         // a bounded reprieve, not a permanent pin (the time-based age-out is
-        // covered by the synthetic-clock prune_slots tests). This mirrors the
-        // round-2 responder's `built.proof_for(key).is_some()` check folded over
-        // the slots, so "pruner won't delete" == "responder owes an answer".
+        // covered by the synthetic-clock prune_slots tests). It is the upper
+        // bound on what the round-2 responder can be asked to open: the responder
+        // authorises only the nonce-selected subtree of the pinned slot, so
+        // "pruner won't delete" covers every key it could still owe an answer for.
         let (pk, sk) = keypair();
         let pk_bytes = pk.to_bytes();
         let state = ResponderCommitmentState::new();
