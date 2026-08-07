@@ -189,7 +189,7 @@ test-utils = []
 # head so ant-protocol and ant-node share one saorsa-core source and type
 # identity; remove this patch once #149 is released on crates.io.
 [patch.crates-io]
-saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "e74a1bf4085cbd175136b331a0ecfb9c7e423752" }
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", rev = "a4faf6f72c1dd4425a2d1f3bdece6789c1f85b83" }
 
 [profile.release]
 lto = true
