@@ -136,6 +136,14 @@ pub async fn check_bootstrap_drained(
             state.pending_peer_requests,
             state.pending_keys.len(),
         );
+        // The deadline deliberately abandons bootstrap accounting debt. Clear
+        // that debt as one atomic state transition so post-bootstrap
+        // verification and cleanup are not still gated by stale request
+        // counters or bootstrap-only key tracking. Queue contents are left
+        // intact and continue through the normal verification pipeline.
+        state.pending_peer_requests = 0;
+        state.pending_keys.clear();
+        state.capacity_rejected_sources.clear();
         state.drained = true;
         return true;
     }
@@ -183,6 +191,9 @@ pub async fn note_capacity_rejected(
     source: saorsa_core::identity::PeerId,
 ) {
     let mut state = bootstrap_state.write().await;
+    if state.drained {
+        return;
+    }
     if state.note_capacity_rejected(source, Instant::now()) {
         let n = state.capacity_rejected_sources.len();
         debug!(
@@ -254,6 +265,9 @@ pub async fn track_discovered_keys(
     keys: &HashSet<XorName>,
 ) {
     let mut state = bootstrap_state.write().await;
+    if state.drained {
+        return;
+    }
     state.pending_keys.extend(keys);
     debug!(
         "Bootstrap tracking {} total discovered keys",
@@ -267,6 +281,9 @@ pub async fn increment_pending_requests(
     count: usize,
 ) {
     let mut state = bootstrap_state.write().await;
+    if state.drained {
+        return;
+    }
     state.pending_peer_requests += count;
 }
 
@@ -419,6 +436,22 @@ mod tests {
             0,
             "should saturate at zero"
         );
+    }
+
+    #[tokio::test]
+    async fn drained_state_ignores_new_bootstrap_accounting() {
+        let source = saorsa_core::identity::PeerId::from_bytes([7; 32]);
+        let state = Arc::new(RwLock::new(BootstrapState::new()));
+        mark_bootstrap_drained(&state).await;
+
+        increment_pending_requests(&state, 3).await;
+        track_discovered_keys(&state, &HashSet::from([xor_name_from_byte(0x01)])).await;
+        note_capacity_rejected(&state, source).await;
+
+        let state = state.read().await;
+        assert_eq!(state.pending_peer_requests, 0);
+        assert!(state.pending_keys.is_empty());
+        assert!(state.capacity_rejected_sources.is_empty());
     }
 
     /// Round-3 regression: a source that previously had capacity-rejected
@@ -641,7 +674,9 @@ mod tests {
                 m
             },
             // Backdate bootstrap start past the 60s deadline.
-            bootstrap_started_at: Instant::now() - Duration::from_secs(61),
+            bootstrap_started_at: Instant::now()
+                .checked_sub(Duration::from_secs(61))
+                .expect("test duration must fit in Instant"),
             bootstrap_drain_deadline: Duration::from_secs(60),
         }));
         let queues = ReplicationQueues::new();
@@ -654,6 +689,10 @@ mod tests {
             state.read().await.drained,
             "drained flag must be set by force-drain"
         );
+        let state = state.read().await;
+        assert_eq!(state.pending_peer_requests, 0);
+        assert!(state.pending_keys.is_empty());
+        assert!(state.capacity_rejected_sources.is_empty());
     }
 
     /// (d) Within the deadline, outstanding state still blocks drain: the
