@@ -3451,15 +3451,29 @@ impl ReplicationEngine {
                             )
                         };
                         let bootstrapping = *is_bootstrapping.read().await;
+                        let snapshot_state = if drained && !bootstrapping {
+                            "healthy"
+                        } else if drained {
+                            "drained_waiting_for_bootstrap_flag"
+                        } else {
+                            "pending"
+                        };
                         info!(
                             drained,
                             pending_peer_requests,
                             pending_keys,
                             capacity_rejected_sources,
                             is_bootstrapping = bootstrapping,
+                            snapshot_state,
                             uptime_secs = started_at.elapsed().as_secs(),
                             "Replication bootstrap state snapshot"
                         );
+                        if drained && !bootstrapping {
+                            info!(
+                                "Replication bootstrap diagnostics reached healthy state; stopping periodic snapshots"
+                            );
+                            break;
+                        }
                     }
                 }
             }
