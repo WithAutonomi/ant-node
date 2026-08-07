@@ -177,9 +177,9 @@ required-features = ["test-utils"]
 [features]
 default = ["logging"]
 # Enable tracing/logging infrastructure.
-# Included in `default` so dev builds (`cargo build`, `cargo test`) get logging
-# automatically. Release builds strip it:
-#   cargo build --release --no-default-features
+# Included in `default`, so every build we ship — dev, release candidate and
+# release alike — has logging. Opt out only for a bespoke build that needs it
+# gone: `cargo build --release --no-default-features`.
 logging = ["tracing", "tracing-subscriber", "tracing-appender"]
 # Expose test helpers (cache_insert, payment_verifier accessor) for
 # integration tests and downstream test harnesses.
