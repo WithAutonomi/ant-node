@@ -1524,6 +1524,11 @@ const RETENTION_PERSIST_INTERVAL_SECS: u64 = 30;
 /// default that keeps log volume negligible.
 const TRAFFIC_SUMMARY_INTERVAL_SECS: u64 = 300;
 
+/// Cadence of the read-only bootstrap state snapshot used to separate drain
+/// debt from cache and broader connectivity failures in fleet logs.
+#[cfg(feature = "logging")]
+const BOOTSTRAP_STATE_SNAPSHOT_INTERVAL_SECS: u64 = 60;
+
 /// Maximum tolerated auditor↔responder wall-clock skew for the first-audit
 /// in-window screen (ADR-0004 A1 guardrail A). The screen accepts a monetized pin
 /// for first audit only if its SIGNED `quote_ts` lands in
@@ -2176,6 +2181,9 @@ impl ReplicationEngine {
         self.start_first_audit_drainer();
         // V2-623: periodic cumulative per-variant traffic accounting.
         self.start_traffic_summary_loop();
+        // V2-884: read-only bootstrap state for cache/drain/connectivity triage.
+        #[cfg(feature = "logging")]
+        self.start_bootstrap_state_snapshot_loop();
         #[cfg(feature = "logging")]
         self.start_audit_responder_summary_loop();
 
@@ -3408,6 +3416,68 @@ impl ReplicationEngine {
                 }
             }
             debug!("Replication traffic summary loop shut down");
+        });
+        self.task_handles.push(handle);
+    }
+
+    /// Periodically expose the state that gates bootstrap completion and prune
+    /// admission. The state counts are copied before reading `is_bootstrapping`
+    /// so this diagnostic path never nests async locks.
+    #[cfg(feature = "logging")]
+    fn start_bootstrap_state_snapshot_loop(&mut self) {
+        let shutdown = self.shutdown.clone();
+        let bootstrap_state = Arc::clone(&self.bootstrap_state);
+        let is_bootstrapping = Arc::clone(&self.is_bootstrapping);
+        let started_at = Instant::now();
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(Duration::from_secs(
+                        BOOTSTRAP_STATE_SNAPSHOT_INTERVAL_SECS,
+                    )) => {
+                        let (
+                            drained,
+                            pending_peer_requests,
+                            pending_keys,
+                            capacity_rejected_sources,
+                        ) = {
+                            let state = bootstrap_state.read().await;
+                            (
+                                state.drained,
+                                state.pending_peer_requests,
+                                state.pending_keys.len(),
+                                state.capacity_rejected_sources.len(),
+                            )
+                        };
+                        let bootstrapping = *is_bootstrapping.read().await;
+                        let snapshot_state = if drained && !bootstrapping {
+                            "healthy"
+                        } else if drained {
+                            "drained_waiting_for_bootstrap_flag"
+                        } else {
+                            "pending"
+                        };
+                        info!(
+                            drained,
+                            pending_peer_requests,
+                            pending_keys,
+                            capacity_rejected_sources,
+                            is_bootstrapping = bootstrapping,
+                            snapshot_state,
+                            uptime_secs = started_at.elapsed().as_secs(),
+                            "Replication bootstrap state snapshot"
+                        );
+                        if drained && !bootstrapping {
+                            info!(
+                                "Replication bootstrap diagnostics reached healthy state; stopping periodic snapshots"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            debug!("Bootstrap state snapshot loop shut down");
         });
         self.task_handles.push(handle);
     }
