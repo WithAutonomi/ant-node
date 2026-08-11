@@ -98,8 +98,13 @@ async fn main() -> color_eyre::Result<()> {
         ));
     }
     config.advertise_ip = cli.host;
-    let evm_info =
-        resolve_evm_info(cli.evm_network.as_deref(), cli.enable_evm, &mut config).await?;
+    let evm_info = resolve_evm_info(
+        cli.evm_network.as_deref(),
+        cli.enable_evm,
+        cli.host,
+        &mut config,
+    )
+    .await?;
 
     let mut devnet = Devnet::new(config).await?;
     devnet.start().await?;
@@ -141,6 +146,7 @@ async fn main() -> color_eyre::Result<()> {
 async fn resolve_evm_info(
     evm_network: Option<&str>,
     enable_evm: bool,
+    host: Option<std::net::Ipv4Addr>,
     config: &mut DevnetConfig,
 ) -> color_eyre::Result<Option<DevnetEvmInfo>> {
     if let Some(net_name) = evm_network {
@@ -166,6 +172,19 @@ async fn resolve_evm_info(
             payment_vault_address: vault_addr,
         }))
     } else if enable_evm {
+        // Anvil binds — and evmlib publishes in the manifest's `rpc_url` —
+        // the address in `ANVIL_IP_ADDR`, defaulting to localhost. A LAN
+        // devnet must expose the chain the way it exposes the nodes, or the
+        // published `rpc_url` is unreachable from every other device —
+        // exactly the audience `--host` serves (external signers can join
+        // and download, but not pay). An explicit `ANVIL_IP_ADDR` wins.
+        if let Some(anvil_ip) = anvil_ip_for_lan(host, std::env::var_os("ANVIL_IP_ADDR")) {
+            ant_node::logging::info!(
+                "Binding Anvil to {anvil_ip} (via ANVIL_IP_ADDR) so LAN clients \
+                 can reach the manifest's rpc_url"
+            );
+            std::env::set_var("ANVIL_IP_ADDR", anvil_ip);
+        }
         ant_node::logging::info!("Starting local Anvil blockchain for EVM payment enforcement...");
         let testnet = evmlib::testnet::Testnet::new()
             .await
@@ -318,4 +337,50 @@ fn spawn_manifest_server(
             let _ = stream.write_all(resp.as_bytes());
         }
     });
+}
+
+/// The Anvil bind/publish address a LAN devnet should use: the `--host` IP,
+/// unless the operator set `ANVIL_IP_ADDR` explicitly (their override wins),
+/// or there is no `--host` (loopback devnet — keep Anvil's localhost
+/// default). Returns the value to write into `ANVIL_IP_ADDR`, or `None` to
+/// leave the environment untouched.
+fn anvil_ip_for_lan(
+    host: Option<std::net::Ipv4Addr>,
+    existing_override: Option<std::ffi::OsString>,
+) -> Option<String> {
+    match (host, existing_override) {
+        (Some(host), None) => Some(host.to_string()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::anvil_ip_for_lan;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn lan_host_becomes_anvil_ip() {
+        assert_eq!(
+            anvil_ip_for_lan(Some(Ipv4Addr::new(192, 168, 0, 61)), None),
+            Some("192.168.0.61".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins() {
+        assert_eq!(
+            anvil_ip_for_lan(
+                Some(Ipv4Addr::new(192, 168, 0, 61)),
+                Some("10.0.0.9".into())
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn loopback_devnet_keeps_anvil_default() {
+        assert_eq!(anvil_ip_for_lan(None, None), None);
+        assert_eq!(anvil_ip_for_lan(None, Some("10.0.0.9".into())), None);
+    }
 }
