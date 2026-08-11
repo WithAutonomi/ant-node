@@ -3006,7 +3006,7 @@ impl ReplicationEngine {
                             }
                         };
                         match dht_event {
-                            DhtNetworkEvent::KClosestPeersChanged { old, new } => {
+                            DhtNetworkEvent::KClosestPeersChanged { old, new, .. } => {
                                 let old_peers = old
                                     .iter()
                                     .take(config.neighbor_sync_scope)
