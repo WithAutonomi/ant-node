@@ -67,6 +67,9 @@ mod security_attacks;
 mod subtree_audit_testnet;
 
 #[cfg(test)]
+mod fetch_local_write_guard;
+
+#[cfg(test)]
 mod fetch_responsibility_recheck;
 
 #[cfg(test)]
