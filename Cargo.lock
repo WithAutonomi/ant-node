@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "ant-node"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "alloy",
  "ant-protocol",
@@ -862,9 +862,9 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.3.1"
+version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3081ee130dd45e8166bc8ac4d789aac17d143e2e7f54f1c3006503dc63cf3edb"
+checksum = "83f2b55e89a468584cfc91dc2f596583e089c17107de6f2f386f8339b665d1f0"
 dependencies = [
  "blake3",
  "bytes",
@@ -2438,9 +2438,9 @@ dependencies = [
 
 [[package]]
 name = "evmlib"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8da0d9ad5b5cab92cc92ddac9afb884f86b226340caf17f6e5c41d51175dcaa1"
+checksum = "83822a94669e50793b583817ed2681b67d2e7059bae652784d34a6ee40fbfd37"
 dependencies = [
  "alloy",
  "ant-merkle",
@@ -3106,7 +3106,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -4293,7 +4293,7 @@ dependencies = [
  "quinn-udp 0.5.15",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4332,7 +4332,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4345,7 +4345,7 @@ checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4920,8 +4920,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-core"
-version = "0.26.4"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?rev=a4faf6f72c1dd4425a2d1f3bdece6789c1f85b83#a4faf6f72c1dd4425a2d1f3bdece6789c1f85b83"
+version = "0.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3858333d71ea51750129693fdffc2962ad9ef95094c2ad76713dc7d5bb949c41"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5034,9 +5035,9 @@ dependencies = [
 
 [[package]]
 name = "saorsa-transport"
-version = "0.35.3"
+version = "0.36.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3284026c300f642077315b782462b22558e24d621265a8deeae23287b1c5542"
+checksum = "e8dbc21ea8af08c30a0d7d66289b987f14eb22e9ff1ed32e12c4e0a07c6d49d8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6417,7 +6418,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
