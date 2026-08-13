@@ -27,15 +27,15 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
-use crate::ant_protocol::{
-    settlement_version_is_supported, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
-    ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2,
-    ChunkQuoteResponse, MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2,
-    MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
-    MIN_SUPPORTED_SETTLEMENT_VERSION,
-};
 #[cfg(test)]
-use crate::ant_protocol::{CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK};
+use crate::ant_protocol::DATA_TYPE_CHUNK;
+use crate::ant_protocol::{
+    settlement_compatibility, ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody,
+    ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2, ChunkQuoteResponse,
+    MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2, MerkleCandidateQuoteResponse,
+    ProtocolError, SettlementCompatibility, CHUNK_PROTOCOL_ID, CURRENT_SETTLEMENT_VERSION,
+    MAX_CHUNK_SIZE, MIN_SUPPORTED_SETTLEMENT_VERSION,
+};
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
@@ -239,21 +239,38 @@ static UNVERSIONED_QUOTES_SERVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64
 /// weakened by letting it past, whereas rejecting it would let a stale node
 /// veto a rule set the network has already moved to.
 fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
-    if settlement_version_is_supported(client_settlement_version) {
-        return None;
+    match settlement_compatibility(client_settlement_version) {
+        SettlementCompatibility::Compatible => None,
+        SettlementCompatibility::ClientTooOld => {
+            warn!(
+                target: "ant_node::quote::settlement",
+                "Refusing {path} quote: client settlement version {client_settlement_version} \
+                 is below the minimum {MIN_SUPPORTED_SETTLEMENT_VERSION}. No quote issued, \
+                 so the client has not been charged.",
+            );
+            Some(ProtocolError::ClientUpdateRequired {
+                client_settlement_version,
+                min_settlement_version: MIN_SUPPORTED_SETTLEMENT_VERSION,
+            })
+        }
+        // This node is the old one. Quoting would promise to accept a payment
+        // whose rules it does not know, and a promise broken at PUT time is
+        // broken after the client has settled on-chain. Refusing sends the
+        // client to a peer that can actually honour the quote, at no cost.
+        SettlementCompatibility::NodeTooOld => {
+            warn!(
+                target: "ant_node::quote::settlement",
+                "Refusing {path} quote: client settles under version \
+                 {client_settlement_version}, newer than this node's \
+                 {CURRENT_SETTLEMENT_VERSION}. This node needs upgrading; the client \
+                 has not been charged.",
+            );
+            Some(ProtocolError::StorerUpdateRequired {
+                client_settlement_version,
+                node_settlement_version: CURRENT_SETTLEMENT_VERSION,
+            })
+        }
     }
-
-    warn!(
-        target: "ant_node::quote::settlement",
-        "Refusing {path} quote: client settlement version {client_settlement_version} \
-         is below the minimum {MIN_SUPPORTED_SETTLEMENT_VERSION}. No quote issued, \
-         so the client has not been charged.",
-    );
-
-    Some(ProtocolError::ClientUpdateRequired {
-        client_settlement_version,
-        min_settlement_version: MIN_SUPPORTED_SETTLEMENT_VERSION,
-    })
 }
 
 /// ANT protocol handler.
@@ -1698,12 +1715,17 @@ mod tests {
         }
     }
 
-    /// A settlement version this build has never heard of is served, not
-    /// refused. The storer still verifies the payment that actually arrives,
-    /// so nothing is weakened, and refusing would let a node that has not been
-    /// upgraded veto a rule set the network has already moved to.
+    /// A settlement version this node has never heard of is refused, because
+    /// quoting it would promise to accept a payment whose rules the verifier
+    /// does not know. That promise would be broken at PUT time, which is after
+    /// the client has settled on-chain and can no longer be refunded.
+    ///
+    /// It must be refused as `StorerUpdateRequired`, not `ClientUpdateRequired`.
+    /// The client is fine; this node is behind. Telling an up-to-date user to
+    /// upgrade would be wrong, and during a client-first rollout it would be
+    /// wrong for most of the fleet at once.
     #[tokio::test]
-    async fn a_newer_settlement_version_is_not_treated_as_an_error() {
+    async fn a_newer_settlement_version_is_refused_as_this_nodes_fault() {
         let (protocol, _temp) = create_test_protocol().await;
 
         let mut request = ChunkQuoteRequestV2::new([0xBB; 32], 4096);
@@ -1722,12 +1744,18 @@ mod tests {
 
         match response.body {
             ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
-                ProtocolError::ClientUpdateRequired { .. },
+                ProtocolError::StorerUpdateRequired {
+                    client_settlement_version,
+                    node_settlement_version,
+                },
             )) => {
-                panic!("a newer client must not be refused by an older node")
+                assert_eq!(
+                    client_settlement_version,
+                    CURRENT_SETTLEMENT_VERSION.saturating_add(1)
+                );
+                assert_eq!(node_settlement_version, CURRENT_SETTLEMENT_VERSION);
             }
-            ChunkMessageBody::QuoteResponse(_) => {}
-            other => panic!("expected QuoteResponse, got: {other:?}"),
+            other => panic!("expected StorerUpdateRequired, got: {other:?}"),
         }
     }
 
