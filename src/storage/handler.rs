@@ -27,13 +27,15 @@
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
-#[cfg(test)]
-use crate::ant_protocol::DATA_TYPE_CHUNK;
 use crate::ant_protocol::{
-    ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
-    ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteResponse, MerkleCandidateQuoteRequest,
+    settlement_version_is_supported, ChunkGetRequest, ChunkGetResponse, ChunkMessage,
+    ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest, ChunkQuoteRequestV2,
+    ChunkQuoteResponse, MerkleCandidateQuoteRequest, MerkleCandidateQuoteRequestV2,
     MerkleCandidateQuoteResponse, ProtocolError, CHUNK_PROTOCOL_ID, MAX_CHUNK_SIZE,
+    MIN_SUPPORTED_SETTLEMENT_VERSION,
 };
+#[cfg(test)]
+use crate::ant_protocol::{CURRENT_SETTLEMENT_VERSION, DATA_TYPE_CHUNK};
 use crate::client::compute_address;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
@@ -45,6 +47,7 @@ use crate::storage::lmdb::LmdbStorage;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -206,6 +209,51 @@ impl Drop for GetRequestTelemetry {
             self.finished = true;
         }
     }
+}
+
+/// How many unversioned quote requests to serve between adoption log lines.
+///
+/// One line per request would drown the log at production quote rates, and one
+/// line total would say nothing about the trend. A running count emitted every
+/// `N` gives the shape of client adoption, which is the number that decides
+/// when unversioned requests can start being refused outright.
+const UNVERSIONED_QUOTE_LOG_INTERVAL: u64 = 1_000;
+
+/// Unversioned quote requests served since start, by path.
+///
+/// Indices are `[single_node, merkle]`. A plain counter rather than a metric
+/// because the only consumer is the rollout decision, and that reads logs.
+static UNVERSIONED_QUOTES_SERVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Refuse a quote when the requesting client settles under rules this node no
+/// longer accepts. `None` means the request may proceed.
+///
+/// This is the whole point of the settlement version. A merkle batch pays
+/// on-chain **before** any storer sees a PUT, so refusing the *payment* is
+/// refusing something already spent and unrefundable. Refusing the *quote*
+/// costs the client nothing: no quote means no pool commitment, which means no
+/// payment.
+///
+/// A version NEWER than this node understands is deliberately allowed through.
+/// The storer still verifies whatever payment actually arrives, so nothing is
+/// weakened by letting it past, whereas rejecting it would let a stale node
+/// veto a rule set the network has already moved to.
+fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
+    if settlement_version_is_supported(client_settlement_version) {
+        return None;
+    }
+
+    warn!(
+        target: "ant_node::quote::settlement",
+        "Refusing {path} quote: client settlement version {client_settlement_version} \
+         is below the minimum {MIN_SUPPORTED_SETTLEMENT_VERSION}. No quote issued, \
+         so the client has not been charged.",
+    );
+
+    Some(ProtocolError::ClientUpdateRequired {
+        client_settlement_version,
+        min_settlement_version: MIN_SUPPORTED_SETTLEMENT_VERSION,
+    })
 }
 
 /// ANT protocol handler.
@@ -420,11 +468,21 @@ impl AntProtocol {
                 ChunkMessageBody::GetResponse(response)
             }
             ChunkMessageBody::QuoteRequest(ref req) => {
+                Self::note_unversioned_quote("single_node");
                 ChunkMessageBody::QuoteResponse(self.handle_quote(req))
             }
             ChunkMessageBody::MerkleCandidateQuoteRequest(ref req) => {
+                Self::note_unversioned_quote("merkle");
                 ChunkMessageBody::MerkleCandidateQuoteResponse(
                     self.handle_merkle_candidate_quote(req),
+                )
+            }
+            ChunkMessageBody::QuoteRequestV2(ref req) => {
+                ChunkMessageBody::QuoteResponse(self.handle_quote_v2(req))
+            }
+            ChunkMessageBody::MerkleCandidateQuoteRequestV2(ref req) => {
+                ChunkMessageBody::MerkleCandidateQuoteResponse(
+                    self.handle_merkle_candidate_quote_v2(req),
                 )
             }
             // Anything else — response messages are handled by client
@@ -776,6 +834,66 @@ impl AntProtocol {
                 }
             }
             Err(e) => ChunkQuoteResponse::Error(ProtocolError::QuoteFailed(e.to_string())),
+        }
+    }
+
+    /// Handle a version-declaring storage quote request.
+    ///
+    /// Refuse first, then fall through to the existing unversioned handler
+    /// with the same request. The gate is the only difference between the two
+    /// paths, so nothing else is duplicated and the two cannot drift.
+    fn handle_quote_v2(&self, request: &ChunkQuoteRequestV2) -> ChunkQuoteResponse {
+        if let Some(refusal) = settlement_gate(request.settlement_version, "single_node") {
+            return ChunkQuoteResponse::Error(refusal);
+        }
+        self.handle_quote(&ChunkQuoteRequest {
+            address: request.address,
+            data_size: request.data_size,
+            data_type: request.data_type,
+        })
+    }
+
+    /// Handle a version-declaring merkle candidate quote request.
+    ///
+    /// The gate matters most here: a merkle batch settles on-chain before any
+    /// storer sees a PUT, so this is the last point at which refusing costs
+    /// the client nothing.
+    fn handle_merkle_candidate_quote_v2(
+        &self,
+        request: &MerkleCandidateQuoteRequestV2,
+    ) -> MerkleCandidateQuoteResponse {
+        if let Some(refusal) = settlement_gate(request.settlement_version, "merkle") {
+            return MerkleCandidateQuoteResponse::Error(refusal);
+        }
+        self.handle_merkle_candidate_quote(&MerkleCandidateQuoteRequest {
+            address: request.address,
+            data_type: request.data_type,
+            data_size: request.data_size,
+            merkle_payment_timestamp: request.merkle_payment_timestamp,
+        })
+    }
+
+    /// Record that a client asked for a quote without declaring a settlement
+    /// version, and periodically report the running count.
+    ///
+    /// Unversioned requests are still served. A node cannot tell a client that
+    /// settles correctly but predates the version field from one that does
+    /// not, and refusing both would break clients that are behaving. What the
+    /// count buys is the evidence for flipping that policy later: once
+    /// unversioned traffic has decayed, refusing it stops turning away only
+    /// the clients that were already going to lose their money.
+    fn note_unversioned_quote(path: &str) {
+        let slot = usize::from(path == "merkle");
+        let Some(counter) = UNVERSIONED_QUOTES_SERVED.get(slot) else {
+            return;
+        };
+        let served = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if served % UNVERSIONED_QUOTE_LOG_INTERVAL == 0 {
+            info!(
+                target: "ant_node::quote::settlement",
+                "Served {served} {path} quotes to clients that declare no settlement version. \
+                 These clients cannot be told to upgrade before they pay.",
+            );
         }
     }
 
@@ -1469,6 +1587,182 @@ mod tests {
                 assert!(candidate.price >= evmlib::common::Amount::ZERO);
             }
             other => panic!("expected MerkleCandidateQuoteResponse::Success, got: {other:?}"),
+        }
+    }
+
+    /// A current client gets a quote through the versioned request, exactly as
+    /// it would through the legacy one. The gate must be invisible to clients
+    /// that can pay.
+    #[tokio::test]
+    async fn v2_merkle_quote_is_served_at_the_current_settlement_version() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let msg = ChunkMessage {
+            request_id: 700,
+            body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(
+                MerkleCandidateQuoteRequestV2::new([0x88; 32], 4096, timestamp),
+            ),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle v2 merkle candidate quote")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        assert_eq!(response.request_id, 700);
+        match response.body {
+            ChunkMessageBody::MerkleCandidateQuoteResponse(
+                MerkleCandidateQuoteResponse::Success { .. },
+            ) => {}
+            other => panic!("expected Success, got: {other:?}"),
+        }
+    }
+
+    /// The point of the whole change: a client that cannot settle correctly is
+    /// turned away at quote time, so it never reaches the on-chain payment it
+    /// would not be able to spend.
+    #[tokio::test]
+    async fn v2_merkle_quote_is_refused_below_the_minimum_settlement_version() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let stale = MIN_SUPPORTED_SETTLEMENT_VERSION.saturating_sub(1);
+        let mut request = MerkleCandidateQuoteRequestV2::new([0x99; 32], 4096, timestamp);
+        request.settlement_version = stale;
+
+        let msg = ChunkMessage {
+            request_id: 701,
+            body: ChunkMessageBody::MerkleCandidateQuoteRequestV2(request),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle v2 merkle candidate quote")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        match response.body {
+            ChunkMessageBody::MerkleCandidateQuoteResponse(
+                MerkleCandidateQuoteResponse::Error(ProtocolError::ClientUpdateRequired {
+                    client_settlement_version,
+                    min_settlement_version,
+                }),
+            ) => {
+                assert_eq!(client_settlement_version, stale);
+                assert_eq!(min_settlement_version, MIN_SUPPORTED_SETTLEMENT_VERSION);
+                // The refusal has to be actionable, not just correct.
+                let rendered = ProtocolError::ClientUpdateRequired {
+                    client_settlement_version,
+                    min_settlement_version,
+                }
+                .to_string();
+                assert!(rendered.contains("ant update"), "{rendered}");
+            }
+            other => panic!("expected ClientUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// Same gate on the single-node path, so a refused merkle client cannot
+    /// simply fall back to per-chunk quotes and burn money that way instead.
+    #[tokio::test]
+    async fn v2_single_node_quote_is_refused_below_the_minimum_settlement_version() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let mut request = ChunkQuoteRequestV2::new([0xAA; 32], 4096);
+        request.settlement_version = MIN_SUPPORTED_SETTLEMENT_VERSION.saturating_sub(1);
+
+        let msg = ChunkMessage {
+            request_id: 702,
+            body: ChunkMessageBody::QuoteRequestV2(request),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle v2 quote")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        match response.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+                ProtocolError::ClientUpdateRequired { .. },
+            )) => {}
+            other => panic!("expected ClientUpdateRequired, got: {other:?}"),
+        }
+    }
+
+    /// A settlement version this build has never heard of is served, not
+    /// refused. The storer still verifies the payment that actually arrives,
+    /// so nothing is weakened, and refusing would let a node that has not been
+    /// upgraded veto a rule set the network has already moved to.
+    #[tokio::test]
+    async fn a_newer_settlement_version_is_not_treated_as_an_error() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let mut request = ChunkQuoteRequestV2::new([0xBB; 32], 4096);
+        request.settlement_version = CURRENT_SETTLEMENT_VERSION.saturating_add(1);
+
+        let msg = ChunkMessage {
+            request_id: 703,
+            body: ChunkMessageBody::QuoteRequestV2(request),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle v2 quote")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        match response.body {
+            ChunkMessageBody::QuoteResponse(ChunkQuoteResponse::Error(
+                ProtocolError::ClientUpdateRequired { .. },
+            )) => {
+                panic!("a newer client must not be refused by an older node")
+            }
+            ChunkMessageBody::QuoteResponse(_) => {}
+            other => panic!("expected QuoteResponse, got: {other:?}"),
+        }
+    }
+
+    /// Legacy requests keep working. A node cannot tell a client that settles
+    /// correctly but predates the version field from one that does not, so
+    /// refusing both would break clients that are behaving.
+    #[tokio::test]
+    async fn unversioned_requests_are_still_served() {
+        let (protocol, _temp) = create_test_protocol().await;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_secs();
+
+        let msg = ChunkMessage {
+            request_id: 704,
+            body: ChunkMessageBody::MerkleCandidateQuoteRequest(MerkleCandidateQuoteRequest {
+                address: [0xCC; 32],
+                data_type: DATA_TYPE_CHUNK,
+                data_size: 4096,
+                merkle_payment_timestamp: timestamp,
+            }),
+        };
+        let response_bytes = protocol
+            .try_handle_request(&msg.encode().expect("encode request"))
+            .await
+            .expect("handle legacy merkle candidate quote")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+
+        match response.body {
+            ChunkMessageBody::MerkleCandidateQuoteResponse(
+                MerkleCandidateQuoteResponse::Success { .. },
+            ) => {}
+            other => panic!("expected Success for a legacy request, got: {other:?}"),
         }
     }
 
