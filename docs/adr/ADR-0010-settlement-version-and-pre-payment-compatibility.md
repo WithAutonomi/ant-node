@@ -71,7 +71,18 @@ It is safe **only while no client can be refused on version grounds**, which hol
 
 > The unversioned retry must be deleted **before** `MIN_SUPPORTED_SETTLEMENT_VERSION` is ever raised.
 
-This is enforced by a compile-time assertion in the client, not by review discipline: raising the minimum while the fallback exists fails the build.
+This is enforced by a compile-time assertion in the client, not by review discipline: raising the minimum while a fallback exists fails the build.
+
+There are **two** independent fallbacks, single-node and merkle. The guard is therefore a single shared constant that each site references, so deleting one path cannot orphan the check for the other. An earlier revision put the assertion beside the merkle path only, which left the single-node retry unguarded while this document claimed otherwise.
+
+### A refusal must not depend on who answered first
+
+A refusal is a verdict about the client, not about one peer, so it cannot be treated as one failed response among many. Two things follow, and both were wrong in the first implementation:
+
+- The collector stops **launching** new peers once it has enough quotes, but keeps **draining** those already launched. Otherwise a refusal still in flight is discarded because faster peers filled the quota, and the upload pays.
+- The verdict is recorded outside the collection timeout. The elapsed arm deliberately falls through so quotes from fast peers stay usable, and would otherwise throw away a refusal observed just before the clock ran out.
+
+`StorerUpdateRequired` deliberately does **not** get this treatment. It is not a verdict about the client, so one lagging peer must not abort an upload the rest of the close group can serve.
 
 ### Unversioned requests are still served
 
@@ -107,7 +118,8 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 - **Range policy.** `a_newer_settlement_version_is_refused_rather_than_assumed_compatible` pins the upper bound, which is the specific error this ADR corrects.
 - **Refusal direction.** `a_newer_settlement_version_is_refused_as_this_nodes_fault` and `the_two_refusals_do_not_blame_the_same_party` pin that a lagging node never reports a client fault.
 - **Terminality.** `a_refusal_aborts_quote_collection_instead_of_counting_as_one_bad_peer` pins that a refusal stops collection rather than joining the failure list, which is what would otherwise let the remaining peers form a quorum and pay anyway.
-- **Downgrade bound.** The compile-time assertion in the client, plus `only_silence_triggers_the_legacy_retry`.
+- **Order independence.** `a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it` and `meeting_the_target_stops_launching_without_stopping_collection` pin that the verdict does not depend on which peers answered first, and `a_lagging_storer_does_not_populate_the_refusal_slot` pins that a behind-the-times peer is not mistaken for one.
+- **Downgrade bound.** The shared compile-time constant referenced from both fallback sites, plus `only_silence_triggers_the_legacy_retry`.
 - **Still outstanding at the time of writing:** a mixed-version dev testnet exercising legacy node, upgraded node, structured refusal, lost refusal, and send failure against real peers. The unit tests pin the decisions; they do not prove the behaviour end to end.
 
 ### Re-open triggers
