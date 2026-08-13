@@ -8244,6 +8244,38 @@ enum FetchResult {
     IntegrityFailed,
     /// Source failed (network error or non-success response) — retryable.
     SourceFailed,
+    /// This node could not write the chunk locally: the capacity pre-check
+    /// refused before the dial, or `put` failed after the bytes arrived.
+    ///
+    /// Distinct from [`Self::SourceFailed`] because nothing about the source
+    /// is implicated, and because the remedy is the opposite one. A source
+    /// failure should move on to the next holder; a local write failure must
+    /// not — every remaining source would send the same chunk into the same
+    /// full disk. The key returns to verification instead, so a later cycle
+    /// retries it once local capacity allows. That is a retry path, not a
+    /// liveness guarantee: `evict_stale` still expires the entry at
+    /// `PENDING_VERIFY_MAX_AGE` measured from when it was first queued, after
+    /// which re-acquisition depends on a fresh hint.
+    LocalWriteFailed,
+    /// This node already holds the key, so there is nothing to fetch —
+    /// terminal, exactly like [`Self::Stored`], because the duty is already
+    /// discharged.
+    ///
+    /// Responsibility is rechecked at download time; possession has to be too.
+    /// The earlier gates already drop held keys out of the fetch pipeline —
+    /// `queue_admitted_hints` skips them, and the promotion-time
+    /// `fetch_allowed_keys` filter and the local-paid probe both terminate
+    /// them. (`is_relevant` is not one of them: possession there makes a key
+    /// *relevant*, which is what keeps us tracking it.) So a held key reaches
+    /// the dial only when it arrived *after* promotion — a fresh-offer push, a
+    /// client PUT, or another source landing first. The nearest-first fetch
+    /// queue is deep enough for that window to be real.
+    ///
+    /// This check must also precede the capacity pre-check below, because
+    /// `LmdbStorage::put` tests `exists` *before* it tests disk space: without
+    /// it, a full node would decline a key it already holds, which `put` would
+    /// have accepted as a duplicate.
+    AlreadyHeld,
     /// Live routing state no longer places this node in the storage-admission
     /// group for the key — terminal, exactly like [`Self::Stored`]. The duty
     /// the fetch was serving has lapsed, so no alternate source is tried and
@@ -8291,7 +8323,7 @@ fn apply_fetch_result(
     verification_retry_after: Duration,
 ) -> FetchFollowUp {
     match result {
-        FetchResult::Stored | FetchResult::NoLongerResponsible => {
+        FetchResult::Stored | FetchResult::NoLongerResponsible | FetchResult::AlreadyHeld => {
             q.complete_fetch(key);
             FetchFollowUp::Terminal
         }
@@ -8299,6 +8331,19 @@ fn apply_fetch_result(
             if let Some(next_peer) = q.retry_fetch(key) {
                 FetchFollowUp::RetryFrom(next_peer)
             } else if q.requeue_fetch_for_verification(key, verification_retry_after) {
+                FetchFollowUp::RequeuedForVerification
+            } else {
+                FetchFollowUp::Terminal
+            }
+        }
+        // No `retry_fetch`: the local write is what failed, so every other
+        // source would be asked to send the same chunk into the same full
+        // disk. Requeueing for verification is what keeps the key from being
+        // stranded — it comes back once capacity allows — and the fallthrough
+        // to `Terminal` when there is no retry metadata is what keeps
+        // bootstrap drain accounting correct, exactly as for a source failure.
+        FetchResult::LocalWriteFailed => {
+            if q.requeue_fetch_for_verification(key, verification_retry_after) {
                 FetchFollowUp::RequeuedForVerification
             } else {
                 FetchFollowUp::Terminal
@@ -8359,6 +8404,48 @@ async fn execute_single_fetch(
         return FetchOutcome {
             key,
             result: FetchResult::NoLongerResponsible,
+        };
+    }
+
+    // Possession, then capacity — both before the dial, and in that order.
+    //
+    // `LmdbStorage::put` tests `exists` before it tests disk space, so a full
+    // node still accepts a key it already holds. Checking possession first is
+    // what keeps this pair of gates from declining work `put` would have
+    // taken.
+    if storage.exists(&key).unwrap_or(false) {
+        debug!(
+            "Skipping fetch for {}: already held locally",
+            hex::encode(key)
+        );
+        return FetchOutcome {
+            key,
+            result: FetchResult::AlreadyHeld,
+        };
+    }
+
+    // Capacity is checked before the dial rather than after the bytes arrive.
+    // `put` runs this same check on every write of a key it does not already
+    // hold, so this reaches the same verdict `put` would reach *at this
+    // instant*. It is not a guarantee about the later write: both answers can
+    // change across the round trip. Space freed in between would have let a
+    // post-download `put` succeed, so a refusal here can cost a fleeting
+    // acquisition and one retry cycle of delay; space lost in between is why
+    // the check inside `put` still has to stay.
+    //
+    // What it buys is that the refusal costs no bandwidth. Without it a
+    // disk-full node pulls the whole chunk over the network first, and the
+    // failure is then classified as the source's — no trust event, but the
+    // worker walks to every remaining holder, and each re-uploads the same
+    // chunk into the same full disk.
+    if let Err(e) = storage.check_capacity() {
+        debug!(
+            "Skipping fetch for {}: local storage cannot accept a write: {e}",
+            hex::encode(key)
+        );
+        return FetchOutcome {
+            key,
+            result: FetchResult::LocalWriteFailed,
         };
     }
 
@@ -8490,13 +8577,19 @@ async fn execute_single_fetch(
                     }
 
                     if let Err(e) = storage.put(&resp_key, &data).await {
+                        // The bytes arrived and passed the content-address
+                        // check, so the source did its job; the failure is
+                        // entirely local (disk-full, or an LMDB error). Any
+                        // valid source must serve identical content, so trying
+                        // the next one cannot cure a local error — it only
+                        // re-downloads the same chunk into the same store.
                         warn!(
                             "Failed to store fetched record {}: {e}",
                             hex::encode(resp_key)
                         );
                         return FetchOutcome {
                             key,
-                            result: FetchResult::SourceFailed,
+                            result: FetchResult::LocalWriteFailed,
                         };
                     }
 
@@ -12830,5 +12923,85 @@ mod tests {
 
         assert_eq!(follow_up, FetchFollowUp::Terminal);
         assert!(!q.contains_key(&key));
+    }
+
+    #[test]
+    fn already_held_key_leaves_the_pipeline_terminally() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x4C);
+        let source = test_peer(0x0B);
+        drive_key_in_flight(&mut q, key, vec![source, test_peer(0x0C)]);
+
+        let follow_up = apply_fetch_result(&mut q, &key, &FetchResult::AlreadyHeld, RETRY_AFTER);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::Terminal,
+            "holding the key already discharges the duty, so the key must leave \
+             the pipeline exactly as a completed fetch does — requeueing it \
+             would re-verify a key that needs nothing"
+        );
+        assert!(!q.contains_key(&key));
+        assert_eq!(
+            q.retry_reserved_slot_count(),
+            0,
+            "the terminal path must release the retry-slot reservation, or the \
+             owner's verification budget leaks"
+        );
+    }
+
+    #[test]
+    fn local_write_failure_does_not_conscript_the_remaining_sources() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x2A);
+        let first = test_peer(0x07);
+        let second = test_peer(0x08);
+        let third = test_peer(0x09);
+        drive_key_in_flight(&mut q, key, vec![first, second, third]);
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+
+        assert_eq!(
+            follow_up,
+            FetchFollowUp::RequeuedForVerification,
+            "a local write failure must go straight back to verification: the two \
+             untried sources would each re-upload the same chunk into the same \
+             full disk, and neither of them did anything wrong"
+        );
+        assert_eq!(q.in_flight_count(), 0);
+        assert_eq!(
+            q.pending_count(),
+            1,
+            "the key must come back — capacity frees up, and a stranded key is \
+             a replica this node silently stops owing"
+        );
+        assert_eq!(q.retry_reserved_slot_count(), 0);
+    }
+
+    #[test]
+    fn local_write_failure_without_retry_metadata_is_terminal() {
+        const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+        // No pending entry to restore, so the only way not to strand the key
+        // in `in_flight_fetch` forever — which would also stall bootstrap
+        // drain — is the terminal path.
+        let mut q = ReplicationQueues::new();
+        let key = test_key(0x3B);
+        let source = test_peer(0x0A);
+        assert!(q.enqueue_fetch(key, key, vec![source]));
+        let candidate = q.dequeue_fetch().expect("enqueued key must dequeue");
+        q.start_dequeued_fetch(candidate, source);
+
+        let follow_up =
+            apply_fetch_result(&mut q, &key, &FetchResult::LocalWriteFailed, RETRY_AFTER);
+
+        assert_eq!(follow_up, FetchFollowUp::Terminal);
+        assert!(!q.contains_key(&key));
+        assert_eq!(q.retry_reserved_slot_count(), 0);
     }
 }
