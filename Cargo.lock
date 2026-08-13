@@ -862,8 +862,8 @@ dependencies = [
 
 [[package]]
 name = "ant-protocol"
-version = "2.4.0"
-source = "git+https://github.com/grumbach/ant-protocol?branch=settlement-version-quote-gate#439ed83d70ab3bbd14c1031c2e319f793141ea5a"
+version = "2.3.2"
+source = "git+https://github.com/grumbach/ant-protocol?branch=settlement-version-quote-gate#83160b044bdd3f035b9a78ba214d9510ab3ca753"
 dependencies = [
  "blake3",
  "bytes",

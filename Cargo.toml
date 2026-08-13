@@ -40,8 +40,8 @@ mimalloc = "0.1"
 # (the rc-2026.4.2 branch) so Cargo can unify the wire types here
 # with ant-protocol's re-exports.
 # Branch pin while the settlement-version wire types are in review
-# (WithAutonomi/ant-protocol#23). Swap back to `ant-protocol = "2.4.0"` once
-# that PR merges and 2.4.0 is published.
+# (WithAutonomi/ant-protocol#23). Swap back to a published `ant-protocol`
+# version pin once that PR merges and the release train publishes it.
 ant-protocol = { git = "https://github.com/grumbach/ant-protocol", branch = "settlement-version-quote-gate" }
 
 # Core (provides EVERYTHING: networking, DHT, security, trust, storage)

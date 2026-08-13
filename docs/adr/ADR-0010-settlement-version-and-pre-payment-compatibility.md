@@ -99,7 +99,7 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 
 - Deploy order is **nodes before clients**, since a node on `ant-protocol` 2.3.x cannot decode versioned requests. The fallback makes this a preference rather than a hard gate.
 - The unversioned-quote counter is the input to the follow-up decision above.
-- `ant-protocol` moves 2.3.2 -> 2.4.0. Additive, minor.
+- The `ant-protocol` change is additive, so it carries a minor semver impact. The version bump itself is left to the release train, not taken in the PR.
 
 ## Validation
 
