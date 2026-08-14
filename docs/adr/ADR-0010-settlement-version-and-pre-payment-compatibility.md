@@ -103,7 +103,7 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 
 - **It does not fix the current burn.** A client too old to settle correctly is also too old to declare a version, so the gate cannot see the population causing today's rejections. Only the reworded error reaches them. Driving client adoption remains the cheaper and faster remedy for the incident that prompted this.
 - **Merkle storers are not exactly the quoted peers.** The gate covers the 16 candidates a client quotes, but the chunk is stored by each chunk's close group, which may include a peer that never quoted. A storer outside the candidate set can still refuse at PUT time. This narrows the exposure substantially without closing it, and only option 3 closes it fully.
-- The fallback costs one extra timeout per silent peer during rollout. Requests run concurrently, so the worst case is 2x the quote timeout overall.
+- The fallback costs one probe per silent peer, bounded by `VERSIONED_QUOTE_PROBE_CEILING` and paid once per peer rather than once per request. Before those two bounds it was one full quote timeout on **every** request, which took the merkle E2E suite from ~24 minutes past the 60-minute CI cap. See the validation section.
 - Clients declaring a version are refused by nodes that have not upgraded. Harmless today because no node has a lower `CURRENT`, but it makes node rollout a prerequisite for the next settlement bump.
 
 ### Neutral / Operational
@@ -120,7 +120,27 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 - **Terminality.** `a_refusal_aborts_quote_collection_instead_of_counting_as_one_bad_peer` pins that a refusal stops collection rather than joining the failure list, which is what would otherwise let the remaining peers form a quorum and pay anyway.
 - **Order independence.** `a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it` and `meeting_the_target_stops_launching_without_stopping_collection` pin that the verdict does not depend on which peers answered first, and `a_lagging_storer_does_not_populate_the_refusal_slot` pins that a behind-the-times peer is not mistaken for one.
 - **Downgrade bound.** The shared compile-time constant referenced from both fallback sites, plus `only_silence_triggers_the_legacy_retry`.
-- **Still outstanding at the time of writing:** a mixed-version dev testnet exercising legacy node, upgraded node, structured refusal, lost refusal, and send failure against real peers. The unit tests pin the decisions; they do not prove the behaviour end to end.
+### Mixed-version validation, and what it found
+
+The new-client-against-old-fleet case has been exercised for real, not simulated. `ant-client`'s merkle E2E suite spawns a 35-node testnet from the **published** `ant-node`, which predates the versioned requests, so the suite is a live mixed-version run: every node logs `Failed to decode message: deserialization failed` for each versioned probe and answers only the unversioned retry.
+
+It passed functionally and **failed on cost**, which is exactly what a unit test could not have shown:
+
+| | Merkle E2E, ubuntu |
+|---|---|
+| Baseline on `main` | 24–38 min |
+| First implementation | exceeded the 60-min CI cap with 4 of 7 tests done |
+
+The cause was that a peer which cannot decode the versioned request never answers, so the client waited the **full** quote timeout before falling back, and paid that on every request rather than once per peer. The suite runs `quote_timeout_secs = 120`, and a merkle pool asks sixteen candidates.
+
+Two changes came out of it, both in the client:
+
+- **Remember the answer.** A peer that fails to answer a versioned request is asked in the legacy shape from then on, so the probe is paid once per peer instead of once per request.
+- **Cap the probe.** A capability probe does not need the patience of a real quote, so the versioned attempt is bounded by `VERSIONED_QUOTE_PROBE_CEILING`. Production's 10s timeout is already below it; the ceiling only binds in test configurations.
+
+Cutting a probe short can misjudge a slow but upgraded peer as legacy. The only consequence is a lost version declaration to that peer, because the fallback still obtains a quote, and it cannot matter while no client can be refused on version grounds. By the time it could, the fallback must already be deleted.
+
+**Still outstanding:** the reverse direction, old client against an upgraded node, and a fleet with both. Those need a testnet built from this branch's `ant-node` rather than the published one, which is not available until the coordinated set lands. Also unproven end to end: structured refusal, lost refusal, and send failure against real peers, which are pinned at unit level only.
 
 ### Re-open triggers
 
