@@ -21,7 +21,7 @@ The general problem is that **`PROTOCOL_VERSION` describes what a peer can parse
 ## Decision Drivers
 
 - A refusal must land **before** payment. Merkle settlement is irreversible, so after-the-fact verification cannot be the only check.
-- A client-first rollout must stay possible. ADR-0008 chose client-first deliberately, because a client paying more is accepted by an old node for free. Any policy that makes old nodes refuse new clients breaks that ordering.
+- A client-first rollout must stay **usable**, though this decision does narrow it. ADR-0008 chose client-first because a client paying more was accepted by an old node for free. Bounding the upper end ends that: an old node now refuses a newer client rather than quoting a payment it cannot promise to honour. The refusal is deliberately not a client fault, so a newer client routes to peers that can serve it and its user sees nothing, but **node rollout becomes a prerequisite for the next settlement bump** rather than merely desirable. That is the price of not paying before compatibility is established, and it is paid knowingly.
 - Old peers must not be misread. `ChunkMessage` is postcard-encoded and non-self-describing, so a new field silently changes how existing peers parse every message.
 - The user must be told what to do. The failure is only expensive because it is silent.
 
@@ -69,11 +69,21 @@ A storer built before the versioned requests cannot decode them and simply never
 
 It is safe **only while no client can be refused on version grounds**, which holds exactly while `MIN_SUPPORTED_SETTLEMENT_VERSION` is the first declarable version. The rule is therefore:
 
-> The unversioned retry must be deleted **before** `MIN_SUPPORTED_SETTLEMENT_VERSION` is ever raised.
+> The unversioned retry must be deleted **before either `MIN_SUPPORTED_SETTLEMENT_VERSION` or `CURRENT_SETTLEMENT_VERSION` is raised.**
+
+Both, not just the minimum. Raising `MIN` creates the too-old refusal; raising `CURRENT` creates the node-behind refusal as soon as any node lags, and the retry routes around that one just as readily.
 
 This is enforced by a compile-time assertion in the client, not by review discipline: raising the minimum while a fallback exists fails the build.
 
 There are **two** independent fallbacks, single-node and merkle. The guard is therefore a single shared constant that each site references, so deleting one path cannot orphan the check for the other. An earlier revision put the assertion beside the merkle path only, which left the single-node retry unguarded while this document claimed otherwise.
+
+### A refusal is a verdict about the client, and needs corroboration
+
+Nothing authenticates a refusal. Acting on one peer's word would let a single hostile or misconfigured storer answer `ClientUpdateRequired` to everything and deny every upload the client attempts, converting an over-query design that tolerates many bad peers into one that tolerates none. So a refusal is believed only once `SETTLEMENT_REFUSAL_QUORUM` distinct peers agree, and a refusal that does not describe this client (wrong echoed version, or a stated minimum this client already meets) is discarded as a bad peer rather than counted.
+
+A genuine incompatibility reaches the threshold immediately, because every peer enforcing the newer rule refuses and a client queries far more than two.
+
+The corroborated verdict is then held **client-wide and sticky**, not in one collector's local state. It concerns this build rather than this upload, so an upload that begins after another has already established it must not proceed to pay, and every payment entry point checks it first.
 
 ### A refusal must not depend on who answered first
 
@@ -104,7 +114,8 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 - **It does not fix the current burn.** A client too old to settle correctly is also too old to declare a version, so the gate cannot see the population causing today's rejections. Only the reworded error reaches them. Driving client adoption remains the cheaper and faster remedy for the incident that prompted this.
 - **Merkle storers are not exactly the quoted peers.** The gate covers the 16 candidates a client quotes, but the chunk is stored by each chunk's close group, which may include a peer that never quoted, and routing can move that group between quoting and storing. A storer outside the candidate set can still refuse at PUT time, after payment. This narrows the exposure substantially without closing it, and only option 3 closes it fully.
 - **A client binary already in the field cannot be reached.** The cutover guard bounds what future builds may do; it does nothing about a released client that still carries the fallback when nodes later raise their minimum. That is inherent to shipping software, and it is the same reason the storer verifies every payment it is actually offered rather than trusting the declared version.
-- **A refusal in a later merkle sub-batch arrives after earlier sub-batches have paid.** Batches above `MAX_LEAVES` settle sequentially, so the gate cannot be consulted for sub-batch two before sub-batch one's money is spent. The refusal is surfaced rather than folded into a partial success, but the earlier spend has already happened.
+- **A refusal in a later merkle sub-batch arrives after earlier sub-batches have paid.** Batches above `MAX_LEAVES` settle sequentially, so the gate cannot be consulted for sub-batch two before sub-batch one's money is spent. That call still returns its earlier proofs rather than failing: the caller writes the receipt cache only on the success path, so failing would strand a spend that has already settled on-chain, which is the destruction this work exists to prevent. Nothing is lost by returning them, because the verdict is latched client-wide and stops the *next* payment instead.
+- **A single upload can still be denied by two colluding peers.** The corroboration threshold trades a lone-peer denial-of-service for a two-peer one. Two is chosen because a genuine incompatibility clears it instantly while a lone attacker cannot; raising it would blunt the real signal, and the failure mode is availability rather than lost funds.
 - The fallback costs one probe per silent peer, bounded by `VERSIONED_QUOTE_PROBE_CEILING` and paid once per peer rather than once per request. Before those two bounds it was one full quote timeout on **every** request, which took the merkle E2E suite from ~24 minutes past the 60-minute CI cap. See the validation section.
 - Clients declaring a version are refused by nodes that have not upgraded. Harmless today because no node has a lower `CURRENT`, but it makes node rollout a prerequisite for the next settlement bump.
 
