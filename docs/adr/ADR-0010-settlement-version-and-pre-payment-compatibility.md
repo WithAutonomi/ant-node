@@ -94,7 +94,7 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 
 ### Positive
 
-- A settlement change can no longer burn an outdated client's money. The refusal lands at quote time, where it costs nothing.
+- A settlement change no longer burns an outdated client's money **on the path the gate covers**: the refusal lands at quote time, where it costs nothing. It is a large reduction rather than an elimination, and the two holes are named under trade-offs below. Read this bullet with those.
 - The user is told what happened and what to do, in both the quote refusal and the PUT-time underpayment message.
 - No protocol cutover. Nodes and clients roll independently.
 - The wire discriminants of every pre-existing message and error are pinned by a regression test, so the append-only property this rests on is enforced rather than assumed.
@@ -102,7 +102,9 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 ### Negative / Trade-offs
 
 - **It does not fix the current burn.** A client too old to settle correctly is also too old to declare a version, so the gate cannot see the population causing today's rejections. Only the reworded error reaches them. Driving client adoption remains the cheaper and faster remedy for the incident that prompted this.
-- **Merkle storers are not exactly the quoted peers.** The gate covers the 16 candidates a client quotes, but the chunk is stored by each chunk's close group, which may include a peer that never quoted. A storer outside the candidate set can still refuse at PUT time. This narrows the exposure substantially without closing it, and only option 3 closes it fully.
+- **Merkle storers are not exactly the quoted peers.** The gate covers the 16 candidates a client quotes, but the chunk is stored by each chunk's close group, which may include a peer that never quoted, and routing can move that group between quoting and storing. A storer outside the candidate set can still refuse at PUT time, after payment. This narrows the exposure substantially without closing it, and only option 3 closes it fully.
+- **A client binary already in the field cannot be reached.** The cutover guard bounds what future builds may do; it does nothing about a released client that still carries the fallback when nodes later raise their minimum. That is inherent to shipping software, and it is the same reason the storer verifies every payment it is actually offered rather than trusting the declared version.
+- **A refusal in a later merkle sub-batch arrives after earlier sub-batches have paid.** Batches above `MAX_LEAVES` settle sequentially, so the gate cannot be consulted for sub-batch two before sub-batch one's money is spent. The refusal is surfaced rather than folded into a partial success, but the earlier spend has already happened.
 - The fallback costs one probe per silent peer, bounded by `VERSIONED_QUOTE_PROBE_CEILING` and paid once per peer rather than once per request. Before those two bounds it was one full quote timeout on **every** request, which took the merkle E2E suite from ~24 minutes past the 60-minute CI cap. See the validation section.
 - Clients declaring a version are refused by nodes that have not upgraded. Harmless today because no node has a lower `CURRENT`, but it makes node rollout a prerequisite for the next settlement bump.
 
@@ -114,12 +116,12 @@ Flipping that to a refusal is a **follow-up**, gated on that count decaying, and
 
 ## Validation
 
-- **Wire safety.** `appending_v2_variants_leaves_existing_discriminants_untouched` and `client_update_required_is_appended_to_protocol_error` pin the discriminant of every pre-existing variant. If either fails, older peers are misreading current traffic.
+- **Wire safety.** `appending_v2_variants_leaves_existing_discriminants_untouched` and `client_update_required_is_appended_to_protocol_error` pin the discriminant of every pre-existing message body **and** every pre-existing `ProtocolError`, responses included. An earlier revision pinned only the request half and the endpoints of the error enum, so a reordered response variant would have passed while breaking old peers.
 - **Range policy.** `a_newer_settlement_version_is_refused_rather_than_assumed_compatible` pins the upper bound, which is the specific error this ADR corrects.
 - **Refusal direction.** `a_newer_settlement_version_is_refused_as_this_nodes_fault` and `the_two_refusals_do_not_blame_the_same_party` pin that a lagging node never reports a client fault.
 - **Terminality.** `a_refusal_aborts_quote_collection_instead_of_counting_as_one_bad_peer` pins that a refusal stops collection rather than joining the failure list, which is what would otherwise let the remaining peers form a quorum and pay anyway.
-- **Order independence.** `a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it` and `meeting_the_target_stops_launching_without_stopping_collection` pin that the verdict does not depend on which peers answered first, and `a_lagging_storer_does_not_populate_the_refusal_slot` pins that a behind-the-times peer is not mistaken for one.
-- **Downgrade bound.** The shared compile-time constant referenced from both fallback sites, plus `only_silence_triggers_the_legacy_retry`.
+- **Order independence.** `a_refusal_is_recorded_where_the_collection_timeout_cannot_discard_it` and `meeting_the_target_stops_launching_without_stopping_collection`, plus `a_lagging_storer_does_not_populate_the_refusal_slot`. Stated precisely, because it is easy to overclaim: these pin the *mechanism* — that the verdict is stored where the elapsed arm cannot reach it, and that the launch budget stops recruiting at the target. **No test drives a real collection to timeout**, so the end-to-end ordering behaviour is argued from those two pieces rather than observed.
+- **Downgrade bound.** The shared compile-time constant referenced from both fallback sites, plus `only_silence_triggers_the_legacy_retry` and `only_silence_is_evidence_worth_caching`. The constant now bounds `CURRENT` as well as `MIN`: raising either opens a refusal the unversioned retry could route around, and an earlier revision guarded only `MIN`.
 ### Mixed-version validation, and what it found
 
 The new-client-against-old-fleet case has been exercised for real, not simulated. `ant-client`'s merkle E2E suite spawns a 35-node testnet from the **published** `ant-node`, which predates the versioned requests, so the suite is a live mixed-version run: every node logs `Failed to decode message: deserialization failed` for each versioned probe and answers only the unversioned retry.

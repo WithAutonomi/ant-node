@@ -234,10 +234,12 @@ static UNVERSIONED_QUOTES_SERVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64
 /// costs the client nothing: no quote means no pool commitment, which means no
 /// payment.
 ///
-/// A version NEWER than this node understands is deliberately allowed through.
-/// The storer still verifies whatever payment actually arrives, so nothing is
-/// weakened by letting it past, whereas rejecting it would let a stale node
-/// veto a rule set the network has already moved to.
+/// A version NEWER than this node understands is refused too, as
+/// `StorerUpdateRequired`. Quoting it would promise to accept a payment whose
+/// rules this build does not know, and that promise can only be broken at PUT
+/// time, once the client has settled on-chain. The client is told to use a
+/// different storer rather than to upgrade, because it is this node that is
+/// behind.
 fn settlement_gate(client_settlement_version: u32, path: &str) -> Option<ProtocolError> {
     match settlement_compatibility(client_settlement_version) {
         SettlementCompatibility::Compatible => None,
