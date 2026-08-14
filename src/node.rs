@@ -15,7 +15,7 @@ use crate::payment::{
 use crate::replication::config::ReplicationConfig;
 use crate::replication::ReplicationEngine;
 use crate::storage::lmdb::MIB;
-use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use crate::storage::{AntProtocol, ChunkRequestContext, LmdbStorage, LmdbStorageConfig};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
 };
@@ -28,6 +28,7 @@ use saorsa_core::{
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -807,6 +808,7 @@ impl RunningNode {
 
                     if let Some((data_type, response_topic)) = handler_info {
                         debug!("Received {data_type} protocol message from {source}");
+                        let received_at = Instant::now();
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
@@ -814,26 +816,53 @@ impl RunningNode {
                             let Ok(_permit) = sem.acquire().await else {
                                 return;
                             };
-                            let result = match data_type {
-                                "chunk" => protocol.try_handle_request(&data).await,
+                            let queue_wait = received_at.elapsed();
+                            let handled = match data_type {
+                                "chunk" => {
+                                    protocol
+                                        .try_handle_request_with_context(
+                                            &data,
+                                            Some(ChunkRequestContext::new(
+                                                source.to_string(),
+                                                received_at,
+                                                queue_wait,
+                                            )),
+                                        )
+                                        .await
+                                }
                                 _ => return,
                             };
-                            match result {
+                            let telemetry = handled.get_telemetry;
+                            match handled.response {
                                 Ok(Some(response)) => {
-                                    if let Err(e) = p2p
+                                    let send_started = Instant::now();
+                                    let send_result = p2p
                                         .send_message(
                                             &source,
                                             response_topic,
                                             response.to_vec(),
                                             &[],
                                         )
-                                        .await
-                                    {
+                                        .await;
+                                    if let Some(telemetry) = telemetry {
+                                        telemetry.finish_send(
+                                            send_started.elapsed(),
+                                            send_result.is_ok(),
+                                        );
+                                    }
+                                    if let Err(e) = send_result {
                                         warn!("Failed to send {data_type} protocol response to {source}: {e}");
                                     }
                                 }
-                                Ok(None) => {}
+                                Ok(None) => {
+                                    if let Some(telemetry) = telemetry {
+                                        telemetry.finish_without_send("no_response");
+                                    }
+                                }
                                 Err(e) => {
+                                    if let Some(telemetry) = telemetry {
+                                        telemetry.finish_without_send("encode_error");
+                                    }
                                     warn!("{data_type} protocol handler error: {e}");
                                 }
                             }

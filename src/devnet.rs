@@ -11,7 +11,7 @@ use crate::payment::{
     QuotingMetricsTracker,
 };
 use crate::replication::config::ReplicationConfig;
-use crate::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+use crate::storage::{AntProtocol, ChunkRequestContext, LmdbStorage, LmdbStorageConfig};
 use evmlib::Network as EvmNetwork;
 use evmlib::RewardsAddress;
 use rand::Rng;
@@ -81,6 +81,52 @@ const DEVNET_REWARDS_ADDRESS: [u8; 20] = [0x01; 20];
 
 /// Initial records for quoting metrics (devnet value).
 const DEVNET_INITIAL_RECORDS: usize = 1000;
+
+async fn handle_chunk_message(
+    protocol: Arc<AntProtocol>,
+    p2p: Arc<P2PNode>,
+    source: PeerId,
+    data: Vec<u8>,
+    node_index: usize,
+    received_at: Instant,
+) {
+    let handled = protocol
+        .try_handle_request_with_context(
+            &data,
+            Some(ChunkRequestContext::new(
+                source.to_string(),
+                received_at.into(),
+                Duration::ZERO,
+            )),
+        )
+        .await;
+    let telemetry = handled.get_telemetry;
+    match handled.response {
+        Ok(Some(response)) => {
+            let send_started = Instant::now();
+            let send_result = p2p
+                .send_message(&source, CHUNK_PROTOCOL_ID, response.to_vec(), &[])
+                .await;
+            if let Some(telemetry) = telemetry {
+                telemetry.finish_send(send_started.elapsed(), send_result.is_ok());
+            }
+            if let Err(e) = send_result {
+                warn!("Node {node_index} failed to send response to {source}: {e}");
+            }
+        }
+        Ok(None) => {
+            if let Some(telemetry) = telemetry {
+                telemetry.finish_without_send("no_response");
+            }
+        }
+        Err(e) => {
+            if let Some(telemetry) = telemetry {
+                telemetry.finish_without_send("encode_error");
+            }
+            warn!("Node {node_index} protocol handler error: {e}");
+        }
+    }
+}
 
 // =============================================================================
 // Default Node Counts
@@ -652,29 +698,15 @@ impl Devnet {
                             );
                             let protocol = Arc::clone(&protocol_clone);
                             let p2p = Arc::clone(&p2p_clone);
-                            tokio::spawn(async move {
-                                match protocol.try_handle_request(&data).await {
-                                    Ok(Some(response)) => {
-                                        if let Err(e) = p2p
-                                            .send_message(
-                                                &source,
-                                                CHUNK_PROTOCOL_ID,
-                                                response.to_vec(),
-                                                &[],
-                                            )
-                                            .await
-                                        {
-                                            warn!(
-                                                "Node {node_index} failed to send response to {source}: {e}"
-                                            );
-                                        }
-                                    }
-                                    Ok(None) => {}
-                                    Err(e) => {
-                                        warn!("Node {node_index} protocol handler error: {e}");
-                                    }
-                                }
-                            });
+                            let received_at = Instant::now();
+                            tokio::spawn(handle_chunk_message(
+                                protocol,
+                                p2p,
+                                source,
+                                data,
+                                node_index,
+                                received_at,
+                            ));
                         }
                     }
                 }
