@@ -159,6 +159,23 @@ The cost of that is roughly two minutes per merkle E2E test for as long as the s
 
 **Still outstanding:** the reverse direction, old client against an upgraded node, and a fleet with both. Those need a testnet built from this branch's `ant-node` rather than the published one, which is not available until the coordinated set lands. Also unproven end to end: structured refusal, lost refusal, and send failure against real peers, which are pinned at unit level only.
 
+### Release gates
+
+Merging puts this in the next release, so the bar is fleet-ready, not code-complete. Green CI covers the code gate and nothing else. **The set is not production ready while any of these is open:**
+
+| Gate | Status |
+|---|---|
+| Code / CI | Proven across all three repos |
+| Dependency | Open: both downstream crates pin a mutable protocol branch |
+| Mixed-version | Partial: new-client against an old fleet is proven by the client suite; the gate itself has never run over a real connection, because the devnet speaks the pre-versioned dialect |
+| Deployment ordering | Open, and **not inert**: against a fleet that cannot answer a versioned request every first contact costs a probe wait, so releasing the client ahead of the nodes adds real latency to cold uploads |
+| Observability | Open: the unversioned-quote counter is the signal that retires the legacy path and has never been read in production |
+| NAT / canary | Open: no canary; relayed and NAT'd peers are the paths this adds work to |
+| Rollback | Argued, not rehearsed |
+| Fleet safety | Open: the corroboration quorum and the client-wide latch have never met a real fleet |
+
+The refusal machinery is inert on arrival, since `MIN` and `CURRENT` are both the first declarable version, so nothing can be refused yet. That lowers the risk. It does not close a gate, and the client-side cost above is live regardless.
+
 ### Re-open triggers
 
 - The unversioned-quote count failing to decay, which would mean a long tail of clients the gate can never protect and would raise the priority of option 3.
