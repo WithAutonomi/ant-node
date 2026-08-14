@@ -149,9 +149,13 @@ The cause was that a peer which cannot decode the versioned request never answer
 Two changes came out of it, both in the client:
 
 - **Remember the answer.** A peer that fails to answer a versioned request is asked in the legacy shape from then on, so the probe is paid once per peer instead of once per request.
-- **Cap the probe.** A capability probe does not need the patience of a real quote, so the versioned attempt is bounded by `VERSIONED_QUOTE_PROBE_CEILING`. Production's 10s timeout is already below it; the ceiling only binds in test configurations.
+- **Cap the probe**, with `VERSIONED_QUOTE_PROBE_CEILING`, but only far enough to bound a pathological timeout. Production's 10s sits below it, so **the ceiling never binds on a production client**.
 
-Cutting a probe short can misjudge a slow but upgraded peer as legacy. The only consequence is a lost version declaration to that peer, because the fallback still obtains a quote, and it cannot matter while no client can be refused on version grounds. By the time it could, the fallback must already be deleted.
+That last point is a safety property, not a tuning choice, and it was nearly got wrong. A shorter ceiling was tried to bring the slower CI runner under its job cap. It would have been a defect: the probe wait is the only window in which a peer can refuse, and the fallback re-asks under a *new* request id, so a refusal arriving after the ceiling answers a request nobody is listening to. It would never count toward corroboration, never set the latch, and the racing unversioned request could return a quote the client then pays against. Neither the never-demote rule nor the compile-time guard covers this: the first only stops a peer being *cached* as legacy, and the second binds future builds while the clients at risk are the ones already released.
+
+Cutting a probe short therefore does more than misjudge a slow peer. The rule is: **keep the ceiling at or above the largest production quote timeout.**
+
+The cost of that is roughly two minutes per merkle E2E test for as long as the suite's devnet speaks the pre-versioned dialect. That is an artifact of the temporary fork-branch protocol pin rather than of the design; when the fleet under test can answer a versioned request there are no probes to pay for and the suite returns to baseline.
 
 **Still outstanding:** the reverse direction, old client against an upgraded node, and a fleet with both. Those need a testnet built from this branch's `ant-node` rather than the published one, which is not available until the coordinated set lands. Also unproven end to end: structured refusal, lost refusal, and send failure against real peers, which are pinned at unit level only.
 
