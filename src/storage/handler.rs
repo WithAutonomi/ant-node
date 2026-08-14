@@ -46,6 +46,7 @@ use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Width of the self-closeness gate on client PUTs (ADR-0003): a node accepts
@@ -58,6 +59,153 @@ use tokio::sync::mpsc;
 /// node — which could only mis-attribute fresh-replication failures — is
 /// turned away.
 const SELF_CLOSENESS_GATE_WIDTH: usize = K_BUCKET_SIZE;
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Receipt context supplied by the authenticated P2P event router.
+///
+/// This is deliberately process-local metadata: it is never encoded or sent on
+/// the wire. The receipt instant spans semaphore queueing, storage, response
+/// encoding, and the response hand-off to the transport.
+pub struct ChunkRequestContext {
+    source_peer: String,
+    received_at: Instant,
+    queue_wait_ms: u64,
+}
+
+impl ChunkRequestContext {
+    #[must_use]
+    pub(crate) fn new(source_peer: String, received_at: Instant, queue_wait: Duration) -> Self {
+        Self {
+            source_peer,
+            received_at,
+            queue_wait_ms: duration_ms(queue_wait),
+        }
+    }
+}
+
+/// A decoded protocol request and, for GETs, its pending one-shot telemetry.
+///
+/// Keeping the handler result and telemetry together lets the router record the
+/// event only after response hand-off, while preserving the existing handler
+/// error and response behaviour.
+pub struct HandledChunkRequest {
+    pub(crate) response: Result<Option<Bytes>>,
+    pub(crate) get_telemetry: Option<GetRequestTelemetry>,
+}
+
+/// Bounded stage timings for one decoded chunk GET.
+///
+/// `finish_send` emits the sole `get_rpc` event. If the routing task is cancelled
+/// after handling but before response hand-off completes, `Drop` emits the same
+/// event with `cancelled` outcomes so the request does not disappear silently.
+pub struct GetRequestTelemetry {
+    source_peer: String,
+    request_id: u64,
+    chunk_address: String,
+    received_at: Instant,
+    queue_wait_ms: u64,
+    storage_read_ms: u64,
+    storage_outcome: &'static str,
+    storage_error_category: &'static str,
+    response_encode_ms: u64,
+    finished: bool,
+}
+
+impl GetRequestTelemetry {
+    fn from_response(
+        context: ChunkRequestContext,
+        request_id: u64,
+        chunk_address: String,
+        storage_read_ms: u64,
+        response: &ChunkGetResponse,
+    ) -> Self {
+        let (storage_outcome, storage_error_category) = match response {
+            ChunkGetResponse::Success { .. } => ("success", "none"),
+            ChunkGetResponse::NotFound { .. } => ("not_found", "none"),
+            ChunkGetResponse::Error(ProtocolError::StorageFailed(_)) => ("error", "storage"),
+            ChunkGetResponse::Error(_) => ("error", "protocol"),
+            _ => ("unknown", "unknown"),
+        };
+        Self {
+            source_peer: context.source_peer,
+            request_id,
+            chunk_address,
+            received_at: context.received_at,
+            queue_wait_ms: context.queue_wait_ms,
+            storage_read_ms,
+            storage_outcome,
+            storage_error_category,
+            response_encode_ms: 0,
+            finished: false,
+        }
+    }
+
+    fn set_response_encode_ms(&mut self, elapsed: Duration) {
+        self.response_encode_ms = duration_ms(elapsed);
+    }
+
+    /// Record the single completed GET event after response hand-off.
+    pub(crate) fn finish_send(mut self, response_send: Duration, send_succeeded: bool) {
+        let (send_outcome, overall_outcome) = if send_succeeded {
+            let overall = match self.storage_outcome {
+                "success" => "success",
+                "not_found" => "not_found",
+                "error" => "storage_error",
+                _ => "unknown",
+            };
+            ("success", overall)
+        } else {
+            ("error", "send_error")
+        };
+        self.emit(response_send, send_outcome, overall_outcome);
+        self.finished = true;
+    }
+
+    /// Record a GET which could not reach the response hand-off stage.
+    pub(crate) fn finish_without_send(mut self, overall_outcome: &'static str) {
+        self.emit(Duration::ZERO, "not_attempted", overall_outcome);
+        self.finished = true;
+    }
+
+    fn emit(
+        &self,
+        response_send: Duration,
+        send_outcome: &'static str,
+        overall_outcome: &'static str,
+    ) {
+        let response_send_ms = duration_ms(response_send);
+        let duration_ms = duration_ms(self.received_at.elapsed());
+        info!(
+            target: "ant_node::storage::rpc_latency",
+            source_peer = %self.source_peer,
+            request_id = self.request_id,
+            chunk_address = %self.chunk_address,
+            addr = %self.chunk_address,
+            queue_wait_ms = self.queue_wait_ms,
+            storage_read_ms = self.storage_read_ms,
+            storage_outcome = self.storage_outcome,
+            storage_error_category = self.storage_error_category,
+            response_encode_ms = self.response_encode_ms,
+            response_send_ms,
+            send_outcome,
+            duration_ms,
+            outcome = overall_outcome,
+            "get_rpc"
+        );
+    }
+}
+
+impl Drop for GetRequestTelemetry {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit(Duration::ZERO, "cancelled", "cancelled");
+            self.finished = true;
+        }
+    }
+}
 
 /// ANT protocol handler.
 ///
@@ -225,17 +373,50 @@ impl AntProtocol {
     ///
     /// Returns an error if message decoding, handling, or encoding fails.
     pub async fn try_handle_request(&self, data: &[u8]) -> Result<Option<Bytes>> {
-        let message = ChunkMessage::decode(data)
-            .map_err(|e| Error::Protocol(format!("Failed to decode message: {e}")))?;
+        self.try_handle_request_with_context(data, None)
+            .await
+            .response
+    }
+
+    /// Handle a request while carrying authenticated receipt context through a
+    /// GET response hand-off. The context is local-only observability metadata.
+    pub(crate) async fn try_handle_request_with_context(
+        &self,
+        data: &[u8],
+        context: Option<ChunkRequestContext>,
+    ) -> HandledChunkRequest {
+        let message = match ChunkMessage::decode(data) {
+            Ok(message) => message,
+            Err(e) => {
+                return HandledChunkRequest {
+                    response: Err(Error::Protocol(format!("Failed to decode message: {e}"))),
+                    get_telemetry: None,
+                };
+            }
+        };
 
         let request_id = message.request_id;
+        let mut get_telemetry = None;
 
         let response_body = match message.body {
             ChunkMessageBody::PutRequest(req) => {
                 ChunkMessageBody::PutResponse(self.handle_put(req).await)
             }
             ChunkMessageBody::GetRequest(req) => {
-                ChunkMessageBody::GetResponse(self.handle_get(req).await)
+                let chunk_address = hex::encode(req.address);
+                let storage_started = Instant::now();
+                let response = self.handle_get_inner(req).await;
+                let storage_read_ms = duration_ms(storage_started.elapsed());
+                if let Some(context) = context {
+                    get_telemetry = Some(GetRequestTelemetry::from_response(
+                        context,
+                        request_id,
+                        chunk_address,
+                        storage_read_ms,
+                        &response,
+                    ));
+                }
+                ChunkMessageBody::GetResponse(response)
             }
             ChunkMessageBody::QuoteRequest(ref req) => {
                 ChunkMessageBody::QuoteResponse(self.handle_quote(req))
@@ -256,18 +437,31 @@ impl AntProtocol {
             // lands here and is dropped. The CHUNK_PROTOCOL_ID multistream-
             // select handshake version-gates peers, so this arm should
             // only be reached by a misconfigured peer.
-            _ => return Ok(None),
+            _ => {
+                return HandledChunkRequest {
+                    response: Ok(None),
+                    get_telemetry: None,
+                };
+            }
         };
 
         let response = ChunkMessage {
             request_id,
             body: response_body,
         };
-
-        response
+        let encode_started = Instant::now();
+        let encoded = response
             .encode()
             .map(|b| Some(Bytes::from(b)))
-            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")))
+            .map_err(|e| Error::Protocol(format!("Failed to encode response: {e}")));
+        if let Some(telemetry) = &mut get_telemetry {
+            telemetry.set_response_encode_ms(encode_started.elapsed());
+        }
+
+        HandledChunkRequest {
+            response: encoded,
+            get_telemetry,
+        }
     }
 
     /// Handle a PUT request.
@@ -457,32 +651,7 @@ impl AntProtocol {
         }
     }
 
-    /// Handle a GET request.
-    ///
-    /// Wraps `handle_get_inner` to emit a single structured tracing event per
-    /// GET RPC at every exit path. See `handle_put` for the rationale.
-    async fn handle_get(&self, request: ChunkGetRequest) -> ChunkGetResponse {
-        let start = std::time::Instant::now();
-        let addr_hex = hex::encode(request.address);
-        let response = self.handle_get_inner(request).await;
-        let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let outcome: &'static str = match &response {
-            ChunkGetResponse::Success { .. } => "success",
-            ChunkGetResponse::NotFound { .. } => "not_found",
-            ChunkGetResponse::Error(_) => "error",
-            _ => "unknown",
-        };
-        info!(
-            target: "ant_node::storage::rpc_latency",
-            duration_ms,
-            outcome,
-            addr = %addr_hex,
-            "get_rpc"
-        );
-        response
-    }
-
-    /// Inner body of `handle_get` — see the wrapper for the per-RPC latency log.
+    /// Read a chunk from local storage for a GET request.
     async fn handle_get_inner(&self, request: ChunkGetRequest) -> ChunkGetResponse {
         let address = request.address;
         let addr_hex = hex::encode(address);
@@ -828,10 +997,27 @@ mod tests {
         };
         let get_bytes = get_msg.encode().expect("encode get");
 
-        // Handle GET
-        let response_bytes = protocol
-            .try_handle_request(&get_bytes)
-            .await
+        // Handle GET with the same local context the authenticated router adds.
+        let handled = protocol
+            .try_handle_request_with_context(
+                &get_bytes,
+                Some(ChunkRequestContext::new(
+                    "peer-success".to_string(),
+                    Instant::now(),
+                    Duration::from_millis(4),
+                )),
+            )
+            .await;
+        let telemetry = handled.get_telemetry.expect("GET telemetry");
+        assert_eq!(telemetry.source_peer, "peer-success");
+        assert_eq!(telemetry.request_id, 2);
+        assert_eq!(telemetry.chunk_address, hex::encode(address));
+        assert_eq!(telemetry.queue_wait_ms, 4);
+        assert_eq!(telemetry.storage_outcome, "success");
+        assert_eq!(telemetry.storage_error_category, "none");
+
+        let response_bytes = handled
+            .response
             .expect("handle get")
             .expect("expected response");
         let response = ChunkMessage::decode(&response_bytes).expect("decode response");
@@ -847,6 +1033,7 @@ mod tests {
         } else {
             panic!("expected GetResponse::Success");
         }
+        telemetry.finish_send(Duration::from_millis(2), true);
     }
 
     #[tokio::test]
@@ -876,6 +1063,52 @@ mod tests {
         } else {
             panic!("expected GetResponse::NotFound");
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_telemetry_preserves_join_fields_and_response() {
+        let (protocol, _temp) = create_test_protocol().await;
+
+        let address = [0xCD; 32];
+        let request_id = 995;
+        let get_msg = ChunkMessage {
+            request_id,
+            body: ChunkMessageBody::GetRequest(ChunkGetRequest::new(address)),
+        };
+        let get_bytes = get_msg.encode().expect("encode get");
+        let received_at = Instant::now();
+        let handled = protocol
+            .try_handle_request_with_context(
+                &get_bytes,
+                Some(ChunkRequestContext::new(
+                    "peer-v2-995".to_string(),
+                    received_at,
+                    Duration::from_millis(17),
+                )),
+            )
+            .await;
+
+        let telemetry = handled.get_telemetry.expect("GET telemetry");
+        assert_eq!(telemetry.source_peer, "peer-v2-995");
+        assert_eq!(telemetry.request_id, request_id);
+        assert_eq!(telemetry.chunk_address, hex::encode(address));
+        assert_eq!(telemetry.queue_wait_ms, 17);
+        assert_eq!(telemetry.storage_outcome, "not_found");
+        assert_eq!(telemetry.storage_error_category, "none");
+
+        let response_bytes = handled
+            .response
+            .expect("handle get")
+            .expect("expected response");
+        let response = ChunkMessage::decode(&response_bytes).expect("decode response");
+        assert_eq!(response.request_id, request_id);
+        assert!(matches!(
+            response.body,
+            ChunkMessageBody::GetResponse(ChunkGetResponse::NotFound { address: found })
+                if found == address
+        ));
+
+        telemetry.finish_send(Duration::from_millis(3), true);
     }
 
     #[tokio::test]
