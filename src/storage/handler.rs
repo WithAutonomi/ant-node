@@ -101,6 +101,7 @@ pub struct HandledChunkRequest {
 /// `finish_send` emits the sole `get_rpc` event. If the routing task is cancelled
 /// after handling but before response hand-off completes, `Drop` emits the same
 /// event with `cancelled` outcomes so the request does not disappear silently.
+#[cfg_attr(not(feature = "logging"), allow(dead_code))]
 pub struct GetRequestTelemetry {
     source_peer: String,
     request_id: u64,
