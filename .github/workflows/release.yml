@@ -432,8 +432,7 @@ jobs:
 
             ### Auto-Upgrade
 
-            Running nodes automatically detect and upgrade to this version
-            within a 24-hour staged rollout window.
+            ${{ needs.validate.outputs.is_prerelease == 'true' && 'This is a pre-release, so it is not installed by nodes on the default `stable` channel. Only `-beta.N` releases are installed automatically, and only by nodes started with `--upgrade-channel beta` (or `ANT_UPGRADE_CHANNEL=beta`). Release candidates (`-rc.N`) are not installed automatically on any channel.' || 'Running nodes automatically detect and upgrade to this version within a 24-hour staged rollout window.' }}
           files: |
             release/ant-node-cli-*.tar.gz
             release/ant-node-cli-*.zip
@@ -441,5 +440,9 @@ jobs:
             release/SHA256SUMS.txt
           draft: false
           prerelease: ${{ needs.validate.outputs.is_prerelease }}
+          # Never promote a pre-release (-beta.N, -rc.N, -alpha.N) to "Latest".
+          # GitHub already refuses to mark a prerelease as latest, but setting this
+          # explicitly keeps the guarantee independent of action defaults.
+          make_latest: ${{ needs.validate.outputs.is_prerelease != 'true' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
