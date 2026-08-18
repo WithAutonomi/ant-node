@@ -687,6 +687,31 @@ impl LmdbStorage {
         self.check_disk_space_cached()
     }
 
+    /// Capacity as a three-way verdict, distinguishing a full disk from a
+    /// query that failed.
+    ///
+    /// Shares the same TTL cache as [`Self::check_capacity`]: a passing result
+    /// is cached, a failing one is always rechecked, so freed space is noticed
+    /// promptly.
+    pub(crate) fn capacity_verdict(&self) -> CapacityVerdict {
+        {
+            let last = self.last_disk_ok.lock();
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS {
+                    return CapacityVerdict::Writable;
+                }
+            }
+        }
+        let verdict = verdict_from_available_space(
+            fs2::available_space(&self.env_dir),
+            self.config.disk_reserve,
+        );
+        if verdict == CapacityVerdict::Writable {
+            *self.last_disk_ok.lock() = Some(Instant::now());
+        }
+        verdict
+    }
+
     /// Check available disk space, skipping the syscall if a recent check passed.
     ///
     /// Only caches *passing* results — a low-space condition is always
@@ -869,6 +894,43 @@ fn map_target_bytes(current_db_bytes: u64, available: u64, reserve: u64) -> u64 
     let growth_room = growth_room.min(WINDOWS_MAP_HEADROOM);
 
     current_db_bytes.saturating_add(growth_room)
+}
+
+/// Map the result of a space query onto a verdict.
+///
+/// Split out from [`LmdbStorage::capacity_verdict`] because the three-way
+/// mapping is the part worth proving, and proving it through the filesystem is
+/// not portable: asking for the free space of a directory that does not exist
+/// fails on Unix but succeeds on Windows, which resolves it to the volume.
+fn verdict_from_available_space(available: std::io::Result<u64>, reserve: u64) -> CapacityVerdict {
+    match available {
+        Ok(available) if available < reserve => CapacityVerdict::Full,
+        Ok(_) => CapacityVerdict::Writable,
+        Err(e) => {
+            warn!("Could not query available disk space: {e}");
+            CapacityVerdict::Unknown
+        }
+    }
+}
+
+/// What a capacity check concluded, when the caller needs to tell "this node is
+/// full" apart from "this node could not find out".
+///
+/// [`LmdbStorage::check_capacity`] collapses both into `Err`, which is right for
+/// a caller that only wants to know whether to attempt a write. A caller
+/// deciding *how long to stand down* needs the distinction: a full disk is a
+/// standing condition worth waiting minutes on, while a failed `statvfs` may
+/// have cleared by the next attempt and must not be treated as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityVerdict {
+    /// Available space is at or above the configured reserve. That is what the
+    /// query establishes, and possibly from the TTL cache — not a promise the
+    /// next write succeeds.
+    Writable,
+    /// Available space is below the configured reserve.
+    Full,
+    /// The query itself failed, so nothing is known about available space.
+    Unknown,
 }
 
 /// Reject the write early if available disk space is below `reserve`.
@@ -1317,5 +1379,80 @@ mod tests {
             .await
             .expect("try_resize did not complete after the raw read released")
             .expect("try_resize");
+    }
+
+    /// The gate fires on `Full` and only on `Full`, so the verdict has to tell a
+    /// disk below its reserve from one above it, and has to notice when that
+    /// stops being true.
+    ///
+    /// The third call is the one that matters for recovery: the below-reserve
+    /// condition clears, and the verdict has to follow it rather than stay stuck
+    /// on its earlier answer. A node that remembered a refusal would stop
+    /// fetching for good.
+    ///
+    /// What this does not show: that a changed free-space reading is re-read from
+    /// the filesystem. The condition is cleared by dropping the reserve, which is
+    /// the same comparison approached from the other side.
+    #[tokio::test]
+    async fn capacity_verdict_follows_the_reserve_and_notices_recovery() {
+        let (writable, _temp) = create_test_storage().await;
+        assert_eq!(writable.capacity_verdict(), CapacityVerdict::Writable);
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let config = LmdbStorageConfig {
+            root_dir: temp_dir.path().to_path_buf(),
+            // Far above any real free space, the same way the e2e builds a
+            // write-blocked node.
+            disk_reserve: u64::MAX / 2,
+            ..LmdbStorageConfig::test_default()
+        };
+        let mut full = LmdbStorage::new(config).await.expect("create storage");
+        assert_eq!(full.capacity_verdict(), CapacityVerdict::Full);
+
+        // Still short of space, so still `Full`. A `Full` result that populated
+        // the passing-result cache would answer `Writable` here.
+        assert_eq!(full.capacity_verdict(), CapacityVerdict::Full);
+
+        // Space is no longer short. Nothing cached a refusal, so the very next
+        // read has to see it.
+        full.config.disk_reserve = 0;
+        assert_eq!(
+            full.capacity_verdict(),
+            CapacityVerdict::Writable,
+            "a refusal must not be negatively cached: the next read has to see the \
+             below-reserve condition clear"
+        );
+    }
+
+    /// A space query that fails says nothing about available space, so it must
+    /// not read as a full disk. The gate stands a key down for five minutes on
+    /// `Full` alone, and a failed `statvfs` is not a condition worth standing
+    /// down for: it may be gone by the next cycle.
+    ///
+    /// The two `Ok` cases pin the boundary the reserve names: equal to the
+    /// reserve is writable, one byte under it is not.
+    ///
+    /// What this does not show: that the gate leaves `Unknown` alone. The gate
+    /// tests `== Full` on a separate line inside the verification cycle, which
+    /// needs a network to reach, so this covers the classification only.
+    #[test]
+    fn a_failed_space_query_reads_as_unknown_not_full() {
+        const RESERVE: u64 = 1024;
+
+        assert_eq!(
+            verdict_from_available_space(Err(std::io::Error::other("space query failed")), RESERVE),
+            CapacityVerdict::Unknown,
+            "a failed query must not be reported as a full disk"
+        );
+
+        assert_eq!(
+            verdict_from_available_space(Ok(RESERVE - 1), RESERVE),
+            CapacityVerdict::Full
+        );
+        assert_eq!(
+            verdict_from_available_space(Ok(RESERVE), RESERVE),
+            CapacityVerdict::Writable,
+            "at the reserve is not below it"
+        );
     }
 }

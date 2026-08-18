@@ -1414,6 +1414,7 @@ fn max_min_allocations(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::replication::config::CAPACITY_BLOCKED_RETRY;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {
@@ -2642,5 +2643,53 @@ mod tests {
             !queues.contains_key(&key),
             "key should be fully processed out of pipeline"
         );
+    }
+
+    // -- capacity gate -----------------------------------------------------
+
+    /// Deferral moves the next look, not the entry's birth, so a blocked key
+    /// still ages out on the ordinary schedule.
+    ///
+    /// This is why the change carries no eviction protection for deferred keys:
+    /// protecting them would preserve, against a bounded queue, exactly the duty
+    /// a full node cannot discharge. The deferred key here is older than the age
+    /// limit and the control is not, so the assertion fails both if deferral
+    /// exempted a key from eviction and if it refreshed `created_at` — either
+    /// would let a full node hold entries indefinitely.
+    ///
+    /// What this does not show: that either gate calls `defer_pending`. The
+    /// gates need a network, so the e2e covers them.
+    #[test]
+    fn capacity_deferral_does_not_extend_entry_lifetime() {
+        // Small enough that the back-dated instant is representable on a
+        // machine that only just booted, wide enough that the control cannot
+        // age out while three in-memory queue operations run.
+        const MAX_AGE: Duration = Duration::from_secs(1);
+
+        let mut queues = ReplicationQueues::new();
+        let aged = xor_name_from_byte(1);
+        let fresh = xor_name_from_byte(2);
+
+        let mut aged_entry = test_entry(1);
+        aged_entry.created_at = Instant::now()
+            .checked_sub(MAX_AGE * 2)
+            .expect("backdate the aged entry");
+        assert!(queues.add_pending_verify(aged, aged_entry).admitted());
+        assert!(queues.add_pending_verify(fresh, test_entry(2)).admitted());
+
+        // The deferral puts the next look beyond the age limit, so an eviction
+        // that read the next look instead of the creation time would spare it.
+        assert!(queues.defer_pending(&aged, CAPACITY_BLOCKED_RETRY));
+
+        let evicted = queues.evict_stale(MAX_AGE);
+        assert!(
+            evicted.contains(&aged),
+            "a capacity-deferred key must still age out on its creation time"
+        );
+        assert!(
+            !evicted.contains(&fresh),
+            "the age limit, not the deferral, is what retires an entry"
+        );
+        assert_eq!(queues.pending_count(), 1);
     }
 }
