@@ -175,7 +175,11 @@ impl UpgradeMonitor {
 
     /// Check if version matches the configured channel.
     ///
-    /// See [`version_matches_channel`] for the rule.
+    /// - Stable: only final releases, i.e. no pre-release component at all.
+    /// - Beta: final releases, plus pre-releases whose first identifier is exactly `beta`
+    ///   (`0.17.0-beta.1`, `0.17.0-beta`).
+    ///
+    /// Every other pre-release suffix, `-rc.*` included, is rejected on both channels.
     #[must_use]
     pub fn version_matches_channel(&self, version: &Version) -> bool {
         version_matches_channel(version, self.channel)
