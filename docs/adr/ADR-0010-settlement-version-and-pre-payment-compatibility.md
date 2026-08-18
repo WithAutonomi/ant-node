@@ -190,13 +190,37 @@ Merging puts this in the next release, so the bar is fleet-ready, not code-compl
 | Code / CI | Proven across all three repos |
 | Dependency | Open: both downstream crates pin a mutable protocol branch |
 | Mixed-version | Partial: new-client against an old fleet is proven by the client suite, and both refusal directions plus the unversioned path now run over a real connection on a devnet built from this branch. A fleet running both node versions at once still needs a deployment |
-| Deployment ordering | Open, and **not inert**: against a fleet that cannot answer a versioned request every first contact costs a probe wait, so releasing the client ahead of the nodes adds real latency to cold uploads |
+| Deployment ordering | Planned, not rehearsed: the order and the watch items are stated below. Still **not inert** — against a fleet that cannot answer a versioned request every first contact costs a probe wait, so releasing the client ahead of the nodes adds real latency to cold uploads |
 | Observability | Open: the refusal lines are now observed emitting on a running node, but the unversioned-quote counter is the signal that retires the legacy path, and its log line has never fired outside production volumes, let alone been read there |
 | NAT / canary | Open: no canary; relayed and NAT'd peers are the paths this adds work to |
-| Rollback | Argued, not rehearsed |
+| Rollback | Planned, not rehearsed: revert order stated below, and it is not the reverse of the deploy order for the reason given there |
 | Fleet safety | Open: the corroboration quorum and the client-wide latch have never met a real fleet |
 
 The refusal machinery is inert on arrival, since `MIN` and `CURRENT` are both the first declarable version, so nothing can be refused yet. That lowers the risk. It does not close a gate, and the client-side cost above is live regardless.
+
+### Rollout order, and what to watch
+
+**Nodes first, then clients.** The asymmetry is one-directional and it is a cost, not a correctness problem: a node built before the versioned request cannot decode one, so it never answers, and the client pays a probe wait before falling back. Ship the client first and every cold upload pays that on first contact with each peer it has not yet cached. Ship the nodes first and there is nothing to pay, because the versioned request is answered on the first try.
+
+Neither order can lose a client money. The gate refuses before a quote exists, and the two constants are equal on arrival, so no refusal is reachable in either direction until a future settlement bump.
+
+Three steps, each with the signal that says the previous one worked:
+
+1. **Publish the protocol crate.** Nothing observable; it only unblocks the pin.
+2. **Roll the nodes.** Watch `ant_node::quote::settlement`. The expected count of refusal lines is **zero** — a `ClientUpdateRequired` or `StorerUpdateRequired` on this release means one of the two constants moved when it should not have. The unversioned-quote line is the one that should appear, and its arrival is also the first confirmation the counter works at all.
+3. **Release the client**, once the node roll has reached enough of the fleet that a client's first few peers can answer. Watch quote latency on cold uploads: a rise is the probe wait, and it says the node roll has not reached far enough, not that anything is broken.
+
+A canary should sit between steps 2 and 3, on relayed and NAT'd peers specifically, since those are the paths a probe wait lengthens most.
+
+### Revert order
+
+**Clients first, then nodes** — deliberately *not* the reverse of the rollout, because the two directions are not symmetric.
+
+Reverting the client first is free: it goes back to sending unversioned requests, which an upgraded node still serves, at no probe cost. Reverting the nodes first while clients still declare versions is the expensive direction, and it recreates exactly the condition step 1 of the rollout exists to avoid — every client pays a probe wait against every reverted node.
+
+Reverting only the nodes is safe but pointless while the client is unchanged. Reverting only the client is both safe and free, and is the right first move for any problem that is not clearly node-side.
+
+What a revert costs, at either end: the unversioned-quote counter, which is the evidence that would eventually retire the legacy path. It costs no client money and breaks no upload, because there is no state on either side of this change — no stored format, no on-chain field, no cached verdict that outlives a process. That holds only while the two constants are equal; once a settlement bump makes `MIN` load-bearing, reverting a node re-opens the underpayment it was raised to refuse, and the revert decision stops being free.
 
 ### Re-open triggers
 
