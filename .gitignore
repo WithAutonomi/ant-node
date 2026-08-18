@@ -224,6 +224,9 @@ proptest-regressions/
 .cargo/
 
 # Claude/AI assistant files
-.claude/
+# Ignore everything under .claude/ (plans, local state) except the shared
+# slash-commands, which are version-controlled so the team runs the same ones.
+.claude/*
+!.claude/commands/
 .cache/
 /devnet-manifest.json

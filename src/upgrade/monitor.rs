@@ -175,14 +175,14 @@ impl UpgradeMonitor {
 
     /// Check if version matches the configured channel.
     ///
-    /// - Stable channel: Only accepts versions without pre-release suffixes
-    /// - Beta channel: Accepts all versions (stable and pre-release)
+    /// - Stable: only final releases, i.e. no pre-release component at all.
+    /// - Beta: final releases, plus pre-releases whose first identifier is exactly `beta`
+    ///   (`0.17.0-beta.1`, `0.17.0-beta`).
+    ///
+    /// Every other pre-release suffix, `-rc.*` included, is rejected on both channels.
     #[must_use]
     pub fn version_matches_channel(&self, version: &Version) -> bool {
-        match self.channel {
-            UpgradeChannel::Stable => version.pre.is_empty(),
-            UpgradeChannel::Beta => true, // Beta accepts all
-        }
+        version_matches_channel(version, self.channel)
     }
 
     /// Check GitHub for available updates.
@@ -440,10 +440,31 @@ impl UpgradeMonitor {
     }
 }
 
+/// Check whether a version is eligible for the given upgrade channel.
+///
+/// - Stable: only final releases, i.e. no pre-release component at all.
+/// - Beta: final releases, plus pre-releases whose first identifier is exactly `beta`
+///   (`0.17.0-beta.1`, `0.17.0-beta`).
+///
+/// Every other pre-release suffix is rejected on both channels. In particular `-rc.*`
+/// is not a beta candidate: release candidates are published before the release gates
+/// have given a verdict, and semver ranks `-rc` above `-beta`, so accepting them would
+/// pull beta nodes off their soak build and onto un-gated code.
+#[must_use]
+fn version_matches_channel(version: &Version, channel: UpgradeChannel) -> bool {
+    if version.pre.is_empty() {
+        return true;
+    }
+
+    match channel {
+        UpgradeChannel::Stable => false,
+        UpgradeChannel::Beta => version.pre.as_str().split('.').next() == Some("beta"),
+    }
+}
+
 /// Select the most appropriate upgrade from a list of releases.
 ///
-/// For stable channel, pre-releases are ignored.
-/// For beta channel, pre-releases are eligible.
+/// Only versions eligible for the channel are considered; see [`version_matches_channel`].
 ///
 /// Returns the newest version that matches the channel and has platform assets.
 fn select_upgrade_from_releases(
@@ -462,7 +483,7 @@ fn select_upgrade_from_releases(
             continue;
         }
 
-        if channel == UpgradeChannel::Stable && !version.pre.is_empty() {
+        if !version_matches_channel(&version, channel) {
             continue;
         }
 
@@ -657,6 +678,19 @@ mod tests {
         assert!(monitor.version_matches_channel(&stable_version));
     }
 
+    /// Test 5b: Stable rejects release candidates too
+    #[test]
+    fn test_stable_channel_filters_rc() {
+        let monitor = UpgradeMonitor::new(
+            "WithAutonomi/ant-node".to_string(),
+            UpgradeChannel::Stable,
+            24,
+        );
+
+        assert!(!monitor.version_matches_channel(&Version::parse("1.0.0-rc.1").unwrap()));
+        assert!(monitor.version_matches_channel(&Version::parse("1.0.0").unwrap()));
+    }
+
     /// Test 6: Channel filtering - beta includes beta
     #[test]
     fn test_beta_channel_accepts_beta() {
@@ -668,6 +702,25 @@ mod tests {
 
         let beta_version = Version::parse("1.0.0-beta.1").unwrap();
         assert!(monitor.version_matches_channel(&beta_version));
+
+        let stable_version = Version::parse("1.0.0").unwrap();
+        assert!(monitor.version_matches_channel(&stable_version));
+    }
+
+    /// Test 6b: Beta rejects release candidates and any other pre-release suffix
+    #[test]
+    fn test_beta_channel_rejects_rc() {
+        let monitor = UpgradeMonitor::new(
+            "WithAutonomi/ant-node".to_string(),
+            UpgradeChannel::Beta,
+            24,
+        );
+
+        assert!(!monitor.version_matches_channel(&Version::parse("1.0.0-rc.1").unwrap()));
+        assert!(!monitor.version_matches_channel(&Version::parse("1.0.0-alpha.1").unwrap()));
+        // Only an exact `beta` identifier qualifies, not a prefix match.
+        assert!(!monitor.version_matches_channel(&Version::parse("1.0.0-betax.1").unwrap()));
+        assert!(monitor.version_matches_channel(&Version::parse("1.0.0-beta").unwrap()));
     }
 
     /// Test 7: Parse GitHub release response
@@ -1068,5 +1121,65 @@ mod tests {
             select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
         assert_eq!(upgrade.version, Version::parse("1.2.0-beta.1").unwrap());
         assert!(upgrade.download_url.contains("beta"));
+    }
+
+    /// Build a release fixture carrying the platform binary and its signature, so that
+    /// `select_upgrade_from_releases` does not skip it for missing assets.
+    fn release_with_assets(tag: &str) -> GitHubRelease {
+        let arch = std::env::consts::ARCH;
+        let os = std::env::consts::OS;
+        #[cfg(windows)]
+        let bin_name = format!("ant-node-{arch}-{os}.exe");
+        #[cfg(not(windows))]
+        let bin_name = format!("ant-node-{arch}-{os}");
+
+        GitHubRelease {
+            tag_name: tag.to_string(),
+            name: tag.to_string(),
+            body: format!("notes for {tag}"),
+            prerelease: tag.contains('-'),
+            assets: vec![
+                Asset {
+                    name: bin_name.clone(),
+                    browser_download_url: format!("https://example.com/{tag}"),
+                },
+                Asset {
+                    name: format!("{bin_name}.sig"),
+                    browser_download_url: format!("https://example.com/{tag}.sig"),
+                },
+            ],
+        }
+    }
+
+    /// Mixed release list: stable takes the final, beta takes the beta, neither takes the rc.
+    #[test]
+    fn test_select_upgrade_never_picks_rc() {
+        let current = Version::parse("0.15.0").unwrap();
+        let releases = vec![
+            release_with_assets("v0.16.0"),
+            release_with_assets("v0.17.0-beta.1"),
+            release_with_assets("v0.17.0-rc.1"),
+        ];
+
+        let stable =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable).unwrap();
+        assert_eq!(stable.version, Version::parse("0.16.0").unwrap());
+
+        let beta = select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
+        assert_eq!(beta.version, Version::parse("0.17.0-beta.1").unwrap());
+    }
+
+    /// Ship-and-promote on the same day: a node soaking `0.16.0-beta.1` sees both the promoted
+    /// `0.16.0` and the next cut `0.17.0-beta.1`, and hops straight to the new beta.
+    #[test]
+    fn test_select_upgrade_beta_ship_and_promote_same_day() {
+        let current = Version::parse("0.16.0-beta.1").unwrap();
+        let releases = vec![
+            release_with_assets("v0.16.0"),
+            release_with_assets("v0.17.0-beta.1"),
+        ];
+
+        let beta = select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
+        assert_eq!(beta.version, Version::parse("0.17.0-beta.1").unwrap());
     }
 }
