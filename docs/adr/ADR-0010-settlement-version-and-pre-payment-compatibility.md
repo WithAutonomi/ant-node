@@ -157,7 +157,29 @@ Cutting a probe short therefore does more than misjudge a slow peer. The rule is
 
 The cost of that is roughly two minutes per merkle E2E test for as long as the suite's devnet speaks the pre-versioned dialect. That is an artifact of the temporary fork-branch protocol pin rather than of the design; when the fleet under test can answer a versioned request there are no probes to pay for and the suite returns to baseline.
 
-**Still outstanding:** the reverse direction, old client against an upgraded node, and a fleet with both. Those need a testnet built from this branch's `ant-node` rather than the published one, which is not available until the coordinated set lands. Also unproven end to end: structured refusal, lost refusal, and send failure against real peers, which are pinned at unit level only.
+### The gate itself, over a real connection
+
+`settlement_version_gate_observed_on_live_network` (`tests/e2e/settlement_version_gate.rs`) closes the half of the mixed-version gate that does not need the coordinated set to land. It spawns a devnet from **this branch's** node and puts all four cases on a real QUIC connection between two nodes, on both quote paths:
+
+| Request | Result |
+|---|---|
+| Unversioned, the shape every released client sends | Served |
+| Declaring `CURRENT` | Served |
+| Declaring below `MIN` | `ClientUpdateRequired`, no quote issued |
+| Declaring above `CURRENT` | `StorerUpdateRequired`, no quote issued |
+
+That covers **old client against an upgraded node**, which this ADR previously recorded as unit-level only, and the **structured refusal against a real peer** in both directions. Both refusals are unreachable in production today, since `MIN` and `CURRENT` are both the first declarable version, so the driver crafts the versions a future settlement bump will make real.
+
+Run with `RUST_LOG=ant_node::quote::settlement=warn`, it also prints the four refusal lines as a running node emits them, which is the first observation of that log target outside a unit test:
+
+```text
+WARN ant_node::quote::settlement: Refusing single_node quote: client settlement version 0
+  is below the minimum 1. No quote issued, so the client has not been charged.
+WARN ant_node::quote::settlement: Refusing merkle quote: client settles under version 2,
+  newer than this node's 1. This node needs upgrading; the client has not been charged.
+```
+
+**Still outstanding:** a genuinely mixed fleet, with old and new nodes answering the same client, which needs a deployment rather than a devnet. Also unproven end to end: lost refusal and send failure against real peers, which are pinned at unit level only, and the unversioned-quote counter, which needs production traffic volumes to cross its log interval at all.
 
 ### Release gates
 
@@ -167,9 +189,9 @@ Merging puts this in the next release, so the bar is fleet-ready, not code-compl
 |---|---|
 | Code / CI | Proven across all three repos |
 | Dependency | Open: both downstream crates pin a mutable protocol branch |
-| Mixed-version | Partial: new-client against an old fleet is proven by the client suite; the gate itself has never run over a real connection, because the devnet speaks the pre-versioned dialect |
+| Mixed-version | Partial: new-client against an old fleet is proven by the client suite, and both refusal directions plus the unversioned path now run over a real connection on a devnet built from this branch. A fleet running both node versions at once still needs a deployment |
 | Deployment ordering | Open, and **not inert**: against a fleet that cannot answer a versioned request every first contact costs a probe wait, so releasing the client ahead of the nodes adds real latency to cold uploads |
-| Observability | Open: the unversioned-quote counter is the signal that retires the legacy path and has never been read in production |
+| Observability | Open: the refusal lines are now observed emitting on a running node, but the unversioned-quote counter is the signal that retires the legacy path, and its log line has never fired outside production volumes, let alone been read there |
 | NAT / canary | Open: no canary; relayed and NAT'd peers are the paths this adds work to |
 | Rollback | Argued, not rehearsed |
 | Fleet safety | Open: the corroboration quorum and the client-wide latch have never met a real fleet |
