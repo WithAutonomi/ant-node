@@ -59,13 +59,17 @@ pub struct Cli {
 
     /// Start a local Anvil blockchain for EVM payment verification.
     /// Starts Anvil, deploys contracts, and configures all nodes to verify
-    /// payments against the local chain.
+    /// payments against the local chain. With `--host`, Anvil binds the same
+    /// LAN IP (unless `ANVIL_IP_ADDR` overrides it) so the manifest's
+    /// `rpc_url` is reachable from other devices — external signers on the
+    /// LAN can pay, not just download.
     #[arg(long)]
     pub enable_evm: bool,
 
     /// Advertise this IPv4 to peers/clients and bind 0.0.0.0, so the devnet is
     /// reachable from other devices on the LAN. When omitted, nodes bind
-    /// loopback (127.0.0.1) as before (single-machine only).
+    /// loopback (127.0.0.1) as before (single-machine only). Also becomes
+    /// Anvil's bind/publish address under `--enable-evm` (see there).
     #[arg(long)]
     pub host: Option<std::net::Ipv4Addr>,
 
