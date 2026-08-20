@@ -1899,7 +1899,11 @@ impl ReplicationEngine {
             gossip_lottery_attempts: Arc::new(RwLock::new(HashMap::new())),
             sync_cycle_epoch: Arc::new(RwLock::new(0)),
             repair_proofs: Arc::new(RwLock::new(RepairProofs::new())),
-            bootstrap_state: Arc::new(RwLock::new(BootstrapState::new())),
+            bootstrap_state: {
+                let mut bs = BootstrapState::new();
+                bs.bootstrap_drain_deadline = config.bootstrap_drain_deadline;
+                Arc::new(RwLock::new(bs))
+            },
             is_bootstrapping: Arc::new(RwLock::new(true)),
             sync_trigger: Arc::new(Notify::new()),
             bootstrap_complete_notify: Arc::new(Notify::new()),
@@ -2154,12 +2158,18 @@ impl ReplicationEngine {
     /// `dht_events` must be subscribed **before** `P2PNode::start()` so that
     /// the `BootstrapComplete` event emitted during DHT bootstrap is not
     /// missed by the bootstrap-sync gate.
-    pub fn start(&mut self, dht_events: tokio::sync::broadcast::Receiver<DhtNetworkEvent>) {
+    pub async fn start(&mut self, dht_events: tokio::sync::broadcast::Receiver<DhtNetworkEvent>) {
         if !self.task_handles.is_empty() {
             error!("ReplicationEngine::start() called while already running — ignoring");
             return;
         }
         info!("Starting replication engine");
+
+        // Construction can happen well before P2P startup and bootstrap.
+        // Start the hard drain ceiling here, when replication bootstrap and
+        // its workers actually begin, rather than charging network startup
+        // time against the drain budget.
+        self.bootstrap_state.write().await.bootstrap_started_at = Instant::now();
 
         self.start_message_handler();
         self.start_neighbor_sync_loop();
@@ -3804,6 +3814,10 @@ impl ReplicationEngine {
             // Process neighbors in batches of NEIGHBOR_SYNC_PEER_COUNT.
             for batch in neighbors.chunks(config.neighbor_sync_peer_count) {
                 if shutdown.is_cancelled() {
+                    break;
+                }
+                if bootstrap_state.read().await.drained {
+                    info!("Bootstrap sync: drain already completed, stopping remaining batches");
                     break;
                 }
 
@@ -7712,9 +7726,15 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
     // Bootstrap admits one concurrent neighbor batch as an atomic source
     // aggregation unit. Do not select newly queued keys until that batch's
-    // hints and drain accounting have both been published.
-    if bootstrap_state.read().await.pending_peer_requests > 0 {
-        return;
+    // hints and drain accounting have both been published. The barrier only
+    // applies while bootstrap is still active: once force-drained the
+    // deadline has abandoned outstanding request debt, so a counter
+    // resurrected by a late/in-flight batch must not wedge verification.
+    {
+        let state = bootstrap_state.read().await;
+        if !state.drained && state.pending_peer_requests > 0 {
+            return;
+        }
     }
 
     // Evict stale entries that have been pending too long (e.g. unreachable
@@ -7740,9 +7760,14 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         // This closes the race
         // where a bootstrap batch starts after the early check: the batch
         // cannot publish its hints under the queue write lock until this
-        // selection either returns or declines to run.
-        if bootstrap_state.read().await.pending_peer_requests > 0 {
-            return;
+        // selection either returns or declines to run. As above, the barrier
+        // is lifted once bootstrap is force-drained so a resurrected request
+        // counter cannot wedge verification after the deadline.
+        {
+            let state = bootstrap_state.read().await;
+            if !state.drained && state.pending_peer_requests > 0 {
+                return;
+            }
         }
         q.select_ready_pending_keys(Instant::now(), MAX_VERIFICATION_KEYS_PER_CYCLE)
     };

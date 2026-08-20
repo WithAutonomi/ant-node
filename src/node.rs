@@ -539,7 +539,7 @@ impl RunningNode {
             // Safety: dht_events_for_bootstrap is Some when replication_engine
             // is Some (both arms use the same condition).
             if let Some(dht_events) = dht_events_for_bootstrap {
-                engine.start(dht_events);
+                engine.start(dht_events).await;
             }
             info!("Replication engine started");
         }

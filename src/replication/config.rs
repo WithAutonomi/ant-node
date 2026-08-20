@@ -626,6 +626,18 @@ const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
 /// Maximum age for pending-verification entries before stale eviction.
 pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
 
+/// Hard ceiling on total bootstrap stall. If bootstrap has not drained within
+/// this duration of the moment bootstrap drain tracking began, drain is forced
+/// with a `warn!` log regardless of any outstanding state. Defence-in-depth
+/// backstop behind the per-source capacity-rejection expiry
+/// (`capacity_rejected_max_age`): it covers multiple coordinated over-cap
+/// sources and any future wedge in the `pending_keys` / `pending_peer_requests`
+/// paths. Aligned with `PENDING_VERIFY_MAX_AGE` so by the deadline stale
+/// `pending_verify` entries have already been evicted.
+const BOOTSTRAP_DRAIN_DEADLINE_SECS: u64 = 30 * 60;
+/// Hard ceiling on total bootstrap stall (30 minutes).
+pub const BOOTSTRAP_DRAIN_DEADLINE: Duration = Duration::from_secs(BOOTSTRAP_DRAIN_DEADLINE_SECS);
+
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
@@ -833,6 +845,11 @@ pub struct ReplicationConfig {
     /// Seconds to wait for `DhtNetworkEvent::BootstrapComplete` before
     /// proceeding with bootstrap sync (covers bootstrap nodes with no peers).
     pub bootstrap_complete_timeout_secs: u64,
+    /// Hard ceiling on total bootstrap stall. If bootstrap has not drained
+    /// within this duration of the moment drain tracking began, drain is
+    /// forced with a `warn!` log regardless of outstanding state.
+    /// Defaults to [`BOOTSTRAP_DRAIN_DEADLINE`].
+    pub bootstrap_drain_deadline: Duration,
     /// Lower bound of the delay before a fresh-replication possession check
     /// runs (ADR-0003). Defaults to [`POSSESSION_CHECK_DELAY_MIN`]; tests
     /// shorten it so the scheduled check fires quickly.
@@ -883,6 +900,7 @@ impl Default for ReplicationConfig {
             verification_request_timeout: VERIFICATION_REQUEST_TIMEOUT,
             fetch_request_timeout: FETCH_REQUEST_TIMEOUT,
             bootstrap_complete_timeout_secs: BOOTSTRAP_COMPLETE_TIMEOUT_SECS,
+            bootstrap_drain_deadline: BOOTSTRAP_DRAIN_DEADLINE,
             possession_check_delay_min: POSSESSION_CHECK_DELAY_MIN,
             possession_check_delay_max: POSSESSION_CHECK_DELAY_MAX,
             subtree_round1_responder_cooldown: SUBTREE_ROUND1_RESPONDER_COOLDOWN,

@@ -1349,7 +1349,7 @@ impl TestNetwork {
             {
                 Ok(mut engine) => {
                     let dht_events = p2p.dht_manager().subscribe_events();
-                    engine.start(dht_events);
+                    engine.start(dht_events).await;
                     node.replication_engine = Some(engine);
                     node.replication_shutdown = Some(shutdown);
                     debug!("Node {} replication engine started", node.index);

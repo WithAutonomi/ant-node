@@ -130,7 +130,7 @@ async fn shutdown_waits_for_detached_lmdb_op_and_envs_reopen() {
     )
     .await
     .expect("create engine");
-    engine.start(p2p.dht_manager().subscribe_events());
+    engine.start(p2p.dht_manager().subscribe_events()).await;
 
     // Park a put's blocking closure on the test gate, then drop its awaiter
     // mid-flight — the exact shape of a select! losing to the shutdown token
