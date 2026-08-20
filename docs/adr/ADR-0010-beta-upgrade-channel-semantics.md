@@ -90,10 +90,28 @@ design:
 This is a rule about the *pair* (candidate, running version) rather than about the candidate alone,
 so it lives beside the channel predicate rather than inside it.
 
-Note the accepted limitation: if the train can change code between the last `beta.N` and the final
-without cutting `beta.N+1`, a beta node skipping the promotion misses that change until the next
-version. Guarding against that is a process obligation on the train — anything that changes after a
-beta must get a new beta tag — not something the node can detect.
+The skip is safe because of how the train is shaped, not because the node can verify it. Promotion
+does change the build: dependency references flip from git branch pins to published crates.io
+versions (`ant-protocol = { git = ..., branch = "rc-2026.8.3" }` becomes `ant-protocol = "2.3.2"`),
+so a final is not byte-identical to the beta it came from. What makes it the *same code* is that any
+change landing on the RC branch produces a **new** beta release, and the final is promoted from the
+most recent beta. There is therefore no window in which the final carries code that no beta carries.
+
+Two consequences follow, and both matter:
+
+- A node holding `X.Y.Z-beta.N` when `X.Y.Z-beta.N+1` and the final `X.Y.Z` are all published does
+  not strand. The later beta is eligible and outranks the one it is running, while the final is
+  skipped, so it converges on `beta.N+1` — the code that became the final. This depends on old beta
+  releases remaining published after promotion, which is the current policy.
+- The comparison must be against the build the node is **committed to**, not the one it is running.
+  During a staged rollout those differ: a node that has selected `0.19.0-beta.1` but not yet applied
+  it is still running `0.18.0-beta.1`, whose core differs from `0.19.0`. Comparing against the
+  running version would let the final through and retarget the node onto it, so whether a node kept
+  its beta identity would depend on where its rollout jitter happened to fall. Selection therefore
+  takes the pending staged-rollout target when there is one.
+
+The "is it newer" guard deliberately stays on the running version, so that a withdrawn pending
+release cannot leave a node refusing everything still published.
 
 ## Consequences
 
@@ -114,8 +132,10 @@ beta must get a new beta tag — not something the node can detect.
   capability reduction and is the main thing a reviewer should weigh.
 - Any future pre-release suffix is rejected by default. That is the safe direction, but it means a
   new suffix requires a deliberate code change rather than working implicitly.
-- A beta node skipping its own promotion depends on the train tagging a new beta whenever code
-  changes after `beta.N`. If that discipline slips, the node holds an older build than it should.
+- The skip depends on two properties of the release process that the node cannot verify: that any
+  change after `beta.N` produces a `beta.N+1` which is what gets promoted, and that old beta
+  releases stay published so a node on a stale beta can converge through them. Neither is
+  mechanically enforced today; if either slips, a beta node holds an older build than it should.
 
 ### Neutral / Operational
 
@@ -133,7 +153,8 @@ beta must get a new beta tag — not something the node can detect.
   `0.17.0-beta.1` on beta; and the ship-and-promote-same-day case hopping from `0.16.0-beta.1`
   straight to `0.17.0-beta.1`. For the amendment: a beta node ignoring its own promotion, still
   taking a newer final, still taking a later beta of the same version, preferring the next beta over
-  its own promotion, and a stable-channel node still taking the promotion of a beta it is running.
+  its own promotion, a stable-channel node still taking the promotion of a beta it is running, and a
+  node holding its pending beta when that beta's final is published mid-rollout.
 - End-to-end validation is tracked separately as V2-1012: a dev testnet where the cohort pulls a fake
   `-beta.N` release and demonstrably ignores a real rc published in the same window.
 - Review trigger: revisit this ADR if a new pre-release suffix is introduced, if internal rc soaking
