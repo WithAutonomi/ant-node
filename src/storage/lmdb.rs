@@ -72,19 +72,33 @@ const WINDOWS_MAP_HEADROOM: u64 = 32 * GIB;
 /// relative to chunk-write throughput, so a multi-second window is safe.
 const DISK_CHECK_INTERVAL_SECS: u64 = 5;
 
-/// Slack granted to a *delete* that cannot copy-on-write inside the pinned map.
+/// Ceiling raise offered to a single *delete* that cannot copy-on-write inside
+/// the pinned map.
 ///
 /// A delete is itself a write: LMDB copies the B-tree path before it frees the
-/// leaf pages. On a store with no free page at all, a map pinned exactly to the
-/// file size leaves a delete nowhere to go, so the node could not prune its way
-/// back to health.
+/// leaf pages, and it may need a page for the free-list's own bookkeeping. On a
+/// map pinned exactly to the file size a delete therefore has nowhere to go,
+/// and the node could not prune its way back to health.
 ///
-/// The slack is granted **only** on the delete retry path and taken away again
-/// immediately, so an ordinary store can never allocate from it. Leaving it
-/// permanently in the ceiling would hand every node a little more of the very
-/// reserve this mode exists to protect, which on a shared volume multiplies by
-/// the number of nodes.
+/// Granted **only** on the delete retry path and taken away again inside the
+/// same locked scope, so an ordinary store can never allocate from it. Leaving
+/// it permanently in the ceiling would hand every node a little more of the
+/// very reserve this mode exists to protect, multiplied by the nodes sharing
+/// the volume.
 const DELETE_COW_SLACK: u64 = 256 * 1024;
+
+/// Total permanent file growth deletes may cause per low-disk episode.
+///
+/// What actually needs bounding is *growth*, not grants. Most slack-assisted
+/// deletes reuse pages already inside `data.mdb` and grow it by nothing, and
+/// those must stay free: a node has to be able to prune indefinitely, and page
+/// reuse is not reliably available to the very next delete because LMDB cannot
+/// hand back pages a still-recent transaction freed. Charging per grant instead
+/// of per byte stops a node pruning after its first assisted delete.
+///
+/// Only bytes the file actually gained are charged here. Reset when the store
+/// leaves no-growth mode. A rounding error against [`DEFAULT_DISK_RESERVE`].
+const DELETE_COW_GROWTH_BUDGET: u64 = 1024 * 1024;
 
 /// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
@@ -187,13 +201,14 @@ pub struct LmdbStorage {
     /// can interleave so the flag ends up describing a map size that was never
     /// applied, leaving the store unpinned while it believes it is pinned.
     growth_mode_lock: tokio::sync::Mutex<()>,
-    /// Maintenance allowance already spent in this low-disk episode.
+    /// Bytes `data.mdb` has permanently gained to slack-assisted deletes in
+    /// this low-disk episode.
     ///
-    /// A delete's copy-on-write can extend `data.mdb`, and LMDB never gives
-    /// file space back, so that growth is permanent. Budgeting the grant stops
-    /// repeated fill-then-delete cycles walking the file into the reserve.
-    /// Reset when the store leaves no-growth mode.
-    delete_slack_granted: Arc<AtomicU64>,
+    /// A delete's copy-on-write can extend the file, and LMDB never gives file
+    /// space back, so that growth is permanent. Bounding it stops repeated
+    /// fill-then-delete cycles walking the file into the reserve. Deletes that
+    /// find room inside the file cost nothing. Reset on leaving no-growth mode.
+    delete_growth_charged: Arc<AtomicU64>,
     /// Tracks every LMDB blocking task spawned by this storage.
     ///
     /// A `spawn_blocking` closure owns a cloned [`Env`] and keeps running
@@ -301,7 +316,7 @@ impl LmdbStorage {
             last_disk_ok: parking_lot::Mutex::new(None),
             no_growth: Arc::new(AtomicBool::new(false)),
             growth_mode_lock: tokio::sync::Mutex::new(()),
-            delete_slack_granted: Arc::new(AtomicU64::new(0)),
+            delete_growth_charged: Arc::new(AtomicU64::new(0)),
             blocking_tracker: TaskTracker::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
@@ -891,7 +906,7 @@ impl LmdbStorage {
             // Real disk again: the maintenance allowance is refreshed. Done on
             // every healthy pass, not just the transition, so an allowance
             // spent while the flag happened to be clear is still returned.
-            self.delete_slack_granted.store(0, Ordering::Release);
+            self.delete_growth_charged.store(0, Ordering::Release);
             return Ok(false);
         }
 
@@ -1006,12 +1021,18 @@ impl LmdbStorage {
     /// granted for, and an error or cancellation between the steps would leave
     /// the ceiling raised for good.
     ///
-    /// The grant is budgeted. If the delete's copy-on-write does extend
-    /// `data.mdb`, that growth is permanent — LMDB never returns file space —
-    /// so an unbudgeted grant would let repeated fill-then-delete cycles walk
-    /// the file into the reserve a slice at a time. In practice one grant is
-    /// enough: once a delete commits there are free pages again, and later
-    /// deletes reuse them. The budget resets when the store leaves no-growth
+    /// What is budgeted is the *growth*, not the grant. If the copy-on-write
+    /// does extend `data.mdb` that growth is permanent, since LMDB never
+    /// returns file space, so repeated fill-then-delete cycles could otherwise
+    /// walk the file into the reserve a slice at a time. A delete that finds
+    /// room inside the file is charged nothing.
+    ///
+    /// Charging per grant instead would be wrong, and was: page reuse is not
+    /// reliably available to the very next delete, because LMDB will not hand
+    /// back pages a still-recent transaction freed. A one-grant budget
+    /// therefore stopped a node pruning after its first assisted delete, which
+    /// showed up as every delete failing on 4 KiB-page hosts while passing on
+    /// 16 KiB-page ones. The budget resets when the store leaves no-growth
     /// mode, i.e. when there is real disk to work with again.
     #[allow(unsafe_code)]
     async fn delete_with_slack(&self, key: &XorName) -> Result<bool> {
@@ -1019,31 +1040,22 @@ impl LmdbStorage {
         let env = self.env.clone();
         let db = self.db;
         let lock = Arc::clone(&self.env_lock);
-        let budget = Arc::clone(&self.delete_slack_granted);
+        let budget = Arc::clone(&self.delete_growth_charged);
 
         let outcome = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<DeleteOutcome> {
-                // Claim, spend and settle the allowance entirely inside the
-                // closure. A `spawn_blocking` body keeps running when its
-                // awaiter is dropped, so accounting split across the await could
-                // claim the budget and then never release it, permanently
-                // costing the node its ability to prune.
-                if budget
-                    .compare_exchange(0, DELETE_COW_SLACK, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
+                // Checked and charged entirely inside the closure. A
+                // `spawn_blocking` body keeps running when its awaiter is
+                // dropped, so accounting split across the await could be
+                // skipped, permanently costing the node its ability to prune.
+                if budget.load(Ordering::Acquire) >= DELETE_COW_GROWTH_BUDGET {
                     return Err(Error::Storage(format!(
-                        "Cannot delete: the local store is full and its {DELETE_COW_SLACK} B \
-                         maintenance allowance is already spent. Free disk space to continue."
+                        "Cannot delete: the local store is full and deletes have already used \
+                         their {DELETE_COW_GROWTH_BUDGET} B growth allowance. \
+                         Free disk space to continue."
                     )));
                 }
-
-                // From here every exit settles the charge, including a panic.
-                let mut allowance = DeleteAllowance {
-                    budget: &budget,
-                    keep: false,
-                };
 
                 // Exclusive for the whole sequence: no transaction may be
                 // active across either resize, and no put may observe the
@@ -1052,6 +1064,9 @@ impl LmdbStorage {
 
                 let page = page_size::get() as u64;
                 let previous_map = env.info().map_size;
+                let file_before = env
+                    .real_disk_size()
+                    .map_err(|e| Error::Storage(format!("Failed to query LMDB file size: {e}")))?;
                 let raised = (previous_map as u64)
                     .saturating_add(DELETE_COW_SLACK)
                     .div_ceil(page)
@@ -1074,13 +1089,16 @@ impl LmdbStorage {
 
                 let outcome = delete_in_txn(&env, db, &key);
 
-                // Keep the charge the moment the delete commits: that is the
-                // one outcome whose copy-on-write can have extended
-                // `data.mdb`, and that growth is permanent. Deciding here
-                // rather than on the combined result means a failure to restore
-                // the ceiling cannot refund an allowance that was really spent.
-                if matches!(outcome, Ok(DeleteOutcome::Done(_))) {
-                    allowance.keep = true;
+                // Charge what the file actually gained, not the fact that slack
+                // was offered. A delete that found room inside `data.mdb` costs
+                // nothing and must not consume the allowance, otherwise a node
+                // stops being able to prune after its first assisted delete.
+                // Measured before the ceiling is restored, and before any error
+                // is propagated, so a committed delete is always accounted for.
+                let file_after = env.real_disk_size().unwrap_or(file_before);
+                let grew = file_after.saturating_sub(file_before);
+                if grew > 0 {
+                    budget.fetch_add(grew, Ordering::AcqRel);
                 }
 
                 // Undo the raise before releasing the lock, on every path and
@@ -1262,25 +1280,6 @@ impl Drop for MapCeilingRestorer<'_> {
             if let Err(e) = self.env.resize(self.previous) {
                 warn!("Failed to restore the LMDB map ceiling while unwinding: {e}");
             }
-        }
-    }
-}
-
-/// Settles the delete maintenance allowance when dropped, including on unwind.
-///
-/// The allowance is claimed before the ceiling is raised, so every exit from
-/// that scope has to either keep the charge or return it. A `Drop` impl is the
-/// only form that also covers a panic: a stranded charge would permanently stop
-/// the node pruning for the rest of the low-disk episode.
-struct DeleteAllowance<'a> {
-    budget: &'a AtomicU64,
-    keep: bool,
-}
-
-impl Drop for DeleteAllowance<'_> {
-    fn drop(&mut self) {
-        if !self.keep {
-            self.budget.store(0, Ordering::Release);
         }
     }
 }
@@ -2015,6 +2014,16 @@ mod tests {
             );
         }
         assert_eq!(storage.current_chunks().expect("current_chunks"), 0);
+
+        // The allowance bounds permanent file growth, not the number of
+        // assisted deletes. Pruning a pinned store must stay possible however
+        // many deletes it takes, so whatever was charged has to be growth the
+        // file really took, and has to stay inside the budget.
+        let charged = storage.delete_growth_charged.load(Ordering::Acquire);
+        assert!(
+            charged < DELETE_COW_GROWTH_BUDGET,
+            "deletes exhausted the growth allowance ({charged} B) while pruning a pinned store"
+        );
 
         // Whether or not any delete needed the maintenance allowance, none of
         // it may be left in the ceiling afterwards: a raised ceiling is
