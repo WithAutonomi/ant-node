@@ -70,6 +70,31 @@ the public `UpgradeMonitor::version_matches_channel`.
 Option 3 is deliberately deferred rather than rejected: nothing here prevents adding an `rc` channel
 later, and the exact-identifier rule means doing so is an additive change.
 
+### Amendment: a beta node skips its own promotion
+
+Channel eligibility alone produced an unwanted hop. Semver ranks a final above its own
+pre-release, so a node running `0.18.0-beta.1` treated the promoted `0.18.0` as an upgrade — a
+binary swap and a network restart for what is the same code re-tagged. Because the train promotes
+on every cycle, this would have happened on every train, to every beta node.
+
+Eligibility is therefore refined: **on the beta channel, a final release is not a candidate when the
+running version is a `beta.*` pre-release of the same `major.minor.patch`.** The skip is narrow by
+design:
+
+- A genuinely newer final is still taken (`0.19.0` while running `0.18.0-beta.1`), so a beta node
+  does not stagnate if the beta line stalls.
+- A later beta of the same version is still taken (`0.18.0-beta.2`).
+- It applies to the beta channel only. A node running a beta build while configured for `stable`
+  still takes the final, since that is its route back onto the stable line.
+
+This is a rule about the *pair* (candidate, running version) rather than about the candidate alone,
+so it lives beside the channel predicate rather than inside it.
+
+Note the accepted limitation: if the train can change code between the last `beta.N` and the final
+without cutting `beta.N+1`, a beta node skipping the promotion misses that change until the next
+version. Guarding against that is a process obligation on the train — anything that changes after a
+beta must get a new beta tag — not something the node can detect.
+
 ## Consequences
 
 ### Positive
@@ -79,6 +104,8 @@ later, and the exact-identifier rule means doing so is an additive change.
 - A beta node holds its soak build until a higher `-beta.N` or a final release appears.
 - The rule exists in one place, so the selection path and the predicate cannot diverge.
 - The `stable` channel is unchanged, so the production fleet is unaffected.
+- Beta nodes restart once per train rather than twice, and keep their identity as beta builds
+  instead of being silently converted to stable ones on every promotion.
 
 ### Negative / Trade-offs
 
@@ -87,6 +114,8 @@ later, and the exact-identifier rule means doing so is an additive change.
   capability reduction and is the main thing a reviewer should weigh.
 - Any future pre-release suffix is rejected by default. That is the safe direction, but it means a
   new suffix requires a deliberate code change rather than working implicitly.
+- A beta node skipping its own promotion depends on the train tagging a new beta whenever code
+  changes after `beta.N`. If that discipline slips, the node holds an older build than it should.
 
 ### Neutral / Operational
 
@@ -102,7 +131,9 @@ later, and the exact-identifier rule means doing so is an additive change.
   accepting `-beta.N` and finals while rejecting `-rc.N`, `-alpha.N` and `-betax.N`; selection over a
   mixed list (`0.16.0`, `0.17.0-beta.1`, `0.17.0-rc.1`) resolving to `0.16.0` on stable and
   `0.17.0-beta.1` on beta; and the ship-and-promote-same-day case hopping from `0.16.0-beta.1`
-  straight to `0.17.0-beta.1`.
+  straight to `0.17.0-beta.1`. For the amendment: a beta node ignoring its own promotion, still
+  taking a newer final, still taking a later beta of the same version, preferring the next beta over
+  its own promotion, and a stable-channel node still taking the promotion of a beta it is running.
 - End-to-end validation is tracked separately as V2-1012: a dev testnet where the cohort pulls a fake
   `-beta.N` release and demonstrably ignores a real rc published in the same window.
 - Review trigger: revisit this ADR if a new pre-release suffix is introduced, if internal rc soaking
