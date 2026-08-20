@@ -7,12 +7,13 @@
 //! {root}/chunks.mdb/   -- LMDB environment directory
 //! ```
 
-use crate::ant_protocol::XorName;
+use crate::ant_protocol::{XorName, MAX_CHUNK_SIZE};
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, trace, warn};
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, MdbError};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
@@ -70,6 +71,20 @@ const WINDOWS_MAP_HEADROOM: u64 = 32 * GIB;
 /// Between checks the cached result is trusted.  Disk space changes slowly
 /// relative to chunk-write throughput, so a multi-second window is safe.
 const DISK_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// Slack granted to a *delete* that cannot copy-on-write inside the pinned map.
+///
+/// A delete is itself a write: LMDB copies the B-tree path before it frees the
+/// leaf pages. On a store with no free page at all, a map pinned exactly to the
+/// file size leaves a delete nowhere to go, so the node could not prune its way
+/// back to health.
+///
+/// The slack is granted **only** on the delete retry path and taken away again
+/// immediately, so an ordinary store can never allocate from it. Leaving it
+/// permanently in the ceiling would hand every node a little more of the very
+/// reserve this mode exists to protect, which on a shared volume multiplies by
+/// the number of nodes.
+const DELETE_COW_SLACK: u64 = 256 * 1024;
 
 /// Configuration for LMDB storage.
 #[derive(Debug, Clone)]
@@ -158,6 +173,27 @@ pub struct LmdbStorage {
     /// `None` means "never checked — check on next write".  Updated only
     /// after a passing check, so a low-space result is always rechecked.
     last_disk_ok: parking_lot::Mutex<Option<Instant>>,
+    /// Whether the map is currently pinned to the file's high-water mark.
+    ///
+    /// Set once available disk drops below the reserve. While pinned, LMDB can
+    /// still serve a write from its own free list but cannot extend
+    /// `data.mdb`, so the reserve is preserved by the allocator itself rather
+    /// than by refusing every write up front.
+    no_growth: Arc<AtomicBool>,
+    /// Serialises entering and leaving no-growth mode.
+    ///
+    /// Setting `no_growth` and resizing the map is one compound transition
+    /// spanning an await. Without this, two callers straddling the threshold
+    /// can interleave so the flag ends up describing a map size that was never
+    /// applied, leaving the store unpinned while it believes it is pinned.
+    growth_mode_lock: tokio::sync::Mutex<()>,
+    /// Maintenance allowance already spent in this low-disk episode.
+    ///
+    /// A delete's copy-on-write can extend `data.mdb`, and LMDB never gives
+    /// file space back, so that growth is permanent. Budgeting the grant stops
+    /// repeated fill-then-delete cycles walking the file into the reserve.
+    /// Reset when the store leaves no-growth mode.
+    delete_slack_granted: Arc<AtomicU64>,
     /// Tracks every LMDB blocking task spawned by this storage.
     ///
     /// A `spawn_blocking` closure owns a cloned [`Env`] and keeps running
@@ -263,6 +299,9 @@ impl LmdbStorage {
             stats: parking_lot::RwLock::new(StorageStats::default()),
             env_lock: Arc::new(parking_lot::RwLock::new(())),
             last_disk_ok: parking_lot::Mutex::new(None),
+            no_growth: Arc::new(AtomicBool::new(false)),
+            growth_mode_lock: tokio::sync::Mutex::new(()),
+            delete_slack_granted: Arc::new(AtomicU64::new(0)),
             blocking_tracker: TaskTracker::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
@@ -314,10 +353,15 @@ impl LmdbStorage {
             return Ok(false);
         }
 
-        // ── Disk-space guard (cached — at most one syscall per interval) ─
+        // ── Capacity guard (cached — at most one syscall per interval) ──
         // Placed after the duplicate check so that re-storing an existing
         // chunk remains a harmless no-op even when disk space is low.
-        self.check_disk_space_cached()?;
+        //
+        // Below the reserve this pins the map instead of refusing outright, so
+        // the write is still attempted and LMDB decides whether a freed page
+        // can take it. A node that has pruned heavily keeps serving the network
+        // from the space it already occupies.
+        let no_growth = self.sync_growth_mode().await?;
 
         // ── Write (with resize-on-demand) ───────────────────────────────
         match self.try_put(address, content).await? {
@@ -327,10 +371,33 @@ impl LmdbStorage {
                 self.stats.write().duplicates += 1;
                 return Ok(false);
             }
+            PutOutcome::MapFull if no_growth => {
+                // Both halves are now true: the volume is below the reserve and
+                // no free page can take *this* value. Resizing would extend the
+                // file into the reserve, so refuse.
+                //
+                // The refusal is not remembered. `MapFull` is specific to the
+                // size just attempted — a smaller value may still fit a smaller
+                // run — so caching it would let one maximum-sized chunk lock out
+                // every subsequent write. `check_capacity` estimates instead.
+                return Err(Error::Storage(format!(
+                    "Insufficient disk space: {:.2} GiB reserve required and no reusable page \
+                     in the local store fits this {} B value. \
+                     Free disk space or increase the partition to continue storing chunks.",
+                    bytes_to_gib(self.config.disk_reserve),
+                    content.len(),
+                )));
+            }
             PutOutcome::MapFull => {
                 // The map ceiling was reached but there may be more disk space
                 // available (e.g. operator expanded the partition).
-                self.try_resize().await?;
+                //
+                // Guarded: `no_growth` was sampled before the write, so the
+                // store may have entered no-growth mode since. Growing the map
+                // outside the transition lock could undo a pin that a
+                // concurrent `sync_growth_mode` had just applied, handing the
+                // reserve back to ordinary writes.
+                self.try_resize_for_growth().await?;
                 // Retry once after resize.
                 match self.try_put(address, content).await? {
                     PutOutcome::New => {}
@@ -506,32 +573,51 @@ impl LmdbStorage {
     /// Returns an error if deletion fails.
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
         let key = *address;
-        let env = self.env.clone();
-        let db = self.db;
-        let lock = Arc::clone(&self.env_lock);
 
-        let deleted = self
-            .blocking_tracker
-            .spawn_blocking(move || -> Result<bool> {
-                let _guard = lock.read();
-                let mut wtxn = env
-                    .write_txn()
-                    .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-                let existed = db
-                    .delete(&mut wtxn, &key)
-                    .map_err(|e| Error::Storage(format!("Failed to delete chunk: {e}")))?;
-                wtxn.commit()
-                    .map_err(|e| Error::Storage(format!("Failed to commit delete: {e}")))?;
-                Ok(existed)
-            })
-            .await
-            .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))??;
+        // Establish growth mode first, exactly as `put` does. Otherwise a
+        // delete arriving while the volume is low but before any write has
+        // pinned the map would copy-on-write into whatever head-room the
+        // ceiling still had, growing `data.mdb` into the reserve without
+        // passing through the budgeted allowance below.
+        self.sync_growth_mode().await?;
+
+        let deleted = match self.try_delete(&key).await? {
+            DeleteOutcome::Done(existed) => existed,
+            DeleteOutcome::MapFull => {
+                // A delete is a write: LMDB copies the B-tree path before it
+                // frees the leaf pages, so a store with no free page at all
+                // cannot delete inside a map pinned to the file size. Without a
+                // way through, a node that filled up before it ever pruned
+                // could never prune its way out.
+                //
+                // Serialised against `sync_growth_mode` so the two cannot
+                // interleave their resizes.
+                let _transition = self.growth_mode_lock.lock().await;
+                self.delete_with_slack(&key).await?
+            }
+        };
 
         if deleted {
             debug!("Deleted chunk {}", hex::encode(address));
         }
 
         Ok(deleted)
+    }
+
+    /// Attempt one delete, reporting `MapFull` rather than raising it.
+    async fn try_delete(&self, key: &XorName) -> Result<DeleteOutcome> {
+        let key = *key;
+        let env = self.env.clone();
+        let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
+
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<DeleteOutcome> {
+                let _guard = lock.read();
+                delete_in_txn(&env, db, &key)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB delete task failed: {e}")))?
     }
 
     /// Get storage statistics.
@@ -672,39 +758,365 @@ impl LmdbStorage {
 
     /// Cheap capacity pre-check for callers that want to reject work *before*
     /// doing expensive setup (e.g. the PUT handler skipping payment
-    /// verification on a disk-full node — see `V2-411`).
+    /// verification on a full node — see `V2-411`).
     ///
-    /// Delegates to the private `check_disk_space_cached`, so it shares the same
-    /// TTL cache and only ever performs an `fs2::available_space` syscall on a
-    /// cache miss. Returns the same `Insufficient disk space …` error the
-    /// store path raises, keeping caller behaviour identical.
+    /// A node is full only when **both** halves are true: the volume is below
+    /// the reserve *and* the store has no reusable page left. Deleting a record
+    /// returns its pages to LMDB's free list and never to the filesystem, so a
+    /// node that has pruned heavily sits on reusable capacity while `statvfs`
+    /// still reports the volume as full. Refusing on the disk half alone stops
+    /// such a node from writing into space it already owns.
+    ///
+    /// This is a **hint**, deliberately biased towards admitting: it estimates
+    /// reusable bytes and only refuses when there is not even one chunk's worth.
+    /// The authority on whether a given write fits stays with LMDB's allocator
+    /// in [`Self::put`], because no page count can account for the
+    /// copy-on-write of the B-tree path, the contiguous run a multi-megabyte
+    /// value needs, or pages still pinned by an open read transaction. An
+    /// over-optimistic hint costs one refused write; an over-pessimistic one
+    /// would recreate the bug this exists to fix.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] when available space is below the configured
-    /// reserve, or when the disk-space query itself fails.
+    /// Returns [`Error::Storage`] when the volume is below the reserve and the
+    /// store holds less than one chunk of reusable space, or when the
+    /// disk-space query itself fails.
     pub(crate) fn check_capacity(&self) -> Result<()> {
-        self.check_disk_space_cached()
+        let Some(available) = self.available_space_cached()? else {
+            return Ok(());
+        };
+
+        let reusable = self.reusable_bytes()?;
+        if reusable >= MAX_CHUNK_SIZE as u64 {
+            return Ok(());
+        }
+
+        Err(Error::Storage(format!(
+            "Insufficient disk space: {:.2} GiB available, {:.2} GiB reserve required, \
+             and only {reusable} B reusable inside the local store. \
+             Free disk space or increase the partition to continue storing chunks.",
+            bytes_to_gib(available),
+            bytes_to_gib(self.config.disk_reserve),
+        )))
     }
 
-    /// Check available disk space, skipping the syscall if a recent check passed.
+    /// Estimated bytes inside `data.mdb` that LMDB could write without growing
+    /// the file: the file size minus the pages currently holding data.
     ///
-    /// Only caches *passing* results — a low-space condition is always
-    /// rechecked so we detect freed space promptly.
-    fn check_disk_space_cached(&self) -> Result<()> {
+    /// Deliberately an over-estimate. `stat()` counts only the branch, leaf and
+    /// overflow pages of the unnamed database, so the free-list's own pages and
+    /// the environment metadata fall on the "reusable" side. Erring high keeps
+    /// [`Self::check_capacity`] biased towards admitting the attempt.
+    ///
+    /// Uses `stat()` rather than heed's `non_free_pages_size()`, which walks the
+    /// unnamed database calling `String::from_utf8(key).unwrap()` on every key
+    /// without a zero byte. Our keys are 32 random bytes, so that call panics
+    /// almost immediately. A single unnamed database makes `stat()` equivalent.
+    fn reusable_bytes(&self) -> Result<u64> {
+        // Order matters. The two samples are not atomic, so read the live pages
+        // first and the file length second: a write committing in between then
+        // pairs an older (smaller) live count with a newer (larger) file, which
+        // over-estimates. Sampling the other way round pairs a stale file
+        // length with a fresh live count and can under-estimate, which would
+        // refuse a node that has room — the very bug this fixes.
+        let stat = self.env.stat();
+        let live_pages = (stat.branch_pages as u64)
+            .saturating_add(stat.leaf_pages as u64)
+            .saturating_add(stat.overflow_pages as u64);
+        let live_bytes = live_pages.saturating_mul(u64::from(stat.page_size));
+
+        let file_bytes = self
+            .env
+            .real_disk_size()
+            .map_err(|e| Error::Storage(format!("Failed to query LMDB file size: {e}")))?;
+
+        Ok(file_bytes.saturating_sub(live_bytes))
+    }
+
+    /// Available bytes on the storage volume, or `None` when a recent check
+    /// already showed it above the reserve.
+    ///
+    /// Only *passing* results are cached, so a low-space condition is always
+    /// re-measured and freed space is detected promptly.
+    fn available_space_cached(&self) -> Result<Option<u64>> {
         {
             let last = self.last_disk_ok.lock();
             if let Some(t) = *last {
                 if t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS {
-                    return Ok(());
+                    return Ok(None);
                 }
             }
         }
-        // Cache miss or stale — perform the actual statvfs check.
-        check_disk_space(&self.env_dir, self.config.disk_reserve)?;
-        // Passed — update the cache timestamp.
-        *self.last_disk_ok.lock() = Some(Instant::now());
-        Ok(())
+
+        let available = fs2::available_space(&self.env_dir)
+            .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
+
+        if available >= self.config.disk_reserve {
+            *self.last_disk_ok.lock() = Some(Instant::now());
+            return Ok(None);
+        }
+
+        Ok(Some(available))
+    }
+
+    /// Align the map ceiling with the current disk state, returning whether the
+    /// store is in no-growth mode.
+    ///
+    /// Below the reserve the map is pinned to the file's high-water mark, so a
+    /// put succeeds exactly when LMDB can satisfy it from the free list and
+    /// returns `MapFull` the moment it would need to extend `data.mdb`. That
+    /// makes the allocator the authority on "can this write fit".
+    ///
+    /// The whole transition runs under `growth_mode_lock`. Setting the flag and
+    /// resizing the map is one compound change spanning an await, so without
+    /// serialisation two callers straddling the threshold can interleave and
+    /// leave the flag describing a map that was never applied.
+    async fn sync_growth_mode(&self) -> Result<bool> {
+        let _transition = self.growth_mode_lock.lock().await;
+
+        // Re-measured inside the lock: a caller that queued behind a transition
+        // must act on the state that transition left behind, not the one it saw
+        // before waiting.
+        if self.available_space_cached()?.is_none() {
+            // At or above the reserve: restore normal head-room if we pinned it.
+            if self.no_growth.load(Ordering::Acquire) {
+                // Intent first, work second. A `spawn_blocking` body outlives a
+                // cancelled awaiter, so ordering between two resizes cannot be
+                // guaranteed by holding an async lock. Publishing the intent
+                // before the work lets each closure re-read it under the
+                // exclusive lock and decline if it has since been reversed.
+                self.no_growth.store(false, Ordering::Release);
+                self.try_resize().await?;
+            }
+            // Real disk again: the maintenance allowance is refreshed. Done on
+            // every healthy pass, not just the transition, so an allowance
+            // spent while the flag happened to be clear is still returned.
+            self.delete_slack_granted.store(0, Ordering::Release);
+            return Ok(false);
+        }
+
+        // Called unconditionally, not just on the transition. A re-pin that
+        // failed, or a transition whose caller was cancelled while its detached
+        // resize was still in flight, can leave the flag set while the map is
+        // not actually pinned; re-asserting it here repairs that instead of
+        // trusting the flag. The call is a no-op when already pinned.
+        self.no_growth.store(true, Ordering::Release);
+        self.pin_map_to_high_water().await?;
+
+        Ok(true)
+    }
+
+    /// Pin the LMDB map to the size of `data.mdb` on disk.
+    ///
+    /// Every page already in the file stays usable, including free ones, but
+    /// the file cannot grow, so the configured reserve is preserved by LMDB
+    /// itself rather than by refusing writes it could have served.
+    ///
+    /// Deliberately leaves **no** head-room: any slack in the ceiling is
+    /// ordinary put capacity, so it would be spent on the next chunk rather
+    /// than kept for maintenance, and on a shared volume every node would take
+    /// its own slice out of the reserve. Deletes get their copy-on-write room
+    /// on demand instead, see [`Self::delete`].
+    ///
+    /// Takes the **exclusive** `env_lock` for the same reason
+    /// [`Self::try_resize`] does: `mdb_env_set_mapsize` requires that no
+    /// transaction is active. Callers hold `growth_mode_lock`.
+    #[allow(unsafe_code)]
+    async fn pin_map_to_high_water(&self) -> Result<()> {
+        // The "is it already pinned?" test lives inside the exclusive lock
+        // below, not out here. An unlocked pre-check can observe "already
+        // pinned" moments before a detached resize from a cancelled transition
+        // lands, after which the flag would claim a pin that no longer holds.
+        // Callers invoke this on every low-disk write so the pinned state
+        // repairs itself; the locked section is a few reads when nothing is to
+        // be done.
+        let env = self.env.clone();
+        let lock = Arc::clone(&self.env_lock);
+        let no_growth = Arc::clone(&self.no_growth);
+
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<()> {
+                // Exclusive lock guarantees no concurrent transactions.
+                let _guard = lock.write();
+
+                // Re-read under the lock: this closure may have been queued
+                // behind others, or its awaiter cancelled, and the store may
+                // have left no-growth mode since it was spawned.
+                if !no_growth.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+
+                let current_map = env.info().map_size;
+                let file_bytes = env
+                    .real_disk_size()
+                    .map_err(|e| Error::Storage(format!("Failed to query LMDB file size: {e}")))?;
+
+                let page = page_size::get() as u64;
+                let aligned = file_bytes.div_ceil(page) * page;
+                let target = usize::try_from(aligned).unwrap_or(usize::MAX);
+
+                // Re-checked under the lock: the state may have moved between
+                // the cheap check and here.
+                if target >= current_map {
+                    return Ok(());
+                }
+
+                // SAFETY: We hold an exclusive lock, so no transactions are active.
+                unsafe {
+                    env.resize(target)
+                        .map_err(|e| Error::Storage(format!("Failed to pin LMDB map: {e}")))?;
+                }
+
+                info!(
+                    "Disk below reserve: pinned LMDB map to {:.2} GiB (was {:.2} GiB). \
+                     Writes that fit in already-freed pages still succeed; \
+                     only writes that would grow the file are refused.",
+                    bytes_to_gib(target as u64),
+                    bytes_to_gib(current_map as u64),
+                );
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB map pin task failed: {e}")))?
+    }
+
+    /// Grow the map for a write, unless the store is pinned below the reserve.
+    ///
+    /// Serialised against [`Self::sync_growth_mode`] so a resize cannot land
+    /// after a pin and quietly undo it. If the store entered no-growth mode
+    /// while the write was in flight, the caller's `MapFull` is final and no
+    /// growth happens.
+    async fn try_resize_for_growth(&self) -> Result<()> {
+        let _transition = self.growth_mode_lock.lock().await;
+
+        if self.no_growth.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        self.try_resize().await
+    }
+
+    /// Delete `key` with [`DELETE_COW_SLACK`] of temporary map head-room, then
+    /// take the head-room straight back.
+    ///
+    /// The raise, the delete and the re-pin all happen inside **one** exclusive
+    /// `env_lock` scope. Doing them as three separate locked steps would leave
+    /// windows in which an ordinary put could allocate from the raised ceiling,
+    /// spending the reserve on a chunk instead of on the maintenance it was
+    /// granted for, and an error or cancellation between the steps would leave
+    /// the ceiling raised for good.
+    ///
+    /// The grant is budgeted. If the delete's copy-on-write does extend
+    /// `data.mdb`, that growth is permanent — LMDB never returns file space —
+    /// so an unbudgeted grant would let repeated fill-then-delete cycles walk
+    /// the file into the reserve a slice at a time. In practice one grant is
+    /// enough: once a delete commits there are free pages again, and later
+    /// deletes reuse them. The budget resets when the store leaves no-growth
+    /// mode, i.e. when there is real disk to work with again.
+    #[allow(unsafe_code)]
+    async fn delete_with_slack(&self, key: &XorName) -> Result<bool> {
+        let key = *key;
+        let env = self.env.clone();
+        let db = self.db;
+        let lock = Arc::clone(&self.env_lock);
+        let budget = Arc::clone(&self.delete_slack_granted);
+
+        let outcome = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<DeleteOutcome> {
+                // Claim, spend and settle the allowance entirely inside the
+                // closure. A `spawn_blocking` body keeps running when its
+                // awaiter is dropped, so accounting split across the await could
+                // claim the budget and then never release it, permanently
+                // costing the node its ability to prune.
+                if budget
+                    .compare_exchange(0, DELETE_COW_SLACK, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Err(Error::Storage(format!(
+                        "Cannot delete: the local store is full and its {DELETE_COW_SLACK} B \
+                         maintenance allowance is already spent. Free disk space to continue."
+                    )));
+                }
+
+                // From here every exit settles the charge, including a panic.
+                let mut allowance = DeleteAllowance {
+                    budget: &budget,
+                    keep: false,
+                };
+
+                // Exclusive for the whole sequence: no transaction may be
+                // active across either resize, and no put may observe the
+                // raised ceiling.
+                let _guard = lock.write();
+
+                let page = page_size::get() as u64;
+                let previous_map = env.info().map_size;
+                let raised = (previous_map as u64)
+                    .saturating_add(DELETE_COW_SLACK)
+                    .div_ceil(page)
+                    .saturating_mul(page);
+
+                // SAFETY: exclusive lock held, so no transactions are active.
+                let granted = unsafe {
+                    env.resize(usize::try_from(raised).unwrap_or(usize::MAX))
+                        .map_err(|e| Error::Storage(format!("Failed to grant delete slack: {e}")))
+                };
+                granted?;
+
+                // Armed across the delete so an unwind still restores the
+                // ceiling; disarmed once the explicit restore below succeeds.
+                let mut ceiling_guard = MapCeilingRestorer {
+                    env: &env,
+                    previous: previous_map,
+                    armed: true,
+                };
+
+                let outcome = delete_in_txn(&env, db, &key);
+
+                // Keep the charge the moment the delete commits: that is the
+                // one outcome whose copy-on-write can have extended
+                // `data.mdb`, and that growth is permanent. Deciding here
+                // rather than on the combined result means a failure to restore
+                // the ceiling cannot refund an allowance that was really spent.
+                if matches!(outcome, Ok(DeleteOutcome::Done(_))) {
+                    allowance.keep = true;
+                }
+
+                // Undo the raise before releasing the lock, on every path and
+                // whatever the delete did. Restoring to the previous ceiling
+                // rather than to a freshly measured file size keeps this
+                // unconditional: it is exactly the inverse of the raise, needs
+                // no second syscall that could itself fail, and is correct
+                // whether or not the store was pinned. If the copy-on-write did
+                // extend the file, LMDB clamps a request below the space in use,
+                // so the map still covers the data.
+                //
+                // SAFETY: exclusive lock held, so no transactions are active.
+                let restored = unsafe {
+                    env.resize(previous_map)
+                        .map_err(|e| Error::Storage(format!("Failed to restore LMDB map: {e}")))
+                };
+                if restored.is_ok() {
+                    ceiling_guard.armed = false;
+                }
+
+                // A failed restore is reported ahead of a failed delete, so the
+                // failure is not lost behind the delete's own error.
+                match (outcome, restored) {
+                    (Ok(outcome), Ok(())) => Ok(outcome),
+                    (_, Err(e)) | (Err(e), Ok(())) => Err(e),
+                }
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("LMDB delete-slack task failed: {e}")))?;
+
+        match outcome? {
+            DeleteOutcome::Done(existed) => Ok(existed),
+            DeleteOutcome::MapFull => Err(Error::Storage(
+                "LMDB map full during delete even with the maintenance allowance".into(),
+            )),
+        }
     }
 
     /// Grow the LMDB map to match currently available disk space.
@@ -719,14 +1131,29 @@ impl LmdbStorage {
     /// called (an LMDB safety requirement).
     #[allow(unsafe_code)]
     async fn try_resize(&self) -> Result<()> {
-        let from_disk = compute_map_size(&self.env_dir, self.config.disk_reserve)?;
         let env = self.env.clone();
         let lock = Arc::clone(&self.env_lock);
+        let no_growth = Arc::clone(&self.no_growth);
+        let env_dir = self.env_dir.clone();
+        let reserve = self.config.disk_reserve;
 
         self.blocking_tracker
             .spawn_blocking(move || -> Result<()> {
                 // Exclusive lock guarantees no concurrent transactions.
                 let _guard = lock.write();
+
+                // Re-read under the lock. A `spawn_blocking` body outlives a
+                // cancelled awaiter, so this closure may land after the store
+                // entered no-growth mode. Growing then would hand back the
+                // head-room a pin had just taken away, and with it the disk
+                // reserve.
+                if no_growth.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+
+                // Measured here rather than before the spawn, so a late closure
+                // sizes from the disk as it is now, not as it was when queued.
+                let from_disk = compute_map_size(&env_dir, reserve)?;
 
                 // Never shrink below the current map — existing data must remain
                 // addressable regardless of what the disk-space calculation says.
@@ -811,6 +1238,84 @@ enum PutOutcome {
     MapFull,
 }
 
+/// Restores an LMDB map ceiling when dropped, including while unwinding.
+///
+/// The explicit restore in [`LmdbStorage::delete_with_slack`] is the normal
+/// path, because it can report a failure to the caller. This exists so a panic
+/// between the raise and that restore cannot leave the ceiling raised, which
+/// would quietly hand ordinary writes the disk reserve.
+struct MapCeilingRestorer<'a> {
+    env: &'a Env,
+    previous: usize,
+    armed: bool,
+}
+
+impl Drop for MapCeilingRestorer<'_> {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: the owner holds the exclusive `env_lock` for this whole
+        // scope, so no transaction is active.
+        unsafe {
+            if let Err(e) = self.env.resize(self.previous) {
+                warn!("Failed to restore the LMDB map ceiling while unwinding: {e}");
+            }
+        }
+    }
+}
+
+/// Settles the delete maintenance allowance when dropped, including on unwind.
+///
+/// The allowance is claimed before the ceiling is raised, so every exit from
+/// that scope has to either keep the charge or return it. A `Drop` impl is the
+/// only form that also covers a panic: a stranded charge would permanently stop
+/// the node pruning for the rest of the low-disk episode.
+struct DeleteAllowance<'a> {
+    budget: &'a AtomicU64,
+    keep: bool,
+}
+
+impl Drop for DeleteAllowance<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.budget.store(0, Ordering::Release);
+        }
+    }
+}
+
+/// Run one delete in its own write transaction, reporting `MapFull` rather than
+/// raising it.
+///
+/// The caller owns the `env_lock` discipline: [`LmdbStorage::try_delete`] holds
+/// the shared guard, [`LmdbStorage::delete_with_slack`] the exclusive one.
+fn delete_in_txn(env: &Env, db: Database<Bytes, Bytes>, key: &XorName) -> Result<DeleteOutcome> {
+    let mut wtxn = match env.write_txn() {
+        Ok(wtxn) => wtxn,
+        Err(heed::Error::Mdb(MdbError::MapFull)) => return Ok(DeleteOutcome::MapFull),
+        Err(e) => return Err(Error::Storage(format!("Failed to create write txn: {e}"))),
+    };
+    let existed = match db.delete(&mut wtxn, key) {
+        Ok(existed) => existed,
+        Err(heed::Error::Mdb(MdbError::MapFull)) => return Ok(DeleteOutcome::MapFull),
+        Err(e) => return Err(Error::Storage(format!("Failed to delete chunk: {e}"))),
+    };
+    match wtxn.commit() {
+        Ok(()) => Ok(DeleteOutcome::Done(existed)),
+        Err(heed::Error::Mdb(MdbError::MapFull)) => Ok(DeleteOutcome::MapFull),
+        Err(e) => Err(Error::Storage(format!("Failed to commit delete: {e}"))),
+    }
+}
+
+/// Outcome of one delete attempt.
+enum DeleteOutcome {
+    /// The delete committed; the flag is whether the key had existed.
+    Done(bool),
+    /// The map ceiling left no room for the delete's copy-on-write.
+    MapFull,
+}
+
 /// Compute the LMDB map size from the disk hosting `db_dir`.
 ///
 /// The result covers **all existing data** plus all remaining usable disk
@@ -869,23 +1374,6 @@ fn map_target_bytes(current_db_bytes: u64, available: u64, reserve: u64) -> u64 
     let growth_room = growth_room.min(WINDOWS_MAP_HEADROOM);
 
     current_db_bytes.saturating_add(growth_room)
-}
-
-/// Reject the write early if available disk space is below `reserve`.
-fn check_disk_space(db_dir: &Path, reserve: u64) -> Result<()> {
-    let available = fs2::available_space(db_dir)
-        .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
-
-    if available < reserve {
-        return Err(Error::Storage(format!(
-            "Insufficient disk space: {:.2} GiB available, {:.2} GiB reserve required. \
-             Free disk space or increase the partition to continue storing chunks.",
-            bytes_to_gib(available),
-            bytes_to_gib(reserve),
-        )));
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1317,5 +1805,316 @@ mod tests {
             .await
             .expect("try_resize did not complete after the raw read released")
             .expect("try_resize");
+    }
+
+    // ── Capacity below the disk reserve (LMDB reuse) ────────────────────
+
+    /// Value size for the reuse tests. A whole number of chunks' worth, so the
+    /// space freed by a few deletes is unambiguously enough for one more.
+    const REUSE_VALUE_LEN: usize = 1024 * 1024;
+
+    /// Distinct filler of `REUSE_VALUE_LEN` bytes.
+    fn reuse_filler(seed: u32) -> Vec<u8> {
+        let mut content = seed.to_le_bytes().to_vec();
+        content.resize(REUSE_VALUE_LEN, 0u8);
+        content
+    }
+
+    /// A config for `dir` whose reserve exceeds any real disk, so the store
+    /// always sees itself as below the reserve.
+    fn below_reserve_config(dir: &Path) -> LmdbStorageConfig {
+        LmdbStorageConfig {
+            root_dir: dir.to_path_buf(),
+            disk_reserve: u64::MAX,
+            ..LmdbStorageConfig::test_default()
+        }
+    }
+
+    /// Write `count` chunks with an unconstrained reserve, returning their
+    /// addresses in insertion order.
+    async fn seed_chunks(dir: &Path, count: u32) -> Vec<XorName> {
+        let config = LmdbStorageConfig {
+            root_dir: dir.to_path_buf(),
+            ..LmdbStorageConfig::test_default()
+        };
+        let storage = LmdbStorage::new(config).await.expect("create storage");
+
+        let mut addresses = Vec::new();
+        for seed in 0..count {
+            let content = reuse_filler(seed);
+            let address = LmdbStorage::compute_address(&content);
+            storage.put(&address, &content).await.expect("seed put");
+            addresses.push(address);
+        }
+
+        storage.wait_idle().await;
+        addresses
+    }
+
+    fn file_len(storage: &LmdbStorage) -> u64 {
+        storage.env.real_disk_size().expect("real_disk_size")
+    }
+
+    /// The regression this change is about: a node whose volume is below the
+    /// reserve must still write into pages an earlier delete freed. Before the
+    /// fix the pre-check refused on the disk half alone, so a node that had
+    /// pruned sat on reusable space it could not use.
+    #[tokio::test]
+    async fn below_reserve_put_reuses_freed_pages() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let seeded = seed_chunks(temp_dir.path(), 12).await;
+
+        let storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        let content = reuse_filler(u32::MAX);
+        let address = LmdbStorage::compute_address(&content);
+
+        // Nothing freed yet, so this write would have to grow the file. Below
+        // the reserve that is exactly what must be refused.
+        assert!(
+            storage.put(&address, &content).await.is_err(),
+            "a write that must grow the file was allowed below the reserve"
+        );
+
+        // Free several chunks. Their pages go on LMDB's free list, not back to
+        // the filesystem, so `statvfs` still reports the volume as full.
+        for seeded_address in seeded.iter().take(6) {
+            assert!(storage.delete(seeded_address).await.expect("delete"));
+        }
+
+        let before = file_len(&storage);
+        let stored = storage
+            .put(&address, &content)
+            .await
+            .expect("put into freed pages was refused below the reserve");
+        assert!(stored);
+        assert_eq!(
+            storage.get(&address).await.expect("get"),
+            Some(content),
+            "chunk written into reused pages did not read back"
+        );
+
+        // The whole point: it was served from inside the existing file.
+        assert_eq!(
+            file_len(&storage),
+            before,
+            "reusing freed pages grew data.mdb, consuming the reserve"
+        );
+    }
+
+    /// A refused write must not have grown the file on its way to failing,
+    /// which is what protects the reserve while the map is pinned.
+    #[tokio::test]
+    async fn below_reserve_refused_put_does_not_grow_the_file() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let _ = seed_chunks(temp_dir.path(), 6).await;
+
+        let storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        let content = reuse_filler(u32::MAX);
+        let address = LmdbStorage::compute_address(&content);
+
+        // Take the baseline after the first attempt, so it includes the pin.
+        let refusal = storage
+            .put(&address, &content)
+            .await
+            .expect_err("a write that must grow the file was allowed");
+        assert!(
+            refusal.to_string().contains("Insufficient disk space"),
+            "refused for the wrong reason: {refusal}"
+        );
+        let before = file_len(&storage);
+        let pinned_map = storage.env.info().map_size;
+
+        for seed in 0..4u32 {
+            let content = reuse_filler(u32::MAX - 1 - seed);
+            let address = LmdbStorage::compute_address(&content);
+            let refusal = storage
+                .put(&address, &content)
+                .await
+                .expect_err("a write that must grow the file was allowed");
+            assert!(
+                refusal.to_string().contains("Insufficient disk space"),
+                "refused for the wrong reason: {refusal}"
+            );
+        }
+
+        assert_eq!(
+            storage.env.info().map_size,
+            pinned_map,
+            "the map ceiling drifted while writes were being refused"
+        );
+
+        assert_eq!(
+            file_len(&storage),
+            before,
+            "refused writes still extended data.mdb into the reserve"
+        );
+    }
+
+    /// One refused maximum-sized value must not lock out smaller ones. LMDB's
+    /// `MapFull` is specific to the allocation it was asked for, so remembering
+    /// it store-wide would let a single large chunk deny every later write.
+    #[tokio::test]
+    async fn large_refusal_does_not_block_a_smaller_put() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let seeded = seed_chunks(temp_dir.path(), 10).await;
+
+        let storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        // Free room for a small value, but not for a large one.
+        let Some(first) = seeded.first() else {
+            panic!("seed_chunks returned no addresses");
+        };
+        assert!(storage.delete(first).await.expect("delete"));
+
+        // A value far larger than what was freed cannot fit.
+        let oversized = vec![3u8; 8 * REUSE_VALUE_LEN];
+        let oversized_address = LmdbStorage::compute_address(&oversized);
+        assert!(storage.put(&oversized_address, &oversized).await.is_err());
+
+        // A small value still must, using the pages the delete released.
+        let small = b"small record that fits in a freed page".to_vec();
+        let small_address = LmdbStorage::compute_address(&small);
+        let stored = storage
+            .put(&small_address, &small)
+            .await
+            .expect("a large refusal blocked a small put that had room");
+        assert!(stored);
+    }
+
+    /// A store with no reusable page must still be able to delete, or it can
+    /// never prune its way back to health.
+    #[tokio::test]
+    async fn full_store_below_reserve_can_still_delete() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let seeded = seed_chunks(temp_dir.path(), 8).await;
+
+        let storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        // Pin the map by attempting a write that cannot fit.
+        let content = reuse_filler(u32::MAX);
+        let address = LmdbStorage::compute_address(&content);
+        assert!(storage.put(&address, &content).await.is_err());
+        assert!(storage.no_growth.load(Ordering::Acquire));
+
+        let pinned_map = storage.env.info().map_size;
+
+        for seeded_address in &seeded {
+            assert!(
+                storage.delete(seeded_address).await.expect("delete"),
+                "a pinned store could not prune"
+            );
+        }
+        assert_eq!(storage.current_chunks().expect("current_chunks"), 0);
+
+        // Whether or not any delete needed the maintenance allowance, none of
+        // it may be left in the ceiling afterwards: a raised ceiling is
+        // ordinary put capacity, so leaking it hands away the reserve.
+        let file_bytes = file_len(&storage);
+        assert!(
+            storage.env.info().map_size as u64 <= file_bytes.max(pinned_map as u64),
+            "delete left maintenance slack in the map ceiling"
+        );
+
+        // And the store must still refuse a write it cannot fit, i.e. the pin
+        // is still doing its job after the prune.
+        let oversized = vec![9u8; 64 * REUSE_VALUE_LEN];
+        let oversized_address = LmdbStorage::compute_address(&oversized);
+        assert!(
+            storage.put(&oversized_address, &oversized).await.is_err(),
+            "pinning stopped working after a delete used the allowance"
+        );
+    }
+
+    /// The pre-check must admit while reuse is plausible and refuse once it is
+    /// not. Refusing on `statvfs` alone is what blinded a node to its own free
+    /// pages, so being below the reserve cannot by itself be an error.
+    #[tokio::test]
+    async fn check_capacity_tracks_reusable_space_not_just_disk() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let seeded = seed_chunks(temp_dir.path(), 16).await;
+
+        let storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        // A freshly written store has almost no free page, so below the reserve
+        // the pre-check refuses and the caller skips its expensive setup.
+        assert!(
+            storage.check_capacity().is_err(),
+            "pre-check stayed open on a store with no reusable space"
+        );
+
+        // Pruning puts pages back on the free list. Nothing is returned to the
+        // filesystem, so `statvfs` is unchanged and only the reusable half of
+        // the predicate can reopen the node.
+        for seeded_address in seeded.iter().take(10) {
+            assert!(storage.delete(seeded_address).await.expect("delete"));
+        }
+
+        storage
+            .check_capacity()
+            .expect("pre-check stayed closed after pruning freed pages");
+    }
+
+    /// Freeing disk must lift the pin, or a node would stay clamped to its
+    /// high-water mark after an operator grew the partition.
+    #[tokio::test]
+    async fn leaving_no_growth_restores_head_room() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let _ = seed_chunks(temp_dir.path(), 6).await;
+
+        let mut storage = LmdbStorage::new(below_reserve_config(temp_dir.path()))
+            .await
+            .expect("reopen storage");
+
+        let content = reuse_filler(u32::MAX);
+        let address = LmdbStorage::compute_address(&content);
+        assert!(storage.put(&address, &content).await.is_err());
+        assert!(storage.no_growth.load(Ordering::Acquire));
+        let pinned_map = storage.env.info().map_size;
+
+        // Simulate the operator freeing space: the reserve is now satisfiable.
+        storage.config.disk_reserve = 0;
+        *storage.last_disk_ok.lock() = None;
+
+        let stored = storage
+            .put(&address, &content)
+            .await
+            .expect("store stayed pinned after disk was freed");
+        assert!(stored);
+        assert!(!storage.no_growth.load(Ordering::Acquire));
+        assert!(
+            storage.env.info().map_size > pinned_map,
+            "map was not re-grown after leaving no-growth mode"
+        );
+    }
+
+    /// Above the reserve nothing changes: no pinning, and writes grow the file
+    /// on demand exactly as before.
+    #[tokio::test]
+    async fn above_reserve_behaviour_is_unchanged() {
+        let (storage, _temp) = create_test_storage().await;
+
+        storage
+            .check_capacity()
+            .expect("pre-check on a healthy node");
+
+        let content = reuse_filler(1);
+        let address = LmdbStorage::compute_address(&content);
+        assert!(storage.put(&address, &content).await.expect("put"));
+        assert!(!storage.no_growth.load(Ordering::Acquire));
+        storage
+            .check_capacity()
+            .expect("pre-check after a healthy put");
     }
 }
