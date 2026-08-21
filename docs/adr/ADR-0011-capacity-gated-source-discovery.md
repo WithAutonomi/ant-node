@@ -174,6 +174,16 @@ set.
   one of those is not suppressed. The default 500 MiB reserve normally makes the node
   refuse chunks well before literal ENOSPC, which is why this predicate covers the
   observed condition — but it is narrower than the name suggests.
+- The verdict restates the pre-check's predicate rather than sharing its code, so the two
+  can drift apart. That is not hypothetical. ant-node #210 makes the pre-check two-part —
+  below the reserve *and* out of reusable pages inside the store, since LMDB returns a
+  deleted record's pages to its own free list and never to the filesystem. Left
+  unreconciled, a heavily pruned node would read as `Full` here while its own dial
+  pre-check admits the write, standing its keys down for five minutes at a time instead
+  of looking for chunks it could store. That is under-replication, which is worse than
+  the probe traffic this gate exists to remove, so the coupling is held by a test rather
+  than by a comment: `capacity_verdict_refuses_exactly_when_check_capacity_does` fails in
+  exactly that state.
 - The second gate is now covered by a test rather than by inspection. Hosting the chunk
   on every other node clears the four-of-seven quorum threshold, and leaving it out of
   the target's paid list forces the network branch. Cutting the capacity-specific
@@ -196,6 +206,13 @@ set.
 - Unit: the existing `apply_fetch_result` cases still hold with `LocalWriteFailed` back
   to its upstream shape — no alternate source is conscripted, and the no-metadata path
   stays terminal.
+- Unit: `capacity_verdict_refuses_exactly_when_check_capacity_does` holds the gate's
+  verdict and the dial's pre-check to one predicate. It is built on a store that has
+  deleted more than one chunk's worth of pages rather than on a bare full disk, because
+  that is the state the two predicates are about to part company over; on a bare full
+  disk they still agree, so a test built on one would pass straight through the
+  divergence. Applying #210's predicate to the pre-check fails this test and nothing
+  else in the 934-test suite.
 - E2E: `write_blocked_node_neither_probes_nor_dials` runs all three phases on one
   network — no dial, then no probe — seeding two nodes identically through the local
   paid-list path so they differ only in whether storage accepts writes. Probes are
@@ -228,7 +245,9 @@ set.
   the plan's 60-minute allowance. Flat *near zero* is the wrong expectation either way:
   unauthorized keys still run their quorum round by design.
 - Review trigger: if `PENDING_VERIFY_MAX_AGE`, the neighbour-sync cadence, or
-  `MAX_PENDING_VERIFY` change, revisit the 5-minute constant.
+  `MAX_PENDING_VERIFY` change, revisit the 5-minute constant. If what
+  `LmdbStorage::check_capacity` refuses on changes, carry the change into
+  `capacity_verdict` in the same commit.
 
 ## Notes for AI-assisted work
 
