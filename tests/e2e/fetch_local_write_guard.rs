@@ -45,11 +45,13 @@
 use super::testnet::TestNetworkConfig;
 use super::verify_storage_gate::find_key_for_target;
 use super::TestHarness;
+use ant_node::client::XorName;
 use ant_node::replication::config::storage_admission_width;
 use ant_node::replication::{
     verification_requests_for_key_from_for_test, watch_verification_requests_for_test,
 };
-use ant_node::ReplicationConfig;
+use ant_node::{ReplicationConfig, ReplicationEngine};
+use saorsa_core::identity::PeerId;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -74,6 +76,33 @@ const CONTROL_INDEX: usize = 7;
 /// backoff rather than just "something deferred it". Every other requeue in this
 /// path waits `verification_request_timeout`, which is 15 s.
 const CAPACITY_BACKOFF_FLOOR: Duration = Duration::from_secs(60);
+
+/// Put `key` into `engine`'s pending-verification queue, tolerating a hint that
+/// arrived first.
+///
+/// Seeding a key on other nodes is what makes it advertisable, so a replica hint
+/// can land in the target's queue before this call runs. `add_pending_verify`
+/// then merges the hint into the entry already there and reports
+/// `AlreadyPresent` rather than `Admitted`, which is not a failure: every phase
+/// below needs the key to *be* pending verification, not this call to be what
+/// put it there. Asserting on the admission result alone made the phases lose a
+/// race that widens on a slow runner, and did so at the setup step rather than
+/// at anything the gate decides.
+///
+/// A key that is neither newly admitted nor already pending is still a hard
+/// stop. Left unchecked, the later assertions would read a missing queue entry
+/// as a gate decision.
+async fn ensure_pending_verify(engine: &ReplicationEngine, key: XorName, hinter: PeerId) {
+    if engine.enqueue_pending_verify_for_test(key, hinter).await {
+        return;
+    }
+    assert!(
+        engine.pending_verify_delay_for_test(&key).await.is_some(),
+        "key {} was refused admission to pending verification and is not already \
+         there, so the phase that follows has nothing to observe",
+        hex::encode(key)
+    );
+}
 
 /// A node whose available space is below its reserve must neither dial for a
 /// chunk it has already authorized nor ask its close group where to find one.
@@ -244,18 +273,8 @@ async fn write_blocked_node_neither_probes_nor_dials() {
         .await
         .expect("seed control paid list");
 
-    assert!(
-        target_engine
-            .enqueue_pending_verify_for_test(blocked_key, holder_peer)
-            .await,
-        "blocked key must be admitted to pending verification"
-    );
-    assert!(
-        control_engine
-            .enqueue_pending_verify_for_test(control_key, holder_peer)
-            .await,
-        "control key must be admitted to pending verification"
-    );
+    ensure_pending_verify(target_engine, blocked_key, holder_peer).await;
+    ensure_pending_verify(control_engine, control_key, holder_peer).await;
 
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
     let mut blocked_delay = None;
@@ -337,12 +356,7 @@ async fn write_blocked_node_neither_probes_nor_dials() {
             }
         }
     }
-    assert!(
-        target_engine
-            .enqueue_pending_verify_for_test(quorum_key, holder_peer)
-            .await,
-        "quorum key must be admitted to pending verification"
-    );
+    ensure_pending_verify(target_engine, quorum_key, holder_peer).await;
 
     let deadline = tokio::time::Instant::now() + OBSERVATION_WINDOW;
     let mut quorum_delay = None;
