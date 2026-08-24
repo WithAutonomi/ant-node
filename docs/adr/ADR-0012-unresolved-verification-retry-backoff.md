@@ -1,4 +1,4 @@
-# ADR-0011: Back off and report once when a verification round finds no holder
+# ADR-0012: Back off and report once when a verification round finds no holder
 
 - **Status:** Proposed
 - **Date:** 2026-08-24
@@ -6,7 +6,7 @@
 - **Reviewers:** TBD
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** V2-1049, V2-883, [saorsa-core #152](https://github.com/WithAutonomi/saorsa-core/pull/152)
+- **Related:** ADR-0005 (replication repair hardening — owns the verification/fetch pipeline this changes); ADR-0011 (capacity-gated source discovery — adds the flat write-blocked deferral this change deliberately keeps flat). V2-1049 is the issue, V2-1062 tracks the cause, and [saorsa-core #152](https://github.com/WithAutonomi/saorsa-core/pull/152) characterises it.
 
 ## Context
 
@@ -72,10 +72,11 @@ We will take option 4.
 methods that mean different things:
 
 - `defer_pending(key, retry_after)` keeps today's flat behaviour, for deferrals
-  that are **not** a failed round — the write-blocked capacity gate added by
-  ADR-0005's successor work defers without asking anyone, so nothing was learned
-  about the key and neither the backoff nor the first-failure warning should be
-  consumed.
+  that are **not** a failed round — the write-blocked capacity gate of ADR-0011
+  defers without asking anyone, so nothing was learned about the key and neither
+  the backoff nor the first-failure warning should be consumed. That ADR states
+  the gate is "applied flat, through the ordinary `defer_pending`"; keeping the
+  two methods distinct is what preserves that.
 - `defer_unresolved(key, base_retry_after)` is the failed-round path. It
   increments the counter and returns `DeferralOutcome { attempt, retry_after }`,
   where `retry_after` doubles from the base and saturates at a new
