@@ -600,6 +600,16 @@ fn spawn_verification_batch_task(
             }
         };
 
+        // Recorded at the wire call, after the permit and the encode, so the
+        // count is send attempts rather than scheduled batches — recording where
+        // a batch is merely queued would stay positive if the encode or the task
+        // itself regressed. It is not proof of delivery: a send that fails
+        // immediately is still counted. Recording on the responder would be
+        // worse, reading zero for requests the receiver shed at admission or as
+        // stale.
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::replication::record_verification_request_sent(p2p.peer_id(), &requested_keys);
+
         let response = match p2p
             .send_request(&peer, REPLICATION_PROTOCOL_ID, encoded, timeout)
             .await

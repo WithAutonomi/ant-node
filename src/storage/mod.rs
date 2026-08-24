@@ -50,4 +50,5 @@ pub(crate) mod lmdb;
 pub use crate::ant_protocol::XorName;
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
+pub(crate) use lmdb::CapacityVerdict;
 pub use lmdb::{LmdbStorage, LmdbStorageConfig, StorageStats};

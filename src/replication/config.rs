@@ -626,6 +626,45 @@ const PENDING_VERIFY_MAX_AGE_SECS: u64 = 30 * 60;
 /// Maximum age for pending-verification entries before stale eviction.
 pub const PENDING_VERIFY_MAX_AGE: Duration = Duration::from_secs(PENDING_VERIFY_MAX_AGE_SECS);
 
+/// How long a key waits for another look once this node's disk is **full**.
+///
+/// Only a full disk, not any refused write: a space query that fails says
+/// nothing about available space and keeps the ordinary retry schedule.
+///
+/// A node that cannot write cannot finish an acquisition, so before this gate
+/// the key came straight back. At [`VERIFICATION_REQUEST_TIMEOUT`] that was a
+/// close-group probe as often as every 15 s for every key the node owes — the
+/// requested delay, so cycle polling, round duration and bounded per-cycle
+/// selection make it an upper rate rather than an observed cadence. The owed set
+/// grows with the network rather than with anything this node does — 25.6% of a
+/// 195-service testnet, held full, produced 99.6% of every verification-request
+/// byte on the network (V2-987).
+///
+/// What this schedules is a *look*: the cycle re-reads local capacity and only
+/// probes if space has returned. A key that stays full and authorized sends no
+/// probes at all, because the gate stops the round before it is sent.
+///
+/// Five minutes is chosen against [`PENDING_VERIFY_MAX_AGE`], which it is well
+/// inside. That is not a guarantee that freed space is noticed while the entry
+/// lives: one deferred inside its final five minutes expires first, and a
+/// backlog can delay selection further.
+///
+/// This is deliberately a constant rather than a [`ReplicationConfig`] field.
+/// The struct is publicly re-exported and is not `#[non_exhaustive]`, so a new
+/// field would break downstream exhaustive construction for a knob nothing
+/// needs to tune at runtime.
+///
+/// Applied flat, through the ordinary `defer_pending`. A key deferred inside the
+/// last five minutes of its entry's life therefore expires at
+/// [`PENDING_VERIFY_MAX_AGE`] without a further look and comes back on the next
+/// neighbour-sync hint. An earlier revision clamped the delay to half the
+/// entry's remaining life to avoid that; it was cut because the extra looks it
+/// bought near expiry can themselves become ungated quorum rounds.
+const CAPACITY_BLOCKED_RETRY_SECS: u64 = 5 * 60;
+/// How long a key waits for another look once this node's disk is full.
+pub(crate) const CAPACITY_BLOCKED_RETRY: Duration =
+    Duration::from_secs(CAPACITY_BLOCKED_RETRY_SECS);
+
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
@@ -1801,6 +1840,30 @@ mod tests {
         assert!(
             saw_different,
             "audit intervals should exhibit randomized jitter across samples"
+        );
+    }
+
+    /// The capacity stand-down has to be an order of magnitude above the retry
+    /// it replaces and still below the life of the entry it defers.
+    ///
+    /// A stand-down only a little above the request timeout would leave the
+    /// repeat cost the same order as before, which is the cost this change
+    /// exists to remove. At or past `PENDING_VERIFY_MAX_AGE` every deferral
+    /// would instead become an eviction, which is a different design with
+    /// different failure modes: the key would only return on a fresh
+    /// neighbour-sync hint rather than on its own schedule.
+    ///
+    /// What this does not show: that either gate uses the constant. It pins the
+    /// policy the constant encodes; the e2e proves the gates.
+    #[test]
+    fn capacity_blocked_retry_is_an_order_above_the_request_timeout_and_below_the_entry_lifetime() {
+        assert!(
+            CAPACITY_BLOCKED_RETRY >= VERIFICATION_REQUEST_TIMEOUT * 10,
+            "a stand-down near the request timeout leaves the repeat cost unchanged in order"
+        );
+        assert!(
+            CAPACITY_BLOCKED_RETRY < PENDING_VERIFY_MAX_AGE,
+            "a deferral at or past the entry lifetime is an eviction, not a deferral"
         );
     }
 }

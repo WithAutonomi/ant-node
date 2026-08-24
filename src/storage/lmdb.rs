@@ -815,6 +815,53 @@ impl LmdbStorage {
         )))
     }
 
+    /// Capacity as a three-way verdict, distinguishing a full node from a
+    /// query that failed.
+    ///
+    /// Refuses on the same two-part predicate as [`Self::check_capacity`]:
+    /// `Full` only when the volume is below the reserve *and* the store holds
+    /// less than one chunk of reusable space. Deleted records return their
+    /// pages to LMDB's free list and never to the filesystem, so a pruned node
+    /// reads as full to `statvfs` while still able to store chunks — such a
+    /// node must keep discovering holders for the keys it owes.
+    ///
+    /// Shares the same TTL cache as [`Self::check_capacity`]: a passing disk
+    /// reading is cached, a failing one is always rechecked, so freed space is
+    /// noticed promptly. An admit that rests on reusable pages is deliberately
+    /// not cached, matching the pre-check, because the free list can drain a
+    /// chunk at a time.
+    pub(crate) fn capacity_verdict(&self) -> CapacityVerdict {
+        {
+            let last = self.last_disk_ok.lock();
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS {
+                    return CapacityVerdict::Writable;
+                }
+            }
+        }
+        let disk = verdict_from_available_space(
+            fs2::available_space(&self.env_dir),
+            self.config.disk_reserve,
+        );
+        match disk {
+            CapacityVerdict::Writable => {
+                *self.last_disk_ok.lock() = Some(Instant::now());
+                CapacityVerdict::Writable
+            }
+            CapacityVerdict::Unknown => CapacityVerdict::Unknown,
+            // Below the reserve is only half the predicate: the store may
+            // still hold pages it can reuse without growing the file.
+            CapacityVerdict::Full => match self.reusable_bytes() {
+                Ok(reusable) if reusable >= MAX_CHUNK_SIZE as u64 => CapacityVerdict::Writable,
+                Ok(_) => CapacityVerdict::Full,
+                Err(e) => {
+                    warn!("Could not query the store's reusable space: {e}");
+                    CapacityVerdict::Unknown
+                }
+            },
+        }
+    }
+
     /// Estimated bytes inside `data.mdb` that LMDB could write without growing
     /// the file: the file size minus the pages currently holding data.
     ///
@@ -1375,10 +1422,53 @@ fn map_target_bytes(current_db_bytes: u64, available: u64, reserve: u64) -> u64 
     current_db_bytes.saturating_add(growth_room)
 }
 
+/// Map the result of a space query onto the *disk half* of the capacity
+/// verdict.
+///
+/// `Full` here means "below the reserve", which since ant-node #210 is only
+/// half the refusal predicate: [`LmdbStorage::capacity_verdict`] goes on to
+/// consult the store's reusable pages before refusing.
+///
+/// Split out from [`LmdbStorage::capacity_verdict`] because the three-way
+/// mapping is the part worth proving, and proving it through the filesystem is
+/// not portable: asking for the free space of a directory that does not exist
+/// fails on Unix but succeeds on Windows, which resolves it to the volume.
+fn verdict_from_available_space(available: std::io::Result<u64>, reserve: u64) -> CapacityVerdict {
+    match available {
+        Ok(available) if available < reserve => CapacityVerdict::Full,
+        Ok(_) => CapacityVerdict::Writable,
+        Err(e) => {
+            warn!("Could not query available disk space: {e}");
+            CapacityVerdict::Unknown
+        }
+    }
+}
+
+/// What a capacity check concluded, when the caller needs to tell "this node is
+/// full" apart from "this node could not find out".
+///
+/// [`LmdbStorage::check_capacity`] collapses both into `Err`, which is right for
+/// a caller that only wants to know whether to attempt a write. A caller
+/// deciding *how long to stand down* needs the distinction: a full disk is a
+/// standing condition worth waiting minutes on, while a failed `statvfs` may
+/// have cleared by the next attempt and must not be treated as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityVerdict {
+    /// Available space is at or above the configured reserve. That is what the
+    /// query establishes, and possibly from the TTL cache — not a promise the
+    /// next write succeeds.
+    Writable,
+    /// Available space is below the configured reserve.
+    Full,
+    /// The query itself failed, so nothing is known about available space.
+    Unknown,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::ant_protocol::MAX_CHUNK_SIZE;
 
     /// Short probe used to prove `wait_idle` is still blocked on a parked op.
     const WAIT_IDLE_BLOCKED_PROBE: std::time::Duration = std::time::Duration::from_millis(200);
@@ -1804,6 +1894,169 @@ mod tests {
             .await
             .expect("try_resize did not complete after the raw read released")
             .expect("try_resize");
+    }
+
+    /// The gate fires on `Full` and only on `Full`, so the verdict has to tell a
+    /// disk below its reserve from one above it, and has to notice when that
+    /// stops being true.
+    ///
+    /// The third call is the one that matters for recovery: the below-reserve
+    /// condition clears, and the verdict has to follow it rather than stay stuck
+    /// on its earlier answer. A node that remembered a refusal would stop
+    /// fetching for good.
+    ///
+    /// What this does not show: that a changed free-space reading is re-read from
+    /// the filesystem. The condition is cleared by dropping the reserve, which is
+    /// the same comparison approached from the other side.
+    #[tokio::test]
+    async fn capacity_verdict_follows_the_reserve_and_notices_recovery() {
+        let (writable, _temp) = create_test_storage().await;
+        assert_eq!(writable.capacity_verdict(), CapacityVerdict::Writable);
+
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let config = LmdbStorageConfig {
+            root_dir: temp_dir.path().to_path_buf(),
+            // Far above any real free space, the same way the e2e builds a
+            // write-blocked node.
+            disk_reserve: u64::MAX / 2,
+            ..LmdbStorageConfig::test_default()
+        };
+        let mut full = LmdbStorage::new(config).await.expect("create storage");
+        assert_eq!(full.capacity_verdict(), CapacityVerdict::Full);
+
+        // Still short of space, so still `Full`. A `Full` result that populated
+        // the passing-result cache would answer `Writable` here.
+        assert_eq!(full.capacity_verdict(), CapacityVerdict::Full);
+
+        // Space is no longer short. Nothing cached a refusal, so the very next
+        // read has to see it.
+        full.config.disk_reserve = 0;
+        assert_eq!(
+            full.capacity_verdict(),
+            CapacityVerdict::Writable,
+            "a refusal must not be negatively cached: the next read has to see the \
+             below-reserve condition clear"
+        );
+    }
+
+    /// A space query that fails says nothing about available space, so it must
+    /// not read as a full disk. The gate stands a key down for five minutes on
+    /// `Full` alone, and a failed `statvfs` is not a condition worth standing
+    /// down for: it may be gone by the next cycle.
+    ///
+    /// The two `Ok` cases pin the boundary the reserve names: equal to the
+    /// reserve is writable, one byte under it is not.
+    ///
+    /// What this does not show: that the gate leaves `Unknown` alone. The gate
+    /// tests `== Full` on a separate line inside the verification cycle, which
+    /// needs a network to reach, so this covers the classification only.
+    #[test]
+    fn a_failed_space_query_reads_as_unknown_not_full() {
+        const RESERVE: u64 = 1024;
+
+        assert_eq!(
+            verdict_from_available_space(Err(std::io::Error::other("space query failed")), RESERVE),
+            CapacityVerdict::Unknown,
+            "a failed query must not be reported as a full disk"
+        );
+
+        assert_eq!(
+            verdict_from_available_space(Ok(RESERVE - 1), RESERVE),
+            CapacityVerdict::Full
+        );
+        assert_eq!(
+            verdict_from_available_space(Ok(RESERVE), RESERVE),
+            CapacityVerdict::Writable,
+            "at the reserve is not below it"
+        );
+    }
+
+    /// The verdict and the pre-check have to refuse on the same condition.
+    ///
+    /// They are two readings of one question — can this node write? — and two
+    /// callers depend on them separately: the verification cycle gates the
+    /// close-group probe on the verdict, while `execute_single_fetch` gates the
+    /// dial on the pre-check. A verdict stricter than the pre-check is the
+    /// harmful direction. A node the pre-check would let write stops
+    /// discovering holders for keys it could have stored, which is
+    /// under-replication rather than a saved probe, and nothing else in the
+    /// change would notice.
+    ///
+    /// This is a tripwire, deliberately built on the state where the two are
+    /// about to part company rather than on a bare full disk. ant-node
+    /// \#210 makes the pre-check a two-part predicate — below the reserve *and*
+    /// out of reusable pages inside the store — and a store that has deleted
+    /// more than one chunk's worth of pages fails only the first half, because
+    /// LMDB returns those pages to its own free list and never to the
+    /// filesystem. On a bare full disk the two predicates still agree, so a
+    /// test built on one would pass straight through the divergence. Whichever
+    /// of the two changes merges second has to carry the second half into the
+    /// verdict, and this is what makes that a red test rather than a textual
+    /// conflict resolved without it.
+    ///
+    /// What this does not show: which of `Full` and `Unknown` a refusal is.
+    /// `a_failed_space_query_reads_as_unknown_not_full` pins that, and only
+    /// `Full` reaches the gate.
+    #[tokio::test]
+    async fn capacity_verdict_refuses_exactly_when_check_capacity_does() {
+        let (mut storage, _temp) = create_test_storage().await;
+        assert_eq!(storage.capacity_verdict(), CapacityVerdict::Writable);
+        assert!(
+            storage.check_capacity().is_ok(),
+            "a writable verdict has to mean the pre-check admits the write"
+        );
+
+        // Two chunks written and deleted, so the store sits on more than one
+        // chunk of space LMDB can reuse and the filesystem will never take
+        // back. This is the pruned node the two predicates disagree about.
+        for fill in [1u8, 2u8] {
+            let content = vec![fill; MAX_CHUNK_SIZE];
+            let address = LmdbStorage::compute_address(&content);
+            assert!(storage.put(&address, &content).await.expect("put"));
+            assert!(storage.delete(&address).await.expect("delete"));
+        }
+
+        // Established without either function under test, so the scenario does
+        // not rest on the thing being measured.
+        storage.config.disk_reserve = u64::MAX / 2;
+        *storage.last_disk_ok.lock() = None;
+        let available = fs2::available_space(&storage.env_dir).expect("query available space");
+        assert!(
+            available < storage.config.disk_reserve,
+            "the volume has to read as below the reserve, or neither predicate is \
+             being asked the interesting question"
+        );
+        // Reusable bytes read the way the two-part predicate reads them: the
+        // file's size less the pages still holding data. `Env::stat` rather
+        // than `non_free_pages_size`, which calls `String::from_utf8(key)` and
+        // unwraps, so it panics on our 32 random bytes of key.
+        let stat = storage.env.stat();
+        let live_pages = (stat.branch_pages as u64)
+            .saturating_add(stat.leaf_pages as u64)
+            .saturating_add(stat.overflow_pages as u64);
+        let live_bytes = live_pages.saturating_mul(u64::from(stat.page_size));
+        let file_bytes = storage.env.real_disk_size().expect("query store file size");
+        let reusable = file_bytes.saturating_sub(live_bytes);
+        assert!(
+            reusable > MAX_CHUNK_SIZE as u64,
+            "the store has to sit on more than one chunk of reusable space, or the \
+             two predicates are not yet being asked to differ \
+             (file_bytes={file_bytes}, live_bytes={live_bytes})"
+        );
+
+        // Neither call caches a refusal, so the order of the two does not
+        // decide either answer.
+        let pre_check_refuses = storage.check_capacity().is_err();
+        let verdict = storage.capacity_verdict();
+        assert_eq!(
+            pre_check_refuses,
+            verdict != CapacityVerdict::Writable,
+            "the dial pre-check and the verification gate disagree about whether \
+             this node can write: check_capacity refuses={pre_check_refuses}, \
+             verdict={verdict:?}. A verdict of Full under a pre-check that admits \
+             the write leaves a node that can store chunks refusing to look for \
+             them"
+        );
     }
 
     // ── Capacity below the disk reserve (LMDB reuse) ────────────────────
