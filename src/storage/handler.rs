@@ -1180,18 +1180,24 @@ mod tests {
         }
     }
 
-    /// V2-411: a disk-full node must reject a PUT with the disk-space error
-    /// *before* running payment verification.
+    /// A node that is genuinely full must reject a PUT with the disk-space
+    /// error *before* running payment verification (`V2-411`).
+    ///
+    /// "Full" now means both halves of the predicate: the volume is below the
+    /// reserve **and** the store has no reusable space. A freshly created store
+    /// has no freed pages, so both hold and the pre-check short-circuits, as it
+    /// always did. The companion cases in `storage::lmdb::tests` cover the half
+    /// that changed, where pruning has left reusable pages and the node must be
+    /// admitted rather than refused on `statvfs` alone.
     ///
     /// The chunk is intentionally **not** cache-inserted, so if the handler
-    /// reached `verify_payment` it would return `PaymentRequired`/`PaymentFailed`
-    /// (an uncached chunk with no proof). Observing the `StorageFailed` disk
-    /// error instead proves the disk pre-check short-circuited ahead of
-    /// verification — there is no on-chain path to reach.
+    /// reached `verify_payment` it would return `PaymentFailed` (an uncached
+    /// chunk with no proof). Observing the `StorageFailed` disk error instead
+    /// proves the pre-check short-circuited ahead of verification.
     #[tokio::test]
-    async fn test_put_rejected_on_insufficient_disk_before_verification() {
-        // u64::MAX reserve guarantees `available < reserve`, so the cached
-        // disk-space check always fails.
+    async fn test_put_rejected_on_insufficient_capacity_before_verification() {
+        // u64::MAX reserve guarantees `available < reserve`, and a fresh store
+        // has no reusable pages, so the node is full on both halves.
         let (protocol, _temp) = create_test_protocol_with_reserve(u64::MAX).await;
 
         let content = b"chunk for a disk-full node";
