@@ -59,6 +59,7 @@ fn entry_from(sender: PeerId) -> VerificationEntry {
         next_verify_at: now,
         hint_sources: HashSet::from([sender]),
         replica_hint_sources: HashSet::from([sender]),
+        unresolved_retries: 0,
     }
 }
 

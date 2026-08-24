@@ -99,6 +99,19 @@ pub struct VerificationEntry {
     /// Subset of [`Self::hint_sources`] that advertised a replica hint and
     /// therefore claimed chunk possession. Paid-only advertisers are excluded.
     pub replica_hint_sources: HashSet<PeerId>,
+    /// Consecutive verification rounds that left this key unresolved.
+    ///
+    /// Counts deferrals, not rounds: it advances only when a round ends with no
+    /// usable holder (or an inconclusive quorum) and the key is put back for a
+    /// later retry. Zero means the key has not yet failed a round, so the next
+    /// deferral is its first.
+    ///
+    /// Drives the retry backoff, and decides whether a failure is worth a
+    /// warning: the first is news, the five hundredth is the same news.
+    /// Lifetime is the entry's own — eviction and re-admission start a fresh
+    /// count, which is what makes the log "once per episode" rather than once
+    /// ever.
+    pub unresolved_retries: u32,
 }
 
 impl VerificationEntry {

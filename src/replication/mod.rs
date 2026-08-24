@@ -91,7 +91,7 @@ use crate::replication::protocol::{
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::scheduling::{CapacityDisplacement, ReplicationQueues};
+use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
@@ -2166,6 +2166,7 @@ impl ReplicationEngine {
             next_verify_at: now,
             hint_sources: HashSet::from([hinter]),
             replica_hint_sources: HashSet::from([hinter]),
+            unresolved_retries: 0,
         };
         self.queues
             .write()
@@ -7748,6 +7749,7 @@ fn queue_admitted_hints(
                     // Non-empty: this peer claimed possession, so it is a
                     // fetch-source candidate. Derives HintPipeline::Replica.
                     replica_hint_sources: HashSet::from([*source_peer]),
+                    unresolved_retries: 0,
                 },
             );
             match result {
@@ -7775,6 +7777,7 @@ fn queue_admitted_hints(
                 // Empty: a paid hint makes no possession claim, so this peer is
                 // not a fetch source. Derives HintPipeline::PaidOnly.
                 replica_hint_sources: HashSet::new(),
+                unresolved_retries: 0,
             },
         );
         match result {
@@ -7974,6 +7977,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 
     let local_paid_probe_count = local_paid_presence_probe_keys.len();
     let keys_needing_network_count = keys_needing_network.len();
+    // Keys this cycle put back because no peer claimed possession. Reported in
+    // aggregate below; the per-key line is warned once per entry, not per retry.
+    let mut no_holder_deferrals = 0usize;
 
     // Step 1b: Local paid-list hit for fetch-eligible keys. Per Section 9
     // step 4, authorization succeeds immediately; run a presence-only probe
@@ -8008,11 +8014,12 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 add_replica_hint_sources(&mut sources, &entry.replica_hint_sources);
             }
             if sources.is_empty() {
-                warn!(
-                    "Locally paid key {} has no responding holders yet; deferring retry",
-                    hex::encode(key)
+                no_holder_deferrals += 1;
+                report_unresolved_deferral(
+                    "Locally paid key",
+                    &key,
+                    q.defer_unresolved(&key, config.verification_request_timeout),
                 );
-                q.defer_pending(&key, config.verification_request_timeout);
             } else {
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
@@ -8210,11 +8217,12 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
                     } else if fetch_eligible && fetch_sources.is_empty() {
-                        warn!(
-                            "Verified storage-admitted key {} has no holders yet; deferring retry",
-                            hex::encode(key)
+                        no_holder_deferrals += 1;
+                        report_unresolved_deferral(
+                            "Verified storage-admitted key",
+                            &key,
+                            q.defer_unresolved(&key, config.verification_request_timeout),
                         );
-                        q.defer_pending(&key, config.verification_request_timeout);
                     } else {
                         q.remove_pending(&key);
                         terminal_keys.push(key);
@@ -8226,7 +8234,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 }
                 KeyVerificationOutcome::QuorumInconclusive => {
                     q.set_pending_state(&key, VerificationState::QuorumInconclusive);
-                    q.defer_pending(&key, config.verification_request_timeout);
+                    // Backed off like any other unresolved round; an
+                    // inconclusive quorum is not worth a per-key line.
+                    let _ = q.defer_unresolved(&key, config.verification_request_timeout);
                 }
             }
         }
@@ -8275,12 +8285,42 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     if elapsed_ms >= VERIFICATION_CYCLE_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::verification",
-            "Slow replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+            "Slow replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, no_holders={no_holder_deferrals}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
         );
     } else {
         debug!(
             target: "ant_node::replication::verification",
-            "Replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+            "Replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, no_holders={no_holder_deferrals}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+        );
+    }
+}
+
+/// Report a verification round that left a key without a usable holder.
+///
+/// Warns once per entry — the first failure is news, and by the hundredth the
+/// node is re-asking peers it has already exhausted. Later failures stay at
+/// `debug`, and the per-cycle count is carried in the cycle summary so the
+/// scale of a backlog is still visible without a line per key per retry.
+///
+/// Eviction at `PENDING_VERIFY_MAX_AGE` drops the entry, so a key re-hinted
+/// afterwards warns again: "once per episode", not "once ever".
+fn report_unresolved_deferral(what: &str, key: &XorName, outcome: Option<DeferralOutcome>) {
+    let Some(outcome) = outcome else {
+        // The entry left `pending_verify` under the same lock; nothing deferred.
+        return;
+    };
+    if outcome.attempt == 1 {
+        warn!(
+            "{what} {} has no responding holders yet; deferring retry",
+            hex::encode(key)
+        );
+    } else {
+        debug!(
+            "{what} {} still has no responding holders after {} attempts; \
+             retrying in {}s",
+            hex::encode(key),
+            outcome.attempt,
+            outcome.retry_after.as_secs()
         );
     }
 }
@@ -10952,6 +10992,7 @@ mod tests {
                 next_verify_at: now,
                 hint_sources: HashSet::from([peer]),
                 replica_hint_sources: HashSet::from([peer]),
+                unresolved_retries: 0,
             },
         );
         super::bootstrap::track_discovered_keys(&bootstrap_state, &HashSet::from([key])).await;
@@ -12995,6 +13036,7 @@ mod tests {
             next_verify_at: now,
             hint_sources: HashSet::from([hinter]),
             replica_hint_sources: HashSet::from([hinter]),
+            unresolved_retries: 0,
         };
         assert!(q.add_pending_verify(key, entry).admitted());
         assert!(q.promote_pending_to_fetch(key, key, sources));
