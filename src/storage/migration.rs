@@ -1887,7 +1887,9 @@ mod tests {
             root_dir: root.clone(),
             ..crate::storage::ChunkStoreConfig::test_default()
         };
-        config.migration.retire_legacy = true;
+        // Deliberately NOT setting `retire_legacy`. The shipped default has to be what
+        // carries this all the way to a removed environment, or the release migrates every
+        // node and reclaims nothing.
         config.migration.tick_secs = 1;
         // Scoped to this test's own directory. In production the lock is keyed by the
         // filesystem, so without this every test on this machine would serialise against
