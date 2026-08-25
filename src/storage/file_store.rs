@@ -1175,14 +1175,25 @@ pub fn fsync_path_best_effort(path: &Path) {
 /// refetch rather than data. Pretending otherwise in the code would be dishonest.
 #[cfg(unix)]
 fn fsync_dir_best_effort(path: &Path) {
-    match File::open(path) {
-        Ok(dir) => {
-            if let Err(e) = dir.sync_all() {
-                debug!("Directory flush of {} failed: {e}", path.display());
-            }
-        }
-        Err(e) => debug!("Could not open {} to flush it: {e}", path.display()),
+    if let Err(e) = fsync_dir(path) {
+        debug!("Directory flush of {} failed: {e}", path.display());
     }
+}
+
+/// Flush a directory, reporting whether it worked.
+///
+/// Used where the answer is load-bearing: a chunk copied out of the legacy store is only
+/// durable once its directory entry is, and that copy is what permits the legacy store to
+/// be deleted.
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// No directory to flush on platforms that do not offer one.
+#[cfg(not(unix))]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// No-op on platforms with no way to flush a directory handle.
@@ -1812,7 +1823,18 @@ fn publish_via_rename(
         }
     }
 
-    fsync_dir_best_effort(shard);
+    // NOT best effort here. On every platform that takes this path the directory flush is
+    // what makes the rename durable, and a copy that is reported successful is what
+    // authorises deleting the only other copy. Swallowing the failure would let a power
+    // loss discard the directory entry after the legacy store had already been removed.
+    fsync_dir(shard).map_err(|e| {
+        Error::Storage(format!(
+            "Published {} but could not flush {}: {e}. Not reporting this chunk as stored, \
+             because a copy that is not durable must not authorise deleting another.",
+            final_path.display(),
+            shard.display()
+        ))
+    })?;
     Ok(PutOutcome::New)
 }
 
@@ -1821,6 +1843,45 @@ fn publish_via_rename(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// A directory flush that fails must say so.
+    ///
+    /// The quiet version of this function is only used where the answer does not change
+    /// what happens next. On the publish path it does.
+    #[cfg(not(windows))]
+    #[test]
+    fn flushing_a_directory_that_is_not_there_reports_the_failure() {
+        let dir = TempDir::new().expect("temp dir");
+        assert!(fsync_dir(dir.path()).is_ok());
+        assert!(fsync_dir(&dir.path().join("no-such-shard")).is_err());
+    }
+
+    /// A chunk whose directory entry was never flushed is not reported as stored.
+    ///
+    /// This is the whole safety argument for retirement: the legacy store is deleted
+    /// because every chunk was copied durably. A published file whose directory flush
+    /// failed can vanish on power loss, so counting it as copied would lose data. The
+    /// file staying on disk afterwards is fine, the next pass republishes it.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_publish_whose_directory_flush_fails_is_not_reported_as_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let temp_path = dir.path().join("chunk.tmp");
+        let final_path = dir.path().join("chunk");
+        let unflushable = dir.path().join("shard-that-does-not-exist");
+
+        let outcome = publish_via_rename(&temp_path, &final_path, b"payload", &unflushable);
+
+        assert!(
+            outcome.is_err(),
+            "an unflushed publication must not be reported as stored"
+        );
+        assert!(
+            !temp_path.exists(),
+            "the temp file must not be left behind either way"
+        );
+    }
+
     use tempfile::TempDir;
 
     /// Open a store on a fresh temp directory with the disk reserve disabled.

@@ -756,6 +756,23 @@ pub struct MigrationContext {
     pub close_group_size: usize,
 }
 
+/// How many of the peers auditing this node now have seen its reduced commitment.
+///
+/// `received` is who was sent the current root, `current` is the close group as routing
+/// sees it at this moment. Only the overlap counts. A peer that received the root and has
+/// since left is not going to audit this node, and a peer that has since joined has never
+/// seen the root, so neither is evidence that shedding is safe.
+fn enough_of_the_group_knows(
+    received: &HashSet<PeerId>,
+    current: &[PeerId],
+    needed: usize,
+) -> bool {
+    if needed == 0 {
+        return false;
+    }
+    current.iter().filter(|p| received.contains(*p)).count() >= needed
+}
+
 impl MigrationContext {
     /// How many peers of the close group must have seen the reduced commitment.
     ///
@@ -772,15 +789,52 @@ impl MigrationContext {
     /// A rotation is not the same as neighbours knowing. Until they have seen the smaller
     /// key set they keep auditing against the one this node used to hold, so giving a
     /// chunk up before then turns a legitimate migration into a wave of audit failures.
-    #[must_use]
-    pub fn neighbours_know_the_commitment(&self) -> bool {
+    pub async fn neighbours_know_the_commitment(&self) -> bool {
         let needed = self.commitment_recipients_needed();
         if needed == 0 {
             return false;
         }
-        self.commitment
-            .as_ref()
-            .is_some_and(|state| state.current_delivered_peer_count() >= needed)
+        let Some(state) = self.commitment.as_ref() else {
+            return false;
+        };
+        let received = state.current_delivered_peers();
+        if received.is_empty() {
+            return false;
+        }
+        // Counted against the group as it stands now, not as it stood when the root went
+        // out. A peer that has since left knowing this node's reduced commitment says
+        // nothing about the peers that will actually audit it, and letting a departed
+        // peer satisfy the gate is how a node gives chunks up while its real neighbours
+        // still hold it to the larger key set.
+        let Some(current) = self.current_close_group().await else {
+            return false;
+        };
+        enough_of_the_group_knows(&received, &current, needed)
+    }
+
+    /// This node's close group as routing sees it now, or `None` if the view is too thin
+    /// to be evidence about a group at all.
+    async fn current_close_group(&self) -> Option<Vec<PeerId>> {
+        let (Some(p2p), Some(me), Some(self_xor)) = (
+            self.p2p.as_ref(),
+            self.self_id.as_ref(),
+            self.self_xor.as_ref(),
+        ) else {
+            return None;
+        };
+        let closest = p2p
+            .dht_manager()
+            .find_closest_nodes_local(self_xor, self.close_group_size)
+            .await;
+        let peers: Vec<PeerId> = closest
+            .iter()
+            .map(|n| n.peer_id)
+            .filter(|p| p != me)
+            .collect();
+        if peers.len() + 1 < self.close_group_size {
+            return None;
+        }
+        Some(peers)
     }
 
     /// Is this key still answerable under a retained commitment slot?
@@ -1383,7 +1437,7 @@ async fn shedding_is_still_safe(
         // A rotation is not the same as neighbours knowing. Until they have the
         // smaller key set they keep auditing this node against the one it used to
         // hold, and a wave of audit failures is as damaging as losing the chunks.
-        if !context.neighbours_know_the_commitment() {
+        if !context.neighbours_know_the_commitment().await {
             info!(
                 "Holding: {} of this node's close group must receive its reduced \
                  commitment before it gives up {} chunk(s). {} have it so far.",
@@ -2203,5 +2257,65 @@ mod tests {
         assert_eq!(total.bytes, 500);
         assert_eq!(total.unusable, 1);
         assert!(total.stopped_for_space);
+    }
+    /// A peer that received the commitment and then left the group is not evidence.
+    ///
+    /// It is not going to audit this node, so counting it lets a node give chunks up
+    /// while the neighbours who will audit it still hold it to the old, larger key set.
+    #[test]
+    fn a_departed_peer_that_knows_the_commitment_does_not_open_the_gate() {
+        let received: HashSet<PeerId> = (0..6).map(peer_id).collect();
+        let still_here: Vec<PeerId> = (0..3).map(peer_id).collect();
+        let joined_since: Vec<PeerId> = (100..103).map(peer_id).collect();
+        let current: Vec<PeerId> = still_here
+            .iter()
+            .chain(joined_since.iter())
+            .copied()
+            .collect();
+
+        // Six peers know it and the group is six wide, so a count that ignores who is
+        // actually here would sail past the threshold.
+        assert_eq!(received.len(), 6);
+        assert_eq!(current.len(), 6);
+        assert!(!enough_of_the_group_knows(&received, &current, 5));
+
+        // Only the three that are both here and informed count.
+        assert!(enough_of_the_group_knows(&received, &current, 3));
+        assert!(!enough_of_the_group_knows(&received, &current, 4));
+    }
+
+    #[test]
+    fn a_group_that_has_all_seen_the_commitment_opens_the_gate() {
+        let group: Vec<PeerId> = (0..6).map(peer_id).collect();
+        let received: HashSet<PeerId> = group.iter().copied().collect();
+        assert!(enough_of_the_group_knows(&received, &group, 5));
+    }
+
+    #[test]
+    fn no_peer_ever_satisfies_a_zero_threshold() {
+        let group: Vec<PeerId> = (0..6).map(peer_id).collect();
+        let received: HashSet<PeerId> = group.iter().copied().collect();
+        // A group this node cannot reason about must not be read as unanimous consent.
+        assert!(!enough_of_the_group_knows(&received, &group, 0));
+    }
+
+    /// The gate stays shut when routing cannot show a full close group at all.
+    ///
+    /// Without a routing view there is no way to tell an informed neighbour from a
+    /// departed one, and an unanswerable question must not read as a yes.
+    #[tokio::test]
+    async fn without_a_routing_view_the_commitment_gate_stays_shut() {
+        let context = MigrationContext {
+            p2p: None,
+            self_id: None,
+            self_xor: None,
+            commitment: None,
+            replication: None,
+            sync_state: None,
+            audit_challenge_coordinator: None,
+            peer_commitments: None,
+            close_group_size: 7,
+        };
+        assert!(!context.neighbours_know_the_commitment().await);
     }
 }

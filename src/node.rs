@@ -13,6 +13,7 @@ use crate::payment::{
     EvmVerifierConfig, PaymentVerifier, PaymentVerifierConfig, PriceFloorConfig, QuoteGenerator,
 };
 use crate::replication::config::ReplicationConfig;
+use crate::replication::fresh::FreshWriteEvent;
 use crate::replication::ReplicationEngine;
 use crate::storage::MIB;
 use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
@@ -25,16 +26,25 @@ use saorsa_core::{
     IPDiversityConfig as CoreDiversityConfig, MultiAddr, NodeConfig as CoreNodeConfig, P2PEvent,
     P2PNode,
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
+
+/// How long shutdown waits for the storage migration to reach a stopping point.
+///
+/// Generous, because interrupting a copy mid-chunk costs nothing (every step is
+/// idempotent and re-derived at the next start) but interrupting the drain that precedes
+/// removing the legacy store is worth avoiding. Bounded, because a step that will not
+/// finish must not hold the process open.
+const MIGRATION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
@@ -151,65 +161,20 @@ impl NodeBuilder {
             protocol.attach_p2p_node(Arc::clone(&p2p_arc));
         }
 
-        // Set inside the engine branch below, once the migration's dependencies exist.
-        let mut migration_task: Option<JoinHandle<()>> = None;
-        // Initialize replication engine (if storage is enabled)
-        let replication_engine = if let (Some(ref protocol), Some(fresh_rx)) =
-            (&ant_protocol, fresh_write_rx)
-        {
-            let storage_arc = protocol.storage();
-            let payment_verifier_arc = protocol.payment_verifier_arc();
-            match ReplicationEngine::new(
-                repl_config,
-                Arc::clone(&p2p_arc),
-                storage_arc,
-                payment_verifier_arc,
-                Arc::clone(&identity),
-                &self.config.root_dir,
-                fresh_rx,
-                shutdown.clone(),
-            )
-            .await
-            {
-                Ok(engine) => {
-                    // ADR-0004: wire the engine's commitment state as the
-                    // quote generator's commitment source so quotes force
-                    // their price from the live storage commitment. Done
-                    // here because the engine owns the commitment state and
-                    // is built after the protocol.
-                    if let Some(ref protocol) = ant_protocol {
-                        let concrete = Arc::clone(engine.commitment_state());
-                        let source: Arc<dyn crate::payment::quote::CommitmentSource> = concrete;
-                        protocol.attach_commitment_source(source);
-                        // ADR-0004: share the engine's gossip commitment
-                        // cache with the verifier so the cross-check can
-                        // resolve quote pins against neighbours' commitments.
-                        protocol
-                            .payment_verifier_arc()
-                            .attach_commitment_cache(Arc::clone(engine.last_commitment_by_peer()));
-                        // ADR-0004: give the verifier the monetized-pin sender so
-                        // commitments that back a payment get a deterministic
-                        // first audit from the engine's drainer.
-                        protocol
-                            .payment_verifier_arc()
-                            .attach_monetized_pin_sender(engine.monetized_pin_sender());
-
-                        migration_task = Self::spawn_storage_migration(
-                            protocol.storage(),
-                            &p2p_arc,
-                            &engine,
-                            shutdown.clone(),
-                        );
-                    }
-                    Some(engine)
-                }
-                Err(e) => {
-                    warn!("Failed to initialize replication engine: {e}");
-                    None
-                }
+        let (replication_engine, migration_task) = match (&ant_protocol, fresh_write_rx) {
+            (Some(protocol), Some(fresh_rx)) => {
+                Self::build_replication_engine(
+                    protocol,
+                    repl_config,
+                    &p2p_arc,
+                    &identity,
+                    &self.config.root_dir,
+                    fresh_rx,
+                    &shutdown,
+                )
+                .await?
             }
-        } else {
-            None
+            _ => (None, None),
         };
 
         let node = RunningNode {
@@ -227,6 +192,84 @@ impl NodeBuilder {
         };
 
         Ok(node)
+    }
+
+    /// Start the replication engine and, if this node still has one, the migration off
+    /// the legacy chunk store.
+    ///
+    /// The two are built together because the migration cannot run without the engine:
+    /// it needs the commitment state, which holds the veto on deleting the old store,
+    /// and the live routing view that says which chunks this node must never give up.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the engine fails to start on a node that has a legacy
+    /// store to migrate. On a node with nothing to migrate an engine failure is logged
+    /// and the node runs without one, as it always has.
+    async fn build_replication_engine(
+        protocol: &Arc<AntProtocol>,
+        repl_config: ReplicationConfig,
+        p2p: &Arc<P2PNode>,
+        identity: &Arc<NodeIdentity>,
+        root_dir: &Path,
+        fresh_rx: UnboundedReceiver<FreshWriteEvent>,
+        shutdown: &CancellationToken,
+    ) -> Result<(Option<ReplicationEngine>, Option<JoinHandle<()>>)> {
+        let engine = match ReplicationEngine::new(
+            repl_config,
+            Arc::clone(p2p),
+            protocol.storage(),
+            protocol.payment_verifier_arc(),
+            Arc::clone(identity),
+            root_dir,
+            fresh_rx,
+            shutdown.clone(),
+        )
+        .await
+        {
+            Ok(engine) => engine,
+            Err(e) => {
+                // A node that still has a legacy chunk store depends on this engine for
+                // the commitment state, the routing view and the possession challenges
+                // the migration cannot proceed without. Carrying on would leave it
+                // serving from both stores forever, never reclaiming its disk, which is
+                // the condition this release exists to end. Refuse to start instead of
+                // running in it indefinitely.
+                if protocol.storage().has_legacy() {
+                    return Err(Error::Startup(format!(
+                        "This node has a legacy chunk store to migrate but the \
+                         replication engine did not start: {e}. Without it the \
+                         migration cannot run and the disk is never reclaimed. \
+                         Fix the cause rather than running on."
+                    )));
+                }
+                warn!("Failed to initialize replication engine: {e}");
+                return Ok((None, None));
+            }
+        };
+
+        // ADR-0004: wire the engine's commitment state as the quote generator's
+        // commitment source so quotes force their price from the live storage
+        // commitment. Done here because the engine owns the commitment state and is
+        // built after the protocol.
+        let concrete = Arc::clone(engine.commitment_state());
+        let source: Arc<dyn crate::payment::quote::CommitmentSource> = concrete;
+        protocol.attach_commitment_source(source);
+        // ADR-0004: share the engine's gossip commitment cache with the verifier so the
+        // cross-check can resolve quote pins against neighbours' commitments.
+        protocol
+            .payment_verifier_arc()
+            .attach_commitment_cache(Arc::clone(engine.last_commitment_by_peer()));
+        // ADR-0004: give the verifier the monetized-pin sender so commitments that back
+        // a payment get a deterministic first audit from the engine's drainer.
+        protocol
+            .payment_verifier_arc()
+            .attach_monetized_pin_sender(engine.monetized_pin_sender());
+
+        let migration_task =
+            Self::spawn_storage_migration(protocol.storage(), p2p, &engine, shutdown.clone());
+
+        Ok((Some(engine), migration_task))
     }
 
     /// Build the saorsa-core `NodeConfig` from our config.
@@ -763,13 +806,28 @@ impl RunningNode {
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
 
-        // The migration first, and awaited rather than aborted: it is mid-way through
-        // reading and writing the chunk store, and it holds the commitment state and the
-        // routing handle that the two shutdowns below are about to invalidate. It watches
-        // the same cancellation token, so this returns as soon as its current step does.
+        // Protocol routing stops FIRST. The migration's last step drains the legacy
+        // store's in-flight reads, and inbound protocol traffic keeps starting new ones,
+        // so waiting on the migration while still serving requests can keep that drain
+        // from ever completing and hang shutdown.
+        if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
+
+        // Then the migration, awaited rather than aborted: it is mid-way through reading
+        // and writing the chunk store, and it holds the commitment state and the routing
+        // handle that the shutdown below is about to invalidate. It watches the same
+        // cancellation token, so this returns as soon as its current step does. Bounded,
+        // because a step that will not finish must not hold the process open.
         if let Some(handle) = self.migration_task.take() {
-            if let Err(e) = handle.await {
-                warn!("Storage migration task did not stop cleanly: {e}");
+            match tokio::time::timeout(MIGRATION_SHUTDOWN_GRACE, handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Storage migration task did not stop cleanly: {e}"),
+                Err(_) => warn!(
+                    "Storage migration did not stop within {}s; continuing shutdown. \
+                     Everything it does is idempotent and re-derived at the next start.",
+                    MIGRATION_SHUTDOWN_GRACE.as_secs()
+                ),
             }
         }
 
@@ -777,11 +835,6 @@ impl RunningNode {
         // use a dead P2P layer, and Arc<ChunkStore> references are released.
         if let Some(ref mut engine) = self.replication_engine {
             engine.shutdown().await;
-        }
-
-        // Stop protocol routing task
-        if let Some(handle) = self.protocol_task.take() {
-            handle.abort();
         }
 
         // Shutdown P2P node
@@ -974,7 +1027,17 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use rand::Rng;
     use tempfile::TempDir;
+
+    /// The e2e port range, so a test bind never lands on a production or dev instance.
+    const TEST_PORT_RANGE: std::ops::Range<u16> = 20000..60000;
+
+    /// How many times a bind is retried before the failure is treated as real.
+    const BIND_ATTEMPTS: u32 = 5;
+
+    /// A well-formed address that receives nothing; no chain is contacted in these tests.
+    const TEST_REWARDS_ADDRESS: &str = "0x0000000000000000000000000000000000000001";
 
     /// A node with a legacy chunk store must get a migration task; one without must not.
     ///
@@ -1031,6 +1094,128 @@ mod tests {
             crate::storage::migration::should_migrate(&upgrading),
             "a node with a legacy store must be migrated, or its disk is never reclaimed"
         );
+    }
+
+    /// Seed a legacy LMDB store under `root` with one chunk, then close it.
+    async fn seed_legacy_store(root: &std::path::Path) {
+        let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
+            root_dir: root.to_path_buf(),
+            verify_on_read: true,
+            max_map_size: 0,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("open legacy");
+        let content = b"a chunk written before the migration";
+        let addr = crate::client::compute_address(content);
+        lmdb.put(&addr, content).await.expect("put");
+        lmdb.wait_idle().await;
+    }
+
+    /// A node config that builds without touching a chain or a real network.
+    fn local_node_config(root: &std::path::Path, port: u16) -> NodeConfig {
+        NodeConfig {
+            root_dir: root.to_path_buf(),
+            port,
+            ipv4_only: true,
+            network_mode: NetworkMode::Development,
+            payment: crate::config::PaymentConfig {
+                rewards_address: Some(TEST_REWARDS_ADDRESS.to_string()),
+                ..crate::config::PaymentConfig::default()
+            },
+            ..NodeConfig::default()
+        }
+    }
+
+    /// A real, fully built node with a legacy store is actually migrating it.
+    ///
+    /// This goes through `build()` rather than calling the spawn helper, because the
+    /// failure that already happened here was the *call site* going missing, not the
+    /// helper being wrong. A test of the helper alone stays green through exactly that
+    /// bug. Deleting the spawn from `build()` must turn this red.
+    #[tokio::test]
+    async fn a_built_node_with_a_legacy_store_is_migrating_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        seed_legacy_store(&root).await;
+
+        // Ports are picked at random from the test range and a freshly released one can
+        // still be held for a moment, so a bind failure is retried rather than reported
+        // as a wiring fault.
+        let mut built = None;
+        let mut last_err = String::new();
+        for _ in 0..BIND_ATTEMPTS {
+            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+            match NodeBuilder::new(local_node_config(&root, port))
+                .build()
+                .await
+            {
+                Ok(node) => {
+                    built = Some(node);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        let Some(node) = built else {
+            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
+        };
+
+        let storage_has_legacy = node
+            .ant_protocol
+            .as_ref()
+            .is_some_and(|p| p.storage().has_legacy());
+        assert!(
+            storage_has_legacy,
+            "the node must have opened the legacy store this test seeded"
+        );
+        assert!(
+            node.migration_task.is_some(),
+            "a node holding a legacy chunk store came up with nothing migrating it, so \
+             its disk would never be reclaimed"
+        );
+
+        node.shutdown.cancel();
+        if let Some(handle) = node.migration_task {
+            handle.abort();
+        }
+    }
+
+    /// A node with nothing to migrate does not start a driver for it.
+    #[tokio::test]
+    async fn a_built_node_without_a_legacy_store_starts_no_migration() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        let mut built = None;
+        let mut last_err = String::new();
+        for _ in 0..BIND_ATTEMPTS {
+            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+            match NodeBuilder::new(local_node_config(&root, port))
+                .build()
+                .await
+            {
+                Ok(node) => {
+                    built = Some(node);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }
+        }
+        let Some(node) = built else {
+            panic!("could not build a node after {BIND_ATTEMPTS} attempts: {last_err}");
+        };
+
+        assert!(node.migration_task.is_none());
+        node.shutdown.cancel();
     }
     use super::*;
     use crate::config::NODES_SUBDIR;

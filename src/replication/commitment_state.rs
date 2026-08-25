@@ -557,17 +557,28 @@ impl ResponderCommitmentState {
     /// seen yet.
     #[must_use]
     pub fn current_delivered_peer_count(&self) -> usize {
+        self.current_delivered_peers().len()
+    }
+
+    /// Which peers have received the current commitment root.
+    ///
+    /// The caller intersects this with whoever is in the close group *now*. A peer that
+    /// has since left knowing the root is no evidence about the group that will audit
+    /// this node, and counting it would let a node give chunks up while its actual
+    /// neighbours still hold it to the larger key set.
+    #[must_use]
+    pub fn current_delivered_peers(&self) -> HashSet<PeerId> {
         let guard = self.inner.read();
         if !guard.has_current {
-            return 0;
+            return HashSet::new();
         }
         let Some(hash) = guard.slots.first().map(|c| c.cached_hash) else {
-            return 0;
+            return HashSet::new();
         };
         if guard.current_recipients_hash == Some(hash) {
-            guard.current_recipients.len()
+            guard.current_recipients.clone()
         } else {
-            0
+            HashSet::new()
         }
     }
 
