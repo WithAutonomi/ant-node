@@ -53,6 +53,10 @@ pub const RETIRED_SUFFIX: &str = ".retired";
 /// authorise deleting an environment that had since taken a chunk.
 const RETIRED_MARKER: &str = "RETIRED";
 
+/// How many retired directories may be waiting to be deleted before the node stops
+/// finding new names for them. Far more than a node should ever accumulate.
+const MAX_TOMBSTONES: u32 = 64;
+
 /// The legacy environment's data file. Its presence is what says a node still has one.
 const LEGACY_DATA_FILE: &str = "data.mdb";
 
@@ -1327,10 +1331,7 @@ impl ChunkStore {
         // through leaves a directory that can no longer be opened as an environment, and
         // recording the migration as finished on top of that would have the node claim
         // completion over a half-deleted store. A rename either happens or does not.
-        let tombstone = self
-            .config
-            .root_dir
-            .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+        let tombstone = free_tombstone_path(&self.config.root_dir);
 
         if let Err(e) = std::fs::rename(&self.legacy_env_dir, &tombstone) {
             // Nothing was deleted, but the handle is already closed, so this node has
@@ -1599,15 +1600,11 @@ fn finish_interrupted_retirement(root_dir: &Path) {
              behind rather than a live environment. Finishing that removal.",
             env.display()
         );
-        let tombstone = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
         // Renamed rather than deleted here, so the node can get on with starting: the
-        // deletion itself is detached below and can take minutes on a large store.
-        if tombstone.try_exists().unwrap_or(false) {
-            if let Err(e) = std::fs::remove_dir_all(&tombstone) {
-                warn!("Could not clear {}: {e}", tombstone.display());
-                return;
-            }
-        }
+        // deletion itself is detached below and can take minutes on a large store. Under a
+        // name nothing else is using, so a tombstone whose deletion is still running does
+        // not force a synchronous delete first.
+        let tombstone = free_tombstone_path(root_dir);
         if let Err(e) = std::fs::rename(&env, &tombstone) {
             warn!(
                 "Could not move {} aside: {e}. It will be tried again at the next start.",
@@ -1620,27 +1617,72 @@ fn finish_interrupted_retirement(root_dir: &Path) {
 }
 
 fn sweep_retired_legacy(root_dir: &Path) {
-    let tombstone = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-    if !tombstone.try_exists().unwrap_or(false) {
+    let tombstones = retired_tombstones(root_dir);
+    if tombstones.is_empty() {
         return;
     }
     // Flushed first, and only best effort is not good enough here for the same reason it
     // was not good enough when the rename was made: deleting the contents of a directory
     // whose new name may not have reached the disk is what turns a power loss into a
-    // resurrected, half-empty environment. If it cannot be flushed, leave the tombstone
-    // for a later start. It costs disk, not data.
+    // resurrected, half-empty environment. If it cannot be flushed, leave them for a later
+    // start. It costs disk, not data.
     if let Err(e) = crate::storage::file_store::fsync_path(root_dir) {
         warn!(
-            "Leaving {} in place: {} could not be flushed ({e}), so the rename that put it \
-             there may not be on disk yet.",
-            tombstone.display(),
+            "Leaving {} retired chunk environment(s) in place: {} could not be flushed \
+             ({e}), so the rename that put them there may not be on disk yet.",
+            tombstones.len(),
             root_dir.display()
         );
         return;
     }
     // Detached, so a node starting beside a large leftover directory serves immediately
     // rather than waiting out a recursive delete before it opens its store.
-    delete_retired_directory(tombstone);
+    for tombstone in tombstones {
+        delete_retired_directory(tombstone);
+    }
+}
+
+/// Every retired environment directory under `root_dir`.
+///
+/// More than one can be there: a node that retires, is restarted before the deletion
+/// finishes, and somehow acquires another environment would leave the first behind. Each
+/// is named so it cannot collide with the next.
+fn retired_tombstones(root_dir: &Path) -> Vec<PathBuf> {
+    let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
+    let Ok(entries) = std::fs::read_dir(root_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// A directory name to retire the environment under that nothing else is using.
+///
+/// A fixed name would collide with a tombstone whose deletion is still running, and
+/// clearing that one first would put a synchronous recursive delete back on the path this
+/// is trying to keep clear.
+fn free_tombstone_path(root_dir: &Path) -> PathBuf {
+    let base = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+    if !base.try_exists().unwrap_or(true) {
+        return base;
+    }
+    for n in 1..=MAX_TOMBSTONES {
+        let candidate = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.{n}"));
+        if !candidate.try_exists().unwrap_or(true) {
+            return candidate;
+        }
+    }
+    // Every name taken, which means many retirements have been interrupted without their
+    // deletions finishing. Reuse the base: the rename fails, retirement defers, and the
+    // operator sees a directory full of them.
+    base
 }
 
 /// Whether a legacy environment is on disk under `root_dir`.
