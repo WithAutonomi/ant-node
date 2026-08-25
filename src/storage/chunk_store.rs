@@ -399,6 +399,14 @@ impl ChunkStore {
                         hex::encode(address)
                     );
                 } else {
+                    // Marked legacy-only BEFORE the write, not after it. The write runs on
+                    // a blocking thread that outlives this future: a shutdown that drops
+                    // the caller mid-way can leave the environment holding a chunk while
+                    // nothing here ever ran to record it, and a key in neither view is
+                    // what retirement destroys. Recorded first, a cancelled write leaves
+                    // the copier a key to pick up; if the write never landed, the copier
+                    // finds nothing behind it and drops it again.
+                    l.only.write().insert(*address);
                     // Best effort, and only best effort. The verdict above is optimistic
                     // by design: LMDB can still refuse a write for fragmentation, pages
                     // pinned by a long read, or a copy-on-write B-tree split. Propagating
@@ -431,20 +439,30 @@ impl ChunkStore {
                 // and calling that key legacy-only while the file index still names it
                 // puts it in both views, where it stays answerable and vetoes retirement
                 // for good.
-                if dual_written && !self.files.is_indexed(address) {
+                // Already recorded before the legacy write, so nothing to do here but
+                // leave it recorded. Taking it back out when the file store does have the
+                // key is what the check below is for: a write can fail because the file
+                // that is already there could not be read, and calling that key
+                // legacy-only while the index still names it puts it in both views.
+                if self.files.is_indexed(address) {
                     if let Some(ref l) = legacy {
-                        l.only.write().insert(*address);
+                        l.only.write().remove(address);
                     }
                 }
+                let _ = dual_written;
                 return Err(e);
             }
         };
 
+        // The file store has it, so it is not legacy-only, whether it was already there
+        // or this call put it there. Removed only now, after the file write returned:
+        // between the mark above and here the key is deliberately over-recorded, which
+        // costs the copier one lookup and is the direction that cannot lose a chunk.
+        if let Some(ref l) = legacy {
+            l.only.write().remove(address);
+        }
         if already_in_legacy {
             // Migrated for free: a hot key the copier no longer has to move.
-            if let Some(ref l) = legacy {
-                l.only.write().remove(address);
-            }
             return Ok(false);
         }
         Ok(stored_in_files)
@@ -962,13 +980,30 @@ impl ChunkStore {
                         // The legacy bytes do not hash to their own key, so this chunk
                         // cannot be reproduced and was never servable. Stop advertising
                         // it rather than carrying a key we cannot answer for.
+                        //
+                        // Deleted from the environment too, and only dropped from the key
+                        // set once that has worked. Leaving the record behind puts the
+                        // key in neither view, which the pre-retirement pass reads as a
+                        // chunk to protect and puts straight back — and the next copier
+                        // pass drops it again. One malformed record would keep a node,
+                        // and every node sharing its disk, from ever reclaiming space.
                         warn!(
                             "Chunk {} in the legacy environment does not match its address; \
-                             dropping it from the key set so replication can repair it",
+                             removing it so replication can repair it",
                             hex::encode(key)
                         );
-                        legacy.only.write().remove(key);
-                        report.unusable += 1;
+                        match legacy.lmdb.delete(key).await {
+                            Ok(_) => {
+                                legacy.only.write().remove(key);
+                                report.unusable += 1;
+                            }
+                            Err(e) => warn!(
+                                "Chunk {} does not match its address and could not be \
+                                 removed from the legacy environment: {e}. It stays on the \
+                                 list and the environment stays.",
+                                hex::encode(key)
+                            ),
+                        }
                         continue;
                     }
                     if message.contains("Insufficient disk space") {
@@ -1149,8 +1184,14 @@ impl ChunkStore {
         shutdown: &CancellationToken,
     ) -> Result<VerifyReport> {
         let mut report = VerifyReport::default();
+        // Taken BEFORE anything is read. Stamping it at the end would absorb exactly the
+        // failures this exists to catch: a chunk verified early in the pass that stops
+        // being readable before the pass finishes would leave the report carrying the
+        // already-incremented count, and both later checks would see it match.
+        let health_at_start = self.files.health_generation();
         let Some(legacy) = self.legacy() else {
             report.ran = true;
+            report.health = health_at_start;
             return Ok(report);
         };
         report.ran = true;
@@ -1261,11 +1302,17 @@ impl ChunkStore {
                 report.checked, report.repaired
             );
         }
-        // Stamped last, so it reflects everything the pass saw. Retirement compares it
-        // against the store's own count immediately before deleting anything, and a
-        // difference means a chunk stopped being servable since and this pass no longer
-        // describes the store.
-        report.health = self.files.health_generation();
+        // The count this pass started from, and a refusal if the store moved while it
+        // ran. Retirement compares the same value again immediately before deleting
+        // anything, so one number covers both windows: during the pass, and after it.
+        report.health = health_at_start;
+        if self.files.health_generation() != health_at_start {
+            warn!(
+                "A chunk stopped being servable while the pre-retirement pass was running, \
+                 so this pass does not describe the store. Another runs on the next tick."
+            );
+            report.unrepairable = report.unrepairable.saturating_add(1);
+        }
         Ok(report)
     }
 
@@ -1854,6 +1901,16 @@ impl VerifyReport {
 fn mark_directory_retired(dir: &Path) -> std::result::Result<(), MarkFailure> {
     match write_retirement_mark(dir) {
         Ok(()) => Ok(()),
+        Err(e) if e.pre_existing => {
+            // Nothing here was created by this attempt, so there is nothing to take back.
+            // Removing a mark that was already there because re-flushing it failed is how
+            // a correctly retired directory comes to look unmarked, and an unmarked
+            // directory is restored as a live environment.
+            Err(MarkFailure {
+                pre_existing: true,
+                ..e
+            })
+        }
         Err(e) => {
             // A half-written mark is worse than none: the caller puts the directory back
             // under the live name and reopens it, and a mark left inside would have the
@@ -1871,6 +1928,7 @@ fn mark_directory_retired(dir: &Path) -> std::result::Result<(), MarkFailure> {
                             path.display()
                         ),
                         mark_definitely_gone: false,
+                        pre_existing: false,
                     })
                 }
             }
@@ -1882,11 +1940,13 @@ fn mark_directory_retired(dir: &Path) -> std::result::Result<(), MarkFailure> {
                         path.display()
                     ),
                     mark_definitely_gone: false,
+                    pre_existing: false,
                 });
             }
             Err(MarkFailure {
                 reason: format!("{e}"),
                 mark_definitely_gone: true,
+                pre_existing: false,
             })
         }
     }
@@ -1902,6 +1962,13 @@ struct MarkFailure {
     /// Only then may the caller put it back under the live name. A mark left inside would
     /// have the next cleanup pass reap a live, open environment.
     mark_definitely_gone: bool,
+    /// Was the mark already there before this attempt?
+    ///
+    /// Then this attempt created nothing and must take nothing away. Removing a mark that
+    /// was already there because re-flushing it failed is how a correctly retired
+    /// directory comes to look unmarked, and an unmarked directory is restored as a live
+    /// environment.
+    pre_existing: bool,
 }
 
 impl std::fmt::Display for MarkFailure {
@@ -1911,7 +1978,7 @@ impl std::fmt::Display for MarkFailure {
 }
 
 /// Create the mark. See [`mark_directory_retired`], which owns the failure handling.
-fn write_retirement_mark(dir: &Path) -> Result<()> {
+fn write_retirement_mark(dir: &Path) -> std::result::Result<(), MarkFailure> {
     let path = dir.join(RETIRED_MARKER);
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -1923,18 +1990,21 @@ fn write_retirement_mark(dir: &Path) -> Result<()> {
         // again rather than taken on trust: the attempt that wrote it may have been the
         // one that could not flush it.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return crate::storage::file_store::fsync_path(dir).map_err(|flush| {
-                Error::Storage(format!(
+            return crate::storage::file_store::fsync_path(dir).map_err(|flush| MarkFailure {
+                reason: format!(
                     "{} is already there but could not be flushed: {flush}",
                     path.display()
-                ))
+                ),
+                mark_definitely_gone: false,
+                pre_existing: true,
             })
         }
         Err(e) => {
-            return Err(Error::Storage(format!(
-                "Could not mark {} as retired: {e}",
-                path.display()
-            )))
+            return Err(MarkFailure {
+                reason: format!("Could not mark {} as retired: {e}", path.display()),
+                mark_definitely_gone: true,
+                pre_existing: false,
+            })
         }
     };
     // For whoever reads the directory. To the node, presence is the whole signal.
@@ -1944,32 +2014,34 @@ retired. It is being deleted; if it is still here, that was interrupted and the 
 node start finishes it. Nothing needs it.\n",
     ) {
         drop(file);
-        let _ = std::fs::remove_file(&path);
-        return Err(Error::Storage(format!(
-            "Could not write {}: {e}",
-            path.display()
-        )));
+        return Err(MarkFailure {
+            reason: format!("Could not write {}: {e}", path.display()),
+            mark_definitely_gone: false,
+            pre_existing: false,
+        });
     }
-    file.sync_all().map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        Error::Storage(format!(
+    file.sync_all().map_err(|e| MarkFailure {
+        reason: format!(
             "Could not flush {}: {e}. Not deleting on the strength of a mark that may not \
              survive a power loss.",
             path.display()
-        ))
+        ),
+        mark_definitely_gone: false,
+        pre_existing: false,
     })?;
     // And the directory that now contains it. Flushing the file makes its contents
     // durable; the entry naming it is in the directory, and on Unix that needs its own
     // flush. Without this the mark can be missing after a crash from a directory that
     // was in fact retired, which is the whole question this file answers.
-    crate::storage::file_store::fsync_path(dir).map_err(|e| {
-        let _ = std::fs::remove_file(&path);
-        Error::Storage(format!(
+    crate::storage::file_store::fsync_path(dir).map_err(|e| MarkFailure {
+        reason: format!(
             "Marked {} retired but could not flush {}: {e}. Not deleting on the strength \
              of a mark that may not survive a power loss.",
             path.display(),
             dir.display()
-        ))
+        ),
+        mark_definitely_gone: false,
+        pre_existing: false,
     })
 }
 
@@ -3587,7 +3659,10 @@ mod tests {
             .verify_before_retire(0, &never_cancelled())
             .await
             .expect("verify");
-        assert_eq!(proof.unrepairable, 1);
+        assert!(
+            proof.unrepairable >= 1,
+            "the vanished file must be counted against the proof"
+        );
         assert!(!proof.is_clean());
         assert!(!path.exists(), "the pass must not republish it");
         assert!(store.legacy_only_keys().contains(&key));
@@ -3672,10 +3747,16 @@ mod tests {
         assert!(store.has_legacy());
     }
 
+    /// A legacy record whose bytes do not hash to its key is removed, not passed around.
+    ///
+    /// Leaving it in the environment while dropping it from the key set puts it in
+    /// neither view, and the pre-retirement pass reads a key in neither view as one to
+    /// protect and puts it straight back. The next copier pass drops it again. One rotted
+    /// record would keep this node, and every node sharing its disk, from ever reclaiming
+    /// space.
     #[tokio::test]
-    async fn a_legacy_chunk_that_does_not_match_its_address_is_dropped_once() {
+    async fn a_legacy_chunk_that_does_not_match_its_address_is_removed_not_recycled() {
         let dir = TempDir::new().expect("temp dir");
-        // Write a mismatched entry straight into LMDB, bypassing its own address check.
         let (addr, _) = addressed("bad");
         let other = addressed("other").1;
         {
@@ -3687,24 +3768,37 @@ mod tests {
             })
             .await
             .expect("open legacy");
-            // `put` verifies, so seed a good chunk and corrupt the association by
-            // storing the other content under a key it does not hash to.
-            let bad_key = crate::client::compute_address(&other);
-            lmdb.put(&bad_key, &other).await.expect("put");
+            // Under a key it does not hash to: what a record that rotted in place looks
+            // like, and the one shape the ordinary path refuses to create.
+            lmdb.put_unchecked(&addr, &other).await.expect("put");
             lmdb.wait_idle().await;
         }
         let store = open(&dir).await;
         let keys = store.legacy_only_keys();
-        assert_eq!(keys.len(), 1);
-        assert_ne!(keys.first().copied(), Some(addr));
+        assert_eq!(keys, vec![addr]);
 
-        // A well-formed entry copies cleanly; the report shape is what the driver reads.
         let report = store
             .copy_batch(&keys, 0, 0, &never_cancelled())
             .await
             .expect("copy");
-        assert_eq!(report.copied, 1);
-        assert_eq!(report.unusable, 0);
+        assert_eq!(report.copied, 0);
+        assert_eq!(report.unusable, 1);
+        assert!(store.legacy_only_keys().is_empty());
+
+        // And it is gone from the environment, so the pass below cannot find it and put
+        // it back. That is the loop this is about.
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        assert!(
+            store.legacy_only_keys().is_empty(),
+            "a removed record must not come back on the copier's list"
+        );
+        assert!(
+            proof.is_clean(),
+            "and must not go on refusing the proof for ever"
+        );
     }
 
     #[test]

@@ -327,9 +327,26 @@ impl LmdbStorage {
     /// Returns an error if the write fails, content doesn't match address,
     /// or the disk is too full to accept new chunks.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        self.put_inner(address, content, true).await
+    }
+
+    /// Store bytes under a key they do not hash to. Tests only.
+    ///
+    /// Stands in for a record that rotted in place, which is the one shape the ordinary
+    /// path refuses to create and the migration has to survive finding.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::put`], minus the address check.
+    #[cfg(test)]
+    pub(crate) async fn put_unchecked(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        self.put_inner(address, content, false).await
+    }
+
+    async fn put_inner(&self, address: &XorName, content: &[u8], verify: bool) -> Result<bool> {
         // Verify content address
         let computed = Self::compute_address(content);
-        if computed != *address {
+        if verify && computed != *address {
             return Err(Error::Storage(format!(
                 "Content address mismatch: expected {}, computed {}",
                 hex::encode(address),

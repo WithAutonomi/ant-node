@@ -463,6 +463,13 @@ pub struct FileStore {
     /// Held back from everything the node says it has, while the files themselves are
     /// left alone. See [`Self::mark_suspect`].
     suspect: Arc<parking_lot::RwLock<HashSet<XorName>>>,
+    /// Indexed chunks a read has proven do not match their name.
+    ///
+    /// Separate from the above because they clear differently. Not being able to read a
+    /// file is a question a later read answers; bytes that are wrong stay wrong however
+    /// often they are read, and only a repair or a removal settles it. A raw read that
+    /// does not hash anything must not take a chunk out of this set.
+    known_wrong: Arc<parking_lot::RwLock<HashSet<XorName>>>,
     /// Bumped whenever a chunk stops being servable.
     ///
     /// The pre-retirement pass reads every chunk, and its result is reused for a while
@@ -563,6 +570,7 @@ impl FileStore {
             stats: parking_lot::RwLock::new(StorageStats::default()),
             shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
             suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity,
             temp_seq: AtomicU64::new(0),
@@ -823,10 +831,15 @@ impl FileStore {
     async fn stored_bytes_match(&self, address: &XorName) -> StoredBytes {
         match self.get_raw(address).await {
             Ok(Some(bytes)) if crate::client::compute_address(&bytes) == *address => {
+                // A read that hashed. It settles both questions.
                 self.clear_suspect(address);
+                self.clear_known_wrong(address);
                 StoredBytes::Good
             }
-            Ok(Some(_)) => StoredBytes::Wrong,
+            Ok(Some(_)) => {
+                self.mark_known_wrong(address);
+                StoredBytes::Wrong
+            }
             Ok(None) => StoredBytes::Absent,
             // NOT the same as wrong. A file that could not be read this once may be
             // perfectly good, and off Unix replacing it means opening it with `truncate`,
@@ -903,6 +916,7 @@ impl FileStore {
         // Rewritten from bytes that hash to their own name, so whatever was wrong with
         // the old file is not wrong with this one.
         self.clear_suspect(address);
+        self.clear_known_wrong(address);
         debug!("Repaired chunk {}", hex::encode(address));
         Ok(())
     }
@@ -969,10 +983,16 @@ impl FileStore {
     /// Never fails. The signature keeps the shape the LMDB store had, because callers
     /// treat the error as "assume absent".
     pub fn exists(&self, address: &XorName) -> Result<bool> {
-        if self.suspect.read().contains(address) {
+        if self.is_unservable(address) {
             return Ok(false);
         }
         Ok(self.is_indexed(address))
+    }
+
+    /// Is this chunk one the node must not answer for?
+    #[must_use]
+    fn is_unservable(&self, address: &XorName) -> bool {
+        self.suspect.read().contains(address) || self.known_wrong.read().contains(address)
     }
 
     /// Is this chunk in the index, whether or not it can currently be read?
@@ -1065,14 +1085,15 @@ impl FileStore {
     pub async fn all_keys(&self) -> Result<Vec<XorName>> {
         // Copied out first so neither lock is held while the other is taken, and so the
         // usual case, where nothing is suspect, costs one clone of an empty set.
-        let suspect: HashSet<XorName> = self.suspect.read().clone();
+        let mut unservable: HashSet<XorName> = self.suspect.read().clone();
+        unservable.extend(self.known_wrong.read().iter().copied());
         let keys = self.index.read().clone();
-        if suspect.is_empty() {
+        if unservable.is_empty() {
             return Ok(keys.into_iter().collect());
         }
         Ok(keys
             .into_iter()
-            .filter(|key| !suspect.contains(key))
+            .filter(|key| !unservable.contains(key))
             .collect())
     }
 
@@ -1112,6 +1133,30 @@ impl FileStore {
     fn note_health_changed(&self) {
         self.health
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Stop answering for a chunk a read has proven wrong.
+    ///
+    /// Unlike [`Self::mark_suspect`], a later read does not clear this. The bytes are
+    /// wrong, and reading them again says the same thing; only replacing them or removing
+    /// them settles it. Bumping health matters as much as the suppression: a chunk that
+    /// has become unservable since the last pre-retirement pass must invalidate that pass,
+    /// or a repair that fails leaves the node deleting the copy it would have repaired
+    /// from.
+    fn mark_known_wrong(&self, address: &XorName) {
+        if self.known_wrong.write().insert(*address) {
+            self.note_health_changed();
+            warn!(
+                "Chunk {} does not match its name; this node stops answering for it until \
+                 it is repaired or removed",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// Answer for a chunk again, after it has been replaced or removed.
+    fn clear_known_wrong(&self, address: &XorName) {
+        self.known_wrong.write().remove(address);
     }
 
     /// Answer for a chunk again, after a read that worked.
@@ -1295,21 +1340,27 @@ impl FileStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
-        let forgotten = self
-            .blocking_tracker
+        // The bump happens inside the closure, with the mutation it describes. The
+        // closure runs to completion on its own thread whether or not anyone is still
+        // awaiting it, so bumping after the await is skipped entirely when a shutdown
+        // drops the caller — and the index change it was meant to announce still lands.
+        // A cached pre-retirement proof would then stay valid over a store that had
+        // quietly lost a chunk.
+        let health = Arc::clone(&self.health);
+        self.blocking_tracker
             .spawn_blocking(move || {
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                 if path.exists() {
                     return false;
                 }
-                index.write().remove(&key)
+                let forgotten = index.write().remove(&key);
+                if forgotten {
+                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                forgotten
             })
             .await
-            .unwrap_or(false);
-        if forgotten {
-            self.note_health_changed();
-        }
-        forgotten
+            .unwrap_or(false)
     }
 
     /// Remove a chunk whose bytes do not match its name, and stop advertising it.
@@ -1323,6 +1374,9 @@ impl FileStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
+        // For the reason given on `forget_if_absent`: this closure outlives its awaiter,
+        // and the change it makes has to be announced by the same thread that makes it.
+        let health = Arc::clone(&self.health);
         let outcome =
             self.blocking_tracker
                 .spawn_blocking(move || -> std::io::Result<bool> {
@@ -1336,6 +1390,7 @@ impl FileStore {
                             .map_err(|e| std::io::Error::other(e.to_string()))?,
                         Ok(None) => {
                             index.write().remove(&key);
+                            health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                             return Ok(true);
                         }
                         Err(e) => return Err(std::io::Error::other(e.to_string())),
@@ -1346,12 +1401,14 @@ impl FileStore {
                     }
                     std::fs::remove_file(&path)?;
                     index.write().remove(&key);
+                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     Ok(true)
                 })
                 .await;
         match outcome {
             Ok(Ok(true)) => {
-                self.note_health_changed();
+                self.clear_known_wrong(address);
+                self.clear_suspect(address);
                 warn!(
                     "Removed corrupt chunk file {}; replication will repair it",
                     hex::encode(address)
