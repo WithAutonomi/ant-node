@@ -2758,42 +2758,37 @@ mod tests {
     /// data file looks like. That leaves a genuinely retired, partly deleted directory
     /// carrying no evidence of it, and the next start would read that as intact and
     /// restore it.
+    /// Unix only: the failure is provoked with directory permissions, which is not how
+    /// the same thing happens on Windows. The behaviour under test is platform-neutral.
+    #[cfg(unix)]
     #[test]
     fn a_failed_deletion_leaves_the_mark_in_place() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new().expect("temp dir");
         let retired = dir.path().join("chunks.mdb.retired");
         std::fs::create_dir_all(&retired).expect("mkdir");
-        std::fs::write(retired.join("data.mdb"), b"payload").expect("write");
+        std::fs::write(retired.join(LEGACY_DATA_FILE), b"payload").expect("write");
         mark_directory_retired(&retired).expect("mark");
 
-        // A subdirectory that cannot be removed, standing in for whatever the filesystem
+        // An entry that cannot be removed, standing in for whatever the filesystem
         // refuses on the day.
-        let stuck = retired.join("stuck");
-        std::fs::create_dir_all(&stuck).expect("mkdir");
+        std::fs::create_dir_all(retired.join("stuck")).expect("mkdir");
         let mut perms = std::fs::metadata(&retired).expect("meta").permissions();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o500);
-            std::fs::set_permissions(&retired, perms.clone()).expect("chmod");
-        }
+        perms.set_mode(0o500);
+        std::fs::set_permissions(&retired, perms.clone()).expect("chmod");
 
         let failed = remove_marked_directory(&retired).is_err();
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            perms.set_mode(0o700);
-            std::fs::set_permissions(&retired, perms).expect("chmod back");
-        }
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&retired, perms).expect("chmod back");
 
-        if failed {
-            assert!(
-                directory_is_retired(&retired),
-                "a deletion that failed must leave the mark, or the directory stops \
-                 saying what it is"
-            );
-        }
+        assert!(failed, "the deletion was supposed to fail");
+        assert!(
+            directory_is_retired(&retired),
+            "a deletion that failed must leave the mark, or the directory stops saying \
+             what it is"
+        );
     }
 
     /// A directory under the live name that says it was retired is never opened.
@@ -2890,36 +2885,39 @@ mod tests {
     ///
     /// An unmarked directory that still exists is the one state the scheme says cannot
     /// happen: the next start would read it as an intact environment.
+    ///
+    /// Unix only: the failure is provoked with directory permissions, which is not how
+    /// the same thing happens on Windows. The behaviour under test is platform-neutral.
+    #[cfg(unix)]
     #[test]
     fn a_directory_that_cannot_be_removed_keeps_saying_it_was_retired() {
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new().expect("temp dir");
         let retired = dir.path().join("chunks.mdb.retired");
         std::fs::create_dir_all(&retired).expect("mkdir");
-        std::fs::write(retired.join("data.mdb"), b"payload").expect("write");
+        std::fs::write(retired.join(LEGACY_DATA_FILE), b"payload").expect("write");
         mark_directory_retired(&retired).expect("mark");
 
-        // Make the parent read-only so the directory cannot be unlinked from it, while
-        // its own contents still can be.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-            perms.set_mode(0o500);
-            std::fs::set_permissions(dir.path(), perms).expect("chmod");
+        // The parent read-only, so the directory cannot be unlinked from it while its own
+        // contents still can be. That is the shape that leaves an emptied, unmarked
+        // directory behind.
+        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+        perms.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod");
 
-            let failed = remove_marked_directory(&retired).is_err();
+        let failed = remove_marked_directory(&retired).is_err();
 
-            let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-            perms.set_mode(0o700);
-            std::fs::set_permissions(dir.path(), perms).expect("chmod back");
+        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(dir.path(), perms).expect("chmod back");
 
-            if failed && retired.exists() {
-                assert!(
-                    directory_is_retired(&retired),
-                    "a directory that outlived its deletion must still say what it is"
-                );
-            }
-        }
+        assert!(failed, "the removal was supposed to fail");
+        assert!(retired.exists(), "and to leave the directory behind");
+        assert!(
+            directory_is_retired(&retired),
+            "a directory that outlived its deletion must still say what it is"
+        );
     }
 
     /// A key the environment holds that is in neither view stops retirement.
