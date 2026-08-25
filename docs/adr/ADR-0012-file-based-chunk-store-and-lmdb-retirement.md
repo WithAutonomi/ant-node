@@ -177,7 +177,10 @@ chunks cannot stop its auditors from penalising it, so the auditors have to stop
 
 What the first release withholds is deliberately narrow: only the penalty for **not holding a close-group
 chunk you were supposed to be holding**. The commitment-bound subtree audit still
-penalises, in every release. That is not a compromise, it is what makes the rest work: a
+penalises, in every release. So does a responder whose own storage fails: a fetch answered
+with an error means the read faulted or the bytes no longer hash to their address, which is
+never what a node giving chunks up looks like, and a node that does not hold the chunk says
+so with `NotFound` instead. That is not a compromise, it is what makes the rest work: a
 node reduces its commitment precisely so its peers hold it to the smaller claim, and
 suspending that enforcement would make the reduction meaningless. Audits of both kinds run
 and record throughout.
