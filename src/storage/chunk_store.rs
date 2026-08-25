@@ -755,8 +755,13 @@ impl ChunkStore {
                 // next reconciliation finds it in the environment and puts it back on the
                 // copier's list, undoing a prune the node decided on. Waited out here,
                 // holding the lane, so the delete is genuinely last.
+                //
+                // Both halves. A write has an environment half and a file half, either of
+                // which can be the one still running, and draining only the first leaves
+                // the second free to publish the file after this has deleted it.
                 if legacy.pending.read().contains(address) {
                     legacy.lmdb.wait_idle().await;
+                    self.files.wait_idle().await;
                 }
                 let deleted = legacy.lmdb.delete(address).await?;
                 let was_only = legacy.only.write().remove(address);
@@ -3581,6 +3586,74 @@ mod tests {
         // And the note is resolved against what is actually there: nothing, so it goes.
         store.reconcile_pending_writes().await;
         assert!(!store.has_pending_writes());
+        assert!(!store.legacy_only_keys().contains(&addr));
+    }
+
+    /// A delete outlasts a write for the same key that nobody waited for.
+    ///
+    /// A write has an environment half and a file half, and either can still be running
+    /// when its caller is dropped: the blocking work is not cancelled with the future.
+    /// A delete that did not wait for both would be undone by whichever half landed
+    /// afterwards, putting back a chunk the node had decided to prune.
+    #[tokio::test]
+    async fn a_delete_outlasts_a_write_nobody_waited_for() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["neighbour"]).await;
+        let store = Arc::new(open(&dir).await);
+        let (addr, content) = addressed("written-then-pruned");
+
+        // The gate is held from its own thread, so nothing holds a blocking guard across
+        // an await, and it is released through a channel when the test is ready.
+        let gate = store.files.test_put_gate();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _parked = gate.write();
+            held_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        held_rx.recv().expect("the gate is held");
+
+        // The state under test, built directly rather than by racing a real put: a write
+        // that announced itself, whose file half is parked mid-publish, and whose caller
+        // is gone. Driving it through `put` and aborting would be a race about which half
+        // had started, and a test that sometimes sets up a different state than it claims
+        // is worse than no test.
+        let legacy = store.legacy().expect("legacy");
+        legacy.pending.write().insert(addr);
+        let publishing = {
+            let files = Arc::clone(&store.files);
+            let content = content.clone();
+            tokio::spawn(async move { files.put(&addr, &content).await })
+        };
+        // Until the publish is genuinely in flight and parked at the gate.
+        while store.files.tasks_in_flight() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        publishing.abort();
+        let _ = publishing.await;
+
+        // The delete has to wait the parked half out rather than racing it.
+        let deleting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.delete(&addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deleting.is_finished(),
+            "the delete must wait for the write it would otherwise race"
+        );
+
+        release_tx.send(()).ok();
+        holder.join().ok();
+        deleting.await.expect("join").expect("delete");
+
+        // Whichever half landed, the key is gone and stays gone.
+        store.files.wait_idle().await;
+        assert!(
+            !store.exists(&addr).unwrap_or(true),
+            "a write that landed after the delete would resurrect a pruned chunk"
+        );
         assert!(!store.legacy_only_keys().contains(&addr));
     }
 

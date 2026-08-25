@@ -1288,6 +1288,17 @@ impl FileStore {
         Arc::clone(&self.test_put_gate)
     }
 
+    /// How many blocking tasks this store currently has in flight. Tests only.
+    ///
+    /// Lets a test wait for work to have actually started rather than guessing at a
+    /// delay, which is the difference between a test that proves something and one that
+    /// passes because the machine was quick.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn tasks_in_flight(&self) -> usize {
+        self.blocking_tracker.len()
+    }
+
     /// Wait until every blocking task this store spawned has finished.
     ///
     /// Dropping the awaiting future does not cancel a `spawn_blocking` closure, so
