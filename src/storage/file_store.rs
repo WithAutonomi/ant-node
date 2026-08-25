@@ -1190,12 +1190,6 @@ fn fsync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-/// No directory to flush on platforms that do not offer one.
-#[cfg(not(unix))]
-fn fsync_dir(_path: &Path) -> std::io::Result<()> {
-    Ok(())
-}
-
 /// No-op on platforms with no way to flush a directory handle.
 #[cfg(not(unix))]
 fn fsync_dir_best_effort(_path: &Path) {}
@@ -1252,7 +1246,10 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
         rand::random::<u32>()
     ));
     write_temp(&temp, bytes)?;
-    std::fs::rename(&temp, path).map_err(|e| {
+    // Through the retry, because these small files (the layout marker, the migration
+    // state) are rewritten while the node runs, and on Windows a scanner holding a handle
+    // for a few milliseconds turns an ordinary rewrite into a hard failure.
+    rename_with_retry(&temp, path).map_err(|e| {
         let _ = std::fs::remove_file(&temp);
         Error::Storage(format!("Failed to publish {}: {e}", path.display()))
     })?;
@@ -1662,24 +1659,78 @@ fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()>
 
 /// Write `payload` and publish it as `final_path`, replacing whatever is there.
 ///
-/// The rename is intra-directory and therefore atomic, so a reader sees the old content
-/// or the new one and never an absence.
+/// Success here means the bytes are durable, not merely written. The repair path this
+/// serves runs during the pre-retirement pass, where a chunk that fails to match its
+/// address is rewritten from the legacy store and the legacy store is then deleted. A
+/// replacement that a power loss can undo would leave that chunk with the wrong bytes and
+/// no other copy.
 fn write_and_replace(
     temp_path: &Path,
     final_path: &Path,
     payload: &[u8],
     shard: &Path,
 ) -> Result<()> {
-    write_temp(temp_path, payload)?;
-    if let Err(e) = rename_with_retry(temp_path, final_path) {
-        let _ = std::fs::remove_file(temp_path);
-        return Err(Error::Storage(format!(
-            "Failed to replace chunk {}: {e}",
-            final_path.display()
-        )));
+    // Unix: an intra-directory rename is atomic, so a reader sees the old content or the
+    // new one and never an absence, and the directory flush is what makes it durable.
+    #[cfg(unix)]
+    {
+        write_temp(temp_path, payload)?;
+        if let Err(e) = rename_with_retry(temp_path, final_path) {
+            let _ = std::fs::remove_file(temp_path);
+            return Err(Error::Storage(format!(
+                "Failed to replace chunk {}: {e}",
+                final_path.display()
+            )));
+        }
+        fsync_dir(shard).map_err(|e| {
+            Error::Storage(format!(
+                "Replaced {} but could not flush {}: {e}. Not reporting the repair as \
+                 done, because a rewrite that is not durable must not authorise deleting \
+                 the copy it was rewritten from.",
+                final_path.display(),
+                shard.display()
+            ))
+        })?;
+        Ok(())
     }
-    fsync_dir_best_effort(shard);
-    Ok(())
+    // Everywhere else, Windows included: there is no way to flush a directory through the
+    // standard library, so a rename cannot be shown to be durable at return. Overwriting
+    // the existing file changes no directory entry at all, and `sync_all` (FlushFileBuffers
+    // on Windows) is documented to flush the file's data, so a successful return is
+    // durable under a documented contract.
+    //
+    // The cost is that this is not atomic: a crash part-way leaves the file holding a mix
+    // of old and new bytes. That is safe here and only here, because the only caller that
+    // matters runs before the legacy store is deleted, and a crash means no report was
+    // produced and nothing was deleted. The next start re-reads the file, sees it does not
+    // match its address, and repairs it again from the store that is still there.
+    #[cfg(not(unix))]
+    {
+        let _ = temp_path;
+        let _ = shard;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(final_path)
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "Failed to open {} for replacement: {e}",
+                    final_path.display()
+                ))
+            })?;
+        file.write_all(payload).map_err(|e| {
+            Error::Storage(format!("Failed to rewrite {}: {e}", final_path.display()))
+        })?;
+        file.sync_all().map_err(|e| {
+            Error::Storage(format!(
+                "Rewrote {} but could not flush it: {e}. Not reporting the repair as \
+                 done, because a rewrite that is not durable must not authorise deleting \
+                 the copy it was rewritten from.",
+                final_path.display()
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 /// Create `temp_path`, write `payload` into it, and flush it.
@@ -1719,41 +1770,52 @@ fn write_temp(temp_path: &Path, payload: &[u8]) -> Result<()> {
 ///
 /// The temp lives in the destination directory, so the publish is an intra-directory
 /// rename: atomic on every filesystem we support, and needing only that one directory
-/// flushed afterwards.
+/// Put `payload` on disk as `final_path`, durably.
+///
+/// Returns [`PutOutcome::Duplicate`] when the name is already taken. The name is a hash
+/// of the content, so that is not treated as proof the bytes are right: the caller
+/// re-reads and verifies them.
+#[cfg(unix)]
 fn publish(
     temp_path: &Path,
     final_path: &Path,
     payload: &[u8],
     shard: &Path,
 ) -> Result<PutOutcome> {
-    // Windows takes a different route, for a documented reason. There is no way to flush
-    // a directory through the standard library, and Microsoft does not document
-    // `MoveFileEx` as durable at return unless it is called with MOVEFILE_WRITE_THROUGH,
-    // which std does not use. So the rename cannot be relied on to have reached the disk
-    // before the old store is deleted.
-    //
-    // Creating the file under its final name sidesteps the rename entirely. Microsoft
-    // documents that creation metadata is cached and that `FlushFileBuffers`, which
-    // `sync_all` calls on Windows, is the way to flush it. So a successful create, write
-    // and flush is a durable publication under a documented contract, with no directory
-    // flush and no rename involved.
-    //
-    // The cost is that a crash mid-write leaves a partial file wearing a real chunk name.
-    // That is why the duplicate path below re-reads and verifies rather than trusting the
-    // name, and why the pre-retirement pass re-hashes everything before anything is
-    // deleted.
-    #[cfg(windows)]
-    {
-        let _ = temp_path;
-        let _ = shard;
-        return publish_in_place(final_path, payload);
-    }
-    #[cfg(not(windows))]
     publish_via_rename(temp_path, final_path, payload, shard)
 }
 
-/// Create the chunk under its final name and flush it. Windows only.
-#[cfg(windows)]
+/// Put `payload` on disk as `final_path`, durably. See [`publish_in_place`] for why this
+/// takes a different route off Unix.
+#[cfg(not(unix))]
+fn publish(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    shard: &Path,
+) -> Result<PutOutcome> {
+    let _ = temp_path;
+    let _ = shard;
+    publish_in_place(final_path, payload)
+}
+
+/// Create the chunk under its final name and flush it. Everywhere but Unix.
+///
+/// There is no way to flush a directory through the standard library, and Microsoft does
+/// not document `MoveFileEx` as durable at return unless it is called with
+/// `MOVEFILE_WRITE_THROUGH`, which std does not use. So off Unix a rename cannot be
+/// relied on to have reached the disk before the legacy store is deleted.
+///
+/// Creating the file under its final name sidesteps the rename entirely. Microsoft
+/// documents that creation metadata is cached and that `FlushFileBuffers`, which
+/// `sync_all` calls on Windows, is the way to flush it. So a successful create, write and
+/// flush is a durable publication under a documented contract, with no directory flush
+/// and no rename involved.
+///
+/// The cost is that a crash mid-write leaves a partial file wearing a real chunk name.
+/// That is why a duplicate re-reads and verifies rather than trusting the name, and why
+/// the pre-retirement pass re-hashes everything before anything is deleted.
+#[cfg(not(unix))]
 fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
     let mut file = match OpenOptions::new()
         .write(true)
@@ -1790,8 +1852,8 @@ fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
     Ok(PutOutcome::New)
 }
 
-/// Write a temp beside the target and rename it into place. Everywhere but Windows.
-#[cfg(not(windows))]
+/// Write a temp beside the target and rename it into place. Unix only.
+#[cfg(unix)]
 fn publish_via_rename(
     temp_path: &Path,
     final_path: &Path,
@@ -1848,7 +1910,7 @@ mod tests {
     ///
     /// The quiet version of this function is only used where the answer does not change
     /// what happens next. On the publish path it does.
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[test]
     fn flushing_a_directory_that_is_not_there_reports_the_failure() {
         let dir = TempDir::new().expect("temp dir");
@@ -1862,7 +1924,7 @@ mod tests {
     /// because every chunk was copied durably. A published file whose directory flush
     /// failed can vanish on power loss, so counting it as copied would lose data. The
     /// file staying on disk afterwards is fine, the next pass republishes it.
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[test]
     fn a_publish_whose_directory_flush_fails_is_not_reported_as_stored() {
         let dir = TempDir::new().expect("temp dir");
