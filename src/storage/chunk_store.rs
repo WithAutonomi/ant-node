@@ -185,13 +185,16 @@ impl ChunkStore {
         // Before anything looks at the legacy environment: a start that finds the
         // retirement marker finishes what a previous run began, rather than opening a
         // directory that may be half deleted.
-        finish_interrupted_retirement(&config, &files).await;
+        let kept = finish_interrupted_retirement(&config, &files).await;
         sweep_retired_legacy(&config.root_dir);
         let legacy_env_dir = config.root_dir.join(LEGACY_ENV_DIR);
-        let legacy = if legacy_present(&config.root_dir)? {
-            Some(Self::open_legacy(&config, &files).await?)
-        } else {
-            None
+        let legacy = match kept {
+            // Already open, and opening it is what proved it was worth keeping.
+            Some(legacy) => Some(legacy),
+            None if legacy_present(&config.root_dir)? => {
+                Some(Self::open_legacy(&config, &files).await?)
+            }
+            None => None,
         };
 
         let phase = if legacy.is_some() {
@@ -1578,11 +1581,16 @@ fn clear_retirement_marker(root_dir: &Path) {
 /// power loss with its contents half deleted is removed rather than opened. The marker is
 /// only written once the file store has been proven to hold every chunk, so there is
 /// nothing here to lose.
-async fn finish_interrupted_retirement(config: &ChunkStoreConfig, files: &Arc<FileStore>) {
+/// Returns the environment if it was opened and kept, so the caller does not open it a
+/// second time: that open is a full key scan, and on a large store it is not cheap.
+async fn finish_interrupted_retirement(
+    config: &ChunkStoreConfig,
+    files: &Arc<FileStore>,
+) -> Option<Legacy> {
     let root_dir = &config.root_dir;
     let marker = root_dir.join(RETIREMENT_MARKER);
     if !marker.try_exists().unwrap_or(false) {
-        return;
+        return None;
     }
     let env = root_dir.join(LEGACY_ENV_DIR);
     if env.try_exists().unwrap_or(false) {
@@ -1598,7 +1606,6 @@ async fn finish_interrupted_retirement(config: &ChunkStoreConfig, files: &Arc<Fi
         // the node starts at all.
         match ChunkStore::open_legacy(config, files).await {
             Ok(intact) => {
-                drop(intact);
                 warn!(
                     "A previous run was removing {} and did not finish, but it opens \
                      cleanly, so it is kept and the migration starts again from the \
@@ -1606,7 +1613,7 @@ async fn finish_interrupted_retirement(config: &ChunkStoreConfig, files: &Arc<Fi
                     env.display()
                 );
                 clear_retirement_marker(root_dir);
-                return;
+                return Some(intact);
             }
             Err(e) => {
                 warn!(
@@ -1622,13 +1629,14 @@ async fn finish_interrupted_retirement(config: &ChunkStoreConfig, files: &Arc<Fi
                         env.display()
                     );
                     // The marker stays, so the next start tries again.
-                    return;
+                    return None;
                 }
             }
         }
     }
     sweep_retired_legacy(root_dir);
     clear_retirement_marker(root_dir);
+    None
 }
 
 fn sweep_retired_legacy(root_dir: &Path) {
