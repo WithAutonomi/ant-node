@@ -740,6 +740,13 @@ pub fn rank_closest_first(mut keys: Vec<XorName>, self_xor: Option<XorName>) -> 
 pub const MIGRATION_EVENT: &str = "migration_event";
 
 /// Log the operator-facing summary of a completed migration.
+///
+/// `freed_bytes` is what the retired environment held, which is what the deletion running
+/// in the background will return. The line that says the space is actually back is
+/// `migration_event = "space_returned"`, emitted by that deletion when it finishes. Two
+/// lines rather than one because the deletion of a large environment takes minutes, and a
+/// node that reports the disk back before it is back is a node whose operator cannot tell
+/// a slow deletion from a failed one.
 pub fn log_migration_complete(kept: u64, shed: u64, freed_bytes: u64) {
     #[allow(clippy::cast_precision_loss)] // display only
     let freed_gib = freed_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -750,7 +757,7 @@ pub fn log_migration_complete(kept: u64, shed: u64, freed_bytes: u64) {
             shed,
             freed_bytes,
             "Storage migration complete: {kept} chunks now in the file store, nothing shed, \
-             {freed_gib:.2} GiB returned to the filesystem"
+             {freed_gib:.2} GiB being returned to the filesystem"
         );
     } else {
         info!(
@@ -759,7 +766,7 @@ pub fn log_migration_complete(kept: u64, shed: u64, freed_bytes: u64) {
             shed,
             freed_bytes,
             "Storage migration complete: kept {kept} chunks, shed {shed} that would not fit, \
-             {freed_gib:.2} GiB returned to the filesystem. The shed keys are the ones this \
+             {freed_gib:.2} GiB being returned to the filesystem. The shed keys are the ones this \
              node was furthest from; replication will refetch what still belongs here now \
              that there is room."
         );
@@ -1228,6 +1235,8 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
             held.give_up();
         }
 
+        maybe_recover_lost_handle(&store).await;
+
         match store.migration_phase() {
             MigrationPhase::FilesOnly => return,
             MigrationPhase::Bridging => {
@@ -1301,6 +1310,17 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 }
             }
         }
+    }
+}
+
+/// Put a lost legacy handle back, if there is one to put back.
+///
+/// A node that lost its handle to an environment still on disk cannot read the chunks that
+/// live only there. The cause is usually transient, so this runs every tick rather than
+/// leaving the node half-blind until somebody restarts it.
+async fn maybe_recover_lost_handle(store: &Arc<ChunkStore>) {
+    if store.recover_lost_legacy_handle().await {
+        info!("Reopened the legacy chunk environment; the migration continues");
     }
 }
 
@@ -1845,8 +1865,11 @@ async fn retire_tick(
                 proof
             }
             Err(e) => {
+                // A pass that failed is not progress, however quickly it failed, and
+                // treating it as work would let a node whose store cannot be read hold
+                // the volume against every other node on the machine for good.
                 warn!("Pre-retirement verification failed: {e}. Retrying on the next tick.");
-                return RetireOutcome::Working;
+                return RetireOutcome::NoWorkToSerialise;
             }
         },
     };

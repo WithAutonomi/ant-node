@@ -603,30 +603,8 @@ impl FileStore {
         // So the bytes decide. Checked before the reservation below, so re-storing a chunk
         // this node already holds stays a no-op on a full disk.
         if self.index.read().contains(address) {
-            match self.stored_bytes_match(address).await {
-                StoredBytes::Good => {
-                    trace!("Chunk {} already exists", hex::encode(address));
-                    {
-                        let mut stats = self.stats.write();
-                        stats.duplicates = stats.duplicates.saturating_add(1);
-                    }
-                    return Ok(false);
-                }
-                StoredBytes::Wrong => {
-                    warn!(
-                        "Chunk {} is indexed but its bytes are wrong; replacing it with \
-                         the copy just offered",
-                        hex::encode(address)
-                    );
-                    self.repair(address, content).await?;
-                    return Ok(true);
-                }
-                // Indexed but gone: publish it fresh rather than replacing something that
-                // is not there.
-                StoredBytes::Absent => {}
-                // Unanswerable this time. Do not touch what is there; the offer is
-                // declined as a duplicate, and the next verifying read decides.
-                StoredBytes::Unreadable => return Ok(false),
+            if let Some(answer) = self.settle_indexed_duplicate(address, content).await {
+                return answer;
             }
         }
 
@@ -738,6 +716,46 @@ impl FileStore {
                 .map_err(|e| Error::Storage(format!("Could not flush {}: {e}", dir.display())))?;
         }
         Ok(())
+    }
+
+    /// Decide what to do about a write of a chunk the index already names.
+    ///
+    /// `None` means the index was wrong and there is nothing on disk, so the caller
+    /// publishes it as new. Everything else is the answer.
+    async fn settle_indexed_duplicate(
+        &self,
+        address: &XorName,
+        content: &[u8],
+    ) -> Option<Result<bool>> {
+        match self.stored_bytes_match(address).await {
+            StoredBytes::Good => {
+                trace!("Chunk {} already exists", hex::encode(address));
+                {
+                    let mut stats = self.stats.write();
+                    stats.duplicates = stats.duplicates.saturating_add(1);
+                }
+                Some(Ok(false))
+            }
+            StoredBytes::Wrong => {
+                warn!(
+                    "Chunk {} is indexed but its bytes are wrong; replacing it with the \
+                     copy just offered",
+                    hex::encode(address)
+                );
+                Some(self.repair(address, content).await.map(|()| true))
+            }
+            // Indexed but gone: publish it fresh rather than replacing something that is
+            // not there.
+            StoredBytes::Absent => None,
+            // Unanswerable this time. Do not touch what is there, and do not tell the
+            // caller the chunk is safely stored either: a client would take that as an
+            // acknowledgement and drop the only other copy.
+            StoredBytes::Unreadable => Some(Err(Error::Storage(format!(
+                "Chunk {} is indexed but could not be read to check it. Not replacing it, \
+                 and not reporting it as stored.",
+                hex::encode(address)
+            )))),
+        }
     }
 
     /// The size of the file behind `address`, if there is one.
@@ -1153,27 +1171,32 @@ impl FileStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
-        let outcome = self
-            .blocking_tracker
-            .spawn_blocking(move || -> std::io::Result<bool> {
-                let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
-                let buf = match open_regular(&path) {
-                    Ok(Some(f)) => read_bounded(f, &path).unwrap_or_default(),
-                    Ok(None) => {
-                        index.write().remove(&key);
-                        return Ok(true);
+        let outcome =
+            self.blocking_tracker
+                .spawn_blocking(move || -> std::io::Result<bool> {
+                    let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                    // Nothing is thrown away without proof. A re-read that fails says the
+                    // question could not be answered this time, not that the bytes are wrong,
+                    // and a repair may have published a good copy since the read that brought
+                    // us here. Treating either as corruption deletes a chunk this node has.
+                    let buf = match open_regular(&path) {
+                        Ok(Some(f)) => read_bounded(f, &path)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?,
+                        Ok(None) => {
+                            index.write().remove(&key);
+                            return Ok(true);
+                        }
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    };
+                    if crate::client::compute_address(&buf) == key {
+                        // Repaired between the failing read and now. Leave it alone.
+                        return Ok(false);
                     }
-                    Err(_) => Vec::new(),
-                };
-                if crate::client::compute_address(&buf) == key {
-                    // Repaired between the failing read and now. Leave it alone.
-                    return Ok(false);
-                }
-                std::fs::remove_file(&path)?;
-                index.write().remove(&key);
-                Ok(true)
-            })
-            .await;
+                    std::fs::remove_file(&path)?;
+                    index.write().remove(&key);
+                    Ok(true)
+                })
+                .await;
         match outcome {
             Ok(Ok(true)) => warn!(
                 "Removed corrupt chunk file {}; replication will repair it",

@@ -53,6 +53,12 @@ pub const RETIRED_SUFFIX: &str = ".retired";
 /// authorise deleting an environment that had since taken a chunk.
 const RETIRED_MARKER: &str = "RETIRED";
 
+/// How many times the background reaper retries deleting a retired directory.
+const RETIRED_DELETE_ATTEMPTS: u32 = 5;
+
+/// Base wait between those attempts, multiplied by the attempt number.
+const RETIRED_DELETE_BACKOFF: Duration = Duration::from_secs(10);
+
 /// How many retired directories may be waiting to be deleted before the node stops
 /// finding new names for them. Far more than a node should ever accumulate.
 const MAX_TOMBSTONES: u32 = 64;
@@ -595,16 +601,10 @@ impl ChunkStore {
         if !self.files.exists(address).unwrap_or(false) {
             return false;
         }
-        // Cheap first: a length that does not match cannot be these bytes, and this is the
-        // shape an interrupted create leaves.
-        if self.files.stored_len(address) != Some(content.len()) {
-            warn!(
-                "Chunk {} is on disk at the wrong length; replacing it with the copy just \
-                 offered",
-                hex::encode(address)
-            );
-            return self.files.repair(address, content).await.is_ok();
-        }
+        // No cheap length pre-check. `metadata` failing is not the same as a length that
+        // does not match, and off Unix replacing a chunk truncates it in place, so acting
+        // on an unanswered question would empty a healthy sole copy. The read below
+        // distinguishes them.
         match self.files.get_raw(address).await {
             Ok(Some(stored)) if stored == content => true,
             Ok(_) => {
@@ -615,7 +615,8 @@ impl ChunkStore {
                 );
                 self.files.repair(address, content).await.is_ok()
             }
-            // Unreadable. Not claimed as held, so the offer goes through the normal path.
+            // Unanswerable this time. Not claimed as held, so the offer goes through the
+            // ordinary path, which writes it rather than replacing anything.
             Err(e) => {
                 warn!("Could not read {} to check it: {e}", hex::encode(address));
                 false
@@ -1402,6 +1403,31 @@ impl ChunkStore {
         Ok(freed)
     }
 
+    /// Try again to open a legacy environment this node has lost its handle to.
+    ///
+    /// A rename that failed and then could not be reopened leaves the directory on disk
+    /// with no way to read it, and every chunk that lives only there unserved. Saying so
+    /// once and waiting for a restart is not enough: the reason is usually transient, and
+    /// a node that is otherwise healthy should not stay half-blind until somebody notices.
+    ///
+    /// Returns whether it came back. Does nothing when there is a handle already, or when
+    /// there is nothing on disk to open.
+    pub async fn recover_lost_legacy_handle(&self) -> bool {
+        if self.has_legacy() || directory_is_retired(&self.legacy_env_dir) {
+            return false;
+        }
+        if !legacy_present(&self.config.root_dir).unwrap_or(false) {
+            return false;
+        }
+        // Exclusive, because it puts a handle back that reads and writes will start using
+        // the moment it is there.
+        let _recovering = self.retirement.write().await;
+        if self.has_legacy() {
+            return false;
+        }
+        self.reopen_legacy().await
+    }
+
     /// Reopen the legacy store after a failed retirement, so the node keeps serving.
     ///
     /// Returns whether it came back. The handle is closed before the rename is attempted,
@@ -1549,6 +1575,19 @@ node start finishes it. Nothing needs it.\n",
              survive a power loss.",
             path.display()
         ))
+    })?;
+    // And the directory that now contains it. Flushing the file makes its contents
+    // durable; the entry naming it is in the directory, and on Unix that needs its own
+    // flush. Without this the mark can be missing after a crash from a directory that
+    // was in fact retired, which is the whole question this file answers.
+    crate::storage::file_store::fsync_path(dir).map_err(|e| {
+        let _ = std::fs::remove_file(&path);
+        Error::Storage(format!(
+            "Marked {} retired but could not flush {}: {e}. Not deleting on the strength \
+             of a mark that may not survive a power loss.",
+            path.display(),
+            dir.display()
+        ))
     })
 }
 
@@ -1559,22 +1598,46 @@ node start finishes it. Nothing needs it.\n",
 /// is finished by the next start. What matters is that neither shutdown nor startup ever
 /// blocks on a recursive delete that can run for minutes.
 fn delete_retired_directory(dir: PathBuf) {
-    if let Err(e) = std::thread::Builder::new()
+    let named = dir.clone();
+    let started = std::thread::Builder::new()
         .name("chunk-store-retire".into())
-        .spawn(move || match std::fs::remove_dir_all(&dir) {
-            Ok(()) => info!(
-                "Removed the retired chunk environment {} and returned its space",
-                dir.display()
-            ),
-            Err(e) => warn!(
-                "The chunk environment has been retired but {} could not be deleted: {e}. \
-                 Its space is not returned until it is, and the node needs nothing from \
-                 it. The next start tries again.",
-                dir.display()
-            ),
-        })
-    {
-        warn!("Could not start the thread to delete a retired chunk environment: {e}");
+        .spawn(move || {
+            for attempt in 1..=RETIRED_DELETE_ATTEMPTS {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => {
+                        info!(
+                            migration_event = "space_returned",
+                            "Removed the retired chunk environment {} and returned its \
+                             space",
+                            dir.display()
+                        );
+                        return;
+                    }
+                    // Worth another go: on Windows a scanner or an antivirus can hold a
+                    // handle inside it for a moment, and a partial delete leaves less to
+                    // do next time.
+                    Err(e) if attempt < RETIRED_DELETE_ATTEMPTS => {
+                        debug!(
+                            "Could not delete {} (attempt {attempt}): {e}. Trying again.",
+                            dir.display()
+                        );
+                        std::thread::sleep(RETIRED_DELETE_BACKOFF * attempt);
+                    }
+                    Err(e) => warn!(
+                        "The chunk environment has been retired but {} could not be \
+                         deleted: {e}. Its space is not returned until it is, and the node \
+                         needs nothing from it. The next start tries again.",
+                        dir.display()
+                    ),
+                }
+            }
+        });
+    if let Err(e) = started {
+        warn!(
+            "Could not start the thread to delete the retired chunk environment {}: {e}. \
+             The next start sweeps it.",
+            named.display()
+        );
     }
 }
 
@@ -1635,10 +1698,60 @@ fn sweep_retired_legacy(root_dir: &Path) {
         );
         return;
     }
-    // Detached, so a node starting beside a large leftover directory serves immediately
-    // rather than waiting out a recursive delete before it opens its store.
     for tombstone in tombstones {
-        delete_retired_directory(tombstone);
+        // The name is not the evidence. Only the directory's own mark is: a crash between
+        // the rename and the mark leaves an intact environment sitting under the retired
+        // name, and deleting that because of what it is called would destroy every chunk
+        // in it.
+        if directory_is_retired(&tombstone) {
+            // Detached, so a node starting beside a large leftover directory serves
+            // immediately rather than waiting out a recursive delete before it opens its
+            // store.
+            delete_retired_directory(tombstone);
+            continue;
+        }
+        restore_unmarked_environment(root_dir, &tombstone);
+    }
+}
+
+/// Put an intact environment back under its own name.
+///
+/// An environment under the retired name with no mark inside it was renamed and then
+/// interrupted before it could be marked. Nothing was deleted, so it is whole, and the
+/// answer is to give it its name back and let the migration run again from the beginning:
+/// every gate is re-derived, and a second retirement costs a pass, not data.
+fn restore_unmarked_environment(root_dir: &Path, tombstone: &Path) {
+    let env = root_dir.join(LEGACY_ENV_DIR);
+    if env.try_exists().unwrap_or(true) {
+        // Both names are taken, so which one the node should serve is not this code's
+        // decision to make.
+        error!(
+            "{} and {} both exist, and {} carries no retirement mark, so it may hold \
+             chunks. Neither has been touched. Move or remove one by hand: the node is \
+             using {}.",
+            env.display(),
+            tombstone.display(),
+            tombstone.display(),
+            env.display()
+        );
+        return;
+    }
+    match std::fs::rename(tombstone, &env) {
+        Ok(()) => {
+            let _ = crate::storage::file_store::fsync_path(root_dir);
+            warn!(
+                "{} was moved aside for retirement but never marked retired, so it is \
+                 intact. It has been restored to {} and the migration starts again.",
+                tombstone.display(),
+                env.display()
+            );
+        }
+        Err(e) => error!(
+            "{} carries no retirement mark, so it may hold chunks, but it could not be \
+             restored to {}: {e}. It has not been deleted.",
+            tombstone.display(),
+            env.display()
+        ),
     }
 }
 
@@ -2339,6 +2452,50 @@ mod tests {
             blocker.contains("no handle"),
             "the reason must name the actual problem, got: {blocker}"
         );
+    }
+
+    /// A directory under the retired name with no mark inside it is an intact store.
+    ///
+    /// It got that name from a rename, and the rename happens after every gate; the mark
+    /// is written straight afterwards. A crash in between leaves a whole environment
+    /// wearing a name that says otherwise, and deleting it because of what it is called
+    /// would destroy every chunk in it. It is put back instead.
+    #[tokio::test]
+    async fn an_unmarked_retired_directory_is_restored_rather_than_deleted() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["not-really-retired"]).await;
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+        std::fs::rename(&env, &tombstone).expect("rename");
+        assert!(!directory_is_retired(&tombstone));
+
+        let store = open(&dir).await;
+        assert!(
+            store.has_legacy(),
+            "an unmarked environment must be restored and served, not deleted"
+        );
+        assert!(env.exists(), "it must be back under its own name");
+        for key in &keys {
+            assert!(store.get(key).await.expect("get").is_some());
+        }
+    }
+
+    /// Both names taken is not a decision this code makes.
+    #[tokio::test]
+    async fn an_unmarked_retired_directory_beside_a_live_one_is_left_alone() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["live"]).await;
+        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+        std::fs::create_dir_all(&tombstone).expect("mkdir");
+        std::fs::write(tombstone.join("data.mdb"), b"something").expect("write");
+
+        let store = open(&dir).await;
+        assert!(store.has_legacy());
+        assert!(
+            tombstone.exists(),
+            "an unmarked directory must never be deleted, even beside a live one"
+        );
+        assert!(dir.path().join(LEGACY_ENV_DIR).exists());
     }
 
     /// A single node can still be told to keep both stores.
