@@ -70,6 +70,15 @@ const STATE_SCHEMA: u32 = 1;
 /// gossiped. Four hours clears that with an hour to spare.
 pub const MIN_RETIRE_DELAY_HOURS: u64 = 4;
 
+/// The longest one node may hold the volume migration lock before giving others a turn.
+///
+/// Every branch that waits rather than works is meant to give the lock back on its own.
+/// This is the backstop for the one that does not: without it, a node stuck on a condition
+/// that never resolves stops every other node sharing the disk from ever starting, for the
+/// whole release. Longer than a copy pass and a verification take, so it never interrupts
+/// a node that is genuinely working.
+const MAX_VOLUME_LOCK_HOLD: Duration = Duration::from_secs(6 * 3600);
+
 /// How many commitment rebuilds must be observed after the node commits to its
 /// file-backed set before the legacy environment may be retired.
 ///
@@ -567,6 +576,25 @@ fn lock_path_for(root_dir: &Path) -> PathBuf {
             return std::env::temp_dir().join(format!("ant-migration-{}.lock", meta.dev()));
         }
     }
+    // Off Unix, the volume root: the drive or share the path starts from. Not as precise
+    // as a device id, since a mount point below it belongs to another volume, but it
+    // groups the ordinary case of several nodes under one drive letter, which is what a
+    // lock beside each node's own root does not.
+    #[cfg(not(unix))]
+    {
+        use std::path::Component;
+        if let Some(Component::Prefix(prefix)) = root_dir.components().next() {
+            let key: String = prefix
+                .as_os_str()
+                .to_string_lossy()
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .collect();
+            if !key.is_empty() {
+                return std::env::temp_dir().join(format!("ant-migration-{key}.lock"));
+            }
+        }
+    }
     root_dir
         .parent()
         .unwrap_or(root_dir)
@@ -886,9 +914,14 @@ impl MigrationContext {
         ) else {
             return None;
         };
+        // Self-inclusive, then self filtered out. The self-excluding call would return
+        // `close_group_size` *remote* peers, one more than the group actually has, and the
+        // threshold is computed from a group that includes this node. Four real
+        // neighbours plus one peer outside the group would then clear a bar meant to
+        // require five real ones.
         let closest = p2p
             .dht_manager()
-            .find_closest_nodes_local(self_xor, self.close_group_size)
+            .find_closest_nodes_local_with_self(self_xor, self.close_group_size)
             .await;
         let peers: Vec<PeerId> = closest
             .iter()
@@ -1002,8 +1035,11 @@ pub async fn unconfirmed_by_neighbours(
         let mut targets_by_key: HashMap<XorName, Vec<PeerId>> = HashMap::new();
         let mut keys_by_peer: HashMap<PeerId, Vec<XorName>> = HashMap::new();
         for key in batch {
+            // Self-inclusive, matching the pruner, whose evidence this is. The
+            // self-excluding call returns one peer more than the key's group holds, and a
+            // proof from a peer outside it is not evidence the chunk stays in it.
             let closest = dht
-                .find_closest_nodes_local(key, config.close_group_size)
+                .find_closest_nodes_local_with_self(key, config.close_group_size)
                 .await;
             let peers: Vec<PeerId> = closest
                 .iter()
@@ -1144,6 +1180,11 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
 
     let tick = Duration::from_secs(config.tick_secs.max(1));
     let mut volume_lock: Option<VolumeLock> = None;
+    // When the current lock was taken, so no single node can hold the volume against
+    // every other node on the machine indefinitely. Each branch below is meant to give
+    // the lock back when it is waiting rather than working; this is the backstop for the
+    // one that turns out not to.
+    let mut held_since: Option<Instant> = None;
     let mut next_shed_evaluation = Instant::now();
     // A clean verification is a full re-read of everything both stores hold. If
     // retirement is then deferred (a read still holds the legacy handle), re-hashing on
@@ -1157,6 +1198,19 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 return;
             }
             () = tokio::time::sleep(tick) => {}
+        }
+
+        // Never hold the volume against the rest of the machine for longer than this,
+        // whatever the node is waiting on. Dropping it costs a tick: if nobody else wants
+        // it, the branches below take it straight back.
+        if held_since.is_some_and(|at| at.elapsed() >= MAX_VOLUME_LOCK_HOLD) {
+            debug!(
+                "Held the volume migration lock for {} hour(s); giving it back so any \
+                 other node on this volume gets a turn",
+                MAX_VOLUME_LOCK_HOLD.as_secs() / 3600
+            );
+            volume_lock = None;
+            held_since = None;
         }
 
         match store.migration_phase() {
@@ -1192,6 +1246,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                     // Copying is blocked on something only an operator can change, so
                     // stop holding the volume lock against the other nodes here.
                     volume_lock = None;
+                    held_since = None;
                 }
             }
             MigrationPhase::Committed => {
@@ -1200,7 +1255,10 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 // verify it) is exactly the disk-heavy work the lock exists to serialise.
                 if volume_lock.is_none() {
                     match VolumeLock::try_acquire(store.root_dir(), config.lock_dir.as_deref()) {
-                        LockAttempt::Acquired(lock) => volume_lock = Some(lock),
+                        LockAttempt::Acquired(lock) => {
+                            volume_lock = Some(lock);
+                            held_since = Some(Instant::now());
+                        }
                         LockAttempt::Busy => {
                             debug!("Another node on this volume is migrating; waiting");
                             continue;
@@ -1218,6 +1276,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                         // node per volume copies and the other eleven do nothing for the
                         // whole release.
                         volume_lock = None;
+                        held_since = None;
                     }
                 }
             }
@@ -1464,7 +1523,21 @@ async fn keys_this_node_must_not_give_up(
 async fn every_gate_still_holds(
     store: &Arc<ChunkStore>,
     context: &MigrationContext,
+    candidates: &std::collections::BTreeSet<XorName>,
 ) -> Option<RetireOutcome> {
+    // A key that joined the legacy-only set since the snapshot was taken has been through
+    // none of this. Stop now rather than asking the gates about a set that has already
+    // moved; the next tick copies it and takes a fresh snapshot.
+    let live: std::collections::BTreeSet<XorName> = store.legacy_only_keys().into_iter().collect();
+    if live != *candidates {
+        debug!(
+            "Legacy environment not retired: the set changed while the gates were being \
+             checked ({} keys then, {} now)",
+            candidates.len(),
+            live.len()
+        );
+        return Some(RetireOutcome::Waiting);
+    }
     if !keys_this_node_must_not_give_up(store, context)
         .await
         .is_empty()
@@ -1472,7 +1545,7 @@ async fn every_gate_still_holds(
         debug!("Legacy environment not retired: the shed rule changed during verification");
         return Some(RetireOutcome::Waiting);
     }
-    if let Some(outcome) = shedding_is_still_safe(store, context).await {
+    if let Some(outcome) = shedding_is_still_safe(store, context, candidates).await {
         return Some(outcome);
     }
     // And the retention contract once more, for the same reason.
@@ -1491,12 +1564,12 @@ async fn every_gate_still_holds(
 async fn shedding_is_still_safe(
     store: &Arc<ChunkStore>,
     context: &MigrationContext,
+    shedding: &std::collections::BTreeSet<XorName>,
 ) -> Option<RetireOutcome> {
     // Nothing below is reached until the node has reduced its commitment (the phase
     // is `Committed`) and that reduction has been rebuilt and published. What remains
     // is to confirm the close group has actually *received* it, and that the chunks
     // being given up still exist elsewhere. Only then is anything deleted.
-    let shedding = store.legacy_only_keys();
     if !shedding.is_empty() {
         // A rotation is not the same as neighbours knowing. Until they have the
         // smaller key set they keep auditing this node against the one it used to
@@ -1530,12 +1603,16 @@ async fn shedding_is_still_safe(
                     .as_ref()
                     .map_or(0, |s| s.current_delivered_peer_count())
             );
-            return Some(RetireOutcome::Waiting);
+            // Give the volume back while waiting on this. It is a network condition, not
+            // a disk one, and it may never resolve: holding the lock through it would let
+            // one node stop every other node on the machine from ever starting.
+            return Some(RetireOutcome::NoWorkToSerialise);
         }
         // Asked again here, not only when the node committed. Hours pass in between,
         // the group moves, and a peer that held a copy then may not now. This is the
         // last moment at which the answer still matters.
-        let unconfirmed = unconfirmed_by_neighbours(store, context, &shedding).await;
+        let ordered: Vec<XorName> = shedding.iter().copied().collect();
+        let unconfirmed = unconfirmed_by_neighbours(store, context, &ordered).await;
         if !unconfirmed.is_empty() {
             let sample: Vec<String> = unconfirmed
                 .iter()
@@ -1662,16 +1739,19 @@ async fn retire_tick(
         return RetireOutcome::NoWorkToSerialise;
     }
 
-    if let Some(outcome) = every_gate_still_holds(store, context).await {
+    // Snapshotted BEFORE the gates, not after. Every gate below is asked about exactly
+    // this set, and exactly this set is what the removal is permitted to destroy. Taken
+    // afterwards, a key that joined between the last gate and the snapshot would be
+    // counted as approved having passed nothing, which is the case the gates exist for.
+    let approved: std::collections::BTreeSet<XorName> =
+        store.legacy_only_keys().into_iter().collect();
+
+    if let Some(outcome) = every_gate_still_holds(store, context, &approved).await {
         return outcome;
     }
 
     let kept = store.current_chunks().unwrap_or(0);
     let shed = store.migration_state().shed_key_count;
-    // Exactly the set the gates above cleared. Anything that joins it between here and
-    // the removal has passed nothing, and the removal refuses rather than destroying it.
-    let approved: std::collections::BTreeSet<XorName> =
-        store.legacy_only_keys().into_iter().collect();
     match store
         .retire_legacy(
             &proof,

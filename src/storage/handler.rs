@@ -521,20 +521,19 @@ impl AntProtocol {
 
         // 3. Check if already exists (idempotent success)
         //
-        // Asked with the length, not by name alone. A name can outlive the bytes under it,
-        // and answering `AlreadyExists` to a good copy of a chunk this node holds only a
-        // damaged version of throws that copy away and does not get offered another.
-        match self.storage.holds_exactly(&address, request.content.len()) {
-            Ok(true) => {
-                debug!("Chunk {addr_hex} already exists");
-                return ChunkPutResponse::AlreadyExists { address };
-            }
-            Err(e) => {
-                return ChunkPutResponse::Error(ProtocolError::Internal(format!(
-                    "Storage read failed: {e}"
-                )));
-            }
-            Ok(false) => {}
+        // Verified against the offered bytes, not answered from the name. A name can
+        // outlive the bytes under it, and acknowledging a good copy of a chunk this node
+        // holds only a damaged version of throws that copy away and does not get offered
+        // another. Reached only when this node already has the chunk, and the content
+        // address was checked in step 2, so a damaged copy is repaired from these bytes
+        // rather than the offer being refused.
+        if self
+            .storage
+            .holds_verified(&address, &request.content)
+            .await
+        {
+            debug!("Chunk {addr_hex} already exists");
+            return ChunkPutResponse::AlreadyExists { address };
         }
 
         // 4. Cheap disk-space pre-check — runs BEFORE the expensive payment

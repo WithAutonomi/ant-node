@@ -829,6 +829,10 @@ impl RunningNode {
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
         }
+        // Cancelled first, so anything still queued behind the concurrency permits gives
+        // up rather than starting fresh storage work, then given a moment to finish what
+        // is genuinely in flight.
+        self.shutdown.cancel();
         self.protocol_children.close();
         if tokio::time::timeout(PROTOCOL_DRAIN_GRACE, self.protocol_children.wait())
             .await
@@ -944,6 +948,58 @@ impl RunningNode {
         Ok(())
     }
 
+    /// Handle one inbound protocol message and send whatever it produced.
+    async fn answer_one_request(
+        protocol: &Arc<AntProtocol>,
+        p2p: &Arc<P2PNode>,
+        source: &saorsa_core::identity::PeerId,
+        data: &[u8],
+        data_type: &str,
+        response_topic: &str,
+        received_at: Instant,
+    ) {
+        if data_type != "chunk" {
+            return;
+        }
+        let queue_wait = received_at.elapsed();
+        let handled = protocol
+            .try_handle_request_with_context(
+                data,
+                Some(ChunkRequestContext::new(
+                    source.to_string(),
+                    received_at,
+                    queue_wait,
+                )),
+            )
+            .await;
+        let telemetry = handled.get_telemetry;
+        match handled.response {
+            Ok(Some(response)) => {
+                let send_started = Instant::now();
+                let send_result = p2p
+                    .send_message(source, response_topic, response.to_vec(), &[])
+                    .await;
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish_send(send_started.elapsed(), send_result.is_ok());
+                }
+                if let Err(e) = send_result {
+                    warn!("Failed to send {data_type} protocol response to {source}: {e}");
+                }
+            }
+            Ok(None) => {
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish_without_send("no_response");
+                }
+            }
+            Err(e) => {
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish_without_send("encode_error");
+                }
+                warn!("{data_type} protocol handler error: {e}");
+            }
+        }
+    }
+
     /// Start the protocol message routing background task.
     ///
     /// Subscribes to P2P events and routes incoming chunk protocol messages
@@ -958,6 +1014,7 @@ impl RunningNode {
         let p2p = Arc::clone(&self.p2p_node);
         let semaphore = Arc::new(Semaphore::new(64));
         let children = self.protocol_children.clone();
+        let stopping = self.shutdown.clone();
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -980,60 +1037,38 @@ impl RunningNode {
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
+                        let stopping = stopping.clone();
                         children.spawn(async move {
-                            let Ok(_permit) = sem.acquire().await else {
+                            // A queued handler must not start work once shutdown has
+                            // begun. With 64 permits and a busy node the queue behind them
+                            // can be long, and every one of those would otherwise start
+                            // fresh storage reads while the store beneath is being torn
+                            // down.
+                            let _permit = {
+                                let acquired = tokio::select! {
+                                    biased;
+                                    () = stopping.cancelled() => return,
+                                    p = sem.acquire() => p,
+                                };
+                                match acquired {
+                                    Ok(permit) => permit,
+                                    Err(_) => return,
+                                }
+                            };
+                            // Checked again: the wait for a permit may have been long.
+                            if stopping.is_cancelled() {
                                 return;
-                            };
-                            let queue_wait = received_at.elapsed();
-                            let handled = match data_type {
-                                "chunk" => {
-                                    protocol
-                                        .try_handle_request_with_context(
-                                            &data,
-                                            Some(ChunkRequestContext::new(
-                                                source.to_string(),
-                                                received_at,
-                                                queue_wait,
-                                            )),
-                                        )
-                                        .await
-                                }
-                                _ => return,
-                            };
-                            let telemetry = handled.get_telemetry;
-                            match handled.response {
-                                Ok(Some(response)) => {
-                                    let send_started = Instant::now();
-                                    let send_result = p2p
-                                        .send_message(
-                                            &source,
-                                            response_topic,
-                                            response.to_vec(),
-                                            &[],
-                                        )
-                                        .await;
-                                    if let Some(telemetry) = telemetry {
-                                        telemetry.finish_send(
-                                            send_started.elapsed(),
-                                            send_result.is_ok(),
-                                        );
-                                    }
-                                    if let Err(e) = send_result {
-                                        warn!("Failed to send {data_type} protocol response to {source}: {e}");
-                                    }
-                                }
-                                Ok(None) => {
-                                    if let Some(telemetry) = telemetry {
-                                        telemetry.finish_without_send("no_response");
-                                    }
-                                }
-                                Err(e) => {
-                                    if let Some(telemetry) = telemetry {
-                                        telemetry.finish_without_send("encode_error");
-                                    }
-                                    warn!("{data_type} protocol handler error: {e}");
-                                }
                             }
+                            Self::answer_one_request(
+                                &protocol,
+                                &p2p,
+                                &source,
+                                &data,
+                                data_type,
+                                response_topic,
+                                received_at,
+                            )
+                            .await;
                         });
                     }
                 }

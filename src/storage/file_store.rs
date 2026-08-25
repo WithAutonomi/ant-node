@@ -669,6 +669,39 @@ impl FileStore {
         }
     }
 
+    /// Flush every directory a chunk can live in, so the names in them are durable.
+    ///
+    /// Byte integrity is not the whole of what the pre-retirement proof has to establish.
+    /// A chunk whose contents are on the platter but whose *name* is not is still lost to
+    /// a power loss, and a publish whose rename landed and whose directory flush failed
+    /// leaves exactly that: the next attempt sees the name, the next verification reads
+    /// the right bytes, and nothing goes back to retry the flush. So the proof flushes
+    /// them itself rather than trusting that each publish did.
+    ///
+    /// Cheap: at most 257 directory flushes for a store of any size, and nothing off Unix,
+    /// where directories cannot be flushed and the retirement marker covers the same
+    /// ground instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] on the first directory that cannot be flushed. The
+    /// caller must treat that as a proof it did not get.
+    pub fn flush_namespace(&self) -> Result<()> {
+        fsync_dir(&self.chunks_dir).map_err(|e| {
+            Error::Storage(format!(
+                "Could not flush {}: {e}",
+                self.chunks_dir.display()
+            ))
+        })?;
+        let present = *self.shards_present.lock();
+        for (shard, _) in present.iter().enumerate().filter(|(_, here)| **here) {
+            let dir = self.chunks_dir.join(format!("{shard:02x}"));
+            fsync_dir(&dir)
+                .map_err(|e| Error::Storage(format!("Could not flush {}: {e}", dir.display())))?;
+        }
+        Ok(())
+    }
+
     /// The size of the file behind `address`, if there is one.
     ///
     /// One `metadata` call, no read. Used where an indexed name has to be checked against
@@ -739,12 +772,16 @@ impl FileStore {
             .await
             .map_err(|e| Error::Storage(format!("Chunk store repair task failed: {e}")))??;
 
-        // Released, not committed. The replacement took the place of a file of the same
-        // size, so nothing net was added to the disk, and charging it as new would make
-        // the guard believe the store is larger than it is until the next remeasurement.
-        // Dropping it does exactly that. The reservation did its job by holding the room
-        // for both copies while they briefly coexisted.
+        // Released rather than committed, because a repair is not a new chunk: it took the
+        // place of one that was already there, and charging it again would make the guard
+        // believe the store is larger than it is.
+        //
+        // But it is not free either. The file it replaced may have been shorter, which is
+        // exactly the case a repair fixes, so the difference is real bytes the cached
+        // measurement does not know about. Rather than guess at the net, throw the
+        // measurement away: the next admission takes a fresh one.
         drop(reservation);
+        self.invalidate_capacity_cache();
 
         debug!("Repaired chunk {}", hex::encode(address));
         Ok(())
