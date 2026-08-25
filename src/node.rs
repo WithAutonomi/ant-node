@@ -97,6 +97,12 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
+        // One release-level decision, applied before anything can audit: while the fleet
+        // moves off the legacy chunk store, a peer is not penalised for failing to hold a
+        // chunk it was supposed to be holding. It is still penalised for failing a
+        // commitment-bound audit. Audits of both kinds run and record throughout.
+        crate::replication::config::apply_close_group_storage_penalty_policy();
+
         // Create shutdown token
         let shutdown = CancellationToken::new();
 

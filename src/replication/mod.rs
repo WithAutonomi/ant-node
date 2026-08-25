@@ -5815,7 +5815,10 @@ async fn dispatch_fresh_offer(
                 responder_class = "fresh_offer",
                 source = %source,
                 key = %hex::encode(key),
-                "Fresh offer refused at admission — this node will be penalised                  for the resulting absence: {failure}"
+                penalty_suspended = config::close_group_storage_penalty_suspended(),
+                "Fresh offer refused at admission; the resulting absence is recorded \
+                 against this node, and penalised unless the release withholds it: \
+                 {failure}"
             );
             // Release the key explicitly rather than on drop, so the next offer
             // opens a fresh entry rather than queueing behind a handler that was
@@ -8171,7 +8174,7 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
 
         // Step 5: Update queues with the evaluated outcomes.
-        let mut bad_singleton_hints: HashMap<PeerId, usize> = HashMap::new();
+        let mut bad_singleton_hints: HashMap<(PeerId, SingletonHintFault), usize> = HashMap::new();
         let mut q = queues.write().await;
         for (key, outcome) in evaluated {
             let replica_hint_sources = q
@@ -8232,20 +8235,38 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
         }
         drop(q);
 
-        for (peer, bad_hint_count) in bad_singleton_hints {
+        for ((peer, fault), bad_hint_count) in bad_singleton_hints {
             let reports = bad_hint_count.min(MAX_BAD_HINT_TRUST_REPORTS_PER_PEER_PER_CYCLE);
             warn!(
                 "Peer {peer} submitted {bad_hint_count} rejected or self-contradicting \
-                 sole-source replica hints; \
+                 sole-source replica hints ({fault:?}); \
                  reporting {reports} bounded trust failure(s)"
             );
             for _ in 0..reports {
-                p2p_node
-                    .report_trust_event(
-                        &peer,
-                        TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                    )
-                    .await;
+                match fault {
+                    // A claim about a key that does not exist. Punishable whatever the
+                    // sender's disk is doing.
+                    SingletonHintFault::RejectedByCloseGroup => {
+                        p2p_node
+                            .report_trust_event(
+                                &peer,
+                                TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
+                            )
+                            .await;
+                    }
+                    // "I advertised it and no longer have it." That is the one statement a
+                    // node short of disk cannot avoid making while it moves its chunks, so
+                    // it goes through the release switch.
+                    SingletonHintFault::DeniedPossession => {
+                        config::penalise_unheld_close_group_chunk(
+                            p2p_node,
+                            &peer,
+                            "replica_hint_denied_possession",
+                            REPLICATION_TRUST_WEIGHT,
+                        )
+                        .await;
+                    }
+                }
             }
         }
     }
@@ -8297,25 +8318,43 @@ fn add_replica_hint_sources(sources: &mut Vec<PeerId>, replica_hint_sources: &Ha
     }
 }
 
+/// Why a sole-source replica hint is punishable.
+///
+/// The two cases look alike and are not. A hint the close group rejects outright is a
+/// claim about a key that does not exist, which is a bad hint however the sender's disk is
+/// doing. A sender that advertised a key and then answers `Absent` for it is making a
+/// statement about its own storage, and that is the one thing a node short of disk cannot
+/// avoid saying while it moves its chunks out of a store that will not give the space back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SingletonHintFault {
+    /// The close group says the key does not exist.
+    RejectedByCloseGroup,
+    /// The sender advertised the key and then denied holding it.
+    DeniedPossession,
+}
+
 /// Return the sole replica advertiser when either the close group definitively
-/// rejects the key or the advertiser explicitly denies possessing it.
+/// rejects the key or the advertiser explicitly denies possessing it, and say which.
 /// Paid-only advertisements, corroborated replica hints, and inconclusive
 /// rounds without that direct contradiction are deliberately non-penalizing.
 fn punishable_singleton_replica_hint_source(
     replica_hint_sources: &HashSet<PeerId>,
     outcome: &KeyVerificationOutcome,
     evidence: &crate::replication::types::KeyVerificationEvidence,
-) -> Option<PeerId> {
+) -> Option<(PeerId, SingletonHintFault)> {
     // A paid-only advertiser leaves this set empty, so the sole-source lane is
     // reserved for peers that actually claimed possession.
     if replica_hint_sources.len() != 1 {
         return None;
     }
     let source = *replica_hint_sources.iter().next()?;
-    let rejected_by_close_group = matches!(outcome, KeyVerificationOutcome::QuorumFailed);
-    let denied_possession = evidence.presence.get(&source) == Some(&PresenceEvidence::Absent);
-
-    (rejected_by_close_group || denied_possession).then_some(source)
+    if matches!(outcome, KeyVerificationOutcome::QuorumFailed) {
+        return Some((source, SingletonHintFault::RejectedByCloseGroup));
+    }
+    if evidence.presence.get(&source) == Some(&PresenceEvidence::Absent) {
+        return Some((source, SingletonHintFault::DeniedPossession));
+    }
+    None
 }
 
 /// Post-verification bootstrap bookkeeping: remove terminal keys from the
@@ -8793,12 +8832,16 @@ async fn execute_single_fetch(
                         "Fetch: verified source {source} returned NotFound for {}",
                         hex::encode(key)
                     );
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
+                    // A node short of the disk to hold its chunks answers exactly this
+                    // way, once per fetching peer per key, so this is one of the lanes
+                    // the release has to withhold.
+                    config::penalise_unheld_close_group_chunk(
+                        &p2p_node,
+                        &source,
+                        "fetch_not_found",
+                        REPLICATION_TRUST_WEIGHT,
+                    )
+                    .await;
                     FetchOutcome {
                         key,
                         result: FetchResult::SourceFailed,
@@ -8812,12 +8855,16 @@ async fn execute_single_fetch(
                         "Fetch: peer {source} returned error for {}: {reason}",
                         hex::encode(key)
                     );
-                    p2p_node
-                        .report_trust_event(
-                            &source,
-                            TrustEvent::ApplicationFailure(REPLICATION_TRUST_WEIGHT),
-                        )
-                        .await;
+                    // A node short of the disk to hold its chunks answers exactly this
+                    // way, once per fetching peer per key, so this is one of the lanes
+                    // the release has to withhold.
+                    config::penalise_unheld_close_group_chunk(
+                        &p2p_node,
+                        &source,
+                        "fetch_error",
+                        REPLICATION_TRUST_WEIGHT,
+                    )
+                    .await;
                     FetchOutcome {
                         key,
                         result: FetchResult::SourceFailed,
@@ -8905,6 +8952,10 @@ async fn handle_subtree_failed_audit(
         let mut provers_guard = recent_provers.write().await;
         apply_audit_failure_credit_revocation(&mut provers_guard, challenged_peer, reason);
     }
+    // Deliberately NOT routed through the release switch. This is the commitment-bound
+    // subtree audit: the peer published a signed claim to hold these keys and could not
+    // answer for them. That contract is enforced in every release, including the one that
+    // withholds the penalty for merely not holding a close-group chunk.
     p2p_node
         .report_trust_event(
             challenged_peer,
@@ -9097,12 +9148,13 @@ async fn handle_audit_result(
                 } else {
                     debug!("Audit timeout for {challenged_peer}; retaining active bootstrap claim");
                 }
-                p2p_node
-                    .report_trust_event(
-                        challenged_peer,
-                        TrustEvent::ApplicationFailure(config::AUDIT_FAILURE_TRUST_WEIGHT),
-                    )
-                    .await;
+                config::penalise_unheld_close_group_chunk(
+                    p2p_node,
+                    challenged_peer,
+                    crate::replication::audit_metrics::AuditType::ResponsibleChunk.as_str(),
+                    config::AUDIT_FAILURE_TRUST_WEIGHT,
+                )
+                .await;
             }
         }
         AuditTickResult::BootstrapClaim { peer } => {
@@ -10364,7 +10416,9 @@ mod tests {
 
         assert_eq!(
             punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
-            Some(source)
+            Some((source, SingletonHintFault::RejectedByCloseGroup)),
+            "a close-group rejection outranks the denial: the key does not exist, which is \
+             a bad hint however the sender's own disk is doing"
         );
         assert_eq!(
             punishable_singleton_replica_hint_source(
@@ -10387,7 +10441,7 @@ mod tests {
             .insert(source, PresenceEvidence::Unresolved);
         assert_eq!(
             punishable_singleton_replica_hint_source(&HashSet::from([source]), &failed, &evidence),
-            Some(source),
+            Some((source, SingletonHintFault::RejectedByCloseGroup)),
             "definitive close-group rejection is punishable without direct contradiction"
         );
         assert_eq!(
@@ -10409,8 +10463,10 @@ mod tests {
                 },
                 &evidence,
             ),
-            Some(source),
-            "an explicit denial is punishable regardless of the overall outcome"
+            Some((source, SingletonHintFault::DeniedPossession)),
+            "an explicit denial is punishable regardless of the overall outcome, and is \
+             classified separately because it is a statement about the sender's own \
+             storage rather than about the key"
         );
     }
 

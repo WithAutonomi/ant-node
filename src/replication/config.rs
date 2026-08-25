@@ -15,6 +15,11 @@ use std::time::Duration;
 use rand::Rng;
 
 use crate::ant_protocol::CLOSE_GROUP_SIZE;
+use crate::logging::{debug, info, warn};
+use saorsa_core::identity::PeerId;
+use saorsa_core::{P2PNode, TrustEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Static constants (compile-time reference profile)
@@ -668,6 +673,145 @@ pub(crate) const CAPACITY_BLOCKED_RETRY: Duration =
 /// Trust event weight for confirmed audit failures.
 pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
+/// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
+///
+/// **`true` while the fleet moves off the legacy LMDB chunk store; back to `false` once it
+/// has.** Flipping it is a one-line change in one release.
+///
+/// Deliberately narrow. It covers exactly one accusation: "you did not have a chunk you
+/// were supposed to be holding". It does **not** cover the commitment-bound subtree audit,
+/// where a peer published a signed claim to hold specific keys and could not answer for
+/// them. That contract stays enforced in every release.
+///
+/// The reason it has to exist at all is that the penalty is the *auditor's* decision. A
+/// node that has to give up chunks, because it cannot fit them while it moves them out of
+/// a store that never returns disk, cannot stop its peers penalising it for that. So the
+/// peers stop first, one release ahead, and the node moves in the next one.
+///
+/// A build constant rather than a config field on purpose: a node writes its effective
+/// configuration back to disk, so shipping this as an ordinary setting would bake this
+/// release's value into every operator's file and the next release would change nothing.
+pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
+
+/// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], for a canary.
+pub const SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV: &str = "ANT_SUSPEND_UNHELD_CHUNK_PENALTY";
+
+/// The live switch.
+///
+/// Initialised **from the release constant**, not to `false`. That matters: a code path
+/// that never applies the policy then behaves like this release rather than the previous
+/// one. Defaulting the other way meant any constructor that skipped the startup call would
+/// keep penalising nodes for the very thing this release exists to stop penalising, and
+/// `ReplicationEngine::new` is public and is constructed directly by test harnesses.
+///
+/// Process-wide rather than threaded through a parameter because it is exactly that: one
+/// release-level decision that every affected site has to obey identically, and those
+/// sites are spread across call graphs that share no configuration object.
+static CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED: AtomicBool =
+    AtomicBool::new(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+
+/// Apply this release's decision. Called once, before anything can audit.
+pub fn apply_close_group_storage_penalty_policy() {
+    let Ok(raw) = std::env::var(SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV) else {
+        apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+        return;
+    };
+    let suspended = match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        other => {
+            warn!(
+                "{SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV}={other} is not a boolean; \
+                 using the build default {RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY}"
+            );
+            RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY
+        }
+    };
+    apply_and_announce(suspended);
+}
+
+/// Set the switch and say so, once, where an operator will see it.
+///
+/// Both states are logged. An operator reading "penalties are suspended" and an operator
+/// reading nothing at all cannot tell the second from a missing log line, and the state
+/// that most needs to be visible is the one that disagrees with what the release intended.
+fn apply_and_announce(suspended: bool) {
+    set_close_group_storage_penalty_suspended(suspended);
+    if suspended != RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY {
+        warn!(
+            close_group_storage_penalty_suspended = suspended,
+            "{SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV} overrides this build: the penalty \
+             for not holding a close-group chunk is {}, where the release intends {}. \
+             Clear that variable unless this node is a deliberate canary.",
+            if suspended { "SUSPENDED" } else { "APPLIED" },
+            if RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY {
+                "SUSPENDED"
+            } else {
+                "APPLIED"
+            }
+        );
+    }
+    if suspended {
+        info!(
+            close_group_storage_penalty_suspended = true,
+            "This release does NOT penalise a peer for failing to hold a close-group \
+             chunk. Commitment-bound audits still penalise. Audits run and record \
+             throughout."
+        );
+    } else {
+        info!(
+            close_group_storage_penalty_suspended = false,
+            "This release penalises a peer for failing to hold a close-group chunk."
+        );
+    }
+}
+
+/// Set whether failing to hold a close-group chunk penalises.
+///
+/// Startup applies the release policy through this. Tests that mean to exercise the
+/// penalty itself set it explicitly, so what they assert is not an accident of whichever
+/// release they happen to be compiled against.
+pub fn set_close_group_storage_penalty_suspended(suspended: bool) {
+    CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.store(suspended, Ordering::Relaxed);
+}
+
+/// Whether failing to hold a close-group chunk currently penalises.
+#[must_use]
+pub fn close_group_storage_penalty_suspended() -> bool {
+    CLOSE_GROUP_STORAGE_PENALTY_SUSPENDED.load(Ordering::Relaxed)
+}
+
+/// Penalise `peer` at `weight` for not holding a chunk it was supposed to be holding,
+/// unless this release withholds that particular penalty.
+///
+/// Covers the responsible-chunk audit, the fresh-replication possession check, the prune
+/// audit, and the fetch paths where a peer that answered `Present` could not then serve
+/// the bytes. A node short of the disk to hold its chunks produces every one of those, so
+/// leaving any of them out would stop some of its accusers and not others.
+///
+/// Only the penalty is withheld. The caller has already logged the failure with its type,
+/// class and key, and that record is what tells us when it is safe to switch the penalty
+/// back on.
+pub async fn penalise_unheld_close_group_chunk(
+    p2p_node: &Arc<P2PNode>,
+    peer: &PeerId,
+    audit_type: &str,
+    weight: f64,
+) {
+    if close_group_storage_penalty_suspended() {
+        debug!(
+            audit_type,
+            peer = %peer,
+            "Recorded but not penalised: this release withholds the penalty for not \
+             holding a close-group chunk. Commitment-bound audits still penalise."
+        );
+        return;
+    }
+    p2p_node
+        .report_trust_event(peer, TrustEvent::ApplicationFailure(weight))
+        .await;
+}
+
 /// Probability of launching a subtree audit when a peer's *changed* commitment
 /// is ingested via gossip (ADR-0002). Keeps audits occasional surprise exams.
 pub const AUDIT_ON_GOSSIP_PROBABILITY: f64 = 0.2;
@@ -1258,6 +1402,7 @@ fn random_duration_in_range(min: Duration, max: Duration) -> Duration {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn defaults_pass_validation() {
@@ -1288,6 +1433,34 @@ mod tests {
     #[test]
     fn audit_failure_weight_is_five() {
         assert!((AUDIT_FAILURE_TRUST_WEIGHT - 5.0).abs() <= f64::EPSILON);
+    }
+
+    /// One test rather than several, because the switch is process-wide: separate tests
+    /// would race each other under the default parallel runner.
+    #[test]
+    #[serial]
+    fn the_unheld_chunk_penalty_switch_follows_the_release_it_is_compiled_into() {
+        // A build that never applies the policy still behaves like THIS release, not the
+        // previous one. `ReplicationEngine::new` is public and is constructed directly by
+        // test harnesses, so defaulting the other way would leave those engines penalising
+        // exactly what the release exists to stop penalising.
+        assert_eq!(
+            close_group_storage_penalty_suspended(),
+            RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY
+        );
+
+        set_close_group_storage_penalty_suspended(true);
+        assert!(close_group_storage_penalty_suspended());
+        set_close_group_storage_penalty_suspended(false);
+        assert!(!close_group_storage_penalty_suspended());
+
+        // And applying the release policy lands on whatever this build ships, without
+        // asserting the constant itself, which the follow-up release flips on purpose.
+        apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+        assert_eq!(
+            close_group_storage_penalty_suspended(),
+            RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY
+        );
     }
 
     #[test]
