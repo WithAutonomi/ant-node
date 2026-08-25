@@ -315,8 +315,22 @@ impl ChunkStore {
                         hex::encode(address)
                     );
                 } else {
-                    l.lmdb.put(address, content).await?;
-                    dual_written = true;
+                    // Best effort, and only best effort. The verdict above is optimistic
+                    // by design: LMDB can still refuse a write for fragmentation, pages
+                    // pinned by a long read, or a copy-on-write B-tree split. Propagating
+                    // that would let a store this node is in the middle of abandoning
+                    // reject paid chunks the file store has ample room for, for the whole
+                    // bridge period. The chunk's own validity is not at stake here; the
+                    // file store checks the content address itself.
+                    match l.lmdb.put(address, content).await {
+                        Ok(_) => dual_written = true,
+                        Err(e) => warn!(
+                            "Could not also write {} to the legacy environment: {e}. \
+                             Storing it in files only. A rollback to a pre-migration \
+                             build would not have this chunk.",
+                            hex::encode(address)
+                        ),
+                    }
                 }
             }
         }
@@ -353,6 +367,13 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] on an I/O failure, or when verification fails and no
     /// intact copy is available.
     pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        // Taken before the file is touched, and held for the whole read. A verifying read
+        // that finds rotted bytes throws the file away, and until this key is back in the
+        // legacy-only set there is a moment when it appears to live in neither store.
+        // Retirement decides it may delete the environment by proving it is the only
+        // holder of this handle, so holding one here is what stops it deleting the copy
+        // this read is about to fall back on.
+        let fallback = self.legacy();
         match self.files.get(address).await {
             Ok(Some(content)) => Ok(Some(content)),
             Ok(None) => {
@@ -360,7 +381,7 @@ impl ChunkStore {
                 // back into the union view: the file index has just dropped it, and a key
                 // in neither view is skipped by the verification pass and destroyed by
                 // retirement.
-                self.serve_from_legacy(address).await
+                self.serve_from_legacy(address, fallback).await
             }
             Err(e) => {
                 // Only a verification failure means the file store threw the file away.
@@ -377,7 +398,7 @@ impl ChunkStore {
                 );
                 // Nothing left anywhere reports the verification failure rather than a
                 // plain miss, so the caller can tell the difference.
-                self.serve_from_legacy(address)
+                self.serve_from_legacy(address, fallback)
                     .await?
                     .map_or(Err(e), |content| Ok(Some(content)))
             }
@@ -392,14 +413,18 @@ impl ChunkStore {
     /// both backings in between, and the key would then be re-inserted from bytes that no
     /// longer exist anywhere: a phantom entry that `exists` reports and `get` never
     /// satisfies.
-    async fn serve_from_legacy(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        if !self.has_legacy() {
-            return Ok(None);
-        }
-        let _lane = self.key_lock(address).await;
-        let Some(legacy) = self.legacy() else {
+    async fn serve_from_legacy(
+        &self,
+        address: &XorName,
+        legacy: Option<Legacy>,
+    ) -> Result<Option<Vec<u8>>> {
+        // The handle the caller took before it read the file. Not re-fetched here: the
+        // point of taking it early is that it has been held continuously since before the
+        // file could be thrown away, so retirement cannot have run in between.
+        let Some(legacy) = legacy else {
             return Ok(None);
         };
+        let _lane = self.key_lock(address).await;
         let Some(content) = legacy.lmdb.get(address).await? else {
             return Ok(None);
         };
@@ -421,21 +446,22 @@ impl ChunkStore {
     ///
     /// Returns [`Error::Storage`] on an I/O failure.
     pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        // Taken first, for the reason given on `get`: it has to have been held since
+        // before the file store was asked, or retirement can run in the gap between the
+        // file going missing and this key being put back in the union view.
+        let fallback = self.legacy();
         if let Some(content) = self.files.get_raw(address).await? {
             return Ok(Some(content));
-        }
-        if !self.has_legacy() {
-            return Ok(None);
         }
         // Deliberately not gated on the legacy-only set. A chunk that was copied and then
         // lost its file is not in that set, and the legacy environment is exactly where
         // its bytes still are. An LMDB miss is cheap. Goes through the same path as
         // `get`, so the key is restored to the union view rather than being served once
         // and then quietly retired away.
-        let _lane = self.key_lock(address).await;
-        let Some(legacy) = self.legacy() else {
+        let Some(legacy) = fallback else {
             return Ok(None);
         };
+        let _lane = self.key_lock(address).await;
         let raw = legacy.lmdb.get_raw(address).await?;
         let missing_locally = !self.files.exists(address).unwrap_or(false);
         if raw.is_some() && missing_locally {
@@ -464,6 +490,35 @@ impl ChunkStore {
             return Ok(true);
         }
         self.files.exists(address)
+    }
+
+    /// Does this node already hold `address` as a chunk of exactly `len` bytes?
+    ///
+    /// The question a responder should ask before turning away an offered copy. Plain
+    /// [`Self::exists`] answers from names alone, and a name can outlive the bytes under
+    /// it: off Unix a chunk is created under its final name before it is written, so a
+    /// crash leaves a short file that `exists` reports as a chunk. Acknowledging a client
+    /// or a replicating peer on the strength of that discards the copy that would repair
+    /// it, and nothing offers it again.
+    ///
+    /// A key held only in the legacy environment answers yes without a length check: those
+    /// bytes are verified on read, and the file that will replace them does not exist yet.
+    ///
+    /// # Errors
+    ///
+    /// Never fails. The signature matches [`Self::exists`], whose callers treat an error
+    /// as "absent".
+    pub fn holds_exactly(&self, address: &XorName, len: usize) -> Result<bool> {
+        if self
+            .legacy()
+            .is_some_and(|l| l.only.read().contains(address))
+        {
+            return Ok(true);
+        }
+        if !self.files.exists(address).unwrap_or(false) {
+            return Ok(false);
+        }
+        Ok(self.files.stored_len(address) == Some(len))
     }
 
     /// Delete a chunk from both backings.
@@ -1669,11 +1724,44 @@ mod tests {
         assert!(store.retirement_blocker(|_| false).is_none());
     }
 
+    /// The stock configuration retires, with no environment variable and no operator step.
+    ///
+    /// This is the property the whole release rests on. Deleting `chunks.mdb` is the only
+    /// step that returns disk: LMDB never gives freed pages back, which is why the fleet
+    /// deleted millions of chunks and recovered nothing. A build that shipped with this
+    /// off would migrate every node and reclaim not one byte.
     #[tokio::test]
-    async fn retirement_is_refused_while_the_release_switch_is_off() {
+    async fn the_shipped_configuration_retires_without_an_operator_setting_anything() {
+        // Asked of the configuration a node actually builds, not of the constant behind
+        // it, so neither the constant nor a serde default nor the `Default` impl can turn
+        // retirement off without this failing.
+        assert!(
+            crate::storage::MigrationConfig::default().retire_legacy,
+            "this release must delete the legacy environment, or it frees no disk"
+        );
+
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["shipped"]).await;
+        let store = open(&dir).await;
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        open_the_retirement_gate(&store);
+        assert!(
+            store.retirement_blocker(|_| false).is_none(),
+            "with every gate met, the shipped configuration must not refuse to retire"
+        );
+    }
+
+    /// A single node can still be told to keep both stores.
+    #[tokio::test]
+    async fn retirement_is_refused_when_the_switch_is_turned_off() {
         let dir = TempDir::new().expect("temp dir");
         seed_legacy(&dir, &["off"]).await;
-        let store = open(&dir).await; // retire_legacy defaults to false in this release
+        let mut config = test_config(&dir);
+        config.migration.retire_legacy = false;
+        let store = ChunkStore::new(config).await.expect("open store");
         store.commit_to_files().expect("commit");
         assert!(store
             .retirement_blocker(|_| false)

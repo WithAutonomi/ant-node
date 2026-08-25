@@ -356,7 +356,12 @@ file.
 **Fleet gates, which cannot be closed from a workstation:**
 
 - Forced power loss on ext4, XFS, btrfs, APFS and NTFS showing old-or-new, with antivirus
-  and 8.3 generation enabled on the NTFS run. Windows retirement stays off until this passes.
+  and 8.3 generation enabled on the NTFS run. The publish path off Unix does not rename at
+  all, precisely because a rename cannot be shown to be durable there: it creates the chunk
+  under its final name and flushes the file, which is documented to flush the creation
+  metadata with it. What that leaves unproven is directory creation, which has no portable
+  flush, so this run is what closes it. `ANT_MIGRATION_RETIRE_LEGACY=0` holds retirement off
+  a node until then, per node, without a separate build.
 - Startup scan, RSS and inode use at 100k, 1M and 10M keys on each filesystem.
 - The first release gates on no audit-timeout regression on the quiet responsible lane and on
   disk growth

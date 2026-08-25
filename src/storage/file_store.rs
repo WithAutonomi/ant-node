@@ -576,9 +576,16 @@ impl FileStore {
             )));
         }
 
-        // Fast path: an in-memory hit, no syscall. Authoritative enough to skip the
-        // write, because a published index entry always mirrors a completed rename.
-        if self.index.read().contains(address) {
+        // Fast path: an in-memory hit plus one metadata call, no read.
+        //
+        // The index entry alone is not enough. It is built from names, by the startup
+        // scan and by a completed publish, and off Unix a chunk is created under its final
+        // name before its bytes are written, so a crash can leave a short file wearing a
+        // real name. Answering "already have it" to the copy that would fix it is how a
+        // node discards its own repair. Comparing the length is one `metadata` call and
+        // catches exactly that; bytes that rotted without changing length are caught by
+        // the verifying read and by the pass that runs before anything is deleted.
+        if self.index.read().contains(address) && self.stored_len(address) == Some(content.len()) {
             trace!("Chunk {} already exists", hex::encode(address));
             {
                 let mut stats = self.stats.write();
@@ -662,6 +669,18 @@ impl FileStore {
         }
     }
 
+    /// The size of the file behind `address`, if there is one.
+    ///
+    /// One `metadata` call, no read. Used where an indexed name has to be checked against
+    /// what a caller is offering before that offer is turned away.
+    #[must_use]
+    pub fn stored_len(&self, address: &XorName) -> Option<usize> {
+        std::fs::metadata(self.chunk_path(address))
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| usize::try_from(m.len()).ok())
+    }
+
     /// Whether the file already stored under `address` really hashes to it.
     async fn stored_bytes_match(&self, address: &XorName) -> bool {
         match self.get_raw(address).await {
@@ -693,8 +712,10 @@ impl FileStore {
             )));
         }
         // The replacement exists alongside the original until the rename, so the room for
-        // it has to be there first.
-        self.capacity.check(content.len() as u64)?;
+        // it has to be there first. Reserved rather than merely checked: a plain check
+        // passes against a cached measurement, so concurrent repairs and PUTs can each be
+        // admitted against the same headroom and cross the reserve together.
+        let reservation = self.capacity.reserve(content.len() as u64)?;
 
         let shard = self.chunks_dir.join(shard_name(address));
         let final_path = shard.join(hex::encode(address));
@@ -717,6 +738,13 @@ impl FileStore {
             })
             .await
             .map_err(|e| Error::Storage(format!("Chunk store repair task failed: {e}")))??;
+
+        // Released, not committed. The replacement took the place of a file of the same
+        // size, so nothing net was added to the disk, and charging it as new would make
+        // the guard believe the store is larger than it is until the next remeasurement.
+        // Dropping it does exactly that. The reservation did its job by holding the room
+        // for both copies while they briefly coexisted.
+        drop(reservation);
 
         debug!("Repaired chunk {}", hex::encode(address));
         Ok(())
@@ -1103,7 +1131,18 @@ fn ensure_shard_dir(
             dir.display()
         ))
     })?;
-    fsync_dir_best_effort(chunks_dir);
+    // Load-bearing, like the flush that publishes a chunk into this directory. Until the
+    // parent is flushed the shard's own entry can be lost, and losing it loses every chunk
+    // inside it. Reporting the shard present anyway would let the very first chunk written
+    // into it count as durably stored.
+    fsync_dir(chunks_dir).map_err(|e| {
+        Error::Storage(format!(
+            "Created shard directory {} but could not flush {}: {e}. Not marking the shard \
+             usable, because a directory that is not durable cannot hold a chunk that is.",
+            dir.display(),
+            chunks_dir.display()
+        ))
+    })?;
     if let Some(slot) = present.lock().get_mut(shard) {
         *slot = true;
     }
@@ -1188,6 +1227,24 @@ fn fsync_dir_best_effort(path: &Path) {
 #[cfg(unix)]
 fn fsync_dir(path: &Path) -> std::io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+/// Off Unix there is no way to flush a directory through the standard library, so this
+/// reports success without being able to promise anything.
+///
+/// That is why the publish path off Unix does not use a rename at all: it creates the
+/// chunk under its final name and flushes the file, which Microsoft documents as flushing
+/// the creation metadata with it. Directory creation has no equivalent, so the guarantee
+/// there rests on the pre-retirement pass, which re-reads every chunk before the legacy
+/// store is deleted, and on the operator gate that keeps retirement off a platform until
+/// forced power loss has been shown to hold old-or-new on it.
+///
+/// Returns a `Result` so the callers that must handle a flush failure on Unix read the
+/// same on every platform.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// No-op on platforms with no way to flush a directory handle.
@@ -1510,13 +1567,28 @@ fn scan_shard(dir: &Path, shard: u8, locked: bool, result: &mut ScanResult) -> R
         // deliberately avoids. A pipe, socket, device or directory wearing a chunk name
         // must never enter the index: nothing downstream can read it, and it would sit in
         // the published commitment forever.
-        if !entry.file_type().is_ok_and(|t| t.is_file()) {
-            warn!(
-                "Chunk store: {name} in {} is not a regular file; ignoring it",
-                dir.display()
-            );
-            result.skipped = result.skipped.saturating_add(1);
-            continue;
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => {
+                warn!(
+                    "Chunk store: {name} in {} is not a regular file; ignoring it",
+                    dir.display()
+                );
+                result.skipped = result.skipped.saturating_add(1);
+                continue;
+            }
+            // Not the same as knowing it is not a file. Treating an unanswered question
+            // as a no would drop a real chunk from the index and from the commitment
+            // while its bytes sit on disk, and the node would not serve it again until
+            // some later restart happened to succeed. Fail the scan instead: an index
+            // that is missing keys must never be published as this node's key set.
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Could not tell what {name} in {} is: {e}. Refusing to publish an \
+                     index that may be missing chunks.",
+                    dir.display()
+                )));
+            }
         }
         // A file in the wrong shard is unreachable through `chunk_path`, so indexing it
         // would make the index claim a key the read path cannot find.
@@ -1863,32 +1935,38 @@ fn publish_via_rename(
     // Content is immutable and the name is its hash, so an existing file already holds
     // exactly these bytes. Skipping the write is both cheaper and safer than replacing
     // it: on Windows a rename over a file another thread has open fails outright.
-    if final_path.exists() {
-        return Ok(PutOutcome::Duplicate);
-    }
-
-    write_temp(temp_path, payload)?;
-
-    match rename_with_retry(temp_path, final_path) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = std::fs::remove_file(temp_path);
-            // Another writer of the same address won the race, or (on Windows) the
-            // destination was open. Either way the bytes are already published.
-            if final_path.exists() {
-                return Ok(PutOutcome::Duplicate);
+    //
+    // The flush still happens. A name that is already there is not proof it is durable:
+    // the write that put it there may have been this store's own previous attempt, whose
+    // rename landed and whose directory flush then failed. That attempt returned an
+    // error, so nothing was retired on the strength of it, but if this call reported a
+    // durable duplicate without flushing, the retry would silently launder an unflushed
+    // rename into a copy that authorises deleting the last other one.
+    let outcome = if final_path.exists() {
+        PutOutcome::Duplicate
+    } else {
+        write_temp(temp_path, payload)?;
+        match rename_with_retry(temp_path, final_path) {
+            Ok(()) => PutOutcome::New,
+            Err(e) => {
+                let _ = std::fs::remove_file(temp_path);
+                // Another writer of the same address won the race, or the destination was
+                // open. Either way the bytes are already published.
+                if !final_path.exists() {
+                    return Err(Error::Storage(format!(
+                        "Failed to publish chunk {}: {e}",
+                        final_path.display()
+                    )));
+                }
+                PutOutcome::Duplicate
             }
-            return Err(Error::Storage(format!(
-                "Failed to publish chunk {}: {e}",
-                final_path.display()
-            )));
         }
-    }
+    };
 
-    // NOT best effort here. On every platform that takes this path the directory flush is
-    // what makes the rename durable, and a copy that is reported successful is what
-    // authorises deleting the only other copy. Swallowing the failure would let a power
-    // loss discard the directory entry after the legacy store had already been removed.
+    // NOT best effort. The directory flush is what makes the rename durable, and a copy
+    // reported successful is what authorises deleting the only other copy. Swallowing the
+    // failure would let a power loss discard the directory entry after the legacy store
+    // had already been removed.
     fsync_dir(shard).map_err(|e| {
         Error::Storage(format!(
             "Published {} but could not flush {}: {e}. Not reporting this chunk as stored, \
@@ -1897,7 +1975,7 @@ fn publish_via_rename(
             shard.display()
         ))
     })?;
-    Ok(PutOutcome::New)
+    Ok(outcome)
 }
 
 #[cfg(test)]

@@ -10096,7 +10096,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_key_reads_as_a_plain_miss_and_a_failed_read_as_a_fault() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage = LmdbStorage::new(crate::storage::LmdbStorageConfig {
+        let storage = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: true,
             max_map_size: 0,

@@ -520,7 +520,11 @@ impl AntProtocol {
         }
 
         // 3. Check if already exists (idempotent success)
-        match self.storage.exists(&address) {
+        //
+        // Asked with the length, not by name alone. A name can outlive the bytes under it,
+        // and answering `AlreadyExists` to a good copy of a chunk this node holds only a
+        // damaged version of throws that copy away and does not get offered another.
+        match self.storage.holds_exactly(&address, request.content.len()) {
             Ok(true) => {
                 debug!("Chunk {addr_hex} already exists");
                 return ChunkPutResponse::AlreadyExists { address };

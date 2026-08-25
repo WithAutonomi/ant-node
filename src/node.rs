@@ -34,6 +34,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 #[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
@@ -45,6 +46,12 @@ use tokio::signal::unix::{signal, SignalKind};
 /// removing the legacy store is worth avoiding. Bounded, because a step that will not
 /// finish must not hold the process open.
 const MIGRATION_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long shutdown waits for in-flight request handlers to finish.
+///
+/// Short, because these are single request/response exchanges and the peer will retry.
+/// The point is to stop new legacy reads starting, not to see every last one through.
+const PROTOCOL_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Builder for constructing an Ant node.
 pub struct NodeBuilder {
@@ -188,6 +195,7 @@ impl NodeBuilder {
             replication_engine,
             protocol_task: None,
             migration_task,
+            protocol_children: TaskTracker::new(),
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -562,6 +570,13 @@ pub struct RunningNode {
     /// Awaited before the replication engine and the P2P layer are torn down, because it
     /// holds handles to both and is in the middle of reading and writing the chunk store.
     migration_task: Option<JoinHandle<()>>,
+    /// The per-message handler tasks the protocol loop spawns.
+    ///
+    /// Tracked rather than detached so shutdown can stop accepting work and then wait for
+    /// what is already in flight. Aborting only the loop leaves its children running, and
+    /// a chunk read that outlives the loop keeps the legacy store busy exactly while the
+    /// migration is trying to drain it.
+    protocol_children: TaskTracker,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -806,12 +821,25 @@ impl RunningNode {
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
 
-        // Protocol routing stops FIRST. The migration's last step drains the legacy
-        // store's in-flight reads, and inbound protocol traffic keeps starting new ones,
-        // so waiting on the migration while still serving requests can keep that drain
-        // from ever completing and hang shutdown.
+        // Protocol routing stops FIRST, loop and children both. The migration's last step
+        // drains the legacy store's in-flight reads, and inbound protocol traffic keeps
+        // starting new ones, so waiting on the migration while still serving requests can
+        // keep that drain from ever completing and hang shutdown. Aborting the accept loop
+        // alone would not do it: the requests already in flight run in their own tasks.
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
+        }
+        self.protocol_children.close();
+        if tokio::time::timeout(PROTOCOL_DRAIN_GRACE, self.protocol_children.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                "{} request handler(s) had not finished after {}s; continuing shutdown \
+                 without them.",
+                self.protocol_children.len(),
+                PROTOCOL_DRAIN_GRACE.as_secs()
+            );
         }
 
         // Then the migration, awaited rather than aborted: it is mid-way through reading
@@ -819,15 +847,22 @@ impl RunningNode {
         // handle that the shutdown below is about to invalidate. It watches the same
         // cancellation token, so this returns as soon as its current step does. Bounded,
         // because a step that will not finish must not hold the process open.
-        if let Some(handle) = self.migration_task.take() {
-            match tokio::time::timeout(MIGRATION_SHUTDOWN_GRACE, handle).await {
+        if let Some(mut handle) = self.migration_task.take() {
+            // Awaited by reference, so a timeout leaves the handle here to abort rather
+            // than dropping it and letting the task run on detached through the engine and
+            // P2P teardown it depends on.
+            match tokio::time::timeout(MIGRATION_SHUTDOWN_GRACE, &mut handle).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => warn!("Storage migration task did not stop cleanly: {e}"),
-                Err(_) => warn!(
-                    "Storage migration did not stop within {}s; continuing shutdown. \
-                     Everything it does is idempotent and re-derived at the next start.",
-                    MIGRATION_SHUTDOWN_GRACE.as_secs()
-                ),
+                Err(_) => {
+                    warn!(
+                        "Storage migration did not stop within {}s; stopping it. \
+                         Everything it does is idempotent and re-derived at the next start.",
+                        MIGRATION_SHUTDOWN_GRACE.as_secs()
+                    );
+                    handle.abort();
+                    let _ = handle.await;
+                }
             }
         }
 
@@ -922,6 +957,7 @@ impl RunningNode {
         let mut events = self.p2p_node.subscribe_events();
         let p2p = Arc::clone(&self.p2p_node);
         let semaphore = Arc::new(Semaphore::new(64));
+        let children = self.protocol_children.clone();
 
         self.protocol_task = Some(tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
@@ -944,7 +980,7 @@ impl RunningNode {
                         let protocol = Arc::clone(&protocol);
                         let p2p = Arc::clone(&p2p);
                         let sem = semaphore.clone();
-                        tokio::spawn(async move {
+                        children.spawn(async move {
                             let Ok(_permit) = sem.acquire().await else {
                                 return;
                             };

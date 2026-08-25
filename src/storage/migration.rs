@@ -109,9 +109,12 @@ pub struct MigrationConfig {
 
     /// Delete `chunks.mdb` once the retirement gate is satisfied.
     ///
-    /// **`false` in R1, `true` in R2.** This is the only destructive step in the whole
-    /// migration and the only one that cannot be undone, so it ships a release after the
-    /// copier, once the fleet has been observed bridging without incident.
+    /// **On in this release**, because it is the only step that returns disk. It is also
+    /// the only destructive step in the whole migration and the only one that cannot be
+    /// undone, which is why everything in front of it is a gate: the wave the node is
+    /// assigned to, the shed hold, the reduced commitment reaching the close group,
+    /// possession of every chunk being given up proven elsewhere, a re-read of every
+    /// remaining chunk, and a retention delay on top.
     ///
     /// Deliberately never serialised. A node writes its effective configuration back to
     /// disk, so shipping this as an ordinary field would bake R1's `false` into every
@@ -167,6 +170,16 @@ pub struct MigrationConfig {
     /// Chunks copied per tick before yielding.
     #[serde(default = "default_batch_chunks")]
     pub batch_chunks: usize,
+
+    /// Where the volume lock lives, overriding the filesystem this node's root sits on.
+    ///
+    /// `None` in production, which keys the lock by device id so every node on one disk
+    /// serialises against the others. Tests set it so a test's migration contends only
+    /// with its own, rather than with every other test sharing the machine's filesystem.
+    ///
+    /// Never serialised: it exists to scope a test, not to configure a node.
+    #[serde(skip)]
+    pub lock_dir: Option<PathBuf>,
 }
 
 const fn default_true() -> bool {
@@ -175,8 +188,13 @@ const fn default_true() -> bool {
 
 /// Whether this build deletes the legacy environment once the gate is satisfied.
 ///
-/// **R1: `false`. R2: `true`.** One constant, changed by one line, in one release.
-pub const RELEASE_RETIRE_LEGACY: bool = false;
+/// **`true` in this release.** Deleting `chunks.mdb` is the only step that returns disk,
+/// and a build that ships with it off is a migration that never finishes: the fleet
+/// already deleted 2.29M chunks out of LMDB and got back nothing, because LMDB does not
+/// return freed pages to the filesystem. Every gate in front of this is still enforced,
+/// and `ANT_MIGRATION_RETIRE_LEGACY=0` turns it off on a single node if one is ever
+/// needed to hold both stores.
+pub const RELEASE_RETIRE_LEGACY: bool = true;
 
 /// Environment override for [`RELEASE_RETIRE_LEGACY`], for a canary node.
 pub const RETIRE_LEGACY_ENV: &str = "ANT_MIGRATION_RETIRE_LEGACY";
@@ -243,6 +261,7 @@ impl Default for MigrationConfig {
             copier_throttle_mib_per_sec: default_copier_throttle_mib_per_sec(),
             tick_secs: default_tick_secs(),
             batch_chunks: default_batch_chunks(),
+            lock_dir: None,
         }
     }
 }
@@ -478,10 +497,12 @@ pub enum LockAttempt {
 impl VolumeLock {
     /// Try to take the lock for the volume hosting `root_dir`.
     #[must_use]
-    pub fn try_acquire(root_dir: &Path) -> LockAttempt {
+    pub fn try_acquire(root_dir: &Path, scope: Option<&Path>) -> LockAttempt {
         use fs2::FileExt;
-        let dir = root_dir.parent().unwrap_or(root_dir);
-        let path = dir.join("ant-migration.lock");
+        let path = scope.map_or_else(
+            || lock_path_for(root_dir),
+            |dir| dir.join("ant-migration.lock"),
+        );
         let file = match std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -504,9 +525,52 @@ impl VolumeLock {
                 debug!("Took the volume migration lock at {}", path.display());
                 LockAttempt::Acquired(Self { file, path })
             }
-            Err(_) => LockAttempt::Busy,
+            // Only contention means another node is migrating. Everything else, a
+            // filesystem that does not implement locking at all being the one that
+            // matters, is a lock this node will never get, and reporting it as contention
+            // would leave it waiting forever for a holder that does not exist.
+            Err(e) if is_lock_contention(&e) => LockAttempt::Busy,
+            Err(e) => {
+                warn!(
+                    "Could not lock {}: {e}. This node will migrate without serialising \
+                     against others on the same volume, so watch its free space.",
+                    path.display()
+                );
+                LockAttempt::Unavailable
+            }
         }
     }
+}
+
+/// Is this the error a lock held by someone else produces?
+fn is_lock_contention(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
+/// Where the lock for the volume hosting `root_dir` lives.
+///
+/// Keyed by the filesystem, not by the path. Two nodes on one host are configured with
+/// different roots by definition, so a lock beside the root serialises a node against
+/// nobody: `/srv/node-a/data` and `/srv/node-b/data` would take two different locks on one
+/// disk and copy at the same time, which is the case the lock exists to prevent.
+///
+/// The device id names the filesystem, and the host's temporary directory is somewhere
+/// every node on that host can reach. If the device cannot be read, this falls back to a
+/// lock beside the root: weaker, but never worse than having none.
+fn lock_path_for(root_dir: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(meta) = std::fs::metadata(root_dir) {
+            return std::env::temp_dir().join(format!("ant-migration-{}.lock", meta.dev()));
+        }
+    }
+    root_dir
+        .parent()
+        .unwrap_or(root_dir)
+        .join("ant-migration.lock")
 }
 
 impl Drop for VolumeLock {
@@ -1105,7 +1169,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 // permanently stuck (see below), which must not go on excluding the
                 // others for a release.
                 if volume_lock.is_none() {
-                    match VolumeLock::try_acquire(store.root_dir()) {
+                    match VolumeLock::try_acquire(store.root_dir(), config.lock_dir.as_deref()) {
                         LockAttempt::Acquired(lock) => volume_lock = Some(lock),
                         LockAttempt::Busy => {
                             debug!("Another node on this volume is migrating; waiting");
@@ -1135,7 +1199,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 // (copying anything that must be kept, then re-reading the whole store to
                 // verify it) is exactly the disk-heavy work the lock exists to serialise.
                 if volume_lock.is_none() {
-                    match VolumeLock::try_acquire(store.root_dir()) {
+                    match VolumeLock::try_acquire(store.root_dir(), config.lock_dir.as_deref()) {
                         LockAttempt::Acquired(lock) => volume_lock = Some(lock),
                         LockAttempt::Busy => {
                             debug!("Another node on this volume is migrating; waiting");
@@ -1437,7 +1501,25 @@ async fn shedding_is_still_safe(
         // A rotation is not the same as neighbours knowing. Until they have the
         // smaller key set they keep auditing this node against the one it used to
         // hold, and a wave of audit failures is as damaging as losing the chunks.
-        if !context.neighbours_know_the_commitment().await {
+        // Asked only when there is a commitment to deliver. A node whose file-backed set
+        // is empty commits to nothing, so there is no hash for a neighbour to acknowledge
+        // and this gate would never open, stranding its disk for good. Nothing is lost by
+        // skipping it: the gate exists to stop neighbours auditing this node against a key
+        // set it no longer holds, and a node claiming nothing cannot fail such an audit.
+        // The possession check below, which proves every chunk being given up still exists
+        // elsewhere, is the gate that protects the data, and it still runs.
+        let commits_to_nothing = store
+            .committable_keys()
+            .await
+            .is_ok_and(|keys| keys.is_empty());
+        if commits_to_nothing {
+            info!(
+                "This node's file-backed set is empty, so it commits to nothing and has \
+                 no reduced commitment for its close group to receive. Proceeding to the \
+                 possession check on the {} chunk(s) it is giving up.",
+                shedding.len()
+            );
+        } else if !context.neighbours_know_the_commitment().await {
             info!(
                 "Holding: {} of this node's close group must receive its reduced \
                  commitment before it gives up {} chunk(s). {} have it so far.",
@@ -1743,17 +1825,20 @@ mod tests {
         std::fs::create_dir_all(&node_a).expect("mkdir");
         std::fs::create_dir_all(&node_b).expect("mkdir");
 
-        let LockAttempt::Acquired(held) = VolumeLock::try_acquire(&node_a) else {
+        let LockAttempt::Acquired(held) = VolumeLock::try_acquire(&node_a, None) else {
             panic!("the first node must take the lock");
         };
         assert!(
-            matches!(VolumeLock::try_acquire(&node_b), LockAttempt::Busy),
+            matches!(VolumeLock::try_acquire(&node_b, None), LockAttempt::Busy),
             "a second node on the same volume must be told to wait, not that no lock exists"
         );
 
         drop(held);
         assert!(
-            matches!(VolumeLock::try_acquire(&node_b), LockAttempt::Acquired(_)),
+            matches!(
+                VolumeLock::try_acquire(&node_b, None),
+                LockAttempt::Acquired(_)
+            ),
             "and take it once the first is done"
         );
     }
@@ -1804,6 +1889,10 @@ mod tests {
         };
         config.migration.retire_legacy = true;
         config.migration.tick_secs = 1;
+        // Scoped to this test's own directory. In production the lock is keyed by the
+        // filesystem, so without this every test on this machine would serialise against
+        // every other one that runs a migration.
+        config.migration.lock_dir = Some(root.clone());
         config.migration.copier_throttle_mib_per_sec = 0;
         let store = Arc::new(
             crate::storage::ChunkStore::new(config)
@@ -1915,6 +2004,10 @@ mod tests {
         };
         config.migration.retire_legacy = true;
         config.migration.tick_secs = 1;
+        // Scoped to this test's own directory. In production the lock is keyed by the
+        // filesystem, so without this every test on this machine would serialise against
+        // every other one that runs a migration.
+        config.migration.lock_dir = Some(root.clone());
         // Elapsed, so the hold is not what is doing the refusing here.
         config.migration.shed_hold_hours = 0;
         config.migration.wave_hours = 0;
