@@ -160,18 +160,6 @@ pub struct MigrationConfig {
     #[serde(default = "default_wave_hours")]
     pub wave_hours: u64,
 
-    /// Permit removing the legacy environment on Windows.
-    ///
-    /// Off by default, and the only platform-specific switch here. NTFS documents no
-    /// ordering between the rename that publishes a copied chunk and the deletion of the
-    /// store it came from, and Windows offers no way to flush a directory through the
-    /// standard library, so a power loss could in principle replay with the deletion but
-    /// without the copies. Unlike the release switches this **is** an operator decision
-    /// and does persist in their configuration: someone who has done the power-loss
-    /// testing on their own hardware should not have to re-assert it on every start.
-    #[serde(default = "default_allow_windows_retire")]
-    pub allow_windows_retire: bool,
-
     /// Seconds between copier ticks.
     #[serde(default = "default_tick_secs")]
     pub tick_secs: u64,
@@ -225,14 +213,6 @@ const fn default_wave_hours() -> u64 {
     24
 }
 
-/// Windows retirement is off unless an operator turns it on.
-fn default_allow_windows_retire() -> bool {
-    env_override(WINDOWS_RETIRE_ENV, false)
-}
-
-/// Environment override for [`MigrationConfig::allow_windows_retire`].
-pub const WINDOWS_RETIRE_ENV: &str = "ANT_MIGRATION_ALLOW_WINDOWS_RETIRE";
-
 const fn default_copier_slack_mb() -> u64 {
     2048
 }
@@ -259,7 +239,6 @@ impl Default for MigrationConfig {
             shed_hold_hours: default_shed_hold_hours(),
             retire_delay_hours: default_retire_delay_hours(),
             wave_hours: default_wave_hours(),
-            allow_windows_retire: default_allow_windows_retire(),
             copier_slack_mb: default_copier_slack_mb(),
             copier_throttle_mib_per_sec: default_copier_throttle_mib_per_sec(),
             tick_secs: default_tick_secs(),
@@ -615,10 +594,22 @@ const MIGRATION_WAVE_DOMAIN: &[u8] = b"ant-node/storage-migration-wave/v1";
 /// being unable to serve, so it is not part of the problem the waves exist to solve.
 #[must_use]
 pub fn wave_has_opened(state: &MigrationState, config: &MigrationConfig, wave: u64) -> bool {
-    let opens_at = state
+    now_unix() >= wave_opens_at(state, config, wave)
+}
+
+/// When a given wave opens, in Unix seconds.
+///
+/// Measured from the END of the shed hold, not from first start. Measured from the start
+/// the two settings cancel each other out: with a 72 hour hold and 24 hour waves, waves
+/// would open at 0, 24, 48 and 72 hours while nothing at all may shed until hour 72, so
+/// every wave would be open the moment the first one could act and the whole close group
+/// would migrate together. That is the pile-up the waves exist to prevent.
+#[must_use]
+pub fn wave_opens_at(state: &MigrationState, config: &MigrationConfig, wave: u64) -> u64 {
+    state
         .first_start_unix
-        .saturating_add(wave.saturating_mul(config.wave_hours.saturating_mul(3600)));
-    now_unix() >= opens_at
+        .saturating_add(config.shed_hold_hours.saturating_mul(3600))
+        .saturating_add(wave.saturating_mul(config.wave_hours.saturating_mul(3600)))
 }
 
 /// Order keys closest-first by XOR distance from this node.
@@ -1243,11 +1234,16 @@ async fn evaluate_shed(
              of {}. Its turn opens {} hour(s) after this build first started, so the rest of \
              its close group stays steady and can keep serving what it is about to give up.",
             migration_wave_count(context.close_group_size),
-            wave.saturating_mul(config.wave_hours)
+            config
+                .shed_hold_hours
+                .saturating_add(wave.saturating_mul(config.wave_hours))
         );
         return false;
     }
 
+    // Kept as its own check even though the wave now starts after it: the hold is about
+    // peers on an older build still applying the penalty, the wave is about the close
+    // group being able to cover for whoever moves. Different reasons, both required.
     if !state.shed_hold_elapsed(config) {
         info!(
             "This node is {short_by} chunk(s) short of disk. Holding for {} hour(s) after \
@@ -1753,7 +1749,6 @@ mod tests {
             ..crate::storage::ChunkStoreConfig::test_default()
         };
         config.migration.retire_legacy = true;
-        config.migration.allow_windows_retire = true;
         config.migration.tick_secs = 1;
         config.migration.copier_throttle_mib_per_sec = 0;
         let store = Arc::new(
@@ -1865,7 +1860,6 @@ mod tests {
             ..crate::storage::ChunkStoreConfig::test_default()
         };
         config.migration.retire_legacy = true;
-        config.migration.allow_windows_retire = true;
         config.migration.tick_secs = 1;
         // Elapsed, so the hold is not what is doing the refusing here.
         config.migration.shed_hold_hours = 0;
@@ -2117,23 +2111,49 @@ mod tests {
     }
 
     #[test]
-    fn a_wave_opens_only_after_the_ones_before_it() {
-        let config = MigrationConfig {
-            wave_hours: 24,
-            ..MigrationConfig::default()
-        };
+    fn waves_are_actually_staggered_under_the_shipped_defaults() {
+        // The combination is what matters, not either setting alone. Measured from first
+        // start, a 72 hour hold and 24 hour waves cancel out: waves would open at 0, 24,
+        // 48 and 72 hours while nothing may shed until 72, so every wave is open the
+        // moment the first one can act and the whole close group moves together. Measured
+        // from the end of the hold, they stagger as intended.
+        let config = MigrationConfig::default();
+        assert_eq!(config.shed_hold_hours, 72);
+        assert_eq!(config.wave_hours, 24);
+
         let mut state = MigrationState::new(MigrationPhase::Bridging);
+        let waves = migration_wave_count(7);
+        assert_eq!(waves, 4);
+
+        // Nothing is open before the hold ends.
         state.first_start_unix = now_unix();
+        for w in 0..waves {
+            assert!(
+                !wave_has_opened(&state, &config, w),
+                "wave {w} opened too early"
+            );
+        }
 
-        // Wave 0 is open from the start; later waves are not.
+        // At the end of the hold, exactly the first wave is open.
+        state.first_start_unix = now_unix().saturating_sub(72 * 3600 + 60);
         assert!(wave_has_opened(&state, &config, 0));
-        assert!(!wave_has_opened(&state, &config, 1));
-        assert!(!wave_has_opened(&state, &config, 3));
+        for w in 1..waves {
+            assert!(
+                !wave_has_opened(&state, &config, w),
+                "wave {w} must wait its turn, or the group migrates together"
+            );
+        }
 
-        // Two days in, waves 0 through 2 have opened and wave 3 has not.
-        state.first_start_unix = now_unix().saturating_sub(2 * 24 * 3600 + 60);
-        assert!(wave_has_opened(&state, &config, 2));
-        assert!(!wave_has_opened(&state, &config, 3));
+        // Each later wave opens one wave_hours after the one before it.
+        for open in 1..waves {
+            state.first_start_unix = now_unix().saturating_sub((72 + open * 24) * 3600 + 60);
+            for w in 0..=open {
+                assert!(wave_has_opened(&state, &config, w));
+            }
+            for w in open + 1..waves {
+                assert!(!wave_has_opened(&state, &config, w));
+            }
+        }
     }
 
     #[test]

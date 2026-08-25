@@ -631,9 +631,20 @@ impl FileStore {
 
         match outcome {
             PutOutcome::Duplicate => {
-                // The file was already on disk. Either another writer won the race or
-                // the index had drifted; either way the key is now admitted and the
-                // reservation bought nothing, so its `Drop` gave it back.
+                // The file was already on disk, and its name is not evidence its contents
+                // are right. The startup scan indexes by name without reading anything,
+                // and on Windows a crash mid-write leaves a partial file under a real
+                // chunk name. Trusting the name here would acknowledge a chunk that was
+                // never stored, and then discard the good copy arriving to repair it.
+                if !self.stored_bytes_match(address).await {
+                    warn!(
+                        "Chunk {} was already on disk but its contents are wrong; \
+                         replacing it with the copy just offered",
+                        hex::encode(address)
+                    );
+                    self.repair(address, content).await?;
+                    return Ok(true);
+                }
                 {
                     let mut stats = self.stats.write();
                     stats.duplicates = stats.duplicates.saturating_add(1);
@@ -648,6 +659,15 @@ impl FileStore {
                 debug!("Stored chunk {} ({len} bytes)", hex::encode(address));
                 Ok(true)
             }
+        }
+    }
+
+    /// Whether the file already stored under `address` really hashes to it.
+    async fn stored_bytes_match(&self, address: &XorName) -> bool {
+        match self.get_raw(address).await {
+            Ok(Some(bytes)) => crate::client::compute_address(&bytes) == *address,
+            // Absent or unreadable is not a match, and the caller rewrites it.
+            _ => false,
         }
     }
 
@@ -1690,6 +1710,78 @@ fn write_temp(temp_path: &Path, payload: &[u8]) -> Result<()> {
 /// rename: atomic on every filesystem we support, and needing only that one directory
 /// flushed afterwards.
 fn publish(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    shard: &Path,
+) -> Result<PutOutcome> {
+    // Windows takes a different route, for a documented reason. There is no way to flush
+    // a directory through the standard library, and Microsoft does not document
+    // `MoveFileEx` as durable at return unless it is called with MOVEFILE_WRITE_THROUGH,
+    // which std does not use. So the rename cannot be relied on to have reached the disk
+    // before the old store is deleted.
+    //
+    // Creating the file under its final name sidesteps the rename entirely. Microsoft
+    // documents that creation metadata is cached and that `FlushFileBuffers`, which
+    // `sync_all` calls on Windows, is the way to flush it. So a successful create, write
+    // and flush is a durable publication under a documented contract, with no directory
+    // flush and no rename involved.
+    //
+    // The cost is that a crash mid-write leaves a partial file wearing a real chunk name.
+    // That is why the duplicate path below re-reads and verifies rather than trusting the
+    // name, and why the pre-retirement pass re-hashes everything before anything is
+    // deleted.
+    #[cfg(windows)]
+    {
+        let _ = temp_path;
+        let _ = shard;
+        return publish_in_place(final_path, payload);
+    }
+    #[cfg(not(windows))]
+    publish_via_rename(temp_path, final_path, payload, shard)
+}
+
+/// Create the chunk under its final name and flush it. Windows only.
+#[cfg(windows)]
+fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(final_path)
+    {
+        Ok(f) => f,
+        // Someone got there first. Immutable content under a content-addressed name, so
+        // the caller verifies what is already there rather than assuming it is right.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(PutOutcome::Duplicate),
+        Err(e) => {
+            return Err(Error::Storage(format!(
+                "Failed to create chunk {}: {e}",
+                final_path.display()
+            )))
+        }
+    };
+    if let Err(e) = file.write_all(payload) {
+        drop(file);
+        let _ = std::fs::remove_file(final_path);
+        return Err(Error::Storage(format!(
+            "Failed to write {}: {e}",
+            final_path.display()
+        )));
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        let _ = std::fs::remove_file(final_path);
+        return Err(Error::Storage(format!(
+            "Failed to flush {}: {e}",
+            final_path.display()
+        )));
+    }
+    Ok(PutOutcome::New)
+}
+
+/// Write a temp beside the target and rename it into place. Everywhere but Windows.
+#[cfg(not(windows))]
+fn publish_via_rename(
     temp_path: &Path,
     final_path: &Path,
     payload: &[u8],

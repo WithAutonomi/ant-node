@@ -156,7 +156,7 @@ Per platform, honestly:
 | XFS | yes | not by that sequence | yes |
 | btrfs | yes | **uncertain**, ALICE found reordering | yes |
 | APFS | yes | `sync_all` already uses `F_FULLFSYNC` on Apple targets | returns 0, effect undocumented |
-| NTFS | **not documented as atomic** | unknown | **no documented way** |
+| NTFS | **not documented as atomic** | see below | **no documented way** |
 
 On Windows a node cannot make the rename durable through the standard library at all. The
 content is content-addressed and re-replicable, so the position we take is: accept it,
@@ -314,10 +314,9 @@ one machine's disk, the wave is about one chunk's replicas.
   path self-heals, and a `stat` per call on the node's hottest path is not worth it.
 - One inode and one directory entry per chunk. At 4 MiB per object that is 0.05% overhead
   and block rounding for a full chunk is exactly zero, but it is real.
-- Windows retirement is off by default (`storage.migration.allow_windows_retire`), so
-  Windows nodes keep both stores until an operator has tested power loss on their own
-  hardware. It is a configuration field rather than a hidden environment read precisely so
-  it is visible, reviewable, and persists once someone has done that testing.
+- Windows publishes chunks under their final name rather than by rename, so a crash
+  mid-write leaves a partial file that the write, read and pre-retirement paths each have
+  to detect rather than trust.
 - The paid list is still LMDB. It is a fixed 256 MiB map that contributes nothing to the
   disk problem, but it is why `heed` cannot be dropped yet.
 - **Narrowing the commitment cuts the quoted price.** Price is quadratic in the committed
