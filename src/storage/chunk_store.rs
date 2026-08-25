@@ -13,7 +13,7 @@
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
-use crate::logging::{debug, info, warn};
+use crate::logging::{debug, error, info, warn};
 use crate::storage::file_store::{FileStore, FileStoreConfig};
 use crate::storage::lmdb::{LmdbStorage, LmdbStorageConfig};
 use crate::storage::migration::{
@@ -1013,7 +1013,12 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if verification did not pass, if the handle is still
     /// shared (the caller should retry on the next tick), or if the directory cannot be
     /// removed.
-    pub async fn retire_legacy<F>(&self, proof: &VerifyReport, still_answerable: &F) -> Result<u64>
+    pub async fn retire_legacy<F>(
+        &self,
+        proof: &VerifyReport,
+        still_answerable: &F,
+        approved_to_shed: &BTreeSet<XorName>,
+    ) -> Result<u64>
     where
         F: Fn(&XorName) -> bool + Send + Sync,
     {
@@ -1072,13 +1077,31 @@ impl ChunkStore {
                     // what makes the final check below atomic with the removal: this is
                     // the only moment at which the answer cannot change underneath us.
                     Some(l) if Arc::strong_count(&l.lmdb) == 1 => {
-                        if let Some(key) = l.only.read().iter().find(|k| still_answerable(k)) {
+                        let only = l.only.read();
+                        // A count of one proves nobody else holds a handle, so nobody can
+                        // be mutating this set. That is what makes the two checks below
+                        // authoritative rather than a snapshot that has already moved.
+                        if let Some(key) = only.iter().find(|k| still_answerable(k)) {
                             return Err(Error::Storage(format!(
                                 "Refusing to remove the legacy environment: chunk {} became \
                                  answerable again while retirement was in progress",
                                 hex::encode(key)
                             )));
                         }
+                        // Only the keys the caller cleared may go. A write whose file half
+                        // failed adds a legacy-only key that is in no commitment, so the
+                        // answerability check above cannot see it, and it would otherwise
+                        // be destroyed without ever facing the rank, delivery or
+                        // possession gates.
+                        if let Some(key) = only.iter().find(|k| !approved_to_shed.contains(*k)) {
+                            return Err(Error::Storage(format!(
+                                "Refusing to remove the legacy environment: chunk {} entered \
+                                 the legacy-only set after the gates were cleared and has \
+                                 passed none of them",
+                                hex::encode(key)
+                            )));
+                        }
+                        drop(only);
                         guard.take()
                     }
                     Some(_) => None,
@@ -1088,7 +1111,7 @@ impl ChunkStore {
             if let Some(Legacy { lmdb, only }) = taken {
                 drop(only);
                 drop(lmdb);
-                return self.remove_legacy_dir(freed);
+                return self.remove_legacy_dir(freed).await;
             }
             if attempt + 1 < RETIRE_UNWRAP_ATTEMPTS {
                 tokio::time::sleep(RETIRE_UNWRAP_BACKOFF).await;
@@ -1106,7 +1129,7 @@ impl ChunkStore {
     /// either way. If the removal fails the phase still moves on, because there is no
     /// going back to a half-removed environment, and the operator is told exactly which
     /// directory to delete by hand to get the space back.
-    fn remove_legacy_dir(&self, freed: u64) -> Result<u64> {
+    async fn remove_legacy_dir(&self, freed: u64) -> Result<u64> {
         // Renamed aside first, because `remove_dir_all` is not atomic: a failure partway
         // through leaves a directory that can no longer be opened as an environment, and
         // recording the migration as finished on top of that would have the node claim
@@ -1115,13 +1138,22 @@ impl ChunkStore {
             .config
             .root_dir
             .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-        std::fs::rename(&self.legacy_env_dir, &tombstone).map_err(|e| {
-            Error::Storage(format!(
-                "Could not move the legacy environment {} aside: {e}. Nothing has been \
-                 deleted and the node keeps serving from both stores.",
-                self.legacy_env_dir.display()
-            ))
-        })?;
+        if let Err(e) = std::fs::rename(&self.legacy_env_dir, &tombstone) {
+            // Nothing was deleted, but the handle is already closed, so this node has
+            // stopped being able to serve anything that lives only in there. Put it back
+            // rather than carrying on with chunks it holds and cannot read, and rather
+            // than letting the next tick see no handle and call that success.
+            let restored = self.reopen_legacy().await;
+            return Err(Error::Storage(format!(
+                "Could not move the legacy environment {} aside: {e}. Nothing was deleted{}",
+                self.legacy_env_dir.display(),
+                if restored {
+                    " and it has been reopened, so the node keeps serving from both stores."
+                } else {
+                    ". IT COULD NOT BE REOPENED: this node cannot serve chunks that live                      only there until it is restarted."
+                }
+            )));
+        }
         // The rename has to reach the directory itself, not just the page cache, or a
         // power loss could bring the environment back under its old name beside a store
         // that has already recorded itself as file-only.
@@ -1144,6 +1176,28 @@ impl ChunkStore {
             self.legacy_env_dir.display()
         );
         Ok(freed)
+    }
+
+    /// Reopen the legacy store after a failed retirement, so the node keeps serving.
+    ///
+    /// Returns whether it came back. The handle is closed before the rename is attempted,
+    /// so a rename that fails leaves the node holding chunks it can no longer read; that
+    /// is worth undoing rather than living with until the next restart.
+    async fn reopen_legacy(&self) -> bool {
+        if !legacy_present(&self.config.root_dir).unwrap_or(false) {
+            return false;
+        }
+        match Self::open_legacy(&self.config, &self.files).await {
+            Ok(legacy) => {
+                *self.legacy.write() = Some(legacy);
+                warn!("Reopened the legacy chunk environment after a failed retirement");
+                true
+            }
+            Err(e) => {
+                error!("Could not reopen the legacy chunk environment: {e}");
+                false
+            }
+        }
     }
 
     /// Record that this node serves from files alone from here on.
@@ -1313,6 +1367,11 @@ mod tests {
     use super::*;
     use crate::storage::migration::{now_unix, rank_closest_first, MIN_RETIRE_DELAY_HOURS};
     use tempfile::TempDir;
+
+    /// Everything currently legacy-only, as the set a test has "approved" for shedding.
+    fn approved_shed(store: &ChunkStore) -> BTreeSet<XorName> {
+        store.legacy_only_keys().into_iter().collect()
+    }
 
     /// A token that is never cancelled, for tests that are not exercising shutdown.
     fn never_cancelled() -> CancellationToken {
@@ -1648,7 +1707,7 @@ mod tests {
             .expect("verify");
         assert!(proof.is_clean());
         let err = store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect_err("Windows retirement must be refused by default");
         assert!(format!("{err}").contains("on Windows"), "{err}");
@@ -1695,7 +1754,7 @@ mod tests {
         assert_eq!(proof.checked, 3);
 
         let freed = store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect("retire");
         assert!(freed > 0, "retirement must report the space it returned");
@@ -1739,7 +1798,7 @@ mod tests {
             .await
             .expect("verify");
         let err = store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect_err("must defer while the handle is held");
         assert!(format!("{err}").contains("deferred"), "{err}");
@@ -1754,7 +1813,7 @@ mod tests {
         // Once the reader lets go, the next attempt succeeds.
         drop(squatter);
         store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect("retire");
         assert!(!store.has_legacy());
@@ -1777,7 +1836,7 @@ mod tests {
         // the verification pass. The one available here is the default, which never ran.
         let absent = VerifyReport::default();
         let err = store
-            .retire_legacy(&absent, &|_: &XorName| false)
+            .retire_legacy(&absent, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect_err("must refuse a report that never ran");
         assert!(format!("{err}").contains("unrepairable"), "{err}");
@@ -1792,7 +1851,7 @@ mod tests {
             .expect("verify");
         assert!(proof.is_clean());
         let err = store
-            .retire_legacy(&proof, &|_: &XorName| true)
+            .retire_legacy(&proof, &|_: &XorName| true, &approved_shed(&store))
             .await
             .expect_err("must refuse while a chunk is still answerable");
         assert!(format!("{err}").contains("still answerable"), "{err}");
@@ -1835,7 +1894,7 @@ mod tests {
         assert!(proof.is_clean());
 
         store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .expect("retire");
         assert_eq!(
@@ -1946,7 +2005,7 @@ mod tests {
         assert!(!path.exists(), "the pass must not republish it");
         assert!(store.legacy_only_keys().contains(&key));
         assert!(store
-            .retire_legacy(&proof, &|_: &XorName| false)
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
             .await
             .is_err());
         assert!(store.has_legacy());

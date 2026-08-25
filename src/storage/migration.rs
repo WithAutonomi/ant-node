@@ -925,16 +925,28 @@ pub async fn unconfirmed_by_neighbours(
         let publishing = peers_publishing_a_recent_commitment(context).await;
 
         for key in batch {
-            let peers: Vec<PeerId> = targets_by_key
-                .get(key)
-                .map_or(&[][..], Vec::as_slice)
+            let group = targets_by_key.get(key).map_or(&[][..], Vec::as_slice);
+
+            // A routing view that does not even see a full close group is not evidence
+            // about that group. A node whose table is thin after a restart would otherwise
+            // measure itself against whatever handful of peers it happens to know.
+            if group.len() + 1 < config.close_group_size {
+                unconfirmed.push(*key);
+                continue;
+            }
+
+            // The threshold comes from the WHOLE group, never from whichever subset
+            // happens to qualify. Deriving it from the filtered list is how two last
+            // holders destroy a chunk between them: each sees only the other publishing,
+            // so each needs exactly one proof, each gets it from the other, and both
+            // delete. The count of qualifying peers must clear a bar set by the group.
+            let needed = prune_proofs_needed(group.len());
+            let qualifying: Vec<PeerId> = group
                 .iter()
                 .filter(|p| publishing.contains(*p))
                 .copied()
                 .collect();
-            let peers = peers.as_slice();
-            if !target_peers_reported_present(key, peers, &proofs, prune_proofs_needed(peers.len()))
-            {
+            if !target_peers_reported_present(key, &qualifying, &proofs, needed) {
                 unconfirmed.push(*key);
             }
         }
@@ -1328,6 +1340,35 @@ async fn keys_this_node_must_not_give_up(
     must_keep
 }
 
+/// Re-ask every network gate, after verification and immediately before the deletion.
+///
+/// Verification re-reads the whole store and can run for hours. A gate satisfied before it
+/// started says nothing about the moment of deletion: peers leave, replicas are pruned
+/// elsewhere, and a write whose file half failed adds a fresh legacy-only key that has
+/// faced none of these checks. This is the last point at which the answer can still be
+/// acted on, so it is the point at which it has to be true.
+async fn every_gate_still_holds(
+    store: &Arc<ChunkStore>,
+    context: &MigrationContext,
+) -> Option<RetireOutcome> {
+    if !keys_this_node_must_not_give_up(store, context)
+        .await
+        .is_empty()
+    {
+        debug!("Legacy environment not retired: the shed rule changed during verification");
+        return Some(RetireOutcome::Waiting);
+    }
+    if let Some(outcome) = shedding_is_still_safe(store, context).await {
+        return Some(outcome);
+    }
+    // And the retention contract once more, for the same reason.
+    if let Some(reason) = store.retirement_blocker(|k| context.still_answerable(k)) {
+        debug!("Legacy environment not retired: {reason}");
+        return Some(RetireOutcome::Waiting);
+    }
+    None
+}
+
 /// The last two questions before anything is deleted, asked in this order because the
 /// order is the safety argument: reduce the claim, let the group learn it, then give the
 /// chunks up.
@@ -1417,11 +1458,6 @@ async fn retire_tick(
     // served from the legacy copy, and a write whose file half failed. Neither went
     // through the rank check, and both would be thrown away by the removal below.
     let must_keep = keys_this_node_must_not_give_up(store, context).await;
-    if must_keep.is_empty() {
-        if let Some(outcome) = shedding_is_still_safe(store, context).await {
-            return outcome;
-        }
-    }
     if !must_keep.is_empty() {
         warn!(
             "{} chunk(s) are still only in the legacy environment and this node is too \
@@ -1494,10 +1530,22 @@ async fn retire_tick(
         return RetireOutcome::NoWorkToSerialise;
     }
 
+    if let Some(outcome) = every_gate_still_holds(store, context).await {
+        return outcome;
+    }
+
     let kept = store.current_chunks().unwrap_or(0);
     let shed = store.migration_state().shed_key_count;
+    // Exactly the set the gates above cleared. Anything that joins it between here and
+    // the removal has passed nothing, and the removal refuses rather than destroying it.
+    let approved: std::collections::BTreeSet<XorName> =
+        store.legacy_only_keys().into_iter().collect();
     match store
-        .retire_legacy(&proof, &|k: &XorName| context.still_answerable(k))
+        .retire_legacy(
+            &proof,
+            &|k: &XorName| context.still_answerable(k),
+            &approved,
+        )
         .await
     {
         Ok(freed) => {
@@ -1959,6 +2007,55 @@ mod tests {
                 "and none of them may be given up"
             );
         }
+    }
+
+    #[test]
+    fn the_possession_threshold_comes_from_the_whole_group_not_the_qualifying_subset() {
+        use crate::replication::pruning::{prune_proofs_needed, target_peers_reported_present};
+        use std::collections::{HashMap, HashSet};
+
+        // Seven holders. Deriving the bar from whichever peers happen to qualify is how
+        // two last holders destroy a chunk between them: each sees only the other
+        // publishing, so each needs exactly one proof, each gets it from the other, and
+        // both delete. The bar must come from the group.
+        let key = [7u8; 32];
+        let group: Vec<PeerId> = (0..6u8).map(peer_id).collect();
+        let only_one_qualifies: Vec<PeerId> = group.iter().take(1).copied().collect();
+
+        // That one peer does answer the challenge.
+        let mut proofs: HashMap<XorName, HashSet<PeerId>> = HashMap::new();
+        proofs.insert(key, only_one_qualifies.iter().copied().collect());
+
+        // The dangerous reading: bar taken from the qualifying subset, so one is enough.
+        assert!(
+            target_peers_reported_present(
+                &key,
+                &only_one_qualifies,
+                &proofs,
+                prune_proofs_needed(only_one_qualifies.len()),
+            ),
+            "this is the mistake being guarded against, shown here to be a real risk"
+        );
+
+        // The correct reading: bar taken from the whole group, so one is nowhere near.
+        assert!(
+            !target_peers_reported_present(
+                &key,
+                &only_one_qualifies,
+                &proofs,
+                prune_proofs_needed(group.len()),
+            ),
+            "one proof must never satisfy a group of six"
+        );
+
+        // And with the whole group answering, it passes.
+        proofs.insert(key, group.iter().copied().collect());
+        assert!(target_peers_reported_present(
+            &key,
+            &group,
+            &proofs,
+            prune_proofs_needed(group.len()),
+        ));
     }
 
     #[test]
