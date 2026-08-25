@@ -1183,10 +1183,18 @@ impl ChunkStore {
                 "Refusing to remove the legacy environment: {reason}"
             )));
         }
-        // Exclusive from here to the removal. Every read holds this shared, so taking it
-        // means none is in progress and none can start: no reader is mid-way between
-        // discarding a corrupt file and reaching the copy that would replace it.
-        let _retiring = self.retirement.write().await;
+        // Exclusive from here until the handle is out. Every read, write and delete holds
+        // this shared, so taking it means none is in progress and none can start: no
+        // reader is mid-way between discarding a corrupt file and reaching the copy that
+        // would replace it, and nothing new can start work in an environment that is about
+        // to go idle.
+        //
+        // Released as soon as the handle has been taken and the directory renamed away,
+        // which is the point after which nothing can reach the environment anyway. The
+        // deletion that follows can take a long time on a large store, and holding every
+        // chunk request on the node behind it would turn retirement into an outage.
+        //
+        let retiring = self.retirement.write().await;
         let Some(legacy) = self.legacy() else {
             return Ok(0);
         };
@@ -1251,13 +1259,16 @@ impl ChunkStore {
             if let Some(Legacy { lmdb, only }) = taken {
                 drop(only);
                 drop(lmdb);
-                return self.remove_legacy_dir(freed).await;
+                return self.remove_legacy_dir(freed, retiring).await;
             }
             if attempt + 1 < RETIRE_UNWRAP_ATTEMPTS {
                 tokio::time::sleep(RETIRE_UNWRAP_BACKOFF).await;
             }
         }
 
+        // Nothing was taken and nothing will be this tick, so let the node get on with
+        // serving rather than leaving this held until the function returns.
+        drop(retiring);
         Err(Error::Storage(
             "Legacy environment is still being read; retirement deferred to the next tick".into(),
         ))
@@ -1269,7 +1280,11 @@ impl ChunkStore {
     /// either way. If the removal fails the phase still moves on, because there is no
     /// going back to a half-removed environment, and the operator is told exactly which
     /// directory to delete by hand to get the space back.
-    async fn remove_legacy_dir(&self, freed: u64) -> Result<u64> {
+    async fn remove_legacy_dir(
+        &self,
+        freed: u64,
+        retiring: tokio::sync::RwLockWriteGuard<'_, ()>,
+    ) -> Result<u64> {
         // Renamed aside first, because `remove_dir_all` is not atomic: a failure partway
         // through leaves a directory that can no longer be opened as an environment, and
         // recording the migration as finished on top of that would have the node claim
@@ -1322,6 +1337,11 @@ impl ChunkStore {
             return Ok(0);
         }
         self.finish_migration();
+
+        // From here nothing can reach the environment: its handle is gone and its
+        // directory is under a name no code looks for. Let the node serve again rather
+        // than holding every chunk request behind a deletion that can run for minutes.
+        drop(retiring);
 
         // Only now, and best effort: the bytes come back when this completes, and if it
         // does not the next start sweeps the tombstone.
