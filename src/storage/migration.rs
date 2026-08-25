@@ -1651,6 +1651,231 @@ mod tests {
         );
     }
 
+    /// Seed a real LMDB chunk store, the way a node upgrading into this build has one.
+    async fn seed_legacy(root: &std::path::Path, count: u32) -> Vec<XorName> {
+        let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
+            root_dir: root.to_path_buf(),
+            verify_on_read: true,
+            max_map_size: 0,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("open legacy");
+        let mut keys = Vec::new();
+        for i in 0..count {
+            let content = format!("legacy-chunk-{i}").into_bytes();
+            let addr = crate::client::compute_address(&content);
+            lmdb.put(&addr, &content).await.expect("legacy put");
+            keys.push(addr);
+        }
+        lmdb.wait_idle().await;
+        drop(lmdb);
+        keys
+    }
+
+    /// The whole point, end to end: a node that starts with an LMDB chunk store and a
+    /// disk to hold it finishes with the chunks in files and the LMDB gone.
+    ///
+    /// Driven by `run`, the same entry point node startup calls, rather than by poking the
+    /// pieces. That matters: the wiring that calls it went missing once and every test
+    /// passed, because they all built the store directly and a node with no legacy store
+    /// starts no migration.
+    #[tokio::test]
+    async fn a_node_with_room_copies_everything_and_removes_the_legacy_store() {
+        const CHUNKS: u32 = 24;
+
+        let tmp = TempDir::new().expect("temp dir");
+        // Nested, so the volume lock this node takes lives in its own directory rather
+        // than one shared with every other test running in parallel.
+        let root = tmp.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let keys = seed_legacy(&root, CHUNKS).await;
+
+        let mut config = crate::storage::ChunkStoreConfig {
+            root_dir: root.clone(),
+            ..crate::storage::ChunkStoreConfig::test_default()
+        };
+        config.migration.retire_legacy = true;
+        config.migration.allow_windows_retire = true;
+        config.migration.tick_secs = 1;
+        config.migration.copier_throttle_mib_per_sec = 0;
+        let store = Arc::new(
+            crate::storage::ChunkStore::new(config)
+                .await
+                .expect("open store"),
+        );
+
+        // Precondition: everything is in the legacy store and nothing is in files.
+        assert!(store.has_legacy(), "the node must start with an LMDB store");
+        assert_eq!(store.migration_phase(), MigrationPhase::Bridging);
+        assert_eq!(store.legacy_only_keys().len(), CHUNKS as usize);
+        assert!(root.join("chunks.mdb").exists());
+
+        let shutdown = CancellationToken::new();
+        let driver = tokio::spawn(run(
+            Arc::clone(&store),
+            MigrationContext {
+                p2p: None,
+                self_id: None,
+                self_xor: None,
+                commitment: None,
+                replication: None,
+                sync_state: None,
+                audit_challenge_coordinator: None,
+                peer_commitments: None,
+                close_group_size: 7,
+            },
+            shutdown.clone(),
+        ));
+
+        // The copier runs on its own and settles once nothing is left only in the legacy
+        // store. This node has room, so it sheds nothing and needs no network at all.
+        wait_for(
+            &store,
+            MigrationPhase::Committed,
+            "the copier should finish",
+        )
+        .await;
+        assert!(
+            store.legacy_only_keys().is_empty(),
+            "every chunk should have been copied"
+        );
+
+        // Stand in for the commitment builder, which lives in the replication engine: the
+        // retirement gate wants the reduced commitment published and its window elapsed.
+        store.note_commitment_rebuilt();
+        store.note_commitment_rebuilt();
+        store.force_migration_state(|s| {
+            s.committed_at_unix =
+                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
+        });
+
+        wait_for(
+            &store,
+            MigrationPhase::FilesOnly,
+            "retirement should complete",
+        )
+        .await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), driver).await;
+
+        // The point of the whole exercise: the LMDB is gone from the filesystem.
+        assert!(
+            !root.join("chunks.mdb").exists(),
+            "the legacy store must be removed, which is the only moment disk comes back"
+        );
+        assert!(!store.has_legacy());
+
+        // And nothing was lost: every chunk still reads, now out of a file.
+        assert_eq!(store.current_chunks().expect("count"), u64::from(CHUNKS));
+        for (i, key) in keys.iter().enumerate() {
+            let expected = format!("legacy-chunk-{i}").into_bytes();
+            assert_eq!(
+                store.get(key).await.expect("get").expect("present"),
+                expected,
+                "chunk {i} did not survive the migration"
+            );
+        }
+
+        // In files, under the suffix shard its address names.
+        let sample = keys.first().copied().expect("a key");
+        let path = root
+            .join(crate::storage::file_store::CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", sample.last().copied().unwrap_or(0)))
+            .join(hex::encode(sample));
+        assert!(path.exists(), "expected a chunk file at {}", path.display());
+    }
+
+    /// The other half: a node that cannot fit its chunks and cannot prove anyone else
+    /// holds them keeps both stores and deletes nothing.
+    ///
+    /// This is the case that must fail safe. The node is out of disk, so it would like to
+    /// give chunks up, but with no view of the network it cannot show a single one exists
+    /// elsewhere. Refusing costs it disk. Proceeding would cost the network data.
+    #[tokio::test]
+    async fn a_node_that_cannot_prove_its_chunks_are_safe_deletes_nothing() {
+        const CHUNKS: u32 = 8;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let root = tmp.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let keys = seed_legacy(&root, CHUNKS).await;
+
+        let mut config = crate::storage::ChunkStoreConfig {
+            root_dir: root.clone(),
+            // Nothing will fit: the copier stops for space on its first chunk.
+            disk_reserve: u64::MAX / 2,
+            ..crate::storage::ChunkStoreConfig::test_default()
+        };
+        config.migration.retire_legacy = true;
+        config.migration.allow_windows_retire = true;
+        config.migration.tick_secs = 1;
+        // Elapsed, so the hold is not what is doing the refusing here.
+        config.migration.shed_hold_hours = 0;
+        config.migration.wave_hours = 0;
+        let store = Arc::new(
+            crate::storage::ChunkStore::new(config)
+                .await
+                .expect("open store"),
+        );
+        assert_eq!(store.legacy_only_keys().len(), CHUNKS as usize);
+
+        let shutdown = CancellationToken::new();
+        let driver = tokio::spawn(run(
+            Arc::clone(&store),
+            MigrationContext {
+                p2p: None,
+                self_id: None,
+                self_xor: None,
+                commitment: None,
+                replication: None,
+                sync_state: None,
+                audit_challenge_coordinator: None,
+                peer_commitments: None,
+                close_group_size: 7,
+            },
+            shutdown.clone(),
+        ));
+
+        // Give it long enough to have tried, re-tried, and evaluated shedding.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        shutdown.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(10), driver).await;
+
+        assert_eq!(
+            store.migration_phase(),
+            MigrationPhase::Bridging,
+            "a node that cannot prove its chunks are held elsewhere must not commit"
+        );
+        assert!(
+            root.join("chunks.mdb").exists(),
+            "and must not remove the only copy of them"
+        );
+        assert_eq!(store.legacy_only_keys().len(), CHUNKS as usize);
+        for (i, key) in keys.iter().enumerate() {
+            assert_eq!(
+                store.get(key).await.expect("get").expect("present"),
+                format!("legacy-chunk-{i}").into_bytes(),
+                "chunk {i} must still be served throughout"
+            );
+        }
+    }
+
+    /// Poll until the store reaches `phase`, or fail with what it reached instead.
+    async fn wait_for(store: &Arc<crate::storage::ChunkStore>, phase: MigrationPhase, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while std::time::Instant::now() < deadline {
+            if store.migration_phase() == phase {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!(
+            "{what}: still in {:?} after 60s, expected {phase:?}",
+            store.migration_phase()
+        );
+    }
+
     #[tokio::test]
     async fn the_driver_exits_immediately_when_there_is_nothing_to_migrate() {
         // The whole feature hangs off `run` being reachable from node startup. A port that
