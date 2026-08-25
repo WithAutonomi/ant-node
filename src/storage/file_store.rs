@@ -657,22 +657,42 @@ impl FileStore {
                 // and on Windows a crash mid-write leaves a partial file under a real
                 // chunk name. Trusting the name here would acknowledge a chunk that was
                 // never stored, and then discard the good copy arriving to repair it.
-                // Replaced only when the bytes were read and proven wrong. A read that
-                // failed says nothing, and replacing on it would destroy a healthy copy.
-                if self.stored_bytes_match(address).await == StoredBytes::Wrong {
-                    warn!(
-                        "Chunk {} was already on disk but its contents are wrong; \
-                         replacing it with the copy just offered",
+                // Every answer handled, because three of the four must not report the
+                // chunk as stored. A caller that hears success acts on it: a client drops
+                // its own copy, replication marks the key held, and the copier takes it
+                // out of the legacy-only set.
+                match self.stored_bytes_match(address).await {
+                    StoredBytes::Good => {
+                        {
+                            let mut stats = self.stats.write();
+                            stats.duplicates = stats.duplicates.saturating_add(1);
+                        }
+                        Ok(false)
+                    }
+                    StoredBytes::Wrong => {
+                        warn!(
+                            "Chunk {} was already on disk but its contents are wrong; \
+                             replacing it with the copy just offered",
+                            hex::encode(address)
+                        );
+                        self.repair(address, content).await.map(|()| true)
+                    }
+                    // The name was taken a moment ago and is not now, or was never a
+                    // readable chunk file. Either way nothing holds these bytes, so say so
+                    // rather than reporting a chunk that is not there.
+                    StoredBytes::Absent => Err(Error::Storage(format!(
+                        "Chunk {} was reported already on disk but nothing is there. Not \
+                         reporting it as stored.",
                         hex::encode(address)
-                    );
-                    self.repair(address, content).await?;
-                    return Ok(true);
+                    ))),
+                    // Replacing on an unanswered question would destroy a healthy copy,
+                    // and reporting success would discard the offered one.
+                    StoredBytes::Unreadable => Err(Error::Storage(format!(
+                        "Chunk {} is on disk but could not be read to check it. Not \
+                         replacing it, and not reporting it as stored.",
+                        hex::encode(address)
+                    ))),
                 }
-                {
-                    let mut stats = self.stats.write();
-                    stats.duplicates = stats.duplicates.saturating_add(1);
-                }
-                Ok(false)
             }
             PutOutcome::New => {
                 let mut stats = self.stats.write();

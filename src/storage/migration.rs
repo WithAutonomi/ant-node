@@ -70,6 +70,12 @@ const STATE_SCHEMA: u32 = 1;
 /// gossiped. Four hours clears that with an hour to spare.
 pub const MIN_RETIRE_DELAY_HOURS: u64 = 4;
 
+/// How long between attempts to reopen an environment this node has lost its handle to.
+///
+/// Each attempt scans every key in it, so retrying on every tick would spend a large store
+/// entirely on failing to open it.
+const HANDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(300);
+
 /// The longest one node may hold the volume migration lock before giving others a turn.
 ///
 /// Every branch that waits rather than works is meant to give the lock back on its own.
@@ -1208,6 +1214,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
     let mut volume_lock: Option<VolumeLock> = None;
     let mut held = LockHold::default();
     let mut next_shed_evaluation = Instant::now();
+    let mut next_handle_recovery = Instant::now();
     // A clean verification is a full re-read of everything both stores hold. If
     // retirement is then deferred (a read still holds the legacy handle), re-hashing on
     // every tick would be minutes of disk for nothing, so a recent pass is reused.
@@ -1235,7 +1242,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
             held.give_up();
         }
 
-        maybe_recover_lost_handle(&store).await;
+        maybe_recover_lost_handle(&store, &mut next_handle_recovery).await;
 
         match store.migration_phase() {
             MigrationPhase::FilesOnly => return,
@@ -1318,10 +1325,18 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
 /// A node that lost its handle to an environment still on disk cannot read the chunks that
 /// live only there. The cause is usually transient, so this runs every tick rather than
 /// leaving the node half-blind until somebody restarts it.
-async fn maybe_recover_lost_handle(store: &Arc<ChunkStore>) {
+async fn maybe_recover_lost_handle(store: &Arc<ChunkStore>, next_attempt: &mut Instant) {
+    if Instant::now() < *next_attempt {
+        return;
+    }
     if store.recover_lost_legacy_handle().await {
         info!("Reopened the legacy chunk environment; the migration continues");
+        *next_attempt = Instant::now();
+        return;
     }
+    // Backed off, because each attempt scans the whole environment and a cause that has
+    // not cleared in half a minute is unlikely to clear in the next.
+    *next_attempt = Instant::now() + HANDLE_RECOVERY_INTERVAL;
 }
 
 /// How long this node has had the volume migration lock, and when it may ask again.
@@ -1784,6 +1799,31 @@ enum RetireOutcome {
     NoWorkToSerialise,
 }
 
+/// The retention contract, asked before anything else in the tick.
+///
+/// `Some` with what the driver should do, or `None` when nothing is in the way.
+fn blocked_before_the_gates(
+    store: &Arc<ChunkStore>,
+    context: &MigrationContext,
+    config: &MigrationConfig,
+) -> Option<RetireOutcome> {
+    let reason = store.retirement_blocker(|k| context.still_answerable(k))?;
+    debug!("Legacy environment not retired yet: {reason}");
+    // A node that cannot read its own environment is not going to retire it, and no
+    // amount of exclusive disk access changes that. Give the volume back to the nodes
+    // that can use it.
+    if store.has_lost_its_legacy_handle() {
+        return Some(RetireOutcome::NoWorkToSerialise);
+    }
+    Some(if config.retire_legacy {
+        RetireOutcome::Waiting
+    } else {
+        // Retirement is switched off on this node, so it will never free its disk here
+        // however long it waits.
+        RetireOutcome::NoWorkToSerialise
+    })
+}
+
 /// One pass of the retirement gate.
 async fn retire_tick(
     store: &Arc<ChunkStore>,
@@ -1792,15 +1832,8 @@ async fn retire_tick(
     verified: &mut Option<(VerifyReport, Instant)>,
     shutdown: &CancellationToken,
 ) -> RetireOutcome {
-    if let Some(reason) = store.retirement_blocker(|k| context.still_answerable(k)) {
-        debug!("Legacy environment not retired yet: {reason}");
-        return if config.retire_legacy {
-            RetireOutcome::Waiting
-        } else {
-            // R1: retirement is off for the whole release, so this node will never free
-            // its disk here however long it waits.
-            RetireOutcome::NoWorkToSerialise
-        };
+    if let Some(outcome) = blocked_before_the_gates(store, context, config) {
+        return outcome;
     }
 
     // Re-check the shed rule against live routing immediately before the destructive
@@ -2287,8 +2320,13 @@ mod tests {
     }
 
     /// Poll until the store reaches `phase`, or fail with what it reached instead.
+    ///
+    /// The deadline is generous because it is measured on the wall clock while the driver
+    /// it is waiting on runs on the runtime. On a saturated machine both stretch, and a
+    /// deadline sized for the work rather than for the contention turns a slow build into
+    /// a failing test. The work itself is two ticks.
     async fn wait_for(store: &Arc<crate::storage::ChunkStore>, phase: MigrationPhase, what: &str) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
         while std::time::Instant::now() < deadline {
             if store.migration_phase() == phase {
                 return;

@@ -54,10 +54,17 @@ pub const RETIRED_SUFFIX: &str = ".retired";
 const RETIRED_MARKER: &str = "RETIRED";
 
 /// How many times the background reaper retries deleting a retired directory.
-const RETIRED_DELETE_ATTEMPTS: u32 = 5;
+///
+/// Generous, because giving up strands the disk until the next restart and the thread
+/// costs nothing while it sleeps. With the backoff below this keeps trying for about a
+/// day.
+const RETIRED_DELETE_ATTEMPTS: u32 = 60;
 
-/// Base wait between those attempts, multiplied by the attempt number.
+/// Base wait between those attempts, multiplied by the attempt number up to the cap.
 const RETIRED_DELETE_BACKOFF: Duration = Duration::from_secs(10);
+
+/// The longest the reaper waits between attempts.
+const RETIRED_DELETE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
 
 /// How many retired directories may be waiting to be deleted before the node stops
 /// finding new names for them. Far more than a node should ever accumulate.
@@ -198,13 +205,14 @@ impl ChunkStore {
         // Before anything looks at the legacy environment: a directory carrying its own
         // retirement mark is the remains of a removal a power loss interrupted, and is
         // moved aside rather than opened.
-        finish_interrupted_retirement(&config.root_dir);
+        let openable = finish_interrupted_retirement(&config.root_dir);
         let legacy_env_dir = config.root_dir.join(LEGACY_ENV_DIR);
-        let legacy = if legacy_present(&config.root_dir)? {
-            Some(Self::open_legacy(&config, &files).await?)
-        } else {
-            None
-        };
+        let legacy =
+            if openable == LiveEnvironment::WhateverIsOnDisk && legacy_present(&config.root_dir)? {
+                Some(Self::open_legacy(&config, &files).await?)
+            } else {
+                None
+            };
 
         let phase = if legacy.is_some() {
             MigrationPhase::Bridging
@@ -1419,13 +1427,40 @@ impl ChunkStore {
         if !legacy_present(&self.config.root_dir).unwrap_or(false) {
             return false;
         }
-        // Exclusive, because it puts a handle back that reads and writes will start using
-        // the moment it is there.
+        // Opened WITHOUT the exclusive guard. Opening scans every key in the environment,
+        // which on a large store is minutes, and every read and write on the node would
+        // wait behind it. Nothing else can be installing a handle: retirement does nothing
+        // while there is none, and this runs from the one migration task.
+        let opened = match Self::open_legacy(&self.config, &self.files).await {
+            Ok(legacy) => legacy,
+            Err(e) => {
+                warn!(
+                    "Could not reopen {}: {e}. The chunks that live only there stay \
+                     unreadable until this succeeds.",
+                    self.legacy_env_dir.display()
+                );
+                return false;
+            }
+        };
+        // Exclusive only to install it, which is instant.
         let _recovering = self.retirement.write().await;
         if self.has_legacy() {
             return false;
         }
-        self.reopen_legacy().await
+        *self.legacy.write() = Some(opened);
+        warn!(
+            "Reopened {} after losing its handle",
+            self.legacy_env_dir.display()
+        );
+        true
+    }
+
+    /// Is there an environment on disk this node can no longer read?
+    #[must_use]
+    pub fn has_lost_its_legacy_handle(&self) -> bool {
+        !self.has_legacy()
+            && !directory_is_retired(&self.legacy_env_dir)
+            && legacy_present(&self.config.root_dir).unwrap_or(false)
     }
 
     /// Reopen the legacy store after a failed retirement, so the node keeps serving.
@@ -1603,7 +1638,7 @@ fn delete_retired_directory(dir: PathBuf) {
         .name("chunk-store-retire".into())
         .spawn(move || {
             for attempt in 1..=RETIRED_DELETE_ATTEMPTS {
-                match std::fs::remove_dir_all(&dir) {
+                match remove_marked_directory(&dir) {
                     Ok(()) => {
                         info!(
                             migration_event = "space_returned",
@@ -1621,7 +1656,9 @@ fn delete_retired_directory(dir: PathBuf) {
                             "Could not delete {} (attempt {attempt}): {e}. Trying again.",
                             dir.display()
                         );
-                        std::thread::sleep(RETIRED_DELETE_BACKOFF * attempt);
+                        std::thread::sleep(
+                            (RETIRED_DELETE_BACKOFF * attempt).min(RETIRED_DELETE_BACKOFF_MAX),
+                        );
                     }
                     Err(e) => warn!(
                         "The chunk environment has been retired but {} could not be \
@@ -1641,6 +1678,42 @@ fn delete_retired_directory(dir: PathBuf) {
     }
 }
 
+/// Delete a retired directory, taking its mark away last of all.
+///
+/// `remove_dir_all` walks in whatever order the filesystem hands back, so it can unlink
+/// the mark and then fail on the next entry, which is exactly what a Windows sharing
+/// violation on the data file produces. What is left is a genuinely retired, partly
+/// deleted directory carrying no evidence that it was retired, and the next start would
+/// read that as an intact environment and restore it.
+///
+/// Emptying it first and removing the mark last means the mark is only ever absent from a
+/// directory that has nothing else left in it.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error. The directory is left with its mark intact on every
+/// failure that happens before the mark is reached.
+fn remove_marked_directory(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == RETIRED_MARKER {
+            continue;
+        }
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    match std::fs::remove_file(dir.join(RETIRED_MARKER)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    std::fs::remove_dir(dir)
+}
+
 /// Has this directory been retired?
 fn directory_is_retired(dir: &Path) -> bool {
     dir.join(RETIRED_MARKER).try_exists().unwrap_or(false)
@@ -1653,7 +1726,7 @@ fn directory_is_retired(dir: &Path) -> bool {
 /// scans every key, so a full disk, a permission change, a mapping limit or a transient
 /// I/O fault all look identical to corruption, and deleting on any of those would destroy
 /// a perfectly good environment.
-fn finish_interrupted_retirement(root_dir: &Path) {
+fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
     let env = root_dir.join(LEGACY_ENV_DIR);
     if env.try_exists().unwrap_or(false) && directory_is_retired(&env) {
         // Its own contents say it was retired, so whatever name it is wearing now, it is
@@ -1669,14 +1742,30 @@ fn finish_interrupted_retirement(root_dir: &Path) {
         // not force a synchronous delete first.
         let tombstone = free_tombstone_path(root_dir);
         if let Err(e) = std::fs::rename(&env, &tombstone) {
-            warn!(
-                "Could not move {} aside: {e}. It will be tried again at the next start.",
+            error!(
+                "{} carries its own retirement mark but could not be moved aside: {e}. It \
+                 will NOT be opened: it says it has been retired, so it may be partly \
+                 deleted, and its chunks are in the file store. The node serves from files \
+                 alone and the next start tries again.",
                 env.display()
             );
-            return;
+            sweep_retired_legacy(root_dir);
+            return LiveEnvironment::None;
         }
     }
     sweep_retired_legacy(root_dir);
+    LiveEnvironment::WhateverIsOnDisk
+}
+
+/// Whether the ordinary open may look at what is under the live environment name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveEnvironment {
+    /// Nothing is claiming it should not be opened.
+    WhateverIsOnDisk,
+    /// A directory under the live name says it has been retired, and could not be moved
+    /// out of the way. It must not be opened: a retired directory may be partly deleted,
+    /// and opening it would put its keys back into a commitment they have left.
+    None,
 }
 
 fn sweep_retired_legacy(root_dir: &Path) {
@@ -2496,6 +2585,98 @@ mod tests {
             "an unmarked directory must never be deleted, even beside a live one"
         );
         assert!(dir.path().join(LEGACY_ENV_DIR).exists());
+    }
+
+    /// The mark is the last thing a deletion takes away.
+    ///
+    /// A recursive delete walks in whatever order the filesystem gives, so it can unlink
+    /// the mark and then fail on the next entry, which is what a sharing violation on the
+    /// data file looks like. That leaves a genuinely retired, partly deleted directory
+    /// carrying no evidence of it, and the next start would read that as intact and
+    /// restore it.
+    #[test]
+    fn a_failed_deletion_leaves_the_mark_in_place() {
+        let dir = TempDir::new().expect("temp dir");
+        let retired = dir.path().join("chunks.mdb.retired");
+        std::fs::create_dir_all(&retired).expect("mkdir");
+        std::fs::write(retired.join("data.mdb"), b"payload").expect("write");
+        mark_directory_retired(&retired).expect("mark");
+
+        // A subdirectory that cannot be removed, standing in for whatever the filesystem
+        // refuses on the day.
+        let stuck = retired.join("stuck");
+        std::fs::create_dir_all(&stuck).expect("mkdir");
+        let mut perms = std::fs::metadata(&retired).expect("meta").permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o500);
+            std::fs::set_permissions(&retired, perms.clone()).expect("chmod");
+        }
+
+        let failed = remove_marked_directory(&retired).is_err();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&retired, perms).expect("chmod back");
+        }
+
+        if failed {
+            assert!(
+                directory_is_retired(&retired),
+                "a deletion that failed must leave the mark, or the directory stops \
+                 saying what it is"
+            );
+        }
+    }
+
+    /// A directory under the live name that says it was retired is never opened.
+    ///
+    /// It may be partly deleted, and opening it would put keys back into a commitment
+    /// they have already left. Its chunks are in the file store, which is what the mark
+    /// records, so serving from files alone is correct.
+    #[tokio::test]
+    async fn a_marked_directory_under_the_live_name_is_not_served_from() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["marked-live"]).await;
+        {
+            let store = open(&dir).await;
+            store
+                .copy_batch(&keys, 0, 0, &never_cancelled())
+                .await
+                .expect("copy");
+        }
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        mark_directory_retired(&env).expect("mark");
+
+        // Every name it could be moved to is taken by something that is not empty, so the
+        // rename fails and the marked directory stays under the live name. That is the
+        // case this is about: it must be left alone rather than opened.
+        for n in 0..=MAX_TOMBSTONES {
+            let taken = if n == 0 {
+                dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"))
+            } else {
+                dir.path()
+                    .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.{n}"))
+            };
+            std::fs::create_dir_all(&taken).expect("mkdir");
+            std::fs::write(taken.join("occupied"), b"x").expect("write");
+        }
+
+        let store = open(&dir).await;
+        assert!(
+            env.exists(),
+            "the rename was supposed to fail, leaving the marked directory in place"
+        );
+        assert!(
+            !store.has_legacy(),
+            "a directory that says it was retired must never be opened as live"
+        );
+        for key in &keys {
+            assert!(store.get(key).await.expect("get").is_some());
+        }
     }
 
     /// A single node can still be told to keep both stores.
