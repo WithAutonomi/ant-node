@@ -1145,9 +1145,9 @@ impl FileStore {
 
     /// Stop answering for a chunk a read has proven wrong.
     ///
-    /// Unlike [`Self::mark_suspect`], a later read does not clear this. The bytes are
-    /// wrong, and reading them again says the same thing; only replacing them or removing
-    /// them settles it. Bumping health matters as much as the suppression: a chunk that
+    /// Unlike a chunk that merely could not be read, a later read does not clear this.
+    /// The bytes are wrong, and reading them again says the same thing; only replacing
+    /// them or removing them settles it. Bumping health matters as much as the suppression: a chunk that
     /// has become unservable since the last pre-retirement pass must invalidate that pass,
     /// or a repair that fails leaves the node deleting the copy it would have repaired
     /// from.
