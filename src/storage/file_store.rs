@@ -825,7 +825,11 @@ impl FileStore {
     // Async without awaiting anything, deliberately: the whole point of this store is
     // that the key set is already in memory. Callers are spread across the replication
     // engine and cannot all be de-async'd in this change.
-    #[allow(clippy::unused_async)]
+    //
+    // Two lint names because they were renamed between toolchains, and `unknown_lints`
+    // so whichever one the compiler in use has never heard of stays quiet.
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn all_keys(&self) -> Result<Vec<XorName>> {
         Ok(self.index.read().iter().copied().collect())
     }
