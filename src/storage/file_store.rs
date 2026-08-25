@@ -913,8 +913,11 @@ impl FileStore {
         drop(reservation);
         self.invalidate_capacity_cache();
 
-        // Rewritten from bytes that hash to their own name, so whatever was wrong with
-        // the old file is not wrong with this one.
+        // Cleared here rather than inside the blocking closure only because the closure
+        // returns before this line runs on every path that reaches it: an error short-
+        // circuits above, and a cancelled repair leaves the marks in place, which is the
+        // safe direction. The reconciliation the next verifying read performs clears them
+        // if the replacement did land.
         self.clear_suspect(address);
         self.clear_known_wrong(address);
         debug!("Repaired chunk {}", hex::encode(address));
@@ -947,6 +950,11 @@ impl FileStore {
                     hex::encode(address),
                     hex::encode(computed)
                 );
+                // Said before it is acted on. Removing the file can fail or be cancelled,
+                // and a chunk proven wrong that goes on looking healthy is one the node
+                // keeps committing to and, worse, one a cached pre-retirement pass still
+                // covers: the legacy copy that would repair it gets deleted.
+                self.mark_known_wrong(address);
                 self.quarantine_corrupt(address).await;
                 return Err(Error::Storage(format!(
                     "Chunk verification failed for {}",
@@ -1143,6 +1151,13 @@ impl FileStore {
     /// has become unservable since the last pre-retirement pass must invalidate that pass,
     /// or a repair that fails leaves the node deleting the copy it would have repaired
     /// from.
+    ///
+    /// For callers outside this module that have proven it themselves.
+    pub fn note_known_wrong(&self, address: &XorName) {
+        self.mark_known_wrong(address);
+    }
+
+    /// Stop answering for a chunk a read has proven wrong.
     fn mark_known_wrong(&self, address: &XorName) {
         if self.known_wrong.write().insert(*address) {
             self.note_health_changed();

@@ -145,6 +145,18 @@ struct Legacy {
     /// sequences. It is derived at open (LMDB keys minus file keys) and maintained by
     /// every write, copy and delete.
     only: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
+    /// Writes that have started and whose outcome is not yet known.
+    ///
+    /// A write into the legacy environment runs on a blocking thread that outlives the
+    /// future waiting for it, so a shutdown can leave the environment holding a chunk
+    /// while nothing ran to record it. A key in neither view is what retirement destroys,
+    /// so every write announces itself here first.
+    ///
+    /// Deliberately NOT part of what the node says it holds. This is a note to itself
+    /// that something is in flight, not a claim: `exists`, `all_keys`, the commitment, the
+    /// quote count and the pruner all ignore it. It vetoes retirement, and the driver
+    /// resolves each entry against what is actually on disk.
+    pending: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
 }
 
 /// Content-addressed chunk storage.
@@ -292,6 +304,7 @@ impl ChunkStore {
                 &legacy_keys,
                 files,
             ))),
+            pending: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         })
     }
 
@@ -399,14 +412,14 @@ impl ChunkStore {
                         hex::encode(address)
                     );
                 } else {
-                    // Marked legacy-only BEFORE the write, not after it. The write runs on
-                    // a blocking thread that outlives this future: a shutdown that drops
-                    // the caller mid-way can leave the environment holding a chunk while
+                    // Announced BEFORE the write, not after it. The write runs on a
+                    // blocking thread that outlives this future: a shutdown that drops the
+                    // caller mid-way can leave the environment holding a chunk while
                     // nothing here ever ran to record it, and a key in neither view is
-                    // what retirement destroys. Recorded first, a cancelled write leaves
-                    // the copier a key to pick up; if the write never landed, the copier
-                    // finds nothing behind it and drops it again.
-                    l.only.write().insert(*address);
+                    // what retirement destroys. In the in-flight note rather than the key
+                    // set, because until the write returns this node does not hold the
+                    // chunk and must not say it does.
+                    l.pending.write().insert(*address);
                     // Best effort, and only best effort. The verdict above is optimistic
                     // by design: LMDB can still refuse a write for fragmentation, pages
                     // pinned by a long read, or a copy-on-write B-tree split. Propagating
@@ -439,27 +452,26 @@ impl ChunkStore {
                 // and calling that key legacy-only while the file index still names it
                 // puts it in both views, where it stays answerable and vetoes retirement
                 // for good.
-                // Already recorded before the legacy write, so nothing to do here but
-                // leave it recorded. Taking it back out when the file store does have the
-                // key is what the check below is for: a write can fail because the file
-                // that is already there could not be read, and calling that key
-                // legacy-only while the index still names it puts it in both views.
-                if self.files.is_indexed(address) {
-                    if let Some(ref l) = legacy {
-                        l.only.write().remove(address);
+                // The file half failed and the legacy half did not, so the environment
+                // holds the only copy and the key really is legacy-only now. Promoted
+                // from the in-flight note to the key set, which is the one moment that
+                // promotion is warranted: both outcomes are known.
+                if let Some(ref l) = legacy {
+                    l.pending.write().remove(address);
+                    if dual_written && !self.files.is_indexed(address) {
+                        l.only.write().insert(*address);
                     }
                 }
-                let _ = dual_written;
                 return Err(e);
             }
         };
 
         // The file store has it, so it is not legacy-only, whether it was already there
-        // or this call put it there. Removed only now, after the file write returned:
-        // between the mark above and here the key is deliberately over-recorded, which
-        // costs the copier one lookup and is the direction that cannot lose a chunk.
+        // or this call put it there. The in-flight note goes at the same time: both
+        // writes have returned, so there is nothing left in flight to protect.
         if let Some(ref l) = legacy {
             l.only.write().remove(address);
+            l.pending.write().remove(address);
         }
         if already_in_legacy {
             // Migrated for free: a hot key the copier no longer has to move.
@@ -696,6 +708,11 @@ impl ChunkStore {
                      copy just offered",
                     hex::encode(address)
                 );
+                // Recorded before the repair is attempted, not after it succeeds. A
+                // repair can fail for capacity or I/O, and a chunk proven wrong that goes
+                // on looking healthy leaves a cached pre-retirement pass covering it,
+                // which deletes the legacy copy the repair would have come from.
+                self.files.note_known_wrong(address);
                 self.files.repair(address, content).await.is_ok()
             }
             // Unanswerable this time. Not claimed as held, so the offer goes through the
@@ -1419,6 +1436,13 @@ impl ChunkStore {
                     .into(),
             ));
         }
+        if self.has_pending_writes() {
+            return Err(Error::Storage(
+                "Refusing to remove the legacy environment: a write announced itself and \
+                 has not reported back, so what the environment holds is not yet settled."
+                    .into(),
+            ));
+        }
         // Rechecked here, not only by the caller. Everything between the caller's check
         // and this point is a window: the verification pass alone can run for hours, and
         // a write whose file half failed inserts a new legacy-only key in the meantime.
@@ -1512,8 +1536,14 @@ impl ChunkStore {
                     None => return Ok(0),
                 }
             };
-            if let Some(Legacy { lmdb, only }) = taken {
+            if let Some(Legacy {
+                lmdb,
+                only,
+                pending,
+            }) = taken
+            {
                 drop(only);
+                drop(pending);
                 drop(lmdb);
                 return self.remove_legacy_dir(freed, retiring).await;
             }
@@ -1682,6 +1712,7 @@ impl ChunkStore {
         *self.legacy.write() = Some(Legacy {
             lmdb,
             only: Arc::new(parking_lot::RwLock::new(only)),
+            pending: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
         });
         // A node that recorded itself file-only and then got an environment back has to
         // go through the migration again from the start: the phase decides what the
@@ -1734,6 +1765,47 @@ impl ChunkStore {
             return;
         }
         finish_interrupted_retirement(&self.config.root_dir);
+    }
+
+    /// Resolve writes whose outcome was never recorded.
+    ///
+    /// A write announces itself before it starts and clears the note when both halves
+    /// have returned. A note still there afterwards belongs to a write nobody waited for,
+    /// and only the disk can say what became of it: the file store has the chunk, or the
+    /// environment does and nothing else, or neither and there was never anything to
+    /// protect.
+    pub async fn reconcile_pending_writes(&self) {
+        let Some(legacy) = self.legacy() else {
+            return;
+        };
+        let waiting: Vec<XorName> = legacy.pending.read().iter().copied().collect();
+        if waiting.is_empty() {
+            return;
+        }
+        // Whatever was still running has finished by the time this returns, so what the
+        // disk says now is final rather than a race.
+        legacy.lmdb.wait_idle().await;
+        self.files.wait_idle().await;
+        for key in waiting {
+            let _lane = self.key_lock(&key).await;
+            if self.files.is_indexed(&key) {
+                legacy.only.write().remove(&key);
+            } else if matches!(legacy.lmdb.get_raw(&key).await, Ok(Some(_))) {
+                debug!(
+                    "Chunk {} was written to the legacy environment by a call that never \
+                     returned; recording it so the copier picks it up",
+                    hex::encode(key)
+                );
+                legacy.only.write().insert(key);
+            }
+            legacy.pending.write().remove(&key);
+        }
+    }
+
+    /// Are there writes in flight whose outcome nothing has recorded?
+    #[must_use]
+    pub fn has_pending_writes(&self) -> bool {
+        self.legacy().is_some_and(|l| !l.pending.read().is_empty())
     }
 
     /// Is there anything at the legacy environment's path at all?
@@ -3386,6 +3458,63 @@ mod tests {
         let mut perms = std::fs::metadata(&path).expect("meta").permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&path, perms).expect("chmod back");
+    }
+
+    /// A write in flight is a note to self, not a claim to hold the chunk.
+    ///
+    /// The note exists because a write into the environment outlives the future waiting
+    /// for it, so a cancelled one could leave a chunk nothing had recorded. But until both
+    /// halves have returned the node does not hold it, and saying it does puts the key in
+    /// signed commitments and in the count a quote is priced from.
+    #[tokio::test]
+    async fn a_write_in_flight_is_not_claimed_but_does_stop_retirement() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["settled"]).await;
+        let store = open(&dir).await;
+        let legacy = store.legacy().expect("legacy");
+        let (addr, _) = addressed("in-flight");
+
+        // Stand in for a write that announced itself and never came back.
+        legacy.pending.write().insert(addr);
+
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "a write in flight must not be reported as held"
+        );
+        assert!(!store.all_keys().await.expect("keys").contains(&addr));
+        assert!(!store.legacy_only_keys().contains(&addr));
+        assert!(store.has_pending_writes());
+
+        // The distinction is the point: the same key in the key set IS claimed. If a
+        // write announced itself there instead, every one of the assertions above would
+        // be the opposite for as long as the write took.
+        legacy.only.write().insert(addr);
+        assert!(store.exists(&addr).expect("exists"));
+        assert!(store.all_keys().await.expect("keys").contains(&addr));
+        legacy.only.write().remove(&addr);
+
+        // But it does stop the environment going, because what it holds is unsettled.
+        store.commit_to_files().expect("commit");
+        store.note_commitment_rebuilt();
+        store.note_commitment_rebuilt();
+        store.force_migration_state(|s| {
+            s.committed_at_unix =
+                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
+        });
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        let err = store
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
+            .await
+            .expect_err("an unsettled write must stop the removal");
+        assert!(format!("{err}").contains("not reported back"), "{err}");
+
+        // And the note is resolved against what is actually there: nothing, so it goes.
+        store.reconcile_pending_writes().await;
+        assert!(!store.has_pending_writes());
+        assert!(!store.legacy_only_keys().contains(&addr));
     }
 
     /// A single node can still be told to keep both stores.

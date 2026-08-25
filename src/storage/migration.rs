@@ -1234,6 +1234,9 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
         // until the next tick, and the completion check in between would see no handle
         // and no pending cleanup and call the migration finished.
         let cleanup = cleanup_state(&store);
+        // Before anything reads the key set: a write that nobody waited for leaves a
+        // note behind, and only the disk can say what became of it.
+        store.reconcile_pending_writes().await;
         maybe_recover_lost_handle(&store, &mut next_handle_recovery).await;
         if cleanup == CleanupState::Finished && !store.has_legacy() {
             info!("Storage migration finished; nothing left on disk to clean up");
