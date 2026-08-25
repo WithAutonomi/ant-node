@@ -1144,6 +1144,25 @@ impl ChunkStore {
                 return Ok(report);
             }
             if !self.files.exists(&key).unwrap_or(false) {
+                // Known to be legacy-only, which is what a key this node is giving up
+                // looks like. Whether it may go is the gates' decision, not this pass's.
+                if legacy.only.read().contains(&key) {
+                    continue;
+                }
+                // In neither view. However that came about — a publish that failed, a
+                // file quarantined for corruption, a name this store stopped advertising —
+                // the environment holds the only copy, and nothing is looking after it:
+                // the gates only ever see the legacy-only set. Put it back there and
+                // refuse the proof this pass. What neither view protects is exactly what
+                // retirement destroys.
+                warn!(
+                    "Chunk {} is in the legacy environment, is not in the file store, and \
+                     was in neither view; re-queued for copying and the legacy environment \
+                     stays",
+                    hex::encode(key)
+                );
+                legacy.only.write().insert(key);
+                report.unrepairable = report.unrepairable.saturating_add(1);
                 continue;
             }
             since_log += 1;
@@ -1520,6 +1539,15 @@ impl ChunkStore {
         finish_interrupted_retirement(&self.config.root_dir);
     }
 
+    /// Is the legacy environment a link this node must not delete?
+    ///
+    /// Copying out of it works; only the removal is refused. Callers use this to stop
+    /// waiting for a retirement that is never going to happen.
+    #[must_use]
+    pub fn legacy_is_a_link(&self) -> bool {
+        self.has_legacy() && is_a_link(&self.legacy_env_dir)
+    }
+
     /// Is there an environment on disk this node can no longer read?
     #[must_use]
     pub fn has_lost_its_legacy_handle(&self) -> bool {
@@ -1698,10 +1726,17 @@ node start finishes it. Nothing needs it.\n",
 /// is finished by the next start. What matters is that neither shutdown nor startup ever
 /// blocks on a recursive delete that can run for minutes.
 fn delete_retired_directory(dir: PathBuf) {
+    // One at a time per directory. The driver asks for cleanup on every tick while
+    // anything is pending, and starting a fresh thread each time would leave hundreds of
+    // them asleep on the same path, all retrying the same failure.
+    if !REAPING.lock().insert(dir.clone()) {
+        return;
+    }
     let named = dir.clone();
     let started = std::thread::Builder::new()
         .name("chunk-store-retire".into())
         .spawn(move || {
+            let _done = ReapingGuard(dir.clone());
             for attempt in 1..=RETIRED_DELETE_ATTEMPTS {
                 match remove_marked_directory(&dir) {
                     Ok(()) => {
@@ -1735,11 +1770,24 @@ fn delete_retired_directory(dir: PathBuf) {
             }
         });
     if let Err(e) = started {
+        REAPING.lock().remove(&named);
         warn!(
             "Could not start the thread to delete the retired chunk environment {}: {e}. \
              The next start sweeps it.",
             named.display()
         );
+    }
+}
+
+/// Directories a reaper thread is already working on.
+static REAPING: parking_lot::Mutex<BTreeSet<PathBuf>> = parking_lot::Mutex::new(BTreeSet::new());
+
+/// Releases a directory from [`REAPING`] however its thread ends.
+struct ReapingGuard(PathBuf);
+
+impl Drop for ReapingGuard {
+    fn drop(&mut self) {
+        REAPING.lock().remove(&self.0);
     }
 }
 
@@ -1957,8 +2005,18 @@ fn restore_unmarked_environment(root_dir: &Path, tombstone: &Path) {
 /// is named so it cannot collide with the next.
 fn retired_tombstones(root_dir: &Path) -> Vec<PathBuf> {
     let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
-    let Ok(entries) = std::fs::read_dir(root_dir) else {
-        return Vec::new();
+    let entries = match std::fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            // Cannot tell. Not the same as nothing here, and the caller uses this to
+            // decide whether cleanup is finished, so answer with the one that keeps it
+            // looking rather than the one that declares victory.
+            warn!(
+                "Could not list {} to look for retired chunk environments: {e}",
+                root_dir.display()
+            );
+            return vec![root_dir.join(&prefix)];
+        }
     };
     entries
         .flatten()
@@ -2862,6 +2920,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A key the environment holds that is in neither view stops retirement.
+    ///
+    /// The gates only ever see the legacy-only set, so a key that has fallen out of both
+    /// the file index and that set has been through nothing and is protected by nothing.
+    /// It is the environment's only copy, and retirement would take it.
+    #[tokio::test]
+    async fn a_legacy_key_in_neither_view_refuses_the_proof_and_is_re_queued() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["orphan"]).await;
+        let key = *keys.first().expect("one key");
+        let store = open(&dir).await;
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        assert!(!store.legacy_only_keys().contains(&key));
+
+        // Stand in for whatever takes the file out from under the index: a quarantine, a
+        // publish that failed, an operator. The key is now in neither view.
+        let path = dir
+            .path()
+            .join("chunks")
+            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+            .join(hex::encode(key));
+        std::fs::remove_file(&path).expect("remove the file");
+        store.files.forget_for_test(&key);
+        assert!(!store.files.exists(&key).unwrap_or(false));
+        assert!(!store.legacy_only_keys().contains(&key));
+
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        assert!(
+            !proof.is_clean(),
+            "a key protected by neither view must refuse the proof"
+        );
+        assert!(
+            store.legacy_only_keys().contains(&key),
+            "and must be put back where the gates can see it"
+        );
     }
 
     /// A single node can still be told to keep both stores.

@@ -1234,7 +1234,12 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
         }
 
         match store.migration_phase() {
-            MigrationPhase::FilesOnly => return,
+            // Nothing left to migrate. Whether there is anything left to clean up is
+            // decided at the top of the loop, which is also where this returns from.
+            MigrationPhase::FilesOnly => {
+                volume_lock = None;
+                held.released();
+            }
             MigrationPhase::Bridging => {
                 // Held from the first copy through retirement, not released in between:
                 // a node that let go after copying would let its eleven neighbours start
@@ -1287,7 +1292,14 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                     continue;
                 }
                 match retire_tick(&store, &context, &config, &mut verified, &shutdown).await {
-                    RetireOutcome::Done => return,
+                    // Not a return. The environment is gone from the node's point of
+                    // view, but its directory is still being deleted in the background,
+                    // and if that fails there has to be something left to try again. The
+                    // loop exits at the top once nothing is pending.
+                    RetireOutcome::Done => {
+                        volume_lock = None;
+                        held.released();
+                    }
                     // Time spent reading or copying is the volume lock doing its job, not
                     // a node sitting on it. The cap is there for a node that waits, and
                     // restarting a full verification because a large store took longer
@@ -1838,6 +1850,26 @@ enum RetireOutcome {
     NoWorkToSerialise,
 }
 
+/// When this node last said out loud that its migration needs a person.
+static LAST_OPERATOR_WARNING: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
+
+/// How often to repeat it. Often enough to be noticed, rarely enough not to drown the log.
+const OPERATOR_WARNING_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Should the "this needs a person" warning be repeated now?
+///
+/// The condition it reports is checked on every tick and does not clear on its own, so
+/// without this it would be a line every thirty seconds for as long as the node runs.
+fn operator_should_hear_again() -> bool {
+    let mut last = LAST_OPERATOR_WARNING.lock();
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < OPERATOR_WARNING_INTERVAL) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
 /// The retention contract, asked before anything else in the tick.
 ///
 /// `Some` with what the driver should do, or `None` when nothing is in the way.
@@ -1847,13 +1879,20 @@ fn blocked_before_the_gates(
     config: &MigrationConfig,
 ) -> Option<RetireOutcome> {
     let reason = store.retirement_blocker(|k| context.still_answerable(k))?;
-    debug!("Legacy environment not retired yet: {reason}");
-    // A node that cannot read its own environment is not going to retire it, and no
-    // amount of exclusive disk access changes that. Give the volume back to the nodes
-    // that can use it.
-    if store.has_lost_its_legacy_handle() {
+    // Two blockers no amount of exclusive disk access will clear: an environment this
+    // node cannot read, and one it must not delete because it is a link to somewhere
+    // else. Both need a person, so give the volume back to the nodes that can use it and
+    // say so where an operator will see it rather than at debug.
+    if store.has_lost_its_legacy_handle() || store.legacy_is_a_link() {
+        if operator_should_hear_again() {
+            warn!(
+                migration_event = "needs_an_operator",
+                "The legacy chunk environment will not be retired automatically: {reason}"
+            );
+        }
         return Some(RetireOutcome::NoWorkToSerialise);
     }
+    debug!("Legacy environment not retired yet: {reason}");
     Some(if config.retire_legacy {
         RetireOutcome::Waiting
     } else {

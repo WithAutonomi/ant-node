@@ -687,20 +687,16 @@ impl FileStore {
                     ))),
                     // Replacing on an unanswered question would destroy a healthy copy,
                     // and reporting success would discard the offered one. The index entry
-                    // goes, though: a name this store cannot read is one it must stop
-                    // advertising, or the copier drops the key from the legacy-only set on
-                    // the strength of it and replication answers "already held" and never
-                    // repairs it. The file itself stays, and a later read that succeeds
-                    // puts it back.
-                    StoredBytes::Unreadable => {
-                        self.index.write().remove(address);
-                        Err(Error::Storage(format!(
-                            "Chunk {} is on disk but could not be read to check it. Not \
-                             replacing it, not reporting it as stored, and no longer \
-                             claiming to hold it.",
-                            hex::encode(address)
-                        )))
-                    }
+                    // stays: the file is still there, and dropping the entry would leave
+                    // the chunk in neither this store's view nor the legacy one, which is
+                    // what retirement destroys. Removing an entry is the quarantine path's
+                    // job, and it removes the file with it, after a read that succeeded
+                    // and proved the bytes wrong.
+                    StoredBytes::Unreadable => Err(Error::Storage(format!(
+                        "Chunk {} is on disk but could not be read to check it. Not \
+                         replacing it, and not reporting it as stored.",
+                        hex::encode(address)
+                    ))),
                 }
             }
             PutOutcome::New => {
@@ -778,17 +774,23 @@ impl FileStore {
             StoredBytes::Absent => None,
             // Unanswerable this time. Do not touch what is there, and do not tell the
             // caller the chunk is safely stored either: a client would take that as an
-            // acknowledgement and drop the only other copy. Stop advertising it, for the
-            // reason given on the same case after publication.
-            StoredBytes::Unreadable => {
-                self.index.write().remove(address);
-                Some(Err(Error::Storage(format!(
-                    "Chunk {} is indexed but could not be read to check it. Not replacing \
-                     it, not reporting it as stored, and no longer claiming to hold it.",
-                    hex::encode(address)
-                ))))
-            }
+            // acknowledgement and drop the only other copy. The index entry stays, for
+            // the reason given on the same case after publication.
+            StoredBytes::Unreadable => Some(Err(Error::Storage(format!(
+                "Chunk {} is indexed but could not be read to check it. Not replacing it, \
+                 and not reporting it as stored.",
+                hex::encode(address)
+            )))),
         }
+    }
+
+    /// Drop an address from the index without touching the file. Tests only.
+    ///
+    /// Stands in for whatever leaves a key indexed nowhere: a quarantine, a publish that
+    /// failed after the file went, an operator with a shell.
+    #[cfg(test)]
+    pub(crate) fn forget_for_test(&self, address: &XorName) {
+        self.index.write().remove(address);
     }
 
     /// The size of the file behind `address`, if there is one.
