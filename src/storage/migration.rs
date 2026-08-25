@@ -984,6 +984,15 @@ pub fn rank_is_sheddable(rank: GroupRank, width: usize) -> bool {
     }
 }
 
+/// Whether this store needs a migration driver at all.
+///
+/// The single predicate both the spawn site and its test use, so "should this node be
+/// migrating" cannot be answered one way by the wiring and another way by what checks it.
+#[must_use]
+pub fn should_migrate(store: &Arc<ChunkStore>) -> bool {
+    store.has_legacy()
+}
+
 /// Runs the migration to completion, then returns.
 ///
 /// Everything it does is idempotent and derived from the filesystem, so a crash at any

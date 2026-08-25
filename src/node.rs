@@ -410,7 +410,7 @@ impl NodeBuilder {
         engine: &ReplicationEngine,
         shutdown: CancellationToken,
     ) -> Option<JoinHandle<()>> {
-        if !store.has_legacy() {
+        if !crate::storage::migration::should_migrate(&store) {
             return None;
         }
         let context = crate::storage::migration::MigrationContext {
@@ -742,6 +742,22 @@ impl RunningNode {
             });
         }
 
+        // A node that still has a legacy chunk store and no task moving it off one is the
+        // failure this cannot be allowed to have silently: the store opens, serves the
+        // union of both, and never frees a byte. It happened once, during a rebase that
+        // dropped the spawn, and nothing noticed because a node without a legacy store
+        // starts no migration and every test built the store directly. Say so loudly.
+        if let Some(ref protocol) = self.ant_protocol {
+            if protocol.storage().has_legacy() && self.migration_task.is_none() {
+                error!(
+                    migration_event = "not_started",
+                    "This node still has a legacy chunk store but nothing is migrating it. \
+                     Its disk will never be reclaimed. This is a wiring fault, not a \
+                     configuration one: report it rather than working around it."
+                );
+            }
+        }
+
         info!("Node running, waiting for shutdown signal");
 
         // Run the main event loop with signal handling
@@ -958,6 +974,64 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    use tempfile::TempDir;
+
+    /// A node with a legacy chunk store must get a migration task; one without must not.
+    ///
+    /// The spawn helper is tested directly because its *absence* is the failure mode that
+    /// already happened here: a rebase dropped the call, the store still opened and still
+    /// served, and no test could tell the difference.
+    #[tokio::test]
+    async fn a_legacy_store_gets_a_migration_task_and_a_fresh_node_does_not() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        std::fs::create_dir_all(&root).expect("mkdir");
+
+        // Fresh node: nothing to migrate, so no task.
+        let fresh = Arc::new(
+            crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
+                root_dir: root.clone(),
+                ..crate::storage::ChunkStoreConfig::test_default()
+            })
+            .await
+            .expect("open fresh"),
+        );
+        assert!(!fresh.has_legacy());
+        assert!(
+            !crate::storage::migration::should_migrate(&fresh),
+            "a node with no legacy store has nothing to migrate"
+        );
+        drop(fresh);
+
+        // Seed a legacy store, then reopen: now there is something to migrate.
+        {
+            let lmdb = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
+                root_dir: root.clone(),
+                verify_on_read: true,
+                max_map_size: 0,
+                disk_reserve: 0,
+            })
+            .await
+            .expect("open legacy");
+            let content = b"a chunk from before the migration";
+            let addr = crate::client::compute_address(content);
+            lmdb.put(&addr, content).await.expect("put");
+            lmdb.wait_idle().await;
+        }
+        let upgrading = Arc::new(
+            crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
+                root_dir: root.clone(),
+                ..crate::storage::ChunkStoreConfig::test_default()
+            })
+            .await
+            .expect("open upgrading"),
+        );
+        assert!(upgrading.has_legacy());
+        assert!(
+            crate::storage::migration::should_migrate(&upgrading),
+            "a node with a legacy store must be migrated, or its disk is never reclaimed"
+        );
+    }
     use super::*;
     use crate::config::NODES_SUBDIR;
 
