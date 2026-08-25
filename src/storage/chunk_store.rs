@@ -1214,10 +1214,23 @@ impl ChunkStore {
                 }
             )));
         }
-        // The rename has to reach the directory itself, not just the page cache, or a
-        // power loss could bring the environment back under its old name beside a store
-        // that has already recorded itself as file-only.
-        crate::storage::file_store::fsync_path_best_effort(&self.config.root_dir);
+        // The rename has to reach the directory itself, not just the page cache, and this
+        // one is not best effort. The tombstone is deleted a few lines below. If the
+        // rename has not reached the disk when that happens, a power loss brings the
+        // environment back under its old name with its contents already removed, and the
+        // next start finds a corrupt environment it cannot open. Stopping here instead
+        // leaves the tombstone in place, which the next start sweeps.
+        if let Err(e) = crate::storage::file_store::fsync_path(&self.config.root_dir) {
+            warn!(
+                "The legacy environment was moved aside but {} could not be flushed: {e}. \
+                 Leaving {} in place rather than deleting a directory whose new name may \
+                 not have reached the disk. The next start finishes this.",
+                self.config.root_dir.display(),
+                tombstone.display()
+            );
+            self.finish_migration();
+            return Ok(0);
+        }
         self.finish_migration();
 
         // Only now, and best effort: the bytes come back when this completes, and if it
