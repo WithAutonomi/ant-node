@@ -7471,9 +7471,11 @@ async fn run_neighbor_sync_round(
     // same value across the batch is fine and reduces RwLock churn). Atomically
     // snapshot + mark-gossiped so we stay answerable for exactly what we emit
     // (ADR-0002 retention), with no TOCTOU vs a concurrent retire/rotate.
-    let my_commitment = commitment_state
-        .current_for_gossip()
-        .map(|b| b.commitment().clone());
+    let gossiped = commitment_state.current_for_gossip();
+    // The hash actually put on the wire, captured with the payload. A rotation later in
+    // the round must not let a reply be credited to a root the peer never saw.
+    let gossiped_hash = gossiped.as_ref().map(|b| b.hash());
+    let my_commitment = gossiped.map(|b| b.commitment().clone());
 
     let mut hints_by_peer = neighbor_sync::build_sync_hints_for_peers(
         &batch,
@@ -7503,8 +7505,8 @@ async fn run_neighbor_sync_round(
             // That is proof of delivery rather than proof of emission, and the storage
             // migration will not let a node give anything up until its close group has
             // actually seen the reduced root.
-            if my_commitment.is_some() {
-                commitment_state.note_commitment_delivered(*peer);
+            if let Some(hash) = gossiped_hash {
+                commitment_state.note_commitment_delivered(*peer, hash);
             }
             handle_sync_response(
                 &self_id,
@@ -7560,6 +7562,14 @@ async fn run_neighbor_sync_round(
                 .await;
 
                 if let Some(outcome) = replacement_outcome {
+                    // Same payload, same round trip, same proof: a reply can only come
+                    // back if the request carrying the root reached this peer. Omitting it
+                    // here made the counter under-report on any node whose primary syncs
+                    // often fall through to a replacement, which is exactly the node most
+                    // likely to be short of disk, and stalled its migration indefinitely.
+                    if let Some(hash) = gossiped_hash {
+                        commitment_state.note_commitment_delivered(replacement_peer, hash);
+                    }
                     handle_sync_response(
                         &self_id,
                         &replacement_peer,

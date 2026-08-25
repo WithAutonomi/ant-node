@@ -583,12 +583,13 @@ impl ChunkStore {
     /// own verdict is deliberately not consulted: it accounts for pages it can reuse
     /// internally, and a reusable page in a store this node is moving *off* says nothing
     /// about whether the file it is about to write will fit.
+    ///
+    /// Three-way, not two. The verification cycle treats `Full` as a standing condition
+    /// worth minutes of backoff, so folding a failed free-space query into it would latch
+    /// a transient filesystem hiccup into a stall on a node that is not full at all.
     #[must_use]
     pub(crate) fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
-        match self.files.check_capacity() {
-            Ok(()) => crate::storage::CapacityVerdict::Writable,
-            Err(_) => crate::storage::CapacityVerdict::Full,
-        }
+        self.files.capacity_verdict()
     }
 
     /// Reject work early when the disk cannot take `bytes` more.
@@ -2067,24 +2068,15 @@ mod tests {
         // would change nothing.
         let mut config = MigrationConfig::default();
         config.retire_legacy = !config.retire_legacy;
-        config.suspend_close_group_storage_penalty = !config.suspend_close_group_storage_penalty;
         config.allow_shed = false;
         config.shed_hold_hours = 5;
 
         let encoded = toml::to_string(&config).expect("encode");
         assert!(!encoded.contains("retire_legacy"), "{encoded}");
-        assert!(
-            !encoded.contains("suspend_close_group_storage_penalty"),
-            "{encoded}"
-        );
 
         let decoded: MigrationConfig = toml::from_str(&encoded).expect("decode");
         let fresh = MigrationConfig::default();
         assert_eq!(decoded.retire_legacy, fresh.retire_legacy);
-        assert_eq!(
-            decoded.suspend_close_group_storage_penalty,
-            fresh.suspend_close_group_storage_penalty
-        );
         // Genuine operator controls do survive.
         assert!(!decoded.allow_shed);
         assert_eq!(decoded.shed_hold_hours, 5);

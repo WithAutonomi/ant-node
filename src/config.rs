@@ -632,10 +632,6 @@ mod tests {
         // build rather than from whatever an operator's config last recorded.
         let build = MigrationConfig::default();
         assert_eq!(config.migration.retire_legacy, build.retire_legacy);
-        assert_eq!(
-            config.migration.suspend_close_group_storage_penalty,
-            build.suspend_close_group_storage_penalty
-        );
     }
 
     #[test]

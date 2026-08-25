@@ -263,6 +263,18 @@ impl CapacityGuard {
             .saturating_add(ALLOC_UNIT)
     }
 
+    /// Free bytes right now, or `None` if the question could not be answered.
+    ///
+    /// Deliberately separate from [`Self::measure`], which folds a failure into an error
+    /// the caller cannot tell from "below the reserve".
+    fn measure_available(&self) -> Option<u64> {
+        let mut snapshot = self.snapshot.lock();
+        match self.measure(&mut snapshot) {
+            Ok(()) => Some(snapshot.free_estimate()),
+            Err(_) => None,
+        }
+    }
+
     /// Query the filesystem and refresh the snapshot.
     fn measure(&self, snapshot: &mut CapacitySnapshot) -> Result<()> {
         let available = fs2::available_space(&self.dir)
@@ -870,6 +882,24 @@ impl FileStore {
     /// Returns [`Error::Storage`] when free space is below the configured reserve.
     pub fn check_capacity(&self) -> Result<()> {
         self.capacity.check(0)
+    }
+
+    /// Three-way answer to "can this store take a write right now".
+    ///
+    /// Kept distinct from [`Self::check_capacity`] because a failed free-space query and a
+    /// genuinely full disk are not the same thing, and the replication verification cycle
+    /// depends on the difference: a full disk is a standing condition worth minutes of
+    /// backoff, while a `statvfs` that failed says nothing about available space and may
+    /// well succeed on the next pass.
+    #[must_use]
+    pub fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
+        match self.capacity.measure_available() {
+            Some(available) if available < self.capacity.reserve => {
+                crate::storage::CapacityVerdict::Full
+            }
+            Some(_) => crate::storage::CapacityVerdict::Writable,
+            None => crate::storage::CapacityVerdict::Unknown,
+        }
     }
 
     /// Reject work early when the disk cannot take `bytes` more.

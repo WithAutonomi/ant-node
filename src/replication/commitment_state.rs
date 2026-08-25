@@ -486,6 +486,12 @@ impl ResponderCommitmentState {
     pub fn rotate(&self, new_current: BuiltCommitment) {
         let new_current = Arc::new(new_current);
         let mut guard = self.inner.write();
+        // Nobody has seen the new root yet, so nobody is a recipient of it. Clearing here
+        // rather than lazily on the next delivery is what makes the invariant true: the
+        // lazy version credited whichever peer happened to answer next, for a root that
+        // peer had never been sent.
+        guard.current_recipients.clear();
+        guard.current_recipients_hash = None;
         guard.slots.insert(0, new_current);
         guard.has_current = true;
         prune_slots(&mut guard, Instant::now());
@@ -519,11 +525,12 @@ impl ResponderCommitmentState {
     /// `GOSSIP_ANSWERABILITY_TTL` after its last emission, which is what lets
     /// an out-of-range key age out even when the no-op guard freezes the
     /// committed key set.
-    /// Record that `peer` demonstrably received the current commitment root.
+    /// Record that `peer` demonstrably received the commitment root `delivered`.
     ///
-    /// Called when a peer answers a neighbour sync that carried our root, which is proof
-    /// of arrival rather than proof of emission.
-    pub fn note_commitment_delivered(&self, peer: PeerId) {
+    /// Called when a peer answers a neighbour sync that carried that root, which is proof
+    /// of arrival rather than proof of emission. Ignored if the node has rotated since,
+    /// because the peer then saw a root that is no longer the one being attested.
+    pub fn note_commitment_delivered(&self, peer: PeerId, delivered: [u8; 32]) {
         let mut guard = self.inner.write();
         if !guard.has_current {
             return;
@@ -531,6 +538,12 @@ impl ResponderCommitmentState {
         let Some(hash) = guard.slots.first().map(|c| c.cached_hash) else {
             return;
         };
+        // The caller names the root it actually put on the wire. A rotation between the
+        // send and the reply means this peer saw the previous root, and crediting it to
+        // the current one would attest to something that did not happen.
+        if delivered != hash {
+            return;
+        }
         if guard.current_recipients_hash != Some(hash) {
             guard.current_recipients.clear();
             guard.current_recipients_hash = Some(hash);
@@ -1328,25 +1341,42 @@ mod tests {
         let state = ResponderCommitmentState::default();
 
         // Nothing advertised, so nobody can have received anything.
-        state.note_commitment_delivered(peer(1));
+        state.note_commitment_delivered(peer(1), [0u8; 32]);
         assert_eq!(state.current_delivered_peer_count(), 0);
 
-        state.rotate(built(&[1, 2, 3]));
+        let first = built(&[1, 2, 3]);
+        let h_first = first.hash();
+        state.rotate(first);
         assert_eq!(state.current_delivered_peer_count(), 0);
 
-        state.note_commitment_delivered(peer(1));
-        state.note_commitment_delivered(peer(2));
+        state.note_commitment_delivered(peer(1), h_first);
+        state.note_commitment_delivered(peer(2), h_first);
         // The same peer twice is still one peer.
-        state.note_commitment_delivered(peer(2));
+        state.note_commitment_delivered(peer(2), h_first);
         assert_eq!(state.current_delivered_peer_count(), 2);
 
         // A different key set is a different claim, and nobody has seen it yet. This is
         // what stops a node treating "they knew my old commitment" as "they know my new
         // smaller one", which is exactly the confusion the storage migration must avoid.
-        state.rotate(built(&[1, 2]));
-        assert_eq!(state.current_delivered_peer_count(), 0);
+        let second = built(&[1, 2]);
+        let h_second = second.hash();
+        state.rotate(second);
+        assert_eq!(
+            state.current_delivered_peer_count(),
+            0,
+            "a rotation must empty the set, not wait to be told"
+        );
 
-        state.note_commitment_delivered(peer(1));
+        // A reply to a sync that carried the OLD root arrives after the rotation. It is
+        // proof that peer saw the old root, and no evidence at all about the new one.
+        state.note_commitment_delivered(peer(3), h_first);
+        assert_eq!(
+            state.current_delivered_peer_count(),
+            0,
+            "a late reply must not be credited to a root its peer never saw"
+        );
+
+        state.note_commitment_delivered(peer(1), h_second);
         assert_eq!(state.current_delivered_peer_count(), 1);
 
         // Retiring the current root means there is nothing being advertised to know.

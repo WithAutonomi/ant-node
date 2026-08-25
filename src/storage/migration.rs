@@ -22,17 +22,22 @@
 //! penalised for a shed. Everyone else has to stop first, which is why this lands over
 //! three releases rather than one:
 //!
-//! | Release | [`MigrationConfig::suspend_close_group_storage_penalty`] | [`MigrationConfig::retire_legacy`] |
+//! | Release | Penalise not holding a close-group chunk? | [`MigrationConfig::retire_legacy`] |
 //! |---|---|---|
-//! | R1 stop slashing | `true` | `false` |
-//! | R2 migrate | `true` | `true` |
-//! | R3 resume slashing | `false` | `true` |
+//! | First: stop that one penalty | no | `false` |
+//! | Second: migrate | no | `true` |
+//! | Third: restore it | yes | `true` |
 //!
-//! Audits keep running and keep recording throughout. What R1 withholds is narrow and
+//! The penalty column is not a field here. It lives once, in
+//! [`crate::replication::config::RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], and both
+//! the auditors that apply it and the shedder that depends on it being withheld read that
+//! same switch. Two copies would let a node shed while its peers still penalised.
+//!
+//! Audits keep running and keep recording throughout. What the first release withholds is narrow and
 //! deliberate: only the penalty for *not holding a close-group chunk*. The
 //! commitment-bound subtree audit still penalises in every release, because the whole
 //! migration turns on a node's reduced commitment still being binding. The record those
-//! audits keep is also how we will know when R3 is safe to ship.
+//! audits keep is also how we will know when the third release is safe to ship.
 
 use crate::ant_protocol::XorName;
 use crate::error::{Error, Result};
@@ -116,24 +121,6 @@ pub struct MigrationConfig {
     #[serde(skip, default = "release_retire_legacy")]
     pub retire_legacy: bool,
 
-    /// Withhold the penalty for *not holding a close-group chunk* while the fleet
-    /// migrates.
-    ///
-    /// **`true` in R1 and R2, `false` in R3.** Deliberately narrow: the commitment-bound
-    /// subtree audit still penalises in every release. A node reduces its commitment
-    /// precisely so its peers can hold it to the smaller claim, and suspending that would
-    /// make the reduction meaningless. What is withheld is only the accusation "you did
-    /// not have a chunk you were supposed to be holding", which is exactly what a node
-    /// giving chunks up will produce and cannot avoid.
-    ///
-    /// Audits still run and still record throughout, which is how we will know when it is
-    /// safe to switch this back on.
-    ///
-    /// Not serialised, for the same reason as [`Self::retire_legacy`]. Overridden by
-    /// `ANT_MIGRATION_SUSPEND_PENALTIES`.
-    #[serde(skip, default = "release_suspend_close_group_storage_penalty")]
-    pub suspend_close_group_storage_penalty: bool,
-
     /// Hours after this build first starts before a node may shed anything.
     ///
     /// Long enough for peers still on a pre-R1 build to upgrade, because one of those
@@ -203,16 +190,8 @@ const fn default_true() -> bool {
 /// **R1: `false`. R2: `true`.** One constant, changed by one line, in one release.
 pub const RELEASE_RETIRE_LEGACY: bool = false;
 
-/// Whether this build withholds the penalty for not holding a close-group chunk.
-///
-/// **R1 and R2: `true`. R3: `false`.** Commitment-bound audits penalise regardless.
-pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
-
 /// Environment override for [`RELEASE_RETIRE_LEGACY`], for a canary node.
 pub const RETIRE_LEGACY_ENV: &str = "ANT_MIGRATION_RETIRE_LEGACY";
-
-/// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`].
-pub const SUSPEND_PENALTIES_ENV: &str = "ANT_MIGRATION_SUSPEND_PENALTIES";
 
 /// Read a boolean override from the environment, falling back to the build constant.
 fn env_override(name: &str, build_default: bool) -> bool {
@@ -232,14 +211,6 @@ fn env_override(name: &str, build_default: bool) -> bool {
 /// The retirement switch for this build, after any environment override.
 fn release_retire_legacy() -> bool {
     env_override(RETIRE_LEGACY_ENV, RELEASE_RETIRE_LEGACY)
-}
-
-/// The penalty-suspension switch for this build, after any environment override.
-fn release_suspend_close_group_storage_penalty() -> bool {
-    env_override(
-        SUSPEND_PENALTIES_ENV,
-        RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY,
-    )
 }
 
 const fn default_shed_hold_hours() -> u64 {
@@ -285,7 +256,6 @@ impl Default for MigrationConfig {
             dual_write_legacy: true,
             allow_shed: true,
             retire_legacy: release_retire_legacy(),
-            suspend_close_group_storage_penalty: release_suspend_close_group_storage_penalty(),
             shed_hold_hours: default_shed_hold_hours(),
             retire_delay_hours: default_retire_delay_hours(),
             wave_hours: default_wave_hours(),
@@ -1214,7 +1184,12 @@ async fn evaluate_shed(
     let remaining = store.legacy_only_keys();
     let short_by = remaining.len();
 
-    if !config.suspend_close_group_storage_penalty {
+    // Read from the one switch the auditors read, not from a second copy of it. There
+    // used to be two constants of the same name with two environment overrides, one on
+    // each side of this decision, and nothing coupling them: a node could have been
+    // willing to shed while every peer was still applying the full penalty, which is the
+    // exact outcome the release ordering exists to prevent.
+    if !crate::replication::config::close_group_storage_penalty_suspended() {
         warn!(
             "This node cannot fit {short_by} chunk(s) in the file store, but this release \
              has audit penalties switched back on, so giving anything up now would be \
@@ -1538,6 +1513,7 @@ fn bytes_to_gib(bytes: u64) -> f64 {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::TempDir;
 
     fn peer_id(byte: u8) -> PeerId {
@@ -1676,6 +1652,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_driver_exits_immediately_when_there_is_nothing_to_migrate() {
+        // The whole feature hangs off `run` being reachable from node startup. A port that
+        // dropped that call once already, and nothing caught it, because a fresh node has
+        // no legacy environment and every test built one directly. This asserts the entry
+        // point is callable and terminates on its own for a node with nothing to do.
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(
+            crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
+                root_dir: dir.path().to_path_buf(),
+                ..crate::storage::ChunkStoreConfig::test_default()
+            })
+            .await
+            .expect("open store"),
+        );
+        assert!(!store.has_legacy());
+
+        let context = MigrationContext {
+            p2p: None,
+            self_id: None,
+            self_xor: None,
+            commitment: None,
+            replication: None,
+            sync_state: None,
+            audit_challenge_coordinator: None,
+            peer_commitments: None,
+            close_group_size: 7,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            run(store, context, CancellationToken::new()),
+        )
+        .await
+        .expect("the driver must return rather than idle when there is nothing to migrate");
+    }
+
+    #[tokio::test]
     async fn a_node_with_no_view_of_the_network_gives_up_nothing() {
         // Every field is `None`, which is what a devnet or a node whose routing is not up
         // yet looks like. No view of the network is no evidence, and the answer has to be
@@ -1713,6 +1725,25 @@ mod tests {
                 "and none of them may be given up"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn shedding_reads_the_same_switch_the_auditors_read() {
+        use crate::replication::config::{
+            close_group_storage_penalty_suspended, set_close_group_storage_penalty_suspended,
+        };
+        // One switch, not two. There used to be a second constant of the same name with
+        // its own environment override on this side of the decision, and nothing coupling
+        // them: a node could have been willing to shed while every peer still applied the
+        // full penalty, which is precisely what the release ordering exists to prevent.
+        set_close_group_storage_penalty_suspended(true);
+        assert!(close_group_storage_penalty_suspended());
+        set_close_group_storage_penalty_suspended(false);
+        assert!(!close_group_storage_penalty_suspended());
+        set_close_group_storage_penalty_suspended(
+            crate::replication::config::RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY,
+        );
     }
 
     #[test]

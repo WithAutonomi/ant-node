@@ -151,6 +151,8 @@ impl NodeBuilder {
             protocol.attach_p2p_node(Arc::clone(&p2p_arc));
         }
 
+        // Set inside the engine branch below, once the migration's dependencies exist.
+        let mut migration_task: Option<JoinHandle<()>> = None;
         // Initialize replication engine (if storage is enabled)
         let replication_engine = if let (Some(ref protocol), Some(fresh_rx)) =
             (&ant_protocol, fresh_write_rx)
@@ -191,6 +193,13 @@ impl NodeBuilder {
                         protocol
                             .payment_verifier_arc()
                             .attach_monetized_pin_sender(engine.monetized_pin_sender());
+
+                        migration_task = Self::spawn_storage_migration(
+                            protocol.storage(),
+                            &p2p_arc,
+                            &engine,
+                            shutdown.clone(),
+                        );
                     }
                     Some(engine)
                 }
@@ -213,6 +222,7 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
+            migration_task,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -388,6 +398,37 @@ impl NodeBuilder {
         monitor
     }
 
+    /// Start moving this node off the legacy LMDB chunk store, if it still has one.
+    ///
+    /// Started after the replication engine rather than with the store, because the
+    /// copier needs two things only the engine has: the commitment state, which owns the
+    /// retention veto on deleting the old store, and live routing, which is how the node
+    /// knows which chunks it is among the closest to and therefore must never give up.
+    fn spawn_storage_migration(
+        store: Arc<ChunkStore>,
+        p2p: &Arc<P2PNode>,
+        engine: &ReplicationEngine,
+        shutdown: CancellationToken,
+    ) -> Option<JoinHandle<()>> {
+        if !store.has_legacy() {
+            return None;
+        }
+        let context = crate::storage::migration::MigrationContext {
+            p2p: Some(Arc::clone(p2p)),
+            self_id: Some(*p2p.peer_id()),
+            self_xor: crate::client::peer_id_to_xor_name(&p2p.peer_id().to_string()),
+            commitment: Some(Arc::clone(engine.commitment_state())),
+            replication: Some(Arc::clone(engine.config())),
+            sync_state: Some(Arc::clone(engine.sync_state())),
+            audit_challenge_coordinator: Some(Arc::clone(engine.audit_challenge_coordinator())),
+            peer_commitments: Some(Arc::clone(engine.last_commitment_by_peer())),
+            close_group_size: engine.config().close_group_size,
+        };
+        Some(tokio::spawn(async move {
+            crate::storage::migration::run(store, context, shutdown).await;
+        }))
+    }
+
     /// Build the ANT protocol handler from config.
     ///
     /// Initializes LMDB storage, payment verifier, and quote generator.
@@ -473,6 +514,11 @@ pub struct RunningNode {
     replication_engine: Option<ReplicationEngine>,
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
+    /// The task moving this node off the legacy chunk store, if it has one.
+    ///
+    /// Awaited before the replication engine and the P2P layer are torn down, because it
+    /// holds handles to both and is in the middle of reading and writing the chunk store.
+    migration_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -700,6 +746,16 @@ impl RunningNode {
 
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
+
+        // The migration first, and awaited rather than aborted: it is mid-way through
+        // reading and writing the chunk store, and it holds the commitment state and the
+        // routing handle that the two shutdowns below are about to invalidate. It watches
+        // the same cancellation token, so this returns as soon as its current step does.
+        if let Some(handle) = self.migration_task.take() {
+            if let Err(e) = handle.await {
+                warn!("Storage migration task did not stop cleanly: {e}");
+            }
+        }
 
         // Shutdown replication engine before P2P so background tasks don't
         // use a dead P2P layer, and Arc<ChunkStore> references are released.
