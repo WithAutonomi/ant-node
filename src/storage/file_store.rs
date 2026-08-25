@@ -576,22 +576,31 @@ impl FileStore {
             )));
         }
 
-        // Fast path: an in-memory hit plus one metadata call, no read.
+        // An indexed name is not proof of the bytes under it. The index is built from
+        // names, by the startup scan and by a completed publish, and a name can outlive
+        // what it points at: off Unix a chunk is created under its final name before its
+        // bytes are written, so a crash leaves a short file wearing a real name, and rot
+        // leaves a full-length one. Answering "already have it" to the copy that would fix
+        // either is how a node discards its own repair and is never offered another.
         //
-        // The index entry alone is not enough. It is built from names, by the startup
-        // scan and by a completed publish, and off Unix a chunk is created under its final
-        // name before its bytes are written, so a crash can leave a short file wearing a
-        // real name. Answering "already have it" to the copy that would fix it is how a
-        // node discards its own repair. Comparing the length is one `metadata` call and
-        // catches exactly that; bytes that rotted without changing length are caught by
-        // the verifying read and by the pass that runs before anything is deleted.
-        if self.index.read().contains(address) && self.stored_len(address) == Some(content.len()) {
-            trace!("Chunk {} already exists", hex::encode(address));
-            {
-                let mut stats = self.stats.write();
-                stats.duplicates = stats.duplicates.saturating_add(1);
+        // So the bytes decide. Checked before the reservation below, so re-storing a chunk
+        // this node already holds stays a no-op on a full disk.
+        if self.index.read().contains(address) {
+            if self.stored_bytes_match(address).await {
+                trace!("Chunk {} already exists", hex::encode(address));
+                {
+                    let mut stats = self.stats.write();
+                    stats.duplicates = stats.duplicates.saturating_add(1);
+                }
+                return Ok(false);
             }
-            return Ok(false);
+            warn!(
+                "Chunk {} is indexed but its bytes are wrong; replacing it with the copy \
+                 just offered",
+                hex::encode(address)
+            );
+            self.repair(address, content).await?;
+            return Ok(true);
         }
 
         let len = content.len() as u64;

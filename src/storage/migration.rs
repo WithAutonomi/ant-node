@@ -79,6 +79,12 @@ pub const MIN_RETIRE_DELAY_HOURS: u64 = 4;
 /// a node that is genuinely working.
 const MAX_VOLUME_LOCK_HOLD: Duration = Duration::from_secs(6 * 3600);
 
+/// How long a node stands back after the cap takes the volume lock off it.
+///
+/// Long enough that another node waiting on the lock actually gets it, rather than losing
+/// the race to the node that has just been holding it for six hours.
+const VOLUME_LOCK_COOLDOWN: Duration = Duration::from_secs(120);
+
 /// How many commitment rebuilds must be observed after the node commits to its
 /// file-backed set before the legacy environment may be retired.
 ///
@@ -576,6 +582,13 @@ fn lock_path_for(root_dir: &Path) -> PathBuf {
             return std::env::temp_dir().join(format!("ant-migration-{}.lock", meta.dev()));
         }
     }
+    // Resolved first, because a relative root has no volume in it to read. Two nodes
+    // started from different working directories on one drive would otherwise each fall
+    // through to a lock beside their own root, which serialises neither against the other.
+    #[cfg(not(unix))]
+    let resolved = std::fs::canonicalize(root_dir).unwrap_or_else(|_| root_dir.to_path_buf());
+    #[cfg(not(unix))]
+    let root_dir = resolved.as_path();
     // Off Unix, the volume root: the drive or share the path starts from. Not as precise
     // as a device id, since a mount point below it belongs to another volume, but it
     // groups the ordinary case of several nodes under one drive letter, which is what a
@@ -1072,20 +1085,26 @@ pub async fn unconfirmed_by_neighbours(
         for key in batch {
             let group = targets_by_key.get(key).map_or(&[][..], Vec::as_slice);
 
-            // A routing view that does not even see a full close group is not evidence
-            // about that group. A node whose table is thin after a restart would otherwise
-            // measure itself against whatever handful of peers it happens to know.
-            if group.len() + 1 < config.close_group_size {
+            // The lookup is self-inclusive, and this node is giving the chunk up, so a
+            // full group is `close_group_size` peers none of which is this node. Fewer
+            // than that is a routing view too thin to be evidence about the group at all,
+            // which is what a table looks like shortly after a restart. This node still
+            // appearing in the group means it is not outside it after all, and the
+            // decision to give the chunk up was taken against a view that has since
+            // changed.
+            if group.len() < config.close_group_size {
                 unconfirmed.push(*key);
                 continue;
             }
 
-            // The threshold comes from the WHOLE group, never from whichever subset
-            // happens to qualify. Deriving it from the filtered list is how two last
-            // holders destroy a chunk between them: each sees only the other publishing,
-            // so each needs exactly one proof, each gets it from the other, and both
-            // delete. The count of qualifying peers must clear a bar set by the group.
-            let needed = prune_proofs_needed(group.len());
+            // The threshold comes from the configured group size, never from whichever
+            // subset happens to qualify, nor from however many peers routing returned.
+            // Deriving it from the filtered list is how two last holders destroy a chunk
+            // between them: each sees only the other publishing, so each needs exactly one
+            // proof, each gets it from the other, and both delete. Deriving it from the
+            // observed length is the same mistake more quietly: a view that has lost a
+            // peer lowers the bar exactly when it should not be trusted.
+            let needed = prune_proofs_needed(config.close_group_size);
             let qualifying: Vec<PeerId> = group
                 .iter()
                 .filter(|p| publishing.contains(*p))
@@ -1185,6 +1204,10 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
     // the lock back when it is waiting rather than working; this is the backstop for the
     // one that turns out not to.
     let mut held_since: Option<Instant> = None;
+    // After the cap gives the volume up, this is how long before this node may ask for it
+    // again. Without it the very next tick takes it straight back and nobody else gets a
+    // turn.
+    let mut cooldown_until: Option<Instant> = None;
     let mut next_shed_evaluation = Instant::now();
     // A clean verification is a full re-read of everything both stores hold. If
     // retirement is then deferred (a read still holds the legacy handle), re-hashing on
@@ -1211,6 +1234,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
             );
             volume_lock = None;
             held_since = None;
+            cooldown_until = Some(Instant::now() + VOLUME_LOCK_COOLDOWN);
         }
 
         match store.migration_phase() {
@@ -1222,17 +1246,17 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 // lock exists to prevent. The one exception is a node that has become
                 // permanently stuck (see below), which must not go on excluding the
                 // others for a release.
-                if volume_lock.is_none() {
-                    match VolumeLock::try_acquire(store.root_dir(), config.lock_dir.as_deref()) {
-                        LockAttempt::Acquired(lock) => volume_lock = Some(lock),
-                        LockAttempt::Busy => {
-                            debug!("Another node on this volume is migrating; waiting");
-                            continue;
-                        }
-                        // No lock is possible here, so waiting for one would strand this
-                        // node permanently. Proceed; the slack floor is the backstop.
-                        LockAttempt::Unavailable => {}
-                    }
+                if matches!(
+                    take_volume_lock(
+                        &mut volume_lock,
+                        &mut held_since,
+                        cooldown_until,
+                        store.root_dir(),
+                        config.lock_dir.as_deref(),
+                    ),
+                    LockStep::WaitATick
+                ) {
+                    continue;
                 }
                 if !bridge_tick(
                     &store,
@@ -1253,18 +1277,17 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 // A node that restarted in this phase has no lock, and the work below
                 // (copying anything that must be kept, then re-reading the whole store to
                 // verify it) is exactly the disk-heavy work the lock exists to serialise.
-                if volume_lock.is_none() {
-                    match VolumeLock::try_acquire(store.root_dir(), config.lock_dir.as_deref()) {
-                        LockAttempt::Acquired(lock) => {
-                            volume_lock = Some(lock);
-                            held_since = Some(Instant::now());
-                        }
-                        LockAttempt::Busy => {
-                            debug!("Another node on this volume is migrating; waiting");
-                            continue;
-                        }
-                        LockAttempt::Unavailable => {}
-                    }
+                if matches!(
+                    take_volume_lock(
+                        &mut volume_lock,
+                        &mut held_since,
+                        cooldown_until,
+                        store.root_dir(),
+                        config.lock_dir.as_deref(),
+                    ),
+                    LockStep::WaitATick
+                ) {
+                    continue;
                 }
                 match retire_tick(&store, &context, &config, &mut verified, &shutdown).await {
                     RetireOutcome::Done => return,
@@ -1281,6 +1304,50 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 }
             }
         }
+    }
+}
+
+/// What taking the volume lock produced for the driver loop.
+enum LockStep {
+    /// Held, or not needed because none is possible here.
+    Proceed,
+    /// Someone else has it. Try again next tick.
+    WaitATick,
+}
+
+/// Take the volume lock if it is not already held, stamping when it was taken.
+///
+/// One place, because the stamp is what stops a node holding the volume against every
+/// other node on the machine, and a branch that acquires without stamping silently opts
+/// out of that.
+fn take_volume_lock(
+    held: &mut Option<VolumeLock>,
+    held_since: &mut Option<Instant>,
+    cooldown_until: Option<Instant>,
+    root_dir: &Path,
+    scope: Option<&Path>,
+) -> LockStep {
+    if held.is_some() {
+        return LockStep::Proceed;
+    }
+    // After giving the volume up at the cap, stand back for a moment. Reacquiring in the
+    // same breath would hand nobody anything.
+    if cooldown_until.is_some_and(|until| Instant::now() < until) {
+        return LockStep::WaitATick;
+    }
+    match VolumeLock::try_acquire(root_dir, scope) {
+        LockAttempt::Acquired(lock) => {
+            *held = Some(lock);
+            *held_since = Some(Instant::now());
+            LockStep::Proceed
+        }
+        LockAttempt::Busy => {
+            debug!("Another node on this volume is migrating; waiting");
+            LockStep::WaitATick
+        }
+        // No lock is possible here, so waiting for one would strand this node
+        // permanently. Proceed; the slack floor is the backstop.
+        LockAttempt::Unavailable => LockStep::Proceed,
     }
 }
 
