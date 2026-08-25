@@ -463,6 +463,13 @@ pub struct FileStore {
     /// Held back from everything the node says it has, while the files themselves are
     /// left alone. See [`Self::mark_suspect`].
     suspect: Arc<parking_lot::RwLock<HashSet<XorName>>>,
+    /// Bumped whenever a chunk stops being servable.
+    ///
+    /// The pre-retirement pass reads every chunk, and its result is reused for a while
+    /// rather than re-read on every tick. This is how the caller can tell that the store
+    /// has not changed underneath that result: a proof carries the value it saw, and a
+    /// file that has since gone or stopped being readable makes it stale.
+    health: Arc<std::sync::atomic::AtomicU64>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
     /// Monotonic counter that makes temp filenames unique within this store.
@@ -556,6 +563,7 @@ impl FileStore {
             stats: parking_lot::RwLock::new(StorageStats::default()),
             shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
             suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity,
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
@@ -1081,12 +1089,29 @@ impl FileStore {
     /// suspended.
     fn mark_suspect(&self, address: &XorName) {
         if self.suspect.write().insert(*address) {
+            self.note_health_changed();
             warn!(
                 "Chunk {} is on disk but could not be read; this node stops answering for \
                  it until a read succeeds",
                 hex::encode(address)
             );
         }
+    }
+
+    /// What the store's health looked like at this moment.
+    ///
+    /// Compare a value taken before a long-running check with one taken after, or after
+    /// taking a lock: different means a chunk stopped being servable in between and any
+    /// conclusion drawn from that check is out of date.
+    #[must_use]
+    pub fn health_generation(&self) -> u64 {
+        self.health.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a chunk stopped being servable.
+    fn note_health_changed(&self) {
+        self.health
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Answer for a chunk again, after a read that worked.
@@ -1270,7 +1295,8 @@ impl FileStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
-        self.blocking_tracker
+        let forgotten = self
+            .blocking_tracker
             .spawn_blocking(move || {
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                 if path.exists() {
@@ -1279,7 +1305,11 @@ impl FileStore {
                 index.write().remove(&key)
             })
             .await
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if forgotten {
+            self.note_health_changed();
+        }
+        forgotten
     }
 
     /// Remove a chunk whose bytes do not match its name, and stop advertising it.
@@ -1320,20 +1350,32 @@ impl FileStore {
                 })
                 .await;
         match outcome {
-            Ok(Ok(true)) => warn!(
-                "Removed corrupt chunk file {}; replication will repair it",
-                hex::encode(address)
-            ),
+            Ok(Ok(true)) => {
+                self.note_health_changed();
+                warn!(
+                    "Removed corrupt chunk file {}; replication will repair it",
+                    hex::encode(address)
+                );
+            }
             Ok(Ok(false)) => debug!(
                 "Chunk {} verified on re-read; leaving it in place",
                 hex::encode(address)
             ),
-            Ok(Err(e)) => warn!(
-                "Corrupt chunk {} could not be removed: {e}. It stays indexed and will \
-                 keep failing verification until the operator intervenes",
-                hex::encode(address)
-            ),
-            Err(e) => warn!("Corrupt-chunk removal task failed: {e}"),
+            // Still indexed, so it must not still be claimed: the read that brought us
+            // here proved the bytes wrong, and the node would otherwise go on committing
+            // to a chunk it knows it cannot serve.
+            Ok(Err(e)) => {
+                self.mark_suspect(address);
+                warn!(
+                    "Corrupt chunk {} could not be removed: {e}. It stays on disk, and \
+                     this node stops answering for it.",
+                    hex::encode(address)
+                );
+            }
+            Err(e) => {
+                self.mark_suspect(address);
+                warn!("Corrupt-chunk removal task failed: {e}");
+            }
         }
     }
 }

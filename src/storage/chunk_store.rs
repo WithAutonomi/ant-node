@@ -551,8 +551,25 @@ impl ChunkStore {
         // file going missing and this key being put back in the union view.
         let _reading = self.retirement.read().await;
         let fallback = self.legacy();
-        if let Some(content) = self.files.get_raw(address).await? {
-            return Ok(Some(content));
+        let from_files = self.files.get_raw(address).await;
+        match from_files {
+            Ok(Some(content)) => return Ok(Some(content)),
+            Ok(None) => {}
+            // Same rule as `get`: while the legacy environment is there it may have the
+            // bytes, and this is the read that drives digest audits, possession checks
+            // and pruning. Answering "no digest" for a chunk the node can still produce
+            // is a failed audit for nothing.
+            Err(e) => {
+                let Some(legacy) = fallback else {
+                    return Err(e);
+                };
+                let _lane = self.key_lock(address).await;
+                return match legacy.lmdb.get_raw(address).await {
+                    Ok(Some(content)) => Ok(Some(content)),
+                    // Nothing anywhere: report the original failure, not a plain miss.
+                    Ok(None) | Err(_) => Err(e),
+                };
+            }
         }
         // Deliberately not gated on the legacy-only set. A chunk that was copied and then
         // lost its file is not in that set, and the legacy environment is exactly where
@@ -1244,6 +1261,11 @@ impl ChunkStore {
                 report.checked, report.repaired
             );
         }
+        // Stamped last, so it reflects everything the pass saw. Retirement compares it
+        // against the store's own count immediately before deleting anything, and a
+        // difference means a chunk stopped being servable since and this pass no longer
+        // describes the store.
+        report.health = self.files.health_generation();
         Ok(report)
     }
 
@@ -1342,6 +1364,14 @@ impl ChunkStore {
                 proof.unrepairable, proof.ran
             )));
         }
+        if !proof.still_describes(&self.files) {
+            return Err(Error::Storage(
+                "Refusing to remove the legacy environment: a chunk stopped being \
+                 servable since it was verified, so that verification no longer describes \
+                 the file store. A fresh pass runs on the next tick."
+                    .into(),
+            ));
+        }
         // Rechecked here, not only by the caller. Everything between the caller's check
         // and this point is a window: the verification pass alone can run for hours, and
         // a write whose file half failed inserts a new legacy-only key in the meantime.
@@ -1362,6 +1392,18 @@ impl ChunkStore {
         // chunk request on the node behind it would turn retirement into an outage.
         //
         let retiring = self.retirement.write().await;
+        // Asked again with the guard held, which is the only moment the answer cannot
+        // change underneath it. The check above can be overtaken by a read that fails
+        // between there and here.
+        if !proof.still_describes(&self.files) {
+            drop(retiring);
+            return Err(Error::Storage(
+                "Refusing to remove the legacy environment: a chunk stopped being \
+                 servable while retirement was starting. A fresh pass runs on the next \
+                 tick."
+                    .into(),
+            ));
+        }
         let Some(legacy) = self.legacy() else {
             return Ok(0);
         };
@@ -1594,6 +1636,26 @@ impl ChunkStore {
             lmdb,
             only: Arc::new(parking_lot::RwLock::new(only)),
         });
+        // A node that recorded itself file-only and then got an environment back has to
+        // go through the migration again from the start: the phase decides what the
+        // driver does, and file-only does no copying, so leaving it there would give the
+        // node a handle it never uses. Conservative on purpose; the copier finds most of
+        // the work already done.
+        if self.migration_phase() == MigrationPhase::FilesOnly {
+            warn!(
+                "Recovered a legacy chunk environment after recording this node as \
+                 file-only. Starting the migration again from the copying stage."
+            );
+            let mut state = self.state.write();
+            state.phase = MigrationPhase::Bridging;
+            state.committed_at_unix = None;
+            state.rebuilds_since_commit = 0;
+            let snapshot = state.clone();
+            drop(state);
+            if let Err(e) = snapshot.save(&self.config.root_dir) {
+                warn!("Could not persist the migration marker: {e}");
+            }
+        }
         warn!(
             "Reopened {} after losing its handle",
             self.legacy_env_dir.display()
@@ -1638,7 +1700,14 @@ impl ChunkStore {
         // storage that is not mounted right now reads as nothing at all through the
         // second, and the node would call its migration finished and go file-only, blind
         // to every chunk that lives only there until somebody restarts it.
-        std::fs::symlink_metadata(&self.legacy_env_dir).is_ok()
+        match std::fs::symlink_metadata(&self.legacy_env_dir) {
+            Ok(_) => true,
+            // Only "it is not there" means it is not there. A permission change or a
+            // transient fault is an unanswered question, and answering it with "nothing
+            // here" is how the driver declares the migration finished over a store it has
+            // merely lost sight of.
+            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+        }
     }
 
     /// Is the legacy environment a link this node must not delete?
@@ -1732,6 +1801,14 @@ pub struct VerifyReport {
     repaired: u64,
     /// Chunks whose file was wrong and could not be repaired.
     unrepairable: u64,
+    /// What the file store's health looked like when this pass finished.
+    ///
+    /// A clean report is reused for a while rather than re-read on every tick, and a lot
+    /// can happen in that window: a kept file can start failing to read while ordinary
+    /// requests are served from the legacy copy, and the node would then delete the
+    /// legacy copy on the strength of a pass that no longer describes the store. This is
+    /// how retirement tells, immediately before it deletes anything.
+    health: u64,
 }
 
 impl VerifyReport {
@@ -1739,6 +1816,12 @@ impl VerifyReport {
     #[must_use]
     pub fn is_clean(&self) -> bool {
         self.ran && self.unrepairable == 0
+    }
+
+    /// Does this report still describe the store?
+    #[must_use]
+    fn still_describes(&self, files: &FileStore) -> bool {
+        self.health == files.health_generation()
     }
 
     /// Chunks re-hashed.
@@ -2118,6 +2201,18 @@ fn sweep_retired_legacy(root_dir: &Path) {
         // name, and deleting that because of what it is called would destroy every chunk
         // in it.
         if directory_is_retired(&tombstone) {
+            // The mark is re-established before anything is deleted on the strength of
+            // it. A retirement that failed part-way can leave one that was never flushed,
+            // and this is the pass that would otherwise act on it thirty seconds after
+            // the failure that said it would be left alone.
+            if let Err(e) = mark_directory_retired(&tombstone) {
+                warn!(
+                    "{} says it was retired but that could not be confirmed ({e}). \
+                     Leaving it.",
+                    tombstone.display()
+                );
+                continue;
+            }
             // Detached, so a node starting beside a large leftover directory serves
             // immediately rather than waiting out a recursive delete before it opens its
             // store.
@@ -2135,6 +2230,16 @@ fn sweep_retired_legacy(root_dir: &Path) {
 /// answer is to give it its name back and let the migration run again from the beginning:
 /// every gate is re-derived, and a second retirement costs a pass, not data.
 fn restore_unmarked_environment(root_dir: &Path, tombstone: &Path) {
+    // An empty one is what a deletion that removed the contents and the mark and then
+    // could not remove the directory leaves. There is nothing in it to restore, and
+    // putting it back under the live name would strand an empty path the node then tries
+    // to open.
+    if std::fs::read_dir(tombstone).is_ok_and(|mut entries| entries.next().is_none()) {
+        if let Err(e) = std::fs::remove_dir(tombstone) {
+            warn!("Could not remove the empty {}: {e}", tombstone.display());
+        }
+        return;
+    }
     let env = root_dir.join(LEGACY_ENV_DIR);
     if env.try_exists().unwrap_or(true) {
         // Both names are taken, so which one the node should serve is not this code's
@@ -3149,6 +3254,66 @@ mod tests {
             store.legacy_only_keys().contains(&key),
             "and must be put back where the gates can see it"
         );
+    }
+
+    /// A verification that no longer describes the store does not authorise a deletion.
+    ///
+    /// The pass reads every chunk and its result is reused for a while rather than re-read
+    /// on every tick. Retirement is often deferred in that window by a gate that has
+    /// nothing to do with the files. If a kept chunk stops being readable meanwhile,
+    /// ordinary requests are still served from the legacy copy, and deleting that copy on
+    /// the strength of the older pass leaves the node holding only the unreadable one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_verification_overtaken_by_a_failing_file_does_not_authorise_retirement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["kept-then-unreadable"]).await;
+        let key = *keys.first().expect("one key");
+        let mut config = test_config(&dir);
+        config.migration.retire_legacy = true;
+        let store = ChunkStore::new(config).await.expect("open");
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        open_the_retirement_gate(&store);
+
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        assert!(proof.is_clean());
+
+        // The window: the file stops being readable after the pass and before the
+        // deletion it authorised.
+        let path = dir
+            .path()
+            .join("chunks")
+            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
+            .join(hex::encode(key));
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        assert!(
+            store.get(&key).await.is_ok(),
+            "the legacy copy still serves it, which is what hides the problem"
+        );
+
+        let err = store
+            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
+            .await
+            .expect_err("a verification the store has outrun must not authorise a delete");
+        assert!(format!("{err}").contains("no longer describes"), "{err}");
+        assert!(
+            store.has_legacy(),
+            "and the legacy environment must survive"
+        );
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
     }
 
     /// A single node can still be told to keep both stores.

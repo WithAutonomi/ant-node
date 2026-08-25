@@ -1337,7 +1337,10 @@ fn worth_starting(store: &Arc<ChunkStore>, config: &MigrationConfig) -> bool {
         );
         return false;
     }
-    if !store.has_legacy() && !store.has_cleanup_pending() {
+    // The same question the spawn site asks. A different one here means a driver that is
+    // started and then returns immediately, which is how a node whose environment is a
+    // link to storage that was not mounted yet ends up never picking it up.
+    if !should_migrate(store) {
         debug!("No legacy chunk environment; nothing to migrate");
         return false;
     }
