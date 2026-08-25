@@ -285,6 +285,24 @@ impl ChunkStore {
 
     /// Open the legacy environment and work out which keys only it holds.
     async fn open_legacy(config: &ChunkStoreConfig, files: &FileStore) -> Result<Legacy> {
+        let (lmdb, legacy_keys) = Self::open_legacy_env(config).await?;
+        Ok(Legacy {
+            lmdb,
+            only: Arc::new(parking_lot::RwLock::new(Self::keys_only_in_legacy(
+                &legacy_keys,
+                files,
+            ))),
+        })
+    }
+
+    /// Open the legacy environment and read every key in it.
+    ///
+    /// Split from the diff against the file store because the two want different timing:
+    /// this is slow and safe to do at any moment, the diff has to be the last thing before
+    /// the handle is installed.
+    async fn open_legacy_env(
+        config: &ChunkStoreConfig,
+    ) -> Result<(Arc<LmdbStorage>, Vec<XorName>)> {
         let lmdb = Arc::new(
             LmdbStorage::new(LmdbStorageConfig {
                 root_dir: config.root_dir.clone(),
@@ -294,18 +312,22 @@ impl ChunkStore {
             })
             .await?,
         );
-
         let legacy_keys = lmdb.all_keys().await?;
-        let mut only = BTreeSet::new();
-        for key in legacy_keys {
-            if !files.exists(&key).unwrap_or(false) {
-                only.insert(key);
-            }
-        }
-        Ok(Legacy {
-            lmdb,
-            only: Arc::new(parking_lot::RwLock::new(only)),
-        })
+        Ok((lmdb, legacy_keys))
+    }
+
+    /// Which of `legacy_keys` the file store does not have.
+    ///
+    /// In memory, no I/O: the file store answers from its index. Cheap enough to redo
+    /// immediately before installing a handle, which is the point. A key that lost its
+    /// file while the environment was being read must be in this set, or nothing will
+    /// look for it again and retirement will destroy the copy that is left.
+    fn keys_only_in_legacy(legacy_keys: &[XorName], files: &FileStore) -> BTreeSet<XorName> {
+        legacy_keys
+            .iter()
+            .filter(|key| !files.exists(key).unwrap_or(false))
+            .copied()
+            .collect()
     }
 
     /// Take the critical section for one key.
@@ -1028,6 +1050,19 @@ impl ChunkStore {
                 "retirement is disabled in this release (storage.migration.retire_legacy)".into(),
             );
         }
+        // A linked environment is never retired automatically. Retirement renames the
+        // path and then deletes what is behind it, and behind a link is a directory
+        // somewhere else that this node does not own. Copying still happens; only the
+        // removal is refused, so the node ends up serving from files with its old store
+        // intact and its operator told what to do about it.
+        if is_a_link(&self.legacy_env_dir) {
+            return Some(format!(
+                "{} is a link rather than a directory. The chunks are being copied out of \
+                 it, but it will not be deleted: what it points at is not this node's to \
+                 remove. Once the migration has settled, delete it by hand.",
+                self.legacy_env_dir.display()
+            ));
+        }
         let state = self.state.read().clone();
         if state.phase != MigrationPhase::Committed {
             return Some(format!("phase is {:?}, not Committed", state.phase));
@@ -1431,8 +1466,8 @@ impl ChunkStore {
         // which on a large store is minutes, and every read and write on the node would
         // wait behind it. Nothing else can be installing a handle: retirement does nothing
         // while there is none, and this runs from the one migration task.
-        let opened = match Self::open_legacy(&self.config, &self.files).await {
-            Ok(legacy) => legacy,
+        let (lmdb, legacy_keys) = match Self::open_legacy_env(&self.config).await {
+            Ok(opened) => opened,
             Err(e) => {
                 warn!(
                     "Could not reopen {}: {e}. The chunks that live only there stay \
@@ -1447,12 +1482,42 @@ impl ChunkStore {
         if self.has_legacy() {
             return false;
         }
-        *self.legacy.write() = Some(opened);
+        // The diff happens HERE, not when the environment was read. Reading it takes
+        // minutes on a large store, and a verifying read in that time can find a file
+        // rotted and throw it away. With no handle installed there was nothing to put the
+        // key back into, so a set computed beforehand would be missing it, every gate
+        // would skip it, and retirement would destroy the intact copy in the environment.
+        // Under this guard no read, write or delete is in flight, so the file store's
+        // answer cannot move while it is being asked.
+        let only = Self::keys_only_in_legacy(&legacy_keys, &self.files);
+        *self.legacy.write() = Some(Legacy {
+            lmdb,
+            only: Arc::new(parking_lot::RwLock::new(only)),
+        });
         warn!(
             "Reopened {} after losing its handle",
             self.legacy_env_dir.display()
         );
         true
+    }
+
+    /// Is there a retired directory still waiting to be deleted?
+    ///
+    /// Separate from having a legacy environment: a node whose removal was interrupted has
+    /// no handle and nothing to migrate, but its disk has not come back. Something has to
+    /// keep trying during this uptime rather than leaving it until the next restart.
+    #[must_use]
+    pub fn has_cleanup_pending(&self) -> bool {
+        !retired_tombstones(&self.config.root_dir).is_empty()
+            || directory_is_retired(&self.legacy_env_dir)
+    }
+
+    /// Try again to finish a removal a previous attempt left behind.
+    ///
+    /// Safe to call at any time: it only ever moves or deletes a directory that carries
+    /// its own retirement mark.
+    pub fn retry_cleanup(&self) {
+        finish_interrupted_retirement(&self.config.root_dir);
     }
 
     /// Is there an environment on disk this node can no longer read?
@@ -1694,6 +1759,17 @@ fn delete_retired_directory(dir: PathBuf) {
 /// Returns the underlying I/O error. The directory is left with its mark intact on every
 /// failure that happens before the mark is reached.
 fn remove_marked_directory(dir: &Path) -> std::io::Result<()> {
+    // Never through a link. An operator who points the chunk environment at another
+    // volume leaves a symlink here, and walking it would delete the contents of a
+    // directory that is not this node's to delete. Retirement refuses such a root before
+    // it gets this far; this is the second line, because the check and the walk are not
+    // one operation.
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(std::io::Error::other(format!(
+            "{} is a link, not a directory. Refusing to delete through it.",
+            dir.display()
+        )));
+    }
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_name() == RETIRED_MARKER {
@@ -1711,12 +1787,42 @@ fn remove_marked_directory(dir: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    std::fs::remove_dir(dir)
+    match std::fs::remove_dir(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // The mark is gone and the directory is not, which is the one state the whole
+            // scheme says cannot happen: a start that found it would read an unmarked
+            // directory as an intact environment. Put the mark back before giving up.
+            if let Err(remark) = mark_directory_retired(dir) {
+                error!(
+                    "Could not remove {} ({e}) and could not restore its retirement mark \
+                     ({remark}). It is empty and nothing needs it; delete it by hand.",
+                    dir.display()
+                );
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Has this directory been retired?
+///
+/// A link is never treated as retired, whatever it points at: the mark would have been
+/// written through it into somebody else's directory, and acting on it would delete
+/// somebody else's data.
 fn directory_is_retired(dir: &Path) -> bool {
+    if is_a_link(dir) {
+        return false;
+    }
     dir.join(RETIRED_MARKER).try_exists().unwrap_or(false)
+}
+
+/// Is this path a symbolic link, or something whose kind cannot be determined?
+///
+/// Unknown counts as yes. Every caller is deciding whether it is safe to delete through
+/// the path, and a question that cannot be answered is not a yes to that.
+fn is_a_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
 }
 
 /// Finish a removal a previous run did not, before anything tries to open the environment.
@@ -2676,6 +2782,85 @@ mod tests {
         );
         for key in &keys {
             assert!(store.get(key).await.expect("get").is_some());
+        }
+    }
+
+    /// A linked environment is copied out of but never deleted.
+    ///
+    /// An operator who points the chunk store at another volume leaves a link here.
+    /// Retirement renames the path and then deletes what is behind it, and behind a link
+    /// is a directory somewhere else that this node does not own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_environment_is_never_retired() {
+        let outside = TempDir::new().expect("temp dir");
+        let dir = TempDir::new().expect("temp dir");
+        // A real environment that lives in `outside`; the node root only links to it.
+        seed_legacy(&outside, &["someone-elses"]).await;
+        let real = outside.path().join(LEGACY_ENV_DIR);
+        let bystander = outside.path().join("unrelated");
+        std::fs::create_dir_all(&bystander).expect("mkdir");
+        std::os::unix::fs::symlink(&real, dir.path().join(LEGACY_ENV_DIR)).expect("symlink");
+
+        let store = open(&dir).await;
+        let blocker = store
+            .retirement_blocker(|_| false)
+            .expect("a linked environment must block retirement");
+        assert!(
+            blocker.contains("link"),
+            "the reason must name the actual problem, got: {blocker}"
+        );
+
+        // And nothing walks through it, whatever it is marked with.
+        std::fs::write(real.join(RETIRED_MARKER), b"x").expect("mark through the link");
+        assert!(
+            !directory_is_retired(&dir.path().join(LEGACY_ENV_DIR)),
+            "a link must never be treated as a retired directory"
+        );
+        assert!(
+            remove_marked_directory(&dir.path().join(LEGACY_ENV_DIR)).is_err(),
+            "deleting through a link must be refused"
+        );
+        assert!(
+            real.join(LEGACY_DATA_FILE).exists(),
+            "and must delete nothing"
+        );
+        assert!(bystander.exists());
+    }
+
+    /// A deletion that cannot remove the directory itself puts the mark back.
+    ///
+    /// An unmarked directory that still exists is the one state the scheme says cannot
+    /// happen: the next start would read it as an intact environment.
+    #[test]
+    fn a_directory_that_cannot_be_removed_keeps_saying_it_was_retired() {
+        let dir = TempDir::new().expect("temp dir");
+        let retired = dir.path().join("chunks.mdb.retired");
+        std::fs::create_dir_all(&retired).expect("mkdir");
+        std::fs::write(retired.join("data.mdb"), b"payload").expect("write");
+        mark_directory_retired(&retired).expect("mark");
+
+        // Make the parent read-only so the directory cannot be unlinked from it, while
+        // its own contents still can be.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+            perms.set_mode(0o500);
+            std::fs::set_permissions(dir.path(), perms).expect("chmod");
+
+            let failed = remove_marked_directory(&retired).is_err();
+
+            let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(dir.path(), perms).expect("chmod back");
+
+            if failed && retired.exists() {
+                assert!(
+                    directory_is_retired(&retired),
+                    "a directory that outlived its deletion must still say what it is"
+                );
+            }
         }
     }
 

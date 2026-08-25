@@ -1179,7 +1179,10 @@ pub fn rank_is_sheddable(rank: GroupRank, width: usize) -> bool {
 /// migrating" cannot be answered one way by the wiring and another way by what checks it.
 #[must_use]
 pub fn should_migrate(store: &Arc<ChunkStore>) -> bool {
-    store.has_legacy()
+    // Or has a removal to finish. A node whose retirement was interrupted has no handle
+    // and nothing left to copy, but its disk has not come back, and the driver is what
+    // keeps trying.
+    store.has_legacy() || store.has_cleanup_pending()
 }
 
 /// Runs the migration to completion, then returns.
@@ -1188,27 +1191,9 @@ pub fn should_migrate(store: &Arc<ChunkStore>) -> bool {
 /// point costs at most the work of one tick.
 pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: CancellationToken) {
     let config = store.migration_config().clone();
-    if !config.enabled {
-        warn!(
-            "Storage migration is disabled. This node will keep reading both stores and \
-             will never return the legacy environment's disk space."
-        );
+    if !worth_starting(&store, &config) {
         return;
     }
-    if !store.has_legacy() {
-        debug!("No legacy chunk environment; nothing to migrate");
-        return;
-    }
-
-    let to_copy = store.legacy_only_keys().len();
-    info!(
-        migration_event = "start",
-        to_copy,
-        legacy_bytes = store.legacy_bytes(),
-        "Storage migration starting: {to_copy} chunk(s) still only in the legacy \
-         environment, {:.2} GiB to reclaim",
-        bytes_to_gib(store.legacy_bytes())
-    );
 
     let tick = Duration::from_secs(config.tick_secs.max(1));
     let mut volume_lock: Option<VolumeLock> = None;
@@ -1243,6 +1228,10 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
         }
 
         maybe_recover_lost_handle(&store, &mut next_handle_recovery).await;
+
+        if nothing_left_to_do(&store) {
+            return;
+        }
 
         match store.migration_phase() {
             MigrationPhase::FilesOnly => return,
@@ -1318,6 +1307,49 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
             }
         }
     }
+}
+
+/// Should the driver run at all, and say why in the log if not?
+fn worth_starting(store: &Arc<ChunkStore>, config: &MigrationConfig) -> bool {
+    if !config.enabled {
+        warn!(
+            "Storage migration is disabled. This node will keep reading both stores and \
+             will never return the legacy environment's disk space."
+        );
+        return false;
+    }
+    if !store.has_legacy() && !store.has_cleanup_pending() {
+        debug!("No legacy chunk environment; nothing to migrate");
+        return false;
+    }
+
+    let to_copy = store.legacy_only_keys().len();
+    info!(
+        migration_event = "start",
+        to_copy,
+        legacy_bytes = store.legacy_bytes(),
+        "Storage migration starting: {to_copy} chunk(s) still only in the legacy \
+         environment, {:.2} GiB to reclaim",
+        bytes_to_gib(store.legacy_bytes())
+    );
+    true
+}
+
+/// Retry any removal that did not finish, and say whether the driver is done.
+///
+/// Runs independently of the phase. A removal that could not finish leaves nothing to
+/// migrate but a disk that has not come back, and the reasons it failed (a name already
+/// taken, a directory that could not be flushed, a scanner holding a handle) are the kind
+/// that clear on their own.
+fn nothing_left_to_do(store: &Arc<ChunkStore>) -> bool {
+    if store.has_cleanup_pending() {
+        store.retry_cleanup();
+    }
+    if store.has_legacy() || store.has_cleanup_pending() {
+        return false;
+    }
+    info!("Storage migration finished; nothing left on disk to clean up");
+    true
 }
 
 /// Put a lost legacy handle back, if there is one to put back.
@@ -1448,7 +1480,14 @@ async fn bridge_tick(
     let remaining = store.legacy_only_keys();
     if remaining.is_empty() {
         if let Err(e) = store.commit_to_files() {
-            warn!("Could not record the migration commitment: {e}");
+            // Not progress, and not something exclusive disk access fixes. Saying it was
+            // would reset the hold cap every tick and let this node keep the volume from
+            // every other node on the machine for as long as the failure lasts.
+            warn!(
+                "Everything is copied but the migration commitment could not be recorded: \
+                 {e}. Retrying on the next tick."
+            );
+            return false;
         }
         return true;
     }
@@ -2334,7 +2373,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!(
-            "{what}: still in {:?} after 60s, expected {phase:?}",
+            "{what}: still in {:?} after the deadline, expected {phase:?}",
             store.migration_phase()
         );
     }
