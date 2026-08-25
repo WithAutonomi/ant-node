@@ -172,6 +172,17 @@ pub struct LmdbStorage {
     /// `data.mdb`, so the reserve is preserved by the allocator itself rather
     /// than by refusing every write up front.
     no_growth: Arc<AtomicBool>,
+    /// Keep the map pinned whatever the free space says.
+    ///
+    /// Set for the whole of the migration bridge. While both stores are open they each
+    /// measure the same free space and neither knows what the other is about to spend, so
+    /// a chunk written to both can be admitted twice against one lot of headroom and the
+    /// pair can cross the reserve together. Pinned, this environment cannot claim any new
+    /// disk at all: a write it cannot satisfy from its own free list is refused, and the
+    /// caller stores the chunk in files alone. That is the right answer anyway, because
+    /// this copy exists to make a rollback survivable, not to be the one that must
+    /// succeed.
+    growth_pinned: Arc<AtomicBool>,
     /// Serialises entering and leaving no-growth mode.
     ///
     /// Setting `no_growth` and resizing the map is one compound transition
@@ -293,6 +304,7 @@ impl LmdbStorage {
             env_lock: Arc::new(parking_lot::RwLock::new(())),
             last_disk_ok: parking_lot::Mutex::new(None),
             no_growth: Arc::new(AtomicBool::new(false)),
+            growth_pinned: Arc::new(AtomicBool::new(false)),
             growth_mode_lock: tokio::sync::Mutex::new(()),
             delete_growth_charged: Arc::new(AtomicU64::new(0)),
             blocking_tracker: TaskTracker::new(),
@@ -942,6 +954,13 @@ impl LmdbStorage {
         // Re-measured inside the lock: a caller that queued behind a transition
         // must act on the state that transition left behind, not the one it saw
         // before waiting.
+        // Pinned for the bridge: never unpinned by having room, because the room is not
+        // this environment's to spend while another store is measuring the same disk.
+        if self.growth_pinned.load(Ordering::Acquire) {
+            self.no_growth.store(true, Ordering::Release);
+            self.pin_map_to_high_water().await?;
+            return Ok(true);
+        }
         if self.available_space_cached()?.is_none() {
             // At or above the reserve: restore normal head-room if we pinned it.
             if self.no_growth.load(Ordering::Acquire) {
@@ -969,6 +988,20 @@ impl LmdbStorage {
         self.pin_map_to_high_water().await?;
 
         Ok(true)
+    }
+
+    /// Keep this environment from ever claiming new disk, until the process ends.
+    ///
+    /// For the migration bridge, where a second store measures the same free space and
+    /// neither knows what the other is about to spend. Pinned, this one writes only from
+    /// pages it already holds, so the other's accounting is the only claim on free disk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the map cannot be pinned.
+    pub async fn pin_growth(&self) -> Result<()> {
+        self.growth_pinned.store(true, Ordering::Release);
+        self.sync_growth_mode().await.map(|_| ())
     }
 
     /// Pin the LMDB map to the size of `data.mdb` on disk.

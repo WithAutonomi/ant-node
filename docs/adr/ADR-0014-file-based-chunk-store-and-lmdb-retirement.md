@@ -281,7 +281,7 @@ one machine's disk, the wave is about one chunk's replicas.
 
 ## What the review added
 
-Four mechanisms are in the implementation that are not in the design above. Each exists
+Five mechanisms are in the implementation that are not in the design above. Each exists
 because adversarial review found a way for the destructive step to run on a belief that
 was no longer true. They are recorded here because they are load-bearing, not incidental.
 
@@ -317,7 +317,17 @@ claims to hold: it vetoes retirement and is reconciled against the disk, but no 
 quote or presence answer sees it. A delete drains both halves of any announced write for its
 key, so a publish cannot land afterwards and undo it.
 
-The category underneath all four is the same: **a fact established at one moment being acted
+**The legacy environment never grows again.** Both stores sit on one disk, each measures
+the same free space, and neither knows what the other is about to spend, so a chunk written
+to both can be admitted twice against one lot of headroom and enough of them can cross the
+reserve together and fill the volume this whole exercise exists to free. From the moment it
+is adopted the environment is pinned to what it already occupies: it writes only from pages
+it already has, and the file store's accounting becomes the only claim on free disk. The
+cost is that the rollback copy is made only when the environment has room of its own, which
+on a real node it usually does, because this migration exists precisely because deleting
+millions of chunks filled the free list and returned nothing to the filesystem.
+
+The category underneath all five is the same: **a fact established at one moment being acted
 on at another.** Copying, verifying and retiring are separated by hours by design, and every
 gap between them is somewhere the store can move. The pattern that works is to make the
 belief carry its own expiry — the directory carries its mark, the proof carries the count it

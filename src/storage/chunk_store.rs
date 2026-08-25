@@ -325,6 +325,18 @@ impl ChunkStore {
             })
             .await?,
         );
+        // From here it never grows. Two stores on one disk each measure the same free
+        // space and neither knows what the other is about to spend, so a chunk written to
+        // both can be admitted twice against one lot of headroom and the pair can cross
+        // the reserve together. Pinned, this one writes only from pages it already has,
+        // so the file store's accounting is the only claim on free disk.
+        //
+        // What it costs is that the rollback copy is made only when the environment has
+        // room of its own. That is the right way round: the copy exists to make a fleet
+        // rollback survivable, not to be the write that has to succeed, and an
+        // environment this migration exists to delete should not be taking new disk to
+        // hold a second copy of something the file store already has.
+        lmdb.pin_growth().await?;
         let legacy_keys = lmdb.all_keys().await?;
         Ok((lmdb, legacy_keys))
     }
@@ -2784,30 +2796,40 @@ mod tests {
         assert_eq!(store.current_chunks().expect("count"), 5);
     }
 
+    /// The legacy environment takes no new disk during the bridge.
+    ///
+    /// Both stores sit on one disk, each measures the same free space, and neither knows
+    /// what the other is about to spend. A chunk written to both could be admitted twice
+    /// against one lot of headroom, and enough of them could cross the reserve together
+    /// and fill the volume this migration exists to free.
+    ///
+    /// So the environment is pinned to what it already occupies. It still takes the
+    /// rollback copy when it has room of its own, which on a real node it usually does:
+    /// this migration exists because deleting millions of chunks left the free list full
+    /// and returned nothing to the filesystem. What it will not do is grow.
     #[tokio::test]
-    async fn a_put_during_the_bridge_reaches_both_stores() {
+    async fn the_legacy_environment_takes_no_new_disk_during_the_bridge() {
         let dir = TempDir::new().expect("temp dir");
         seed_legacy(&dir, &["seed"]).await;
         let store = open(&dir).await;
 
-        let (addr, content) = addressed("dual");
-        assert!(store.put(&addr, &content).await.expect("put"));
-        store.wait_idle().await;
-        drop(store);
+        let data_file = dir.path().join(LEGACY_ENV_DIR).join(LEGACY_DATA_FILE);
+        let before = std::fs::metadata(&data_file).expect("meta").len();
 
-        // Reopening only the legacy environment proves the chunk really landed there,
-        // which is what makes a fleet rollback survivable.
-        let lmdb = LmdbStorage::new(LmdbStorageConfig {
-            root_dir: dir.path().to_path_buf(),
-            verify_on_read: true,
-            max_map_size: 0,
-            disk_reserve: 0,
-        })
-        .await
-        .expect("reopen legacy");
+        for seed in ["dual-1", "dual-2", "dual-3", "dual-4"] {
+            let (addr, content) = addressed(seed);
+            assert!(store.put(&addr, &content).await.expect("put"));
+            assert!(
+                store.exists(&addr).expect("exists"),
+                "the file store is the one that has to have it"
+            );
+        }
+        store.wait_idle().await;
+
+        let after = std::fs::metadata(&data_file).expect("meta").len();
         assert_eq!(
-            lmdb.get(&addr).await.expect("get").expect("present"),
-            content
+            after, before,
+            "the environment must not claim disk the file store is also counting on"
         );
     }
 
