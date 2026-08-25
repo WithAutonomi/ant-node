@@ -401,6 +401,23 @@ impl Drop for Reservation {
     }
 }
 
+/// What is behind a chunk's name on disk.
+///
+/// Four answers, not two, because "could not read it" must never be treated as "wrong":
+/// replacing a chunk is destructive, and off Unix it truncates the file in place, so a
+/// transient fault would turn a healthy sole copy into an empty one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredBytes {
+    /// The bytes are there and hash to the name.
+    Good,
+    /// The bytes are there and do not.
+    Wrong,
+    /// There is nothing behind the name.
+    Absent,
+    /// The question could not be answered this time.
+    Unreadable,
+}
+
 /// Convert a byte count to GiB for human-readable log messages.
 #[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is irrelevant
 fn bytes_to_gib(bytes: u64) -> f64 {
@@ -586,21 +603,31 @@ impl FileStore {
         // So the bytes decide. Checked before the reservation below, so re-storing a chunk
         // this node already holds stays a no-op on a full disk.
         if self.index.read().contains(address) {
-            if self.stored_bytes_match(address).await {
-                trace!("Chunk {} already exists", hex::encode(address));
-                {
-                    let mut stats = self.stats.write();
-                    stats.duplicates = stats.duplicates.saturating_add(1);
+            match self.stored_bytes_match(address).await {
+                StoredBytes::Good => {
+                    trace!("Chunk {} already exists", hex::encode(address));
+                    {
+                        let mut stats = self.stats.write();
+                        stats.duplicates = stats.duplicates.saturating_add(1);
+                    }
+                    return Ok(false);
                 }
-                return Ok(false);
+                StoredBytes::Wrong => {
+                    warn!(
+                        "Chunk {} is indexed but its bytes are wrong; replacing it with \
+                         the copy just offered",
+                        hex::encode(address)
+                    );
+                    self.repair(address, content).await?;
+                    return Ok(true);
+                }
+                // Indexed but gone: publish it fresh rather than replacing something that
+                // is not there.
+                StoredBytes::Absent => {}
+                // Unanswerable this time. Do not touch what is there; the offer is
+                // declined as a duplicate, and the next verifying read decides.
+                StoredBytes::Unreadable => return Ok(false),
             }
-            warn!(
-                "Chunk {} is indexed but its bytes are wrong; replacing it with the copy \
-                 just offered",
-                hex::encode(address)
-            );
-            self.repair(address, content).await?;
-            return Ok(true);
         }
 
         let len = content.len() as u64;
@@ -652,7 +679,9 @@ impl FileStore {
                 // and on Windows a crash mid-write leaves a partial file under a real
                 // chunk name. Trusting the name here would acknowledge a chunk that was
                 // never stored, and then discard the good copy arriving to repair it.
-                if !self.stored_bytes_match(address).await {
+                // Replaced only when the bytes were read and proven wrong. A read that
+                // failed says nothing, and replacing on it would destroy a healthy copy.
+                if self.stored_bytes_match(address).await == StoredBytes::Wrong {
                     warn!(
                         "Chunk {} was already on disk but its contents are wrong; \
                          replacing it with the copy just offered",
@@ -724,11 +753,21 @@ impl FileStore {
     }
 
     /// Whether the file already stored under `address` really hashes to it.
-    async fn stored_bytes_match(&self, address: &XorName) -> bool {
+    async fn stored_bytes_match(&self, address: &XorName) -> StoredBytes {
         match self.get_raw(address).await {
-            Ok(Some(bytes)) => crate::client::compute_address(&bytes) == *address,
-            // Absent or unreadable is not a match, and the caller rewrites it.
-            _ => false,
+            Ok(Some(bytes)) if crate::client::compute_address(&bytes) == *address => {
+                StoredBytes::Good
+            }
+            Ok(Some(_)) => StoredBytes::Wrong,
+            Ok(None) => StoredBytes::Absent,
+            // NOT the same as wrong. A file that could not be read this once may be
+            // perfectly good, and off Unix replacing it means opening it with `truncate`,
+            // which would destroy a healthy sole copy on the strength of a transient
+            // fault. Say so and let the caller leave it alone.
+            Err(e) => {
+                debug!("Could not read {} to check it: {e}", hex::encode(address));
+                StoredBytes::Unreadable
+            }
         }
     }
 

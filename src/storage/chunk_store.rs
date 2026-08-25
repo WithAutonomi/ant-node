@@ -33,22 +33,25 @@ pub const LEGACY_ENV_DIR: &str = "chunks.mdb";
 /// Suffix for a legacy environment that has been retired but not yet deleted.
 pub const RETIRED_SUFFIX: &str = ".retired";
 
-/// Records that a retirement was authorised and may not have finished.
+/// Written inside a chunk environment directory once it has been retired.
 ///
-/// The rename that moves the legacy environment aside cannot be shown to be durable off
-/// Unix: there is no way to flush a directory through the standard library, and
-/// `MoveFileEx` is not documented as durable at return without a flag std does not use.
-/// So a power loss can bring the environment back under its old name with its contents
-/// already deleted, and a node that then tried to open it would fail to start.
+/// The rename that moves the environment aside cannot be shown to be durable off Unix:
+/// there is no way to flush a directory through the standard library, and `MoveFileEx` is
+/// not documented as durable at return without a flag std does not use. So a power loss
+/// can bring the directory back under its old name with its contents already deleted, and
+/// a node that tried to open that would fail to start.
 ///
-/// This marker is what makes that safe. It is created before anything is moved, with the
-/// same create-and-flush that publishes a chunk, which *is* documented as durable
-/// everywhere. It means: the file store has been proven to hold every chunk, so the legacy
-/// environment is no longer needed. A start that finds it finishes the removal instead of
-/// opening whatever is there. It is cleared when the removal completes, and also when a
-/// rename fails recoverably and the node goes back to bridging, so it only ever survives a
-/// crash.
-const RETIREMENT_MARKER: &str = "chunks.mdb.retiring";
+/// This file is what makes that unambiguous, and it is *inside* the directory rather than
+/// beside it so that it travels with it: a directory that reverts to its old name reverts
+/// carrying its own evidence. It is created with the same create-and-flush that publishes
+/// a chunk, which is documented as durable everywhere, and only after the rename has
+/// already succeeded. So a directory holding it has been retired, whatever it is called,
+/// and one that does not is a live environment and is opened normally.
+///
+/// Deliberately not a file beside the environment. A marker that can outlive the thing it
+/// describes has to be cancelled, cancellation can fail or be lost, and a stale one would
+/// authorise deleting an environment that had since taken a chunk.
+const RETIRED_MARKER: &str = "RETIRED";
 
 /// The legacy environment's data file. Its presence is what says a node still has one.
 const LEGACY_DATA_FILE: &str = "data.mdb";
@@ -182,19 +185,15 @@ impl ChunkStore {
             .await?,
         );
 
-        // Before anything looks at the legacy environment: a start that finds the
-        // retirement marker finishes what a previous run began, rather than opening a
-        // directory that may be half deleted.
-        let kept = finish_interrupted_retirement(&config, &files).await;
-        sweep_retired_legacy(&config.root_dir);
+        // Before anything looks at the legacy environment: a directory carrying its own
+        // retirement mark is the remains of a removal a power loss interrupted, and is
+        // moved aside rather than opened.
+        finish_interrupted_retirement(&config.root_dir);
         let legacy_env_dir = config.root_dir.join(LEGACY_ENV_DIR);
-        let legacy = match kept {
-            // Already open, and opening it is what proved it was worth keeping.
-            Some(legacy) => Some(legacy),
-            None if legacy_present(&config.root_dir)? => {
-                Some(Self::open_legacy(&config, &files).await?)
-            }
-            None => None,
+        let legacy = if legacy_present(&config.root_dir)? {
+            Some(Self::open_legacy(&config, &files).await?)
+        } else {
+            None
         };
 
         let phase = if legacy.is_some() {
@@ -562,6 +561,10 @@ impl ChunkStore {
         // Held for the whole check, like every other operation that can reach the legacy
         // environment.
         let _using_legacy = self.retirement.read().await;
+        // And the key's own critical section, for the whole of it. Without it the pruner
+        // can delete both backings between the read and the answer, and the offered copy
+        // would be turned away for a chunk the node no longer has at all.
+        let _lane = self.key_lock(address).await;
 
         if let Some(legacy) = self.legacy() {
             if legacy.only.read().contains(address) {
@@ -569,7 +572,6 @@ impl ChunkStore {
                 // bytes in there can be wrong too, and the copier drops such a key from
                 // the union when it finds out, which would leave no copy anywhere if this
                 // had turned the good one away.
-                let _lane = self.key_lock(address).await;
                 if matches!(legacy.lmdb.get_raw(address).await, Ok(Some(bytes)) if bytes == content)
                 {
                     return true;
@@ -992,6 +994,20 @@ impl ChunkStore {
         F: Fn(&XorName) -> bool,
     {
         if !self.has_legacy() {
+            // No handle is not the same as no environment. A rename that failed and then
+            // could not be reopened leaves exactly that: the directory is still on disk
+            // and this node can no longer read it. Answering "nothing blocks retirement"
+            // would have the driver log the migration complete over a store that is still
+            // there and still holding chunks nothing else can serve.
+            if legacy_present(&self.config.root_dir).unwrap_or(true)
+                && !directory_is_retired(&self.legacy_env_dir)
+            {
+                return Some(format!(
+                    "{} is still on disk but this node has no handle to it. It cannot be \
+                     read, verified or removed until the node is restarted.",
+                    self.legacy_env_dir.display()
+                ));
+            }
             return None;
         }
         if !self.config.migration.retire_legacy {
@@ -1316,16 +1332,7 @@ impl ChunkStore {
             .root_dir
             .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
 
-        // Written before anything moves, and durably, because the move itself cannot be
-        // shown to be durable off Unix. From here on, a crash at any point leaves a start
-        // that knows the file store holds everything and finishes the removal, rather than
-        // one that finds a half-deleted environment and refuses to open it.
-        mark_retirement_authorised(&self.config.root_dir)?;
-
         if let Err(e) = std::fs::rename(&self.legacy_env_dir, &tombstone) {
-            // Recoverable: nothing has been deleted. Take the marker back so a later start
-            // does not act on an authorisation this node has just abandoned.
-            clear_retirement_marker(&self.config.root_dir);
             // Nothing was deleted, but the handle is already closed, so this node has
             // stopped being able to serve anything that lives only in there. Put it back
             // rather than carrying on with chunks it holds and cannot read, and rather
@@ -1347,6 +1354,20 @@ impl ChunkStore {
         // environment back under its old name with its contents already removed, and the
         // next start finds a corrupt environment it cannot open. Stopping here instead
         // leaves the tombstone in place, which the next start sweeps.
+        // Marked from the inside, now that the rename has succeeded and before anything
+        // is deleted. This is what a directory that reverts to its old name carries with
+        // it, and it is the only thing a later start treats as permission to delete.
+        if let Err(e) = mark_directory_retired(&tombstone) {
+            warn!(
+                "Moved the legacy environment to {} but could not mark it retired: {e}. \
+                 Leaving it rather than deleting a directory whose new name may not have \
+                 reached the disk. The next start finishes this.",
+                tombstone.display()
+            );
+            self.finish_migration();
+            return Ok(0);
+        }
+
         if let Err(e) = crate::storage::file_store::fsync_path(&self.config.root_dir) {
             warn!(
                 "The legacy environment was moved aside but {} could not be flushed: {e}. \
@@ -1368,37 +1389,15 @@ impl ChunkStore {
         // Only now, and best effort: the bytes come back when this completes, and if it
         // does not the next start sweeps the tombstone.
         //
-        // On its own thread, because this is a synchronous recursive delete of a directory
-        // that can hold hundreds of gigabytes, and nothing can interrupt it once it starts.
-        // Left in the migration task it would sit through shutdown's grace and past it,
-        // because an abort cannot be observed until the call returns. Out here, shutdown
-        // walks away and the next start finishes the job.
-        let target = tombstone.clone();
-        let removal = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&target));
-        match removal.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                warn!(
-                    "The legacy environment has been retired but {} could not be deleted: \
-                     {e}. Its space is not returned until it is. The node is serving from \
-                     files and needs nothing else.",
-                    tombstone.display()
-                );
-                return Ok(0);
-            }
-            Err(e) => {
-                warn!(
-                    "Stopped waiting for {} to be deleted: {e}. The next start sweeps it.",
-                    tombstone.display()
-                );
-                return Ok(0);
-            }
-        }
-        clear_retirement_marker(&self.config.root_dir);
-        debug!(
-            "Removed {} and returned {freed} bytes to the filesystem",
-            self.legacy_env_dir.display()
-        );
+        // On a detached OS thread, and not awaited. This is a synchronous recursive delete
+        // of a directory that can hold hundreds of gigabytes and cannot be interrupted
+        // once it starts. Inside the migration task it would sit through shutdown's grace
+        // and past it, because an abort is not observed until the call returns; on the
+        // runtime's blocking pool a normal runtime shutdown would wait for it anyway. A
+        // plain thread is the only one the process can genuinely walk away from, and the
+        // directory carries its own retirement mark, so whatever is left is finished by
+        // the next start.
+        delete_retired_directory(tombstone);
         Ok(freed)
     }
 
@@ -1504,36 +1503,36 @@ impl VerifyReport {
     }
 }
 
-/// Delete any legacy environment that was retired but whose removal did not finish.
-/// Create the retirement marker, durably.
+/// Mark a retired environment directory as retired, from the inside, durably.
+///
+/// Called only after the directory has already been renamed aside, so it can never land
+/// inside a live environment. See [`RETIRED_MARKER`] for why it goes inside.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Storage`] if it cannot be created or flushed. Retirement stops there,
-/// having touched nothing.
-fn mark_retirement_authorised(root_dir: &Path) -> Result<()> {
-    let path = root_dir.join(RETIREMENT_MARKER);
+/// Returns [`Error::Storage`] if it cannot be created or flushed.
+fn mark_directory_retired(dir: &Path) -> Result<()> {
+    let path = dir.join(RETIRED_MARKER);
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
     {
         Ok(f) => f,
-        // Already there, from an attempt earlier in this run. It says exactly what this
-        // one would say.
+        // Already there, from an attempt that got this far and no further.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
         Err(e) => {
             return Err(Error::Storage(format!(
-                "Could not record that retirement was authorised at {}: {e}",
+                "Could not mark {} as retired: {e}",
                 path.display()
             )))
         }
     };
     // For whoever reads the directory. To the node, presence is the whole signal.
     if let Err(e) = file.write_all(
-        b"The chunk environment beside this file was verified as fully copied into the \n\
-file store and is being removed. If it is still here, that removal was interrupted and \n\
-the next node start finishes it. Nothing needs it.\n",
+        b"This chunk environment was verified as fully copied into the file store and \n\
+retired. It is being deleted; if it is still here, that was interrupted and the next \n\
+node start finishes it. Nothing needs it.\n",
     ) {
         drop(file);
         let _ = std::fs::remove_file(&path);
@@ -1545,98 +1544,79 @@ the next node start finishes it. Nothing needs it.\n",
     file.sync_all().map_err(|e| {
         let _ = std::fs::remove_file(&path);
         Error::Storage(format!(
-            "Could not flush {}: {e}. Not removing the legacy environment on the strength \
-             of a marker that may not survive a power loss.",
+            "Could not flush {}: {e}. Not deleting on the strength of a mark that may not \
+             survive a power loss.",
             path.display()
         ))
     })
 }
 
-/// Remove the retirement marker, if it is there, and make the removal durable.
+/// Delete a retired directory in the background, without anything waiting for it.
 ///
-/// The flush matters: an unlink that has not reached the disk can be undone by a power
-/// loss, and a marker that comes back says the environment beside it may be deleted.
-fn clear_retirement_marker(root_dir: &Path) {
-    let path = root_dir.join(RETIREMENT_MARKER);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            warn!("Could not remove {}: {e}", path.display());
-            return;
-        }
-    }
-    if let Err(e) = crate::storage::file_store::fsync_path(root_dir) {
-        warn!(
-            "Removed {} but could not flush {}: {e}",
-            path.display(),
-            root_dir.display()
-        );
+/// The caller is finished with it either way: the environment is closed, the directory is
+/// under a name nothing looks for, and it carries its own mark, so an interrupted deletion
+/// is finished by the next start. What matters is that neither shutdown nor startup ever
+/// blocks on a recursive delete that can run for minutes.
+fn delete_retired_directory(dir: PathBuf) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("chunk-store-retire".into())
+        .spawn(move || match std::fs::remove_dir_all(&dir) {
+            Ok(()) => info!(
+                "Removed the retired chunk environment {} and returned its space",
+                dir.display()
+            ),
+            Err(e) => warn!(
+                "The chunk environment has been retired but {} could not be deleted: {e}. \
+                 Its space is not returned until it is, and the node needs nothing from \
+                 it. The next start tries again.",
+                dir.display()
+            ),
+        })
+    {
+        warn!("Could not start the thread to delete a retired chunk environment: {e}");
     }
 }
 
-/// Finish a retirement a previous run did not.
+/// Has this directory been retired?
+fn directory_is_retired(dir: &Path) -> bool {
+    dir.join(RETIRED_MARKER).try_exists().unwrap_or(false)
+}
+
+/// Finish a removal a previous run did not, before anything tries to open the environment.
 ///
-/// Runs before the legacy environment is opened, so a `chunks.mdb` that came back after a
-/// power loss with its contents half deleted is removed rather than opened. The marker is
-/// only written once the file store has been proven to hold every chunk, so there is
-/// nothing here to lose.
-/// Returns the environment if it was opened and kept, so the caller does not open it a
-/// second time: that open is a full key scan, and on a large store it is not cheap.
-async fn finish_interrupted_retirement(
-    config: &ChunkStoreConfig,
-    files: &Arc<FileStore>,
-) -> Option<Legacy> {
-    let root_dir = &config.root_dir;
-    let marker = root_dir.join(RETIREMENT_MARKER);
-    if !marker.try_exists().unwrap_or(false) {
-        return None;
-    }
+/// The only thing that counts as evidence is the directory's own mark. An open that fails
+/// is not: `open_legacy` queries free space, maps the file, takes a write transaction and
+/// scans every key, so a full disk, a permission change, a mapping limit or a transient
+/// I/O fault all look identical to corruption, and deleting on any of those would destroy
+/// a perfectly good environment.
+fn finish_interrupted_retirement(root_dir: &Path) {
     let env = root_dir.join(LEGACY_ENV_DIR);
-    if env.try_exists().unwrap_or(false) {
-        // The marker alone does not authorise this. It can be stale: a rename that failed
-        // recoverably clears it, and that clearing can itself be lost. Since then the
-        // environment may have taken a key that has been through none of the gates.
-        //
-        // Opening it is the test. An environment that opens is intact, so it is not debris
-        // and nothing here may delete it: the node goes back to bridging and every gate
-        // runs again from the start. An environment that cannot be opened is exactly what
-        // an interrupted removal leaves behind, and the marker says the file store was
-        // proven to hold everything in it, so removing it is both safe and the only way
-        // the node starts at all.
-        match ChunkStore::open_legacy(config, files).await {
-            Ok(intact) => {
-                warn!(
-                    "A previous run was removing {} and did not finish, but it opens \
-                     cleanly, so it is kept and the migration starts again from the \
-                     copying stage.",
-                    env.display()
-                );
-                clear_retirement_marker(root_dir);
-                return Some(intact);
+    if env.try_exists().unwrap_or(false) && directory_is_retired(&env) {
+        // Its own contents say it was retired, so whatever name it is wearing now, it is
+        // the remains of a removal that a power loss undid the rename of.
+        warn!(
+            "{} carries its own retirement mark, so it is what an interrupted removal left \
+             behind rather than a live environment. Finishing that removal.",
+            env.display()
+        );
+        let tombstone = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+        // Renamed rather than deleted here, so the node can get on with starting: the
+        // deletion itself is detached below and can take minutes on a large store.
+        if tombstone.try_exists().unwrap_or(false) {
+            if let Err(e) = std::fs::remove_dir_all(&tombstone) {
+                warn!("Could not clear {}: {e}", tombstone.display());
+                return;
             }
-            Err(e) => {
-                warn!(
-                    "A previous run was removing {} when it stopped, and what is left \
-                     cannot be opened ({e}). Every chunk in it had been verified as copied \
-                     into the file store, so finishing that removal now.",
-                    env.display()
-                );
-                if let Err(e) = std::fs::remove_dir_all(&env) {
-                    warn!(
-                        "Could not remove {}: {e}. Its space is not returned until it is, \
-                         and the node needs nothing from it.",
-                        env.display()
-                    );
-                    // The marker stays, so the next start tries again.
-                    return None;
-                }
-            }
+        }
+        if let Err(e) = std::fs::rename(&env, &tombstone) {
+            warn!(
+                "Could not move {} aside: {e}. It will be tried again at the next start.",
+                env.display()
+            );
+            return;
         }
     }
     sweep_retired_legacy(root_dir);
-    clear_retirement_marker(root_dir);
-    None
 }
 
 fn sweep_retired_legacy(root_dir: &Path) {
@@ -1658,17 +1638,9 @@ fn sweep_retired_legacy(root_dir: &Path) {
         );
         return;
     }
-    match std::fs::remove_dir_all(&tombstone) {
-        Ok(()) => info!(
-            "Removed the retired legacy environment left over from a previous run at {}",
-            tombstone.display()
-        ),
-        Err(e) => warn!(
-            "A retired legacy environment is still at {}: {e}. Delete it to reclaim its \
-             space; the node needs nothing from it.",
-            tombstone.display()
-        ),
-    }
+    // Detached, so a node starting beside a large leftover directory serves immediately
+    // rather than waiting out a recursive delete before it opens its store.
+    delete_retired_directory(tombstone);
 }
 
 /// Whether a legacy environment is on disk under `root_dir`.
@@ -2223,43 +2195,36 @@ mod tests {
         assert!(!store.holds_verified(&addr, &content).await);
     }
 
-    /// A marker is not on its own permission to delete an environment.
+    /// An environment is never deleted because it failed to open.
     ///
-    /// It can be stale: a rename that failed recoverably clears it, and that clearing can
-    /// itself be lost to a power loss. Since then the environment may have taken a key
-    /// that has been through none of the gates. So an environment that still opens is
-    /// kept, the marker is dropped, and every gate runs again.
+    /// Opening is not a corruption test. It queries free space, maps the file, takes a
+    /// write transaction and scans every key, so a full disk, a permission change or a
+    /// transient fault all look identical to corruption. The only thing that counts is the
+    /// directory's own mark.
     #[tokio::test]
-    async fn an_intact_environment_is_never_deleted_on_a_stale_marker() {
+    async fn an_unmarked_environment_is_kept_however_badly_it_reads() {
         let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["intact"]).await;
-        mark_retirement_authorised(dir.path()).expect("mark");
+        seed_legacy(&dir, &["unmarked"]).await;
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        assert!(!directory_is_retired(&env));
 
-        let store = open(&dir).await;
+        finish_interrupted_retirement(dir.path());
         assert!(
-            store.has_legacy(),
-            "an environment that opens cleanly must be kept, whatever the marker says"
+            env.exists(),
+            "an environment carrying no retirement mark must never be removed"
         );
-        assert!(
-            !dir.path().join(RETIREMENT_MARKER).exists(),
-            "and the stale marker must be dropped rather than left to act again"
-        );
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
     }
 
-    /// An environment left unopenable by an interrupted removal is finished off.
+    /// A directory carrying its own retirement mark is finished off, whatever it is named.
     ///
-    /// This is the case the marker exists for. Off Unix the rename that moves the
+    /// This is the case the mark exists for. Off Unix the rename that moves the
     /// environment aside cannot be shown to be durable, so a power loss can bring it back
-    /// with its contents already deleted. Opening that fails, and without the marker the
-    /// node would refuse to start on it forever. The marker says the file store was proven
-    /// to hold every chunk, so removing the remains is safe and is the only way forward.
+    /// under its old name with its contents already deleted. Without the mark the node
+    /// would refuse to start on it forever; with it, the directory says what it is.
     #[tokio::test]
-    async fn an_unopenable_environment_left_by_an_interrupted_removal_is_finished_off() {
+    async fn a_directory_that_says_it_was_retired_is_removed_under_any_name() {
         let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["interrupted"]).await;
+        let keys = seed_legacy(&dir, &["reverted"]).await;
         {
             let store = open(&dir).await;
             store
@@ -2267,29 +2232,71 @@ mod tests {
                 .await
                 .expect("copy");
         }
-        // What a half-finished removal leaves: the directory is back, its contents are
-        // not what an environment looks like.
-        let data = dir.path().join(LEGACY_ENV_DIR).join(LEGACY_DATA_FILE);
-        std::fs::write(&data, b"not an environment any more").expect("wreck");
-        mark_retirement_authorised(dir.path()).expect("mark");
+        // What a reverted rename leaves: the old name, the retirement mark inside it.
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        mark_directory_retired(&env).expect("mark");
 
         let store = open(&dir).await;
         assert!(
             !store.has_legacy(),
             "the remains of an interrupted removal must not be adopted"
         );
-        assert!(
-            !dir.path().join(LEGACY_ENV_DIR).exists(),
-            "the next start must finish the removal"
-        );
-        assert!(
-            !dir.path().join(RETIREMENT_MARKER).exists(),
-            "and clear the marker once it has"
-        );
+        assert!(!env.exists(), "and the next start must finish the removal");
         // Every chunk is still served, from the file store.
         for key in &keys {
             assert!(store.get(key).await.expect("get").is_some());
         }
+    }
+
+    /// The mark goes inside the directory, so a rename cannot separate them.
+    ///
+    /// A mark beside the environment would have to be cancelled when a retirement is
+    /// abandoned, cancellation can fail or be lost, and a stale one would then authorise
+    /// deleting an environment that had since taken a chunk.
+    #[test]
+    fn the_retirement_mark_travels_with_the_directory() {
+        let dir = TempDir::new().expect("temp dir");
+        let original = dir.path().join("chunks.mdb");
+        std::fs::create_dir_all(&original).expect("mkdir");
+        mark_directory_retired(&original).expect("mark");
+        assert!(directory_is_retired(&original));
+
+        let renamed = dir.path().join("chunks.mdb.retired");
+        std::fs::rename(&original, &renamed).expect("rename");
+        assert!(
+            directory_is_retired(&renamed),
+            "the mark must survive the rename it exists to outlive"
+        );
+        // And back again, which is what a power loss undoing the rename looks like.
+        std::fs::rename(&renamed, &original).expect("rename back");
+        assert!(directory_is_retired(&original));
+    }
+
+    /// Losing the handle to an environment that is still there is not completion.
+    ///
+    /// A rename that failed and then could not be reopened leaves the directory on disk
+    /// with no way to read it. Treating the missing handle as "nothing left to migrate"
+    /// would have the driver log the migration finished over a store still holding chunks
+    /// nothing else can serve.
+    #[tokio::test]
+    async fn a_lost_handle_beside_a_live_environment_blocks_retirement() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["orphaned"]).await;
+        let store = open(&dir).await;
+        assert!(store.has_legacy());
+
+        // Stand in for a failed rename followed by a failed reopen.
+        *store.legacy.write() = None;
+        assert!(!store.has_legacy());
+        assert!(dir.path().join(LEGACY_ENV_DIR).exists());
+
+        let blocker = store
+            .retirement_blocker(|_| false)
+            .expect("a live environment with no handle must block");
+        assert!(
+            blocker.contains("no handle"),
+            "the reason must name the actual problem, got: {blocker}"
+        );
     }
 
     /// A single node can still be told to keep both stores.

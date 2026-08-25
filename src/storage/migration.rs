@@ -1199,15 +1199,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
 
     let tick = Duration::from_secs(config.tick_secs.max(1));
     let mut volume_lock: Option<VolumeLock> = None;
-    // When the current lock was taken, so no single node can hold the volume against
-    // every other node on the machine indefinitely. Each branch below is meant to give
-    // the lock back when it is waiting rather than working; this is the backstop for the
-    // one that turns out not to.
-    let mut held_since: Option<Instant> = None;
-    // After the cap gives the volume up, this is how long before this node may ask for it
-    // again. Without it the very next tick takes it straight back and nobody else gets a
-    // turn.
-    let mut cooldown_until: Option<Instant> = None;
+    let mut held = LockHold::default();
     let mut next_shed_evaluation = Instant::now();
     // A clean verification is a full re-read of everything both stores hold. If
     // retirement is then deferred (a read still holds the legacy handle), re-hashing on
@@ -1226,15 +1218,14 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
         // Never hold the volume against the rest of the machine for longer than this,
         // whatever the node is waiting on. Dropping it costs a tick: if nobody else wants
         // it, the branches below take it straight back.
-        if held_since.is_some_and(|at| at.elapsed() >= MAX_VOLUME_LOCK_HOLD) {
+        if held.has_overstayed() {
             debug!(
                 "Held the volume migration lock for {} hour(s); giving it back so any \
                  other node on this volume gets a turn",
                 MAX_VOLUME_LOCK_HOLD.as_secs() / 3600
             );
             volume_lock = None;
-            held_since = None;
-            cooldown_until = Some(Instant::now() + VOLUME_LOCK_COOLDOWN);
+            held.give_up();
         }
 
         match store.migration_phase() {
@@ -1249,8 +1240,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 if matches!(
                     take_volume_lock(
                         &mut volume_lock,
-                        &mut held_since,
-                        cooldown_until,
+                        &mut held,
                         store.root_dir(),
                         config.lock_dir.as_deref(),
                     ),
@@ -1258,7 +1248,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 ) {
                     continue;
                 }
-                if !bridge_tick(
+                if bridge_tick(
                     &store,
                     &context,
                     &config,
@@ -1267,10 +1257,13 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 )
                 .await
                 {
+                    // The copier ran. That is the volume lock being used rather than held.
+                    held.note_disk_work();
+                } else {
                     // Copying is blocked on something only an operator can change, so
                     // stop holding the volume lock against the other nodes here.
                     volume_lock = None;
-                    held_since = None;
+                    held.released();
                 }
             }
             MigrationPhase::Committed => {
@@ -1280,8 +1273,7 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 if matches!(
                     take_volume_lock(
                         &mut volume_lock,
-                        &mut held_since,
-                        cooldown_until,
+                        &mut held,
                         store.root_dir(),
                         config.lock_dir.as_deref(),
                     ),
@@ -1291,6 +1283,11 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                 }
                 match retire_tick(&store, &context, &config, &mut verified, &shutdown).await {
                     RetireOutcome::Done => return,
+                    // Time spent reading or copying is the volume lock doing its job, not
+                    // a node sitting on it. The cap is there for a node that waits, and
+                    // restarting a full verification because a large store took longer
+                    // than the cap would be the cap causing the problem it prevents.
+                    RetireOutcome::Working => held.note_disk_work(),
                     RetireOutcome::Waiting => {}
                     RetireOutcome::NoWorkToSerialise => {
                         // Nothing this node can do will return space, so holding the
@@ -1299,11 +1296,65 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
                         // node per volume copies and the other eleven do nothing for the
                         // whole release.
                         volume_lock = None;
-                        held_since = None;
+                        held.released();
                     }
                 }
             }
         }
+    }
+}
+
+/// How long this node has had the volume migration lock, and when it may ask again.
+///
+/// Split out because the rule is easy to get wrong in one branch and not another: a
+/// branch that takes the lock without recording when, or that gives it up without a
+/// cooldown, silently opts out of the cap that stops one node holding a whole machine.
+#[derive(Default)]
+struct LockHold {
+    /// When the lock was taken, or when it was last used for real disk work.
+    since: Option<Instant>,
+    /// Before this, do not ask for it again.
+    cooldown_until: Option<Instant>,
+}
+
+impl LockHold {
+    /// Record that the lock has just been taken.
+    fn taken(&mut self) {
+        self.since = Some(Instant::now());
+    }
+
+    /// Record that it is no longer held.
+    fn released(&mut self) {
+        self.since = None;
+    }
+
+    /// Record that this tick used the lock for what it is for.
+    ///
+    /// Copying and verifying are the exclusive disk work the lock exists to serialise, so
+    /// time spent on them is not time spent sitting on it. Without this a node with a
+    /// large store would have the cap fire in the middle of a verification pass and
+    /// restart it, which is the cap causing the problem it prevents.
+    fn note_disk_work(&mut self) {
+        self.since = Some(Instant::now());
+    }
+
+    /// Has this node held the lock past the cap without using it?
+    fn has_overstayed(&self) -> bool {
+        self.since
+            .is_some_and(|at| at.elapsed() >= MAX_VOLUME_LOCK_HOLD)
+    }
+
+    /// Give the lock up and stand back so somebody else can take it.
+    fn give_up(&mut self) {
+        self.since = None;
+        self.cooldown_until = Some(Instant::now() + VOLUME_LOCK_COOLDOWN);
+    }
+
+    /// May this node ask for the lock yet?
+    fn may_ask(&self) -> bool {
+        !self
+            .cooldown_until
+            .is_some_and(|until| Instant::now() < until)
     }
 }
 
@@ -1321,24 +1372,23 @@ enum LockStep {
 /// other node on the machine, and a branch that acquires without stamping silently opts
 /// out of that.
 fn take_volume_lock(
-    held: &mut Option<VolumeLock>,
-    held_since: &mut Option<Instant>,
-    cooldown_until: Option<Instant>,
+    lock: &mut Option<VolumeLock>,
+    held: &mut LockHold,
     root_dir: &Path,
     scope: Option<&Path>,
 ) -> LockStep {
-    if held.is_some() {
+    if lock.is_some() {
         return LockStep::Proceed;
     }
     // After giving the volume up at the cap, stand back for a moment. Reacquiring in the
     // same breath would hand nobody anything.
-    if cooldown_until.is_some_and(|until| Instant::now() < until) {
+    if !held.may_ask() {
         return LockStep::WaitATick;
     }
     match VolumeLock::try_acquire(root_dir, scope) {
-        LockAttempt::Acquired(lock) => {
-            *held = Some(lock);
-            *held_since = Some(Instant::now());
+        LockAttempt::Acquired(taken) => {
+            *lock = Some(taken);
+            held.taken();
             LockStep::Proceed
         }
         LockAttempt::Busy => {
@@ -1703,7 +1753,12 @@ async fn shedding_is_still_safe(
 enum RetireOutcome {
     /// The legacy environment is gone. The driver is finished.
     Done,
-    /// Still working towards it. Keep the volume to ourselves.
+    /// Exclusive disk work happened this tick: copying, or re-reading the store to verify
+    /// it. Keep the volume, and count the time as time spent using it rather than time
+    /// spent holding it.
+    Working,
+    /// Still working towards it, but waiting on a clock rather than on the disk. Keep the
+    /// volume, because the node is about to need it, but let the hold cap run.
     Waiting,
     /// Blocked on something no amount of exclusive disk access will fix.
     NoWorkToSerialise,
@@ -1768,7 +1823,7 @@ async fn retire_tick(
         // Anything copied changed the file store, so a previous verification no longer
         // covers it.
         *verified = None;
-        return RetireOutcome::Waiting;
+        return RetireOutcome::Working;
     }
 
     // The real report from a recent pass, never a fabricated one. Reuse deliberately does
@@ -1791,7 +1846,7 @@ async fn retire_tick(
             }
             Err(e) => {
                 warn!("Pre-retirement verification failed: {e}. Retrying on the next tick.");
-                return RetireOutcome::Waiting;
+                return RetireOutcome::Working;
             }
         },
     };
