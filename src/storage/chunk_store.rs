@@ -115,6 +115,17 @@ pub struct ChunkStore {
     files: Arc<FileStore>,
     /// The legacy environment, until it is retired.
     legacy: parking_lot::RwLock<Option<Legacy>>,
+    /// Excludes retirement from running while any read is in progress.
+    ///
+    /// Readers take it shared and hold it for the whole read; retirement takes it
+    /// exclusively before it takes the environment away. Sole ownership of the handle is
+    /// not enough on its own: a read that has decided the file store cannot answer, and
+    /// has not yet taken a legacy handle, holds nothing and would be invisible to that
+    /// check. Nor would holding a handle for the whole read do instead, because on a busy
+    /// node there would always be one, and retirement would never see the environment
+    /// unreferenced. A shared/exclusive lock states the actual requirement, and because
+    /// it is fair, a waiting retirement stops new readers rather than starving.
+    retirement: tokio::sync::RwLock<()>,
     /// Where the legacy environment lives.
     legacy_env_dir: PathBuf,
     /// Store configuration.
@@ -209,6 +220,7 @@ impl ChunkStore {
         let store = Self {
             files,
             legacy: parking_lot::RwLock::new(legacy),
+            retirement: tokio::sync::RwLock::new(()),
             legacy_env_dir,
             config,
             state: parking_lot::RwLock::new(state),
@@ -367,12 +379,11 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] on an I/O failure, or when verification fails and no
     /// intact copy is available.
     pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        // Taken before the file is touched, and held for the whole read. A verifying read
-        // that finds rotted bytes throws the file away, and until this key is back in the
-        // legacy-only set there is a moment when it appears to live in neither store.
-        // Retirement decides it may delete the environment by proving it is the only
-        // holder of this handle, so holding one here is what stops it deleting the copy
-        // this read is about to fall back on.
+        // Held for the whole read. A verifying read that finds rotted bytes throws the
+        // file away, and until this key is back in the legacy-only set there is a moment
+        // when it appears to live in neither store. Retirement waits behind this rather
+        // than deleting the copy the read is about to fall back on.
+        let _reading = self.retirement.read().await;
         let fallback = self.legacy();
         match self.files.get(address).await {
             Ok(Some(content)) => Ok(Some(content)),
@@ -446,9 +457,9 @@ impl ChunkStore {
     ///
     /// Returns [`Error::Storage`] on an I/O failure.
     pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        // Taken first, for the reason given on `get`: it has to have been held since
-        // before the file store was asked, or retirement can run in the gap between the
+        // For the reason given on `get`: retirement must not run in the gap between the
         // file going missing and this key being put back in the union view.
+        let _reading = self.retirement.read().await;
         let fallback = self.legacy();
         if let Some(content) = self.files.get_raw(address).await? {
             return Ok(Some(content));
@@ -1092,6 +1103,10 @@ impl ChunkStore {
                 "Refusing to remove the legacy environment: {reason}"
             )));
         }
+        // Exclusive from here to the removal. Every read holds this shared, so taking it
+        // means none is in progress and none can start: no reader is mid-way between
+        // discarding a corrupt file and reaching the copy that would replace it.
+        let _retiring = self.retirement.write().await;
         let Some(legacy) = self.legacy() else {
             return Ok(0);
         };
@@ -1752,6 +1767,58 @@ mod tests {
             store.retirement_blocker(|_| false).is_none(),
             "with every gate met, the shipped configuration must not refuse to retire"
         );
+    }
+
+    /// Retirement waits for a read that is already running.
+    ///
+    /// The window this closes: a verifying read finds rotted bytes, throws the file away,
+    /// and has not yet reached the legacy copy that would replace it. If retirement ran in
+    /// that gap it would delete the only remaining copy. Holding the barrier shared for
+    /// the whole read, and exclusively for the removal, is what makes that impossible.
+    #[tokio::test]
+    async fn retirement_waits_for_a_read_that_is_already_running() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["held"]).await;
+        let store = Arc::new(open(&dir).await);
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        open_the_retirement_gate(&store);
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+
+        // Stand in for a read that has started and not finished.
+        let reading = store.retirement.read().await;
+
+        let retiring = {
+            let store = Arc::clone(&store);
+            let approved = approved_shed(&store);
+            tokio::spawn(async move {
+                store
+                    .retire_legacy(&proof, &|_: &XorName| false, &approved)
+                    .await
+            })
+        };
+
+        // It must not have got anywhere. Given a generous window rather than a tight one,
+        // so this fails on the behaviour rather than on scheduling luck.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !retiring.is_finished(),
+            "retirement removed the legacy environment while a read was still running"
+        );
+        assert!(
+            store.has_legacy(),
+            "the legacy environment went while a read was still running"
+        );
+
+        drop(reading);
+        let freed = retiring.await.expect("join").expect("retire");
+        assert!(freed > 0, "retirement should have freed the environment");
+        assert!(!store.has_legacy());
     }
 
     /// A single node can still be told to keep both stores.
