@@ -279,6 +279,51 @@ first copy through retirement, so a node cannot release it and let eleven others
 before it has returned a byte. The two limits answer different questions: the lock is about
 one machine's disk, the wave is about one chunk's replicas.
 
+## What the review added
+
+Four mechanisms are in the implementation that are not in the design above. Each exists
+because adversarial review found a way for the destructive step to run on a belief that
+was no longer true. They are recorded here because they are load-bearing, not incidental.
+
+**A directory that has been retired says so from the inside.** The rename that moves the
+environment aside cannot be shown to be durable off Unix, so a power loss can bring it back
+under its old name with its contents already deleted, and a node that opened that would
+fail to start. A file written inside it after the rename and before any deletion travels
+with the directory, so what it is never has to be inferred. A mark beside the environment
+was tried first and was wrong: it would have to be cancelled when a retirement is abandoned,
+cancellation can fail or be lost, and a stale one authorises deleting an environment that
+has since taken a chunk. Deletion removes the mark last, so a failed deletion never leaves a
+retired directory looking intact.
+
+**A chunk the node cannot serve is kept but not claimed.** Deleting it, or dropping it from
+the index, puts the key in neither the file store's view nor the legacy one, and what
+neither view protects is what retirement destroys. Claiming it puts the key in signed
+commitments and answers presence probes with a yes for a chunk that cannot be served, which
+the commitment-bound audit penalises. So the file stays and the answers stop. Two states,
+not one: a chunk that could not be *read* is settled by a later read, and one whose bytes
+were *proven wrong* is not, because reading them again says the same thing.
+
+**A verification proof expires.** The pre-retirement pass reads every chunk, and its result
+is reused rather than re-read on every tick, because retirement is usually deferred by a
+gate that has nothing to do with the files. A kept chunk that stops being servable in that
+window is invisible: ordinary requests are still served from the legacy copy. The store
+counts the times a chunk stops being servable, a proof records that count, and retirement
+refuses a proof the store has outrun.
+
+**A write announces itself before it starts.** The work runs on a blocking thread that
+outlives the future waiting for it, so a cancelled write can leave the environment holding a
+chunk that nothing recorded. The announcement is deliberately not part of what the node
+claims to hold: it vetoes retirement and is reconciled against the disk, but no commitment,
+quote or presence answer sees it. A delete drains both halves of any announced write for its
+key, so a publish cannot land afterwards and undo it.
+
+The category underneath all four is the same: **a fact established at one moment being acted
+on at another.** Copying, verifying and retiring are separated by hours by design, and every
+gap between them is somewhere the store can move. The pattern that works is to make the
+belief carry its own expiry — the directory carries its mark, the proof carries the count it
+saw, the write carries its note — rather than to check again and hope the check is close
+enough to the act.
+
 ## Consequences
 
 ### Positive
@@ -352,6 +397,15 @@ drops out of the index so replication repairs it; the copier is resumable and ca
 resurrect a pruned chunk; retirement is refused while any gate is unmet and removes the
 environment when they are all met; the release switches never round-trip through a config
 file.
+
+For the four mechanisms above: an environment carrying no mark is kept however badly it
+reads, one carrying its own mark is removed whatever it is named, and the mark survives the
+rename it exists to outlive; a chunk that cannot be read is kept on disk, not acknowledged,
+not advertised, and answered for again once it can be read; a verification overtaken by a
+file that stopped being readable does not authorise a deletion; a write in flight is not
+claimed but does stop retirement; a delete outlasts a write nobody waited for; and a key the
+environment holds that is in neither view refuses the proof and is put back where the gates
+can see it. Each was verified by removing the fix and confirming the test fails.
 
 **Fleet gates, which cannot be closed from a workstation:**
 
