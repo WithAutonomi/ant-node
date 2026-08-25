@@ -1031,12 +1031,14 @@ impl ChunkStore {
                 "Refusing to remove the legacy environment: {reason}"
             )));
         }
-        if cfg!(windows) && !windows_retirement_allowed() {
+        if cfg!(windows) && !self.config.migration.allow_windows_retire {
             return Err(Error::Storage(format!(
                 "Refusing to remove the legacy environment on Windows: NTFS gives no \
                  documented ordering between a rename and this deletion, so a power loss \
-                 could replay without the copied files. Set {WINDOWS_RETIRE_ENV}=1 to \
-                 override once power-loss testing has been done."
+                 could replay without the copied files. Set \
+                 storage.migration.allow_windows_retire, or {}=1, once power-loss testing \
+                 has been done.",
+                crate::storage::migration::WINDOWS_RETIRE_ENV
             )));
         }
         let Some(legacy) = self.legacy() else {
@@ -1155,14 +1157,6 @@ impl ChunkStore {
             warn!("Could not persist the migration marker: {e}");
         }
     }
-}
-
-/// Environment override that permits retirement on Windows.
-pub const WINDOWS_RETIRE_ENV: &str = "ANT_MIGRATION_ALLOW_WINDOWS_RETIRE";
-
-/// Whether an operator has explicitly accepted the Windows durability gap.
-fn windows_retirement_allowed() -> bool {
-    std::env::var(WINDOWS_RETIRE_ENV).is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
 }
 
 /// What checking one chunk concluded.
@@ -1563,6 +1557,9 @@ mod tests {
         let keys = seed_legacy(&dir, &["g1", "g2"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
 
         // Still bridging.
@@ -1605,6 +1602,9 @@ mod tests {
         seed_legacy(&dir, &["h1", "h2"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
 
         // Shed both, as a node short of disk would.
@@ -1625,6 +1625,38 @@ mod tests {
         assert!(store.retirement_blocker(|_| false).is_none());
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retirement_is_refused_on_windows_until_an_operator_accepts_the_durability_gap() {
+        let dir = TempDir::new().expect("temp dir");
+        let keys = seed_legacy(&dir, &["win"]).await;
+        let mut config = test_config(&dir);
+        config.migration.retire_legacy = true;
+        // Deliberately NOT set: this is the default a Windows node ships with.
+        config.migration.allow_windows_retire = false;
+        let store = ChunkStore::new(config).await.expect("open");
+        store
+            .copy_batch(&keys, 0, 0, &never_cancelled())
+            .await
+            .expect("copy");
+        open_the_retirement_gate(&store);
+
+        let proof = store
+            .verify_before_retire(0, &never_cancelled())
+            .await
+            .expect("verify");
+        assert!(proof.is_clean());
+        let err = store
+            .retire_legacy(&proof, &|_: &XorName| false)
+            .await
+            .expect_err("Windows retirement must be refused by default");
+        assert!(format!("{err}").contains("on Windows"), "{err}");
+        assert!(
+            store.has_legacy(),
+            "the legacy environment must survive the refusal"
+        );
+    }
+
     #[tokio::test]
     async fn retirement_is_refused_while_the_release_switch_is_off() {
         let dir = TempDir::new().expect("temp dir");
@@ -1643,6 +1675,9 @@ mod tests {
         let keys = seed_legacy(&dir, &["f1", "f2", "f3"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
 
         store
@@ -1683,6 +1718,9 @@ mod tests {
         let keys = seed_legacy(&dir, &["busy"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = Arc::new(ChunkStore::new(config).await.expect("open"));
         store
             .copy_batch(&keys, 0, 0, &never_cancelled())
@@ -1729,6 +1767,9 @@ mod tests {
         seed_legacy(&dir, &["v1"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
 
         // A report cannot be fabricated: every field is private and the only source is
@@ -1763,6 +1804,9 @@ mod tests {
         let keys = seed_legacy(&dir, &["w1", "w2"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
         store
             .copy_batch(&keys, 0, 0, &never_cancelled())
@@ -1870,6 +1914,9 @@ mod tests {
         let keys = seed_legacy(&dir, &["gone"]).await;
         let mut config = test_config(&dir);
         config.migration.retire_legacy = true;
+        // Cleared the way a Windows operator who has done the power-loss testing would.
+        // Without it these tests only pass on platforms with a durable directory flush.
+        config.migration.allow_windows_retire = true;
         let store = ChunkStore::new(config).await.expect("open");
         store
             .copy_batch(&keys, 0, 0, &never_cancelled())

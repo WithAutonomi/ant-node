@@ -314,8 +314,10 @@ one machine's disk, the wave is about one chunk's replicas.
   path self-heals, and a `stat` per call on the node's hottest path is not worth it.
 - One inode and one directory entry per chunk. At 4 MiB per object that is 0.05% overhead
   and block rounding for a full chunk is exactly zero, but it is real.
-- Windows retirement is off by default, so Windows nodes keep both stores until we can test
-  power loss on NTFS.
+- Windows retirement is off by default (`storage.migration.allow_windows_retire`), so
+  Windows nodes keep both stores until an operator has tested power loss on their own
+  hardware. It is a configuration field rather than a hidden environment read precisely so
+  it is visible, reviewable, and persists once someone has done that testing.
 - The paid list is still LMDB. It is a fixed 256 MiB map that contributes nothing to the
   disk problem, but it is why `heed` cannot be dropped yet.
 - **Narrowing the commitment cuts the quoted price.** Price is quadratic in the committed

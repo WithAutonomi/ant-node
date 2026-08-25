@@ -173,6 +173,18 @@ pub struct MigrationConfig {
     #[serde(default = "default_wave_hours")]
     pub wave_hours: u64,
 
+    /// Permit removing the legacy environment on Windows.
+    ///
+    /// Off by default, and the only platform-specific switch here. NTFS documents no
+    /// ordering between the rename that publishes a copied chunk and the deletion of the
+    /// store it came from, and Windows offers no way to flush a directory through the
+    /// standard library, so a power loss could in principle replay with the deletion but
+    /// without the copies. Unlike the release switches this **is** an operator decision
+    /// and does persist in their configuration: someone who has done the power-loss
+    /// testing on their own hardware should not have to re-assert it on every start.
+    #[serde(default = "default_allow_windows_retire")]
+    pub allow_windows_retire: bool,
+
     /// Seconds between copier ticks.
     #[serde(default = "default_tick_secs")]
     pub tick_secs: u64,
@@ -242,6 +254,14 @@ const fn default_wave_hours() -> u64 {
     24
 }
 
+/// Windows retirement is off unless an operator turns it on.
+fn default_allow_windows_retire() -> bool {
+    env_override(WINDOWS_RETIRE_ENV, false)
+}
+
+/// Environment override for [`MigrationConfig::allow_windows_retire`].
+pub const WINDOWS_RETIRE_ENV: &str = "ANT_MIGRATION_ALLOW_WINDOWS_RETIRE";
+
 const fn default_copier_slack_mb() -> u64 {
     2048
 }
@@ -269,6 +289,7 @@ impl Default for MigrationConfig {
             shed_hold_hours: default_shed_hold_hours(),
             retire_delay_hours: default_retire_delay_hours(),
             wave_hours: default_wave_hours(),
+            allow_windows_retire: default_allow_windows_retire(),
             copier_slack_mb: default_copier_slack_mb(),
             copier_throttle_mib_per_sec: default_copier_throttle_mib_per_sec(),
             tick_secs: default_tick_secs(),

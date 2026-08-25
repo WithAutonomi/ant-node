@@ -95,6 +95,13 @@ retire_delay_hours = 4
 # Free space, in MiB, the copier leaves untouched on top of disk_reserve_mb.
 copier_slack_mb = 2048
 
+# Permit deleting the old store on Windows. Off by default, and the only setting here
+# that is platform-specific. NTFS documents no ordering between the rename that publishes
+# a copied chunk and the deletion of the store it came from, and there is no way to flush
+# a directory, so a power loss could in principle replay with the deletion but without the
+# copies. Turn this on only after testing power loss on your own hardware.
+allow_windows_retire = false
+
 # Copy rate ceiling, in MiB/s. Keep it modest: an unthrottled copier competing with the
 # audit responder for disk turns a storage migration into an audit incident.
 copier_throttle_mib_per_sec = 32
