@@ -14,8 +14,8 @@ use crate::payment::{
 };
 use crate::replication::config::ReplicationConfig;
 use crate::replication::ReplicationEngine;
-use crate::storage::lmdb::MIB;
-use crate::storage::{AntProtocol, ChunkRequestContext, LmdbStorage, LmdbStorageConfig};
+use crate::storage::MIB;
+use crate::storage::{AntProtocol, ChunkRequestContext, ChunkStore, ChunkStoreConfig};
 use crate::upgrade::{
     upgrade_cache_dir, AutoApplyUpgrader, BinaryCache, ReleaseCache, UpgradeMonitor, UpgradeResult,
 };
@@ -398,13 +398,14 @@ impl NodeBuilder {
         close_group_size: usize,
     ) -> Result<AntProtocol> {
         // Create LMDB storage
-        let storage_config = LmdbStorageConfig {
+        let storage_config = ChunkStoreConfig {
             root_dir: config.root_dir.clone(),
             verify_on_read: config.storage.verify_on_read,
             max_map_size: config.storage.db_size_gb.saturating_mul(1024 * 1024 * 1024),
             disk_reserve: config.storage.disk_reserve_mb.saturating_mul(MIB),
+            migration: config.storage.migration.clone(),
         };
-        let storage = LmdbStorage::new(storage_config)
+        let storage = ChunkStore::new(storage_config)
             .await
             .map_err(|e| Error::Startup(format!("Failed to create LMDB storage: {e}")))?;
 
@@ -701,7 +702,7 @@ impl RunningNode {
         self.run_event_loop().await?;
 
         // Shutdown replication engine before P2P so background tasks don't
-        // use a dead P2P layer, and Arc<LmdbStorage> references are released.
+        // use a dead P2P layer, and Arc<ChunkStore> references are released.
         if let Some(ref mut engine) = self.replication_engine {
             engine.shutdown().await;
         }

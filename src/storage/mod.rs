@@ -44,11 +44,48 @@
 //! listener.register_protocol(protocol).await?;
 //! ```
 
+pub(crate) mod chunk_store;
+pub(crate) mod file_store;
 mod handler;
 pub(crate) mod lmdb;
+pub mod migration;
 
 pub use crate::ant_protocol::XorName;
+pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport};
+pub use file_store::{FileStore, FileStoreConfig, StoreLayout};
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
 pub(crate) use lmdb::CapacityVerdict;
-pub use lmdb::{LmdbStorage, LmdbStorageConfig, StorageStats};
+pub use lmdb::{LmdbStorage, LmdbStorageConfig};
+pub use migration::{MigrationConfig, MigrationPhase, MigrationState};
+
+/// Bytes in one MiB.
+pub const MIB: u64 = 1024 * 1024;
+
+/// Bytes in one GiB.
+pub const GIB: u64 = 1024 * MIB;
+
+/// Default free disk space to keep unused on the storage partition.
+pub const DEFAULT_DISK_RESERVE: u64 = 500 * MIB;
+
+/// Statistics about storage operations.
+///
+/// Counters other than `current_chunks` are cumulative for the lifetime of the
+/// process; `current_chunks` is the live count.
+#[derive(Debug, Clone, Default)]
+pub struct StorageStats {
+    /// Total number of chunks stored.
+    pub chunks_stored: u64,
+    /// Total number of chunks retrieved.
+    pub chunks_retrieved: u64,
+    /// Total bytes stored.
+    pub bytes_stored: u64,
+    /// Total bytes retrieved.
+    pub bytes_retrieved: u64,
+    /// Number of duplicate writes (already exists).
+    pub duplicates: u64,
+    /// Number of verification failures on read.
+    pub verification_failures: u64,
+    /// Number of chunks currently persisted.
+    pub current_chunks: u64,
+}

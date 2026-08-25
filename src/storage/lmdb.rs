@@ -20,12 +20,9 @@ use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
 
 use crate::ant_protocol::XORNAME_LEN;
+use crate::storage::StorageStats;
 
-/// Bytes in one MiB.
-pub const MIB: u64 = 1024 * 1024;
-
-/// Bytes in one GiB.
-pub const GIB: u64 = 1024 * MIB;
+use crate::storage::{GIB, MIB};
 
 /// Default minimum free disk space to preserve on the storage partition.
 const DEFAULT_DISK_RESERVE: u64 = 500 * MIB;
@@ -140,25 +137,6 @@ impl LmdbStorageConfig {
             ..Self::default()
         }
     }
-}
-
-/// Statistics about storage operations.
-#[derive(Debug, Clone, Default)]
-pub struct StorageStats {
-    /// Total number of chunks stored.
-    pub chunks_stored: u64,
-    /// Total number of chunks retrieved.
-    pub chunks_retrieved: u64,
-    /// Total bytes stored.
-    pub bytes_stored: u64,
-    /// Total bytes retrieved.
-    pub bytes_retrieved: u64,
-    /// Number of duplicate writes (already exists).
-    pub duplicates: u64,
-    /// Number of verification failures on read.
-    pub verification_failures: u64,
-    /// Number of chunks currently persisted.
-    pub current_chunks: u64,
 }
 
 /// Content-addressed LMDB storage.
@@ -796,6 +774,14 @@ impl LmdbStorage {
     /// Returns [`Error::Storage`] when the volume is below the reserve and the
     /// store holds less than one chunk of reusable space, or when the
     /// disk-space query itself fails.
+    /// Unused while the node is moving off this store.
+    ///
+    /// Capacity is now the file store's question, because that is where writes land, and
+    /// this predicate deliberately answers a different one: it counts pages this store can
+    /// reuse internally, which says nothing about whether the *file* about to be written
+    /// will fit. [`Self::capacity_verdict`] is still used, to decide whether the bridge's
+    /// copy into this store is worth attempting. Both go when this store does.
+    #[allow(dead_code)]
     pub(crate) fn check_capacity(&self) -> Result<()> {
         let Some(available) = self.available_space_cached()? else {
             return Ok(());

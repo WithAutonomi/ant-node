@@ -1,5 +1,6 @@
 //! Configuration for ant-node.
 
+use crate::storage::MigrationConfig;
 use evmlib::Network as EvmNetwork;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -436,6 +437,13 @@ pub struct StorageConfig {
     /// preventing the node from filling the disk completely.  Default: 500 MiB.
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
+
+    /// Controls for moving this node off the legacy LMDB chunk store.
+    ///
+    /// The two release switches inside it are deliberately not serialised: see
+    /// [`MigrationConfig`].
+    #[serde(default)]
+    pub migration: MigrationConfig,
 }
 
 impl Default for StorageConfig {
@@ -445,6 +453,7 @@ impl Default for StorageConfig {
             verify_on_read: default_storage_verify_on_read(),
             db_size_gb: 0,
             disk_reserve_mb: default_disk_reserve_mb(),
+            migration: MigrationConfig::default(),
         }
     }
 }
@@ -598,8 +607,36 @@ fn default_testnet_bootstrap() -> Vec<SocketAddr> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
+
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn the_shipped_storage_config_parses() {
+        // The migration section is operator-facing, so a typo in it would only surface on
+        // a node that had already shipped. Only `[storage]` is checked: the rest of
+        // `production.toml` does not currently deserialize as a `NodeConfig` (its
+        // `evm_network` is a bare string where an internally tagged enum is expected),
+        // which is a separate, pre-existing problem.
+        let raw = include_str!("../config/production.toml");
+        let doc: toml::Value = toml::from_str(raw).expect("production.toml must be valid TOML");
+        let storage = doc.get("storage").expect("a [storage] section").clone();
+        let config: StorageConfig = storage.try_into().expect("[storage] must deserialize");
+
+        assert!(config.migration.enabled);
+        assert!(config.migration.dual_write_legacy);
+        assert_eq!(config.migration.shed_hold_hours, 72);
+        assert_eq!(config.migration.copier_throttle_mib_per_sec, 32);
+        assert_eq!(config.migration.copier_slack_mb, 2048);
+        // The release switches are absent from the file on purpose, so they come from the
+        // build rather than from whatever an operator's config last recorded.
+        let build = MigrationConfig::default();
+        assert_eq!(config.migration.retire_legacy, build.retire_legacy);
+        assert_eq!(
+            config.migration.suspend_close_group_storage_penalty,
+            build.suspend_close_group_storage_penalty
+        );
+    }
 
     #[test]
     fn test_default_config_has_cache_capacity() {

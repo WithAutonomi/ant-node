@@ -24,9 +24,11 @@
 //! its persisted key set — so an honest restarted node can answer every pin that
 //! is still inside its answerability window, and an unanswerable pin is provable
 //! misbehaviour rather than an honest crash-restart. Trees are otherwise rebuilt
-//! from `LmdbStorage` at the next rotation tick. Memory cost is bounded by
+//! from `ChunkStore` at the next rotation tick. Memory cost is bounded by
 //! `2 × (key_count × ~64 bytes + signature_size)` — for 10k keys, ~1.3 MB.
 
+use saorsa_core::identity::PeerId;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -441,6 +443,18 @@ struct Inner {
     /// the answerability TTL, not a fixed count). A commitment is retained iff it
     /// is the live current one or its hash appears here with an unexpired stamp.
     recently_gossiped: Vec<GossipedAt>,
+    /// Peers that have demonstrably received the CURRENT commitment root.
+    ///
+    /// Distinct from `recently_gossiped`, which records that a root was put on the wire.
+    /// This records that a specific peer's node answered afterwards, so the request
+    /// carrying the root arrived. The storage migration needs that stronger statement: a
+    /// node must not start giving chunks up until its close group has actually seen the
+    /// reduced commitment, or those peers keep auditing it against the set it used to
+    /// hold.
+    current_recipients: HashSet<PeerId>,
+    /// The root `current_recipients` refers to. A rotation to a different root empties
+    /// the set, because nobody has seen the new one yet.
+    current_recipients_hash: Option<[u8; 32]>,
 }
 
 impl Default for ResponderCommitmentState {
@@ -460,6 +474,8 @@ impl ResponderCommitmentState {
                 slots: Vec::with_capacity(RETAINED_GOSSIPED_COMMITMENTS + 1),
                 has_current: false,
                 recently_gossiped: Vec::with_capacity(RETAINED_GOSSIPED_COMMITMENTS),
+                current_recipients: HashSet::new(),
+                current_recipients_hash: None,
             }),
         }
     }
@@ -503,6 +519,46 @@ impl ResponderCommitmentState {
     /// `GOSSIP_ANSWERABILITY_TTL` after its last emission, which is what lets
     /// an out-of-range key age out even when the no-op guard freezes the
     /// committed key set.
+    /// Record that `peer` demonstrably received the current commitment root.
+    ///
+    /// Called when a peer answers a neighbour sync that carried our root, which is proof
+    /// of arrival rather than proof of emission.
+    pub fn note_commitment_delivered(&self, peer: PeerId) {
+        let mut guard = self.inner.write();
+        if !guard.has_current {
+            return;
+        }
+        let Some(hash) = guard.slots.first().map(|c| c.cached_hash) else {
+            return;
+        };
+        if guard.current_recipients_hash != Some(hash) {
+            guard.current_recipients.clear();
+            guard.current_recipients_hash = Some(hash);
+        }
+        guard.current_recipients.insert(peer);
+    }
+
+    /// How many distinct peers have received the current commitment root.
+    ///
+    /// Zero once the root changes, because a rotation is a new claim that nobody has
+    /// seen yet.
+    #[must_use]
+    pub fn current_delivered_peer_count(&self) -> usize {
+        let guard = self.inner.read();
+        if !guard.has_current {
+            return 0;
+        }
+        let Some(hash) = guard.slots.first().map(|c| c.cached_hash) else {
+            return 0;
+        };
+        if guard.current_recipients_hash == Some(hash) {
+            guard.current_recipients.len()
+        } else {
+            0
+        }
+    }
+
+    /// Stamp `hash` as emitted on the wire, refreshing its answerability window.
     pub fn mark_gossiped(&self, hash: [u8; 32]) {
         let now = Instant::now();
         let mut guard = self.inner.write();
@@ -873,6 +929,14 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = byte;
         k
+    }
+
+    fn peer(byte: u8) -> PeerId {
+        let mut bytes = [0u8; 32];
+        if let Some(slot) = bytes.first_mut() {
+            *slot = byte;
+        }
+        PeerId::from_bytes(bytes)
     }
 
     fn bh(byte: u8) -> [u8; 32] {
@@ -1259,6 +1323,37 @@ mod tests {
 
     /// Build a `BuiltCommitment` over the given keys for use in raw `prune_slots`
     /// tests (each key's `bytes_hash` is `bh(k[0])`).
+    #[test]
+    fn commitment_delivery_counts_per_root_and_a_rotation_resets_it() {
+        let state = ResponderCommitmentState::default();
+
+        // Nothing advertised, so nobody can have received anything.
+        state.note_commitment_delivered(peer(1));
+        assert_eq!(state.current_delivered_peer_count(), 0);
+
+        state.rotate(built(&[1, 2, 3]));
+        assert_eq!(state.current_delivered_peer_count(), 0);
+
+        state.note_commitment_delivered(peer(1));
+        state.note_commitment_delivered(peer(2));
+        // The same peer twice is still one peer.
+        state.note_commitment_delivered(peer(2));
+        assert_eq!(state.current_delivered_peer_count(), 2);
+
+        // A different key set is a different claim, and nobody has seen it yet. This is
+        // what stops a node treating "they knew my old commitment" as "they know my new
+        // smaller one", which is exactly the confusion the storage migration must avoid.
+        state.rotate(built(&[1, 2]));
+        assert_eq!(state.current_delivered_peer_count(), 0);
+
+        state.note_commitment_delivered(peer(1));
+        assert_eq!(state.current_delivered_peer_count(), 1);
+
+        // Retiring the current root means there is nothing being advertised to know.
+        state.retire_current();
+        assert_eq!(state.current_delivered_peer_count(), 0);
+    }
+
     fn built(keys: &[u8]) -> BuiltCommitment {
         let (pk, sk) = keypair();
         let entries: Vec<_> = keys.iter().map(|&b| (key(b), bh(b))).collect();
@@ -1288,6 +1383,8 @@ mod tests {
         let base = Instant::now();
         let now = base + GOSSIP_ANSWERABILITY_TTL + Duration::from_secs(1);
         let mut inner = Inner {
+            current_recipients: HashSet::new(),
+            current_recipients_hash: None,
             slots: vec![Arc::clone(&c_current), Arc::clone(&c_stale)],
             has_current: true,
             recently_gossiped: vec![
@@ -1337,6 +1434,8 @@ mod tests {
         let base = Instant::now();
         let now = base + GOSSIP_ANSWERABILITY_TTL / 2;
         let mut inner = Inner {
+            current_recipients: HashSet::new(),
+            current_recipients_hash: None,
             slots: vec![Arc::clone(&c_current), Arc::clone(&c_prev)],
             has_current: true,
             recently_gossiped: vec![
@@ -1405,6 +1504,8 @@ mod tests {
         let base = Instant::now();
         let now = base + GOSSIP_ANSWERABILITY_TTL + Duration::from_secs(1);
         let mut inner = Inner {
+            current_recipients: HashSet::new(),
+            current_recipients_hash: None,
             slots: vec![Arc::clone(&c1)],
             has_current: false, // already retired
             recently_gossiped: vec![GossipedAt {
@@ -1435,6 +1536,8 @@ mod tests {
         let base = Instant::now();
         let now = base + GOSSIP_ANSWERABILITY_TTL / 2;
         let mut inner = Inner {
+            current_recipients: HashSet::new(),
+            current_recipients_hash: None,
             slots: vec![Arc::clone(&c1)],
             has_current: false, // retired
             recently_gossiped: vec![GossipedAt {
