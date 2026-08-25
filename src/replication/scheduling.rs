@@ -11,10 +11,39 @@ use std::time::{Duration, Instant};
 use crate::logging::debug;
 
 use crate::ant_protocol::XorName;
+use crate::replication::config::VERIFICATION_RETRY_BACKOFF_MAX;
 use crate::replication::types::{
     FetchCandidate, FetchOrder, FetchPayload, VerificationEntry, VerificationState,
 };
 use saorsa_core::identity::PeerId;
+
+/// Result of deferring a pending key to a later verification round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeferralOutcome {
+    /// Consecutive unresolved rounds for this entry, counting this one. `1` is
+    /// the entry's first failure, which is the one worth reporting.
+    pub attempt: u32,
+    /// Delay applied before this key is eligible for another round.
+    pub retry_after: Duration,
+}
+
+/// Exponential backoff for an unresolved pending key.
+///
+/// `attempt` is 1-based, so the first deferral waits `base` and each subsequent
+/// one doubles, saturating at [`VERIFICATION_RETRY_BACKOFF_MAX`]. The shift is
+/// bounded before it is applied so a long-lived entry cannot overflow into a
+/// short delay.
+fn backoff_delay(base: Duration, attempt: u32) -> Duration {
+    // Clamp the exponent before shifting: `1u32 << 32` is undefined behaviour
+    // territory in release builds, and any base doubled 31 times has long since
+    // saturated the cap anyway.
+    let exponent = attempt.saturating_sub(1).min(31);
+    base.saturating_mul(1u32 << exponent)
+        .min(VERIFICATION_RETRY_BACKOFF_MAX)
+        // Never retry faster than the caller asked for, even if a config sets a
+        // base above the cap.
+        .max(base)
+}
 
 /// Global hard upper bound on the number of keys held in `pending_verify`.
 ///
@@ -976,12 +1005,76 @@ impl ReplicationQueues {
         self.refresh_eviction_candidate(&key);
     }
 
-    /// Defer a pending key before its next verification attempt.
+    /// Defer a pending key before its next verification attempt, by a flat
+    /// delay.
+    ///
+    /// For deferrals that are *not* a failed round: the caller chose not to ask
+    /// (a full disk, say), so nothing was learned about the key and the
+    /// unresolved-round count must not move.
     pub fn defer_pending(&mut self, key: &XorName, retry_after: Duration) -> bool {
         let Some(entry) = self.pending_verify.get_mut(key) else {
             return false;
         };
         entry.next_verify_at = Instant::now() + retry_after;
+        true
+    }
+
+    /// Defer a pending key whose verification round left it unresolved.
+    ///
+    /// `base_retry_after` is the delay for the entry's *first* such deferral.
+    /// Each consecutive one doubles it, capped at
+    /// [`VERIFICATION_RETRY_BACKOFF_MAX`]. A key that keeps failing is failing
+    /// for a reason a faster retry cannot change, so the cost of asking decays
+    /// rather than being paid in full every 15 seconds.
+    ///
+    /// Returns `None` if the key is not pending, otherwise the resulting
+    /// [`DeferralOutcome`], whose `attempt` is 1 on this entry's first
+    /// unresolved round — the one worth reporting.
+    pub fn defer_unresolved(
+        &mut self,
+        key: &XorName,
+        base_retry_after: Duration,
+    ) -> Option<DeferralOutcome> {
+        let entry = self.pending_verify.get_mut(key)?;
+        entry.unresolved_retries = entry.unresolved_retries.saturating_add(1);
+        let attempt = entry.unresolved_retries;
+        let retry_after = backoff_delay(base_retry_after, attempt);
+        entry.next_verify_at = Instant::now() + retry_after;
+        Some(DeferralOutcome {
+            attempt,
+            retry_after,
+        })
+    }
+
+    /// Claim this entry's single no-holder warning.
+    ///
+    /// Returns `true` the first time it is called for a given entry and `false`
+    /// after, so the caller can warn once and drop to `debug` thereafter.
+    ///
+    /// Kept separate from [`Self::defer_unresolved`] on purpose. A round can
+    /// legitimately advance the failure count without producing a no-holder
+    /// result — an inconclusive quorum does exactly that — and if the two
+    /// shared state, such a round would consume the warning before the
+    /// condition it describes had ever been observed.
+    pub fn claim_no_holder_report(&mut self, key: &XorName) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
+        !std::mem::replace(&mut entry.no_holder_reported, true)
+    }
+
+    /// Clear an entry's unresolved history after a round that found a holder.
+    ///
+    /// The round succeeded even if the key could not move on — a full fetch
+    /// queue leaves it pending — so it must not inherit the earlier backoff, and
+    /// a later relapse deserves a fresh warning. Returns whether an entry was
+    /// present to clear.
+    pub fn clear_unresolved(&mut self, key: &XorName) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
+        entry.unresolved_retries = 0;
+        entry.no_holder_reported = false;
         true
     }
 
@@ -1414,6 +1507,7 @@ fn max_min_allocations(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::replication::config::CAPACITY_BLOCKED_RETRY;
 
     /// Build a `PeerId` from a single byte (zero-padded to 32 bytes).
     fn peer_id_from_byte(b: u8) -> PeerId {
@@ -1444,6 +1538,8 @@ mod tests {
             next_verify_at: now,
             hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         }
     }
 
@@ -2349,6 +2445,217 @@ mod tests {
         assert_eq!(queues.ready_pending_keys(after_retry), vec![key]);
     }
 
+    #[test]
+    fn repeated_deferrals_back_off_and_saturate_at_the_cap() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAB);
+        queues.add_pending_verify(key, test_entry(1));
+
+        // 15s doubling per consecutive unresolved round.
+        for (attempt, expected_secs) in [(1, 15), (2, 30), (3, 60), (4, 120), (5, 240)] {
+            let outcome = queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+            assert_eq!(outcome.attempt, attempt);
+            assert_eq!(
+                outcome.retry_after,
+                Duration::from_secs(expected_secs),
+                "attempt {attempt} should back off to {expected_secs}s"
+            );
+        }
+
+        // Everything past the cap stays at the cap rather than overflowing the
+        // shift into a short (or zero) delay.
+        for _ in 0..64 {
+            let outcome = queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+            assert_eq!(
+                outcome.retry_after, VERIFICATION_RETRY_BACKOFF_MAX,
+                "backoff must saturate at the cap, never wrap"
+            );
+        }
+    }
+
+    /// The counter and the warning answer different questions, so a round that
+    /// advances the count without producing a no-holder result — an
+    /// inconclusive quorum — must leave the warning unclaimed. Deriving the
+    /// report from `attempt == 1` loses the first and only warning for every
+    /// key whose opening round is inconclusive.
+    #[test]
+    fn a_non_reporting_round_does_not_consume_the_no_holder_warning() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAE);
+        queues.add_pending_verify(key, test_entry(1));
+
+        // Round 1: inconclusive quorum. Backs off, reports nothing.
+        let first = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(first.attempt, 1);
+
+        // Round 2 is the first that actually finds no holder. It is at
+        // attempt 2, but it is the first report and must still warn.
+        let second = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(second.attempt, 2, "the inconclusive round still counts");
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "the first no-holder result must warn even at attempt 2"
+        );
+        assert!(
+            !queues.claim_no_holder_report(&key),
+            "the warning is claimed exactly once per entry"
+        );
+    }
+
+    /// A round that found a holder ends the run of failures, even when a full
+    /// fetch queue leaves the key pending. It must not inherit the old backoff,
+    /// and a later relapse deserves a fresh warning.
+    #[test]
+    fn finding_a_holder_clears_the_backoff_and_rearms_the_warning() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAF);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..4 {
+            queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+        }
+        assert!(queues.claim_no_holder_report(&key));
+
+        assert!(queues.clear_unresolved(&key));
+
+        let outcome = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(outcome.attempt, 1, "a resolved round restarts the run");
+        assert_eq!(outcome.retry_after, BASE);
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "a relapse after a good round is reported again"
+        );
+    }
+
+    /// The whole fix rests on a duplicate hint merging into the live entry
+    /// rather than replacing it. A refactor that replaced would silently revert
+    /// the backoff with every other test here still green.
+    #[test]
+    fn a_duplicate_hint_does_not_reset_the_backoff_or_the_retry_time() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xB0);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..3 {
+            queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+        }
+        assert!(queues.claim_no_holder_report(&key));
+        let deferred_until = queues.pending_verify[&key].next_verify_at;
+
+        // A second advertiser re-hints the same key.
+        assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
+
+        let entry = &queues.pending_verify[&key];
+        assert_eq!(
+            entry.unresolved_retries, 3,
+            "a re-hint must not restart the backoff"
+        );
+        assert!(
+            entry.no_holder_reported,
+            "a re-hint must not re-arm the warning; only eviction ends an episode"
+        );
+        assert_eq!(
+            entry.next_verify_at, deferred_until,
+            "a re-hint must not pull the key forward into an earlier round"
+        );
+    }
+
+    /// The write-blocked capacity gate defers without asking anyone, so it must
+    /// not consume the entry's first-failure warning or advance its backoff:
+    /// nothing was learned about the key.
+    #[test]
+    fn flat_defer_does_not_advance_the_unresolved_backoff() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAD);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..10 {
+            assert!(queues.defer_pending(&key, Duration::from_secs(300)));
+        }
+
+        let outcome = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(
+            outcome.attempt, 1,
+            "a flat deferral is not a failed round and must not consume attempt 1"
+        );
+        assert_eq!(outcome.retry_after, BASE);
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "nor may it consume the warning"
+        );
+    }
+
+    #[test]
+    fn defer_unresolved_reports_none_for_unknown_key() {
+        let mut queues = ReplicationQueues::new();
+        assert!(queues
+            .defer_unresolved(&xor_name_from_byte(0xFF), Duration::from_secs(15))
+            .is_none());
+    }
+
+    #[test]
+    fn re_admission_after_eviction_restarts_the_backoff() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAC);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..5 {
+            queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+        }
+
+        // Stale eviction drops the entry; the next hint admits a fresh one. The
+        // count lives on the entry, so the episode — and its single warning —
+        // starts over.
+        queues.evict_stale(Duration::ZERO);
+        assert_eq!(queues.pending_count(), 0);
+        queues.add_pending_verify(key, test_entry(1));
+
+        let outcome = queues
+            .defer_unresolved(&key, BASE)
+            .expect("re-admitted key should defer");
+        assert_eq!(outcome.attempt, 1, "re-admission starts a new episode");
+        assert_eq!(outcome.retry_after, BASE);
+    }
+
+    #[test]
+    fn backoff_never_retries_faster_than_the_caller_base() {
+        // A base above the cap (an unusual config, but representable) must not
+        // be shortened into a tighter retry loop than the caller asked for.
+        let long_base = VERIFICATION_RETRY_BACKOFF_MAX + Duration::from_secs(60);
+        assert_eq!(backoff_delay(long_base, 1), long_base);
+        assert_eq!(backoff_delay(long_base, 9), long_base);
+    }
+
     // -- remove_pending ---------------------------------------------------
 
     #[test]
@@ -2449,6 +2756,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([peer_id_from_byte(1)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(1)]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
 
         assert!(queues.add_pending_verify(key, entry).admitted());
@@ -2469,6 +2778,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([peer_id_from_byte(2)]),
             replica_hint_sources: HashSet::new(),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
 
         assert!(
@@ -2509,6 +2820,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([paid_advertiser]),
             replica_hint_sources: HashSet::new(),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(queues.add_pending_verify(key, paid_entry).admitted());
         assert_eq!(
@@ -2528,6 +2841,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([replica_advertiser]),
             replica_hint_sources: HashSet::from([replica_advertiser]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(!queues.add_pending_verify(key, replica_entry).admitted());
 
@@ -2559,6 +2874,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([replica_advertiser, paid_advertiser]),
             replica_hint_sources: HashSet::from([replica_advertiser]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(queues.add_pending_verify(key, entry).admitted());
 
@@ -2598,6 +2915,8 @@ mod tests {
             next_verify_at: Instant::now(),
             hint_sources: HashSet::from([peer_id_from_byte(3)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(3)]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(
             queues.add_pending_verify(key, entry).admitted(),
@@ -2642,5 +2961,53 @@ mod tests {
             !queues.contains_key(&key),
             "key should be fully processed out of pipeline"
         );
+    }
+
+    // -- capacity gate -----------------------------------------------------
+
+    /// Deferral moves the next look, not the entry's birth, so a blocked key
+    /// still ages out on the ordinary schedule.
+    ///
+    /// This is why the change carries no eviction protection for deferred keys:
+    /// protecting them would preserve, against a bounded queue, exactly the duty
+    /// a full node cannot discharge. The deferred key here is older than the age
+    /// limit and the control is not, so the assertion fails both if deferral
+    /// exempted a key from eviction and if it refreshed `created_at` — either
+    /// would let a full node hold entries indefinitely.
+    ///
+    /// What this does not show: that either gate calls `defer_pending`. The
+    /// gates need a network, so the e2e covers them.
+    #[test]
+    fn capacity_deferral_does_not_extend_entry_lifetime() {
+        // Small enough that the back-dated instant is representable on a
+        // machine that only just booted, wide enough that the control cannot
+        // age out while three in-memory queue operations run.
+        const MAX_AGE: Duration = Duration::from_secs(1);
+
+        let mut queues = ReplicationQueues::new();
+        let aged = xor_name_from_byte(1);
+        let fresh = xor_name_from_byte(2);
+
+        let mut aged_entry = test_entry(1);
+        aged_entry.created_at = Instant::now()
+            .checked_sub(MAX_AGE * 2)
+            .expect("backdate the aged entry");
+        assert!(queues.add_pending_verify(aged, aged_entry).admitted());
+        assert!(queues.add_pending_verify(fresh, test_entry(2)).admitted());
+
+        // The deferral puts the next look beyond the age limit, so an eviction
+        // that read the next look instead of the creation time would spare it.
+        assert!(queues.defer_pending(&aged, CAPACITY_BLOCKED_RETRY));
+
+        let evicted = queues.evict_stale(MAX_AGE);
+        assert!(
+            evicted.contains(&aged),
+            "a capacity-deferred key must still age out on its creation time"
+        );
+        assert!(
+            !evicted.contains(&fresh),
+            "the age limit, not the deferral, is what retires an entry"
+        );
+        assert_eq!(queues.pending_count(), 1);
     }
 }

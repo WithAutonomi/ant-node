@@ -91,13 +91,13 @@ use crate::replication::protocol::{
 };
 use crate::replication::quorum::KeyVerificationOutcome;
 use crate::replication::recent_provers::RecentProvers;
-use crate::replication::scheduling::{CapacityDisplacement, ReplicationQueues};
+use crate::replication::scheduling::{CapacityDisplacement, DeferralOutcome, ReplicationQueues};
 use crate::replication::types::{
     AuditFailureReason, BootstrapClaimObservation, BootstrapState, FailureEvidence,
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
     VerificationState,
 };
-use crate::storage::LmdbStorage;
+use crate::storage::{CapacityVerdict, LmdbStorage};
 use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
@@ -2147,6 +2147,44 @@ impl ReplicationEngine {
     #[cfg(any(test, feature = "test-utils"))]
     pub async fn fetch_pipeline_contains_for_test(&self, key: &XorName) -> bool {
         self.queues.read().await.contains_key(key)
+    }
+
+    /// Test-only: place `key` into pending verification as though `hinter` had
+    /// just advertised it with a replica hint. Returns whether it was admitted.
+    ///
+    /// Enters the pipeline one stage earlier than
+    /// [`Self::enqueue_fetch_for_test`], so what the verification cycle itself
+    /// decides about the key is observable.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn enqueue_pending_verify_for_test(&self, key: XorName, hinter: PeerId) -> bool {
+        let now = Instant::now();
+        let entry = VerificationEntry {
+            state: VerificationState::PendingVerify,
+            verified_sources: Vec::new(),
+            tried_sources: HashSet::new(),
+            created_at: now,
+            next_verify_at: now,
+            hint_sources: HashSet::from([hinter]),
+            replica_hint_sources: HashSet::from([hinter]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
+        };
+        self.queues
+            .write()
+            .await
+            .add_pending_verify(key, entry)
+            .admitted()
+    }
+
+    /// Test-only: how far ahead `key`'s next verification round is scheduled,
+    /// or `None` when the key is not pending verification.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn pending_verify_delay_for_test(&self, key: &XorName) -> Option<Duration> {
+        self.queues.read().await.get_pending(key).map(|entry| {
+            entry
+                .next_verify_at
+                .saturating_duration_since(Instant::now())
+        })
     }
 
     /// Start all background tasks.
@@ -6546,6 +6584,99 @@ async fn handle_neighbor_sync_request(
     Ok(())
 }
 
+/// Test-only record of who *sent* a verification request covering a watched key.
+///
+/// The capacity gate's entire effect is a request that is never sent, and a
+/// request that was not sent leaves no production counter anywhere — not on the
+/// sender, whose traffic counters are process-global and so cannot separate one
+/// node of a single-process testnet from another, and not on the responder,
+/// which simply never hears from it. Recording who asked is what lets a test
+/// tell "held the key back" apart from "probed the close group, was refused at
+/// the dial, and then held the key back", which are otherwise identical from the
+/// queue's point of view.
+///
+/// Arming replaces the previous watch, so the outer map holds exactly the keys
+/// the current test named, and each inner map holds at most one entry per node
+/// in the process. Nothing is recorded until a test arms it, and the armed path
+/// costs one read lock on the sending side.
+///
+/// Counting is per key because a node that cannot write legitimately keeps
+/// sending verification requests for keys it has not yet authorized — that is
+/// `PaidForList` convergence, which the gate leaves alone — so a per-peer total
+/// would assert something untrue.
+///
+/// It counts *send attempts*, deliberately, recorded immediately before the wire
+/// call. A responder sheds requests at admission and as stale, so a
+/// receiver-side count would report zero for probes that were really sent, and
+/// an assertion that this node asked nobody would pass on the strength of the
+/// receiver dropping the question. It is not proof of delivery: a send that
+/// fails immediately, with no route or during shutdown, is still counted.
+///
+/// `OnceLock` rather than `LazyLock`, which needs a newer Rust than this crate's
+/// MSRV.
+#[cfg(any(test, feature = "test-utils"))]
+type VerificationWatch = HashMap<XorName, HashMap<PeerId, usize>>;
+
+#[cfg(any(test, feature = "test-utils"))]
+static VERIFICATION_WATCH: std::sync::OnceLock<std::sync::RwLock<VerificationWatch>> =
+    std::sync::OnceLock::new();
+
+#[cfg(any(test, feature = "test-utils"))]
+fn verification_watch() -> &'static std::sync::RwLock<VerificationWatch> {
+    VERIFICATION_WATCH.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Test-only: start counting verification requests for `keys`, from zero.
+///
+/// Replaces any previous watch rather than adding to it, so the map is bounded
+/// by the keys of the test that armed it last and nothing accumulates across a
+/// process running many tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn watch_verification_requests_for_test(keys: &[XorName]) {
+    if let Ok(mut watch) = verification_watch().write() {
+        watch.clear();
+        for key in keys {
+            watch.insert(*key, HashMap::new());
+        }
+    }
+}
+
+/// Record that `requester` sent a verification request covering `keys`, for
+/// whichever of them are watched. A poisoned lock is ignored rather than
+/// propagated: this is observation for tests and must never change behaviour.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn record_verification_request_sent(requester: &PeerId, keys: &[XorName]) {
+    // Fast path under a read lock: with nothing watched — every production
+    // build, and every test that did not ask — this is all the sender pays.
+    match verification_watch().read() {
+        Ok(watch) if watch.is_empty() => return,
+        Ok(watch) if !keys.iter().any(|key| watch.contains_key(key)) => return,
+        Ok(_) => {}
+        Err(_) => return,
+    }
+    if let Ok(mut watch) = verification_watch().write() {
+        for key in keys {
+            if let Some(by_peer) = watch.get_mut(key) {
+                *by_peer.entry(*requester).or_insert(0) += 1;
+            }
+        }
+    }
+}
+
+/// Test-only: how many times `requester` has asked this process about `key`.
+/// Zero unless the key was registered with `watch_verification_requests_for_test`.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn verification_requests_for_key_from_for_test(requester: &PeerId, key: &XorName) -> usize {
+    verification_watch().read().map_or(0, |watch| {
+        watch
+            .get(key)
+            .and_then(|by_peer| by_peer.get(requester))
+            .copied()
+            .unwrap_or(0)
+    })
+}
+
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
@@ -7619,6 +7750,8 @@ fn queue_admitted_hints(
                     // Non-empty: this peer claimed possession, so it is a
                     // fetch-source candidate. Derives HintPipeline::Replica.
                     replica_hint_sources: HashSet::from([*source_peer]),
+                    unresolved_retries: 0,
+                    no_holder_reported: false,
                 },
             );
             match result {
@@ -7646,6 +7779,8 @@ fn queue_admitted_hints(
                 // Empty: a paid hint makes no possession claim, so this peer is
                 // not a fetch source. Derives HintPipeline::PaidOnly.
                 replica_hint_sources: HashSet::new(),
+                unresolved_retries: 0,
+                no_holder_reported: false,
             },
         );
         match result {
@@ -7752,6 +7887,30 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     }
     let initial_pending_count = pending_keys.len();
 
+    // Capacity verdict for this cycle — the same pre-check the PUT handler and
+    // the fresh-offer path already run (V2-411), read once and reused below.
+    //
+    // It gates only the two steps that exist to enable a fetch: the presence
+    // probe that discovers holders, and the promotion that queues the download.
+    // Everything a cycle does that does not need a local write still runs on a
+    // full node — the local paid-list fast path, `PaidForList` convergence
+    // through the quorum round, and the terminal checks that retire a key this
+    // node already holds or is no longer admitted for. Gating earlier than this
+    // would stop a full node learning which of its keys were paid for, and
+    // would strand keys that should have retired, which keeps bootstrap drain
+    // pending and audits disabled until stale eviction.
+    // Only a *full* disk is a standing condition worth minutes of backoff. A
+    // failed `statvfs` says nothing about available space and may have cleared
+    // by the next cycle, so it is treated as writable here and left to the
+    // pre-check at the dial, which queries again and may well permit the write.
+    let write_blocked = storage.capacity_verdict() == CapacityVerdict::Full;
+    // Counted per gate rather than combined. `local_paid_probe` below counts
+    // probes actually sent, so it reads zero once the first gate fires; keeping
+    // the two deferral counts apart is what lets an operator see which branch a
+    // full node's keys are taking without adding a code path to find out.
+    let mut capacity_deferred_probe = 0usize;
+    let mut capacity_deferred_promote = 0usize;
+
     let self_id = *p2p_node.peer_id();
 
     // Step 1: Check local PaidForList for fast-path authorization (Section 9,
@@ -7802,10 +7961,28 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 terminal_keys.push(key);
             }
         }
+
+        // Capacity gate, first of two. Everything above this point has already
+        // run: authorization succeeded via the local `PaidForList` hit, and the
+        // keys that should retire (already held, or no longer storage-admitted)
+        // have retired. What is left is a probe whose only purpose is finding a
+        // holder to download from, and this node cannot write what it would
+        // download.
+        if write_blocked && !local_paid_presence_probe_keys.is_empty() {
+            let mut q = queues.write().await;
+            for key in std::mem::take(&mut local_paid_presence_probe_keys) {
+                if q.defer_pending(&key, config::CAPACITY_BLOCKED_RETRY) {
+                    capacity_deferred_probe += 1;
+                }
+            }
+        }
     }
 
     let local_paid_probe_count = local_paid_presence_probe_keys.len();
     let keys_needing_network_count = keys_needing_network.len();
+    // Keys this cycle put back because no peer claimed possession. Reported in
+    // aggregate below; the per-key line is warned once per entry, not per retry.
+    let mut no_holder_deferrals = 0usize;
 
     // Step 1b: Local paid-list hit for fetch-eligible keys. Per Section 9
     // step 4, authorization succeeds immediately; run a presence-only probe
@@ -7840,12 +8017,16 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 add_replica_hint_sources(&mut sources, &entry.replica_hint_sources);
             }
             if sources.is_empty() {
-                warn!(
-                    "Locally paid key {} has no responding holders yet; deferring retry",
-                    hex::encode(key)
-                );
-                q.defer_pending(&key, config.verification_request_timeout);
+                no_holder_deferrals += 1;
+                let outcome = q.defer_unresolved(&key, config.verification_request_timeout);
+                let first_report = q.claim_no_holder_report(&key);
+                report_unresolved_deferral("Locally paid key", &key, outcome, first_report);
             } else {
+                // A holder answered, so whatever came before is not a run of
+                // consecutive failures any more. Clear before promoting: if the
+                // fetch queue is full the entry stays pending, and it must not
+                // carry the old backoff.
+                q.clear_unresolved(&key);
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
                 // pending entry is preserved and retried next cycle (no
@@ -8023,7 +8204,19 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                     let mut fetch_sources = sources;
                     add_replica_hint_sources(&mut fetch_sources, &replica_hint_sources);
                     let fetch_eligible = fetch_allowed_keys.contains(&key);
-                    if fetch_eligible && !fetch_sources.is_empty() {
+                    if fetch_eligible && write_blocked {
+                        // Capacity gate, second of two, and deliberately after
+                        // Step 4: the key is now recorded in `PaidForList` and
+                        // its verification stands. Only the download is held,
+                        // because `execute_single_fetch` would refuse it and
+                        // hand the key straight back here.
+                        if q.defer_pending(&key, config::CAPACITY_BLOCKED_RETRY) {
+                            capacity_deferred_promote += 1;
+                        }
+                    } else if fetch_eligible && !fetch_sources.is_empty() {
+                        // A holder answered; see the matching clear on the
+                        // local-paid path.
+                        q.clear_unresolved(&key);
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                         // Atomic remove+enqueue: on fetch_queue capacity miss
@@ -8033,11 +8226,15 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // Not terminal — either moved to fetch queue, or
                         // retained as pending until queue drains.
                     } else if fetch_eligible && fetch_sources.is_empty() {
-                        warn!(
-                            "Verified storage-admitted key {} has no holders yet; deferring retry",
-                            hex::encode(key)
+                        no_holder_deferrals += 1;
+                        let outcome = q.defer_unresolved(&key, config.verification_request_timeout);
+                        let first_report = q.claim_no_holder_report(&key);
+                        report_unresolved_deferral(
+                            "Verified storage-admitted key",
+                            &key,
+                            outcome,
+                            first_report,
                         );
-                        q.defer_pending(&key, config.verification_request_timeout);
                     } else {
                         q.remove_pending(&key);
                         terminal_keys.push(key);
@@ -8049,7 +8246,11 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 }
                 KeyVerificationOutcome::QuorumInconclusive => {
                     q.set_pending_state(&key, VerificationState::QuorumInconclusive);
-                    q.defer_pending(&key, config.verification_request_timeout);
+                    // Backed off like any other unresolved round, but it does
+                    // NOT claim the no-holder report: nothing yet says this key
+                    // has no holder, so the first round that does say so must
+                    // still be the one that warns.
+                    let _ = q.defer_unresolved(&key, config.verification_request_timeout);
                 }
             }
         }
@@ -8098,12 +8299,52 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
     if elapsed_ms >= VERIFICATION_CYCLE_SLOW_LOG_MS {
         info!(
             target: "ant_node::replication::verification",
-            "Slow replication verification cycle: pending_start={initial_pending_count}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+            "Slow replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, no_holders={no_holder_deferrals}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
         );
     } else {
         debug!(
             target: "ant_node::replication::verification",
-            "Replication verification cycle: pending_start={initial_pending_count}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+            "Replication verification cycle: pending_start={initial_pending_count}, capacity_deferred_probe={capacity_deferred_probe}, capacity_deferred_promote={capacity_deferred_promote}, local_paid_probe={local_paid_probe_count}, network_verify={keys_needing_network_count}, terminal={terminal_key_count}, no_holders={no_holder_deferrals}, pending_after={pending_after}, fetch_after={fetch_after}, in_flight_after={in_flight_after}, elapsed_ms={elapsed_ms}",
+        );
+    }
+}
+
+/// Report a verification round that left a key without a usable holder.
+///
+/// Warns once per entry — the first failure is news, and by the hundredth the
+/// node is re-asking peers it has already exhausted. Later failures stay at
+/// `debug`, and the per-cycle count is carried in the cycle summary so the
+/// scale of a backlog is still visible without a line per key per retry.
+///
+/// `first_report` comes from `claim_no_holder_report`, not from the attempt
+/// number: a round may advance the count without producing a no-holder result,
+/// and such a round must not consume the warning.
+///
+/// Eviction at `PENDING_VERIFY_MAX_AGE` drops the entry, and a round that finds
+/// a holder clears it, so a later relapse warns again: "once per episode", not
+/// "once ever".
+fn report_unresolved_deferral(
+    what: &str,
+    key: &XorName,
+    outcome: Option<DeferralOutcome>,
+    first_report: bool,
+) {
+    let Some(outcome) = outcome else {
+        // The entry left `pending_verify` under the same lock; nothing deferred.
+        return;
+    };
+    if first_report {
+        warn!(
+            "{what} {} has no responding holders yet; deferring retry",
+            hex::encode(key)
+        );
+    } else {
+        debug!(
+            "{what} {} still has no responding holders after {} attempts; \
+             retrying in {}s",
+            hex::encode(key),
+            outcome.attempt,
+            outcome.retry_after.as_secs()
         );
     }
 }
@@ -8342,6 +8583,12 @@ fn apply_fetch_result(
         // stranded — it comes back once capacity allows — and the fallthrough
         // to `Terminal` when there is no retry metadata is what keeps
         // bootstrap drain accounting correct, exactly as for a source failure.
+        //
+        // The ordinary requeue delay, deliberately. A standing capacity block
+        // does not need a longer one here: the key returns to pending, and the
+        // gate at the head of the next cycle defers it for minutes. A separate
+        // backoff on this path would duplicate that to save one 15 s round, on
+        // a race the gate already makes rare.
         FetchResult::LocalWriteFailed => {
             if q.requeue_fetch_for_verification(key, verification_retry_after) {
                 FetchFollowUp::RequeuedForVerification
@@ -10769,6 +11016,8 @@ mod tests {
                 next_verify_at: now,
                 hint_sources: HashSet::from([peer]),
                 replica_hint_sources: HashSet::from([peer]),
+                unresolved_retries: 0,
+                no_holder_reported: false,
             },
         );
         super::bootstrap::track_discovered_keys(&bootstrap_state, &HashSet::from([key])).await;
@@ -12812,6 +13061,8 @@ mod tests {
             next_verify_at: now,
             hint_sources: HashSet::from([hinter]),
             replica_hint_sources: HashSet::from([hinter]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(q.add_pending_verify(key, entry).admitted());
         assert!(q.promote_pending_to_fetch(key, key, sources));
