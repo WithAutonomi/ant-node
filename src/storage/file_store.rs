@@ -41,7 +41,7 @@ use crate::logging::{debug, info, trace, warn};
 use crate::storage::StorageStats;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -88,8 +88,6 @@ const RENAME_RETRY_ATTEMPTS: u32 = 5;
 
 /// Base backoff between those retries; the wait grows linearly with the attempt.
 const RENAME_RETRY_BACKOFF: Duration = Duration::from_millis(20);
-
-/// Minimum age before an orphaned temp file is swept when this process could not take
 
 /// Longest absolute path a chunk file may need, checked once at open.
 ///
@@ -404,26 +402,31 @@ impl Drop for Reservation {
 /// Held by the blocking closure rather than by the caller, so a dropped future cannot
 /// leave an entry behind, and a panic in the work cannot either.
 struct WriteInFlight {
-    writing: Arc<parking_lot::Mutex<HashSet<XorName>>>,
+    writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
     finished: Arc<tokio::sync::Notify>,
     address: XorName,
 }
 
 impl Drop for WriteInFlight {
     fn drop(&mut self) {
-        self.writing.lock().remove(&self.address);
-        self.finished.notify_waiters();
-    }
-}
-
-/// Small helper so the insert reads the same way at every call site.
-trait InsertUnderLock {
-    fn write_lock_insert(&self, address: &XorName);
-}
-
-impl InsertUnderLock for Arc<parking_lot::Mutex<HashSet<XorName>>> {
-    fn write_lock_insert(&self, address: &XorName) {
-        self.lock().insert(*address);
+        let was_last = {
+            let mut writing = self.writing.lock();
+            match writing.get_mut(&self.address) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    writing.remove(&self.address);
+                    true
+                }
+            }
+        };
+        // Only when this was the last one. Waking a waiter while another write for the
+        // same key is still queued is exactly what the count exists to prevent.
+        if was_last {
+            self.finished.notify_waiters();
+        }
     }
 }
 
@@ -506,8 +509,13 @@ pub struct FileStore {
     ///
     /// It lets a delete queue behind the exact write it would otherwise race, rather than
     /// behind every write this store has in flight.
-    writing: Arc<parking_lot::Mutex<HashSet<XorName>>>,
-    /// Woken whenever [`Self::writing`] loses an entry.
+    ///
+    /// Counted, not a set. Cancellation can release the facade's key lane while the
+    /// blocking half survives, so a second write for the same key can start behind the
+    /// first. With one entry between them, whichever finished first would remove it and a
+    /// waiter would be told the key is free while the other was still queued.
+    writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
+    /// Woken when [`Self::writing`] loses its last entry for a key.
     write_finished: Arc<tokio::sync::Notify>,
     /// Bumped whenever a chunk stops being servable.
     ///
@@ -522,12 +530,13 @@ pub struct FileStore {
     temp_seq: AtomicU64,
     /// Random per-instance discriminator for temp filenames.
     nonce: u32,
-    /// Held for the store's lifetime when this process owns the directory.
+    /// Held for the store's lifetime. Startup fails without it.
     ///
-    /// `None` means another process holds it. The store still opens (LMDB allowed
-    /// multi-process access, so refusing here would be a new failure mode), but the
-    /// startup temp sweep becomes age-gated so it can never delete a live write.
-    _lock: File,
+    /// Shared rather than owned so the blocking work that depends on it can hold a lease
+    /// of its own: that work outlives the future that spawned it, and a cancelled caller
+    /// releasing the lock would leave it writing into a directory another process had
+    /// just been let into.
+    lock: Arc<File>,
     /// Tracks every blocking task, so [`FileStore::wait_idle`] can wait for writes that
     /// outlived their awaiting future.
     blocking_tracker: TaskTracker,
@@ -569,9 +578,17 @@ impl FileStore {
         let lock = acquire_store_lock(&chunks_dir)?;
 
         let scan_dir = chunks_dir.clone();
-        let scan = spawn_blocking(move || scan_store(&scan_dir))
-            .await
-            .map_err(|e| Error::Storage(format!("Chunk store scan task failed: {e}")))??;
+        // The scan holds the lease itself. It sweeps interrupted writes on the strength of
+        // being alone here, and it runs on a thread that outlives this future: a
+        // cancelled startup that released the lock would leave it sweeping a directory
+        // another process had just been let into.
+        let scan_lease = Arc::clone(&lock);
+        let scan = spawn_blocking(move || {
+            let _lease = scan_lease;
+            scan_store(&scan_dir)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("Chunk store scan task failed: {e}")))??;
 
         let ScanResult {
             keys,
@@ -611,13 +628,13 @@ impl FileStore {
             shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
             suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
-            writing: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            writing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             write_finished: Arc::new(tokio::sync::Notify::new()),
             health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             capacity,
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
-            _lock: lock,
+            lock,
             blocking_tracker: TaskTracker::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
@@ -692,11 +709,16 @@ impl FileStore {
         // Registered before the work is spawned and cleared by the work itself, so a
         // caller that goes away cannot leave a delete free to race this publish.
         let in_flight = self.begin_write(address);
+        // And the lease, for the same reason the scan holds it: this thread writes into a
+        // directory whose exclusivity the lock is what establishes, and it can outlive
+        // the last owner of the store.
+        let lease = Arc::clone(&self.lock);
 
         let outcome = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<PutOutcome> {
                 let _in_flight = in_flight;
+                let _lease = lease;
                 // Test-only: parks here while a test holds the write half.
                 #[cfg(any(test, feature = "test-utils"))]
                 let _test_put_gate = test_put_gate.read();
@@ -955,38 +977,38 @@ impl FileStore {
         let lane = shard_index(address);
         let key = *address;
         let in_flight = self.begin_write(address);
+        let lease = Arc::clone(&self.lock);
+        let capacity = Arc::clone(&self.capacity);
+        let suspect = Arc::clone(&self.suspect);
+        let known_wrong = Arc::clone(&self.known_wrong);
 
         self.blocking_tracker
             .spawn_blocking(move || -> Result<()> {
                 let _in_flight = in_flight;
+                let _lease = lease;
                 let _reservation = reservation;
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                 ensure_shard_dir(&chunks_dir, &shard, lane, &shards_present)?;
                 write_and_replace(&temp_path, &final_path, &payload, &shard)?;
                 index.write().insert(key);
+                // Settled here rather than after the await. The replacement has landed
+                // and hashes to its own name, so nothing is wrong with this chunk any
+                // more; a caller that stopped waiting would otherwise leave a healthy
+                // file excluded from everything the node claims to hold, and the
+                // measurement believing the store is a chunk smaller than it is.
+                suspect.write().remove(&key);
+                known_wrong.write().remove(&key);
+                capacity.invalidate();
                 Ok(())
             })
             .await
             .map_err(|e| Error::Storage(format!("Chunk store repair task failed: {e}")))??;
 
-        // The reservation was released by the work itself, which is what makes it cover
-        // the write rather than the wait. It is released rather than committed because a
-        // repair is not a new chunk: it took the place of one that was already there, and
-        // charging it again would make the guard believe the store is larger than it is.
-        //
-        // It is not free either. The file it replaced may have been shorter, which is
-        // exactly the case a repair fixes, so the difference is real bytes the cached
-        // measurement does not know about. Rather than guess at the net, throw the
-        // measurement away: the next admission takes a fresh one.
-        self.invalidate_capacity_cache();
-
-        // Cleared here rather than inside the blocking closure only because the closure
-        // returns before this line runs on every path that reaches it: an error short-
-        // circuits above, and a cancelled repair leaves the marks in place, which is the
-        // safe direction. The reconciliation the next verifying read performs clears them
-        // if the replacement did land.
-        self.clear_suspect(address);
-        self.clear_known_wrong(address);
+        // Everything the success means was recorded by the work that succeeded: the
+        // reservation released, the marks cleared, the measurement thrown away. Released
+        // rather than committed because a repair is not a new chunk, and the measurement
+        // discarded rather than adjusted because the file it replaced may have been
+        // shorter, which is exactly the case a repair fixes.
         debug!("Repaired chunk {}", hex::encode(address));
         Ok(())
     }
@@ -1356,7 +1378,7 @@ impl FileStore {
     /// The token must be moved into the blocking closure that does the work, so the entry
     /// is cleared by the thread that finishes rather than by a caller that may be gone.
     fn begin_write(&self, address: &XorName) -> WriteInFlight {
-        self.writing.write_lock_insert(address);
+        *self.writing.lock().entry(*address).or_insert(0) += 1;
         WriteInFlight {
             writing: Arc::clone(&self.writing),
             finished: Arc::clone(&self.write_finished),
@@ -1372,7 +1394,7 @@ impl FileStore {
         loop {
             // Registered before the check, so a clear between the two is not missed.
             let waiting = self.write_finished.notified();
-            if !self.writing.lock().contains(address) {
+            if !self.writing.lock().contains_key(address) {
                 return;
             }
             waiting.await;
@@ -1864,19 +1886,25 @@ pub fn read_small_file(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Take the store lock.
+/// Take the store lock, or refuse to open the store.
 ///
-/// `Ok(None)` means no lock file could be created at all, which is not a concurrency
-/// hazard and is tolerated (the startup temp sweep then becomes age-gated). Another
-/// process actually holding the lock **is** refused: unlike LMDB, which was genuinely
+/// Both failures are refusals, deliberately. Unlike LMDB, which was genuinely
 /// multi-process safe, two of these stores on one directory keep independent in-memory
-/// indices, so both would report the same write as new and each would keep serving keys
-/// the other had deleted.
+/// indices, independent views of what is in flight, and independent opinions about
+/// whether the legacy environment may be deleted: both would report the same write as
+/// new and each would keep serving keys the other had deleted. A node that cannot create
+/// the lock file has no way to know it is alone, and this is the one migration where
+/// being wrong about that destroys data.
+///
+/// The lock is an [`Arc`] so the work that relies on it can hold a lease. The startup
+/// scan sweeps interrupted writes on the strength of being alone in the directory, and it
+/// runs on a thread that outlives the future that started it.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Storage`] when another process owns the directory.
-fn acquire_store_lock(chunks_dir: &Path) -> Result<File> {
+/// Returns [`Error::Storage`] when another process owns the directory, or when the lock
+/// file cannot be created.
+fn acquire_store_lock(chunks_dir: &Path) -> Result<Arc<File>> {
     let path = chunks_dir.join(LOCK_FILE_NAME);
     let file = match OpenOptions::new()
         .write(true)
@@ -1901,7 +1929,7 @@ fn acquire_store_lock(chunks_dir: &Path) -> Result<File> {
         }
     };
     match file.try_lock_exclusive() {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Arc::new(file)),
         Err(e) => Err(Error::Storage(format!(
             "Another process already has the chunk store at {} open ({e}). Two nodes \
              cannot share one data directory: each keeps its own index and they would \
@@ -2558,6 +2586,49 @@ mod tests {
             store.exists(&addr).expect("exists"),
             "and a plain read that worked must start it answering again"
         );
+        drop(dir);
+    }
+
+    /// Two writes for one key: waiting means waiting for both.
+    ///
+    /// Cancellation releases the caller's lane while the blocking half survives, so a
+    /// second write for the same key can start behind the first. If the registry only
+    /// recorded that *something* was writing, whichever finished first would clear it and
+    /// a delete would be told the key was free while the other was still queued, then be
+    /// undone by it.
+    #[tokio::test]
+    async fn waiting_for_a_key_waits_for_every_write_of_it() {
+        let (store, dir) = test_store().await;
+        let store = Arc::new(store);
+        let (addr, content) = addressed("two-writers");
+
+        // Two registrations, as two overlapping writes would make.
+        let first = store.begin_write(&addr);
+        let second = store.begin_write(&addr);
+
+        let waiting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.wait_for_write(&addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        // One finishes. The other has not, so the wait must continue.
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "one write finishing does not mean the key is free"
+        );
+
+        drop(second);
+        waiting
+            .await
+            .expect("the wait ends once both have finished");
+
+        // And the store is still usable afterwards.
+        store.put(&addr, &content).await.expect("put");
+        assert!(store.exists(&addr).expect("exists"));
         drop(dir);
     }
 

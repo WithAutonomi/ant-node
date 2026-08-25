@@ -1420,6 +1420,11 @@ impl ChunkStore {
             };
         };
         if crate::client::compute_address(&bytes) == *key {
+            // The pass hashed these bytes and they are right, so whatever this store
+            // thought was wrong with them is not. It reads raw, which does not settle
+            // that on its own, and leaving the mark would retire the environment while a
+            // healthy chunk stayed unadvertised until some later verified read.
+            self.files.note_bytes_proven_good(key);
             return VerifyOutcome {
                 bytes: len,
                 verdict: VerifyVerdict::Intact,
