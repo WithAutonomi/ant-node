@@ -722,6 +722,10 @@ impl FileStore {
                 }
             }
             PutOutcome::New => {
+                // Freshly published bytes that were checked against their own name on the
+                // way in.
+                self.clear_known_wrong(address);
+                self.clear_suspect(address);
                 let mut stats = self.stats.write();
                 stats.chunks_stored = stats.chunks_stored.saturating_add(1);
                 stats.bytes_stored = stats.bytes_stored.saturating_add(len);
@@ -963,6 +967,14 @@ impl FileStore {
             }
         }
 
+        if self.config.verify_on_read {
+            // The bytes hashed to their name. Whatever this store thought was wrong with
+            // them is not wrong with them, and a mark that outlives the fault it
+            // describes means the node can serve a chunk it will not claim, commit or
+            // offer.
+            self.clear_known_wrong(address);
+        }
+
         let len = content.len() as u64;
         {
             let mut stats = self.stats.write();
@@ -1167,6 +1179,12 @@ impl FileStore {
                 hex::encode(address)
             );
         }
+    }
+
+    /// A caller outside this module has proven the stored bytes are right.
+    pub fn note_bytes_proven_good(&self, address: &XorName) {
+        self.clear_known_wrong(address);
+        self.clear_suspect(address);
     }
 
     /// Answer for a chunk again, after it has been replaced or removed.
@@ -1429,10 +1447,16 @@ impl FileStore {
                     hex::encode(address)
                 );
             }
-            Ok(Ok(false)) => debug!(
-                "Chunk {} verified on re-read; leaving it in place",
-                hex::encode(address)
-            ),
+            Ok(Ok(false)) => {
+                // The re-read hashed and matched: a repair landed between the failing
+                // read and this one.
+                self.clear_known_wrong(address);
+                self.clear_suspect(address);
+                debug!(
+                    "Chunk {} verified on re-read; leaving it in place",
+                    hex::encode(address)
+                );
+            }
             // Still indexed, so it must not still be claimed: the read that brought us
             // here proved the bytes wrong, and the node would otherwise go on committing
             // to a chunk it knows it cannot serve.

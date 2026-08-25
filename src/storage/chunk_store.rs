@@ -701,7 +701,12 @@ impl ChunkStore {
         // on an unanswered question would empty a healthy sole copy. The read below
         // distinguishes them.
         match self.files.get_raw(address).await {
-            Ok(Some(stored)) if stored == content => true,
+            // Byte-for-byte what the caller has, and the caller checked those bytes
+            // against the address before getting here. Nothing is wrong with this file.
+            Ok(Some(stored)) if stored == content => {
+                self.files.note_bytes_proven_good(address);
+                true
+            }
             Ok(_) => {
                 warn!(
                     "Chunk {} is on disk but its contents are wrong; replacing it with the \
@@ -745,8 +750,17 @@ impl ChunkStore {
         // pre-retirement verification, so retirement would take the only copy.
         let from_legacy = match self.legacy() {
             Some(legacy) => {
+                // A write for this key that nobody waited for may still be queued behind
+                // this delete. Letting it land afterwards would resurrect the key: the
+                // next reconciliation finds it in the environment and puts it back on the
+                // copier's list, undoing a prune the node decided on. Waited out here,
+                // holding the lane, so the delete is genuinely last.
+                if legacy.pending.read().contains(address) {
+                    legacy.lmdb.wait_idle().await;
+                }
                 let deleted = legacy.lmdb.delete(address).await?;
                 let was_only = legacy.only.write().remove(address);
+                legacy.pending.write().remove(address);
                 deleted || was_only
             }
             None => false,
@@ -1399,28 +1413,12 @@ impl ChunkStore {
         }
     }
 
-    /// Close the legacy environment and remove it, returning the bytes freed.
-    ///
-    /// This is the only destructive step in the migration and the only one that cannot
-    /// be undone. It is also the only moment the disk comes back.
-    ///
-    /// Takes a [`VerifyReport`] rather than a flag so the verification pass cannot be
-    /// skipped: there is no way to call this without having produced one.
+    /// Is this verification still worth acting on?
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] if verification did not pass, if the handle is still
-    /// shared (the caller should retry on the next tick), or if the directory cannot be
-    /// removed.
-    pub async fn retire_legacy<F>(
-        &self,
-        proof: &VerifyReport,
-        still_answerable: &F,
-        approved_to_shed: &BTreeSet<XorName>,
-    ) -> Result<u64>
-    where
-        F: Fn(&XorName) -> bool + Send + Sync,
-    {
+    /// Returns [`Error::Storage`] naming what has changed since the pass ran.
+    fn proof_is_usable(&self, proof: &VerifyReport) -> Result<()> {
         if !proof.is_clean() {
             return Err(Error::Storage(format!(
                 "Refusing to remove the legacy environment: verification reported {} \
@@ -1443,6 +1441,32 @@ impl ChunkStore {
                     .into(),
             ));
         }
+        Ok(())
+    }
+
+    /// Close the legacy environment and remove it, returning the bytes freed.
+    ///
+    /// This is the only destructive step in the migration and the only one that cannot
+    /// be undone. It is also the only moment the disk comes back.
+    ///
+    /// Takes a [`VerifyReport`] rather than a flag so the verification pass cannot be
+    /// skipped: there is no way to call this without having produced one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if verification did not pass or no longer describes the
+    /// store, if a write has not reported back, if the handle is still shared (the caller
+    /// should retry on the next tick), or if the directory cannot be removed.
+    pub async fn retire_legacy<F>(
+        &self,
+        proof: &VerifyReport,
+        still_answerable: &F,
+        approved_to_shed: &BTreeSet<XorName>,
+    ) -> Result<u64>
+    where
+        F: Fn(&XorName) -> bool + Send + Sync,
+    {
+        self.proof_is_usable(proof)?;
         // Rechecked here, not only by the caller. Everything between the caller's check
         // and this point is a window: the verification pass alone can run for hours, and
         // a write whose file half failed inserts a new legacy-only key in the meantime.
@@ -1505,6 +1529,21 @@ impl ChunkStore {
                     // what makes the final check below atomic with the removal: this is
                     // the only moment at which the answer cannot change underneath us.
                     Some(l) if Arc::strong_count(&l.lmdb) == 1 => {
+                        // Asked here, in the same critical section as the checks below
+                        // and immediately before the handle is taken. Asking earlier is
+                        // not enough: a write can announce itself under the shared guard,
+                        // be cancelled so the guard is released, and leave its blocking
+                        // half running past the drain above. Its note is the only thing
+                        // that says so, and dropping the journal with the environment
+                        // would take the evidence with it.
+                        if !l.pending.read().is_empty() {
+                            return Err(Error::Storage(
+                                "Refusing to remove the legacy environment: a write \
+                                 announced itself and has not reported back, so what the \
+                                 environment holds is not yet settled."
+                                    .into(),
+                            ));
+                        }
                         let only = l.only.read();
                         // A count of one proves nobody else holds a handle, so nobody can
                         // be mutating this set. That is what makes the two checks below
@@ -1775,6 +1814,18 @@ impl ChunkStore {
     /// environment does and nothing else, or neither and there was never anything to
     /// protect.
     pub async fn reconcile_pending_writes(&self) {
+        if !self.has_pending_writes() {
+            return;
+        }
+        // Exclusively, and before the snapshot. Draining is not a barrier on its own:
+        // writes hold this shared, and a new one for the same key could announce itself,
+        // be cancelled, and leave its blocking half running while this decided the older
+        // one's fate and removed the single entry they share. Held here, nothing new can
+        // start, so what the disk says once the drain returns is final.
+        //
+        // Only reached when something is waiting, which after a clean run is never, so
+        // this is not a stall on the ordinary path.
+        let _settling = self.retirement.write().await;
         let Some(legacy) = self.legacy() else {
             return;
         };
@@ -1782,23 +1833,39 @@ impl ChunkStore {
         if waiting.is_empty() {
             return;
         }
-        // Whatever was still running has finished by the time this returns, so what the
-        // disk says now is final rather than a race.
         legacy.lmdb.wait_idle().await;
         self.files.wait_idle().await;
         for key in waiting {
             let _lane = self.key_lock(&key).await;
             if self.files.is_indexed(&key) {
                 legacy.only.write().remove(&key);
-            } else if matches!(legacy.lmdb.get_raw(&key).await, Ok(Some(_))) {
-                debug!(
-                    "Chunk {} was written to the legacy environment by a call that never \
-                     returned; recording it so the copier picks it up",
-                    hex::encode(key)
-                );
-                legacy.only.write().insert(key);
+                legacy.pending.write().remove(&key);
+                continue;
             }
-            legacy.pending.write().remove(&key);
+            match legacy.lmdb.get_raw(&key).await {
+                Ok(Some(_)) => {
+                    debug!(
+                        "Chunk {} was written to the legacy environment by a call that \
+                         never returned; recording it so the copier picks it up",
+                        hex::encode(key)
+                    );
+                    legacy.only.write().insert(key);
+                    legacy.pending.write().remove(&key);
+                }
+                // Nothing behind it: there was never anything to protect.
+                Ok(None) => {
+                    legacy.pending.write().remove(&key);
+                }
+                // NOT the same as nothing behind it. Dropping the note on a read that
+                // failed would leave a committed write with no protection at all, which
+                // is the case this journal exists for. Keep it and ask again next tick;
+                // retirement stays vetoed meanwhile.
+                Err(e) => warn!(
+                    "Could not tell what became of the write for {}: {e}. Asking again on \
+                     the next tick.",
+                    hex::encode(key)
+                ),
+            }
         }
     }
 
