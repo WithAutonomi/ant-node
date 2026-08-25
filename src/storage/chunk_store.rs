@@ -325,7 +325,7 @@ impl ChunkStore {
     fn keys_only_in_legacy(legacy_keys: &[XorName], files: &FileStore) -> BTreeSet<XorName> {
         legacy_keys
             .iter()
-            .filter(|key| !files.exists(key).unwrap_or(false))
+            .filter(|key| !files.is_indexed(key))
             .copied()
             .collect()
     }
@@ -431,7 +431,7 @@ impl ChunkStore {
                 // and calling that key legacy-only while the file index still names it
                 // puts it in both views, where it stays answerable and vetoes retirement
                 // for good.
-                if dual_written && !self.files.exists(address).unwrap_or(false) {
+                if dual_written && !self.files.is_indexed(address) {
                     if let Some(ref l) = legacy {
                         l.only.write().insert(*address);
                     }
@@ -473,23 +473,35 @@ impl ChunkStore {
                 self.serve_from_legacy(address, fallback).await
             }
             Err(e) => {
-                // Only a verification failure means the file store threw the file away.
-                // Every other error (a full descriptor table, an I/O fault, an oversized
-                // file) leaves a perfectly good file in place, and re-queueing on those
-                // would double-count the key and could block retirement indefinitely.
-                if !format!("{e}").contains("verification failed") {
-                    return Err(e);
-                }
+                // Whatever went wrong with the file, the legacy environment may still
+                // have the bytes, and while it is there it is the point of the bridge to
+                // use them. A verification failure means the file was thrown away; every
+                // other error (a full descriptor table, an I/O fault, an oversized file)
+                // leaves the file in place and unreadable. Both are unservable from the
+                // file store, and both are worth asking the other store about.
+                let verification_failed = format!("{e}").contains("verification failed");
                 warn!(
-                    "Chunk {} failed verification in the file store; looking for an intact \
+                    "Chunk {} could not be served from the file store ({e}); looking for a \
                      copy in the legacy environment",
                     hex::encode(address)
                 );
-                // Nothing left anywhere reports the verification failure rather than a
-                // plain miss, so the caller can tell the difference.
-                self.serve_from_legacy(address, fallback)
-                    .await?
-                    .map_or(Err(e), |content| Ok(Some(content)))
+                let from_legacy = self.serve_from_legacy(address, fallback).await;
+                match from_legacy {
+                    Ok(Some(content)) => Ok(Some(content)),
+                    // Nothing anywhere. Report the original failure rather than a plain
+                    // miss, so the caller can tell the difference. The key is only
+                    // re-queued for copying when the file really went: an unreadable file
+                    // that is still there is not legacy-only, and calling it so is how a
+                    // key ends up claimed through one view and servable through neither.
+                    Ok(None) => Err(e),
+                    Err(legacy_error) => {
+                        if verification_failed {
+                            Err(e)
+                        } else {
+                            Err(legacy_error)
+                        }
+                    }
+                }
             }
         }
     }
@@ -519,7 +531,7 @@ impl ChunkStore {
         };
         // Only if the file really is gone: a concurrent write or repair may have put a
         // good one back while this was waiting for the lock.
-        if !self.files.exists(address).unwrap_or(false) {
+        if !self.files.is_indexed(address) {
             legacy.only.write().insert(*address);
             debug!(
                 "Chunk {} served from the legacy environment and re-queued for copying",
@@ -552,7 +564,7 @@ impl ChunkStore {
         };
         let _lane = self.key_lock(address).await;
         let raw = legacy.lmdb.get_raw(address).await?;
-        let missing_locally = !self.files.exists(address).unwrap_or(false);
+        let missing_locally = !self.files.is_indexed(address);
         if raw.is_some() && missing_locally {
             legacy.only.write().insert(*address);
         }
@@ -634,7 +646,7 @@ impl ChunkStore {
                 return true;
             }
         }
-        if !self.files.exists(address).unwrap_or(false) {
+        if !self.files.is_indexed(address) {
             return false;
         }
         // No cheap length pre-check. `metadata` failing is not the same as a length that
@@ -901,7 +913,9 @@ impl ChunkStore {
             if !legacy.only.read().contains(key) {
                 continue;
             }
-            if self.files.exists(key).unwrap_or(false) {
+            // Physically, again: a chunk the store holds and cannot read is not one to
+            // copy over the top of, and it is not legacy-only either.
+            if self.files.is_indexed(key) {
                 legacy.only.write().remove(key);
                 continue;
             }
@@ -1154,7 +1168,10 @@ impl ChunkStore {
             // the legacy-only set in between, and this pass would put it straight back.
             let classified = {
                 let _lane = self.key_lock(&key).await;
-                let in_files = self.files.exists(&key).unwrap_or(false);
+                // The physical question. A chunk the store holds but cannot currently
+                // read is still one it holds, and calling it absent here would put the
+                // key in the legacy-only set, where the union view advertises it again.
+                let in_files = self.files.is_indexed(&key);
                 let legacy_only = legacy.only.read().contains(&key);
                 if in_files && legacy_only {
                     // In both views at once, which nothing else clears once the copier
@@ -1473,7 +1490,10 @@ impl ChunkStore {
             // unmarked directory to its own name, and a node that has already called
             // itself file-only would then exit with a live environment on disk and no
             // handle to it.
-            let restored = std::fs::rename(&tombstone, &self.legacy_env_dir).is_ok();
+            // Only when the mark is provably gone. A mark left inside would have the
+            // next cleanup pass reap a live, open environment.
+            let restored =
+                e.mark_definitely_gone && std::fs::rename(&tombstone, &self.legacy_env_dir).is_ok();
             let reopened = restored && self.reopen_legacy().await;
             return Err(Error::Storage(format!(
                 "Moved the legacy environment to {} but could not mark it retired: {e}. \
@@ -1482,9 +1502,13 @@ impl ChunkStore {
                 if reopened {
                     ", and it has been put back, so the node keeps serving from both \
                      stores and retirement is tried again."
-                } else {
+                } else if e.mark_definitely_gone {
                     ". IT COULD NOT BE PUT BACK: this node cannot serve chunks that live \
                      only there until it is restarted."
+                } else {
+                    ". It has been left where nothing will open it, because a partial \
+                     retirement mark may still be inside it. Its chunks are in the file \
+                     store; move it back by hand only after removing that mark."
                 }
             )));
         }
@@ -1593,6 +1617,13 @@ impl ChunkStore {
     /// Safe to call at any time: it only ever moves or deletes a directory that carries
     /// its own retirement mark.
     pub fn retry_cleanup(&self) {
+        // Never while this node has the environment open. Cleanup decides what to do from
+        // the directory's own mark, and a mark that outlived a failed retirement would
+        // have it rename a live, mapped environment out from under the handle.
+        if self.has_legacy() {
+            sweep_retired_legacy(&self.config.root_dir);
+            return;
+        }
         finish_interrupted_retirement(&self.config.root_dir);
     }
 
@@ -1603,7 +1634,11 @@ impl ChunkStore {
     /// whether or not this node can currently read it.
     #[must_use]
     pub fn legacy_dir_is_on_disk(&self) -> bool {
-        self.legacy_env_dir.try_exists().unwrap_or(true)
+        // `symlink_metadata`, not `try_exists`, which follows links. An operator's link to
+        // storage that is not mounted right now reads as nothing at all through the
+        // second, and the node would call its migration finished and go file-only, blind
+        // to every chunk that lives only there until somebody restarts it.
+        std::fs::symlink_metadata(&self.legacy_env_dir).is_ok()
     }
 
     /// Is the legacy environment a link this node must not delete?
@@ -1733,7 +1768,67 @@ impl VerifyReport {
 /// # Errors
 ///
 /// Returns [`Error::Storage`] if it cannot be created or flushed.
-fn mark_directory_retired(dir: &Path) -> Result<()> {
+fn mark_directory_retired(dir: &Path) -> std::result::Result<(), MarkFailure> {
+    match write_retirement_mark(dir) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // A half-written mark is worse than none: the caller puts the directory back
+            // under the live name and reopens it, and a mark left inside would have the
+            // next cleanup pass reap a live, open environment. If it cannot be taken away,
+            // say so, and the caller keeps the directory where nothing will open it.
+            let path = dir.join(RETIRED_MARKER);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {}
+                Err(stuck) => {
+                    return Err(MarkFailure {
+                        reason: format!(
+                            "{e}. The partial mark at {} could not be removed either \
+                             ({stuck})",
+                            path.display()
+                        ),
+                        mark_definitely_gone: false,
+                    })
+                }
+            }
+            if let Err(flush) = crate::storage::file_store::fsync_path(dir) {
+                return Err(MarkFailure {
+                    reason: format!(
+                        "{e}. Removing the partial mark at {} could not be flushed \
+                         ({flush})",
+                        path.display()
+                    ),
+                    mark_definitely_gone: false,
+                });
+            }
+            Err(MarkFailure {
+                reason: format!("{e}"),
+                mark_definitely_gone: true,
+            })
+        }
+    }
+}
+
+/// Why a directory could not be marked retired, and whether it is safe to reopen.
+#[derive(Debug)]
+struct MarkFailure {
+    /// What went wrong, for the operator.
+    reason: String,
+    /// Is the directory provably free of a partial mark?
+    ///
+    /// Only then may the caller put it back under the live name. A mark left inside would
+    /// have the next cleanup pass reap a live, open environment.
+    mark_definitely_gone: bool,
+}
+
+impl std::fmt::Display for MarkFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+/// Create the mark. See [`mark_directory_retired`], which owns the failure handling.
+fn write_retirement_mark(dir: &Path) -> Result<()> {
     let path = dir.join(RETIRED_MARKER);
     let mut file = match std::fs::OpenOptions::new()
         .write(true)
@@ -1741,8 +1836,17 @@ fn mark_directory_retired(dir: &Path) -> Result<()> {
         .open(&path)
     {
         Ok(f) => f,
-        // Already there, from an attempt that got this far and no further.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        // Already there, from an attempt that got this far and no further. Flushed
+        // again rather than taken on trust: the attempt that wrote it may have been the
+        // one that could not flush it.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return crate::storage::file_store::fsync_path(dir).map_err(|flush| {
+                Error::Storage(format!(
+                    "{} is already there but could not be flushed: {flush}",
+                    path.display()
+                ))
+            })
+        }
         Err(e) => {
             return Err(Error::Storage(format!(
                 "Could not mark {} as retired: {e}",

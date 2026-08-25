@@ -892,6 +892,9 @@ impl FileStore {
         drop(reservation);
         self.invalidate_capacity_cache();
 
+        // Rewritten from bytes that hash to their own name, so whatever was wrong with
+        // the old file is not wrong with this one.
+        self.clear_suspect(address);
         debug!("Repaired chunk {}", hex::encode(address));
         Ok(())
     }
@@ -961,7 +964,19 @@ impl FileStore {
         if self.suspect.read().contains(address) {
             return Ok(false);
         }
-        Ok(self.index.read().contains(address))
+        Ok(self.is_indexed(address))
+    }
+
+    /// Is this chunk in the index, whether or not it can currently be read?
+    ///
+    /// The physical question, as against [`Self::exists`]'s question about what the node
+    /// is willing to claim. The migration must ask this one: a suspect chunk is still a
+    /// file this store has, and treating it as absent would put the key in the legacy-only
+    /// set, from where the union view advertises it again — a key the node claims through
+    /// one view and cannot serve through either.
+    #[must_use]
+    pub fn is_indexed(&self, address: &XorName) -> bool {
+        self.index.read().contains(address)
     }
 
     /// Delete a chunk, returning whether it was present.
@@ -1214,7 +1229,22 @@ impl FileStore {
                 }
             })
             .await
-            .map_err(|e| Error::Storage(format!("Chunk store read task failed: {e}")))??;
+            .map_err(|e| Error::Storage(format!("Chunk store read task failed: {e}")))?;
+
+        // Every read decides the question, not only the ones that were checking. A read
+        // that failed means this chunk cannot be served, whoever asked; a read that
+        // worked means it can be, whoever asked. Doing this anywhere else leaves a key
+        // stuck unadvertised after the fault has cleared, or advertised after it has not.
+        let read = match read {
+            Ok(read) => {
+                self.clear_suspect(address);
+                read
+            }
+            Err(e) => {
+                self.mark_suspect(address);
+                return Err(e);
+            }
+        };
 
         if read.is_none() && self.forget_if_absent(address).await {
             // The file went away underneath us. Stop advertising the key so the close
@@ -1233,6 +1263,8 @@ impl FileStore {
     /// Re-checks under the address's write lane, so a chunk republished between the
     /// failing read and this call keeps its entry.
     async fn forget_if_absent(&self, address: &XorName) -> bool {
+        // Not suspect any more: it is not unreadable, it is not there.
+        self.clear_suspect(address);
         let path = self.chunk_path(address);
         let lanes = Arc::clone(&self.write_lanes);
         let index = Arc::clone(&self.index);
@@ -2253,6 +2285,47 @@ mod tests {
         })
         .await
         .expect("reopen store")
+    }
+
+    /// An ordinary read settles whether the node answers for a chunk.
+    ///
+    /// Not only the reads that were checking something. A read that failed means the
+    /// chunk cannot be served, whoever asked; a read that worked means it can be. Deciding
+    /// this anywhere else leaves a key stuck unadvertised after the fault has cleared, or
+    /// advertised after it has not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_read_decides_whether_the_node_answers_for_a_chunk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("read-decides");
+        store.put(&addr, &content).await.expect("put");
+        let path = store.chunk_path(&addr);
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        assert!(store.get(&addr).await.is_err(), "the read must fail");
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "and a plain read that failed must stop the node answering for it"
+        );
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
+
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("present"),
+            content
+        );
+        assert!(
+            store.exists(&addr).expect("exists"),
+            "and a plain read that worked must start it answering again"
+        );
+        drop(dir);
     }
 
     /// A chunk this store cannot read is kept but not claimed.

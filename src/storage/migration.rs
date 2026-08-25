@@ -1179,10 +1179,12 @@ pub fn rank_is_sheddable(rank: GroupRank, width: usize) -> bool {
 /// migrating" cannot be answered one way by the wiring and another way by what checks it.
 #[must_use]
 pub fn should_migrate(store: &Arc<ChunkStore>) -> bool {
-    // Or has a removal to finish. A node whose retirement was interrupted has no handle
-    // and nothing left to copy, but its disk has not come back, and the driver is what
-    // keeps trying.
-    store.has_legacy() || store.has_cleanup_pending()
+    // Or has a removal to finish, or has something at the environment's path it could not
+    // open. A node whose retirement was interrupted has no handle and nothing left to
+    // copy, but its disk has not come back. A node whose environment is a link to storage
+    // that was not mounted at startup has neither, and its chunks come back when the
+    // storage does; without a driver it would stay blind to them until a restart.
+    store.has_legacy() || store.has_cleanup_pending() || store.legacy_dir_is_on_disk()
 }
 
 /// Runs the migration to completion, then returns.
