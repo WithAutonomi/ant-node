@@ -744,6 +744,10 @@ impl ChunkStore {
         // go idle while deletes keep starting new work in it, and the wait never ends.
         let _using_legacy = self.retirement.read().await;
         let _lane = self.key_lock(address).await;
+        // Behind whatever is already writing this key, and only this key. A write's
+        // blocking half outlives the future that started it, so one landing after this
+        // would put back a chunk the node had decided to prune.
+        self.files.wait_for_write(address).await;
         // Legacy first, and only then the in-memory views. The other order removes the
         // key from `only` and then, if the legacy delete fails, leaves bytes that live
         // solely in the legacy store and are invisible to `exists`, `all_keys` and the
@@ -759,9 +763,14 @@ impl ChunkStore {
                 // Both halves. A write has an environment half and a file half, either of
                 // which can be the one still running, and draining only the first leaves
                 // the second free to publish the file after this has deleted it.
+                //
+                // The environment half is found through the journal, which only dual
+                // writes keep. The file half is asked of the file store directly, because
+                // the copier and the repair path also spawn file writes and neither goes
+                // near that journal: using it as a proxy for "is anything writing this
+                // key" was a scope assumption, not a fact.
                 if legacy.pending.read().contains(address) {
                     legacy.lmdb.wait_idle().await;
-                    self.files.wait_idle().await;
                 }
                 let deleted = legacy.lmdb.delete(address).await?;
                 let was_only = legacy.only.write().remove(address);
@@ -1012,6 +1021,31 @@ impl ChunkStore {
                 }
                 Err(e) => {
                     let message = format!("{e}");
+                    // Bigger than this build will ever serve. The legacy store took it
+                    // through an API with no size bound; the file store will not, and no
+                    // amount of retrying changes that. Counted as unusable and removed,
+                    // like a record whose bytes do not match, or one such record would
+                    // stop this node and every node sharing its disk from ever reclaiming
+                    // space.
+                    if message.contains("byte maximum") {
+                        warn!(
+                            "Chunk {} in the legacy environment is larger than this build \
+                             will store; removing it. It cannot be served either way.",
+                            hex::encode(key)
+                        );
+                        match legacy.lmdb.delete(key).await {
+                            Ok(_) => {
+                                legacy.only.write().remove(key);
+                                report.unusable += 1;
+                            }
+                            Err(e) => warn!(
+                                "Oversized chunk {} could not be removed from the legacy \
+                                 environment: {e}. The environment stays.",
+                                hex::encode(key)
+                            ),
+                        }
+                        continue;
+                    }
                     if message.contains("Content address mismatch") {
                         // The legacy bytes do not hash to their own key, so this chunk
                         // cannot be reproduced and was never servable. Stop advertising
@@ -3655,6 +3689,69 @@ mod tests {
             "a write that landed after the delete would resurrect a pruned chunk"
         );
         assert!(!store.legacy_only_keys().contains(&addr));
+    }
+
+    /// A delete outlasts a file write that no journal knows about.
+    ///
+    /// The journal is kept by writes that touch both stores. The copier and the repair
+    /// path write only the file, so a delete that consulted the journal to decide whether
+    /// to wait would not wait for either of them, and whichever landed afterwards would
+    /// put back a chunk the node had decided to prune. What is writing a key is the file
+    /// store's own question to answer.
+    #[tokio::test]
+    async fn a_delete_outlasts_a_file_write_with_no_journal_entry() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["neighbour"]).await;
+        let store = Arc::new(open(&dir).await);
+        let (addr, content) = addressed("copied-then-pruned");
+
+        let gate = store.files.test_put_gate();
+        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _parked = gate.write();
+            held_tx.send(()).ok();
+            release_rx.recv().ok();
+        });
+        held_rx.recv().expect("the gate is held");
+
+        // Deliberately no journal entry: this is the copier's shape, not a dual write.
+        let publishing = {
+            let files = Arc::clone(&store.files);
+            let content = content.clone();
+            tokio::spawn(async move { files.put(&addr, &content).await })
+        };
+        while store.files.tasks_in_flight() == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        publishing.abort();
+        let _ = publishing.await;
+        assert!(
+            !store
+                .legacy()
+                .is_some_and(|l| l.pending.read().contains(&addr)),
+            "this is the case the journal does not cover, so it must be empty"
+        );
+
+        let deleting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.delete(&addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !deleting.is_finished(),
+            "the delete must wait for a write the journal never knew about"
+        );
+
+        release_tx.send(()).ok();
+        holder.join().ok();
+        deleting.await.expect("join").expect("delete");
+
+        store.files.wait_idle().await;
+        assert!(
+            !store.exists(&addr).unwrap_or(true),
+            "a write that landed after the delete would resurrect a pruned chunk"
+        );
     }
 
     /// A single node can still be told to keep both stores.
