@@ -41,7 +41,7 @@ use crate::logging::{debug, info, trace, warn};
 use crate::storage::StorageStats;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -458,6 +458,11 @@ pub struct FileStore {
     /// Which of the 256 shard directories are known to exist, so a steady-state write
     /// does not pay a `create_dir_all` syscall.
     shards_present: Arc<parking_lot::Mutex<[bool; SHARD_COUNT]>>,
+    /// Indexed chunks this store currently cannot read.
+    ///
+    /// Held back from everything the node says it has, while the files themselves are
+    /// left alone. See [`Self::mark_suspect`].
+    suspect: Arc<parking_lot::RwLock<HashSet<XorName>>>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
     /// Monotonic counter that makes temp filenames unique within this store.
@@ -550,6 +555,7 @@ impl FileStore {
             ),
             stats: parking_lot::RwLock::new(StorageStats::default()),
             shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
+            suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
             capacity,
             temp_seq: AtomicU64::new(0),
             nonce: rand::random(),
@@ -809,6 +815,7 @@ impl FileStore {
     async fn stored_bytes_match(&self, address: &XorName) -> StoredBytes {
         match self.get_raw(address).await {
             Ok(Some(bytes)) if crate::client::compute_address(&bytes) == *address => {
+                self.clear_suspect(address);
                 StoredBytes::Good
             }
             Ok(Some(_)) => StoredBytes::Wrong,
@@ -819,6 +826,7 @@ impl FileStore {
             // fault. Say so and let the caller leave it alone.
             Err(e) => {
                 debug!("Could not read {} to check it: {e}", hex::encode(address));
+                self.mark_suspect(address);
                 StoredBytes::Unreadable
             }
         }
@@ -950,6 +958,9 @@ impl FileStore {
     /// Never fails. The signature keeps the shape the LMDB store had, because callers
     /// treat the error as "assume absent".
     pub fn exists(&self, address: &XorName) -> Result<bool> {
+        if self.suspect.read().contains(address) {
+            return Ok(false);
+        }
         Ok(self.index.read().contains(address))
     }
 
@@ -1029,7 +1040,51 @@ impl FileStore {
     #[allow(unknown_lints)]
     #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn all_keys(&self) -> Result<Vec<XorName>> {
-        Ok(self.index.read().iter().copied().collect())
+        // Copied out first so neither lock is held while the other is taken, and so the
+        // usual case, where nothing is suspect, costs one clone of an empty set.
+        let suspect: HashSet<XorName> = self.suspect.read().clone();
+        let keys = self.index.read().clone();
+        if suspect.is_empty() {
+            return Ok(keys.into_iter().collect());
+        }
+        Ok(keys
+            .into_iter()
+            .filter(|key| !suspect.contains(key))
+            .collect())
+    }
+
+    /// Stop answering for a chunk this store could not read.
+    ///
+    /// The file stays. It may be perfectly good and unreadable only for the moment, and
+    /// deleting it, or dropping it from the index, is how a chunk ends up in neither this
+    /// store's view nor the legacy one, which is what retirement destroys.
+    ///
+    /// What does change is what the node says about it. A chunk it cannot read is one it
+    /// cannot serve, and claiming it anyway puts the key in signed commitments, answers
+    /// presence probes with a yes, suppresses the replication that would repair it, and
+    /// earns a penalty at the next commitment-bound audit. Those penalties are not
+    /// suspended.
+    fn mark_suspect(&self, address: &XorName) {
+        if self.suspect.write().insert(*address) {
+            warn!(
+                "Chunk {} is on disk but could not be read; this node stops answering for \
+                 it until a read succeeds",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// Answer for a chunk again, after a read that worked.
+    fn clear_suspect(&self, address: &XorName) {
+        if !self.suspect.read().contains(address) {
+            return;
+        }
+        if self.suspect.write().remove(address) {
+            info!(
+                "Chunk {} could be read again; this node answers for it once more",
+                hex::encode(address)
+            );
+        }
     }
 
     /// Number of chunks currently stored.
@@ -2198,6 +2253,51 @@ mod tests {
         })
         .await
         .expect("reopen store")
+    }
+
+    /// A chunk this store cannot read is kept but not claimed.
+    ///
+    /// Both halves matter. Deleting it, or dropping it from the index, is how a chunk ends
+    /// up in neither this store's view nor the legacy one, which is what retirement
+    /// destroys. Claiming it anyway puts the key in signed commitments and answers
+    /// presence probes with a yes for a chunk the node cannot serve, and the audit that
+    /// catches that still penalises.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chunk_that_cannot_be_read_is_kept_but_not_claimed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("unreadable-for-now");
+        store.put(&addr, &content).await.expect("put");
+        assert!(store.exists(&addr).expect("exists"));
+
+        let path = store.chunk_path(&addr);
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        // Offering the same bytes again must not be acknowledged, and must not replace
+        // what is there on the strength of a read that did not happen.
+        assert!(
+            store.put(&addr, &content).await.is_err(),
+            "an unreadable chunk must not be reported as stored"
+        );
+        assert!(path.exists(), "and the file must be left alone");
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "but the node must stop claiming it"
+        );
+        assert!(!store.all_keys().await.expect("keys").contains(&addr));
+
+        // Readable again: the node answers for it once more.
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
+        assert!(!store.put(&addr, &content).await.expect("put again"));
+        assert!(store.exists(&addr).expect("exists"));
+        assert!(store.all_keys().await.expect("keys").contains(&addr));
+        drop(dir);
     }
 
     /// Content plus the address it hashes to.

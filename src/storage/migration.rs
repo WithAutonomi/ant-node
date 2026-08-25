@@ -1227,9 +1227,14 @@ pub async fn run(store: Arc<ChunkStore>, context: MigrationContext, shutdown: Ca
             held.give_up();
         }
 
+        // Cleanup first. It can put an unmarked directory back under the live name, and
+        // recovery is what gives the node a handle to it; the other order leaves that
+        // until the next tick, and the completion check in between would see no handle
+        // and no pending cleanup and call the migration finished.
+        let cleanup = cleanup_state(&store);
         maybe_recover_lost_handle(&store, &mut next_handle_recovery).await;
-
-        if nothing_left_to_do(&store) {
+        if cleanup == CleanupState::Finished && !store.has_legacy() {
+            info!("Storage migration finished; nothing left on disk to clean up");
             return;
         }
 
@@ -1353,15 +1358,23 @@ fn worth_starting(store: &Arc<ChunkStore>, config: &MigrationConfig) -> bool {
 /// migrate but a disk that has not come back, and the reasons it failed (a name already
 /// taken, a directory that could not be flushed, a scanner holding a handle) are the kind
 /// that clear on their own.
-fn nothing_left_to_do(store: &Arc<ChunkStore>) -> bool {
+fn cleanup_state(store: &Arc<ChunkStore>) -> CleanupState {
     if store.has_cleanup_pending() {
         store.retry_cleanup();
     }
-    if store.has_legacy() || store.has_cleanup_pending() {
-        return false;
+    if store.has_cleanup_pending() || store.legacy_dir_is_on_disk() {
+        return CleanupState::Pending;
     }
-    info!("Storage migration finished; nothing left on disk to clean up");
-    true
+    CleanupState::Finished
+}
+
+/// Whether anything is left on disk for the driver to see through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CleanupState {
+    /// Something is still there.
+    Pending,
+    /// Nothing is.
+    Finished,
 }
 
 /// Put a lost legacy handle back, if there is one to put back.

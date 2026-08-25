@@ -425,7 +425,13 @@ impl ChunkStore {
                 // The bytes reached LMDB but not the file store. Record the key as
                 // legacy-only so the union still finds it and the copier retries later;
                 // without this the node would hold a chunk it could not serve.
-                if dual_written {
+                //
+                // Only when the file store really does not have it. A write can fail
+                // because the file that is already there could not be read to check it,
+                // and calling that key legacy-only while the file index still names it
+                // puts it in both views, where it stays answerable and vetoes retirement
+                // for good.
+                if dual_written && !self.files.exists(address).unwrap_or(false) {
                     if let Some(ref l) = legacy {
                         l.only.write().insert(*address);
                     }
@@ -1143,10 +1149,31 @@ impl ChunkStore {
                 debug!("Pre-retirement verification stopped for shutdown");
                 return Ok(report);
             }
-            if !self.files.exists(&key).unwrap_or(false) {
+            // Under the key's critical section, so the two questions below are asked of
+            // one moment. Without it a write can publish the file and take the key out of
+            // the legacy-only set in between, and this pass would put it straight back.
+            let classified = {
+                let _lane = self.key_lock(&key).await;
+                let in_files = self.files.exists(&key).unwrap_or(false);
+                let legacy_only = legacy.only.read().contains(&key);
+                if in_files && legacy_only {
+                    // In both views at once, which nothing else clears once the copier
+                    // has stopped running. The file store has it, so the legacy-only set
+                    // is the one that is wrong: an answerable key in that set vetoes
+                    // retirement for as long as the process lives.
+                    debug!(
+                        "Chunk {} was in both views; the file store has it, so it is no \
+                         longer legacy-only",
+                        hex::encode(key)
+                    );
+                    legacy.only.write().remove(&key);
+                }
+                (in_files, legacy_only)
+            };
+            if !classified.0 {
                 // Known to be legacy-only, which is what a key this node is giving up
                 // looks like. Whether it may go is the gates' decision, not this pass's.
-                if legacy.only.read().contains(&key) {
+                if classified.1 {
                     continue;
                 }
                 // In neither view. However that came about — a publish that failed, a
@@ -1210,7 +1237,25 @@ impl ChunkStore {
         // that would stall every write to a sixteenth of the address space for hours.
         let _lane = self.key_lock(key).await;
 
-        let bytes = self.files.get_raw(key).await.unwrap_or(None);
+        let bytes = match self.files.get_raw(key).await {
+            Ok(bytes) => bytes,
+            // Not the same as gone. `Vanished` puts the key back on the copier's list,
+            // and doing that for a file that is still there and still indexed leaves the
+            // key in both views at once: the file index keeps it in every commitment, so
+            // it stays answerable, and an answerable legacy-only key vetoes retirement for
+            // as long as the process lives. Refuse this pass instead.
+            Err(e) => {
+                warn!(
+                    "Chunk {} could not be read while verifying: {e}. The legacy \
+                     environment stays.",
+                    hex::encode(key)
+                );
+                return VerifyOutcome {
+                    bytes: 0,
+                    verdict: VerifyVerdict::Unrepairable,
+                };
+            }
+        };
         let len = bytes.as_ref().map_or(0, Vec::len) as u64;
         let Some(bytes) = bytes else {
             return VerifyOutcome {
@@ -1422,14 +1467,26 @@ impl ChunkStore {
         // is deleted. This is what a directory that reverts to its old name carries with
         // it, and it is the only thing a later start treats as permission to delete.
         if let Err(e) = mark_directory_retired(&tombstone) {
-            warn!(
+            // Nothing has been deleted and the directory is intact, so put it back rather
+            // than recording the migration as finished over a store that is still there.
+            // Recording finished would be worse than it sounds: the next tick restores the
+            // unmarked directory to its own name, and a node that has already called
+            // itself file-only would then exit with a live environment on disk and no
+            // handle to it.
+            let restored = std::fs::rename(&tombstone, &self.legacy_env_dir).is_ok();
+            let reopened = restored && self.reopen_legacy().await;
+            return Err(Error::Storage(format!(
                 "Moved the legacy environment to {} but could not mark it retired: {e}. \
-                 Leaving it rather than deleting a directory whose new name may not have \
-                 reached the disk. The next start finishes this.",
-                tombstone.display()
-            );
-            self.finish_migration();
-            return Ok(0);
+                 Nothing was deleted{}",
+                tombstone.display(),
+                if reopened {
+                    ", and it has been put back, so the node keeps serving from both \
+                     stores and retirement is tried again."
+                } else {
+                    ". IT COULD NOT BE PUT BACK: this node cannot serve chunks that live \
+                     only there until it is restarted."
+                }
+            )));
         }
 
         if let Err(e) = crate::storage::file_store::fsync_path(&self.config.root_dir) {
@@ -1537,6 +1594,16 @@ impl ChunkStore {
     /// its own retirement mark.
     pub fn retry_cleanup(&self) {
         finish_interrupted_retirement(&self.config.root_dir);
+    }
+
+    /// Is there anything at the legacy environment's path at all?
+    ///
+    /// Asked without a handle, and answered conservatively: a path this node cannot even
+    /// look at counts as present. The migration is not finished while something is there,
+    /// whether or not this node can currently read it.
+    #[must_use]
+    pub fn legacy_dir_is_on_disk(&self) -> bool {
+        self.legacy_env_dir.try_exists().unwrap_or(true)
     }
 
     /// Is the legacy environment a link this node must not delete?
@@ -2018,15 +2085,32 @@ fn retired_tombstones(root_dir: &Path) -> Vec<PathBuf> {
             return vec![root_dir.join(&prefix)];
         }
     };
-    entries
-        .flatten()
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with(&prefix))
-        })
-        .map(|e| e.path())
-        .collect()
+    let mut found = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&prefix))
+                {
+                    found.push(entry.path());
+                }
+            }
+            // One unreadable entry is not evidence there is nothing here, and the caller
+            // uses this to decide whether cleanup is finished. Answer with the one that
+            // keeps it looking.
+            Err(e) => {
+                warn!(
+                    "Could not read an entry of {} while looking for retired chunk \
+                     environments: {e}",
+                    root_dir.display()
+                );
+                found.push(root_dir.join(&prefix));
+            }
+        }
+    }
+    found
 }
 
 /// A directory name to retire the environment under that nothing else is using.
