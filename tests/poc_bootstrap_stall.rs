@@ -37,6 +37,8 @@ fn entry(sources: HashSet<PeerId>) -> VerificationEntry {
         next_verify_at: now,
         hint_sources: sources.clone(),
         replica_hint_sources: sources,
+        unresolved_retries: 0,
+        no_holder_reported: false,
     }
 }
 

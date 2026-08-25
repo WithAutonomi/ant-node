@@ -339,6 +339,8 @@ mod tests {
             replica_hint_sources: HashSet::from([saorsa_core::identity::PeerId::from_bytes(
                 [0u8; 32],
             )]),
+            unresolved_retries: 0,
+            no_holder_reported: false,
         };
         queues.add_pending_verify(xor_name_from_byte(0x01), entry);
 

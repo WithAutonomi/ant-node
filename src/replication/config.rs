@@ -593,6 +593,26 @@ const VERIFICATION_REQUEST_TIMEOUT_SECS: u64 = 15;
 pub const VERIFICATION_REQUEST_TIMEOUT: Duration =
     Duration::from_secs(VERIFICATION_REQUEST_TIMEOUT_SECS);
 
+/// Ceiling on the exponential backoff applied to a pending key that keeps
+/// failing to resolve.
+///
+/// [`VERIFICATION_REQUEST_TIMEOUT`] is the *first* retry delay, not a flat
+/// cadence. A key whose presence probe finds no holder is almost always in that
+/// state because the answer has not changed — a new node that claims a slice of
+/// the keyspace its routing table cannot yet resolve keeps asking the same peers
+/// the same question. Re-asking every 15 seconds costs a verification round trip
+/// per key per retry and produces one log line each time, for no new
+/// information.
+///
+/// Doubling from 15s and capping here gives roughly ten attempts inside one
+/// [`PENDING_VERIFY_MAX_AGE`] residency instead of roughly a hundred and ten,
+/// while bounding the worst-case delay in noticing that a holder *has* appeared
+/// to this value.
+const VERIFICATION_RETRY_BACKOFF_MAX_SECS: u64 = 5 * 60;
+/// Ceiling on the exponential backoff applied to an unresolved pending key.
+pub const VERIFICATION_RETRY_BACKOFF_MAX: Duration =
+    Duration::from_secs(VERIFICATION_RETRY_BACKOFF_MAX_SECS);
+
 /// Maximum ready hints processed by one verification cycle.
 ///
 /// The pending queue may be much larger. Each cycle takes a sender-fair bounded
@@ -1864,6 +1884,22 @@ mod tests {
         assert!(
             CAPACITY_BLOCKED_RETRY < PENDING_VERIFY_MAX_AGE,
             "a deferral at or past the entry lifetime is an eviction, not a deferral"
+        );
+    }
+
+    /// The backoff ceiling sits in the same band, and for the same reasons: far
+    /// enough above the request timeout to actually cut the repeat cost, far
+    /// enough below the entry lifetime that a capped retry still gets several
+    /// looks before stale eviction ends the episode.
+    #[test]
+    fn verification_retry_backoff_max_is_between_the_request_timeout_and_the_entry_lifetime() {
+        assert!(
+            VERIFICATION_RETRY_BACKOFF_MAX > VERIFICATION_REQUEST_TIMEOUT,
+            "a ceiling at or below the base delay is not a backoff"
+        );
+        assert!(
+            VERIFICATION_RETRY_BACKOFF_MAX * 4 <= PENDING_VERIFY_MAX_AGE,
+            "a capped retry must still get several looks inside one entry lifetime"
         );
     }
 }
