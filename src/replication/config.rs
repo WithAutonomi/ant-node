@@ -1886,4 +1886,20 @@ mod tests {
             "a deferral at or past the entry lifetime is an eviction, not a deferral"
         );
     }
+
+    /// The backoff ceiling sits in the same band, and for the same reasons: far
+    /// enough above the request timeout to actually cut the repeat cost, far
+    /// enough below the entry lifetime that a capped retry still gets several
+    /// looks before stale eviction ends the episode.
+    #[test]
+    fn verification_retry_backoff_max_is_between_the_request_timeout_and_the_entry_lifetime() {
+        assert!(
+            VERIFICATION_RETRY_BACKOFF_MAX > VERIFICATION_REQUEST_TIMEOUT,
+            "a ceiling at or below the base delay is not a backoff"
+        );
+        assert!(
+            VERIFICATION_RETRY_BACKOFF_MAX * 4 <= PENDING_VERIFY_MAX_AGE,
+            "a capped retry must still get several looks inside one entry lifetime"
+        );
+    }
 }

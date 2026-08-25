@@ -1046,6 +1046,38 @@ impl ReplicationQueues {
         })
     }
 
+    /// Claim this entry's single no-holder warning.
+    ///
+    /// Returns `true` the first time it is called for a given entry and `false`
+    /// after, so the caller can warn once and drop to `debug` thereafter.
+    ///
+    /// Kept separate from [`Self::defer_unresolved`] on purpose. A round can
+    /// legitimately advance the failure count without producing a no-holder
+    /// result — an inconclusive quorum does exactly that — and if the two
+    /// shared state, such a round would consume the warning before the
+    /// condition it describes had ever been observed.
+    pub fn claim_no_holder_report(&mut self, key: &XorName) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
+        !std::mem::replace(&mut entry.no_holder_reported, true)
+    }
+
+    /// Clear an entry's unresolved history after a round that found a holder.
+    ///
+    /// The round succeeded even if the key could not move on — a full fetch
+    /// queue leaves it pending — so it must not inherit the earlier backoff, and
+    /// a later relapse deserves a fresh warning. Returns whether an entry was
+    /// present to clear.
+    pub fn clear_unresolved(&mut self, key: &XorName) -> bool {
+        let Some(entry) = self.pending_verify.get_mut(key) else {
+            return false;
+        };
+        entry.unresolved_retries = 0;
+        entry.no_holder_reported = false;
+        true
+    }
+
     /// Number of keys in pending verification.
     #[must_use]
     pub fn pending_count(&self) -> usize {
@@ -1507,6 +1539,7 @@ mod tests {
             hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(sender_byte)]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         }
     }
 
@@ -2446,6 +2479,109 @@ mod tests {
         }
     }
 
+    /// The counter and the warning answer different questions, so a round that
+    /// advances the count without producing a no-holder result — an
+    /// inconclusive quorum — must leave the warning unclaimed. Deriving the
+    /// report from `attempt == 1` loses the first and only warning for every
+    /// key whose opening round is inconclusive.
+    #[test]
+    fn a_non_reporting_round_does_not_consume_the_no_holder_warning() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAE);
+        queues.add_pending_verify(key, test_entry(1));
+
+        // Round 1: inconclusive quorum. Backs off, reports nothing.
+        let first = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(first.attempt, 1);
+
+        // Round 2 is the first that actually finds no holder. It is at
+        // attempt 2, but it is the first report and must still warn.
+        let second = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(second.attempt, 2, "the inconclusive round still counts");
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "the first no-holder result must warn even at attempt 2"
+        );
+        assert!(
+            !queues.claim_no_holder_report(&key),
+            "the warning is claimed exactly once per entry"
+        );
+    }
+
+    /// A round that found a holder ends the run of failures, even when a full
+    /// fetch queue leaves the key pending. It must not inherit the old backoff,
+    /// and a later relapse deserves a fresh warning.
+    #[test]
+    fn finding_a_holder_clears_the_backoff_and_rearms_the_warning() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xAF);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..4 {
+            queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+        }
+        assert!(queues.claim_no_holder_report(&key));
+
+        assert!(queues.clear_unresolved(&key));
+
+        let outcome = queues
+            .defer_unresolved(&key, BASE)
+            .expect("pending key should defer");
+        assert_eq!(outcome.attempt, 1, "a resolved round restarts the run");
+        assert_eq!(outcome.retry_after, BASE);
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "a relapse after a good round is reported again"
+        );
+    }
+
+    /// The whole fix rests on a duplicate hint merging into the live entry
+    /// rather than replacing it. A refactor that replaced would silently revert
+    /// the backoff with every other test here still green.
+    #[test]
+    fn a_duplicate_hint_does_not_reset_the_backoff_or_the_retry_time() {
+        const BASE: Duration = Duration::from_secs(15);
+
+        let mut queues = ReplicationQueues::new();
+        let key = xor_name_from_byte(0xB0);
+        queues.add_pending_verify(key, test_entry(1));
+
+        for _ in 0..3 {
+            queues
+                .defer_unresolved(&key, BASE)
+                .expect("pending key should defer");
+        }
+        assert!(queues.claim_no_holder_report(&key));
+        let deferred_until = queues.pending_verify[&key].next_verify_at;
+
+        // A second advertiser re-hints the same key.
+        assert!(!queues.add_pending_verify(key, test_entry(2)).admitted());
+
+        let entry = &queues.pending_verify[&key];
+        assert_eq!(
+            entry.unresolved_retries, 3,
+            "a re-hint must not restart the backoff"
+        );
+        assert!(
+            entry.no_holder_reported,
+            "a re-hint must not re-arm the warning; only eviction ends an episode"
+        );
+        assert_eq!(
+            entry.next_verify_at, deferred_until,
+            "a re-hint must not pull the key forward into an earlier round"
+        );
+    }
+
     /// The write-blocked capacity gate defers without asking anyone, so it must
     /// not consume the entry's first-failure warning or advance its backoff:
     /// nothing was learned about the key.
@@ -2469,6 +2605,10 @@ mod tests {
             "a flat deferral is not a failed round and must not consume attempt 1"
         );
         assert_eq!(outcome.retry_after, BASE);
+        assert!(
+            queues.claim_no_holder_report(&key),
+            "nor may it consume the warning"
+        );
     }
 
     #[test]
@@ -2617,6 +2757,7 @@ mod tests {
             hint_sources: HashSet::from([peer_id_from_byte(1)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(1)]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
 
         assert!(queues.add_pending_verify(key, entry).admitted());
@@ -2638,6 +2779,7 @@ mod tests {
             hint_sources: HashSet::from([peer_id_from_byte(2)]),
             replica_hint_sources: HashSet::new(),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
 
         assert!(
@@ -2679,6 +2821,7 @@ mod tests {
             hint_sources: HashSet::from([paid_advertiser]),
             replica_hint_sources: HashSet::new(),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(queues.add_pending_verify(key, paid_entry).admitted());
         assert_eq!(
@@ -2699,6 +2842,7 @@ mod tests {
             hint_sources: HashSet::from([replica_advertiser]),
             replica_hint_sources: HashSet::from([replica_advertiser]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(!queues.add_pending_verify(key, replica_entry).admitted());
 
@@ -2731,6 +2875,7 @@ mod tests {
             hint_sources: HashSet::from([replica_advertiser, paid_advertiser]),
             replica_hint_sources: HashSet::from([replica_advertiser]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(queues.add_pending_verify(key, entry).admitted());
 
@@ -2771,6 +2916,7 @@ mod tests {
             hint_sources: HashSet::from([peer_id_from_byte(3)]),
             replica_hint_sources: HashSet::from([peer_id_from_byte(3)]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(
             queues.add_pending_verify(key, entry).admitted(),

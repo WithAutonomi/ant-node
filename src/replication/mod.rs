@@ -2167,6 +2167,7 @@ impl ReplicationEngine {
             hint_sources: HashSet::from([hinter]),
             replica_hint_sources: HashSet::from([hinter]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         self.queues
             .write()
@@ -7750,6 +7751,7 @@ fn queue_admitted_hints(
                     // fetch-source candidate. Derives HintPipeline::Replica.
                     replica_hint_sources: HashSet::from([*source_peer]),
                     unresolved_retries: 0,
+                    no_holder_reported: false,
                 },
             );
             match result {
@@ -7778,6 +7780,7 @@ fn queue_admitted_hints(
                 // not a fetch source. Derives HintPipeline::PaidOnly.
                 replica_hint_sources: HashSet::new(),
                 unresolved_retries: 0,
+                no_holder_reported: false,
             },
         );
         match result {
@@ -8015,12 +8018,15 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
             }
             if sources.is_empty() {
                 no_holder_deferrals += 1;
-                report_unresolved_deferral(
-                    "Locally paid key",
-                    &key,
-                    q.defer_unresolved(&key, config.verification_request_timeout),
-                );
+                let outcome = q.defer_unresolved(&key, config.verification_request_timeout);
+                let first_report = q.claim_no_holder_report(&key);
+                report_unresolved_deferral("Locally paid key", &key, outcome, first_report);
             } else {
+                // A holder answered, so whatever came before is not a run of
+                // consecutive failures any more. Clear before promoting: if the
+                // fetch queue is full the entry stays pending, and it must not
+                // carry the old backoff.
+                q.clear_unresolved(&key);
                 let distance = crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                 // Atomic remove+enqueue: if fetch_queue is at capacity, the
                 // pending entry is preserved and retried next cycle (no
@@ -8208,6 +8214,9 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                             capacity_deferred_promote += 1;
                         }
                     } else if fetch_eligible && !fetch_sources.is_empty() {
+                        // A holder answered; see the matching clear on the
+                        // local-paid path.
+                        q.clear_unresolved(&key);
                         let distance =
                             crate::client::xor_distance(&key, p2p_node.peer_id().as_bytes());
                         // Atomic remove+enqueue: on fetch_queue capacity miss
@@ -8218,10 +8227,13 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                         // retained as pending until queue drains.
                     } else if fetch_eligible && fetch_sources.is_empty() {
                         no_holder_deferrals += 1;
+                        let outcome = q.defer_unresolved(&key, config.verification_request_timeout);
+                        let first_report = q.claim_no_holder_report(&key);
                         report_unresolved_deferral(
                             "Verified storage-admitted key",
                             &key,
-                            q.defer_unresolved(&key, config.verification_request_timeout),
+                            outcome,
+                            first_report,
                         );
                     } else {
                         q.remove_pending(&key);
@@ -8234,8 +8246,10 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
                 }
                 KeyVerificationOutcome::QuorumInconclusive => {
                     q.set_pending_state(&key, VerificationState::QuorumInconclusive);
-                    // Backed off like any other unresolved round; an
-                    // inconclusive quorum is not worth a per-key line.
+                    // Backed off like any other unresolved round, but it does
+                    // NOT claim the no-holder report: nothing yet says this key
+                    // has no holder, so the first round that does say so must
+                    // still be the one that warns.
                     let _ = q.defer_unresolved(&key, config.verification_request_timeout);
                 }
             }
@@ -8302,14 +8316,24 @@ async fn run_verification_cycle(ctx: VerificationCycleContext<'_>) {
 /// `debug`, and the per-cycle count is carried in the cycle summary so the
 /// scale of a backlog is still visible without a line per key per retry.
 ///
-/// Eviction at `PENDING_VERIFY_MAX_AGE` drops the entry, so a key re-hinted
-/// afterwards warns again: "once per episode", not "once ever".
-fn report_unresolved_deferral(what: &str, key: &XorName, outcome: Option<DeferralOutcome>) {
+/// `first_report` comes from `claim_no_holder_report`, not from the attempt
+/// number: a round may advance the count without producing a no-holder result,
+/// and such a round must not consume the warning.
+///
+/// Eviction at `PENDING_VERIFY_MAX_AGE` drops the entry, and a round that finds
+/// a holder clears it, so a later relapse warns again: "once per episode", not
+/// "once ever".
+fn report_unresolved_deferral(
+    what: &str,
+    key: &XorName,
+    outcome: Option<DeferralOutcome>,
+    first_report: bool,
+) {
     let Some(outcome) = outcome else {
         // The entry left `pending_verify` under the same lock; nothing deferred.
         return;
     };
-    if outcome.attempt == 1 {
+    if first_report {
         warn!(
             "{what} {} has no responding holders yet; deferring retry",
             hex::encode(key)
@@ -10993,6 +11017,7 @@ mod tests {
                 hint_sources: HashSet::from([peer]),
                 replica_hint_sources: HashSet::from([peer]),
                 unresolved_retries: 0,
+                no_holder_reported: false,
             },
         );
         super::bootstrap::track_discovered_keys(&bootstrap_state, &HashSet::from([key])).await;
@@ -13037,6 +13062,7 @@ mod tests {
             hint_sources: HashSet::from([hinter]),
             replica_hint_sources: HashSet::from([hinter]),
             unresolved_retries: 0,
+            no_holder_reported: false,
         };
         assert!(q.add_pending_verify(key, entry).admitted());
         assert!(q.promote_pending_to_fetch(key, key, sources));

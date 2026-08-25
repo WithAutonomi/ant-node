@@ -84,15 +84,26 @@ methods that mean different things:
   base.
 
 Both no-holder sites and the inconclusive-quorum deferral use
-`defer_unresolved`. The two no-holder sites warn only when `attempt == 1` and
-drop to `debug!` thereafter; the inconclusive case has no per-key log at all.
-The per-cycle count is added to the existing verification cycle summary as
-`no_holders=`, so the scale of a backlog stays visible without a line per key
-per retry.
+`defer_unresolved`.
 
-The counter lives on the entry, so eviction and re-admission start a fresh
-episode. The warning is therefore "once per episode", not "once ever" — a key
-that becomes unresolvable again after genuinely resolving is reported again.
+Reporting is tracked **separately** from the count, by a `no_holder_reported`
+flag claimed through `claim_no_holder_report` at the two no-holder sites. The
+two answer different questions. The counter asks "how many consecutive rounds
+failed", which an inconclusive quorum legitimately advances. The flag asks "have
+we told anyone", which only a no-holder result may consume. Deriving the second
+from `attempt == 1` would lose the first — and only — warning for any key whose
+opening round is inconclusive, which is the common case: a key entering
+`PaidForList` after its first quorum round takes the local-paid fast path on the
+next cycle.
+
+A round that *does* find a holder clears both, via `clear_unresolved`. The
+round succeeded even where a full fetch queue leaves the key pending, so it must
+not inherit the earlier backoff, and a later relapse deserves a fresh warning.
+Eviction and re-admission likewise start a fresh episode, so "once per episode"
+is literal rather than approximate.
+
+The per-cycle count is added to the verification cycle summary as `no_holders=`,
+so the scale of a backlog stays visible without a line per key per retry.
 
 ## Consequences
 
@@ -121,10 +132,17 @@ that becomes unresolvable again after genuinely resolving is reported again.
 
 ### Neutral / Operational
 
-- `no_holders=` appears in the cycle summary only when a cycle exceeds
-  `VERIFICATION_CYCLE_SLOW_LOG_MS`, which is when a backlog is most likely to be
-  present, but is not a continuous gauge. If a continuous signal is wanted, it
-  belongs in the periodic replication summary.
+- `no_holders=` appears in both verification cycle summaries: at `info` when the
+  cycle exceeds `VERIFICATION_CYCLE_SLOW_LOG_MS`, and at `debug` otherwise. Beta
+  ships at `info`, so in practice the operational signal is the slow-cycle one —
+  which is when a backlog is most likely present, but is therefore not a
+  continuous gauge. If a continuous signal is wanted it belongs in the periodic
+  replication summary.
+- `VerificationEntry` is `pub` with `pub` fields and no `#[non_exhaustive]`, so
+  the two new fields break downstream struct literals. Nothing outside this
+  repository is known to construct one, but the PR is marked breaking on that
+  basis. Adding `#[non_exhaustive]` would stop this recurring; it is itself a
+  breaking change and so belongs with a deliberate bump, not this one.
 - Beta ships at `info`, so the `debug!` follow-ups are dropped at ingest and do
   not reach Elasticsearch.
 
@@ -132,9 +150,17 @@ that becomes unresolvable again after genuinely resolving is reported again.
 
 - Unit tests cover the doubling sequence, saturation at the cap across 64
   further attempts, the `None` result for an unknown key, backoff restart after
-  eviction and re-admission, that a base above the cap is never shortened, and
-  that a flat `defer_pending` does not advance the unresolved count or consume
-  the first-failure warning.
+  eviction and re-admission, and that a base above the cap is never shortened.
+- Three tests pin the separations this decision rests on: a non-reporting round
+  (inconclusive quorum) advances the count without consuming the warning; a flat
+  `defer_pending` does neither; and a duplicate hint merges into the live entry
+  rather than replacing it, so it restarts neither the backoff nor the retry
+  time. The last of these guards a silent revert — a refactor that replaced
+  instead of merging would undo the fix with every other test still green.
+- `VERIFICATION_RETRY_BACKOFF_MAX` is pinned in `config.rs` beside
+  `CAPACITY_BLOCKED_RETRY`: above the request timeout, and far enough below
+  `PENDING_VERIFY_MAX_AGE` that a capped retry still gets several looks per
+  episode.
 - The beta cohort is the live check: the next first-start node should produce on
   the order of one WARN per affected key per episode instead of hundreds, and
   `no_holders=` in the cycle summary should show the affected-key count directly.

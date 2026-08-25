@@ -60,6 +60,7 @@ fn entry_from(sender: PeerId) -> VerificationEntry {
         hint_sources: HashSet::from([sender]),
         replica_hint_sources: HashSet::from([sender]),
         unresolved_retries: 0,
+        no_holder_reported: false,
     }
 }
 

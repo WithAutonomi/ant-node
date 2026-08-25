@@ -106,12 +106,25 @@ pub struct VerificationEntry {
     /// later retry. Zero means the key has not yet failed a round, so the next
     /// deferral is its first.
     ///
-    /// Drives the retry backoff, and decides whether a failure is worth a
-    /// warning: the first is news, the five hundredth is the same news.
-    /// Lifetime is the entry's own — eviction and re-admission start a fresh
-    /// count, which is what makes the log "once per episode" rather than once
-    /// ever.
+    /// Drives the retry backoff. Lifetime is the entry's own — eviction and
+    /// re-admission start a fresh count.
+    ///
+    /// Cleared by a round that *did* find a holder, so it counts consecutive
+    /// failures rather than lifetime ones: a key held up only by a full fetch
+    /// queue is making progress and must not inherit an earlier backoff.
     pub unresolved_retries: u32,
+    /// Whether this entry's one no-holder warning has already been emitted.
+    ///
+    /// Deliberately **not** derived from [`Self::unresolved_retries`]. The two
+    /// answer different questions: the counter asks "how many consecutive
+    /// rounds failed", which an inconclusive quorum legitimately advances, and
+    /// this asks "have we told anyone", which only a no-holder result may
+    /// consume. Deriving one from the other loses the first — and only —
+    /// warning for any key whose opening round is inconclusive.
+    ///
+    /// Cleared alongside the counter, so "once per episode" is literal: a key
+    /// that resolves and later becomes unresolvable again is reported again.
+    pub no_holder_reported: bool,
 }
 
 impl VerificationEntry {
