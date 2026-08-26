@@ -55,11 +55,35 @@ jobs:
       # storage. A failing step aborts the job, so anything sequenced after a flaky one
       # never reports, which is how these ran on no platform at all for a whole run.
       - name: Prove the migration returns disk to the filesystem
-        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_reclaims_disk --features test-utils -- --nocapture --test-threads=1 2>&1 | tee /tmp/reclaims_disk.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/reclaims_disk.log \
+            || { echo 'reclaims_disk ran no tests'; exit 1; }
       - name: Kill a node mid-migration and check what survived
-        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_crash_safety --features test-utils -- --test-threads=1 2>&1 | tee /tmp/crash_safety.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/crash_safety.log \
+            || { echo 'crash_safety ran no tests'; exit 1; }
       - name: Several nodes migrating on one disk
-        run: cargo test --test migration_shared_volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_shared_volume --features test-utils 2>&1 | tee /tmp/shared_volume.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/shared_volume.log \
+            || { echo 'shared_volume ran no tests'; exit 1; }
       # Linux only. This one plants a hundred thousand files to measure what a restart
       # costs, and the answer it is after is a fleet answer, where every node is Linux.
       # The scan itself reads names and nothing else, which is not a platform-specific
@@ -68,7 +92,15 @@ jobs:
       # something no node will ever do there.
       - name: Startup scan, index memory and inode cost at scale
         if: runner.os == 'Linux'
-        run: cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1 2>&1 | tee /tmp/scale.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/scale.log \
+            || { echo 'scale ran no tests'; exit 1; }
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs
@@ -100,6 +132,7 @@ jobs:
       - name: Install the filesystem tools
         run: sudo apt-get update && sudo apt-get install -y xfsprogs btrfs-progs
       - name: Make a ${{ matrix.fs }} volume and mount it
+        shell: bash
         run: |
           set -euo pipefail
           # A loopback image, so these run on a filesystem of the right kind rather than
@@ -119,15 +152,39 @@ jobs:
       - name: The migration returns disk on ${{ matrix.fs }}
         env:
           TMPDIR: /mnt/antfs
-        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_reclaims_disk --features test-utils -- --nocapture --test-threads=1 2>&1 | tee /tmp/reclaims_disk.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/reclaims_disk.log \
+            || { echo 'reclaims_disk ran no tests'; exit 1; }
       - name: A node killed mid-write on ${{ matrix.fs }} loses nothing
         env:
           TMPDIR: /mnt/antfs
-        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_crash_safety --features test-utils -- --test-threads=1 2>&1 | tee /tmp/crash_safety.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/crash_safety.log \
+            || { echo 'crash_safety ran no tests'; exit 1; }
       - name: Several nodes on one ${{ matrix.fs }} volume
         env:
           TMPDIR: /mnt/antfs
-        run: cargo test --test migration_shared_volume
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test migration_shared_volume --features test-utils 2>&1 | tee /tmp/shared_volume.log
+          # A target whose required features are not passed is skipped with a
+          # warning and a zero exit, so a harness can stop running without anyone
+          # noticing. This is what makes that loud.
+          grep -qE 'test result: ok\. [1-9]' /tmp/shared_volume.log \
+            || { echo 'shared_volume ran no tests'; exit 1; }
 
   doc:
     name: Documentation
@@ -162,6 +219,7 @@ jobs:
       # reads it is compiled, and its absence is the absence of the failpoint.
       - name: A shipped binary carries no failpoint
         if: runner.os == 'Linux'
+        shell: bash
         run: |
           set -euo pipefail
           cargo build --bin ant-node

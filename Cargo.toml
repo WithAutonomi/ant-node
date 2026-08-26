@@ -155,6 +155,7 @@ required-features = ["test-utils"]
 [[test]]
 name = "migration_shared_volume"
 path = "tests/migration_shared_volume.rs"
+required-features = ["test-utils"]
 
 # E2E test infrastructure (run with --features test-utils)
 [[test]]
