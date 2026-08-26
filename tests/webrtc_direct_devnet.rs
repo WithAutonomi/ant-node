@@ -6,17 +6,18 @@ use bytes::Bytes;
 use evmlib::common::{Amount, QuoteHash};
 use evmlib::wallet::Wallet;
 use evmlib::RewardsAddress;
+use saorsa_transport::transport::{WebRtcCertificateHash, WebRtcDirectAddr};
+use saorsa_transport::webrtc_direct::{
+    WebRtcDataChannel, WebRtcDirectClient, MAX_DATA_CHANNEL_MESSAGE_SIZE,
+};
 use self_encryption::{DataMap, EncryptedChunk};
 use serde_json::{json, Value};
 use std::error::Error;
 use std::io;
 use std::str::FromStr;
-use tokio::io::AsyncReadExt;
-use wtransport::endpoint::ConnectOptions;
-use wtransport::tls::Sha256Digest;
-use wtransport::{ClientConfig, Endpoint};
 
-const TEST_ORIGIN: &str = "http://127.0.0.1:5173";
+const DATA_CHANNEL_LABEL: &str = "autonomi.web.v3";
+const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a five-node local network"]
@@ -33,9 +34,8 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     )?;
     let mut config = DevnetConfig::minimal();
     config.base_port = 0;
-    config.webtransport = true;
-    config.webtransport_base_port = 0;
-    config.webtransport_allowed_origins = vec![TEST_ORIGIN.to_string()];
+    config.webrtc_direct = true;
+    config.webrtc_direct_base_port = 0;
     config.data_dir = temp.path().join("browser-devnet");
     config.spawn_delay = std::time::Duration::from_millis(20);
     config.evm_network = Some(evm_network);
@@ -65,6 +65,7 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
             "version": 3,
             "request_id": 5,
             "type": "hello",
+            "challenge": "11".repeat(32),
         }),
         &[],
     )
@@ -100,7 +101,7 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     assert!(closest_content.is_empty());
     let discovered_peer = closest["nodes"]
         .as_array()
-        .and_then(|nodes| nodes.iter().find(|node| node["webtransport"].is_object()))
+        .and_then(|nodes| nodes.iter().find(|node| node["webrtc_direct"].is_object()))
         .and_then(|node| node["peer_id"].as_str())
         .ok_or_else(|| io::Error::other("FIND_NODE returned no browser endpoint"))?;
     let download_endpoint = endpoints
@@ -154,7 +155,7 @@ async fn seeded_public_file_downloads_and_paid_uploads_over_direct_node_endpoint
     let decrypted = self_encryption::decrypt(&data_map, &encrypted_chunks)?;
     assert_eq!(decrypted, content.as_slice());
 
-    let upload_content = b"paid browser WebTransport upload";
+    let upload_content = b"paid browser WebRtcDirect upload";
     let upload_address = hex::encode(blake3::hash(upload_content).as_bytes());
     let (quote_header, quote_content) = rpc(
         &download_endpoint.endpoint,
@@ -228,49 +229,97 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, io::Err
 
 async fn rpc(
     endpoint: &BrowserEndpoint,
+    request: Value,
+    content: &[u8],
+) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
+    let request_type = request["type"].as_str().unwrap_or("unknown").to_string();
+    let parsed = endpoint.parse().map_err(io::Error::other)?;
+    let direct_addr = WebRtcDirectAddr::new(
+        parsed.socket_addr,
+        WebRtcCertificateHash::new(parsed.certificate_hash),
+    )?;
+    let client = WebRtcDirectClient::dial(&direct_addr, DATA_CHANNEL_LABEL)
+        .await
+        .map_err(|error| io::Error::other(format!("WebRTC Direct dial failed: {error}")))?;
+    if request["type"] != "hello" {
+        let _ = rpc_stream(
+            client.data_channel(),
+            json!({
+                "version": 3,
+                "request_id": 1,
+                "type": "hello",
+                "challenge": "00".repeat(32),
+            }),
+            &[],
+        )
+        .await
+        .map_err(|error| io::Error::other(format!("WebRTC Direct HELLO failed: {error}")))?;
+    }
+    let result = rpc_stream(client.data_channel(), request, content)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!("WebRTC Direct {request_type} RPC failed: {error}"))
+        });
+    client.close().await?;
+    Ok(result?)
+}
+
+async fn rpc_stream(
+    channel: &WebRtcDataChannel,
     mut request: Value,
     content: &[u8],
 ) -> Result<(Value, Vec<u8>), Box<dyn Error>> {
-    let parsed = endpoint.parse().map_err(io::Error::other)?;
-    let hashes = parsed.certificate_hashes.into_iter().map(Sha256Digest::new);
-    let client_config = ClientConfig::builder()
-        .with_bind_default()
-        .with_server_certificate_hashes(hashes)
-        .build();
-    let endpoint = Endpoint::client(client_config)?;
-    let options = ConnectOptions::builder(&parsed.url)
-        .add_header("origin", TEST_ORIGIN)
-        .build();
-    let connection = endpoint.connect(options).await?;
-    let (mut send, mut recv) = connection.open_bi().await?.await?;
     request["content_length"] = json!(content.len());
     let request_header = serde_json::to_vec(&request)?;
     let request_header_len = u32::try_from(request_header.len())?;
-    send.write_all(&request_header_len.to_be_bytes()).await?;
-    send.write_all(&request_header).await?;
-    send.write_all(content).await?;
-    send.finish().await?;
+    let mut request_frame = Vec::with_capacity(4 + request_header.len() + content.len());
+    request_frame.extend_from_slice(&request_header_len.to_be_bytes());
+    request_frame.extend_from_slice(&request_header);
+    request_frame.extend_from_slice(content);
+    for chunk in request_frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
+        channel.send(chunk).await?;
+    }
 
     let mut frame = Vec::new();
-    recv.read_to_end(&mut frame).await?;
-    if frame.len() < 4 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "WebTransport response has no header length",
-        )
-        .into());
-    }
-    let header_len = u32::from_be_bytes(frame[0..4].try_into()?) as usize;
-    let content_offset = 4usize
-        .checked_add(header_len)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "header length overflow"))?;
-    if content_offset > frame.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "WebTransport response ended inside its JSON header",
-        )
-        .into());
-    }
+    let content_offset = loop {
+        let message = channel.receive().await?;
+        if message.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "WebRtcDirect response channel closed",
+            )
+            .into());
+        }
+        frame.extend_from_slice(&message);
+        if frame.len() < 4 {
+            continue;
+        }
+        let header_len = u32::from_be_bytes(frame[0..4].try_into()?) as usize;
+        let content_offset = 4usize
+            .checked_add(header_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "header length overflow"))?;
+        if frame.len() < content_offset {
+            continue;
+        }
+        let header: Value = serde_json::from_slice(&frame[4..content_offset])?;
+        let content_length = header["content_length"]
+            .as_u64()
+            .and_then(|length| usize::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid content length"))?;
+        let expected = content_offset.checked_add(content_length).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "response length overflow")
+        })?;
+        if frame.len() > expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WebRtcDirect response has trailing bytes",
+            )
+            .into());
+        }
+        if frame.len() == expected {
+            break content_offset;
+        }
+    };
     let header = serde_json::from_slice(&frame[4..content_offset])?;
     Ok((header, frame[content_offset..].to_vec()))
 }

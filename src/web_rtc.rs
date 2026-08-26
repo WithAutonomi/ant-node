@@ -1,15 +1,15 @@
-//! ADR-0009 WebTransport interoperability proof.
+//! ADR-0009 WebRTC Direct browser transport.
 //!
-//! This module is feature-gated, disabled by default, and intentionally keeps
-//! the browser-facing HTTP/3 stack separate from native Saorsa QUIC. It is not
-//! the production endpoint-record or certificate-rotation implementation.
+//! The listener uses Saorsa's signaling-free WebRTC Direct transport for ICE,
+//! DTLS, SCTP, and reliable ordered `DataChannels`. ANT's ML-DSA HELLO binds the
+//! pinned WebRTC endpoint to the node identity without a libp2p or Noise layer.
 
 use crate::ant_protocol::{
     ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse, ChunkQuoteRequest,
     ChunkQuoteResponse, MAX_CHUNK_SIZE,
 };
-use crate::browser::{BrowserEndpoint, BrowserPaymentNetwork, BROWSER_WEBTRANSPORT_PATH};
-use crate::config::WebTransportConfig;
+use crate::browser::{BrowserEndpoint, BrowserPaymentNetwork};
+use crate::config::WebRtcDirectConfig;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use crate::payment::{serialize_single_node_proof, PaymentProof};
@@ -17,27 +17,31 @@ use crate::storage::AntProtocol;
 use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::RwLock;
+use saorsa_core::identity::NodeIdentity;
 use saorsa_core::{P2PNode, PeerId};
+use saorsa_transport::webrtc_direct::{
+    WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
+    MAX_DATA_CHANNEL_MESSAGE_SIZE,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use tokio::io::AsyncReadExt;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use wtransport::endpoint::IncomingSession;
-use wtransport::stream::{RecvStream, SendStream};
-use wtransport::{Endpoint, Identity, ServerConfig};
 
 const PROTOCOL_VERSION: u16 = 3;
 const PROTOCOL_NAME: &str = "autonomi.web.poc.v3";
+const DATA_CHANNEL_LABEL: &str = "autonomi.web.v3";
 const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
+const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
 
 /// Browser endpoints known to one or more listeners in the same process.
 ///
@@ -61,7 +65,7 @@ impl BrowserEndpointCatalog {
 }
 
 /// A running browser listener and the endpoint clients use to reach it.
-pub struct WebTransportServer {
+pub struct WebRtcDirectServer {
     /// Direct endpoint with its certificate pin embedded in the multiaddress.
     pub endpoint: BrowserEndpoint,
     /// Listener background task.
@@ -69,47 +73,37 @@ pub struct WebTransportServer {
 }
 
 /// Start the feature-gated browser listener and return its endpoint and task.
-pub fn spawn(
-    config: &WebTransportConfig,
+pub async fn spawn(
+    config: &WebRtcDirectConfig,
+    root_dir: &Path,
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
     evm_network: &evmlib::Network,
     shutdown: CancellationToken,
     endpoint_catalog: Arc<BrowserEndpointCatalog>,
-) -> Result<WebTransportServer> {
-    validate_config(config)?;
-
-    let identity = Identity::self_signed(&config.certificate_sans)
-        .map_err(|error| Error::Config(format!("invalid WebTransport certificate SAN: {error}")))?;
-    let certificate = identity
-        .certificate_chain()
-        .as_slice()
-        .first()
-        .ok_or_else(|| Error::Startup("WebTransport identity has no certificate".to_string()))?;
-    let certificate_sha256 = *certificate.hash().as_ref();
-
-    let server_config = ServerConfig::builder()
-        .with_bind_address(config.bind)
-        .with_identity(identity)
-        .keep_alive_interval(Some(KEEP_ALIVE_INTERVAL))
-        .build();
-    let endpoint = Endpoint::server(server_config).map_err(|error| {
-        Error::Startup(format!("failed to bind WebTransport endpoint: {error}"))
-    })?;
-    let local_addr = endpoint.local_addr().map_err(|error| {
-        Error::Startup(format!(
-            "failed to read WebTransport bound address: {error}"
-        ))
-    })?;
-    let advertised_url = advertised_url(config, local_addr);
-
+) -> Result<WebRtcDirectServer> {
+    validate_webrtc_config(config)?;
+    let certificate_path = certificate_path(config, root_dir);
+    let certificate = load_or_generate_certificate(&certificate_path).await?;
+    let certificate_sha256 = certificate
+        .sha256_digest()
+        .map_err(|error| Error::Startup(error.to_string()))?;
+    let listener = WebRtcDirectListener::bind(config.bind, certificate)
+        .await
+        .map_err(|error| {
+            Error::Startup(format!("failed to bind WebRTC Direct listener: {error}"))
+        })?;
+    let local_addr = listener.local_addr();
+    let advertised_addr = advertised_addr(config, local_addr)?;
     let peer_id = *p2p.peer_id();
-    let browser_endpoint = BrowserEndpoint::new(&advertised_url, &peer_id, &[certificate_sha256])
+    let identity = Arc::clone(p2p.transport().node_identity());
+    let browser_endpoint = BrowserEndpoint::new(advertised_addr, &peer_id, certificate_sha256)
         .map_err(Error::Config)?;
     endpoint_catalog.insert(peer_id, browser_endpoint.clone());
 
     let state = Arc::new(ServerState {
         config: config.clone(),
+        identity,
         p2p,
         ant_protocol,
         payment: BrowserPaymentNetwork::from_evm_network(evm_network),
@@ -121,251 +115,302 @@ pub fn spawn(
     info!(
         bind = %local_addr,
         multiaddr = %browser_endpoint.multiaddr,
-        "ADR-0009 WebTransport PoC listening"
+        certificate = %certificate_path.display(),
+        "ADR-0009 WebRTC Direct listening"
     );
 
     let task = tokio::spawn(async move {
-        serve(endpoint, state, connection_limit, shutdown).await;
+        serve_webrtc(listener, state, connection_limit, shutdown).await;
     });
-    Ok(WebTransportServer {
+    Ok(WebRtcDirectServer {
         endpoint: browser_endpoint,
         task,
     })
 }
 
-fn validate_config(config: &WebTransportConfig) -> Result<()> {
-    if config.path != BROWSER_WEBTRANSPORT_PATH {
-        return Err(Error::Config(format!(
-            "webtransport.path must be {BROWSER_WEBTRANSPORT_PATH}"
-        )));
-    }
-    if config.allowed_origins.is_empty() {
-        return Err(Error::Config(
-            "webtransport.allowed_origins must not be empty".to_string(),
-        ));
-    }
-    if config.certificate_sans.is_empty() {
-        return Err(Error::Config(
-            "webtransport.certificate_sans must not be empty".to_string(),
-        ));
-    }
+fn validate_webrtc_config(config: &WebRtcDirectConfig) -> Result<()> {
     if config.max_connections == 0 {
         return Err(Error::Config(
-            "webtransport.max_connections must be greater than zero".to_string(),
+            "webrtc_direct.max_connections must be greater than zero".to_string(),
         ));
     }
     if config.max_request_bytes == 0 || config.max_request_bytes > MAX_RESPONSE_HEADER_BYTES {
         return Err(Error::Config(format!(
-            "webtransport.max_request_bytes must be between 1 and {MAX_RESPONSE_HEADER_BYTES}"
+            "webrtc_direct.max_request_bytes must be between 1 and {MAX_RESPONSE_HEADER_BYTES}"
         )));
     }
-    if let Some(url) = config.advertised_url.as_deref() {
-        if !url.starts_with("https://") {
-            return Err(Error::Config(
-                "webtransport.advertised_url must use https://".to_string(),
-            ));
-        }
+    if config.advertised_addr.is_some_and(|addr| addr.port() == 0) {
+        return Err(Error::Config(
+            "webrtc_direct.advertised_addr must not use port zero".to_string(),
+        ));
     }
     Ok(())
 }
 
-fn advertised_url(config: &WebTransportConfig, local_addr: SocketAddr) -> String {
-    if let Some(url) = config.advertised_url.as_ref() {
-        return url.clone();
+fn certificate_path(config: &WebRtcDirectConfig, root_dir: &Path) -> PathBuf {
+    match config.certificate_path.as_ref() {
+        Some(path) if path.is_absolute() => path.clone(),
+        Some(path) => root_dir.join(path),
+        None => root_dir.join("webrtc-direct.pem"),
     }
-
-    let host = match local_addr.ip() {
-        IpAddr::V4(ip) if ip.is_unspecified() => "127.0.0.1".to_string(),
-        IpAddr::V4(ip) => ip.to_string(),
-        IpAddr::V6(ip) if ip.is_unspecified() => "[::1]".to_string(),
-        IpAddr::V6(ip) => format!("[{ip}]"),
-    };
-    format!("https://{host}:{}{}", local_addr.port(), config.path)
 }
 
-async fn serve(
-    endpoint: Endpoint<wtransport::endpoint::endpoint_side::Server>,
+async fn load_or_generate_certificate(path: &Path) -> Result<WebRtcCertificate> {
+    match tokio::fs::read_to_string(path).await {
+        Ok(pem) => WebRtcCertificate::from_pem(&pem).map_err(|error| {
+            Error::Startup(format!(
+                "failed to load WebRTC certificate {}: {error}",
+                path.display()
+            ))
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let certificate = WebRtcCertificate::generate().map_err(|error| {
+                Error::Startup(format!("failed to generate WebRTC certificate: {error}"))
+            })?;
+            tokio::fs::write(path, certificate.serialize_pem()).await?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
+            }
+            Ok(certificate)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn advertised_addr(config: &WebRtcDirectConfig, local_addr: SocketAddr) -> Result<SocketAddr> {
+    if let Some(addr) = config.advertised_addr {
+        return Ok(addr);
+    }
+    if local_addr.ip().is_unspecified() {
+        return Err(Error::Config(
+            "webrtc_direct.advertised_addr is required for a wildcard bind".to_string(),
+        ));
+    }
+    Ok(local_addr)
+}
+
+async fn serve_webrtc(
+    mut listener: WebRtcDirectListener,
     state: Arc<ServerState>,
     connection_limit: Arc<Semaphore>,
     shutdown: CancellationToken,
 ) {
     loop {
-        tokio::select! {
+        let connection = tokio::select! {
             () = shutdown.cancelled() => break,
-            incoming = endpoint.accept() => {
-                match Arc::clone(&connection_limit).try_acquire_owned() {
-                    Ok(permit) => {
-                        let state = Arc::clone(&state);
-                        let connection_shutdown = shutdown.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = handle_incoming(
-                                incoming,
-                                state,
-                                connection_shutdown,
-                                permit,
-                            ).await {
-                                debug!("WebTransport session ended: {error}");
-                            }
-                        });
+            connection = listener.accept() => connection,
+        };
+        match connection {
+            Ok(connection) => {
+                let remote_addr = connection.remote_addr();
+                let Ok(permit) = Arc::clone(&connection_limit).try_acquire_owned() else {
+                    debug!(remote = %remote_addr, "Rejected WebRTC Direct connection: busy");
+                    if let Err(error) = connection.close().await {
+                        debug!(remote = %remote_addr, %error, "Failed to close busy connection");
                     }
-                    Err(_) => {
-                        tokio::spawn(reject_busy(incoming));
+                    continue;
+                };
+                let connection_state = Arc::clone(&state);
+                let connection_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(error) =
+                        handle_connection(connection, connection_state, connection_shutdown).await
+                    {
+                        debug!(remote = %remote_addr, "WebRTC Direct connection ended: {error}");
                     }
+                });
+            }
+            Err(error) => {
+                warn!("WebRTC Direct listener error: {error}");
+            }
+        }
+    }
+    if let Err(error) = listener.close().await {
+        debug!("WebRTC Direct listener close failed: {error}");
+    }
+    info!("ADR-0009 WebRTC Direct stopped");
+}
+
+async fn handle_connection(
+    mut connection: WebRtcDirectConnection,
+    state: Arc<ServerState>,
+    shutdown: CancellationToken,
+) -> ServerResult<()> {
+    let authenticated = Arc::new(AtomicBool::new(false));
+    loop {
+        let channel = tokio::select! {
+            () = shutdown.cancelled() => return Ok(()),
+            result = connection.accept_data_channel() => {
+                result.map_err(|error| format!("DataChannel accept failed: {error}"))?
+            }
+        };
+        let state = Arc::clone(&state);
+        let authenticated = Arc::clone(&authenticated);
+        tokio::spawn(async move {
+            if let Err(error) = handle_webrtc_channel(channel, state, authenticated).await {
+                debug!("WebRTC Direct DataChannel ended: {error}");
+            }
+        });
+    }
+}
+
+async fn handle_webrtc_channel(
+    channel: WebRtcDataChannel,
+    state: Arc<ServerState>,
+    authenticated: Arc<AtomicBool>,
+) -> ServerResult<()> {
+    if channel.label() != DATA_CHANNEL_LABEL {
+        if let Err(error) = channel.close().await {
+            debug!("Failed to close unsupported DataChannel: {error}");
+        }
+        return Err(format!(
+            "unsupported DataChannel label {:?}",
+            channel.label()
+        ));
+    }
+
+    loop {
+        let (request, content) =
+            match read_webrtc_request(&channel, state.config.max_request_bytes).await {
+                Ok(request) => request,
+                Err(error) if error == "DataChannel closed" => return Ok(()),
+                Err(error) => {
+                    let response = Response::error(0, "invalid_request", error);
+                    write_webrtc_response(&channel, &response, &[]).await?;
+                    return Ok(());
+                }
+            };
+        if request.version != PROTOCOL_VERSION {
+            let response = Response::error(
+                request.id,
+                "unsupported_version",
+                format!(
+                    "protocol version {} is unsupported; expected {PROTOCOL_VERSION}",
+                    request.version
+                ),
+            );
+            write_webrtc_response(&channel, &response, &[]).await?;
+            continue;
+        }
+
+        let is_hello = matches!(&request.body, RequestBody::Hello { .. });
+        if !is_hello && !authenticated.load(Ordering::Acquire) {
+            let response = Response::error(
+                request.id,
+                "authentication_required",
+                "HELLO must authenticate this WebRTC connection first".to_string(),
+            );
+            write_webrtc_response(&channel, &response, &[]).await?;
+            continue;
+        }
+
+        let (response, content) = process_request(request, content, &state).await;
+        if is_hello && matches!(&response.status, ResponseStatus::Ok) {
+            authenticated.store(true, Ordering::Release);
+        }
+        write_webrtc_response(&channel, &response, content.as_deref().unwrap_or_default()).await?;
+    }
+}
+
+async fn read_webrtc_request(
+    channel: &WebRtcDataChannel,
+    max_header_bytes: usize,
+) -> ServerResult<(Request, Vec<u8>)> {
+    let read = async {
+        let mut frame = Vec::new();
+        let mut expected_length = None;
+        let max_frame_bytes = 4 + max_header_bytes + MAX_CHUNK_SIZE;
+        loop {
+            let message = channel
+                .receive()
+                .await
+                .map_err(|error| format!("request message read failed: {error}"))?;
+            if message.is_empty() {
+                return Err("DataChannel closed".to_string());
+            }
+            if frame.len() + message.len() > max_frame_bytes {
+                return Err(format!(
+                    "request exceeds the {max_frame_bytes}-byte frame limit"
+                ));
+            }
+            frame.extend_from_slice(&message);
+
+            if expected_length.is_none() && frame.len() >= 4 {
+                let header_len = u32::from_be_bytes(
+                    frame[..4]
+                        .try_into()
+                        .map_err(|_| "request prefix is incomplete".to_string())?,
+                ) as usize;
+                if header_len == 0 || header_len > max_header_bytes {
+                    return Err(format!(
+                        "request header length {header_len} is outside 1..={max_header_bytes}"
+                    ));
+                }
+                if frame.len() >= 4 + header_len {
+                    let request: Request = serde_json::from_slice(&frame[4..4 + header_len])
+                        .map_err(|error| format!("request JSON is invalid: {error}"))?;
+                    if request.content_length > MAX_CHUNK_SIZE {
+                        return Err(format!(
+                            "request content length {} exceeds {MAX_CHUNK_SIZE}",
+                            request.content_length
+                        ));
+                    }
+                    expected_length = Some((4 + header_len + request.content_length, request));
+                }
+            }
+
+            if let Some((length, _)) = expected_length.as_ref() {
+                if frame.len() > *length {
+                    return Err("request contains bytes after its declared frame".to_string());
+                }
+                if frame.len() == *length {
+                    let (_, request) = expected_length
+                        .take()
+                        .ok_or_else(|| "request length state was lost".to_string())?;
+                    let header_len = u32::from_be_bytes(
+                        frame[..4]
+                            .try_into()
+                            .map_err(|_| "request prefix is incomplete".to_string())?,
+                    ) as usize;
+                    return Ok((request, frame.split_off(4 + header_len)));
                 }
             }
         }
-    }
-    endpoint.close(0u32.into(), b"node shutting down");
-    info!("ADR-0009 WebTransport PoC stopped");
-}
-
-async fn reject_busy(incoming: IncomingSession) {
-    match tokio::time::timeout(REQUEST_TIMEOUT, incoming).await {
-        Ok(Ok(request)) => request.too_many_requests().await,
-        Ok(Err(error)) => debug!("Could not reject busy WebTransport session: {error}"),
-        Err(_) => debug!("Timed out while rejecting busy WebTransport session"),
-    }
-}
-
-async fn handle_incoming(
-    incoming: IncomingSession,
-    state: Arc<ServerState>,
-    shutdown: CancellationToken,
-    _permit: OwnedSemaphorePermit,
-) -> ServerResult<()> {
-    let request = tokio::select! {
-        () = shutdown.cancelled() => return Ok(()),
-        result = tokio::time::timeout(REQUEST_TIMEOUT, incoming) => {
-            result
-                .map_err(|_| "session negotiation timed out".to_string())?
-                .map_err(|error| format!("session negotiation failed: {error}"))?
-        }
     };
-
-    if request.path() != state.config.path {
-        request.not_found().await;
-        return Ok(());
-    }
-    if !origin_allowed(&state.config.allowed_origins, request.origin()) {
-        warn!(origin = ?request.origin(), "Rejected WebTransport Origin");
-        request.forbidden().await;
-        return Ok(());
-    }
-
-    let remote = request.remote_address();
-    let connection = request
-        .accept()
+    tokio::time::timeout(REQUEST_TIMEOUT, read)
         .await
-        .map_err(|error| format!("session accept failed: {error}"))?;
-    debug!(remote = %remote, "Accepted browser WebTransport session");
-
-    loop {
-        tokio::select! {
-            () = shutdown.cancelled() => return Ok(()),
-            stream = connection.accept_bi() => {
-                let (send, recv) = stream
-                    .map_err(|error| format!("bidirectional stream accept failed: {error}"))?;
-                handle_stream(send, recv, Arc::clone(&state)).await?;
-            }
-            stream = connection.accept_uni() => {
-                let recv = stream
-                    .map_err(|error| format!("unidirectional stream accept failed: {error}"))?;
-                recv.stop(1u32.into());
-            }
-            datagram = connection.receive_datagram() => {
-                datagram.map_err(|error| format!("datagram receive failed: {error}"))?;
-                debug!("Discarded unsupported WebTransport datagram");
-            }
-        }
-    }
+        .map_err(|_| "request timed out".to_string())?
 }
 
-async fn handle_stream(
-    mut send: SendStream,
-    mut recv: RecvStream,
-    state: Arc<ServerState>,
+async fn write_webrtc_response(
+    channel: &WebRtcDataChannel,
+    response: &Response,
+    content: &[u8],
 ) -> ServerResult<()> {
-    let (request, content) = match read_request(&mut recv, state.config.max_request_bytes).await {
-        Ok(request) => request,
-        Err(error) => {
-            let response = Response::error(0, "invalid_request", error);
-            return write_response(&mut send, &response, &[]).await;
-        }
-    };
-
-    if request.version != PROTOCOL_VERSION {
-        let request_id = request.id;
-        let response = Response::error(
-            request_id,
-            "unsupported_version",
-            format!(
-                "protocol version {} is unsupported; expected {PROTOCOL_VERSION}",
-                request.version
-            ),
-        );
-        return write_response(&mut send, &response, &[]).await;
+    let header = serde_json::to_vec(response)
+        .map_err(|error| format!("response JSON serialization failed: {error}"))?;
+    if header.len() > MAX_RESPONSE_HEADER_BYTES {
+        return Err("response header exceeds protocol limit".to_string());
     }
-
-    let (response, content) = process_request(request, content, &state).await;
-    write_response(&mut send, &response, content.as_deref().unwrap_or_default()).await
-}
-
-async fn read_request(
-    recv: &mut RecvStream,
-    max_header_bytes: usize,
-) -> ServerResult<(Request, Vec<u8>)> {
-    let mut bytes = Vec::new();
-    let max_frame_bytes = 4usize
-        .saturating_add(max_header_bytes)
-        .saturating_add(MAX_CHUNK_SIZE);
-    let mut limited = recv.take((max_frame_bytes + 1) as u64);
-    tokio::time::timeout(REQUEST_TIMEOUT, limited.read_to_end(&mut bytes))
-        .await
-        .map_err(|_| "request body timed out".to_string())?
-        .map_err(|error| format!("request body read failed: {error}"))?;
-
-    if bytes.len() > max_frame_bytes {
-        return Err(format!(
-            "request exceeds the {max_frame_bytes}-byte frame limit"
-        ));
+    let header_len = u32::try_from(header.len())
+        .map_err(|_| "response header length does not fit u32".to_string())?;
+    let mut frame = Vec::with_capacity(4 + header.len() + content.len());
+    frame.extend_from_slice(&header_len.to_be_bytes());
+    frame.extend_from_slice(&header);
+    frame.extend_from_slice(content);
+    for chunk in frame.chunks(WEBRTC_WRITE_CHUNK_BYTES) {
+        channel
+            .send(chunk)
+            .await
+            .map_err(|error| format!("response message write failed: {error}"))?;
     }
-    let prefix = bytes
-        .get(..4)
-        .ok_or_else(|| "request ended before its four-byte header length".to_string())?;
-    let header_len = u32::from_be_bytes(
-        prefix
-            .try_into()
-            .map_err(|_| "request header prefix is invalid".to_string())?,
-    ) as usize;
-    if header_len == 0 || header_len > max_header_bytes {
-        return Err(format!(
-            "request header length {header_len} is outside 1..={max_header_bytes}"
-        ));
-    }
-    let content_offset = 4usize
-        .checked_add(header_len)
-        .ok_or_else(|| "request header length overflow".to_string())?;
-    let header = bytes
-        .get(4..content_offset)
-        .ok_or_else(|| "request ended inside its JSON header".to_string())?;
-    let request: Request = serde_json::from_slice(header)
-        .map_err(|error| format!("request JSON is invalid: {error}"))?;
-    if request.content_length > MAX_CHUNK_SIZE {
-        return Err(format!(
-            "request content length {} exceeds {MAX_CHUNK_SIZE}",
-            request.content_length
-        ));
-    }
-    let expected_len = content_offset
-        .checked_add(request.content_length)
-        .ok_or_else(|| "request content length overflow".to_string())?;
-    if bytes.len() != expected_len {
-        return Err(format!(
-            "request length mismatch: declared {} content bytes",
-            request.content_length
-        ));
-    }
-    Ok((request, bytes[content_offset..].to_vec()))
+    Ok(())
 }
 
 async fn process_request(
@@ -384,26 +429,55 @@ async fn process_request(
         );
     }
     match request.body {
-        RequestBody::Hello => (
-            Response::ok(
-                request.id,
-                ResponseBody::Hello {
-                    protocol: PROTOCOL_NAME.to_string(),
-                    peer_id: state.p2p.peer_id().to_hex(),
-                    max_chunk_size: MAX_CHUNK_SIZE,
-                    endpoint: state.endpoint.clone(),
-                    payment: state.payment.clone(),
-                    capabilities: vec![
-                        "find_node".to_string(),
-                        "get_chunk".to_string(),
-                        "quote_chunk".to_string(),
-                        "put_chunk".to_string(),
-                    ],
-                },
-                0,
-            ),
-            None,
-        ),
+        RequestBody::Hello { challenge } => {
+            let challenge_bytes = match decode_32_byte_hex(&challenge) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return (
+                        Response::error(request.id, "invalid_challenge", error),
+                        None,
+                    )
+                }
+            };
+            let peer_id = state.p2p.peer_id().to_hex();
+            let transcript = hello_transcript(&challenge_bytes, &peer_id, &state.endpoint);
+            let signature = match state.identity.sign(&transcript) {
+                Ok(signature) => signature,
+                Err(error) => {
+                    return (
+                        Response::error(
+                            request.id,
+                            "identity_signing_failed",
+                            format!("could not sign HELLO: {error}"),
+                        ),
+                        None,
+                    )
+                }
+            };
+            (
+                Response::ok(
+                    request.id,
+                    ResponseBody::Hello {
+                        protocol: PROTOCOL_NAME.to_string(),
+                        peer_id,
+                        challenge,
+                        public_key: hex::encode(state.identity.public_key().as_bytes()),
+                        signature: hex::encode(signature.as_bytes()),
+                        max_chunk_size: MAX_CHUNK_SIZE,
+                        endpoint: state.endpoint.clone(),
+                        payment: state.payment.clone(),
+                        capabilities: vec![
+                            "find_node".to_string(),
+                            "get_chunk".to_string(),
+                            "quote_chunk".to_string(),
+                            "put_chunk".to_string(),
+                        ],
+                    },
+                    0,
+                ),
+                None,
+            )
+        }
         RequestBody::FindNode { target, count } => {
             process_find_node(request.id, target, count, state).await
         }
@@ -451,7 +525,7 @@ async fn process_find_node(
         .map(|node| {
             let peer_id = node.peer_id.to_hex();
             BrowserNode {
-                webtransport: state.endpoint_catalog.get(&node.peer_id),
+                webrtc_direct: state.endpoint_catalog.get(&node.peer_id),
                 peer_id,
                 native_addresses: node
                     .addresses_by_priority()
@@ -741,45 +815,20 @@ async fn handle_ant_message(
         .map_err(|error| format!("storage response decoding failed: {error}"))
 }
 
-async fn write_response(
-    send: &mut SendStream,
-    response: &Response,
-    content: &[u8],
-) -> ServerResult<()> {
-    let header = serde_json::to_vec(response)
-        .map_err(|error| format!("response JSON serialization failed: {error}"))?;
-    if header.len() > MAX_RESPONSE_HEADER_BYTES {
-        return Err("response header exceeds protocol limit".to_string());
-    }
-    let header_len = u32::try_from(header.len())
-        .map_err(|_| "response header length does not fit u32".to_string())?;
-    send.write_all(&header_len.to_be_bytes())
-        .await
-        .map_err(|error| format!("response prefix write failed: {error}"))?;
-    send.write_all(&header)
-        .await
-        .map_err(|error| format!("response header write failed: {error}"))?;
-    if !content.is_empty() {
-        send.write_all(content)
-            .await
-            .map_err(|error| format!("response content write failed: {error}"))?;
-    }
-    send.finish()
-        .await
-        .map_err(|error| format!("response finish failed: {error}"))
-}
-
-fn origin_allowed(allowed: &[String], origin: Option<&str>) -> bool {
-    allowed.iter().any(|candidate| candidate == "*")
-        || origin.is_some_and(|origin| allowed.iter().any(|candidate| candidate == origin))
-}
-
 fn decode_32_byte_hex(value: &str) -> ServerResult<[u8; 32]> {
     let value = value.strip_prefix("0x").unwrap_or(value);
     let bytes = hex::decode(value).map_err(|error| format!("expected hexadecimal: {error}"))?;
     bytes
         .try_into()
         .map_err(|bytes: Vec<u8>| format!("expected 32 bytes, received {}", bytes.len()))
+}
+
+fn hello_transcript(challenge: &[u8; 32], peer_id: &str, endpoint: &BrowserEndpoint) -> Vec<u8> {
+    let mut transcript = b"autonomi-webrtc-direct-hello-v1\0".to_vec();
+    transcript.extend_from_slice(challenge);
+    transcript.extend_from_slice(peer_id.as_bytes());
+    transcript.extend_from_slice(endpoint.multiaddr.to_string().as_bytes());
+    transcript
 }
 
 type ServerResult<T> = std::result::Result<T, String>;
@@ -797,7 +846,9 @@ struct Request {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum RequestBody {
-    Hello,
+    Hello {
+        challenge: String,
+    },
     FindNode {
         target: String,
         #[serde(default)]
@@ -876,6 +927,9 @@ enum ResponseBody {
     Hello {
         protocol: String,
         peer_id: String,
+        challenge: String,
+        public_key: String,
+        signature: String,
         max_chunk_size: usize,
         endpoint: BrowserEndpoint,
         payment: BrowserPaymentNetwork,
@@ -912,7 +966,7 @@ struct BrowserNode {
     peer_id: String,
     native_addresses: Vec<String>,
     reliability: f64,
-    webtransport: Option<BrowserEndpoint>,
+    webrtc_direct: Option<BrowserEndpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1035,7 +1089,8 @@ impl BrowserCommitmentArtifact {
 }
 
 struct ServerState {
-    config: WebTransportConfig,
+    config: WebRtcDirectConfig,
+    identity: Arc<NodeIdentity>,
     p2p: Arc<P2PNode>,
     ant_protocol: Option<Arc<AntProtocol>>,
     payment: BrowserPaymentNetwork,
@@ -1081,15 +1136,6 @@ mod tests {
     }
 
     #[test]
-    fn origins_are_exact_unless_wildcard_is_configured() {
-        let exact = vec!["http://localhost:5173".to_string()];
-        assert!(origin_allowed(&exact, Some("http://localhost:5173")));
-        assert!(!origin_allowed(&exact, Some("http://evil.test")));
-        assert!(!origin_allowed(&exact, None));
-        assert!(origin_allowed(&["*".to_string()], None));
-    }
-
-    #[test]
     fn response_header_declares_raw_content_length() {
         let response = Response::ok(
             42,
@@ -1108,9 +1154,28 @@ mod tests {
     }
 
     #[test]
-    fn derives_ipv6_urls_with_brackets() {
-        let config = WebTransportConfig::default();
-        let url = advertised_url(&config, "[::1]:23456".parse().expect("socket"));
-        assert_eq!(url, "https://[::1]:23456/autonomi/webtransport/v1");
+    fn derives_ipv6_advertised_address() {
+        let config = WebRtcDirectConfig::default();
+        let addr = advertised_addr(&config, "[::1]:23456".parse().expect("socket"))
+            .expect("advertised address");
+        assert_eq!(addr, "[::1]:23456".parse().expect("socket"));
+    }
+
+    #[tokio::test]
+    async fn dtls_certificate_is_stable_across_reloads() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("webrtc-direct.pem");
+        let first = load_or_generate_certificate(&path)
+            .await
+            .expect("generate certificate");
+        let second = load_or_generate_certificate(&path)
+            .await
+            .expect("reload certificate");
+
+        assert_eq!(
+            first.sha256_digest().expect("first fingerprint"),
+            second.sha256_digest().expect("second fingerprint")
+        );
+        assert!(path.exists());
     }
 }
