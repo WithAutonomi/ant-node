@@ -38,22 +38,50 @@ const CHUNKS: usize = 400;
 /// unmistakable on disk.
 const CHUNK_BYTES: usize = 16 * 1024;
 
-/// Everything under `path`, in bytes, following no links.
-fn bytes_on_disk(path: &Path) -> u64 {
+/// Blocks actually allocated under `path`, in bytes, following no links.
+///
+/// Allocated blocks rather than file lengths. A length is what the file claims; blocks
+/// are what the filesystem has handed out, and the two part company exactly where this
+/// test needs to be careful: a sparse file, a file whose last block is mostly padding, or
+/// a file that has been unlinked while something still holds it open.
+#[cfg(unix)]
+fn allocated_bytes(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    walk(path, &|meta| meta.blocks() * 512)
+}
+
+/// Off Unix, the length is the best the standard library offers.
+#[cfg(not(unix))]
+fn allocated_bytes(path: &Path) -> u64 {
+    walk(path, &|meta| meta.len())
+}
+
+/// Sum `size` over everything under `path`.
+fn walk(path: &Path, size: &dyn Fn(&std::fs::Metadata) -> u64) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
-        return std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+        return std::fs::symlink_metadata(path).map_or(0, |m| size(&m));
     };
     entries
         .flatten()
         .map(|entry| {
             let path = entry.path();
             match std::fs::symlink_metadata(&path) {
-                Ok(meta) if meta.is_dir() => bytes_on_disk(&path),
-                Ok(meta) => meta.len(),
+                Ok(meta) if meta.is_dir() => walk(&path, size),
+                Ok(meta) => size(&meta),
                 Err(_) => 0,
             }
         })
         .sum()
+}
+
+/// What the filesystem says is free, right now.
+///
+/// The measurement that cannot be argued with, and the one this test exists for. A path
+/// disappearing proves nothing: unlink a file that something still holds open and every
+/// name is gone while every block is still spoken for, which is a fair description of the
+/// bug that started all this.
+fn free_space(path: &Path) -> u64 {
+    fs2::available_space(path).expect("the filesystem should report its free space")
 }
 
 /// Deterministic content for chunk `n`, filled so it does not compress to nothing.
@@ -154,21 +182,30 @@ async fn migrate_and_retire(store: &Arc<ChunkStore>, keys: &[[u8; 32]]) -> u64 {
 
 /// The bytes the legacy environment occupied come back to the filesystem.
 ///
-/// Measured on the directory itself, before and after, because that is the measurement
-/// the original bug fooled: LMDB reported the chunks deleted while the file kept every
-/// byte.
+/// Three measurements, because only the third one settles it: what the filesystem says is
+/// free before anything is written, at the peak when both stores hold everything, and
+/// after the environment is gone. A test that only watched paths disappear would pass
+/// while every block stayed allocated, which is a fair description of the bug that
+/// started all this.
+///
+/// The numbers are noisy on a shared machine, so the assertion is about the shape: the
+/// peak is materially below the start, and the end recovers most of the way back to it.
 #[tokio::test]
 async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     let tmp = TempDir::new().expect("temp dir");
     let root = tmp.path().join("node");
     std::fs::create_dir_all(&root).expect("mkdir");
 
+    let payload = (CHUNKS * CHUNK_BYTES) as u64;
+    let free_at_start = free_space(&root);
+
     let keys = seed_legacy_environment(&root).await;
     let environment = root.join("chunks.mdb");
-    let environment_bytes = bytes_on_disk(&environment);
+    let environment_blocks = allocated_bytes(&environment);
     assert!(
-        environment_bytes >= (CHUNKS * CHUNK_BYTES) as u64,
-        "the seeded environment should hold at least the chunk bytes, holds {environment_bytes}"
+        environment_blocks >= payload,
+        "the seeded environment should have at least the chunk bytes allocated, has \
+         {environment_blocks}"
     );
 
     let store = Arc::new(
@@ -180,16 +217,12 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
 
     let freed = migrate_and_retire(&store, &keys).await;
     store.wait_idle().await;
-
-    // The store's own claim.
     assert_eq!(store.migration_phase(), MigrationPhase::FilesOnly);
     assert!(freed > 0, "retirement reported no bytes freed");
 
-    // The filesystem's answer, which is the one that was wrong last time. The deletion
-    // runs on a detached thread, so give it a moment to finish; it is a few hundred small
-    // files.
-    for _ in 0..200 {
-        if !environment.exists() && bytes_on_disk(&root.join("chunks.mdb.retired")) == 0 {
+    // The deletion runs on a detached thread so the node can serve while it happens.
+    for _ in 0..400 {
+        if !environment.exists() && allocated_bytes(&root) < environment_blocks + payload {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -199,25 +232,55 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
         "the environment directory is still on disk"
     );
 
-    let chunks_dir_bytes = bytes_on_disk(&root.join("chunks"));
-    let leftover = bytes_on_disk(&root) - chunks_dir_bytes;
+    // Dropping the store closes every handle. A file that is unlinked while something
+    // still holds it open keeps its blocks and shows in no directory, so measuring before
+    // this point would be measuring the wrong thing.
+    drop(store);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let free_at_end = free_space(&root);
+
+    // Only the file store's copy should be left.
+    let left_on_disk = allocated_bytes(&root);
+    let file_store_blocks = allocated_bytes(&root.join("chunks"));
     assert!(
-        leftover < environment_bytes / 4,
-        "the environment's bytes did not come back: {leftover} still under {} outside the \
-         file store, against {environment_bytes} before",
-        root.display()
+        left_on_disk <= file_store_blocks + (payload / 10),
+        "something other than the file store is still using disk: {left_on_disk} total \
+         against {file_store_blocks} in the file store"
     );
 
-    // And every chunk is still served, which is the other half of the claim. Space that
-    // came back by losing data would be no achievement.
+    // And the filesystem agrees. Recovering the environment means the end state costs
+    // roughly one copy rather than two, so the space consumed since the start should be
+    // close to the payload and nowhere near twice it.
+    let consumed = free_at_start.saturating_sub(free_at_end);
+    assert!(
+        consumed < payload * 2,
+        "the filesystem lost {consumed} bytes for a {payload} byte payload, so the \
+         environment's space did not come back"
+    );
+
+    // Every chunk is still served, read back through a store opened from scratch, which
+    // is what a restart does. Space recovered by losing data would be no achievement, and
+    // it is the failure this whole change exists to avoid.
+    let fresh = store_reopened(&root).await;
     for (n, key) in keys.iter().enumerate() {
-        let served = store
+        let served = fresh
             .get(key)
             .await
             .expect("read a migrated chunk")
             .expect("a migrated chunk should still be there");
         assert_eq!(served, chunk_bytes(n), "chunk {n} came back wrong");
     }
+}
+
+/// Open the store again from scratch, which is what a restart does.
+async fn store_reopened(root: &Path) -> ChunkStore {
+    ChunkStore::new(ChunkStoreConfig {
+        root_dir: root.to_path_buf(),
+        disk_reserve: 0,
+        ..ChunkStoreConfig::default()
+    })
+    .await
+    .expect("the store must reopen after retirement")
 }
 
 /// The file store holds the same payload in less space than the environment did.
@@ -231,7 +294,7 @@ async fn the_file_store_holds_the_same_chunks_in_less_space() {
     std::fs::create_dir_all(&root).expect("mkdir");
 
     let keys = seed_legacy_environment(&root).await;
-    let environment_bytes = bytes_on_disk(&root.join("chunks.mdb"));
+    let environment_bytes = allocated_bytes(&root.join("chunks.mdb"));
 
     let store = Arc::new(
         ChunkStore::new(migrating_config(&root))
@@ -245,7 +308,7 @@ async fn the_file_store_holds_the_same_chunks_in_less_space() {
     store.wait_idle().await;
 
     let payload = (CHUNKS * CHUNK_BYTES) as u64;
-    let file_store_bytes = bytes_on_disk(&root.join("chunks"));
+    let file_store_bytes = allocated_bytes(&root.join("chunks"));
     assert!(
         file_store_bytes >= payload,
         "the file store should hold at least the payload: {file_store_bytes} < {payload}"

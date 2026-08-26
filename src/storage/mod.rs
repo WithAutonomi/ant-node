@@ -45,6 +45,9 @@
 //! ```
 
 pub(crate) mod chunk_store;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod file_store;
+#[cfg(not(any(test, feature = "test-utils")))]
 pub(crate) mod file_store;
 mod handler;
 pub(crate) mod lmdb;

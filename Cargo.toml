@@ -148,6 +148,7 @@ required-features = ["test-utils"]
 [[test]]
 name = "storage_scale"
 path = "tests/storage_scale.rs"
+required-features = ["test-utils"]
 
 # Several nodes migrating on one disk: the volume lock, and that each finishes with its
 # own chunks and only its own.

@@ -20,9 +20,11 @@
     clippy::cast_possible_truncation
 )]
 
-use ant_node::storage::migration::{LockAttempt, VolumeLock};
+use ant_node::storage::migration::{self, LockAttempt, VolumeLock};
 use ant_node::storage::{ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 
@@ -100,6 +102,151 @@ fn only_one_node_on_a_volume_holds_the_lock() {
     );
 }
 
+/// A migration context with no network, which is all these tests need.
+///
+/// The gates that consult routing have their own tests; what is under test here is the
+/// lock, and a node with no view of the network still copies.
+fn offline_context() -> migration::MigrationContext {
+    migration::MigrationContext {
+        p2p: None,
+        self_id: None,
+        self_xor: None,
+        commitment: None,
+        replication: None,
+        sync_state: None,
+        audit_challenge_coordinator: None,
+        peer_commitments: None,
+        close_group_size: 7,
+    }
+}
+
+/// Two migration drivers on one disk: only one copies at a time.
+///
+/// This drives `migration::run`, not `copy_batch`. The copier does not take the volume
+/// lock; the driver does, and an earlier version of this test called the copier directly
+/// and would have passed with the lock removed from the driver entirely.
+#[tokio::test]
+async fn two_drivers_on_one_volume_do_not_copy_at_the_same_time() {
+    let volume = TempDir::new().expect("temp dir");
+    let mut stores = Vec::new();
+    let mut all_keys = Vec::new();
+
+    for node in 0..2 {
+        let root = volume.path().join(format!("node-{node}"));
+        std::fs::create_dir_all(&root).expect("mkdir");
+        let keys = seed_legacy(&root, node).await;
+
+        let mut config = ChunkStoreConfig {
+            root_dir: root.clone(),
+            disk_reserve: 0,
+            ..ChunkStoreConfig::default()
+        };
+        config.migration.tick_secs = 1;
+        config.migration.copier_throttle_mib_per_sec = 0;
+        config.migration.copier_slack_mb = 0;
+        // Small enough that copying takes several ticks, so there is a window in which
+        // the other node could misbehave and be caught, and large enough that the whole
+        // thing finishes in seconds rather than one chunk per tick.
+        config.migration.batch_chunks = 8;
+        config.migration.lock_dir = Some(volume.path().to_path_buf());
+        stores.push(Arc::new(
+            ChunkStore::new(config).await.expect("open a node"),
+        ));
+        all_keys.push(keys);
+    }
+
+    // Hold the volume before either driver starts, so both are shut out and neither can
+    // be observed making progress.
+    let LockAttempt::Acquired(held) =
+        VolumeLock::try_acquire(&volume.path().join("an-outsider"), Some(volume.path()))
+    else {
+        panic!("the outsider must take the lock");
+    };
+
+    let shutdown = CancellationToken::new();
+    let drivers: Vec<_> = stores
+        .iter()
+        .map(|store| {
+            tokio::spawn(migration::run(
+                Arc::clone(store),
+                offline_context(),
+                shutdown.clone(),
+            ))
+        })
+        .collect();
+
+    // Long enough for several ticks. Neither driver may copy anything while the lock is
+    // held by somebody else.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    for (node, store) in stores.iter().enumerate() {
+        assert_eq!(
+            store.legacy_only_keys().len(),
+            CHUNKS,
+            "node {node} copied while another holder had the volume"
+        );
+    }
+
+    // Released: one of them takes it and copies. The other must not, because the holder
+    // keeps the volume from its first copy through to retiring, rather than handing it
+    // back between chunks. That is the point of the lock: two nodes copying at once each
+    // hold two copies of everything, and the disk this migration exists to free is the
+    // one that fills.
+    drop(held);
+    let mut copier = None;
+    for _ in 0..300 {
+        if let Some(node) = stores
+            .iter()
+            .position(|s| s.legacy_only_keys().len() < CHUNKS)
+        {
+            copier = Some(node);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let copier = copier.expect("one driver should have taken the volume and started");
+
+    // Give the other one many ticks to misbehave in.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let waiting = 1 - copier;
+    assert_eq!(
+        stores[waiting].legacy_only_keys().len(),
+        CHUNKS,
+        "node {waiting} copied while node {copier} held the volume"
+    );
+
+    // And the one that has it finishes.
+    for _ in 0..600 {
+        if stores[copier].legacy_only_keys().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    shutdown.cancel();
+    for driver in drivers {
+        let _ = driver.await;
+    }
+
+    assert!(
+        stores[copier].legacy_only_keys().is_empty(),
+        "the node holding the volume did not finish copying"
+    );
+    let keys = &all_keys[copier];
+    assert_eq!(
+        stores[copier].current_chunks().expect("count") as usize,
+        keys.len(),
+        "a node must hold its own chunks and only its own"
+    );
+    for (n, key) in keys.iter().enumerate() {
+        let served = stores[copier]
+            .get(key)
+            .await
+            .expect("read")
+            .expect("every chunk this node seeded must still be here");
+        assert_eq!(served, chunk_bytes(copier, n), "chunk {n} is wrong");
+    }
+}
+
+/// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
 /// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
 ///
 /// Run one after the other, which is what the lock produces. What is checked is that the

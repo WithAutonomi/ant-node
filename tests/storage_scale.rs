@@ -179,40 +179,157 @@ async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {
     );
 }
 
-/// Every chunk takes exactly one inode and one directory entry.
+/// Every chunk the store writes takes exactly one directory entry.
 ///
-/// Stated in the design and never checked. It matters because a filesystem runs out of
-/// inodes independently of bytes, and a node that fills the inode table stops accepting
-/// writes while `df` still shows free space.
-#[cfg(target_os = "linux")]
+/// Through `put`, not through the fixture. An earlier version planted the files itself
+/// and then counted them, which proves the test can count and nothing about the store: a
+/// store that wrote a sidecar beside every chunk would have passed it.
+///
+/// It matters because a filesystem runs out of inodes independently of bytes, and a node
+/// that fills the inode table stops accepting writes while `df` still shows free space.
 #[tokio::test]
-async fn each_chunk_costs_one_inode() {
-    use std::os::unix::fs::MetadataExt;
-
+async fn each_chunk_the_store_writes_costs_one_directory_entry() {
+    let keys = 2_000;
     let tmp = TempDir::new().expect("temp dir");
     let root = tmp.path().join("node");
-    let chunks_dir = root.join("chunks");
-    std::fs::create_dir_all(&chunks_dir).expect("mkdir");
+    std::fs::create_dir_all(&root).expect("mkdir");
 
-    // Small on purpose: this is about the ratio, and counting inodes means walking them.
-    let keys = 5_000;
-    plant_chunks(&chunks_dir, keys);
+    let store = FileStore::new(FileStoreConfig {
+        root_dir: root.clone(),
+        verify_on_read: true,
+        disk_reserve: 0,
+    })
+    .await
+    .expect("open");
 
-    let mut inodes = std::collections::HashSet::new();
-    for shard in std::fs::read_dir(&chunks_dir)
-        .expect("read shards")
-        .flatten()
-    {
-        for chunk in std::fs::read_dir(shard.path())
-            .expect("read a shard")
-            .flatten()
-        {
-            inodes.insert(chunk.metadata().expect("stat").ino());
+    for n in 0..keys {
+        // Real content through the real path, so anything `put` writes is counted.
+        let mut content = vec![0u8; 512];
+        content[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        let address = ant_node::client::compute_address(&content);
+        store.put(&address, &content).await.expect("put");
+    }
+    store.wait_idle().await;
+
+    let entries = count_entries(&root.join("chunks"));
+    assert_eq!(
+        entries.files, keys,
+        "the store wrote {} files for {keys} chunks",
+        entries.files
+    );
+    // 256 shards and the layout marker are the fixed overhead; nothing should be
+    // proportional to the chunk count but the chunks themselves.
+    assert!(
+        entries.dirs <= 256,
+        "the store made {} directories, which grows with the store",
+        entries.dirs
+    );
+}
+
+/// Files and directories under a path, counted rather than summed.
+struct Entries {
+    files: usize,
+    dirs: usize,
+}
+
+fn count_entries(path: &Path) -> Entries {
+    let mut counted = Entries { files: 0, dirs: 0 };
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return counted;
+    };
+    for entry in entries.flatten() {
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                counted.dirs += 1;
+                let nested = count_entries(&entry.path());
+                counted.files += nested.files;
+                counted.dirs += nested.dirs;
+            }
+            // The store's own two files sit beside the shards and are not chunks: the
+            // layout marker, and the lock that keeps a second process out. Both are
+            // fixed, so neither grows with the store.
+            Ok(_)
+                if entry.file_name() == ant_node::storage::file_store::LAYOUT_FILE_NAME
+                    || entry.file_name() == ".lock" => {}
+            Ok(_) => counted.files += 1,
+            Err(_) => {}
         }
     }
-    assert_eq!(
-        inodes.len(),
-        keys,
-        "each chunk should have one inode of its own"
+    counted
+}
+
+/// The startup scan does not read chunk contents.
+///
+/// The claim the scan's cost rests on: a store of 4 MiB chunks would be unopenable if
+/// starting meant reading them.
+///
+/// Measured in bytes read, not in elapsed time. Timing cannot settle this: the files were
+/// written moments earlier, so reading them back comes from the page cache and costs
+/// almost nothing. A version of this test that compared durations passed with a
+/// deliberate `read` of every file added to the scan. `rchar` counts what the process
+/// asked the kernel for whether or not the answer was cached, which is the question.
+///
+/// Linux only, for `/proc/self/io`. Nothing about the scan is platform-specific, and this
+/// is the platform where the answer can be had exactly.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn the_startup_scan_does_not_read_chunk_contents() {
+    let keys = 3_000;
+    let chunk = 64 * 1024;
+    let tmp = TempDir::new().expect("temp dir");
+    let root = tmp.path().join("node");
+    plant_sized(&root.join("chunks"), keys, chunk);
+
+    let before = bytes_read().expect("linux reports this");
+    let store = FileStore::new(FileStoreConfig {
+        root_dir: root.clone(),
+        verify_on_read: true,
+        disk_reserve: 0,
+    })
+    .await
+    .expect("open");
+    let read = bytes_read()
+        .expect("linux reports this")
+        .saturating_sub(before);
+
+    let payload = (keys * chunk) as u64;
+    println!(
+        "scale: opening a store of {keys} chunks read {read} bytes, against {payload} \
+         bytes of chunk"
     );
+    assert_eq!(store.current_chunks().expect("count") as usize, keys);
+
+    // The scan reads names and the layout marker. A hundredth of the payload is far above
+    // that and far below anything that could be reading chunks.
+    assert!(
+        read < payload / 100,
+        "the scan read {read} bytes of a {payload} byte store, so it is reading contents"
+    );
+}
+
+/// Bytes this process has asked the kernel to read, cached or not.
+#[cfg(target_os = "linux")]
+fn bytes_read() -> Option<u64> {
+    let io = std::fs::read_to_string("/proc/self/io").ok()?;
+    io.lines()
+        .find_map(|line| line.strip_prefix("rchar:"))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+/// Plant `count` chunk files of `bytes` each.
+#[cfg(target_os = "linux")]
+fn plant_sized(chunks_dir: &Path, count: usize, bytes: usize) {
+    for shard in 0u16..256 {
+        std::fs::create_dir_all(chunks_dir.join(format!("{shard:02x}"))).expect("mkdir");
+    }
+    let payload = vec![7u8; bytes];
+    for n in 0..count {
+        let mut address = [0u8; 32];
+        address[..8].copy_from_slice(&(n as u64).to_le_bytes());
+        address[31] = (n % 256) as u8;
+        let path = chunks_dir
+            .join(format!("{:02x}", address[31]))
+            .join(hex::encode(address));
+        std::fs::write(path, &payload).expect("plant a chunk");
+    }
 }

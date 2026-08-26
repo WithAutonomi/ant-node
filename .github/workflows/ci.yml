@@ -65,10 +65,16 @@ jobs:
       - name: Several nodes migrating on one disk
         run: cargo test --test migration_shared_volume
       - name: Startup scan, index memory and inode cost at scale
-        run: cargo test --test storage_scale -- --nocapture
+        run: cargo test --test storage_scale --features test-utils -- --nocapture
 
+  # Runs the storage tests against real ext4, XFS and btrfs rather than whatever the
+  # runner provides. Deliberately NOT named durability: killing a process and reopening
+  # the same mounted filesystem keeps the page cache, so this exercises each filesystem's
+  # syscall, locking, rename and delete behaviour, not its behaviour under power loss.
+  # That still needs block-device fault injection or a real machine, and remains a fleet
+  # gate.
   filesystems:
-    name: Durability on ${{ matrix.fs }}
+    name: Storage on ${{ matrix.fs }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -87,17 +93,21 @@ jobs:
           # on whatever the runner happens to give us. ext4 is what most of the fleet is
           # on; XFS and btrfs are the two the design reasons about separately, btrfs
           # because it has been observed reordering writes around a rename.
+          # 3 GiB is ample: these tests use tens of MiB. The scale harness, which is
+          # the one that needs room, is not in this job.
           truncate -s 3G /tmp/${{ matrix.fs }}.img
           mkfs.${{ matrix.fs }} -q /tmp/${{ matrix.fs }}.img
           sudo mkdir -p /mnt/antfs
           sudo mount -o loop /tmp/${{ matrix.fs }}.img /mnt/antfs
           sudo chown "$USER" /mnt/antfs
           df -hT /mnt/antfs
-      - name: Prove the migration returns disk on ${{ matrix.fs }}
+      # TMPDIR is what `TempDir::new` uses, so this is what puts the test data on the
+      # mounted filesystem rather than on the runner's root.
+      - name: The migration returns disk on ${{ matrix.fs }}
         env:
           TMPDIR: /mnt/antfs
         run: cargo test --test migration_reclaims_disk --features test-utils
-      - name: Kill a node mid-migration on ${{ matrix.fs }}
+      - name: A node killed mid-write on ${{ matrix.fs }} loses nothing
         env:
           TMPDIR: /mnt/antfs
         run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1

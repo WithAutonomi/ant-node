@@ -397,6 +397,30 @@ impl Drop for Reservation {
     }
 }
 
+/// Environment variable naming a failpoint: stop after the temp file, before the rename.
+#[cfg(any(test, feature = "test-utils"))]
+pub const HALT_BEFORE_PUBLISH: &str = "ANT_HALT_BEFORE_PUBLISH";
+
+/// Park forever at a named failpoint, once a marker says the process has reached it.
+///
+/// For crash tests, which need a process to die *inside* an operation rather than at
+/// whatever point a sleep in another process happened to land. The variable holds a path:
+/// this writes it, so the parent knows the child is exactly here, and then waits to be
+/// killed.
+///
+/// Costs one environment read per write when the feature is compiled in, and the feature
+/// is not in a release build.
+#[cfg(any(test, feature = "test-utils"))]
+fn halt_here_if_asked(variable: &str, reached: &Path) {
+    let Ok(marker) = std::env::var(variable) else {
+        return;
+    };
+    let _ = std::fs::write(&marker, reached.as_os_str().as_encoded_bytes());
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
 /// Clears a write's registration when the work finishes, however it finishes.
 ///
 /// Held by the blocking closure rather than by the caller, so a dropped future cannot
@@ -2413,6 +2437,11 @@ fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
             final_path.display()
         )));
     }
+    // Test-only: here the chunk is under its final name and not yet flushed, which is
+    // this platform's equivalent of the unflushed rename above, and the case the
+    // length-comparing duplicate check exists for.
+    #[cfg(any(test, feature = "test-utils"))]
+    halt_here_if_asked(HALT_BEFORE_PUBLISH, final_path);
     if let Err(e) = file.sync_all() {
         drop(file);
         let _ = std::fs::remove_file(final_path);
@@ -2446,6 +2475,11 @@ fn publish_via_rename(
         PutOutcome::Duplicate
     } else {
         write_temp(temp_path, payload)?;
+        // Test-only: the one moment a complete chunk exists on disk under a name nothing
+        // looks for. A crash test needs to die at a named point rather than wherever a
+        // sleep in another process happened to land.
+        #[cfg(any(test, feature = "test-utils"))]
+        halt_here_if_asked(HALT_BEFORE_PUBLISH, temp_path);
         match rename_with_retry(temp_path, final_path) {
             Ok(()) => PutOutcome::New,
             Err(e) => {
