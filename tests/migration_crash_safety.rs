@@ -476,7 +476,10 @@ async fn a_crash_between_the_two_halves_leaves_the_chunk_on_the_list() {
 /// separates the two, and it is written by the process that then dies.
 ///
 /// Its recovery has unit tests that plant the mark by hand. What those cannot show is that
-/// the mark is really on disk at that moment, which is what a killed process settles.
+/// the production path really writes the mark at that moment, before anything is deleted
+/// and by the process that then dies. That is what this settles. It does not settle
+/// durability: killing a process keeps the kernel page cache, so surviving a kill is not
+/// surviving a power cut, which stays a fleet gate.
 #[tokio::test]
 async fn a_retirement_killed_after_the_mark_is_finished_not_reopened() {
     let tmp = TempDir::new().expect("temp dir");

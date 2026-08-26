@@ -700,9 +700,12 @@ impl FileStore {
 
     /// Store a chunk.
     ///
-    /// Publishing is a rename within the destination directory, so the final name can
-    /// never appear on partial content: the name *is* the hash, and the content is
-    /// fully written and flushed before the name exists.
+    /// On Unix, publishing is a rename within the destination directory, so the final name
+    /// can never appear on partial content: the name *is* the hash, and the content is
+    /// fully written and flushed before the name exists. Off Unix there is no rename, for
+    /// the reason `publish_in_place` gives (it is compiled only on those platforms, so this
+    /// is not a link), and a partial file can wear a real name; that
+    /// is why a duplicate is read and compared rather than trusted.
     ///
     /// # Returns
     ///

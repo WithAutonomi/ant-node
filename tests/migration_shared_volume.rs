@@ -391,7 +391,6 @@ async fn ready_to_retire(volume: &Path, root: &Path, keys: &[[u8; 32]]) -> Arc<C
 }
 
 /// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
-/// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
 ///
 /// Run one after the other, which is what the lock produces. What is checked is that the
 /// second node's copy is unaffected by the first having already run on the same

@@ -224,8 +224,10 @@ jobs:
           set -euo pipefail
           cargo build --bin ant-node
           found=$(strings -a target/debug/ant-node | grep -c 'ANT_HALT_' || true)
-          # With --features test-utils this count is 1, which is what makes a count of 0
-          # here evidence rather than an accident of how the binary was stripped.
+          # With --features test-utils this count is not zero, which is what makes a zero
+          # here evidence rather than an accident of how the binary was stripped. The exact
+          # number is one per failpoint and is deliberately not asserted, so that adding a
+          # failpoint does not fail this check.
           if [ "$found" != "0" ]; then
             echo "the publish failpoint is compiled into a default-feature build"
             exit 1

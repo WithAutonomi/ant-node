@@ -142,11 +142,14 @@ rebuilt at startup and then mutated in place drifted to 2,400 keys pointing at f
 
 ### Durability
 
-Write: reserve capacity, create a temp in the **destination** directory, write, flush the
-file, rename, flush the shard directory, then admit the key. The publish is an
-intra-directory rename, so it is atomic on every filesystem we support and only that one
-directory needs flushing. The final name can never appear on partial content, because the
-name is the hash. Delete: unlink, flush the shard directory, then drop the key.
+Write, on Unix: reserve capacity, create a temp in the **destination** directory, write,
+flush the file, rename, flush the shard directory, then admit the key. The publish is an
+intra-directory rename, so it is atomic on every Unix filesystem we support and only that
+one directory needs flushing. Off Unix there is no rename at all, for the reason the table
+below gives; the file is created under its final name and flushed. Either way the final
+name can never appear on partial content, because the name is the hash and a name that does
+appear over the wrong bytes is caught on read. Delete: unlink, flush the shard directory,
+then drop the key.
 
 Per platform, honestly:
 
@@ -159,7 +162,7 @@ Per platform, honestly:
 | NTFS | **not documented as atomic** | see below | **no documented way** |
 
 On Windows a node cannot make the rename durable through the standard library at all. Two
-places in this design used one, and neither does any more.
+places in this design leaned on one, and neither leans on it now.
 
 Publishing a chunk off Unix does not rename: it creates the file under its final name and
 flushes it, which Microsoft documents as flushing the creation metadata with it. The

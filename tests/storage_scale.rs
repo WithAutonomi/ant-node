@@ -182,25 +182,41 @@ async fn opening_a_large_store_stays_quick() {
          ceiling"
     );
 
+    drop(store);
+
     // And the scan reads names only, with no `stat` behind each one. That claim is what
     // the cost above rests on, and a flat ceiling cannot settle it: one `stat` per entry
     // costs about three times a bare walk, which is still far inside any ceiling loose
     // enough not to flake on a shared runner.
     //
     // Measured against this machine instead of against a number. Two walks of the same
-    // directory in the same process, one reading names and one calling `metadata` on each,
-    // bracket what a scan of this store on this filesystem under this load costs. A scan
-    // that stats every entry lands at the far bracket. Runner speed cancels out, because
-    // it moves all three together.
-    let names_only = walk(&chunks_dir, false);
-    let with_stat = walk(&chunks_dir, true);
+    // directory, one reading names and one calling `metadata` on each, bracket what a scan
+    // of this store on this filesystem under this load costs. A scan that stats every entry
+    // lands at the far bracket.
+    //
+    // Three rounds, interleaved, and the median of each. One round of each would let a
+    // scheduling pause that happened to land on the scan and not on the walks decide the
+    // result: runner speed only cancels out when it moves all three together, and a
+    // preemption does not. Interleaving puts the three measurements next to each other in
+    // time and the median throws away the round that was interrupted.
+    let mut scans = Vec::new();
+    let mut bare = Vec::new();
+    let mut stats = Vec::new();
+    for _ in 0..3 {
+        scans.push(time_a_scan(&root).await);
+        bare.push(walk(&chunks_dir, false));
+        stats.push(walk(&chunks_dir, true));
+    }
+    let scan = median(&mut scans);
+    let names_only = median(&mut bare);
+    let with_stat = median(&mut stats);
     // Saturating, because a filesystem where a stat costs nothing would otherwise
     // underflow here. On one of those the midpoint collapses onto the bare walk and this
     // says little, which is the honest answer for such a filesystem.
     let midpoint = names_only + with_stat.saturating_sub(names_only) / 2;
     println!(
-        "scale: bare walk {names_only:?} names only, {with_stat:?} with a stat each, \
-         store scan {scan:?}"
+        "scale: medians of three, bare walk {names_only:?} names only, {with_stat:?} with a \
+         stat each, store scan {scan:?}, midpoint {midpoint:?}"
     );
     assert!(
         scan < midpoint,
@@ -208,6 +224,27 @@ async fn opening_a_large_store_stays_quick() {
          ({names_only:?}) and one that stats every entry ({with_stat:?}), so it is doing \
          more per entry than reading a name"
     );
+}
+
+/// Open a store at `root`, time the scan, and close it again.
+async fn time_a_scan(root: &Path) -> Duration {
+    let started = Instant::now();
+    let store = FileStore::new(FileStoreConfig {
+        root_dir: root.to_path_buf(),
+        verify_on_read: true,
+        disk_reserve: 0,
+    })
+    .await
+    .expect("reopen the store");
+    let elapsed = started.elapsed();
+    drop(store);
+    elapsed
+}
+
+/// The middle of three, so one interrupted round does not decide anything.
+fn median(samples: &mut [Duration]) -> Duration {
+    samples.sort_unstable();
+    samples.get(samples.len() / 2).copied().unwrap_or_default()
 }
 
 /// The index costs a bounded amount of memory per chunk.
@@ -250,11 +287,11 @@ async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {
     );
 
     assert_eq!(store.current_chunks().expect("count") as usize, keys);
-    // A 32-byte address in a sorted set, plus allocator and node overhead. 256 bytes each
-    // is far above what a `BTreeSet` costs and far below anything that would make a
-    // ten-million-chunk node impossible, which is the question being asked.
+    // A 32-byte address in a sorted set, plus allocator and node overhead. Measured at 52
+    // bytes per chunk on a hosted runner; 128 is comfortably above that and no longer five
+    // times it, which was loose enough to let an extra 128 bytes a key through unnoticed.
     assert!(
-        per_key < 256,
+        per_key < 128,
         "the index costs {per_key} bytes per chunk, which does not scale"
     );
 }
