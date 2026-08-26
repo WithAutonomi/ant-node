@@ -43,6 +43,21 @@ const DEFAULT_KEYS: usize = 100_000;
 /// raises the allowance with it instead of turning the gate into a coin toss.
 const SCAN_CEILING_PER_KEY: Duration = Duration::from_micros(50);
 
+/// The most a startup scan may read, whatever the store holds.
+///
+/// Fixed, deliberately, and not a fraction of the payload. A fraction grows with the
+/// store, so it would keep permitting a per-chunk read as long as the chunks were big
+/// enough: at the sizes below, a hundredth of the payload allowed 655 bytes per chunk,
+/// which is a header read of every file in the store passing a test named for not doing
+/// that.
+///
+/// A scan that reads names reads the same handful of bytes whatever the store holds.
+/// Measured at 125 bytes for 3,000 chunks on a hosted runner, which is the layout marker
+/// and nothing else. 64 KiB is five hundred times that and still under 22 bytes per chunk
+/// there, so any read that is per-chunk at all fails, and fails harder the larger the run.
+#[cfg(target_os = "linux")]
+const SCAN_READ_CEILING: u64 = 64 * 1024;
+
 /// How many keys this run should plant.
 fn key_count() -> usize {
     std::env::var("ANT_SCALE_KEYS")
@@ -305,17 +320,6 @@ async fn the_startup_scan_does_not_read_chunk_contents() {
     );
     assert_eq!(store.current_chunks().expect("count") as usize, keys);
 
-    // Fixed, deliberately, and not a fraction of the payload. A fraction grows with the
-    // store, so it would keep permitting a per-chunk read as long as the chunks were big
-    // enough: at these sizes a hundredth of the payload allowed 655 bytes per chunk, which
-    // is a header read of every file in the store passing a test named for not doing that.
-    //
-    // A scan that reads names reads the same handful of bytes whatever the store holds.
-    // Measured at 125 bytes for 3,000 chunks on a hosted runner, which is the layout marker
-    // and nothing else. 64 KiB is five hundred times that and still under 22 bytes per
-    // chunk here, so any read that is per-chunk at all fails, and fails harder the larger
-    // the run.
-    const SCAN_READ_CEILING: u64 = 64 * 1024;
     assert!(
         read < SCAN_READ_CEILING,
         "the scan read {read} bytes of a {payload} byte store, over the \

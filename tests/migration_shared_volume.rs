@@ -20,7 +20,7 @@
     clippy::cast_possible_truncation
 )]
 
-use ant_node::storage::migration::{self, LockAttempt, VolumeLock};
+use ant_node::storage::migration::{self, LockAttempt, VolumeLock, MIN_RETIRE_DELAY_HOURS};
 use ant_node::storage::{ChunkStore, ChunkStoreConfig, LmdbStorage, LmdbStorageConfig};
 use std::path::Path;
 use std::sync::Arc;
@@ -136,22 +136,7 @@ async fn two_drivers_on_one_volume_do_not_copy_at_the_same_time() {
         std::fs::create_dir_all(&root).expect("mkdir");
         let keys = seed_legacy(&root, node).await;
 
-        let mut config = ChunkStoreConfig {
-            root_dir: root.clone(),
-            disk_reserve: 0,
-            ..ChunkStoreConfig::default()
-        };
-        config.migration.tick_secs = 1;
-        config.migration.copier_throttle_mib_per_sec = 0;
-        config.migration.copier_slack_mb = 0;
-        // Small enough that copying takes several ticks, so there is a window in which
-        // the other node could misbehave and be caught, and large enough that the whole
-        // thing finishes in seconds rather than one chunk per tick.
-        config.migration.batch_chunks = 8;
-        config.migration.lock_dir = Some(volume.path().to_path_buf());
-        stores.push(Arc::new(
-            ChunkStore::new(config).await.expect("open a node"),
-        ));
+        stores.push(driven_node(volume.path(), &root).await);
         all_keys.push(keys);
     }
 
@@ -214,8 +199,19 @@ async fn two_drivers_on_one_volume_do_not_copy_at_the_same_time() {
         "node {waiting} copied while node {copier} held the volume"
     );
 
-    // And the one that has it finishes.
+    // And the one that has it finishes copying, checking on every tick that the other has
+    // still not started. The window being watched is the whole of the first node's copy
+    // rather than its two ends.
+    //
+    // Copying is as far as this one goes. Retirement is gated behind hours of wall clock
+    // that a test has no business waiting out, so whether the lock spans that half too has
+    // its own test below.
     for _ in 0..600 {
+        assert_eq!(
+            stores[waiting].legacy_only_keys().len(),
+            CHUNKS,
+            "node {waiting} copied while node {copier} still held the volume"
+        );
         if stores[copier].legacy_only_keys().is_empty() {
             break;
         }
@@ -230,20 +226,168 @@ async fn two_drivers_on_one_volume_do_not_copy_at_the_same_time() {
         stores[copier].legacy_only_keys().is_empty(),
         "the node holding the volume did not finish copying"
     );
-    let keys = &all_keys[copier];
+    // Both of them, not just the one that went first. Counting only the copier would pass
+    // for a node that had picked up its neighbour's chunks as well as its own.
+    for (node, store) in stores.iter().enumerate() {
+        holds_exactly_its_own(store, node, &all_keys[node]).await;
+    }
+}
+
+/// A node set up to be driven by `migration::run` on a shared volume.
+async fn driven_node(volume: &Path, root: &Path) -> Arc<ChunkStore> {
+    let mut config = ChunkStoreConfig {
+        root_dir: root.to_path_buf(),
+        disk_reserve: 0,
+        ..ChunkStoreConfig::default()
+    };
+    config.migration.tick_secs = 1;
+    config.migration.copier_throttle_mib_per_sec = 0;
+    config.migration.copier_slack_mb = 0;
+    // Small enough that copying takes several ticks, so there is a window in which the
+    // other node could misbehave and be caught, and large enough that the whole thing
+    // finishes in seconds rather than one chunk per tick.
+    config.migration.batch_chunks = 8;
+    config.migration.lock_dir = Some(volume.to_path_buf());
+    Arc::new(ChunkStore::new(config).await.expect("open a node"))
+}
+
+/// Every chunk this node seeded is still served, and nothing else is.
+async fn holds_exactly_its_own(store: &ChunkStore, node: usize, keys: &[[u8; 32]]) {
     assert_eq!(
-        stores[copier].current_chunks().expect("count") as usize,
+        store.current_chunks().expect("count") as usize,
         keys.len(),
-        "a node must hold its own chunks and only its own"
+        "node {node} must hold its own chunks and only its own"
     );
     for (n, key) in keys.iter().enumerate() {
-        let served = stores[copier]
+        let served = store
             .get(key)
             .await
             .expect("read")
             .expect("every chunk this node seeded must still be here");
-        assert_eq!(served, chunk_bytes(copier, n), "chunk {n} is wrong");
+        assert_eq!(
+            served,
+            chunk_bytes(node, n),
+            "node {node} chunk {n} is wrong"
+        );
     }
+}
+
+/// A node waits for the volume before it retires, not only before it copies.
+///
+/// The driver is documented as holding the volume from the first copy through retirement
+/// and not handing it back in between. The test above covers the copying half. This one
+/// covers the other, which is the half that matters most: retiring means re-reading every
+/// chunk in the store to verify it and then deleting an environment, so it is the heaviest
+/// the disk gets. A driver that took the lock only for copying would run that pass while
+/// eleven neighbours ran theirs.
+///
+/// Shaped the same way as the copying test, and for the same reason: an outsider holds the
+/// volume first, so the answer does not depend on catching a short window. The node is put
+/// in the phase where retirement is the next thing it would do, and then watched for not
+/// doing it.
+#[tokio::test]
+async fn a_node_waits_for_the_volume_before_it_retires() {
+    let volume = TempDir::new().expect("temp dir");
+    let root = volume.path().join("node-0");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let keys = seed_legacy(&root, 0).await;
+
+    let store = ready_to_retire(volume.path(), &root, &keys).await;
+    let shutdown = CancellationToken::new();
+
+    let LockAttempt::Acquired(held) =
+        VolumeLock::try_acquire(&volume.path().join("an-outsider"), Some(volume.path()))
+    else {
+        panic!("the outsider must take the lock");
+    };
+
+    let driver = tokio::spawn(migration::run(
+        Arc::clone(&store),
+        offline_context(),
+        shutdown.clone(),
+    ));
+
+    // Several ticks with everything else in place. The environment must still be there.
+    for _ in 0..40 {
+        assert!(
+            store.legacy_dir_is_on_disk(),
+            "the node retired while an outsider held the volume"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Released: now it retires. Without this half the test would pass against a node that
+    // never retires at all, which is the failure the whole migration exists to avoid.
+    drop(held);
+    let mut retired = false;
+    for _ in 0..600 {
+        if !store.legacy_dir_is_on_disk() && !store.has_legacy() {
+            retired = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    shutdown.cancel();
+    let _ = driver.await;
+    assert!(
+        retired,
+        "the node never retired once the volume was free, so it was not waiting for it"
+    );
+
+    // And it still holds everything it had. Retiring is deleting the old copy, not the
+    // chunks.
+    for (n, key) in keys.iter().enumerate() {
+        let served = store
+            .get(key)
+            .await
+            .expect("read")
+            .expect("every chunk must survive retirement");
+        assert_eq!(
+            served,
+            chunk_bytes(0, n),
+            "chunk {n} is wrong after retiring"
+        );
+    }
+}
+
+/// Open a node whose only remaining migration work is to retire.
+///
+/// Copied and committed by hand rather than by waiting for the driver, because the driver
+/// gets here by waiting out the shed hold, which is days. Those gates have their own
+/// tests; what the caller is about to watch is the volume lock.
+async fn ready_to_retire(volume: &Path, root: &Path, keys: &[[u8; 32]]) -> Arc<ChunkStore> {
+    let mut config = ChunkStoreConfig {
+        root_dir: root.to_path_buf(),
+        disk_reserve: 0,
+        ..ChunkStoreConfig::default()
+    };
+    config.migration.tick_secs = 1;
+    config.migration.copier_throttle_mib_per_sec = 0;
+    config.migration.copier_slack_mb = 0;
+    config.migration.lock_dir = Some(volume.to_path_buf());
+    let store = Arc::new(ChunkStore::new(config).await.expect("open a node"));
+
+    store
+        .copy_batch(keys, 0, 0, &CancellationToken::new())
+        .await
+        .expect("copy every chunk");
+    store.wait_idle().await;
+    store.commit_to_files().expect("commit to the file set");
+    store.note_commitment_rebuilt();
+    store.note_commitment_rebuilt();
+    store.force_migration_state(|state| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        // Past the delay that buys the rollback window, so the only thing left between
+        // this node and deleting its environment is the volume.
+        state.committed_at_unix = Some(now.saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
+    });
+    assert!(
+        store.legacy_dir_is_on_disk(),
+        "the environment should still be here before the driver runs"
+    );
+    store
 }
 
 /// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
