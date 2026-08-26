@@ -1189,7 +1189,7 @@ impl ChunkStore {
             // would have the driver log the migration complete over a store that is still
             // there and still holding chunks nothing else can serve.
             if legacy_present(&self.config.root_dir).unwrap_or(true)
-                && !directory_is_retired(&self.legacy_env_dir)
+                && !retirement_mark(&self.legacy_env_dir).permits_removal()
             {
                 return Some(format!(
                     "{} is still on disk but this node has no handle to it. It cannot be \
@@ -1778,7 +1778,7 @@ impl ChunkStore {
     /// Returns whether it came back. Does nothing when there is a handle already, or when
     /// there is nothing on disk to open.
     pub async fn recover_lost_legacy_handle(&self) -> bool {
-        if self.has_legacy() || directory_is_retired(&self.legacy_env_dir) {
+        if self.has_legacy() || !retirement_mark(&self.legacy_env_dir).permits_opening() {
             return false;
         }
         if !legacy_present(&self.config.root_dir).unwrap_or(false) {
@@ -1852,7 +1852,7 @@ impl ChunkStore {
     #[must_use]
     pub fn has_cleanup_pending(&self) -> bool {
         !retired_tombstones(&self.config.root_dir).is_empty()
-            || directory_is_retired(&self.legacy_env_dir)
+            || !retirement_mark(&self.legacy_env_dir).permits_opening()
     }
 
     /// Try again to finish a removal a previous attempt left behind.
@@ -1973,7 +1973,7 @@ impl ChunkStore {
     #[must_use]
     pub fn has_lost_its_legacy_handle(&self) -> bool {
         !self.has_legacy()
-            && !directory_is_retired(&self.legacy_env_dir)
+            && retirement_mark(&self.legacy_env_dir).permits_opening()
             && legacy_present(&self.config.root_dir).unwrap_or(false)
     }
 
@@ -2382,16 +2382,79 @@ fn remove_marked_directory(dir: &Path) -> std::io::Result<()> {
     }
 }
 
+/// What a directory's own contents say about whether it was retired.
+///
+/// Three answers, not two. Reading the mark can fail for reasons that are neither yes nor
+/// no: a permission change, a descriptor limit, a filesystem that has gone away underneath
+/// the node. Folding that into "no" is the failure mode the rest of this file exists to
+/// avoid, and it fails in the worst direction: a retired environment that reads as unmarked
+/// is put back under the live name and reopened, and its keys re-enter a commitment they
+/// have already left.
+///
+/// So an unreadable answer is its own answer, and the two questions callers actually ask
+/// are asked separately. Neither of them treats "cannot tell" as permission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetirementMark {
+    /// The directory carries its mark. It is the remains of a removal.
+    Present,
+    /// The directory carries no mark, and that is known rather than assumed.
+    Absent,
+    /// Whether it carries one could not be determined.
+    Unknown,
+}
+
+impl RetirementMark {
+    /// May this directory be deleted, or treated as already gone?
+    ///
+    /// Only a mark actually read says yes. Deleting on a guess destroys chunks.
+    const fn permits_removal(self) -> bool {
+        matches!(self, Self::Present)
+    }
+
+    /// May this directory be opened and served from?
+    ///
+    /// Only a mark known to be absent says yes. Opening a retired environment puts keys
+    /// back into a commitment they have already left.
+    const fn permits_opening(self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
 /// Has this directory been retired?
 ///
 /// A link is never treated as retired, whatever it points at: the mark would have been
 /// written through it into somebody else's directory, and acting on it would delete
-/// somebody else's data.
-fn directory_is_retired(dir: &Path) -> bool {
-    if is_a_link(dir) {
-        return false;
+/// somebody else's data. A path whose kind cannot be determined is not a link either way,
+/// and is reported as unknown rather than as a link, so that neither question gets a yes.
+fn retirement_mark(dir: &Path) -> RetirementMark {
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) if meta.file_type().is_symlink() => return RetirementMark::Absent,
+        Ok(_) => {}
+        // Nothing here at all, which is the ordinary case on a node that has already
+        // finished or never had a legacy store. There is no mark because there is nothing
+        // to carry one, and that is known rather than undetermined.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RetirementMark::Absent,
+        Err(e) => {
+            warn!(
+                "Could not tell what {} is ({e}); treating it as neither removable nor \
+                 openable until it can be read",
+                dir.display()
+            );
+            return RetirementMark::Unknown;
+        }
     }
-    dir.join(RETIRED_MARKER).try_exists().unwrap_or(false)
+    match dir.join(RETIRED_MARKER).try_exists() {
+        Ok(true) => RetirementMark::Present,
+        Ok(false) => RetirementMark::Absent,
+        Err(e) => {
+            warn!(
+                "Could not read the retirement mark in {} ({e}); treating it as neither \
+                 removable nor openable until it can be read",
+                dir.display()
+            );
+            RetirementMark::Unknown
+        }
+    }
 }
 
 /// Is this path a symbolic link, or something whose kind cannot be determined?
@@ -2411,7 +2474,7 @@ fn is_a_link(path: &Path) -> bool {
 /// a perfectly good environment.
 fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
     let env = root_dir.join(LEGACY_ENV_DIR);
-    if env.try_exists().unwrap_or(false) && directory_is_retired(&env) {
+    if env.try_exists().unwrap_or(false) && retirement_mark(&env).permits_removal() {
         // Its own contents say it was retired, so whatever name it is wearing now, it is
         // the remains of a removal that a power loss undid the rename of.
         warn!(
@@ -2475,7 +2538,7 @@ fn sweep_retired_legacy(root_dir: &Path) {
         // the rename and the mark leaves an intact environment sitting under the retired
         // name, and deleting that because of what it is called would destroy every chunk
         // in it.
-        if directory_is_retired(&tombstone) {
+        if retirement_mark(&tombstone).permits_removal() {
             // The mark is re-established before anything is deleted on the strength of
             // it. A retirement that failed part-way can leave one that was never flushed,
             // and this is the pass that would otherwise act on it thirty seconds after
@@ -3192,7 +3255,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         seed_legacy(&dir, &["unmarked"]).await;
         let env = dir.path().join(LEGACY_ENV_DIR);
-        assert!(!directory_is_retired(&env));
+        assert!(!(retirement_mark(&env) == RetirementMark::Present));
 
         finish_interrupted_retirement(dir.path());
         assert!(
@@ -3245,17 +3308,17 @@ mod tests {
         let original = dir.path().join("chunks.mdb");
         std::fs::create_dir_all(&original).expect("mkdir");
         mark_directory_retired(&original).expect("mark");
-        assert!(directory_is_retired(&original));
+        assert!((retirement_mark(&original) == RetirementMark::Present));
 
         let renamed = dir.path().join("chunks.mdb.retired");
         std::fs::rename(&original, &renamed).expect("rename");
         assert!(
-            directory_is_retired(&renamed),
+            (retirement_mark(&renamed) == RetirementMark::Present),
             "the mark must survive the rename it exists to outlive"
         );
         // And back again, which is what a power loss undoing the rename looks like.
         std::fs::rename(&renamed, &original).expect("rename back");
-        assert!(directory_is_retired(&original));
+        assert!((retirement_mark(&original) == RetirementMark::Present));
     }
 
     /// Losing the handle to an environment that is still there is not completion.
@@ -3298,7 +3361,7 @@ mod tests {
         let env = dir.path().join(LEGACY_ENV_DIR);
         let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
         std::fs::rename(&env, &tombstone).expect("rename");
-        assert!(!directory_is_retired(&tombstone));
+        assert!(!(retirement_mark(&tombstone) == RetirementMark::Present));
 
         let store = open(&dir).await;
         assert!(
@@ -3363,9 +3426,64 @@ mod tests {
 
         assert!(failed, "the deletion was supposed to fail");
         assert!(
-            directory_is_retired(&retired),
+            (retirement_mark(&retired) == RetirementMark::Present),
             "a deletion that failed must leave the mark, or the directory stops saying \
              what it is"
+        );
+    }
+
+    /// A mark that cannot be read is not permission to do anything.
+    ///
+    /// The reason this is three states and not two. Reading the mark can fail for reasons
+    /// that are neither yes nor no, and the old answer for those was "no mark", which is
+    /// the worst of the three: a retired environment reads as live, goes back under its own
+    /// name, and its keys re-enter a commitment they have already left. Deleting on an
+    /// unreadable answer would be just as wrong in the other direction.
+    ///
+    /// Unix only, because taking away the permission to look is how the state is staged.
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_that_cannot_be_read_permits_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().expect("temp dir");
+        let env = dir.path().join(LEGACY_ENV_DIR);
+
+        // Nothing there is not the same as cannot tell, and it is the ordinary case: every
+        // node that never had a legacy store, and every node that has finished with one,
+        // asks this question on every tick. Answering "cannot tell" for those would have a
+        // fresh node run a migration driver forever over a store it does not have.
+        assert_eq!(
+            retirement_mark(&env),
+            RetirementMark::Absent,
+            "a directory that is not there carries no mark, and that is known"
+        );
+        assert!(retirement_mark(&env).permits_opening());
+
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(env.join(RETIRED_MARKER), b"retired").expect("mark");
+        assert_eq!(retirement_mark(&env), RetirementMark::Present);
+
+        // Nothing may look inside any more, so the mark is neither there nor not there.
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let unreadable = retirement_mark(&env);
+
+        // Restored first, so the assertions below cannot leave a directory the test
+        // harness is unable to clean up.
+        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        assert_eq!(
+            unreadable,
+            RetirementMark::Unknown,
+            "a mark that cannot be read must not report as absent"
+        );
+        assert!(
+            !unreadable.permits_removal(),
+            "an unreadable mark must not authorise deleting the environment"
+        );
+        assert!(
+            !unreadable.permits_opening(),
+            "an unreadable mark must not authorise reopening the environment"
         );
     }
 
@@ -3445,7 +3563,7 @@ mod tests {
         // And nothing walks through it, whatever it is marked with.
         std::fs::write(real.join(RETIRED_MARKER), b"x").expect("mark through the link");
         assert!(
-            !directory_is_retired(&dir.path().join(LEGACY_ENV_DIR)),
+            retirement_mark(&dir.path().join(LEGACY_ENV_DIR)) != RetirementMark::Present,
             "a link must never be treated as a retired directory"
         );
         assert!(
@@ -3493,7 +3611,7 @@ mod tests {
         assert!(failed, "the removal was supposed to fail");
         assert!(retired.exists(), "and to leave the directory behind");
         assert!(
-            directory_is_retired(&retired),
+            (retirement_mark(&retired) == RetirementMark::Present),
             "a directory that outlived its deletion must still say what it is"
         );
     }
