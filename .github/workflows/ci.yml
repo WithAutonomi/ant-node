@@ -50,6 +50,25 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests
         run: cargo test --lib --features test-utils
+      # Before the e2e suite, deliberately. These are fast and deterministic, and the e2e
+      # suite flakes on hosted runners for transport reasons that have nothing to do with
+      # storage. A failing step aborts the job, so anything sequenced after a flaky one
+      # never reports, which is how these ran on no platform at all for a whole run.
+      - name: Prove the migration returns disk to the filesystem
+        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
+      - name: Kill a node mid-migration and check what survived
+        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
+      - name: Several nodes migrating on one disk
+        run: cargo test --test migration_shared_volume
+      # Linux only. This one plants a hundred thousand files to measure what a restart
+      # costs, and the answer it is after is a fleet answer, where every node is Linux.
+      # The scan itself reads names and nothing else, which is not a platform-specific
+      # path, and opening a store is covered on all three by the unit tests. Planting that
+      # many files on the Windows runner would cost minutes of every run to re-measure
+      # something no node will ever do there.
+      - name: Startup scan, index memory and inode cost at scale
+        if: runner.os == 'Linux'
+        run: cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1
       - name: Run e2e tests
         run: cargo test --test e2e --features test-utils -- --test-threads=1
       - name: Run v12 storage-bound audit attack PoCs
@@ -60,14 +79,6 @@ jobs:
         run: cargo test --test poc_bootstrap_stall --features test-utils
       - name: Shutdown waits for writes whose caller has gone
         run: cargo test --test poc_shutdown_lmdb_drain --features test-utils
-      - name: Prove the migration returns disk to the filesystem
-        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
-      - name: Kill a node mid-migration and check what survived
-        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
-      - name: Several nodes migrating on one disk
-        run: cargo test --test migration_shared_volume
-      - name: Startup scan, index memory and inode cost at scale
-        run: cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1
 
   # Runs the storage tests against real ext4, XFS and btrfs rather than whatever the
   # runner provides. Deliberately NOT named durability: killing a process and reopening

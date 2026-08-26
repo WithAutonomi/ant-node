@@ -199,11 +199,13 @@ async fn seed_legacy_from(root: &Path, first: usize) -> Vec<(usize, [u8; 32])> {
 
 /// A process killed inside a publish leaves no chunk it cannot serve.
 ///
-/// The child stops with the bytes written to a temporary file and the rename not yet
-/// made, which is the one moment a half-finished chunk exists on disk, and is killed
-/// there. The failure this guards against is a name outliving its bytes: the index is
-/// built from filenames at startup, so a partial file wearing a real chunk name would be
-/// advertised, committed to, and unservable.
+/// The child is stopped at the one moment a half-finished chunk exists on disk. On Unix
+/// that is the bytes written to a temporary file with the rename not yet made; off Unix,
+/// where the store writes under the final name because a rename there carries no
+/// durability guarantee, it is the file created and written but not yet flushed. The
+/// failure this guards against is the same on both: a name outliving its bytes. The index
+/// is built from filenames at startup, so a partial file wearing a real chunk name would
+/// be advertised, committed to, and unservable.
 #[tokio::test]
 async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
     let tmp = TempDir::new().expect("temp dir");
@@ -236,6 +238,14 @@ async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
 ///
 /// It carries no chunk name, so it can never be served, and leaving it would cost disk
 /// for the life of the node.
+///
+/// Unix only, because the leftover only exists on Unix. Off Unix the store creates the
+/// file under its final name and flushes it, deliberately, since a rename there is not
+/// documented to be durable. So there is no temporary file to sweep and the equivalent
+/// hazard is different: a real chunk name over bytes that are short or wrong. That one is
+/// covered by the store's own tests, which run on every platform, and by the
+/// re-hash-everything pass the retirement does before it deletes anything.
+#[cfg(unix)]
 #[tokio::test]
 async fn the_leftovers_of_a_killed_publish_are_swept() {
     let tmp = TempDir::new().expect("temp dir");
@@ -261,6 +271,7 @@ async fn the_leftovers_of_a_killed_publish_are_swept() {
 }
 
 /// How many partly-written files are under `chunks_dir`.
+#[cfg(unix)]
 fn temp_files(chunks_dir: &Path) -> usize {
     let Ok(shards) = std::fs::read_dir(chunks_dir) else {
         return 0;
