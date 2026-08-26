@@ -2501,13 +2501,18 @@ fn is_a_link(path: &Path) -> bool {
 /// a perfectly good environment.
 fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
     let env = root_dir.join(LEGACY_ENV_DIR);
-    let here = env.try_exists().unwrap_or(false);
     // Three answers, three branches. Asking only whether it may be removed and letting
     // everything else fall through would put "cannot tell" back on the opening path, which
     // is the whole failure this is three states to avoid: the mark check can fail for a
     // moment and succeed the next, and the open in between would resurrect a store that
     // really had been retired.
-    if here && retirement_mark(&env) == RetirementMark::Unknown {
+    //
+    // Asked of the mark alone, with no separate "is it there" first. A `try_exists` that
+    // could not answer would have folded straight back into "nothing here" and skipped both
+    // branches below, which is the same fold one level up. The mark already tells the three
+    // apart: a path that is not there carries no mark and says so, and a path that cannot be
+    // reached at all says it cannot be reached.
+    if retirement_mark(&env) == RetirementMark::Unknown {
         error!(
             "{} is under the live name and this node cannot tell whether it was retired. \
              It will NOT be opened and it will NOT be removed. The node serves from files \
@@ -2516,7 +2521,7 @@ fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
         );
         return LiveEnvironment::None;
     }
-    if here && retirement_mark(&env).permits_removal() {
+    if retirement_mark(&env).permits_removal() {
         // Its own contents say it was retired, so whatever name it is wearing now, it is
         // the remains of a removal that a power loss undid the rename of.
         warn!(
