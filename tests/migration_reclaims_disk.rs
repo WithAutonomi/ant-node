@@ -253,8 +253,12 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     // still holds it open keeps its blocks and shows in no directory, so measuring before
     // this point would be measuring the wrong thing.
     drop(store);
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    let free_at_end = free_space(&root);
+
+    // Polled rather than sampled once after a fixed pause. Not every filesystem updates
+    // its accounting the instant a file goes: btrfs in particular defers it, and a single
+    // reading taken too early says the space never came back when it is on its way. The
+    // deadline is what makes this a test rather than a wait.
+    let free_at_end = wait_for_space(&root, free_at_peak + environment_blocks / 2).await;
 
     // Only the file store's copy should be left.
     let left_on_disk = allocated_bytes(&root);
@@ -294,6 +298,22 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
             .expect("read a migrated chunk")
             .expect("a migrated chunk should still be there");
         assert_eq!(served, chunk_bytes(n), "chunk {n} came back wrong");
+    }
+}
+
+/// Wait for the filesystem to report at least `wanted` bytes free, and return what it
+/// reports at the end.
+///
+/// Returns whatever it last saw when the deadline passes, so the caller's assertion is
+/// what fails rather than this helper, and the number in the failure is a real reading.
+async fn wait_for_space(path: &Path, wanted: u64) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let free = free_space(path);
+        if free >= wanted || std::time::Instant::now() > deadline {
+            return free;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 

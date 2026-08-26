@@ -1749,8 +1749,7 @@ fn decode_chunk_name(name: &str) -> Option<XorName> {
 /// # Errors
 ///
 /// Returns the underlying I/O error. Off Unix there is no way to flush a directory through
-/// the standard library, so this reports success without being able to promise anything;
-/// see [`fsync_dir`].
+/// the standard library, so this reports success without being able to promise anything.
 pub fn fsync_path(path: &Path) -> std::io::Result<()> {
     fsync_dir(path)
 }

@@ -102,51 +102,6 @@ fn kill_child_at_failpoint(role: &str, root: &Path, let_through: u64) -> PathBuf
     marker
 }
 
-/// Run a child for a while and then kill it, without a failpoint.
-///
-/// For the cases where the point is that the kill lands somewhere in a long stretch of
-/// work rather than at one named instant. The child reports progress so this never kills
-/// one that has not started.
-fn kill_child_once_it_is_working(role: &str, root: &Path, run_for: Duration) {
-    let progress = root.join(format!("working-{role}"));
-    let _ = std::fs::remove_file(&progress);
-
-    let exe = std::env::current_exe().expect("this test binary");
-    let mut child = Command::new(exe)
-        .arg("--exact")
-        .arg(role)
-        .arg("--nocapture")
-        .arg("--ignored")
-        .env("ANT_CRASH_TEST_ROOT", root)
-        .env("ANT_CRASH_TEST_PROGRESS", &progress)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn the child");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    while !progress.exists() {
-        if let Ok(Some(status)) = child.try_wait() {
-            panic!("the child exited before doing any work: {status}");
-        }
-        if std::time::Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("the child never started working");
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    std::thread::sleep(run_for);
-    child.kill().expect("kill the child");
-    let _ = child.wait();
-}
-
-/// Say that this child has started doing the work it was spawned for.
-fn report_working() {
-    if let Ok(path) = std::env::var("ANT_CRASH_TEST_PROGRESS") {
-        let _ = std::fs::write(path, b"working");
-    }
-}
-
 /// Where the child was told to work.
 fn child_root() -> PathBuf {
     PathBuf::from(std::env::var("ANT_CRASH_TEST_ROOT").expect("the child needs a root"))
@@ -165,14 +120,15 @@ async fn child_writes_until_killed() {
     .await
     .expect("open");
 
-    report_working();
     // Always a chunk it has not written before, so the kill lands in real work rather
     // than in a re-offer of something already on disk. An earlier version cycled the same
     // hundred keys and spent almost all its time confirming duplicates.
-    for n in 0.. {
+    let mut n = 0usize;
+    loop {
         let content = chunk_bytes(n);
         let address = ant_node::client::compute_address(&content);
         let _ = store.put(&address, &content).await;
+        n += 1;
     }
 }
 
@@ -202,11 +158,6 @@ async fn child_migrates_until_killed() {
             break;
         };
         let _ = store.copy_batch(&[*key], 0, 0, &shutdown).await;
-        // Said only after a copy has actually happened, so a copier that did nothing at
-        // all cannot be mistaken for one that was interrupted part-way.
-        if store.legacy_only_keys().len() < keys.len() {
-            report_working();
-        }
     }
     panic!("the child copied everything before it was killed, so nothing was interrupted");
 }
@@ -352,11 +303,11 @@ async fn a_killed_migration_still_has_every_chunk_somewhere() {
     std::fs::create_dir_all(&root).expect("mkdir");
     let keys = seed_legacy_from(&root, 0).await;
 
-    kill_child_once_it_is_working(
-        "child_migrates_until_killed",
-        &root,
-        Duration::from_millis(150),
-    );
+    // Ten chunks copied, the eleventh interrupted. An earlier version killed the child
+    // after a fixed delay, which on a fast runner meant it had copied everything and on a
+    // slow one meant it had copied nothing; both make this test say something other than
+    // what it claims.
+    kill_child_at_failpoint("child_migrates_until_killed", &root, 10);
 
     // Interrupted, which is two claims and not one: some chunks copied, and some not.
     // Only the upper bound was checked before, so a copier that did nothing at all passed
