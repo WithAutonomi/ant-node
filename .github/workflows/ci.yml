@@ -154,6 +154,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build release (no logging)
         run: cargo build --release --no-default-features
+      # The crash harness drives the store through a failpoint that parks the process
+      # forever on an environment variable. It is compiled only under `test-utils`, which
+      # is not a default feature and is not passed by the release workflow, so a shipped
+      # binary does not contain it. This proves that rather than trusting it: the variable
+      # name is a string literal, so it survives into the binary whenever the code that
+      # reads it is compiled, and its absence is the absence of the failpoint.
+      - name: A shipped binary carries no failpoint
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          cargo build --bin ant-node
+          found=$(strings -a target/debug/ant-node | grep -c 'ANT_HALT_BEFORE_PUBLISH' || true)
+          # With --features test-utils this count is 1, which is what makes a count of 0
+          # here evidence rather than an accident of how the binary was stripped.
+          if [ "$found" != "0" ]; then
+            echo "the publish failpoint is compiled into a default-feature build"
+            exit 1
+          fi
+          echo "no failpoint in a default-feature build"
 
   test-no-logging:
     name: Test (no logging)

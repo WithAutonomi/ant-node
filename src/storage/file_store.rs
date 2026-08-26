@@ -2436,6 +2436,16 @@ fn publish(
 /// the pre-retirement pass re-hashes everything before anything is deleted.
 #[cfg(not(unix))]
 fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
+    // Test-only, and here rather than after the write so that it means the same thing on
+    // both platforms: the file half of a dual write has not happened yet. On Unix the
+    // equivalent point is the temporary file written and the rename not yet made, which is
+    // also before the chunk's name exists on disk. Stopping after the write instead would
+    // put the file under its real name already, so a crash there is not between the two
+    // halves at all, and it could not demonstrate anything about the missing flush either:
+    // killing a process does not empty the page cache, so the bytes are still there to be
+    // read. Only losing power loses them, which no test that kills a process can stage.
+    #[cfg(any(test, feature = "test-utils"))]
+    halt_here_if_asked(HALT_BEFORE_PUBLISH, final_path);
     let mut file = match OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2460,11 +2470,6 @@ fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
             final_path.display()
         )));
     }
-    // Test-only: here the chunk is under its final name and not yet flushed, which is
-    // this platform's equivalent of the unflushed rename above, and the case the
-    // length-comparing duplicate check exists for.
-    #[cfg(any(test, feature = "test-utils"))]
-    halt_here_if_asked(HALT_BEFORE_PUBLISH, final_path);
     if let Err(e) = file.sync_all() {
         drop(file);
         let _ = std::fs::remove_file(final_path);

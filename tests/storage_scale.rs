@@ -32,12 +32,16 @@ use tempfile::TempDir;
 /// Keys to plant unless told otherwise.
 const DEFAULT_KEYS: usize = 100_000;
 
-/// The longest a cold scan of `DEFAULT_KEYS` may take before this is a regression.
+/// The longest a cold scan may take per chunk before this is a regression.
 ///
-/// Measured at about 1.5 seconds cold for 250,000 files on a developer machine. Ten
-/// times that for less than half the files leaves room for a slow shared runner while
-/// still catching a scan that has gone from linear to something worse.
-const SCAN_CEILING: Duration = Duration::from_secs(30);
+/// Measured at 1,019 ns per key for 100,000 keys on a hosted CI runner. Fifty times that
+/// leaves a slow, loaded, shared runner room to be slow while still catching a scan that
+/// has gone from linear to something worse: the whole 100,000-key budget is five seconds
+/// against a hundred milliseconds measured.
+///
+/// Per key rather than a flat number, so that raising `ANT_SCALE_KEYS` for a larger run
+/// raises the allowance with it instead of turning the gate into a coin toss.
+const SCAN_CEILING_PER_KEY: Duration = Duration::from_micros(50);
 
 /// How many keys this run should plant.
 fn key_count() -> usize {
@@ -131,9 +135,11 @@ async fn opening_a_large_store_stays_quick() {
          ({per_key_ns} ns/key), resident growth {growth}"
     );
 
+    let ceiling = SCAN_CEILING_PER_KEY * u32::try_from(keys).unwrap_or(u32::MAX);
     assert!(
-        scan < SCAN_CEILING,
-        "scanning {keys} chunks took {scan:?}, over the {SCAN_CEILING:?} ceiling"
+        scan < ceiling,
+        "scanning {keys} chunks took {scan:?} ({per_key_ns} ns/key), over the {ceiling:?} \
+         ceiling"
     );
 }
 
@@ -299,11 +305,21 @@ async fn the_startup_scan_does_not_read_chunk_contents() {
     );
     assert_eq!(store.current_chunks().expect("count") as usize, keys);
 
-    // The scan reads names and the layout marker. A hundredth of the payload is far above
-    // that and far below anything that could be reading chunks.
+    // Fixed, deliberately, and not a fraction of the payload. A fraction grows with the
+    // store, so it would keep permitting a per-chunk read as long as the chunks were big
+    // enough: at these sizes a hundredth of the payload allowed 655 bytes per chunk, which
+    // is a header read of every file in the store passing a test named for not doing that.
+    //
+    // A scan that reads names reads the same handful of bytes whatever the store holds.
+    // Measured at 125 bytes for 3,000 chunks on a hosted runner, which is the layout marker
+    // and nothing else. 64 KiB is five hundred times that and still under 22 bytes per
+    // chunk here, so any read that is per-chunk at all fails, and fails harder the larger
+    // the run.
+    const SCAN_READ_CEILING: u64 = 64 * 1024;
     assert!(
-        read < payload / 100,
-        "the scan read {read} bytes of a {payload} byte store, so it is reading contents"
+        read < SCAN_READ_CEILING,
+        "the scan read {read} bytes of a {payload} byte store, over the \
+         {SCAN_READ_CEILING} byte ceiling, so it is reading contents"
     );
 }
 

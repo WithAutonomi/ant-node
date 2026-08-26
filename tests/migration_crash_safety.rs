@@ -199,13 +199,13 @@ async fn seed_legacy_from(root: &Path, first: usize) -> Vec<(usize, [u8; 32])> {
 
 /// A process killed inside a publish leaves no chunk it cannot serve.
 ///
-/// The child is stopped at the one moment a half-finished chunk exists on disk. On Unix
-/// that is the bytes written to a temporary file with the rename not yet made; off Unix,
-/// where the store writes under the final name because a rename there carries no
-/// durability guarantee, it is the file created and written but not yet flushed. The
-/// failure this guards against is the same on both: a name outliving its bytes. The index
-/// is built from filenames at startup, so a partial file wearing a real chunk name would
-/// be advertised, committed to, and unservable.
+/// The child is stopped at the last moment before the chunk's name exists on disk: on Unix
+/// the bytes written to a temporary file with the rename not yet made, off Unix the point
+/// before the file is created at all, since that platform writes under the final name
+/// because a rename there carries no durability guarantee. The failure this guards against
+/// is the same on both: a name outliving its bytes. The index is built from filenames at
+/// startup, so a partial file wearing a real chunk name would be advertised, committed to,
+/// and unservable.
 #[tokio::test]
 async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
     let tmp = TempDir::new().expect("temp dir");
