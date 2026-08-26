@@ -617,9 +617,9 @@ let harness = TestHarness::setup_with_evm().await?;
 assert!(harness.anvil().is_healthy().await);
 ```
 
-For the direct-browser testnet, where every node exposes WebTransport and a
+For the direct-browser testnet, where every node exposes WebRTC Direct and a
 default immutable file is published at startup, see
-[Browser-enabled local testnet](docs/WEBTRANSPORT_TESTNET.md).
+[Browser-enabled local testnet](docs/WEBRTC_DIRECT_TESTNET.md).
 
 ### Roadmap
 

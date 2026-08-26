@@ -28,20 +28,19 @@ pub struct Cli {
     #[arg(long, env = "ANT_IPV4_ONLY")]
     pub ipv4_only: bool,
 
-    /// Enable the ADR-0009 WebTransport `PoC` on this UDP address.
+    /// Enable the ADR-0009 WebRTC Direct `PoC` on this UDP address.
     ///
-    /// The binary must be built with `--features webtransport-poc`.
-    #[arg(long, env = "ANT_WEBTRANSPORT_BIND")]
-    pub webtransport_bind: Option<SocketAddr>,
+    /// The binary must be built with `--features webrtc-direct`.
+    #[arg(long, env = "ANT_WEBRTC_DIRECT_BIND")]
+    pub webrtc_direct_bind: Option<SocketAddr>,
 
-    /// Public WebTransport URL to advertise instead of deriving it from the bind address.
-    #[arg(long, env = "ANT_WEBTRANSPORT_ADVERTISED_URL")]
-    pub webtransport_advertised_url: Option<String>,
-
-    /// Exact browser Origin allowed to open a WebTransport session.
-    /// May be supplied more than once.
-    #[arg(long = "webtransport-origin", env = "ANT_WEBTRANSPORT_ORIGINS")]
-    pub webtransport_origins: Vec<String>,
+    /// Literal public UDP address to advertise instead of the bind address.
+    #[arg(
+        long,
+        env = "ANT_WEBRTC_DIRECT_ADVERTISED_ADDR",
+        requires = "webrtc_direct_bind"
+    )]
+    pub webrtc_direct_advertised_addr: Option<SocketAddr>,
 
     /// Bootstrap peer addresses.
     #[arg(long, short, env = "ANT_BOOTSTRAP")]
@@ -245,15 +244,12 @@ impl Cli {
 
         config.port = self.port;
         config.ipv4_only = self.ipv4_only;
-        if let Some(bind) = self.webtransport_bind {
-            config.webtransport.enabled = true;
-            config.webtransport.bind = bind;
+        if let Some(bind) = self.webrtc_direct_bind {
+            config.webrtc_direct.enabled = true;
+            config.webrtc_direct.bind = bind;
         }
-        if let Some(url) = self.webtransport_advertised_url {
-            config.webtransport.advertised_url = Some(url);
-        }
-        if !self.webtransport_origins.is_empty() {
-            config.webtransport.allowed_origins = self.webtransport_origins;
+        if let Some(addr) = self.webrtc_direct_advertised_addr {
+            config.webrtc_direct.advertised_addr = Some(addr);
         }
         #[cfg(feature = "logging")]
         {

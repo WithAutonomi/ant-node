@@ -88,10 +88,10 @@ async fn main() -> color_eyre::Result<()> {
         config.stabilization_timeout = std::time::Duration::from_secs(timeout_secs);
     }
 
-    #[cfg(not(feature = "webtransport-poc"))]
-    if cli.webtransport {
+    #[cfg(not(feature = "webrtc-direct"))]
+    if cli.webrtc_direct {
         return Err(color_eyre::eyre::eyre!(
-            "--webtransport requires a binary built with --features webtransport-poc"
+            "--webrtc-direct requires a binary built with --features webrtc-direct"
         ));
     }
 
@@ -107,14 +107,9 @@ async fn main() -> color_eyre::Result<()> {
         ));
     }
     config.advertise_ip = cli.host;
-    config.webtransport = cli.webtransport;
-    if let Some(base_port) = cli.webtransport_base_port {
-        config.webtransport_base_port = base_port;
-    }
-    if !cli.webtransport_origins.is_empty() {
-        config.webtransport_allowed_origins = cli.webtransport_origins.clone();
-    } else if let Some(host) = cli.host {
-        config.webtransport_allowed_origins = vec![format!("http://{host}:5173")];
+    config.webrtc_direct = cli.webrtc_direct;
+    if let Some(base_port) = cli.webrtc_direct_base_port {
+        config.webrtc_direct_base_port = base_port;
     }
     let ResolvedEvm {
         manifest: evm_info,
@@ -126,8 +121,8 @@ async fn main() -> color_eyre::Result<()> {
 
     let created_at = chrono::Utc::now().to_rfc3339();
 
-    #[cfg(feature = "webtransport-poc")]
-    let browser_manifest = if cli.webtransport {
+    #[cfg(feature = "webrtc-direct")]
+    let browser_manifest = if cli.webrtc_direct {
         let (name, content_type, content) = load_public_file(cli.public_file.as_deref()).await?;
         let public_file = devnet
             .publish_public_file(name, content_type, &content)
@@ -144,7 +139,7 @@ async fn main() -> color_eyre::Result<()> {
         None
     };
 
-    #[cfg(not(feature = "webtransport-poc"))]
+    #[cfg(not(feature = "webrtc-direct"))]
     let browser_manifest: Option<BrowserDevnetManifest> = None;
 
     let manifest = DevnetManifest {
@@ -172,7 +167,7 @@ async fn main() -> color_eyre::Result<()> {
     // copying files (GET /api/devnet-manifest.json + /api/info).
     let serve_port = cli
         .serve_port
-        .or_else(|| cli.webtransport.then_some(25_000));
+        .or_else(|| cli.webrtc_direct.then_some(25_000));
     if let Some(port) = serve_port {
         serve_manifest_api(
             port,
@@ -191,7 +186,7 @@ async fn main() -> color_eyre::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "webtransport-poc")]
+#[cfg(feature = "webrtc-direct")]
 async fn load_public_file(
     path: Option<&std::path::Path>,
 ) -> color_eyre::Result<(String, String, Vec<u8>)> {

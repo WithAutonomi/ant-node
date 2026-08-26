@@ -1111,7 +1111,7 @@ impl PaymentVerifier {
     /// is handed to a browser. The subsequent PUT still traverses the normal
     /// address, responsibility, payment-cache, storage, and read-verification
     /// checks.
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
     pub(crate) fn cache_insert_browser_devnet_seed(&self, xorname: XorName) {
         self.cache.insert(xorname);
     }

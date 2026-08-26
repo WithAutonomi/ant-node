@@ -49,26 +49,21 @@ pub struct Cli {
     #[arg(long)]
     pub manifest: Option<PathBuf>,
 
-    /// Enable one direct-browser WebTransport listener per devnet node.
+    /// Enable one direct-browser WebRTC Direct listener per devnet node.
     ///
-    /// The binary must be built with `--features webtransport-poc`.
+    /// The binary must be built with `--features webrtc-direct`.
     #[arg(long, requires = "evm-payment")]
-    pub webtransport: bool,
+    pub webrtc_direct: bool,
 
-    /// First UDP port assigned to devnet WebTransport listeners (0 = allocate).
-    #[arg(long, requires = "webtransport")]
-    pub webtransport_base_port: Option<u16>,
-
-    /// Exact browser Origin accepted by WebTransport listeners.
-    /// May be supplied more than once. Defaults to the local Vite origins.
-    #[arg(long = "webtransport-origin", requires = "webtransport")]
-    pub webtransport_origins: Vec<String>,
+    /// First UDP port assigned to devnet WebRTC Direct listeners (0 = allocate).
+    #[arg(long, requires = "webrtc_direct")]
+    pub webrtc_direct_base_port: Option<u16>,
 
     /// File to publish into the devnet on startup.
     ///
     /// When omitted, a built-in text file is published. The resulting BLAKE3
     /// address is included in the browser manifest.
-    #[arg(long, requires = "webtransport")]
+    #[arg(long, requires = "webrtc_direct")]
     pub public_file: Option<PathBuf>,
 
     /// Enable logging output.
@@ -125,7 +120,7 @@ mod tests {
         assert!(cli.host.is_none());
         assert!(cli.evm_network.is_none());
         assert!(cli.serve_port.is_none());
-        assert!(!cli.webtransport);
+        assert!(!cli.webrtc_direct);
     }
 
     /// The LAN flags parse into the expected typed values.
@@ -165,25 +160,25 @@ mod tests {
     }
 
     #[test]
-    fn browser_flags_require_webtransport() {
+    fn browser_flags_require_webrtc_direct() {
         assert!(Cli::try_parse_from(["ant-devnet", "--public-file", "hello.txt"]).is_err());
 
         let cli = Cli::parse_from([
             "ant-devnet",
-            "--webtransport",
+            "--webrtc-direct",
             "--enable-evm",
-            "--webtransport-base-port",
+            "--webrtc-direct-base-port",
             "22000",
             "--public-file",
             "hello.txt",
         ]);
-        assert!(cli.webtransport);
-        assert_eq!(cli.webtransport_base_port, Some(22_000));
+        assert!(cli.webrtc_direct);
+        assert_eq!(cli.webrtc_direct_base_port, Some(22_000));
     }
 
     #[test]
     fn browser_uploads_require_an_explicit_payment_network() {
-        let result = Cli::try_parse_from(["ant-devnet", "--webtransport"]);
+        let result = Cli::try_parse_from(["ant-devnet", "--webrtc-direct"]);
         assert!(result.is_err());
         let rendered = result
             .err()
