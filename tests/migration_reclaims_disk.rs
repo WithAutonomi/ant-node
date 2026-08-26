@@ -263,6 +263,7 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     // Only the file store's copy should be left.
     let left_on_disk = allocated_bytes(&root);
     let file_store_blocks = allocated_bytes(&root.join("chunks"));
+    let recovered = free_at_end.saturating_sub(free_at_peak);
     assert!(
         left_on_disk <= file_store_blocks + (payload / 10),
         "something other than the file store is still using disk: {left_on_disk} total \
@@ -272,19 +273,28 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     // And the filesystem agrees, measured against the peak rather than against a guess.
     // Retiring should hand back most of what the environment was occupying, which makes
     // this a statement about the environment's own size rather than about the payload.
-    let recovered = free_at_end.saturating_sub(free_at_peak);
     assert!(
         recovered > environment_blocks / 2,
         "retiring recovered {recovered} bytes of an environment occupying \
          {environment_blocks}"
     );
 
-    // And what is left costs roughly one copy rather than two.
+    // And what is left costs roughly one copy rather than two, measured against what the
+    // file store actually occupies rather than against what the environment did. The two
+    // are not interchangeable: how much a filesystem spends on four hundred small files
+    // against one large one is its own business, and btrfs in particular charges very
+    // differently for the two. Printed as well as asserted, so a number that is drifting
+    // shows up in the log before it trips anything.
     let consumed = free_at_start.saturating_sub(free_at_end);
+    println!(
+        "reclaim: environment {environment_blocks} bytes, file store {file_store_blocks}, \
+         peak cost {}, end cost {consumed}, recovered {recovered}",
+        free_at_start.saturating_sub(free_at_peak)
+    );
     assert!(
-        consumed < environment_blocks,
-        "the filesystem is still down {consumed} bytes against an environment of \
-         {environment_blocks}, so its space did not come back"
+        consumed < file_store_blocks + environment_blocks / 2,
+        "the filesystem is still down {consumed} bytes with only {file_store_blocks} of \
+         file store to account for it, so the environment's space did not come back"
     );
 
     // Every chunk is still served, read back through a store opened from scratch, which
