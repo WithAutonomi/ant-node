@@ -58,14 +58,16 @@ jobs:
         run: cargo test --test poc_audit_handler_live --features test-utils
       - name: Run bootstrap-stall PoC regression marker
         run: cargo test --test poc_bootstrap_stall --features test-utils
+      - name: Shutdown waits for writes whose caller has gone
+        run: cargo test --test poc_shutdown_lmdb_drain --features test-utils
       - name: Prove the migration returns disk to the filesystem
-        run: cargo test --test migration_reclaims_disk --features test-utils
+        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
       - name: Kill a node mid-migration and check what survived
         run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
       - name: Several nodes migrating on one disk
         run: cargo test --test migration_shared_volume
       - name: Startup scan, index memory and inode cost at scale
-        run: cargo test --test storage_scale --features test-utils -- --nocapture
+        run: cargo test --test storage_scale --features test-utils -- --nocapture --test-threads=1
 
   # Runs the storage tests against real ext4, XFS and btrfs rather than whatever the
   # runner provides. Deliberately NOT named durability: killing a process and reopening
@@ -106,7 +108,7 @@ jobs:
       - name: The migration returns disk on ${{ matrix.fs }}
         env:
           TMPDIR: /mnt/antfs
-        run: cargo test --test migration_reclaims_disk --features test-utils
+        run: cargo test --test migration_reclaims_disk --features test-utils -- --test-threads=1
       - name: A node killed mid-write on ${{ matrix.fs }} loses nothing
         env:
           TMPDIR: /mnt/antfs

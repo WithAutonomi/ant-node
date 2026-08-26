@@ -140,17 +140,25 @@ fn migrating_config(root: &Path) -> ChunkStoreConfig {
 /// Drives the steps the driver would, rather than running the driver, so the test does
 /// not depend on wall-clock gates it has no business waiting for. The gates themselves
 /// are covered by their own tests; what this one is about is the disk.
-async fn migrate_and_retire(store: &Arc<ChunkStore>, keys: &[[u8; 32]]) -> u64 {
-    let shutdown = CancellationToken::new();
-
+async fn copy_everything(store: &Arc<ChunkStore>, keys: &[[u8; 32]]) {
     store
-        .copy_batch(keys, 0, 0, &shutdown)
+        .copy_batch(keys, 0, 0, &CancellationToken::new())
         .await
         .expect("copy every chunk into the file store");
     assert!(
         store.legacy_only_keys().is_empty(),
         "every chunk should have been copied"
     );
+    store.wait_idle().await;
+}
+
+/// Take an already-copied store through retirement, returning the bytes it freed.
+///
+/// Separate from the copying so a caller can measure the disk in between, at the peak
+/// where both stores hold everything. That is the moment a node is most at risk of
+/// filling up, and measuring only the ends would miss it.
+async fn retire(store: &Arc<ChunkStore>) -> u64 {
+    let shutdown = CancellationToken::new();
 
     store
         .commit_to_files()
@@ -215,7 +223,16 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     );
     assert!(store.has_legacy());
 
-    let freed = migrate_and_retire(&store, &keys).await;
+    // Both stores hold everything: the peak, and the moment a node is most at risk of
+    // filling its disk.
+    copy_everything(&store, &keys).await;
+    let free_at_peak = free_space(&root);
+    assert!(
+        free_at_peak < free_at_start,
+        "holding both copies should have consumed disk"
+    );
+
+    let freed = retire(&store).await;
     store.wait_idle().await;
     assert_eq!(store.migration_phase(), MigrationPhase::FilesOnly);
     assert!(freed > 0, "retirement reported no bytes freed");
@@ -248,14 +265,22 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
          against {file_store_blocks} in the file store"
     );
 
-    // And the filesystem agrees. Recovering the environment means the end state costs
-    // roughly one copy rather than two, so the space consumed since the start should be
-    // close to the payload and nowhere near twice it.
+    // And the filesystem agrees, measured against the peak rather than against a guess.
+    // Retiring should hand back most of what the environment was occupying, which makes
+    // this a statement about the environment's own size rather than about the payload.
+    let recovered = free_at_end.saturating_sub(free_at_peak);
+    assert!(
+        recovered > environment_blocks / 2,
+        "retiring recovered {recovered} bytes of an environment occupying \
+         {environment_blocks}"
+    );
+
+    // And what is left costs roughly one copy rather than two.
     let consumed = free_at_start.saturating_sub(free_at_end);
     assert!(
-        consumed < payload * 2,
-        "the filesystem lost {consumed} bytes for a {payload} byte payload, so the \
-         environment's space did not come back"
+        consumed < environment_blocks,
+        "the filesystem is still down {consumed} bytes against an environment of \
+         {environment_blocks}, so its space did not come back"
     );
 
     // Every chunk is still served, read back through a store opened from scratch, which

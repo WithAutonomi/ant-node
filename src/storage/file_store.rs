@@ -415,11 +415,35 @@ fn halt_here_if_asked(variable: &str, reached: &Path) {
     let Ok(marker) = std::env::var(variable) else {
         return;
     };
-    let _ = std::fs::write(&marker, reached.as_os_str().as_encoded_bytes());
+    // Let the first few through. A test that stops the very first write leaves a store
+    // with nothing successfully in it, and an assertion over what it holds then passes by
+    // iterating nothing. Letting some land first means the crash happens to a store that
+    // has real chunks in it, which is the situation worth checking.
+    let skip: u64 = std::env::var(HALT_AFTER)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    if HALTS_SEEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel) < skip {
+        return;
+    }
+    if let Err(e) = std::fs::write(&marker, reached.as_os_str().as_encoded_bytes()) {
+        // The parent waits for this file. Saying so on the way past is the difference
+        // between a test that fails and one that hangs until the job times out.
+        eprintln!("failpoint could not write its marker {marker}: {e}");
+        return;
+    }
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
 }
+
+/// How many writes to let through before the failpoint fires.
+#[cfg(any(test, feature = "test-utils"))]
+pub const HALT_AFTER: &str = "ANT_HALT_AFTER";
+
+/// How many times the failpoint has been reached in this process.
+#[cfg(any(test, feature = "test-utils"))]
+static HALTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Clears a write's registration when the work finishes, however it finishes.
 ///

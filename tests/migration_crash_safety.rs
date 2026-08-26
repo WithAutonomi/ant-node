@@ -62,7 +62,7 @@ fn chunk_bytes(n: usize) -> Vec<u8> {
 /// at a failpoint inside the write and says so by writing a marker; this waits for the
 /// marker and then kills it, so the process always dies at the same point in the same
 /// operation.
-fn kill_child_at_failpoint(role: &str, root: &Path, failpoint: &str) -> PathBuf {
+fn kill_child_at_failpoint(role: &str, root: &Path, let_through: u64) -> PathBuf {
     let marker = root.join(format!("reached-{role}"));
     let _ = std::fs::remove_file(&marker);
 
@@ -73,17 +73,26 @@ fn kill_child_at_failpoint(role: &str, root: &Path, failpoint: &str) -> PathBuf 
         .arg("--nocapture")
         .arg("--ignored")
         .env("ANT_CRASH_TEST_ROOT", root)
-        .env(failpoint, &marker)
+        .env(ant_node::storage::file_store::HALT_BEFORE_PUBLISH, &marker)
+        .env(
+            ant_node::storage::file_store::HALT_AFTER,
+            let_through.to_string(),
+        )
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("spawn the child");
 
-    // No deadline. A slow machine makes this slower, not wrong, and a wait that gave up
-    // would let the test pass without ever reaching the case it exists for.
+    // Generous, but not unbounded. Without a deadline a failpoint that stopped working
+    // would hang the job rather than fail it, and a hang says nothing about the code.
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !marker.exists() {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("the child exited before reaching the failpoint: {status}");
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child never reached the failpoint");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -115,9 +124,14 @@ fn kill_child_once_it_is_working(role: &str, root: &Path, run_for: Duration) {
         .spawn()
         .expect("spawn the child");
 
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
     while !progress.exists() {
         if let Ok(Some(status)) = child.try_wait() {
             panic!("the child exited before doing any work: {status}");
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("the child never started working");
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -178,7 +192,6 @@ async fn child_migrates_until_killed() {
     config.migration.lock_dir = Some(root);
     let store = ChunkStore::new(config).await.expect("open");
 
-    report_working();
     let shutdown = tokio_util::sync::CancellationToken::new();
     // One chunk at a time, so the kill lands between two of them rather than after the
     // whole thing. Deliberately no sleep at the end: a child that finished and then idled
@@ -189,12 +202,17 @@ async fn child_migrates_until_killed() {
             break;
         };
         let _ = store.copy_batch(&[*key], 0, 0, &shutdown).await;
+        // Said only after a copy has actually happened, so a copier that did nothing at
+        // all cannot be mistaken for one that was interrupted part-way.
+        if store.legacy_only_keys().len() < keys.len() {
+            report_working();
+        }
     }
     panic!("the child copied everything before it was killed, so nothing was interrupted");
 }
 
 /// Plant a legacy environment holding chunks numbered from `first`, and close it.
-async fn seed_legacy_from(root: &Path, first: usize) -> Vec<[u8; 32]> {
+async fn seed_legacy_from(root: &Path, first: usize) -> Vec<(usize, [u8; 32])> {
     let lmdb = LmdbStorage::new(LmdbStorageConfig {
         root_dir: root.to_path_buf(),
         verify_on_read: true,
@@ -208,7 +226,21 @@ async fn seed_legacy_from(root: &Path, first: usize) -> Vec<[u8; 32]> {
         let content = chunk_bytes(n);
         let address = ant_node::client::compute_address(&content);
         lmdb.put(&address, &content).await.expect("seed");
-        keys.push(address);
+        // Paired with its chunk number, because half of these are about to be deleted and
+        // a bare position in the surviving list no longer says which chunk it is.
+        keys.push((n, address));
+    }
+
+    // Then delete some, which is what makes this look like a real node rather than a
+    // fresh file. The environment is pinned to its current size for the whole migration,
+    // so a write during the bridge lands only if there are free pages to land in. On a
+    // production node there are plenty: this migration exists precisely because deleting
+    // millions of chunks filled the free list and returned nothing to the filesystem.
+    // Seeded and never deleted from, the environment would have no room and the bridge's
+    // second write would never happen, which is not the case worth testing.
+    let discarded: Vec<(usize, [u8; 32])> = keys.drain(..CHUNKS / 2).collect();
+    for (_, address) in &discarded {
+        lmdb.delete(address).await.expect("make room");
     }
     lmdb.wait_idle().await;
     keys
@@ -227,11 +259,10 @@ async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
     let root = tmp.path().join("node");
     std::fs::create_dir_all(&root).expect("mkdir");
 
-    let marker = kill_child_at_failpoint(
-        "child_writes_until_killed",
-        &root,
-        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
-    );
+    // Twenty chunks land before the crash, so the store this reopens has real content in
+    // it. Stopping the very first write would leave nothing indexed and the loop below
+    // would pass by iterating over nothing.
+    let marker = kill_child_at_failpoint("child_writes_until_killed", &root, 20);
     assert!(
         marker.exists(),
         "the child must have reached the failpoint before it was killed"
@@ -260,11 +291,7 @@ async fn the_leftovers_of_a_killed_publish_are_swept() {
     let root = tmp.path().join("node");
     std::fs::create_dir_all(&root).expect("mkdir");
 
-    kill_child_at_failpoint(
-        "child_writes_until_killed",
-        &root,
-        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
-    );
+    kill_child_at_failpoint("child_writes_until_killed", &root, 5);
 
     let before = temp_files(&root.join("chunks"));
     assert!(
@@ -331,20 +358,28 @@ async fn a_killed_migration_still_has_every_chunk_somewhere() {
         Duration::from_millis(150),
     );
 
-    // Interrupted, not finished: some chunks copied, some still only in the environment.
+    // Interrupted, which is two claims and not one: some chunks copied, and some not.
+    // Only the upper bound was checked before, so a copier that did nothing at all passed
+    // as long as everything was still readable from the environment.
     let store = reopen(&root).await;
+    let left = store.legacy_only_keys().len();
     assert!(
-        !store.legacy_only_keys().is_empty(),
+        left > 0,
         "the child was supposed to be killed part-way through, not after finishing"
     );
+    assert!(
+        left < keys.len(),
+        "the child copied nothing, so nothing was interrupted: {left} of {} left",
+        keys.len()
+    );
 
-    for (n, key) in keys.iter().enumerate() {
+    for (n, key) in &keys {
         let served = store
             .get(key)
             .await
             .expect("read after a crash")
             .expect("every seeded chunk must still be readable from one store or the other");
-        assert_eq!(served, chunk_bytes(n), "chunk {n} came back wrong");
+        assert_eq!(served, chunk_bytes(*n), "chunk {n} came back wrong");
     }
 }
 
@@ -367,21 +402,24 @@ async fn a_crash_between_the_two_halves_leaves_the_chunk_on_the_list() {
     // far above anything it reaches in the time it has.
     seed_legacy_from(&root, 1_000_000).await;
 
-    kill_child_at_failpoint(
-        "child_writes_until_killed",
-        &root,
-        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
-    );
+    // The crash lands inside the write of chunk 20, so chunks 0 to 19 completed and 20
+    // is the one caught between the two halves.
+    kill_child_at_failpoint("child_writes_until_killed", &root, 20);
 
     let store = reopen(&root).await;
 
     // Whatever the environment holds and the file store does not is on the list. It is
     // derived at open from the two key sets, which is the property that makes a crash
     // survivable: re-read from disk, never carried across.
+    // The specific key, not merely a non-empty list. The environment was seeded with
+    // unrelated keys, and an earlier version asserted only that something was on the
+    // list, which those seeds satisfied whether or not a dual write had happened at all.
+    let interrupted = ant_node::client::compute_address(&chunk_bytes(20));
     let legacy_only = store.legacy_only_keys();
     assert!(
-        !legacy_only.is_empty(),
-        "the chunk whose file half never landed must be on the copier's list"
+        legacy_only.contains(&interrupted),
+        "the chunk whose file half never landed must be on the copier's list: it reached \
+         the environment and nothing else knows about it"
     );
     for key in &legacy_only {
         let served = store
