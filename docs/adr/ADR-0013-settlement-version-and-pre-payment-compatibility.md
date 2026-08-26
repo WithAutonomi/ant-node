@@ -1,4 +1,4 @@
-# ADR-0010: Settlement version and pre-payment compatibility
+# ADR-0013: Settlement version and pre-payment compatibility
 
 - **Status:** Proposed
 - **Date:** 2026-08-13
@@ -6,7 +6,7 @@
 - **Reviewers:** David Irvine
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** ADR-0008 (storage economics and payment protocol); ant-protocol#23; ant-node#204; ant-client#171
+- **Related:** ADR-0008 (storage economics and payment protocol); ant-protocol#25; ant-node#204; ant-client#171
 
 ## Context
 

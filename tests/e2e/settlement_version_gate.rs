@@ -1,8 +1,8 @@
-//! Live driver for the settlement-version quote gate (ADR-0010).
+//! Live driver for the settlement-version quote gate (ADR-0013).
 //!
 //! Every other test of this gate calls the handler in-process. This one puts
 //! the four cases on a real QUIC connection between two nodes built from this
-//! branch, which is the one thing ADR-0010 records as never having been done:
+//! branch, which is the one thing ADR-0013 records as never having been done:
 //! "the gate itself has never run over a real connection, because the devnet
 //! speaks the pre-versioned dialect".
 //!
