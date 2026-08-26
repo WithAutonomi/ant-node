@@ -158,11 +158,29 @@ Per platform, honestly:
 | APFS | yes | `sync_all` already uses `F_FULLFSYNC` on Apple targets | returns 0, effect undocumented |
 | NTFS | **not documented as atomic** | see below | **no documented way** |
 
-On Windows a node cannot make the rename durable through the standard library at all. The
-content is content-addressed and re-replicable, so the position we take is: accept it,
-detect a missing or corrupt file on read, repair from the network, and **refuse to delete
-the legacy environment on Windows** unless an operator explicitly overrides after
-power-loss testing.
+On Windows a node cannot make the rename durable through the standard library at all. Two
+places in this design used one, and neither does any more.
+
+Publishing a chunk off Unix does not rename: it creates the file under its final name and
+flushes it, which Microsoft documents as flushing the creation metadata with it. The
+content is content-addressed and re-replicable either way, so a file that does not survive
+is detected on read and repaired from the network.
+
+Retirement still renames the environment aside before deleting it, and that rename is not
+durable off Unix. What makes it safe is that **the mark goes inside the directory, not
+beside it**. A power loss that reverts the rename brings the directory back under its live
+name still carrying its mark, and a marked directory under the live name is never opened or
+served from: its chunks are in the file store, which is what the mark records. A loss
+before the mark leaves the directory unmarked under either name, and an unmarked directory
+is always restored and reopened. Every one of those four states has a test.
+
+So the earlier position, that Windows should refuse to delete the legacy environment until
+an operator overrode it, is not what ships. It has been replaced by a mechanism rather than
+by a policy, which is the better answer: a switch nobody turns on is a migration that never
+finishes. `ANT_MIGRATION_RETIRE_LEGACY=0` remains, per node, for an operator who wants to
+hold retirement off one machine, and the forced power-loss run below is still an open fleet
+gate on every platform including this one. What that run is now checking is directory
+creation, which has no portable flush.
 
 ### Retiring LMDB
 
@@ -420,8 +438,10 @@ claimed but does stop retirement; a delete outlasts a write nobody waited for; a
 environment holds that is in neither view refuses the proof and is put back where the gates
 can see it. Each was verified by removing the fix and confirming the test fails.
 
-**Proved in CI, on every commit.** Four harnesses run on Linux, macOS and Windows, and the
-three that touch durability run again on ext4, XFS and btrfs loopback volumes:
+**Proved in CI, on every commit.** The three harnesses that touch durability run on Linux,
+macOS and Windows, and again on ext4, XFS and btrfs loopback volumes. The fourth measures
+what one file per chunk costs at scale, which is a fleet question on a fleet that is Linux,
+so it runs there:
 
 - *The disk comes back.* Free space is sampled from the filesystem three times: before
   anything is written, at the peak where both stores hold everything, and after the
@@ -432,7 +452,11 @@ three that touch durability run again on ext4, XFS and btrfs loopback volumes:
   after a sleep, so the kill lands where a half-finished chunk exists. What the parent then
   checks is that nothing is claimed that cannot be served, that a leftover is swept, and
   that a chunk caught between the environment write and the file write is named on the
-  copier's list rather than lost between them.
+  copier's list rather than lost between them. The same is done to a retirement: a child is
+  killed with the environment renamed aside and marked, nothing yet deleted, which is the
+  most destructive moment in the migration. The next start must finish that deletion and
+  never reopen the directory, because the node has already told the network it serves those
+  chunks from the file store. Refusing to believe the mark fails it.
 - *Nodes sharing a disk take turns.* Two drivers on one volume, driving `migration::run`
   rather than the copier, with the lock held first by an outsider so neither can be observed
   making progress. Held through retirement as well as through copying, which is the heavier
@@ -440,7 +464,13 @@ three that touch durability run again on ext4, XFS and btrfs loopback volumes:
 - *One file per chunk costs what was claimed.* 100,000 chunks, measured rather than
   asserted: the startup scan takes about 100 ms, the index costs 52 bytes per chunk, opening
   the store reads 125 bytes whatever the chunks contain, and `put` writes exactly one
-  directory entry per chunk.
+  directory entry per chunk. The claim underneath the scan's cost, that it reads names and
+  does not `stat` behind each one, is checked against the machine rather than against a
+  number: the same directory is walked twice in the same process, once reading names and
+  once calling `metadata` on every entry, and the scan has to land on the names-only side of
+  the two. A flat ceiling cannot settle that, because one `stat` per entry costs about three
+  times a bare walk and stays well inside any ceiling loose enough not to flake. Adding that
+  `stat` to the scan fails it.
 
 Each of these was checked by mutation: the fix removed, the test confirmed red, the fix
 restored.
