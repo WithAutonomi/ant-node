@@ -206,6 +206,7 @@ impl UpgradeMonitor {
                     &cached_releases,
                     &self.current_version,
                     self.channel,
+                    self.pending_upgrade_version.as_ref(),
                 ));
             }
 
@@ -227,6 +228,7 @@ impl UpgradeMonitor {
                     &cached_releases,
                     &self.current_version,
                     self.channel,
+                    self.pending_upgrade_version.as_ref(),
                 ));
             }
 
@@ -244,6 +246,7 @@ impl UpgradeMonitor {
                 &releases,
                 &self.current_version,
                 self.channel,
+                self.pending_upgrade_version.as_ref(),
             ));
         }
 
@@ -253,6 +256,7 @@ impl UpgradeMonitor {
             &releases,
             &self.current_version,
             self.channel,
+            self.pending_upgrade_version.as_ref(),
         ))
     }
 
@@ -419,6 +423,11 @@ impl UpgradeMonitor {
             return None;
         }
 
+        if is_redundant_beta_promotion(&latest_version, &self.current_version, self.channel) {
+            debug!("Skipping {latest_version}: promotion of the beta already running");
+            return None;
+        }
+
         // Find platform assets
         let binary_asset = find_platform_asset(&release.assets)?;
 
@@ -458,20 +467,67 @@ fn version_matches_channel(version: &Version, channel: UpgradeChannel) -> bool {
 
     match channel {
         UpgradeChannel::Stable => false,
-        UpgradeChannel::Beta => version.pre.as_str().split('.').next() == Some("beta"),
+        UpgradeChannel::Beta => is_beta_prerelease(version),
     }
+}
+
+/// Whether a version's pre-release component marks it as a beta build.
+///
+/// Matches on the exact first identifier, so `0.17.0-beta.1` and `0.17.0-beta` qualify while
+/// `0.17.0-betax.1` does not.
+#[must_use]
+fn is_beta_prerelease(version: &Version) -> bool {
+    version.pre.as_str().split('.').next() == Some("beta")
+}
+
+/// Whether upgrading to `candidate` would only trade a beta build for its own promotion.
+///
+/// Promoting `X.Y.Z-beta.N` to the final `X.Y.Z` re-tags the same code, so a node already running
+/// that beta would swap its binary and restart for no behavioural change. Semver ranks the final
+/// above the pre-release, so without this the hop would happen on every release train, to every
+/// beta node.
+///
+/// Only the matching final is skipped. A genuinely newer final — `0.19.0` while running
+/// `0.18.0-beta.1` — is still taken, so a node does not stagnate if the beta line stalls.
+///
+/// `current` is the build the node is *committed to*, which during a staged rollout is the target
+/// it has already selected rather than the one it is still running. Without that, a node part-way
+/// through its rollout delay for `0.19.0-beta.1` would compare `0.19.0` against the older
+/// `0.18.0-beta.1`, find the cores differ, and take the final instead — so whether a node kept its
+/// beta identity would depend on where its rollout jitter fell.
+///
+/// Beta channel only: a node running a beta build while configured for `stable` should land on the
+/// final, since that is its route back to the stable line.
+#[must_use]
+fn is_redundant_beta_promotion(
+    candidate: &Version,
+    current: &Version,
+    channel: UpgradeChannel,
+) -> bool {
+    channel == UpgradeChannel::Beta
+        && candidate.pre.is_empty()
+        && is_beta_prerelease(current)
+        && (candidate.major, candidate.minor, candidate.patch)
+            == (current.major, current.minor, current.patch)
 }
 
 /// Select the most appropriate upgrade from a list of releases.
 ///
-/// Only versions eligible for the channel are considered; see [`version_matches_channel`].
+/// Only versions eligible for the channel are considered, and a beta node skips the promotion of
+/// the build it is committed to; see `version_matches_channel` and `is_redundant_beta_promotion`.
 ///
 /// Returns the newest version that matches the channel and has platform assets.
 fn select_upgrade_from_releases(
     releases: &[GitHubRelease],
     current_version: &Version,
     channel: UpgradeChannel,
+    pending_version: Option<&Version>,
 ) -> Option<UpgradeInfo> {
+    // The build this node is committed to: the staged-rollout target it has already selected if
+    // there is one, otherwise whatever it is running. Only the redundancy check uses this — the
+    // "is it newer" guard stays on the running version, so a withdrawn pending release cannot
+    // strand the node above everything still published.
+    let committed_version = pending_version.unwrap_or(current_version);
     let mut best: Option<UpgradeInfo> = None;
 
     for release in releases {
@@ -484,6 +540,11 @@ fn select_upgrade_from_releases(
         }
 
         if !version_matches_channel(&version, channel) {
+            continue;
+        }
+
+        if is_redundant_beta_promotion(&version, committed_version, channel) {
+            debug!("Skipping {version}: promotion of the beta already running");
             continue;
         }
 
@@ -1067,7 +1128,8 @@ mod tests {
         ];
 
         let upgrade =
-            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable).unwrap();
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable, None)
+                .unwrap();
         assert_eq!(upgrade.version, Version::new(1, 1, 0));
         assert!(upgrade.download_url.contains("stable"));
     }
@@ -1118,7 +1180,7 @@ mod tests {
         ];
 
         let upgrade =
-            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
         assert_eq!(upgrade.version, Version::parse("1.2.0-beta.1").unwrap());
         assert!(upgrade.download_url.contains("beta"));
     }
@@ -1162,11 +1224,113 @@ mod tests {
         ];
 
         let stable =
-            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable).unwrap();
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable, None)
+                .unwrap();
         assert_eq!(stable.version, Version::parse("0.16.0").unwrap());
 
-        let beta = select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
+        let beta =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
         assert_eq!(beta.version, Version::parse("0.17.0-beta.1").unwrap());
+    }
+
+    /// A beta node does not restart onto the promotion of the build it is already running:
+    /// `0.18.0-beta.1` -> `0.18.0` re-tags the same code.
+    #[test]
+    fn test_select_upgrade_beta_skips_own_promotion() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![release_with_assets("v0.18.0")];
+
+        assert!(
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).is_none(),
+            "beta node should stay on 0.18.0-beta.1 when only its own promotion is published"
+        );
+    }
+
+    /// A node part-way through its staged rollout for `0.19.0-beta.1` holds that target when the
+    /// promoted `0.19.0` appears, instead of being retargeted onto the final.
+    #[test]
+    fn test_select_upgrade_beta_holds_pending_beta_against_its_promotion() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let pending = Version::parse("0.19.0-beta.1").unwrap();
+        let releases = vec![
+            release_with_assets("v0.19.0-beta.1"),
+            release_with_assets("v0.19.0"),
+        ];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, Some(&pending))
+                .unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.19.0-beta.1").unwrap());
+    }
+
+    /// Without a pending target the same release pair resolves to the final: the node is running
+    /// `0.18.0-beta.1`, whose core differs from `0.19.0`, so nothing marks the final redundant.
+    /// This is what makes threading the pending target through necessary.
+    #[test]
+    fn test_select_upgrade_beta_without_pending_takes_the_final() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![
+            release_with_assets("v0.19.0-beta.1"),
+            release_with_assets("v0.19.0"),
+        ];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.19.0").unwrap());
+    }
+
+    /// The skip is narrow: a genuinely newer final is still taken, so a beta node does not
+    /// stagnate if the beta line stalls.
+    #[test]
+    fn test_select_upgrade_beta_takes_newer_final() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![
+            release_with_assets("v0.18.0"),
+            release_with_assets("v0.19.0"),
+        ];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.19.0").unwrap());
+    }
+
+    /// With its own promotion and a newer beta both published, the beta wins and the promotion is
+    /// skipped rather than taken first.
+    #[test]
+    fn test_select_upgrade_beta_prefers_next_beta_over_own_promotion() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![
+            release_with_assets("v0.18.0"),
+            release_with_assets("v0.19.0-beta.1"),
+        ];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.19.0-beta.1").unwrap());
+    }
+
+    /// The skip is beta-channel only. A node running a beta build but configured for stable takes
+    /// the final, since that is its route back onto the stable line.
+    #[test]
+    fn test_select_upgrade_stable_takes_promotion_of_running_beta() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![release_with_assets("v0.18.0")];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Stable, None)
+                .unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.18.0").unwrap());
+    }
+
+    /// A later beta of the same version is still an upgrade — the skip only covers finals.
+    #[test]
+    fn test_select_upgrade_beta_takes_later_beta_of_same_version() {
+        let current = Version::parse("0.18.0-beta.1").unwrap();
+        let releases = vec![release_with_assets("v0.18.0-beta.2")];
+
+        let upgrade =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
+        assert_eq!(upgrade.version, Version::parse("0.18.0-beta.2").unwrap());
     }
 
     /// Ship-and-promote on the same day: a node soaking `0.16.0-beta.1` sees both the promoted
@@ -1179,7 +1343,8 @@ mod tests {
             release_with_assets("v0.17.0-beta.1"),
         ];
 
-        let beta = select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta).unwrap();
+        let beta =
+            select_upgrade_from_releases(&releases, &current, UpgradeChannel::Beta, None).unwrap();
         assert_eq!(beta.version, Version::parse("0.17.0-beta.1").unwrap());
     }
 }
