@@ -378,10 +378,13 @@ enough to the act.
   key count, so a node that has just proved it is short of disk advertises a cheaper quote
   than its close-group peers and then refuses the store on capacity. A wasted round trip
   rather than a mispayment. The fix belongs to the quote path and is a separate decision.
-- **A cancelled awaiter drops the per-key lock while its blocking write runs on.** The two
-  consequences are bounded: a pruned chunk can be re-created, which the pruner deletes
-  again, and a cancelled write can leave an orphan in the legacy store, which retirement
-  removes and whose client was never acknowledged.
+- **A cancelled awaiter drops the per-key lock while its blocking write runs on.** This was
+  accepted as bounded and is no longer accepted: review showed both consequences were worse
+  than they look. The file store now records what it is writing, per key, cleared by the
+  worker rather than the caller, and a delete waits out whatever is already writing its
+  key, so a publish cannot land afterwards and undo a prune. A write into the legacy
+  environment announces itself before it starts and is reconciled against the disk, so a
+  cancelled one cannot leave a chunk that neither view protects.
 
 ### Neutral / Operational
 
