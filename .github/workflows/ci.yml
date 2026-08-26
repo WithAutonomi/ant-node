@@ -223,7 +223,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --bin ant-node
-          found=$(strings -a target/debug/ant-node | grep -c 'ANT_HALT_BEFORE_PUBLISH' || true)
+          found=$(strings -a target/debug/ant-node | grep -c 'ANT_HALT_' || true)
           # With --features test-utils this count is 1, which is what makes a count of 0
           # here evidence rather than an accident of how the binary was stripped.
           if [ "$found" != "0" ]; then

@@ -34,9 +34,15 @@ use tokio_util::sync::CancellationToken;
 /// overhead, so "the file shrank" cannot be an accounting artefact.
 const CHUNKS: usize = 400;
 
-/// Bytes per chunk. Small enough for a hosted runner, large enough that 400 of them are
-/// unmistakable on disk.
-const CHUNK_BYTES: usize = 16 * 1024;
+/// Bytes per chunk.
+///
+/// Sized against the noise, not against the chunk. This test reads what the *filesystem*
+/// says is free, which on a shared runner moves for reasons that have nothing to do with
+/// it: another job's build, a package cache, an indexer. At 16 KiB a chunk the whole
+/// environment came to about 14 MB and the recovery threshold to about 7 MB, which
+/// ordinary runner activity can swallow. At 128 KiB it is an order of magnitude clear of
+/// that, and 400 chunks still write in a few seconds.
+const CHUNK_BYTES: usize = 128 * 1024;
 
 /// Blocks actually allocated under `path`, in bytes, following no links.
 ///
@@ -205,6 +211,13 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     std::fs::create_dir_all(&root).expect("mkdir");
 
     let payload = (CHUNKS * CHUNK_BYTES) as u64;
+    // What the reading drifts by here, with nothing of ours happening. Printed rather
+    // than asserted on: it is what tells whoever reads a failure whether the space did not
+    // come back or the machine was simply busy.
+    let quiet = free_space(&root);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let drift = quiet.abs_diff(free_space(&root));
+
     let free_at_start = free_space(&root);
 
     let keys = seed_legacy_environment(&root).await;
@@ -288,7 +301,8 @@ async fn retiring_the_legacy_environment_returns_its_bytes_to_the_filesystem() {
     let consumed = free_at_start.saturating_sub(free_at_end);
     println!(
         "reclaim: environment {environment_blocks} bytes, file store {file_store_blocks}, \
-         peak cost {}, end cost {consumed}, recovered {recovered}",
+         peak cost {}, end cost {consumed}, recovered {recovered}, ambient drift {drift} \
+         in half a second",
         free_at_start.saturating_sub(free_at_peak)
     );
     assert!(

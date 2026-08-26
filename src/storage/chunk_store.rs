@@ -1727,6 +1727,14 @@ impl ChunkStore {
             )));
         }
 
+        // Test-only: renamed aside and marked, nothing deleted yet. A process killed here
+        // is what the recovery on the next start exists for.
+        #[cfg(any(test, feature = "test-utils"))]
+        crate::storage::file_store::halt_here_if_asked(
+            crate::storage::file_store::HALT_AFTER_RETIRE_MARK,
+            &tombstone,
+        );
+
         if let Err(e) = crate::storage::file_store::fsync_path(&self.config.root_dir) {
             warn!(
                 "The legacy environment was moved aside but {} could not be flushed: {e}. \

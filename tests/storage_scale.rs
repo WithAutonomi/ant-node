@@ -89,6 +89,31 @@ fn plant_chunks(chunks_dir: &Path, count: usize) {
     }
 }
 
+/// Walk every shard under `chunks_dir`, optionally calling `metadata` on each entry.
+///
+/// The control for the assertion above: the same directory, the same process, the same
+/// moment, with and without the one syscall the design says the scan does not make.
+fn walk(chunks_dir: &Path, stat_each: bool) -> Duration {
+    let started = Instant::now();
+    let mut seen = 0usize;
+    if let Ok(shards) = std::fs::read_dir(chunks_dir) {
+        for shard in shards.flatten() {
+            let Ok(entries) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                // Touched so the name is not optimised away, exactly as the scan uses it.
+                seen += entry.file_name().as_encoded_bytes().len();
+                if stat_each {
+                    seen += usize::from(entry.metadata().is_ok());
+                }
+            }
+        }
+    }
+    assert!(seen > 0, "the control walk found nothing to walk");
+    started.elapsed()
+}
+
 /// Resident memory of this process, in bytes, where the platform will say.
 #[cfg(target_os = "linux")]
 fn resident_bytes() -> Option<u64> {
@@ -156,6 +181,33 @@ async fn opening_a_large_store_stays_quick() {
         "scanning {keys} chunks took {scan:?} ({per_key_ns} ns/key), over the {ceiling:?} \
          ceiling"
     );
+
+    // And the scan reads names only, with no `stat` behind each one. That claim is what
+    // the cost above rests on, and a flat ceiling cannot settle it: one `stat` per entry
+    // costs about three times a bare walk, which is still far inside any ceiling loose
+    // enough not to flake on a shared runner.
+    //
+    // Measured against this machine instead of against a number. Two walks of the same
+    // directory in the same process, one reading names and one calling `metadata` on each,
+    // bracket what a scan of this store on this filesystem under this load costs. A scan
+    // that stats every entry lands at the far bracket. Runner speed cancels out, because
+    // it moves all three together.
+    let names_only = walk(&chunks_dir, false);
+    let with_stat = walk(&chunks_dir, true);
+    // Saturating, because a filesystem where a stat costs nothing would otherwise
+    // underflow here. On one of those the midpoint collapses onto the bare walk and this
+    // says little, which is the honest answer for such a filesystem.
+    let midpoint = names_only + with_stat.saturating_sub(names_only) / 2;
+    println!(
+        "scale: bare walk {names_only:?} names only, {with_stat:?} with a stat each, \
+         store scan {scan:?}"
+    );
+    assert!(
+        scan < midpoint,
+        "the scan took {scan:?}, past the {midpoint:?} midpoint between a names-only walk \
+         ({names_only:?}) and one that stats every entry ({with_stat:?}), so it is doing \
+         more per entry than reading a name"
+    );
 }
 
 /// The index costs a bounded amount of memory per chunk.
@@ -163,6 +215,13 @@ async fn opening_a_large_store_stays_quick() {
 /// One inode and one directory entry per chunk is the filesystem's share, and the ADR
 /// accepts it. What it did not measure is the node's own share: an in-memory set of every
 /// address, which is the part that could quietly make a large node unrunnable.
+///
+/// Worth being clear about what this measurement can and cannot catch. `VmRSS` is
+/// process-wide and the allocator reuses what earlier tests freed, so a small regression
+/// can hide in heap that is already resident, and the order tests run in can move the
+/// number. It catches an index that costs several times what it should, which is the
+/// question the ADR left open. It is not a byte-accurate account of one data structure and
+/// is not offered as one.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {

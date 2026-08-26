@@ -62,7 +62,7 @@ fn chunk_bytes(n: usize) -> Vec<u8> {
 /// at a failpoint inside the write and says so by writing a marker; this waits for the
 /// marker and then kills it, so the process always dies at the same point in the same
 /// operation.
-fn kill_child_at_failpoint(role: &str, root: &Path, let_through: u64) -> PathBuf {
+fn kill_child_at_failpoint(role: &str, root: &Path, failpoint: &str, let_through: u64) -> PathBuf {
     let marker = root.join(format!("reached-{role}"));
     let _ = std::fs::remove_file(&marker);
 
@@ -73,7 +73,7 @@ fn kill_child_at_failpoint(role: &str, root: &Path, let_through: u64) -> PathBuf
         .arg("--nocapture")
         .arg("--ignored")
         .env("ANT_CRASH_TEST_ROOT", root)
-        .env(ant_node::storage::file_store::HALT_BEFORE_PUBLISH, &marker)
+        .env(failpoint, &marker)
         .env(
             ant_node::storage::file_store::HALT_AFTER,
             let_through.to_string(),
@@ -197,6 +197,50 @@ async fn seed_legacy_from(root: &Path, first: usize) -> Vec<(usize, [u8; 32])> {
     keys
 }
 
+/// Child mode: retire the legacy environment, and be killed once it is marked.
+///
+/// Everything before the mark is done here rather than in the parent, because the whole
+/// point is that the process that wrote the mark is the one that dies.
+#[tokio::test]
+#[ignore = "child process of a crash test, not run on its own"]
+async fn child_retires_until_killed() {
+    let root = child_root();
+    let store = reopen(&root).await;
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let keys = store.legacy_only_keys();
+    store
+        .copy_batch(&keys, 0, 0, &shutdown)
+        .await
+        .expect("copy every chunk");
+    store.wait_idle().await;
+    store.commit_to_files().expect("commit to the file set");
+    store.note_commitment_rebuilt();
+    store.note_commitment_rebuilt();
+    store.force_migration_state(|state| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        state.committed_at_unix = Some(
+            now.saturating_sub(ant_node::storage::migration::MIN_RETIRE_DELAY_HOURS * 3600 + 60),
+        );
+    });
+
+    let proof = store
+        .verify_before_retire(0, &shutdown)
+        .await
+        .expect("verify before retiring");
+    // Parks inside this call, once the environment is renamed aside and marked.
+    let _ = store
+        .retire_legacy(
+            &proof,
+            &|_: &[u8; 32]| false,
+            &std::collections::BTreeSet::new(),
+        )
+        .await;
+    panic!("the child finished retiring without being killed, so nothing was interrupted");
+}
+
 /// A process killed inside a publish leaves no chunk it cannot serve.
 ///
 /// The child is stopped at the last moment before the chunk's name exists on disk: on Unix
@@ -215,7 +259,12 @@ async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
     // Twenty chunks land before the crash, so the store this reopens has real content in
     // it. Stopping the very first write would leave nothing indexed and the loop below
     // would pass by iterating over nothing.
-    let marker = kill_child_at_failpoint("child_writes_until_killed", &root, 20);
+    let marker = kill_child_at_failpoint(
+        "child_writes_until_killed",
+        &root,
+        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
+        20,
+    );
     assert!(
         marker.exists(),
         "the child must have reached the failpoint before it was killed"
@@ -252,7 +301,12 @@ async fn the_leftovers_of_a_killed_publish_are_swept() {
     let root = tmp.path().join("node");
     std::fs::create_dir_all(&root).expect("mkdir");
 
-    kill_child_at_failpoint("child_writes_until_killed", &root, 5);
+    kill_child_at_failpoint(
+        "child_writes_until_killed",
+        &root,
+        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
+        5,
+    );
 
     let before = temp_files(&root.join("chunks"));
     assert!(
@@ -318,7 +372,12 @@ async fn a_killed_migration_still_has_every_chunk_somewhere() {
     // after a fixed delay, which on a fast runner meant it had copied everything and on a
     // slow one meant it had copied nothing; both make this test say something other than
     // what it claims.
-    kill_child_at_failpoint("child_migrates_until_killed", &root, 10);
+    kill_child_at_failpoint(
+        "child_migrates_until_killed",
+        &root,
+        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
+        10,
+    );
 
     // Interrupted, which is two claims and not one: some chunks copied, and some not.
     // Only the upper bound was checked before, so a copier that did nothing at all passed
@@ -366,7 +425,12 @@ async fn a_crash_between_the_two_halves_leaves_the_chunk_on_the_list() {
 
     // The crash lands inside the write of chunk 20, so chunks 0 to 19 completed and 20
     // is the one caught between the two halves.
-    kill_child_at_failpoint("child_writes_until_killed", &root, 20);
+    kill_child_at_failpoint(
+        "child_writes_until_killed",
+        &root,
+        ant_node::storage::file_store::HALT_BEFORE_PUBLISH,
+        20,
+    );
 
     let store = reopen(&root).await;
 
@@ -400,4 +464,76 @@ async fn a_crash_between_the_two_halves_leaves_the_chunk_on_the_list() {
             hex::encode(key)
         );
     }
+}
+
+/// A retirement killed after the mark is finished on the next start, never reopened.
+///
+/// The most destructive moment in the whole migration. By the time the mark is written the
+/// environment has been renamed aside and the node has already told the network it serves
+/// those chunks from the file store. A start that put the directory back would leave the
+/// node running two stores again with the disk it came here to free still spent; a start
+/// that deleted an *unmarked* directory would destroy a live environment. The mark is what
+/// separates the two, and it is written by the process that then dies.
+///
+/// Its recovery has unit tests that plant the mark by hand. What those cannot show is that
+/// the mark is really on disk at that moment, which is what a killed process settles.
+#[tokio::test]
+async fn a_retirement_killed_after_the_mark_is_finished_not_reopened() {
+    let tmp = TempDir::new().expect("temp dir");
+    let root = tmp.path().join("node");
+    std::fs::create_dir_all(&root).expect("mkdir");
+    let seeded = seed_legacy_from(&root, 0).await;
+
+    kill_child_at_failpoint(
+        "child_retires_until_killed",
+        &root,
+        ant_node::storage::file_store::HALT_AFTER_RETIRE_MARK,
+        0,
+    );
+
+    // The child died with the directory renamed aside and marked. Nothing had been
+    // deleted, so this is the state a power cut would leave behind.
+    let store = reopen(&root).await;
+    for _ in 0..600 {
+        if !store.legacy_dir_is_on_disk() && tombstones(&root) == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !store.legacy_dir_is_on_disk(),
+        "the marked environment was put back rather than finished"
+    );
+    assert_eq!(
+        tombstones(&root),
+        0,
+        "the marked directory is still on disk, so its space was never returned"
+    );
+
+    // And every chunk the environment held is still served, from the file store.
+    for (n, key) in &seeded {
+        let served = store
+            .get(key)
+            .await
+            .expect("read")
+            .expect("a chunk must survive an interrupted retirement");
+        assert_eq!(served, chunk_bytes(*n), "chunk {n} came back wrong");
+    }
+}
+
+/// Directories beside the live environment that a retirement left behind.
+fn tombstones(root: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(ant_node::storage::LEGACY_ENV_DIR))
+        })
+        .count()
 }

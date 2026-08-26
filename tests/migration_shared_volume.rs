@@ -394,10 +394,15 @@ async fn ready_to_retire(volume: &Path, root: &Path, keys: &[[u8; 32]]) -> Arc<C
 /// Two nodes sharing a disk both finish, and neither loses a chunk to the other.
 ///
 /// Run one after the other, which is what the lock produces. What is checked is that the
-/// second node's migration is unaffected by the first having already run on the same
+/// second node's copy is unaffected by the first having already run on the same
 /// filesystem: no shared state, no name collisions, no lock left behind.
+///
+/// Copying only. It drives `copy_batch` rather than the driver, so it says nothing about
+/// retirement and is not named as if it did: disabling retirement altogether would leave
+/// it green. Retirement on a shared volume is
+/// [`a_node_waits_for_the_volume_before_it_retires`].
 #[tokio::test]
-async fn nodes_sharing_a_volume_each_migrate_completely() {
+async fn nodes_sharing_a_volume_do_not_take_each_others_chunks() {
     let volume = TempDir::new().expect("temp dir");
     let shutdown = CancellationToken::new();
 
@@ -473,22 +478,36 @@ async fn a_node_that_cannot_take_the_lock_keeps_serving() {
         panic!("the other node must take the lock");
     };
 
-    let mut config = ChunkStoreConfig {
-        root_dir: root.clone(),
-        disk_reserve: 0,
-        ..ChunkStoreConfig::default()
-    };
-    config.migration.lock_dir = Some(volume.path().to_path_buf());
-    let store = ChunkStore::new(config).await.expect("open");
+    let store = driven_node(volume.path(), &root).await;
+
+    // A real driver, running the whole time. Without one this would say only that a store
+    // opens, and would still pass against a driver that ignored the lock entirely.
+    let shutdown = CancellationToken::new();
+    let driver = tokio::spawn(migration::run(
+        Arc::clone(&store),
+        offline_context(),
+        shutdown.clone(),
+    ));
 
     // The store opens and serves regardless of the lock: only the copier waits for it.
     assert!(store.has_legacy());
-    for (n, key) in keys.iter().enumerate() {
-        let served = store
-            .get(key)
-            .await
-            .expect("read")
-            .expect("a node waiting for the volume still serves everything it holds");
-        assert_eq!(served, chunk_bytes(0, n));
+    for _ in 0..30 {
+        assert_eq!(
+            store.legacy_only_keys().len(),
+            CHUNKS,
+            "the node copied while another held the volume"
+        );
+        for (n, key) in keys.iter().enumerate() {
+            let served = store
+                .get(key)
+                .await
+                .expect("read")
+                .expect("a node waiting for the volume still serves everything it holds");
+            assert_eq!(served, chunk_bytes(0, n));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+
+    shutdown.cancel();
+    let _ = driver.await;
 }
