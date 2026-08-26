@@ -194,6 +194,7 @@ webrtc-direct = [
 ]
 
 [patch.crates-io]
+ant-protocol = { path = "../ant-protocol-web-support" }
 saorsa-core = { path = "../saorsa-core-web-support" }
 saorsa-transport = { path = "../saorsa-transport-web-support" }
 
