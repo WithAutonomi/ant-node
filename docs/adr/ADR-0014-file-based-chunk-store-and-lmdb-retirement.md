@@ -420,6 +420,31 @@ claimed but does stop retirement; a delete outlasts a write nobody waited for; a
 environment holds that is in neither view refuses the proof and is put back where the gates
 can see it. Each was verified by removing the fix and confirming the test fails.
 
+**Proved in CI, on every commit.** Four harnesses run on Linux, macOS and Windows, and the
+three that touch durability run again on ext4, XFS and btrfs loopback volumes:
+
+- *The disk comes back.* Free space is sampled from the filesystem three times: before
+  anything is written, at the peak where both stores hold everything, and after the
+  environment is gone. Unlinking the environment while holding it open, which makes the
+  paths disappear and keeps every block, fails it. This is the claim the whole decision
+  rests on and the one the old store could not meet.
+- *A crash loses nothing.* A child process is killed at a failpoint inside a publish, not
+  after a sleep, so the kill lands where a half-finished chunk exists. What the parent then
+  checks is that nothing is claimed that cannot be served, that a leftover is swept, and
+  that a chunk caught between the environment write and the file write is named on the
+  copier's list rather than lost between them.
+- *Nodes sharing a disk take turns.* Two drivers on one volume, driving `migration::run`
+  rather than the copier, with the lock held first by an outsider so neither can be observed
+  making progress. Held through retirement as well as through copying, which is the heavier
+  half. Removing the lock from either branch of the driver fails these.
+- *One file per chunk costs what was claimed.* 100,000 chunks, measured rather than
+  asserted: the startup scan takes about 100 ms, the index costs 52 bytes per chunk, opening
+  the store reads 125 bytes whatever the chunks contain, and `put` writes exactly one
+  directory entry per chunk.
+
+Each of these was checked by mutation: the fix removed, the test confirmed red, the fix
+restored.
+
 **Fleet gates, which cannot be closed from a workstation:**
 
 - Forced power loss on ext4, XFS, btrfs, APFS and NTFS showing old-or-new, with antivirus
@@ -429,7 +454,18 @@ can see it. Each was verified by removing the fix and confirming the test fails.
   metadata with it. What that leaves unproven is directory creation, which has no portable
   flush, so this run is what closes it. `ANT_MIGRATION_RETIRE_LEGACY=0` holds retirement off
   a node until then, per node, without a separate build.
-- Startup scan, RSS and inode use at 100k, 1M and 10M keys on each filesystem.
+
+  The loopback jobs above do **not** close this and are not offered as doing so. Killing a
+  process and reopening the same mounted filesystem keeps the kernel page cache, so the
+  bytes written before the kill are still there to be read; removing every flush from the
+  publish path would leave those jobs green. What they do cover is the rest of what a
+  filesystem decides: rename behaviour, locking, deletion, and whether the space is actually
+  returned, which btrfs in particular accounts for differently from ext4.
+- Startup scan, RSS and inode use at 1M and 10M keys, and on each filesystem. CI answers
+  100,000 keys on ext4 and prints every number it measures, so drift is visible in the log
+  before it trips a gate; `ANT_SCALE_KEYS` raises the count for a deliberate larger run on a
+  machine with the disk for it. What CI cannot answer is where the curve stops being linear,
+  which is a question about a machine holding ten million files, not about the code.
 - The first release gates on no audit-timeout regression on the quiet responsible lane and on
   disk growth
   matching prediction.
