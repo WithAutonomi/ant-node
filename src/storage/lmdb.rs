@@ -1178,8 +1178,23 @@ impl LmdbStorage {
                 // stops being able to prune after its first assisted delete.
                 // Measured before the ceiling is restored, and before any error
                 // is propagated, so a committed delete is always accounted for.
-                let file_after = env.real_disk_size().unwrap_or(file_before);
-                let grew = file_after.saturating_sub(file_before);
+                //
+                // A measurement that fails is charged the whole slack rather than nothing.
+                // Reading it back as the size before the delete would say the file did not
+                // grow, and a delete that did grow would then spend disk the budget never
+                // saw. Repeat that and the ceiling stops meaning anything. Over-charging
+                // costs at worst one assisted delete; under-charging costs the reserve.
+                let grew = match env.real_disk_size() {
+                    Ok(file_after) => file_after.saturating_sub(file_before),
+                    Err(e) => {
+                        warn!(
+                            "Could not measure the LMDB file after an assisted delete \
+                             ({e}); charging the whole slack rather than assuming it cost \
+                             nothing"
+                        );
+                        DELETE_COW_SLACK
+                    }
+                };
                 if grew > 0 {
                     budget.fetch_add(grew, Ordering::AcqRel);
                 }
@@ -1422,9 +1437,22 @@ fn compute_map_size(db_dir: &Path, reserve: u64) -> Result<usize> {
     let available = fs2::available_space(db_dir)
         .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
 
-    // The MDB data file may not exist yet on first run.
+    // The MDB data file may not exist yet on first run, and that is the only reason to
+    // read zero here. Any other failure is a question that was not answered, and answering
+    // it with zero sizes the map as though the database were empty, which on a node with a
+    // large one is a map far too small to open it.
     let mdb_file = db_dir.join("data.mdb");
-    let current_db_bytes = std::fs::metadata(&mdb_file).map_or(0, |m| m.len());
+    let current_db_bytes = match std::fs::metadata(&mdb_file) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => {
+            return Err(Error::Storage(format!(
+                "Failed to measure {}: {e}. Refusing to size the map as though it were \
+                 empty.",
+                mdb_file.display()
+            )))
+        }
+    };
 
     let target = map_target_bytes(current_db_bytes, available, reserve);
 

@@ -1182,6 +1182,18 @@ impl ChunkStore {
     where
         F: Fn(&XorName) -> bool,
     {
+        // Before anything else, and whether or not there is a handle. An environment this
+        // node cannot classify must not be retired, and asking only on the no-handle path
+        // meant the ordinary path never asked: a node holding its store open went through
+        // every gate, renamed the directory aside and deleted it.
+        if self.legacy_cannot_be_classified() {
+            return Some(format!(
+                "{} cannot be read well enough to say whether it was already retired. \
+                 Nothing will be deleted until it can. Check that the directory and \
+                 anything inside it can be read.",
+                self.legacy_env_dir.display()
+            ));
+        }
         if !self.has_legacy() {
             // No handle is not the same as no environment. A rename that failed and then
             // could not be reopened leaves exactly that: the directory is still on disk
@@ -1998,7 +2010,11 @@ impl ChunkStore {
     pub fn has_lost_its_legacy_handle(&self) -> bool {
         !self.has_legacy()
             && retirement_mark(&self.legacy_env_dir).permits_opening()
-            && legacy_present(&self.config.root_dir).unwrap_or(false)
+            // Conservative in the same direction as the retirement blocker, which reads the
+            // same failure as "there is one". A question that cannot be answered is not an
+            // answer of no, and answering no here left the node holding the shared volume
+            // for the six-hour cap over work no amount of disk will finish.
+            && legacy_present(&self.config.root_dir).unwrap_or(true)
     }
 
     /// Reopen the legacy store after a failed retirement, so the node keeps serving.
@@ -2217,6 +2233,21 @@ fn write_retirement_mark(dir: &Path) -> std::result::Result<(), MarkFailure> {
         // again rather than taken on trust: the attempt that wrote it may have been the
         // one that could not flush it.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Something is already at that name. That it could not be created is not the
+            // same as its being a mark this node can read, and everything downstream
+            // deletes an environment on the strength of it. The rest of this file insists
+            // the name is not the evidence; this is the one place that was taking it.
+            if retirement_mark(dir) != RetirementMark::Present {
+                return Err(MarkFailure {
+                    reason: format!(
+                        "{} already exists but cannot be read as a retirement mark, so it \
+                         is not one this node will delete on. Check what is at that path.",
+                        path.display()
+                    ),
+                    mark_definitely_gone: false,
+                    pre_existing: true,
+                });
+            }
             return crate::storage::file_store::fsync_path(dir).map_err(|flush| MarkFailure {
                 reason: format!(
                     "{} is already there but could not be flushed: {flush}",
@@ -2224,7 +2255,7 @@ fn write_retirement_mark(dir: &Path) -> std::result::Result<(), MarkFailure> {
                 ),
                 mark_definitely_gone: false,
                 pre_existing: true,
-            })
+            });
         }
         Err(e) => {
             return Err(MarkFailure {
@@ -2512,7 +2543,11 @@ fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
     // branches below, which is the same fold one level up. The mark already tells the three
     // apart: a path that is not there carries no mark and says so, and a path that cannot be
     // reached at all says it cannot be reached.
-    if retirement_mark(&env) == RetirementMark::Unknown {
+    // Asked once. Asking twice is asking two different questions: the answer can change
+    // between them, and a second answer of "cannot tell" after a first of "retired" fell
+    // through to opening the very directory the first answer said not to open.
+    let mark = retirement_mark(&env);
+    if mark == RetirementMark::Unknown {
         error!(
             "{} is under the live name and this node cannot tell whether it was retired. \
              It will NOT be opened and it will NOT be removed. The node serves from files \
@@ -2521,7 +2556,7 @@ fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
         );
         return LiveEnvironment::None;
     }
-    if retirement_mark(&env).permits_removal() {
+    if mark.permits_removal() {
         // Its own contents say it was retired, so whatever name it is wearing now, it is
         // the remains of a removal that a power loss undid the rename of.
         warn!(
@@ -3409,6 +3444,48 @@ mod tests {
         );
     }
 
+    /// A node that still holds its store open is gated too.
+    ///
+    /// The classification used to be asked only when there was no handle, which meant the
+    /// ordinary path never asked it: a node holding its environment open went through every
+    /// gate, renamed the directory aside and deleted it, whatever the mark said or failed to
+    /// say. Retirement deletes the last other copy of these chunks, so it is not a question
+    /// to skip because a different question already had an answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_environment_that_cannot_be_classified_blocks_retirement_even_with_a_handle() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["still-open"]).await;
+        let store = open(&dir).await;
+        assert!(
+            store.has_legacy(),
+            "this one keeps its handle, deliberately"
+        );
+        // Whatever else is in the way at this point, it is not this. Compared rather than
+        // required to be nothing, because the other gates have their own tests and their
+        // own reasons to be unmet here.
+        let before = store.retirement_blocker(|_| false).unwrap_or_default();
+        assert!(
+            !before.contains("already retired"),
+            "a readable environment must not be blocked for being unclassifiable: {before}"
+        );
+
+        make_the_mark_unreadable(&dir.path().join(LEGACY_ENV_DIR));
+
+        let blocker = store
+            .retirement_blocker(|_| false)
+            .expect("an environment that cannot be classified must block retirement");
+        assert!(
+            blocker.contains("already retired"),
+            "the reason must name the actual problem, got: {blocker}"
+        );
+        assert!(
+            store.legacy_cannot_be_classified(),
+            "and the driver must see it as work only a person can finish, so that it \
+             gives the shared volume back"
+        );
+    }
+
     /// A directory under the retired name with no mark inside it is an intact store.
     ///
     /// It got that name from a rename, and the rename happens after every gate; the mark
@@ -3435,6 +3512,41 @@ mod tests {
         }
     }
 
+    /// A mark already at that name is not a mark until it can be read.
+    ///
+    /// The one place in this file that was taking the name as the evidence, which is the
+    /// thing every other part of it refuses to do. Retirement writes the mark with
+    /// `create_new`, and a failure saying something is already there was accepted as "the
+    /// mark is present" and the environment deleted on the strength of it. What is at that
+    /// name might be anything.
+    ///
+    /// It matters most for a node that already has its store open. That path never
+    /// consulted the mark at all until this round, so an unreadable one would have gone
+    /// through every gate and been deleted.
+    #[cfg(unix)]
+    #[test]
+    fn a_mark_already_at_that_name_is_not_accepted_until_it_can_be_read() {
+        let dir = TempDir::new().expect("temp dir");
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        make_the_mark_unreadable(&env);
+
+        let refused = mark_directory_retired(&env).expect_err("an unreadable mark is not a mark");
+        assert!(
+            !refused.mark_definitely_gone,
+            "something is at that name, so the caller must not treat it as absent and put \
+             the directory back under a name that will be opened"
+        );
+        assert_eq!(retirement_mark(&env), RetirementMark::Unknown);
+
+        // And a real one is still accepted, so the refusal above is about being unable to
+        // read it rather than about there being something there at all.
+        std::fs::remove_file(env.join(RETIRED_MARKER)).expect("clear the link");
+        mark_directory_retired(&env).expect("a first mark");
+        mark_directory_retired(&env).expect("and the same mark again, which is readable");
+        assert_eq!(retirement_mark(&env), RetirementMark::Present);
+    }
+
     /// A directory nothing can classify is neither restored nor deleted.
     ///
     /// The half of the three-state answer that a first attempt at this got wrong. Asking
@@ -3443,7 +3555,8 @@ mod tests {
     /// prevent: the mark check can fail for a moment and succeed the next, and the restore
     /// in between brings back a store that really had been retired.
     ///
-    /// Unix only, because taking away the permission to look is how the state is staged.
+    /// Unix only: the state is staged with a symbolic link, which Windows does not offer
+    /// on the same terms.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_tombstone_that_cannot_be_classified_is_left_where_it_is() {
@@ -3590,7 +3703,8 @@ mod tests {
     /// name, and its keys re-enter a commitment they have already left. Deleting on an
     /// unreadable answer would be just as wrong in the other direction.
     ///
-    /// Unix only, because taking away the permission to look is how the state is staged.
+    /// Unix only: the state is staged with a symbolic link, which Windows does not offer
+    /// on the same terms.
     #[cfg(unix)]
     #[test]
     fn a_mark_that_cannot_be_read_permits_nothing() {
