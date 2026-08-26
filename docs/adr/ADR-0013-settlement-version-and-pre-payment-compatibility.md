@@ -96,7 +96,7 @@ A refusal is a verdict about the client, not about one peer, so it cannot be tre
 
 ### Unversioned requests are still served
 
-A storer cannot distinguish a client that settles correctly but predates the version field (ant-core 0.5.1 through 0.6.0) from one that does not. Refusing both would break clients that are behaving, so unversioned requests are served and counted. Nodes log a running total per path under `ant_node::quote::settlement`.
+A storer cannot distinguish a client that settles correctly but predates the version field (ant-core 0.5.1 through 0.6.0) from one that does not. Refusing both would break clients that are behaving, so unversioned requests are served and counted. Nodes log a running total per path under `ant_node::quote::settlement`. The count is taken on arrival rather than on a quote being returned: a request this node refuses for an unrelated reason still came from a client that cannot declare a version, and would still break if the unversioned path were retired.
 
 Flipping that to a refusal is a **follow-up**, gated on that count decaying, and should use a dated self-retiring boundary in the style of `MERKLE_PARITY_ENFORCED_FROM_UNIX`.
 

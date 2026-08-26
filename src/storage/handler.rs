@@ -211,7 +211,7 @@ impl Drop for GetRequestTelemetry {
     }
 }
 
-/// How many unversioned quote requests to serve between adoption log lines.
+/// How many unversioned quote requests to receive between adoption log lines.
 ///
 /// One line per request would drown the log at production quote rates, and one
 /// line total would say nothing about the trend. A running count emitted every
@@ -219,11 +219,16 @@ impl Drop for GetRequestTelemetry {
 /// when unversioned requests can start being refused outright.
 const UNVERSIONED_QUOTE_LOG_INTERVAL: u64 = 1_000;
 
-/// Unversioned quote requests served since start, by path.
+/// Unversioned quote requests received since start, by path.
+///
+/// Counted on arrival, before the quote is generated, because the question
+/// this answers is how many clients still cannot declare a version. A request
+/// this node then refuses for an unrelated reason still came from such a
+/// client, and would still break if the unversioned path were retired.
 ///
 /// Indices are `[single_node, merkle]`. A plain counter rather than a metric
 /// because the only consumer is the rollout decision, and that reads logs.
-static UNVERSIONED_QUOTES_SERVED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+static UNVERSIONED_QUOTE_REQUESTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 /// Refuse a quote when the requesting client settles under rules this node no
 /// longer accepts. `None` means the request may proceed.
@@ -903,15 +908,16 @@ impl AntProtocol {
     /// the clients that were already going to lose their money.
     fn note_unversioned_quote(path: &str) {
         let slot = usize::from(path == "merkle");
-        let Some(counter) = UNVERSIONED_QUOTES_SERVED.get(slot) else {
+        let Some(counter) = UNVERSIONED_QUOTE_REQUESTS.get(slot) else {
             return;
         };
-        let served = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
-        if served % UNVERSIONED_QUOTE_LOG_INTERVAL == 0 {
+        let seen = counter.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if seen % UNVERSIONED_QUOTE_LOG_INTERVAL == 0 {
             info!(
                 target: "ant_node::quote::settlement",
-                "Served {served} {path} quotes to clients that declare no settlement version. \
-                 These clients cannot be told to upgrade before they pay.",
+                "Received {seen} {path} quote requests from clients that declare no \
+                 settlement version. These clients cannot be told to upgrade before \
+                 they pay.",
             );
         }
     }
