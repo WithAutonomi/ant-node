@@ -35,7 +35,8 @@ When `--serve-port` is omitted with `--webrtc-direct`, port 25000 is used. Pass
 `--public-file /path/to/file` to replace the built-in
 `autonomi-browser-testnet.txt`. The generated default is 5 MiB so the demo
 necessarily reconstructs multiple storage records. A custom file may be up to
-64 MiB in this local in-memory launcher.
+1 GB (1,000,000,000 bytes) in this local in-memory launcher. The practical
+limit depends on the browser having enough available memory.
 
 The browser manifest contains every node's self-contained WebRTC Direct
 multiaddress, with its certificate SHA-256 multihash and peer ID embedded,
