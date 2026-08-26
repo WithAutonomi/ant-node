@@ -1,20 +1,20 @@
 # Browser-enabled local testnet
 
 This workflow starts a five-node local Autonomi network where every node has a
-direct WebTransport endpoint. Startup publishes a default immutable test file
+direct WebRTC Direct endpoint. Startup publishes a default immutable test file
 and serves browser bootstrap metadata; the companion site lives in the sibling
 `ant-client-web-support` repository.
 
 ## Start the node testnet
 
-Rust 1.88 or newer is required by the optional WebTransport dependency.
+Rust 1.88 or newer is required by the optional Saorsa WebRTC Direct transport.
 
 ```bash
-cargo run --features webtransport-poc --bin ant-devnet -- \
+cargo run --features webrtc-direct --bin ant-devnet -- \
   --preset minimal \
   --base-port 23000 \
-  --webtransport \
-  --webtransport-base-port 24000 \
+  --webrtc-direct \
+  --webrtc-direct-base-port 24000 \
   --serve-port 25000 \
   --enable-evm \
   --enable-logging
@@ -25,27 +25,27 @@ The services are:
 | Purpose | Address |
 |---|---|
 | Native node QUIC | UDP 127.0.0.1:23000-23004 |
-| Direct browser WebTransport | UDP 127.0.0.1:24000-24004 |
+| Direct browser WebRTC Direct | UDP 127.0.0.1:24000-24004 |
 | Native devnet manifest | http://127.0.0.1:25000/api/devnet-manifest.json |
 | Browser bootstrap manifest | http://127.0.0.1:25000/api/browser-manifest.json |
 | Manifest service metadata | http://127.0.0.1:25000/api/info |
 | Local Anvil JSON-RPC | printed at startup (random loopback port) |
 
-When `--serve-port` is omitted with `--webtransport`, port 25000 is used. Pass
+When `--serve-port` is omitted with `--webrtc-direct`, port 25000 is used. Pass
 `--public-file /path/to/file` to replace the built-in
 `autonomi-browser-testnet.txt`. The generated default is 5 MiB so the demo
 necessarily reconstructs multiple storage records. A custom file may be up to
 64 MiB in this local in-memory launcher.
 
-The browser manifest contains every node's self-contained WebTransport
+The browser manifest contains every node's self-contained WebRTC Direct
 multiaddress, with its certificate SHA-256 multihash and peer ID embedded,
 plus the public DataMap address, plaintext file hash, and resolved
 reconstruction metadata. The HTTP server provides bootstrap metadata only;
-the DataMap and file bytes are read from storage nodes over WebTransport.
+the DataMap and file bytes are read from storage nodes over WebRTC Direct.
 Each address string is serialized directly from `saorsa_core::MultiAddr`; the
 node does not maintain a browser-specific multiaddress codec.
 
-`--webtransport` requires an explicit payment network. For this local test,
+`--webrtc-direct` requires an explicit payment network. For this local test,
 `--enable-evm` starts Anvil and startup prints a **Funded wallet private key**. This
 is a disposable local Anvil key for browser upload testing. The browser manifest
 contains only public RPC/token/vault configuration and never contains the
@@ -76,7 +76,7 @@ BLAKE3 hash, and save it under its original filename.
 ## Automated verification
 
 ```bash
-cargo test --features webtransport-poc --test webtransport_devnet -- --ignored
+cargo test --features webrtc-direct --test webrtc_direct_devnet -- --ignored
 ```
 
 This starts Anvil and the five-node network, self-encrypts and publishes a
@@ -84,23 +84,24 @@ default public file through normal PUT admission with devnet-prepaid cache
 entries, extracts a generated certificate pin from the advertised
 multiaddress, retrieves and reconstructs it, then obtains a real signed quote,
 pays it on-chain, uploads a fresh record through paid `PUT_CHUNK`, and reads it
-back through WebTransport.
+back through WebRTC Direct.
 
 ## LAN testing
 
-Use `--host <LAN_IPV4>` and add the exact site origin:
+Use `--host <LAN_IPV4>` to advertise the literal LAN address:
 
 ```bash
-cargo run --features webtransport-poc --bin ant-devnet -- \
+cargo run --features webrtc-direct --bin ant-devnet -- \
   --preset minimal \
   --host 192.168.1.50 \
-  --webtransport \
-  --webtransport-origin http://192.168.1.50:5173 \
+  --webrtc-direct \
   --serve-port 25000 \
+  --enable-evm \
   --enable-logging
 ```
 
-Expose the client dev server on the LAN and change its manifest URL to
+Expose the client dev server on the LAN with `npm run dev -- --host 0.0.0.0`
+and change its manifest URL to
 `http://192.168.1.50:25000/api/browser-manifest.json`. Both the native and
-WebTransport UDP ranges must be reachable. Do not use this unsigned local
+WebRTC Direct UDP ranges must be reachable. Do not use this unsigned local
 manifest mode on a public network.

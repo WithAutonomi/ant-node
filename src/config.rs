@@ -120,12 +120,12 @@ pub struct NodeConfig {
     #[serde(default)]
     pub storage: StorageConfig,
 
-    /// Experimental direct-browser WebTransport listener.
+    /// Experimental direct-browser WebRTC Direct listener.
     ///
     /// This is the ADR-0009 interoperability proof and is disabled by
-    /// default. Enabling it requires a build with `webtransport-poc`.
+    /// default. Enabling it requires a build with `webrtc-direct`.
     #[serde(default)]
-    pub webtransport: WebTransportConfig,
+    pub webrtc_direct: WebRtcDirectConfig,
 
     /// Directory for persisting the close group cache.
     ///
@@ -150,97 +150,69 @@ pub struct NodeConfig {
     pub log_level: String,
 }
 
-/// Configuration for the ADR-0009 WebTransport proof of concept.
+/// Configuration for the ADR-0009 WebRTC Direct proof of concept.
 ///
 /// This listener is deliberately separate from the native Saorsa QUIC port.
-/// It exposes only local closest-node lookup and local immutable chunk GET.
+/// It exposes local closest-node lookup, immutable chunk reads, and paid
+/// content-addressed writes through the ordinary payment verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebTransportConfig {
+pub struct WebRtcDirectConfig {
     /// Enable the experimental listener.
     #[serde(default)]
     pub enabled: bool,
 
-    /// UDP address for the HTTP/3 listener.
-    #[serde(default = "default_webtransport_bind")]
+    /// UDP address for the WebRTC Direct listener.
+    #[serde(default = "default_webrtc_direct_bind")]
     pub bind: SocketAddr,
 
-    /// URL advertised to the browser in `HELLO` and self lookup results.
+    /// Literal public UDP address advertised to browsers.
     ///
-    /// When omitted, the URL is derived from the bound socket and
-    /// [`Self::path`]. A wildcard bind therefore needs an explicit public URL.
+    /// When omitted, the address is derived from the bound socket. A wildcard
+    /// bind therefore needs an explicit public address.
     #[serde(default)]
-    pub advertised_url: Option<String>,
+    pub advertised_addr: Option<SocketAddr>,
 
-    /// WebTransport session path.
-    #[serde(default = "default_webtransport_path")]
-    pub path: String,
-
-    /// Exact browser origins accepted by the `PoC`.
+    /// PEM file used to persist the stable DTLS certificate and private key.
     ///
-    /// `"*"` is supported for local experimentation but must not be used for
-    /// a public deployment.
-    #[serde(default = "default_webtransport_origins")]
-    pub allowed_origins: Vec<String>,
-
-    /// Subject alternative names for the automatically generated certificate.
-    #[serde(default = "default_webtransport_sans")]
-    pub certificate_sans: Vec<String>,
+    /// Relative paths are resolved against the node root directory by the
+    /// caller. The default is `webrtc-direct.pem` beside the node identity.
+    #[serde(default)]
+    pub certificate_path: Option<PathBuf>,
 
     /// Maximum simultaneously accepted browser sessions.
-    #[serde(default = "default_webtransport_max_connections")]
+    #[serde(default = "default_webrtc_direct_max_connections")]
     pub max_connections: usize,
 
     /// Maximum JSON request-header size, in bytes.
     ///
     /// Binary PUT content has a separate [`crate::ant_protocol::MAX_CHUNK_SIZE`]
     /// limit and is never JSON/base64 encoded.
-    #[serde(default = "default_webtransport_max_request_bytes")]
+    #[serde(default = "default_webrtc_direct_max_request_bytes")]
     pub max_request_bytes: usize,
 }
 
-impl Default for WebTransportConfig {
+impl Default for WebRtcDirectConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: default_webtransport_bind(),
-            advertised_url: None,
-            path: default_webtransport_path(),
-            allowed_origins: default_webtransport_origins(),
-            certificate_sans: default_webtransport_sans(),
-            max_connections: default_webtransport_max_connections(),
-            max_request_bytes: default_webtransport_max_request_bytes(),
+            bind: default_webrtc_direct_bind(),
+            advertised_addr: None,
+            certificate_path: None,
+            max_connections: default_webrtc_direct_max_connections(),
+            max_request_bytes: default_webrtc_direct_max_request_bytes(),
         }
     }
 }
 
-fn default_webtransport_bind() -> SocketAddr {
+fn default_webrtc_direct_bind() -> SocketAddr {
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
 }
 
-fn default_webtransport_path() -> String {
-    crate::browser::BROWSER_WEBTRANSPORT_PATH.to_string()
-}
-
-fn default_webtransport_origins() -> Vec<String> {
-    vec![
-        "http://localhost:5173".to_string(),
-        "http://127.0.0.1:5173".to_string(),
-    ]
-}
-
-fn default_webtransport_sans() -> Vec<String> {
-    vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ]
-}
-
-const fn default_webtransport_max_connections() -> usize {
+const fn default_webrtc_direct_max_connections() -> usize {
     32
 }
 
-const fn default_webtransport_max_request_bytes() -> usize {
+const fn default_webrtc_direct_max_request_bytes() -> usize {
     64 * 1024
 }
 
@@ -380,7 +352,7 @@ impl Default for NodeConfig {
             upgrade: UpgradeConfig::default(),
             payment: PaymentConfig::default(),
             storage: StorageConfig::default(),
-            webtransport: WebTransportConfig::default(),
+            webrtc_direct: WebRtcDirectConfig::default(),
             close_group_cache_dir: None,
             max_message_size: default_max_message_size(),
             log_level: default_log_level(),

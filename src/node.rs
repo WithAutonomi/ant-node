@@ -88,11 +88,11 @@ impl NodeBuilder {
 
         Self::validate_production_rewards_address(&self.config)?;
 
-        #[cfg(not(feature = "webtransport-poc"))]
-        if self.config.webtransport.enabled {
+        #[cfg(not(feature = "webrtc-direct"))]
+        if self.config.webrtc_direct.enabled {
             return Err(Error::Config(
-                "webtransport is enabled but this binary was not built with the \
-                 'webtransport-poc' feature"
+                "webrtc_direct is enabled but this binary was not built with the \
+                 'webrtc-direct' feature"
                     .to_string(),
             ));
         }
@@ -222,8 +222,8 @@ impl NodeBuilder {
             ant_protocol,
             replication_engine,
             protocol_task: None,
-            #[cfg(feature = "webtransport-poc")]
-            webtransport_task: None,
+            #[cfg(feature = "webrtc-direct")]
+            webrtc_direct_task: None,
             upgrade_exit_code: Arc::new(AtomicI32::new(-1)),
         };
 
@@ -484,8 +484,8 @@ pub struct RunningNode {
     /// Protocol message routing background task.
     protocol_task: Option<JoinHandle<()>>,
     /// ADR-0009 experimental browser listener task.
-    #[cfg(feature = "webtransport-poc")]
-    webtransport_task: Option<JoinHandle<()>>,
+    #[cfg(feature = "webrtc-direct")]
+    webrtc_direct_task: Option<JoinHandle<()>>,
     /// Exit code requested by a successful upgrade (-1 = no upgrade exit pending).
     upgrade_exit_code: Arc<AtomicI32>,
 }
@@ -546,23 +546,25 @@ impl RunningNode {
             "Node is running on port: {}", actual_port
         );
 
-        #[cfg(feature = "webtransport-poc")]
-        if self.config.webtransport.enabled {
-            let endpoint_catalog =
-                Arc::new(crate::web_transport::BrowserEndpointCatalog::default());
+        #[cfg(feature = "webrtc-direct")]
+        if self.config.webrtc_direct.enabled {
+            let endpoint_catalog = Arc::new(crate::web_rtc::BrowserEndpointCatalog::default());
             let evm_network = self.config.payment.evm_network.clone().into_evm_network();
-            match crate::web_transport::spawn(
-                &self.config.webtransport,
+            match crate::web_rtc::spawn(
+                &self.config.webrtc_direct,
+                &self.config.root_dir,
                 Arc::clone(&self.p2p_node),
                 self.ant_protocol.clone(),
                 &evm_network,
                 self.shutdown.clone(),
                 endpoint_catalog,
-            ) {
-                Ok(server) => self.webtransport_task = Some(server.task),
+            )
+            .await
+            {
+                Ok(server) => self.webrtc_direct_task = Some(server.task),
                 Err(error) => {
                     if let Err(shutdown_error) = self.p2p_node.shutdown().await {
-                        warn!("P2P shutdown after WebTransport startup failure failed: {shutdown_error}");
+                        warn!("P2P shutdown after WebRtcDirect startup failure failed: {shutdown_error}");
                     }
                     return Err(error);
                 }
@@ -737,12 +739,12 @@ impl RunningNode {
         // Run the main event loop with signal handling
         self.run_event_loop().await?;
 
-        // The shared token closes the WebTransport accept loop and active
+        // The shared token closes the WebRtcDirect accept loop and active
         // browser sessions before storage and native P2P are torn down.
-        #[cfg(feature = "webtransport-poc")]
-        if let Some(task) = self.webtransport_task.take() {
+        #[cfg(feature = "webrtc-direct")]
+        if let Some(task) = self.webrtc_direct_task.take() {
             if let Err(error) = task.await {
-                warn!("WebTransport task shutdown failed: {error}");
+                warn!("WebRtcDirect task shutdown failed: {error}");
             }
         }
 

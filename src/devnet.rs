@@ -28,15 +28,15 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-#[cfg(feature = "webtransport-poc")]
+#[cfg(feature = "webrtc-direct")]
 use crate::ant_protocol::{ChunkMessage, ChunkMessageBody, ChunkPutRequest, ChunkPutResponse};
-#[cfg(feature = "webtransport-poc")]
+#[cfg(feature = "webrtc-direct")]
 use crate::browser::{BrowserBootstrapNode, BrowserPaymentNetwork, BrowserPublicFile};
-#[cfg(feature = "webtransport-poc")]
-use crate::config::WebTransportConfig;
-#[cfg(feature = "webtransport-poc")]
+#[cfg(feature = "webrtc-direct")]
+use crate::config::WebRtcDirectConfig;
+#[cfg(feature = "webrtc-direct")]
 use bytes::Bytes;
-#[cfg(feature = "webtransport-poc")]
+#[cfg(feature = "webrtc-direct")]
 use std::collections::HashMap;
 
 // =============================================================================
@@ -227,14 +227,11 @@ pub struct DevnetConfig {
     /// nodes bind 0.0.0.0 and advertise this IP instead of 127.0.0.1.
     pub advertise_ip: Option<Ipv4Addr>,
 
-    /// Run one direct-browser WebTransport listener per devnet node.
-    pub webtransport: bool,
+    /// Run one direct-browser WebRTC Direct listener per devnet node.
+    pub webrtc_direct: bool,
 
-    /// First UDP port in the WebTransport node range (0 = allocate).
-    pub webtransport_base_port: u16,
-
-    /// Browser origins accepted by every devnet WebTransport listener.
-    pub webtransport_allowed_origins: Vec<String>,
+    /// First UDP port in the WebRTC Direct node range (0 = allocate).
+    pub webrtc_direct_base_port: u16,
 }
 
 impl Default for DevnetConfig {
@@ -257,12 +254,8 @@ impl Default for DevnetConfig {
             cleanup_data_dir: true,
             evm_network: None,
             advertise_ip: None,
-            webtransport: false,
-            webtransport_base_port: 0,
-            webtransport_allowed_origins: vec![
-                "http://localhost:5173".to_string(),
-                "http://127.0.0.1:5173".to_string(),
-            ],
+            webrtc_direct: false,
+            webrtc_direct_base_port: 0,
         }
     }
 }
@@ -346,9 +339,9 @@ pub struct DevnetNode {
     state: Arc<RwLock<NodeState>>,
     bootstrap_addrs: Vec<MultiAddr>,
     protocol_task: Option<JoinHandle<()>>,
-    #[cfg(feature = "webtransport-poc")]
-    webtransport_task: Option<JoinHandle<()>>,
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
+    webrtc_direct_task: Option<JoinHandle<()>>,
+    #[cfg(feature = "webrtc-direct")]
     browser_endpoint: Option<crate::browser::BrowserEndpoint>,
 }
 
@@ -370,8 +363,8 @@ pub struct Devnet {
     shutdown: CancellationToken,
     state: Arc<RwLock<NetworkState>>,
     health_monitor: Option<JoinHandle<()>>,
-    #[cfg(feature = "webtransport-poc")]
-    browser_endpoint_catalog: Arc<crate::web_transport::BrowserEndpointCatalog>,
+    #[cfg(feature = "webrtc-direct")]
+    browser_endpoint_catalog: Arc<crate::web_rtc::BrowserEndpointCatalog>,
 }
 
 impl Devnet {
@@ -421,25 +414,19 @@ impl Devnet {
             )));
         }
 
-        #[cfg(not(feature = "webtransport-poc"))]
-        if config.webtransport {
+        #[cfg(not(feature = "webrtc-direct"))]
+        if config.webrtc_direct {
             return Err(DevnetError::Config(
-                "WebTransport devnet support requires the 'webtransport-poc' feature".to_string(),
+                "WebRtcDirect devnet support requires the 'webrtc-direct' feature".to_string(),
             ));
         }
 
-        #[cfg(feature = "webtransport-poc")]
-        if config.webtransport {
-            if config.webtransport_allowed_origins.is_empty() {
-                return Err(DevnetError::Config(
-                    "At least one WebTransport browser Origin is required".to_string(),
-                ));
-            }
-
-            if config.webtransport_base_port == 0 {
+        #[cfg(feature = "webrtc-direct")]
+        if config.webrtc_direct {
+            if config.webrtc_direct_base_port == 0 {
                 let adjacent = max_port;
                 let adjacent_end = adjacent.checked_add(node_count_u16);
-                config.webtransport_base_port = if adjacent_end
+                config.webrtc_direct_base_port = if adjacent_end
                     .is_some_and(|end| end <= DEVNET_PORT_RANGE_MAX)
                 {
                     adjacent
@@ -459,28 +446,28 @@ impl Devnet {
                         })
                         .ok_or_else(|| {
                             DevnetError::Config(
-                                "Could not allocate a disjoint WebTransport port range".to_string(),
+                                "Could not allocate a disjoint WebRtcDirect port range".to_string(),
                             )
                         })?
                 };
             }
 
-            let webtransport_end = config
-                .webtransport_base_port
+            let webrtc_direct_end = config
+                .webrtc_direct_base_port
                 .checked_add(node_count_u16)
                 .ok_or_else(|| {
-                    DevnetError::Config("WebTransport port range overflow".to_string())
+                    DevnetError::Config("WebRtcDirect port range overflow".to_string())
                 })?;
-            if config.webtransport_base_port < DEVNET_PORT_RANGE_MIN
-                || webtransport_end > DEVNET_PORT_RANGE_MAX
+            if config.webrtc_direct_base_port < DEVNET_PORT_RANGE_MIN
+                || webrtc_direct_end > DEVNET_PORT_RANGE_MAX
             {
                 return Err(DevnetError::Config(format!(
-                    "WebTransport ports must remain in the local test range {DEVNET_PORT_RANGE_MIN}..{DEVNET_PORT_RANGE_MAX}"
+                    "WebRtcDirect ports must remain in the local test range {DEVNET_PORT_RANGE_MIN}..{DEVNET_PORT_RANGE_MAX}"
                 )));
             }
-            if base_port < webtransport_end && config.webtransport_base_port < max_port {
+            if base_port < webrtc_direct_end && config.webrtc_direct_base_port < max_port {
                 return Err(DevnetError::Config(
-                    "Native and WebTransport devnet port ranges overlap".to_string(),
+                    "Native and WebRtcDirect devnet port ranges overlap".to_string(),
                 ));
             }
         }
@@ -493,10 +480,8 @@ impl Devnet {
             shutdown: CancellationToken::new(),
             state: Arc::new(RwLock::new(NetworkState::Uninitialized)),
             health_monitor: None,
-            #[cfg(feature = "webtransport-poc")]
-            browser_endpoint_catalog: Arc::new(
-                crate::web_transport::BrowserEndpointCatalog::default(),
-            ),
+            #[cfg(feature = "webrtc-direct")]
+            browser_endpoint_catalog: Arc::new(crate::web_rtc::BrowserEndpointCatalog::default()),
         })
     }
 
@@ -549,11 +534,11 @@ impl Devnet {
             if let Some(handle) = node.protocol_task.take() {
                 handle.abort();
             }
-            #[cfg(feature = "webtransport-poc")]
-            if let Some(handle) = node.webtransport_task.take() {
+            #[cfg(feature = "webrtc-direct")]
+            if let Some(handle) = node.webrtc_direct_task.take() {
                 if let Err(error) = handle.await {
                     warn!(
-                        "Error stopping node {} WebTransport listener: {error}",
+                        "Error stopping node {} WebRtcDirect listener: {error}",
                         node.index
                     );
                 }
@@ -607,7 +592,7 @@ impl Devnet {
     }
 
     /// Get every direct browser endpoint in this devnet.
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
     #[must_use]
     pub fn browser_endpoints(&self) -> Vec<BrowserBootstrapNode> {
         self.nodes
@@ -630,19 +615,19 @@ impl Devnet {
     ///
     /// # Errors
     ///
-    /// Returns an error when WebTransport is disabled, self-encryption fails,
+    /// Returns an error when WebRTC Direct is disabled, self-encryption fails,
     /// a generated chunk is too large, no node admits a required record, or
     /// protocol serialization fails.
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
     pub async fn publish_public_file(
         &self,
         name: String,
         content_type: String,
         content: &[u8],
     ) -> Result<BrowserPublicFile> {
-        if !self.config.webtransport {
+        if !self.config.webrtc_direct {
             return Err(DevnetError::Config(
-                "Cannot publish a browser file when WebTransport is disabled".to_string(),
+                "Cannot publish a browser file when WebRtcDirect is disabled".to_string(),
             ));
         }
         if content.len() < self_encryption::MIN_ENCRYPTABLE_BYTES {
@@ -724,7 +709,7 @@ impl Devnet {
     }
 
     /// Public EVM configuration advertised to direct browser clients.
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
     #[must_use]
     pub fn browser_payment_network(&self) -> BrowserPaymentNetwork {
         let network = self
@@ -735,7 +720,7 @@ impl Devnet {
         BrowserPaymentNetwork::from_evm_network(network)
     }
 
-    #[cfg(feature = "webtransport-poc")]
+    #[cfg(feature = "webrtc-direct")]
     async fn publish_browser_record(&self, address: [u8; 32], content: &Bytes) -> Result<usize> {
         let mut replicas = 0usize;
         let mut failures = Vec::new();
@@ -901,9 +886,9 @@ impl Devnet {
             state: Arc::new(RwLock::new(NodeState::Pending)),
             bootstrap_addrs,
             protocol_task: None,
-            #[cfg(feature = "webtransport-poc")]
-            webtransport_task: None,
-            #[cfg(feature = "webtransport-poc")]
+            #[cfg(feature = "webrtc-direct")]
+            webrtc_direct_task: None,
+            #[cfg(feature = "webrtc-direct")]
             browser_endpoint: None,
         })
     }
@@ -994,18 +979,18 @@ impl Devnet {
         node.p2p_node = Some(Arc::new(p2p_node));
         *node.state.write().await = NodeState::Running;
 
-        #[cfg(feature = "webtransport-poc")]
-        if self.config.webtransport {
+        #[cfg(feature = "webrtc-direct")]
+        if self.config.webrtc_direct {
             let index_u16 = u16::try_from(node.index).map_err(|_| {
                 DevnetError::Config(format!("Node index {} exceeds u16::MAX", node.index))
             })?;
             let port = self
                 .config
-                .webtransport_base_port
+                .webrtc_direct_base_port
                 .checked_add(index_u16)
                 .ok_or_else(|| {
                     DevnetError::Config(format!(
-                        "WebTransport port overflow for node {}",
+                        "WebRtcDirect port overflow for node {}",
                         node.index
                     ))
                 })?;
@@ -1014,34 +999,22 @@ impl Devnet {
                 .config
                 .advertise_ip
                 .map_or(Ipv4Addr::LOCALHOST, |_| Ipv4Addr::UNSPECIFIED);
-            let mut webtransport_config = WebTransportConfig::default();
-            webtransport_config.enabled = true;
-            webtransport_config.bind = SocketAddr::from((bind_ip, port));
-            webtransport_config.advertised_url = Some(format!(
-                "https://{advertised_ip}:{port}{}",
-                webtransport_config.path
-            ));
-            webtransport_config
-                .allowed_origins
-                .clone_from(&self.config.webtransport_allowed_origins);
-            webtransport_config.certificate_sans = if advertised_ip.is_loopback() {
-                vec![
-                    "localhost".to_string(),
-                    Ipv4Addr::LOCALHOST.to_string(),
-                    "::1".to_string(),
-                ]
-            } else {
-                vec![advertised_ip.to_string()]
+            let webrtc_direct_config = WebRtcDirectConfig {
+                enabled: true,
+                bind: SocketAddr::from((bind_ip, port)),
+                advertised_addr: Some(SocketAddr::from((advertised_ip, port))),
+                ..WebRtcDirectConfig::default()
             };
 
             let p2p = node.p2p_node.clone().ok_or_else(|| {
                 DevnetError::Startup(format!(
-                    "Node {} lost its P2P handle before WebTransport startup",
+                    "Node {} lost its P2P handle before WebRtcDirect startup",
                     node.index
                 ))
             })?;
-            let server = crate::web_transport::spawn(
-                &webtransport_config,
+            let server = crate::web_rtc::spawn(
+                &webrtc_direct_config,
+                &node.data_dir,
                 p2p,
                 node.ant_protocol.clone(),
                 self.config
@@ -1051,14 +1024,15 @@ impl Devnet {
                 self.shutdown.clone(),
                 Arc::clone(&self.browser_endpoint_catalog),
             )
+            .await
             .map_err(|error| {
                 DevnetError::Startup(format!(
-                    "Failed to start node {} WebTransport listener: {error}",
+                    "Failed to start node {} WebRtcDirect listener: {error}",
                     node.index
                 ))
             })?;
             node.browser_endpoint = Some(server.endpoint);
-            node.webtransport_task = Some(server.task);
+            node.webrtc_direct_task = Some(server.task);
         }
 
         if let (Some(ref p2p), Some(ref protocol)) = (&node.p2p_node, &node.ant_protocol) {

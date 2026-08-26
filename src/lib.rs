@@ -55,8 +55,8 @@ pub mod payment;
 pub mod replication;
 pub mod storage;
 pub mod upgrade;
-#[cfg(feature = "webtransport-poc")]
-mod web_transport;
+#[cfg(feature = "webrtc-direct")]
+mod web_rtc;
 
 pub use ant_protocol::{
     ChunkGetRequest, ChunkGetResponse, ChunkMessage, ChunkMessageBody, ChunkPutRequest,
@@ -66,13 +66,12 @@ pub use ant_protocol::{
 pub use browser::{
     BrowserBootstrapNode, BrowserChunkInfo, BrowserDevnetManifest, BrowserEndpoint,
     BrowserPaymentNetwork, BrowserPublicFile, ParsedBrowserEndpoint, BROWSER_MANIFEST_VERSION,
-    BROWSER_WEBTRANSPORT_PATH,
 };
 pub use client::{
     compute_address, hex_node_id_to_encoded_peer_id, peer_id_to_xor_name, xor_distance, DataChunk,
     XorName,
 };
-pub use config::{NodeConfig, StorageConfig, WebTransportConfig};
+pub use config::{NodeConfig, StorageConfig, WebRtcDirectConfig};
 pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
@@ -87,6 +86,6 @@ pub mod core {
     pub use saorsa_core::identity::{NodeIdentity, PeerId};
     pub use saorsa_core::{
         IPDiversityConfig, MlDsa65, MultiAddr, NodeConfig as CoreNodeConfig, NodeMode, P2PEvent,
-        P2PNode, WebTransportAddr, WebTransportCertificateHash, WebTransportHost,
+        P2PNode, WebRtcCertificateHash, WebRtcDirectAddr,
     };
 }
