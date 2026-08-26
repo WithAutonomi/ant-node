@@ -253,12 +253,12 @@ fn median(samples: &mut [Duration]) -> Duration {
 /// accepts it. What it did not measure is the node's own share: an in-memory set of every
 /// address, which is the part that could quietly make a large node unrunnable.
 ///
-/// Worth being clear about what this measurement can and cannot catch. `VmRSS` is
-/// process-wide and the allocator reuses what earlier tests freed, so a small regression
-/// can hide in heap that is already resident, and the order tests run in can move the
-/// number. It catches an index that costs several times what it should, which is the
-/// question the ADR left open. It is not a byte-accurate account of one data structure and
-/// is not offered as one.
+/// Measured in a process of its own, which is the only way this measurement means
+/// anything. `VmRSS` is process-wide and the allocator hands back what earlier work freed,
+/// so opening a store in a process that has already opened and dropped one grows the
+/// resident set by nothing at all. That is exactly what happened here: the test read zero
+/// bytes per chunk and passed, having measured the allocator rather than the index. A child
+/// that has done nothing else has no freed heap to reuse.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {
@@ -268,6 +268,64 @@ async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {
     let chunks_dir = root.join("chunks");
     std::fs::create_dir_all(&chunks_dir).expect("mkdir");
     plant_chunks(&chunks_dir, keys);
+
+    let per_key = index_cost_in_a_fresh_process(&root, keys);
+    println!("scale: index costs {per_key} bytes per chunk, measured in its own process");
+
+    // A 32-byte address in a sorted set, plus allocator and node overhead. Measured at 52
+    // bytes per chunk on a hosted runner; 128 is comfortably above that and no longer five
+    // times it, which was loose enough to let an extra 128 bytes a key through unnoticed.
+    assert!(
+        per_key < 128,
+        "the index costs {per_key} bytes per chunk, which does not scale"
+    );
+    // Zero is not a pass. It is what this test reported when it shared a process with one
+    // that had already opened and dropped a store of the same size, and it would report it
+    // again if the child ever stopped opening the store at all.
+    assert!(
+        per_key > 0,
+        "the index reported no cost at all, so nothing was measured"
+    );
+}
+
+/// Open a store of `keys` chunks in a child process and report its resident growth per key.
+#[cfg(target_os = "linux")]
+fn index_cost_in_a_fresh_process(root: &Path, keys: usize) -> u64 {
+    let exe = std::env::current_exe().expect("this test binary");
+    let output = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("child_reports_index_memory")
+        .arg("--nocapture")
+        .arg("--ignored")
+        .env("ANT_SCALE_ROOT", root)
+        .env("ANT_SCALE_KEYS", keys.to_string())
+        .output()
+        .expect("spawn the child");
+    let said = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the child failed: {said}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    said.lines()
+        .find_map(|line| line.strip_prefix(INDEX_BYTES_PER_KEY))
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or_else(|| panic!("the child reported no measurement: {said}"))
+}
+
+/// What the child prints its answer behind.
+#[cfg(target_os = "linux")]
+const INDEX_BYTES_PER_KEY: &str = "INDEX_BYTES_PER_KEY=";
+
+/// Child mode: open the store named by the environment and report what it cost.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "child process of the index memory measurement, not run on its own"]
+async fn child_reports_index_memory() {
+    let root = std::path::PathBuf::from(
+        std::env::var("ANT_SCALE_ROOT").expect("the child needs a store to open"),
+    );
+    let keys = key_count();
 
     let before = resident_bytes().expect("linux reports this");
     let store = FileStore::new(FileStoreConfig {
@@ -279,21 +337,12 @@ async fn the_in_memory_index_costs_a_bounded_amount_per_chunk() {
     .expect("open");
     let after = resident_bytes().expect("linux reports this");
 
-    let grew = after.saturating_sub(before);
-    let per_key = grew / keys.max(1) as u64;
-    println!(
-        "scale: index grew {} KiB, {per_key} bytes per chunk",
-        grew / 1024
-    );
-
     assert_eq!(store.current_chunks().expect("count") as usize, keys);
-    // A 32-byte address in a sorted set, plus allocator and node overhead. Measured at 52
-    // bytes per chunk on a hosted runner; 128 is comfortably above that and no longer five
-    // times it, which was loose enough to let an extra 128 bytes a key through unnoticed.
-    assert!(
-        per_key < 128,
-        "the index costs {per_key} bytes per chunk, which does not scale"
-    );
+    let grew = after.saturating_sub(before);
+    println!("{INDEX_BYTES_PER_KEY}{}", grew / keys.max(1) as u64);
+    // Held until after the measurement is printed, so the index is still resident when it
+    // is read rather than freed by an early drop.
+    drop(store);
 }
 
 /// Every chunk the store writes takes exactly one directory entry.
