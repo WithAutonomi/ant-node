@@ -129,6 +129,32 @@ proptest = "1"
 alloy = { version = "1", features = ["node-bindings"] }
 serial_test = "3"
 
+# Proves the migration returns disk to the filesystem, which is the claim the whole
+# change exists to make good. Needs the test-only migration-state accessor.
+[[test]]
+name = "migration_reclaims_disk"
+path = "tests/migration_reclaims_disk.rs"
+required-features = ["test-utils"]
+
+# Kills a real child process part-way through writing and migrating, then checks what
+# survived. The automatable half of the power-loss gate.
+[[test]]
+name = "migration_crash_safety"
+path = "tests/migration_crash_safety.rs"
+required-features = ["test-utils"]
+
+# Startup scan time, index memory and inode cost at scale. Regression gates, not
+# benchmarks; ANT_SCALE_KEYS raises the count for a deliberate larger run.
+[[test]]
+name = "storage_scale"
+path = "tests/storage_scale.rs"
+
+# Several nodes migrating on one disk: the volume lock, and that each finishes with its
+# own chunks and only its own.
+[[test]]
+name = "migration_shared_volume"
+path = "tests/migration_shared_volume.rs"
+
 # E2E test infrastructure (run with --features test-utils)
 [[test]]
 name = "e2e"

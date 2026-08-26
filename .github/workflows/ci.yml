@@ -58,6 +58,53 @@ jobs:
         run: cargo test --test poc_audit_handler_live --features test-utils
       - name: Run bootstrap-stall PoC regression marker
         run: cargo test --test poc_bootstrap_stall --features test-utils
+      - name: Prove the migration returns disk to the filesystem
+        run: cargo test --test migration_reclaims_disk --features test-utils
+      - name: Kill a node mid-migration and check what survived
+        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
+      - name: Several nodes migrating on one disk
+        run: cargo test --test migration_shared_volume
+      - name: Startup scan, index memory and inode cost at scale
+        run: cargo test --test storage_scale -- --nocapture
+
+  filesystems:
+    name: Durability on ${{ matrix.fs }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, xfs, btrfs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install the filesystem tools
+        run: sudo apt-get update && sudo apt-get install -y xfsprogs btrfs-progs
+      - name: Make a ${{ matrix.fs }} volume and mount it
+        run: |
+          set -euo pipefail
+          # A loopback image, so these run on a filesystem of the right kind rather than
+          # on whatever the runner happens to give us. ext4 is what most of the fleet is
+          # on; XFS and btrfs are the two the design reasons about separately, btrfs
+          # because it has been observed reordering writes around a rename.
+          truncate -s 3G /tmp/${{ matrix.fs }}.img
+          mkfs.${{ matrix.fs }} -q /tmp/${{ matrix.fs }}.img
+          sudo mkdir -p /mnt/antfs
+          sudo mount -o loop /tmp/${{ matrix.fs }}.img /mnt/antfs
+          sudo chown "$USER" /mnt/antfs
+          df -hT /mnt/antfs
+      - name: Prove the migration returns disk on ${{ matrix.fs }}
+        env:
+          TMPDIR: /mnt/antfs
+        run: cargo test --test migration_reclaims_disk --features test-utils
+      - name: Kill a node mid-migration on ${{ matrix.fs }}
+        env:
+          TMPDIR: /mnt/antfs
+        run: cargo test --test migration_crash_safety --features test-utils -- --test-threads=1
+      - name: Several nodes on one ${{ matrix.fs }} volume
+        env:
+          TMPDIR: /mnt/antfs
+        run: cargo test --test migration_shared_volume
 
   doc:
     name: Documentation
