@@ -1980,6 +1980,19 @@ impl ChunkStore {
         self.has_legacy() && is_a_link(&self.legacy_env_dir)
     }
 
+    /// Is there an environment on disk this node cannot classify at all?
+    ///
+    /// Neither removable nor openable, which is not a state waiting will clear: something
+    /// about the path has to change first, and until it does the node will refuse to touch
+    /// it in either direction. The driver treats this the way it treats a lost handle or a
+    /// link, by standing down from the shared volume and saying so where an operator looks,
+    /// because holding a disk exclusively to wait for a person is a disk nobody else can
+    /// use.
+    #[must_use]
+    pub fn legacy_cannot_be_classified(&self) -> bool {
+        retirement_mark(&self.legacy_env_dir) == RetirementMark::Unknown
+    }
+
     /// Is there an environment on disk this node can no longer read?
     #[must_use]
     pub fn has_lost_its_legacy_handle(&self) -> bool {
@@ -2488,7 +2501,22 @@ fn is_a_link(path: &Path) -> bool {
 /// a perfectly good environment.
 fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
     let env = root_dir.join(LEGACY_ENV_DIR);
-    if env.try_exists().unwrap_or(false) && retirement_mark(&env).permits_removal() {
+    let here = env.try_exists().unwrap_or(false);
+    // Three answers, three branches. Asking only whether it may be removed and letting
+    // everything else fall through would put "cannot tell" back on the opening path, which
+    // is the whole failure this is three states to avoid: the mark check can fail for a
+    // moment and succeed the next, and the open in between would resurrect a store that
+    // really had been retired.
+    if here && retirement_mark(&env) == RetirementMark::Unknown {
+        error!(
+            "{} is under the live name and this node cannot tell whether it was retired. \
+             It will NOT be opened and it will NOT be removed. The node serves from files \
+             alone. Check that the directory and anything inside it can be read.",
+            env.display()
+        );
+        return LiveEnvironment::None;
+    }
+    if here && retirement_mark(&env).permits_removal() {
         // Its own contents say it was retired, so whatever name it is wearing now, it is
         // the remains of a removal that a power loss undid the rename of.
         warn!(
@@ -2552,7 +2580,21 @@ fn sweep_retired_legacy(root_dir: &Path) {
         // the rename and the mark leaves an intact environment sitting under the retired
         // name, and deleting that because of what it is called would destroy every chunk
         // in it.
-        if retirement_mark(&tombstone).permits_removal() {
+        let mark = retirement_mark(&tombstone);
+        if mark == RetirementMark::Unknown {
+            // Neither restored nor deleted. Restoring would put a directory that may be
+            // half-deleted back under the live name for the next start to open, and
+            // deleting would destroy an intact one. It costs disk until somebody looks,
+            // which is the right price for not knowing.
+            warn!(
+                "{} cannot be classified: this node cannot tell whether it carries a \
+                 retirement mark, so it will be neither restored nor deleted. Check that \
+                 the directory and anything inside it can be read.",
+                tombstone.display()
+            );
+            continue;
+        }
+        if mark.permits_removal() {
             // The mark is re-established before anything is deleted on the strength of
             // it. A retirement that failed part-way can leave one that was never flushed,
             // and this is the pass that would otherwise act on it thirty seconds after
@@ -3388,6 +3430,95 @@ mod tests {
         }
     }
 
+    /// A directory nothing can classify is neither restored nor deleted.
+    ///
+    /// The half of the three-state answer that a first attempt at this got wrong. Asking
+    /// only "may it be removed" and letting everything else fall through puts "cannot tell"
+    /// straight back on the restoring path, which is the resurrection this exists to
+    /// prevent: the mark check can fail for a moment and succeed the next, and the restore
+    /// in between brings back a store that really had been retired.
+    ///
+    /// Unix only, because taking away the permission to look is how the state is staged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tombstone_that_cannot_be_classified_is_left_where_it_is() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["unclassifiable"]).await;
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
+        std::fs::rename(&env, &tombstone).expect("rename");
+        make_the_mark_unreadable(&tombstone);
+        assert_eq!(retirement_mark(&tombstone), RetirementMark::Unknown);
+
+        sweep_retired_legacy(dir.path());
+        let still_there = tombstone.exists();
+        let restored = env.exists();
+
+        assert!(
+            still_there,
+            "a directory that cannot be classified must not be deleted: it may be intact"
+        );
+        assert!(
+            !restored,
+            "a directory that cannot be classified must not be put back under the live \
+             name: it may be half deleted"
+        );
+    }
+
+    /// The same directory under the live name is not opened either.
+    ///
+    /// Opening it would put keys back into a commitment they may already have left, and
+    /// this node cannot tell whether they have. Serving from files alone is the answer that
+    /// is right either way.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_environment_that_cannot_be_classified_is_not_opened() {
+        let dir = TempDir::new().expect("temp dir");
+        let env = dir.path().join(LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(env.join("data.mdb"), b"not really an environment").expect("seed");
+        assert_eq!(
+            finish_interrupted_retirement(dir.path()),
+            LiveEnvironment::WhateverIsOnDisk,
+            "a readable directory with no mark is ordinary and may be opened"
+        );
+
+        make_the_mark_unreadable(&env);
+        assert_eq!(retirement_mark(&env), RetirementMark::Unknown);
+
+        let verdict = finish_interrupted_retirement(dir.path());
+        let still_there = env.exists();
+
+        assert_eq!(
+            verdict,
+            LiveEnvironment::None,
+            "a directory that cannot be classified must not be opened"
+        );
+        assert!(
+            still_there,
+            "and it must not be deleted either: it may be a live environment"
+        );
+    }
+
+    /// Make the retirement mark in `dir` unreadable without touching the directory itself.
+    ///
+    /// A symbolic link pointing at itself. Looking for the mark follows it, gets
+    /// `FilesystemLoop` back, and the answer is neither "there" nor "not there", which is
+    /// the state under test.
+    ///
+    /// Taking the directory's permissions away instead was the first attempt and staged too
+    /// much: at mode 000 the operating system refuses the rename as well, so the code being
+    /// tested was never reached and the test passed with its own protection removed. Root
+    /// can also read a mode-000 directory, which would have made it fail on any CI that
+    /// runs as root. A link loop is neither: everything else about the directory keeps
+    /// working, for every user.
+    #[cfg(unix)]
+    fn make_the_mark_unreadable(dir: &Path) {
+        let link = dir.join(RETIRED_MARKER);
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&link, &link).expect("a link to itself");
+    }
+
     /// Both names taken is not a decision this code makes.
     #[tokio::test]
     async fn an_unmarked_retired_directory_beside_a_live_one_is_left_alone() {
@@ -3458,8 +3589,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_mark_that_cannot_be_read_permits_nothing() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = TempDir::new().expect("temp dir");
         let env = dir.path().join(LEGACY_ENV_DIR);
 
@@ -3478,13 +3607,10 @@ mod tests {
         std::fs::write(env.join(RETIRED_MARKER), b"retired").expect("mark");
         assert_eq!(retirement_mark(&env), RetirementMark::Present);
 
-        // Nothing may look inside any more, so the mark is neither there nor not there.
-        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        // Looking for the mark now goes round in a circle, so the answer is neither there
+        // nor not there.
+        make_the_mark_unreadable(&env);
         let unreadable = retirement_mark(&env);
-
-        // Restored first, so the assertions below cannot leave a directory the test
-        // harness is unable to clean up.
-        std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
         assert_eq!(
             unreadable,

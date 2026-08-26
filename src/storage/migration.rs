@@ -1900,11 +1900,14 @@ fn blocked_before_the_gates(
     config: &MigrationConfig,
 ) -> Option<RetireOutcome> {
     let reason = store.retirement_blocker(|k| context.still_answerable(k))?;
-    // Two blockers no amount of exclusive disk access will clear: an environment this
-    // node cannot read, and one it must not delete because it is a link to somewhere
-    // else. Both need a person, so give the volume back to the nodes that can use it and
-    // say so where an operator will see it rather than at debug.
-    if store.has_lost_its_legacy_handle() || store.legacy_is_a_link() {
+    // Three blockers no amount of exclusive disk access will clear: an environment this
+    // node cannot read, one it cannot classify at all, and one it must not delete because
+    // it is a link to somewhere else. Each needs a person, so give the volume back to the
+    // nodes that can use it and say so where an operator will see it rather than at debug.
+    if store.has_lost_its_legacy_handle()
+        || store.legacy_cannot_be_classified()
+        || store.legacy_is_a_link()
+    {
         if operator_should_hear_again() {
             warn!(
                 migration_event = "needs_an_operator",
