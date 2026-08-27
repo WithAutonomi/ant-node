@@ -165,6 +165,18 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub storage_roots: Vec<PathBuf>,
 
+    /// Keep one legacy wire-protocol endpoint per logical identity while the
+    /// destination-addressed daemon protocol rolls out. Upgraded peers switch
+    /// to the shared endpoint after signed capability negotiation.
+    #[serde(default = "default_true")]
+    pub legacy_compatibility: bool,
+
+    /// First port in the stable per-identity legacy listener range. Zero asks
+    /// the OS for ephemeral ports and is intended for tests or deployments
+    /// whose reachability layer publishes dynamic mappings.
+    #[serde(default)]
+    pub legacy_port_base: u16,
+
     /// Generate and retire logical identities as capacity changes.
     #[serde(default)]
     pub auto_scale_identities: bool,
@@ -200,6 +212,8 @@ impl Default for DaemonConfig {
         Self {
             identity_roots: Vec::new(),
             storage_roots: Vec::new(),
+            legacy_compatibility: true,
+            legacy_port_base: 0,
             auto_scale_identities: false,
             min_identities: default_daemon_min_identities(),
             max_identities: 0,
@@ -217,6 +231,10 @@ impl DaemonConfig {
     pub fn is_enabled(&self) -> bool {
         !self.identity_roots.is_empty() || self.auto_scale_identities
     }
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 const fn default_daemon_min_identities() -> usize {

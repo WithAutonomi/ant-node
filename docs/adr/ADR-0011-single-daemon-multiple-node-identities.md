@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-08-25
-- **Last updated:** 2026-08-26
+- **Last updated:** 2026-08-27
 - **Decision owners:** Autonomi node maintainers
 - **Reviewers:** TBD
 - **Supersedes:** none
@@ -132,6 +132,17 @@ identity named by `to`. Request/response correlation is scoped to the destinatio
 identity cannot consume another identity's response. Connection, byte and queue limits are enforced
 at daemon level with per-identity fairness and observability.
 
+During the compatibility window the daemon is dual-stack. In addition to its multiplexed endpoint,
+it exposes one legacy-protocol endpoint and port per logical identity. A legacy connection is pinned
+to the identity whose endpoint was dialled, making destinationless legacy envelopes unambiguous.
+The identity's signed legacy identity announcement advertises support for multiplexing, the daemon
+transport identity and the shared endpoint addresses. An upgraded peer verifies that announcement,
+connects to the shared endpoint, verifies that the intended logical identity is hosted there, and
+uses destination-addressed envelopes for subsequent traffic. A peer that does not advertise this
+capability remains on its identity-pinned legacy connection. Capability absence must never be
+guessed from malformed data, and an authenticated capability learned during a session must not be
+downgraded by a later unsigned or destinationless message.
+
 After a physical connection is authenticated, daemons exchange the logical identities hosted on
 that connection. Routing records for a logical identity must ultimately include, or resolve to, the
 physical daemon endpoint and a signed binding between the logical identity and daemon identity. The
@@ -154,12 +165,13 @@ handling, upgrade/restart coordination and shutdown for the full roster. It refu
 ambiguous identity configuration rather than silently generating replacements for unreadable keys.
 
 The existing single-identity configuration remains the default and uses the existing wire protocol.
-Multiplexing is opt-in while the protocol is rolled out. A multiplexed daemon can communicate as
-multiple identities only with peers that support destination-addressed envelopes and daemon
-bindings. Compatibility with old clients and old nodes therefore requires either a coordinated
-network cutover or a temporary legacy endpoint per identity; silently sending multiplexed envelopes
-to legacy software is not safe. Nodes, clients, GUI and operator tooling must negotiate or otherwise
-understand the format before multiplexing is enabled in a mixed-version network.
+Multi-identity daemons use the dual-stack policy above during rollout: upgraded peers share the
+daemon connection, while old clients and nodes use a dedicated legacy port for each identity.
+Silently sending multiplexed envelopes to legacy software is not safe. Legacy endpoints must never
+broadcast a destinationless request to all local identities or guess its destination from payload
+contents. Each legacy listener needs its own reachability/NAT mapping and externally advertised
+address; stable deployments should reserve a predictable port range large enough for the maximum
+identity roster.
 
 To reduce migration risk, stage one may reuse existing per-identity storage and replication
 components behind the daemon-owned identity-context boundary. Later stages move their shared work
@@ -231,7 +243,14 @@ allocation choice, not a claim that one machine provides additional independent 
 ### Negative / Trade-offs
 
 - The multiplexed envelope and logical-to-daemon binding require coordinated protocol support in
-  nodes and clients; node-only deployment cannot provide transparent mixed-version compatibility.
+  nodes and clients. During the transition, legacy peers retain interoperability through the
+  per-identity endpoints but do not benefit from connection sharing.
+- The compatibility window requires one listener port, NAT/relay mapping and potentially one remote
+  connection per identity for legacy peers. It deliberately reintroduces that networking overhead
+  only on legacy paths.
+- Legacy peers cannot recognize that identities on different compatibility ports share one machine.
+  They may count them as independent failure domains; protocols requiring machine-level diversity
+  cannot be fully corrected until those peers upgrade.
 - One process or transport failure now interrupts every identity on the machine. The daemon needs
   strong task isolation, health reporting and restart behavior; the release profile's
   `panic = "abort"` makes this failure-domain expansion especially important.
@@ -265,25 +284,36 @@ allocation choice, not a claim that one machine provides additional independent 
 
 ## Migration and Rollout
 
-1. Add destination-addressed, signed multiplexing and hosted-identity registration in
-   `saorsa-core`, with tests proving two logical identities reuse one physical connection and cannot
-   receive each other's messages.
+1. Add destination-addressed, signed multiplexing, hosted-identity registration and signed
+   capability negotiation in `saorsa-core`. Add an identity-pinned legacy endpoint for every hosted
+   identity and reject ambiguous legacy traffic arriving on the shared endpoint.
 2. Add an opt-in, daemon-owned fixed roster to `ant-node`. Keep single-identity startup and on-disk
-   layout as the default. Centralize roster lifecycle and safe identity-independent caches. Do not
-   add automatic scaling yet.
-3. Run isolated node-to-node testnets and compare physical connections, bootstrap time, message
-   routing, per-identity storage/rewards behavior and shutdown/restart recovery.
+   layout as the default. Multi-identity daemon records advertise legacy per-identity endpoints to
+   all peers; upgraded peers discover and switch to the shared endpoint through the signed
+   capability exchange.
+3. Run mixed-version testnets covering old-to-new, new-to-old and new-to-new communication. Verify
+   that old peers see ordinary independent node endpoints, upgraded logical pairs converge onto one
+   physical daemon connection, and neither response correlation nor destination routing crosses
+   identities.
 4. Update `ant-client`, `ant-gui`, the node manager/launcher and operational dashboards for the new
-   capability and compatibility negotiation.
-5. Choose a compatibility strategy and perform a canary rollout. Do not enable multiplexing on the
-   public network until all required message producers/consumers understand the negotiated format.
-6. Canary the parent physical observation view and daemon-wide neighbour-sync, audit and replication
+   capability, separate logical/physical connection counts and legacy-port range requirements.
+5. Canary the dual-stack release on the public network. Track the percentage of peers and traffic
+   using legacy endpoints, failed upgrades to the shared endpoint, old bootstrap infrastructure and
+   the number of operators without sufficient port/NAT configuration.
+6. Once bootstrap nodes and the required network majority support multiplexing, release a transition
+   version that disables legacy endpoints by default while retaining an explicit, time-bounded
+   operator opt-in. Re-enabling compatibility must not change identity keys or shared stored state.
+7. Remove the legacy listeners, negotiation downgrade path and operator opt-in in a later protocol
+   release. This is a declared compatibility cutover: nodes below the minimum supported protocol
+   version will no longer communicate with the upgraded network. The removal gate is based on
+   measured adoption and bootstrap reachability, not merely on one release interval having elapsed.
+8. Canary the parent physical observation view and daemon-wide neighbour-sync, audit and replication
    scheduling. Introduce capability-negotiated multi-subrequest wire batching under a separate wire-
    protocol ADR before changing request formats or trust semantics.
-7. Canary the shared content-addressed store and paid catalogue using reversible copy-and-verify
+9. Canary the shared content-addressed store and paid catalogue using reversible copy-and-verify
    migration. Do not remove old per-identity stores until operational reconciliation proves every
    obligation is represented.
-8. Enable capacity-driven scaling only after shared capacity accounting, local lease handoff and
+10. Enable capacity-driven scaling only after shared capacity accounting, local lease handoff and
    identity draining pass soak and failure testing.
 
 ## Validation
@@ -292,6 +322,9 @@ allocation choice, not a claim that one machine provides additional independent 
   incorrectly signed destination fields, and cross-identity response correlation.
 - An integration test runs two daemons with at least two logical identities each and demonstrates
   that all logical pairs use one physical QUIC connection between the machines.
+- Mixed-version tests prove a legacy node can bootstrap, request, respond and receive unsolicited
+  traffic through each identity-pinned endpoint, while the same daemon uses one shared connection
+  with an upgraded peer. Malformed, unsigned and stale capability advertisements are rejected.
 - Failure tests saturate one identity's work queue and show bounded service for another identity.
 - Parent-routing tests prove liveness work is deduplicated while identity-specific routing and trust
   outcomes remain isolated.

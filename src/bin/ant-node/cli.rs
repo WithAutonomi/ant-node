@@ -41,6 +41,14 @@ pub struct Cli {
     #[arg(long, env = "ANT_DAEMON_AUTO_SCALE_IDENTITIES")]
     pub daemon_auto_scale_identities: bool,
 
+    /// Disable the temporary per-identity legacy protocol listeners.
+    #[arg(long, env = "ANT_DAEMON_DISABLE_LEGACY_COMPATIBILITY")]
+    pub daemon_disable_legacy_compatibility: bool,
+
+    /// First port in the per-identity legacy compatibility listener range.
+    #[arg(long, env = "ANT_DAEMON_LEGACY_PORT_BASE")]
+    pub daemon_legacy_port_base: Option<u16>,
+
     /// Minimum logical identity count in auto-scale mode.
     #[arg(long, env = "ANT_DAEMON_MIN_IDENTITIES")]
     pub daemon_min_identities: Option<usize>,
@@ -270,6 +278,12 @@ impl Cli {
         }
         if self.daemon_auto_scale_identities {
             config.daemon.auto_scale_identities = true;
+        }
+        if self.daemon_disable_legacy_compatibility {
+            config.daemon.legacy_compatibility = false;
+        }
+        if let Some(port) = self.daemon_legacy_port_base {
+            config.daemon.legacy_port_base = port;
         }
         if let Some(min_identities) = self.daemon_min_identities {
             config.daemon.min_identities = min_identities;

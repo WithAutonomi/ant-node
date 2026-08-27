@@ -4922,7 +4922,7 @@ dependencies = [
 [[package]]
 name = "saorsa-core"
 version = "0.27.0"
-source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=feat/multi-identity-daemon#9f840050a2f399830f1ec0d5371495c5d749ed6e"
+source = "git+https://github.com/WithAutonomi/saorsa-core.git?branch=feat/multi-identity-daemon#351be1b9d19f9ed9a177e33de0c144d9ed58d86b"
 dependencies = [
  "anyhow",
  "async-trait",

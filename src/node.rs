@@ -98,7 +98,7 @@ impl NodeBuilder {
 
         // Resolve identity and root_dir (may update self.config.root_dir)
         let identity = Arc::new(Self::resolve_identity(&mut self.config).await?);
-        self.build_resolved(identity, None, true).await
+        self.build_resolved(identity, None, true, None).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -107,6 +107,7 @@ impl NodeBuilder {
         identity: Arc<NodeIdentity>,
         daemon_services: Option<&DaemonSharedServices>,
         enable_upgrade_monitor: bool,
+        legacy_port: Option<u16>,
     ) -> Result<RunningNode> {
         let exit_process_on_upgrade = daemon_services.is_none();
         let handle_os_signals = daemon_services.is_none();
@@ -135,6 +136,14 @@ impl NodeBuilder {
 
         // Initialize saorsa-core's P2PNode
         let p2p_node = match daemon_services {
+            Some(services) if self.config.daemon.legacy_compatibility => {
+                P2PNode::new_with_shared_transport_legacy_compatible(
+                    core_config,
+                    services.transport.as_ref(),
+                    legacy_port.unwrap_or(0),
+                )
+                .await
+            }
             Some(services) => {
                 P2PNode::new_with_shared_transport(core_config, services.transport.as_ref()).await
             }
@@ -543,6 +552,8 @@ struct DaemonRosterEntry {
     peer_id: String,
     root: PathBuf,
     active: bool,
+    #[serde(default)]
+    legacy_port: Option<u16>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -626,7 +637,13 @@ impl NodeDaemonBuilder {
         std::fs::create_dir_all(&self.config.root_dir)?;
         let daemon_state_root = self.config.root_dir.join("daemon-state");
         std::fs::create_dir_all(&daemon_state_root)?;
-        Self::persist_loaded_roster(&daemon_state_root, &roster)?;
+        let legacy_ports = Self::persist_loaded_roster(
+            &daemon_state_root,
+            &roster,
+            self.config.daemon.legacy_compatibility,
+            self.config.daemon.legacy_port_base,
+            self.config.port,
+        )?;
         let daemon_identity =
             Arc::new(Self::load_or_generate_daemon_identity(&self.config.root_dir).await?);
 
@@ -690,8 +707,9 @@ impl NodeDaemonBuilder {
             identity_config.root_dir = root;
             identity_config.close_group_cache_dir = Some(identity_config.root_dir.clone());
             identity_config.daemon.identity_roots.clear();
+            let legacy_port = legacy_ports.get(&identity.peer_id().to_hex()).copied();
             match NodeBuilder::new(identity_config)
-                .build_resolved(identity, Some(services.as_ref()), index == 0)
+                .build_resolved(identity, Some(services.as_ref()), index == 0, legacy_port)
                 .await
             {
                 Ok(node) => nodes.push(node),
@@ -722,23 +740,75 @@ impl NodeDaemonBuilder {
     fn persist_loaded_roster(
         daemon_state_root: &Path,
         roster: &[(PathBuf, Arc<NodeIdentity>)],
-    ) -> Result<()> {
+        legacy_compatibility: bool,
+        legacy_port_base: u16,
+        shared_port: u16,
+    ) -> Result<HashMap<String, u16>> {
         let path = daemon_state_root.join(DAEMON_ROSTER_FILENAME);
-        let mut identities = if path.is_file() {
+        let previous = if path.is_file() {
             serde_json::from_slice::<DaemonRosterManifest>(&std::fs::read(&path)?)
                 .map_err(|error| Error::Config(format!("Failed to parse daemon roster: {error}")))?
                 .identities
-                .into_iter()
-                .filter(|entry| !entry.active)
-                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
-        identities.extend(roster.iter().map(|(root, identity)| DaemonRosterEntry {
-            peer_id: identity.peer_id().to_hex(),
-            root: root.clone(),
-            active: true,
-        }));
+        let mut used_ports = HashSet::new();
+        if shared_port != 0 {
+            used_ports.insert(shared_port);
+        }
+        for port in previous.iter().filter_map(|entry| entry.legacy_port) {
+            if port != 0 && !used_ports.insert(port) {
+                return Err(Error::Config(format!(
+                    "legacy port {port} conflicts with the shared daemon port or another identity"
+                )));
+            }
+        }
+        let previous_by_peer = previous
+            .iter()
+            .map(|entry| (entry.peer_id.clone(), entry.legacy_port))
+            .collect::<HashMap<_, _>>();
+        let roster_peer_ids = roster
+            .iter()
+            .map(|(_, identity)| identity.peer_id().to_hex())
+            .collect::<HashSet<_>>();
+        let mut identities = previous
+            .into_iter()
+            .filter_map(|mut entry| {
+                if roster_peer_ids.contains(&entry.peer_id) {
+                    None
+                } else {
+                    entry.active = false;
+                    Some(entry)
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut active_ports = HashMap::new();
+        for (root, identity) in roster {
+            let peer_id = identity.peer_id().to_hex();
+            let legacy_port = if legacy_compatibility {
+                previous_by_peer
+                    .get(&peer_id)
+                    .copied()
+                    .flatten()
+                    .map_or_else(
+                        || Self::next_legacy_port(legacy_port_base, &mut used_ports),
+                        Ok,
+                    )?
+            } else {
+                0
+            };
+            active_ports.insert(peer_id.clone(), legacy_port);
+            identities.push(DaemonRosterEntry {
+                legacy_port: if legacy_compatibility {
+                    Some(legacy_port)
+                } else {
+                    previous_by_peer.get(&peer_id).copied().flatten()
+                },
+                peer_id,
+                root: root.clone(),
+                active: true,
+            });
+        }
         let manifest = DaemonRosterManifest {
             version: 1,
             identities,
@@ -748,7 +818,21 @@ impl NodeDaemonBuilder {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)?;
-        Ok(())
+        Ok(active_ports)
+    }
+
+    fn next_legacy_port(base: u16, used: &mut HashSet<u16>) -> Result<u16> {
+        if base == 0 {
+            return Ok(0);
+        }
+        for port in base..=u16::MAX {
+            if used.insert(port) {
+                return Ok(port);
+            }
+        }
+        Err(Error::Config(format!(
+            "no free legacy compatibility port remains at or above {base}"
+        )))
     }
 
     async fn prepare_auto_scaled_roster(&mut self) -> Result<()> {
@@ -884,17 +968,22 @@ impl NodeDaemonBuilder {
     }
 
     fn persist_roster_manifest(config: &NodeConfig, path: &Path) -> Result<()> {
-        let mut identities = if path.is_file() {
+        let previous = if path.is_file() {
             let bytes = std::fs::read(path)?;
             serde_json::from_slice::<DaemonRosterManifest>(&bytes)
                 .map_err(|error| Error::Config(format!("Failed to parse daemon roster: {error}")))?
                 .identities
-                .into_iter()
-                .filter(|entry| !entry.active)
-                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
+        let previous_ports = previous
+            .iter()
+            .map(|entry| (entry.peer_id.clone(), entry.legacy_port))
+            .collect::<HashMap<_, _>>();
+        let mut identities = previous
+            .into_iter()
+            .filter(|entry| !entry.active)
+            .collect::<Vec<_>>();
         for root in &config.daemon.identity_roots {
             let key_path = root.join(NODE_IDENTITY_FILENAME);
             let peer_id = if key_path.is_file() {
@@ -905,6 +994,7 @@ impl NodeDaemonBuilder {
                 String::new()
             };
             identities.push(DaemonRosterEntry {
+                legacy_port: previous_ports.get(&peer_id).copied().flatten(),
                 peer_id,
                 root: root.clone(),
                 active: true,
@@ -1364,23 +1454,29 @@ impl RunningNodeDaemon {
             .map_err(|error| {
                 Error::Startup(format!("Failed to persist dynamic identity: {error}"))
             })?;
-        self.persist_roster_entry(DaemonRosterEntry {
+        let legacy_port = self.persist_roster_entry(DaemonRosterEntry {
             peer_id: identity.peer_id().to_hex(),
             root: root.clone(),
             active: true,
+            legacy_port: None,
         })?;
         let mut config = self.config.clone();
         config.root_dir = root;
         config.close_group_cache_dir = Some(config.root_dir.clone());
         config.daemon.identity_roots.clear();
         let node = NodeBuilder::new(config)
-            .build_resolved(identity, Some(self.services.as_ref()), false)
+            .build_resolved(
+                identity,
+                Some(self.services.as_ref()),
+                false,
+                Some(legacy_port),
+            )
             .await?;
         info!(peer_id = %node.p2p_node.peer_id(), "Added dynamic logical identity to running daemon");
         Ok(node)
     }
 
-    fn persist_roster_entry(&self, entry: DaemonRosterEntry) -> Result<()> {
+    fn persist_roster_entry(&self, mut entry: DaemonRosterEntry) -> Result<u16> {
         let path = self
             .config
             .root_dir
@@ -1395,6 +1491,38 @@ impl RunningNodeDaemon {
                 identities: Vec::new(),
             }
         };
+        let existing_port = manifest
+            .identities
+            .iter()
+            .find(|known| known.peer_id == entry.peer_id)
+            .and_then(|known| known.legacy_port);
+        let mut used_ports = manifest
+            .identities
+            .iter()
+            .filter_map(|known| known.legacy_port)
+            .filter(|port| *port != 0)
+            .collect::<HashSet<_>>();
+        if self.config.port != 0 {
+            used_ports.insert(self.config.port);
+        }
+        let legacy_port = if self.config.daemon.legacy_compatibility {
+            existing_port.map_or_else(
+                || {
+                    NodeDaemonBuilder::next_legacy_port(
+                        self.config.daemon.legacy_port_base,
+                        &mut used_ports,
+                    )
+                },
+                Ok,
+            )?
+        } else {
+            0
+        };
+        entry.legacy_port = if self.config.daemon.legacy_compatibility {
+            Some(legacy_port)
+        } else {
+            existing_port
+        };
         manifest
             .identities
             .retain(|known| known.peer_id != entry.peer_id);
@@ -1404,7 +1532,7 @@ impl RunningNodeDaemon {
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, bytes)?;
         std::fs::rename(tmp, path)?;
-        Ok(())
+        Ok(legacy_port)
     }
 
     fn persist_active_roster(
@@ -1429,12 +1557,14 @@ impl RunningNodeDaemon {
             HashMap::new()
         };
         for (peer_id, state) in active {
+            let legacy_port = by_peer.get(peer_id).and_then(|entry| entry.legacy_port);
             by_peer.insert(
                 peer_id.clone(),
                 DaemonRosterEntry {
                     peer_id: peer_id.clone(),
                     root: state.root.clone(),
                     active: !retiring.contains(peer_id),
+                    legacy_port,
                 },
             );
         }
@@ -1913,6 +2043,66 @@ fn jittered_interval(base: std::time::Duration) -> std::time::Duration {
 mod tests {
     use super::*;
     use crate::config::NODES_SUBDIR;
+
+    #[test]
+    fn legacy_port_allocator_skips_reserved_ports() {
+        let mut used = HashSet::from([12_000, 12_001]);
+        assert_eq!(
+            NodeDaemonBuilder::next_legacy_port(12_000, &mut used).unwrap(),
+            12_002
+        );
+        assert_eq!(
+            NodeDaemonBuilder::next_legacy_port(0, &mut used).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn daemon_roster_keeps_stable_legacy_ports_when_identity_order_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon_state = temp.path().join("daemon-state");
+        std::fs::create_dir_all(&daemon_state).unwrap();
+        let first = Arc::new(NodeIdentity::generate().unwrap());
+        let second = Arc::new(NodeIdentity::generate().unwrap());
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        let initial = vec![
+            (first_root.clone(), Arc::clone(&first)),
+            (second_root.clone(), Arc::clone(&second)),
+        ];
+        let first_peer = first.peer_id().to_hex();
+        let second_peer = second.peer_id().to_hex();
+        let ports =
+            NodeDaemonBuilder::persist_loaded_roster(&daemon_state, &initial, true, 12_000, 12_000)
+                .unwrap();
+        assert_eq!(ports.get(&first_peer), Some(&12_001));
+        assert_eq!(ports.get(&second_peer), Some(&12_002));
+
+        let reordered = vec![(second_root, second), (first_root, first)];
+        let ports = NodeDaemonBuilder::persist_loaded_roster(
+            &daemon_state,
+            &reordered,
+            true,
+            12_000,
+            12_000,
+        )
+        .unwrap();
+        assert_eq!(ports.get(&first_peer), Some(&12_001));
+        assert_eq!(ports.get(&second_peer), Some(&12_002));
+
+        NodeDaemonBuilder::persist_loaded_roster(&daemon_state, &reordered, false, 12_000, 12_000)
+            .unwrap();
+        let ports = NodeDaemonBuilder::persist_loaded_roster(
+            &daemon_state,
+            &reordered,
+            true,
+            12_000,
+            12_000,
+        )
+        .unwrap();
+        assert_eq!(ports.get(&first_peer), Some(&12_001));
+        assert_eq!(ports.get(&second_peer), Some(&12_002));
+    }
 
     #[test]
     fn test_build_upgrade_monitor_staged_rollout_enabled() {
