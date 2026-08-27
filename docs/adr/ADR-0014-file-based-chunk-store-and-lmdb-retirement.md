@@ -1,4 +1,4 @@
-# ADR-0012: One File Per Chunk, and Retiring LMDB Without Losing Data
+# ADR-0014: One File Per Chunk, and Retiring LMDB Without Losing Data
 
 - **Status:** Proposed
 - **Date:** 2026-08-25
