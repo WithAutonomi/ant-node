@@ -217,6 +217,20 @@ const fn default_true() -> bool {
 /// needed to hold both stores.
 pub const RELEASE_RETIRE_LEGACY: bool = true;
 
+/// Environment override for the directory the per-volume migration lock lives in.
+///
+/// Set this where the default cannot work, and the default cannot work wherever the nodes
+/// sharing a disk do not share a `/tmp`. Our own multi-node hosts are exactly that case:
+/// the systemd unit sets `PrivateTmp=true`, which gives every unit a tmpfs of its own, so
+/// each node creates the same lock filename in a different filesystem, every one of them
+/// takes it, and the lock serialises nothing. Point every node on a host at one directory
+/// they can all write and the lock does what it is for.
+///
+/// The directory must be writable by the node. A path that cannot be used is reported and
+/// the node migrates unserialised, which is the same answer as having no lock, so a typo
+/// here is loud rather than silent.
+pub const LOCK_DIR_ENV: &str = "ANT_MIGRATION_LOCK_DIR";
+
 /// Environment override for [`RELEASE_RETIRE_LEGACY`], for a canary node.
 pub const RETIRE_LEGACY_ENV: &str = "ANT_MIGRATION_RETIRE_LEGACY";
 
@@ -325,7 +339,7 @@ pub enum MigrationPhase {
 /// Two facts genuinely need to survive a restart: when this build first ran (so the shed
 /// hold is not restarted by a reboot loop) and when the node committed to its file-backed
 /// set (so the retirement clock is not either). Everything else is re-derived.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationState {
     /// Marker schema version.
     pub schema: u32,
@@ -371,10 +385,59 @@ impl MigrationState {
     /// hold would never become eligible to shed and never finish migrating.
     pub fn load_or_create(root_dir: &Path, phase: MigrationPhase) -> Self {
         let state = Self::load_or_new(root_dir, phase);
-        if !state_path(root_dir).exists() {
-            if let Err(e) = state.save(root_dir) {
-                warn!("Could not write the migration marker: {e}");
+        // Written whenever the disk does not already hold what this process is going to
+        // use, rather than only when there is no file at all. A marker that is present but
+        // could not be used is replaced in memory and was previously left on disk, so the
+        // next start read the same bad file and stamped `first_start_unix` afresh. That is
+        // precisely the reset this function exists to prevent, and it is worse than the
+        // one it does prevent: it repeats. Three ways in, all of them leaving a file that
+        // exists: a truncated or otherwise unparseable marker, one from a newer schema, and
+        // one whose clock is impossible and is corrected by `with_sane_clocks`.
+        //
+        // A node restarting more often than the shed hold then never becomes eligible to
+        // shed and never finishes migrating, and a node short of disk is exactly the node
+        // that restarts.
+        let raw = std::fs::read(state_path(root_dir)).ok();
+        let on_disk = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Self>(bytes).ok());
+        if on_disk.as_ref() == Some(&state) {
+            return state;
+        }
+        // The schema is read on its own, from the raw JSON, rather than taken from a
+        // successful parse into today's struct. A marker from a genuinely newer build is
+        // exactly the one least likely to parse into it: a phase this build has no name
+        // for, a field that changed type, a field that went away. Reading the schema only
+        // when the whole thing parses means the markers most worth keeping are the ones
+        // that would be written over.
+        let newer_schema = raw
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .and_then(|value| value.get("schema").and_then(serde_json::Value::as_u64))
+            .filter(|schema| *schema > u64::from(STATE_SCHEMA));
+        if let Some(schema) = newer_schema {
+            let Some(kept) = free_kept_marker_path(root_dir, schema) else {
+                warn!(
+                    "A newer migration marker (schema {schema}) is here and every name to \
+                     keep it under is taken. Leaving it, which means the shed hold restarts \
+                     on every boot until it is dealt with"
+                );
+                return state;
+            };
+            if let Err(e) = std::fs::rename(state_path(root_dir), &kept) {
+                warn!(
+                    "Could not move the newer migration marker aside ({e}); leaving it, \
+                     which means the shed hold restarts on every boot until it is dealt with"
+                );
+                return state;
             }
+            info!(
+                "Kept the newer migration marker as {} and started one this build can use",
+                kept.display()
+            );
+        }
+        if let Err(e) = state.save(root_dir) {
+            warn!("Could not write the migration marker: {e}");
         }
         state
     }
@@ -466,6 +529,32 @@ impl MigrationState {
     }
 }
 
+/// A name to keep a newer marker under that nothing is using yet.
+///
+/// The plain `.schema-N` name is deterministic, so a node downgraded twice would otherwise
+/// write over the marker it kept the first time, or fail the rename and restart the hold on
+/// every boot. Returns `None` if every name is taken, which the caller reports rather than
+/// destroying anything.
+fn free_kept_marker_path(root_dir: &Path, schema: u64) -> Option<PathBuf> {
+    for attempt in 0..16u32 {
+        // Appended, not `with_extension`, which would replace the `.json` and leave a name
+        // that no longer says what the file is.
+        let mut candidate = state_path(root_dir).into_os_string();
+        candidate.push(format!(".schema-{schema}"));
+        if attempt > 0 {
+            candidate.push(format!(".{attempt}"));
+        }
+        let candidate = PathBuf::from(candidate);
+        // `symlink_metadata`, not `try_exists`. The latter follows links, so a dangling
+        // symbolic link at this name reads as nothing being there while `rename` would
+        // happily replace it. Anything at all, of any kind, means pick another name.
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 /// Path of the persisted marker.
 #[must_use]
 pub fn state_path(root_dir: &Path) -> PathBuf {
@@ -488,10 +577,21 @@ pub fn now_unix() -> u64 {
 /// twelve stall. The lock is taken non-blocking: a node that cannot get it simply waits
 /// for the next tick.
 ///
-/// The lock file sits in the parent of the node root, which for a default deployment is
-/// the shared `nodes/` directory. That is a heuristic for "same volume", not a guarantee;
-/// an operator who spreads node roots across volumes gets more serialisation than they
-/// need, which is slow rather than unsafe.
+/// Where the lock file sits is `lock_path_for`'s decision (private, so this is not a
+/// link), and this doc used to describe
+/// a branch of it that a running node almost never reaches: the parent of the node root is
+/// the last resort, taken only when the root's own metadata cannot be read. What a node
+/// normally uses is the host's temporary directory keyed by the volume's device id, or the
+/// directory named by [`LOCK_DIR_ENV`] when one is set.
+///
+/// Which of those is right is a fact about the deployment that no node can check for
+/// itself, and getting it wrong is silent: every node takes a lock of its own and reports
+/// success. That is why the path is logged when the lock is taken, and why a host whose
+/// nodes do not share a `/tmp` has to be told where the lock lives.
+///
+/// The directory has to be one only the node's own user can write. A predictable path in a
+/// world-writable `/tmp` can be created and held by any local user, who could then keep
+/// every node on the host from ever migrating.
 #[derive(Debug)]
 pub struct VolumeLock {
     /// The held file. Dropping it releases the lock.
@@ -543,7 +643,11 @@ impl VolumeLock {
         };
         match file.try_lock_exclusive() {
             Ok(()) => {
-                debug!("Took the volume migration lock at {}", path.display());
+                // Info, not debug. Whether the lock is doing anything depends on whether
+                // the neighbours on this disk can see the same path, which is a deployment
+                // fact no node can check. Printing the path is what lets somebody answer it
+                // from a log rather than by reading a unit file.
+                info!("Took the volume migration lock at {}", path.display());
                 LockAttempt::Acquired(Self { file, path })
             }
             // Only contention means another node is migrating. Everything else, a
@@ -580,7 +684,33 @@ fn is_lock_contention(e: &std::io::Error) -> bool {
 /// The device id names the filesystem, and the host's temporary directory is somewhere
 /// every node on that host can reach. If the device cannot be read, this falls back to a
 /// lock beside the root: weaker, but never worse than having none.
+///
+/// **That last sentence is only true where the nodes share a `/tmp`.** Where they do not,
+/// each computes the same name in a filesystem of its own, every one of them takes it, and
+/// the lock serialises nothing while logging that it worked. `PrivateTmp=true` in a systemd
+/// unit does exactly that, and our own worker unit sets it. There is no way to tell from
+/// inside one process whether the `/tmp` it can see is the one its neighbours see, so this
+/// cannot be detected here and has to be configured: [`LOCK_DIR_ENV`] names a directory
+/// every node on the host can reach, and is consulted first.
 fn lock_path_for(root_dir: &Path) -> PathBuf {
+    lock_path_with(root_dir, std::env::var(LOCK_DIR_ENV).ok().as_deref())
+}
+
+/// The same decision, with the configured directory passed in rather than read.
+///
+/// Split so it can be tested without touching process-wide environment. A test that set
+/// `TMPDIR` to stage the private-`/tmp` case would change where every other test's
+/// `TempDir` lands, and then delete it underneath them: run in parallel that takes out
+/// dozens of unrelated tests with LMDB failures that look like anything but their cause.
+fn lock_path_with(root_dir: &Path, configured: Option<&str>) -> PathBuf {
+    // Before anything derived, because an operator who has set this knows something about
+    // the host that this function cannot find out.
+    if let Some(dir) = configured {
+        let dir = dir.trim();
+        if !dir.is_empty() {
+            return Path::new(dir).join("ant-migration.lock");
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1559,10 +1689,13 @@ async fn bridge_tick(
         // watching a node actually sees, and what says the copier has not silently stalled.
         let left = store.legacy_only_keys().len();
         if left % PROGRESS_LOG_EVERY < usize::try_from(report.copied).unwrap_or(usize::MAX) {
+            let no_rollback = store.writes_without_a_rollback_copy();
             info!(
                 migration_event = "progress",
                 remaining = left,
-                "Storage migration: {left} chunk(s) left to copy out of the legacy environment"
+                no_rollback_copy = no_rollback,
+                "Storage migration: {left} chunk(s) left to copy out of the legacy \
+                 environment, {no_rollback} write(s) made without a rollback copy"
             );
         }
     }
@@ -2439,6 +2572,234 @@ mod tests {
             "{what}: still in {:?} after the deadline, expected {phase:?}",
             store.migration_phase()
         );
+    }
+
+    /// A marker that cannot be used is replaced on disk, not just in memory.
+    ///
+    /// The shed hold counts from `first_start_unix`, and the whole reason this is written
+    /// at startup rather than at the first phase change is that a marker written later
+    /// would restart that clock on every reboot. A marker that is present but unusable used
+    /// to defeat that: it was replaced in memory and left on disk, so every start read the
+    /// same bad file and stamped a fresh clock. A node restarting more often than the hold
+    /// would then never become eligible to shed and never finish migrating, which is the
+    /// failure the doc comment on `load_or_create` names.
+    #[test]
+    fn an_unusable_marker_is_replaced_on_disk_so_the_hold_does_not_restart() {
+        for (name, bad) in [
+            ("truncated", br#"{"schema":1,"phase":"brid"#.to_vec()),
+            ("not json at all", b"\x00\x01\x02".to_vec()),
+            (
+                "a newer schema",
+                serde_json::json!({
+                    "schema": 9_999,
+                    "phase": "bridging",
+                    "first_start_unix": 1,
+                    "committed_at_unix": null,
+                    "rebuilds_since_commit": 0,
+                    "shed_key_count": 0,
+                    "kept_key_count": 0,
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+            // The one most worth keeping, and the one a parse into today's struct cannot
+            // read: a phase this build has no name for, and a field it does not know.
+            (
+                "a newer schema this build cannot parse at all",
+                serde_json::json!({
+                    "schema": 9_999,
+                    "phase": "some_phase_from_the_future",
+                    "first_start_unix": 1,
+                    "something_this_build_never_heard_of": {"a": 1},
+                })
+                .to_string()
+                .into_bytes(),
+            ),
+        ] {
+            let dir = TempDir::new().expect("temp dir");
+            std::fs::write(state_path(dir.path()), &bad).expect("plant the bad marker");
+
+            let first = MigrationState::load_or_create(dir.path(), MigrationPhase::Bridging);
+            let written = std::fs::read(state_path(dir.path())).expect("read it back");
+            assert_ne!(written, bad, "{name}: the unusable marker was left on disk");
+            if name.starts_with("a newer schema") {
+                // Moved aside rather than destroyed: it was written on purpose by a build
+                // that knew more than this one.
+                let mut kept = state_path(dir.path()).into_os_string();
+                kept.push(".schema-9999");
+                let kept = PathBuf::from(kept);
+                assert_eq!(
+                    std::fs::read(&kept).expect("the newer marker must be kept"),
+                    bad,
+                    "the newer marker was written over rather than set aside"
+                );
+            }
+
+            // And the clock survives the next start, which is the point of all this.
+            let second = MigrationState::load_or_create(dir.path(), MigrationPhase::Bridging);
+            assert_eq!(
+                second.first_start_unix, first.first_start_unix,
+                "{name}: the shed hold restarted on the next boot"
+            );
+        }
+    }
+
+    /// A marker whose clock is impossible is corrected on disk too.
+    ///
+    /// `with_sane_clocks` fixes a future-dated marker for the process that read it. Left
+    /// there, the same correction is made again on every start, from a new now each time,
+    /// which is the same repeating reset by another route.
+    #[test]
+    fn a_future_dated_marker_is_corrected_on_disk_not_only_in_memory() {
+        let dir = TempDir::new().expect("temp dir");
+        let ahead = now_unix().saturating_add(60 * 60 * 24 * 365);
+        let planted = serde_json::json!({
+            "schema": 1,
+            "phase": "bridging",
+            "first_start_unix": ahead,
+            "committed_at_unix": null,
+            "rebuilds_since_commit": 0,
+            "shed_key_count": 0,
+            "kept_key_count": 0,
+        })
+        .to_string();
+        std::fs::write(state_path(dir.path()), &planted).expect("plant it");
+
+        let first = MigrationState::load_or_create(dir.path(), MigrationPhase::Bridging);
+        assert!(
+            first.first_start_unix < ahead,
+            "the clock should have been brought back to something possible"
+        );
+
+        let reread: MigrationState =
+            serde_json::from_slice(&std::fs::read(state_path(dir.path())).expect("read"))
+                .expect("the marker on disk must now parse");
+        assert_eq!(
+            reread.first_start_unix, first.first_start_unix,
+            "the correction was made in memory and not written back"
+        );
+    }
+
+    /// A marker that is already right is not rewritten on every start.
+    ///
+    /// The counterpart to the two above: persisting on disagreement must not turn into
+    /// persisting unconditionally, which would put a write on every node's start path for
+    /// nothing.
+    #[test]
+    fn a_usable_marker_is_left_exactly_as_it_is() {
+        let dir = TempDir::new().expect("temp dir");
+        let first = MigrationState::load_or_create(dir.path(), MigrationPhase::Bridging);
+
+        // Written back out by hand in a shape this build would never produce: the same
+        // facts, different spacing and key order. Comparing the bytes of a marker this
+        // build wrote against the bytes after a second start proves nothing, because an
+        // unconditional rewrite produces the same bytes and the test passes either way.
+        // Something semantically equal but textually different is the only thing that can
+        // tell "left alone" from "written again".
+        let noncanonical = format!(
+            "{{\"kept_key_count\":{},\"shed_key_count\":{},\"rebuilds_since_commit\":{},\
+             \"committed_at_unix\":null,\"first_start_unix\":{},\"phase\":\"bridging\",\
+             \"schema\":{}}}",
+            first.kept_key_count,
+            first.shed_key_count,
+            first.rebuilds_since_commit,
+            first.first_start_unix,
+            first.schema
+        );
+        std::fs::write(state_path(dir.path()), &noncanonical).expect("write");
+
+        MigrationState::load_or_create(dir.path(), MigrationPhase::Bridging);
+        assert_eq!(
+            std::fs::read_to_string(state_path(dir.path())).expect("read"),
+            noncanonical,
+            "a marker that already said the right thing was rewritten for no reason"
+        );
+    }
+
+    /// Two nodes on one disk take the same lock, and the override is what makes that true
+    /// where they do not share a `/tmp`.
+    ///
+    /// `lock_path_for` had no coverage at all, which is how it came to be right in a way
+    /// that is false on our own fleet: every shipped test sets `lock_dir` and so never
+    /// calls it. What the lock is for is one node copying at a time on a shared disk, so
+    /// what has to be true is that two different node roots on one volume produce one path.
+    ///
+    /// Nothing here touches process-wide environment. An earlier version of this test set
+    /// `TMPDIR` to stage the private-`/tmp` case, which moved every other test's temporary
+    /// directory and then deleted it underneath them: sixty-three unrelated tests failed
+    /// with LMDB errors that pointed nowhere near the cause.
+    #[test]
+    fn nodes_on_one_volume_agree_on_a_lock_path_when_they_are_told_where_it_is() {
+        let volume = TempDir::new().expect("temp dir");
+        let a = volume.path().join("node-0");
+        let b = volume.path().join("node-1");
+        std::fs::create_dir_all(&a).expect("mkdir");
+        std::fs::create_dir_all(&b).expect("mkdir");
+
+        // With no override and one shared temporary directory, which is the case the
+        // default is right for: two roots on one volume, one lock.
+        assert_eq!(
+            lock_path_with(&a, None),
+            lock_path_with(&b, None),
+            "two roots on one volume must share a lock when they share a /tmp"
+        );
+
+        // Where they do not share one, the default gives each node a lock of its own and
+        // every one of them takes it. That is the deployment hazard, and it is why the
+        // override exists rather than something the code can detect.
+        assert_ne!(
+            lock_path_with(&a, Some("/tmp/private-to-node-0")),
+            lock_path_with(&b, Some("/tmp/private-to-node-1")),
+            "different lock directories must give different locks, or the override would \
+             not be able to express anything"
+        );
+
+        // And told where it lives, both land on it whatever their own root is.
+        let told = volume.path().to_string_lossy().into_owned();
+        let shared_a = lock_path_with(&a, Some(&told));
+        let shared_b = lock_path_with(&b, Some(&told));
+        assert_eq!(
+            shared_a, shared_b,
+            "nodes told where the lock lives must all use it"
+        );
+        assert!(shared_a.starts_with(volume.path()), "and use the one named");
+        assert_eq!(
+            lock_path_with(&a, Some("   ")),
+            lock_path_with(&a, None),
+            "an empty setting is not a location and must not be treated as one"
+        );
+
+        // And the lock itself then does its job across the two roots.
+        let LockAttempt::Acquired(held) = VolumeLock::try_acquire(&a, Some(volume.path())) else {
+            panic!("the first node must take it");
+        };
+        assert!(
+            matches!(
+                VolumeLock::try_acquire(&b, Some(volume.path())),
+                LockAttempt::Busy
+            ),
+            "the second must wait rather than copy alongside it"
+        );
+        drop(held);
+        assert!(matches!(
+            VolumeLock::try_acquire(&b, Some(volume.path())),
+            LockAttempt::Acquired(_)
+        ));
+    }
+
+    /// A lock directory that cannot be written is reported, not silently ignored.
+    ///
+    /// The override is a deployment fact, so a typo in it must not read as "no lock needed
+    /// here". `Unavailable` is the honest answer and it already warns; what this pins is
+    /// that a bad override does not quietly fall back to a path that would appear to work.
+    #[test]
+    fn a_lock_directory_that_does_not_exist_is_unavailable_rather_than_ignored() {
+        let dir = TempDir::new().expect("temp dir");
+        let missing = dir.path().join("no-such-directory");
+        assert!(matches!(
+            VolumeLock::try_acquire(dir.path(), Some(&missing)),
+            LockAttempt::Unavailable
+        ));
     }
 
     #[tokio::test]

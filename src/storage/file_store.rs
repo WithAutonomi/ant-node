@@ -640,8 +640,13 @@ impl FileStore {
         // cancelled startup that released the lock would leave it sweeping a directory
         // another process had just been let into.
         let scan_lease = Arc::clone(&lock);
+        // The node root as well as the chunk tree. The scan sweeps interrupted writes
+        // under `chunks/`, which covers the layout marker's temporary because that lives
+        // there; the migration marker's lives in the root, where nothing looked.
+        let root = config.root_dir.clone();
         let scan = spawn_blocking(move || {
             let _lease = scan_lease;
+            sweep_marker_temps(&root);
             scan_store(&scan_dir)
         })
         .await
@@ -773,6 +778,8 @@ impl FileStore {
         // directory whose exclusivity the lock is what establishes, and it can outlive
         // the last owner of the store.
         let lease = Arc::clone(&self.lock);
+        let known_wrong = Arc::clone(&self.known_wrong);
+        let suspect = Arc::clone(&self.suspect);
 
         let outcome = self
             .blocking_tracker
@@ -786,13 +793,70 @@ impl FileStore {
                 // `mkdir` plus a directory flush are syscalls, so they belong here and
                 // not on a runtime worker.
                 ensure_shard_dir(&chunks_dir, &shard, lane, &shards_present)?;
-                let outcome = publish(&temp_path, &final_path, &payload, &shard)?;
+                let outcome = match publish(&temp_path, &final_path, &payload, &shard) {
+                    Ok(outcome) => outcome,
+                    Err(PublishFailed { error, left_behind }) => {
+                        // A publish that failed can still have left the bytes there: off
+                        // Unix the chunk is created under its final name, and if the write
+                        // or the flush then fails, the cleanup that removes it can fail
+                        // too. Releasing the reservation would hand back a charge for a
+                        // file that is on the disk.
+                        //
+                        // The publish says so rather than this deciding from a later
+                        // `is_file`. Asking the filesystem afterwards infers ownership from
+                        // a name being occupied, which is true under the store lock and the
+                        // shard lane and not true against anything out of band, and this
+                        // file spends a lot of its length arguing that a name is not
+                        // evidence. A bit set by the code that created the file is.
+                        if left_behind {
+                            reservation.commit();
+                        }
+                        return Err(error);
+                    }
+                };
+                // Placed, not yet durable. A failure from here on leaves the bytes on the
+                // disk: the chunk is rightly not reported as stored, because a copy that is
+                // not durable must not authorise deleting another, but the space is spent
+                // all the same. Dropping the reservation would hand that charge back and
+                // admit the next write against room that is already gone.
+                //
+                // Only for a chunk this call published. `Duplicate` means the file was
+                // already there and was charged by whoever wrote it, so charging it again
+                // here would count one file twice and shrink the store's idea of its own
+                // disk on every retry.
+                if let Err(e) = flush_publication(&final_path, &shard) {
+                    if matches!(outcome, PutOutcome::New) {
+                        reservation.commit();
+                    }
+                    return Err(e);
+                }
                 // Index inside the lane, and only after the rename has returned. A
                 // concurrent delete of the same address therefore cannot interleave
                 // between publishing the file and admitting the key.
-                index.write().insert(key);
-                // Settled here, inside the work, so a dropped awaiter cannot strand it.
+                //
+                // Only for a chunk this call actually published. `Duplicate` says a file
+                // already wears the name, and a name is not evidence about the bytes under
+                // it: the four-way answer that decides whether they are good, wrong, absent
+                // or unreadable runs after the await below, and a caller whose future is
+                // dropped never reaches it. Admitting the key here would leave the node
+                // claiming, advertising and committing to bytes nothing has read, with no
+                // suspect or known-wrong mark to hold it back, and the sharpest case is a
+                // name the startup scan deliberately refused because what wears it is a
+                // fifo, a socket or a directory. The duplicate arm admits the key itself,
+                // once a read has proven the bytes.
                 if matches!(outcome, PutOutcome::New) {
+                    index.write().insert(key);
+                    // With the marks that would otherwise hold the key back. These bytes
+                    // were hashed against their own name on the way in, so an older
+                    // instance proven wrong or merely unreadable has just been replaced by
+                    // a good one. Cleared here rather than after the await for the same
+                    // reason the insert is here: a cancelled caller would leave the key
+                    // indexed and suppressed at once, so a chunk this node really does hold
+                    // would stay hidden from `exists` and `all_keys` until some later read
+                    // happened to settle it.
+                    known_wrong.write().remove(&key);
+                    suspect.write().remove(&key);
+                    // Settled here, inside the work, so a dropped awaiter cannot strand it.
                     reservation.commit();
                 }
                 Ok(outcome)
@@ -801,59 +865,12 @@ impl FileStore {
             .map_err(|e| Error::Storage(format!("Chunk store put task failed: {e}")))??;
 
         match outcome {
-            PutOutcome::Duplicate => {
-                // The file was already on disk, and its name is not evidence its contents
-                // are right. The startup scan indexes by name without reading anything,
-                // and on Windows a crash mid-write leaves a partial file under a real
-                // chunk name. Trusting the name here would acknowledge a chunk that was
-                // never stored, and then discard the good copy arriving to repair it.
-                // Every answer handled, because three of the four must not report the
-                // chunk as stored. A caller that hears success acts on it: a client drops
-                // its own copy, replication marks the key held, and the copier takes it
-                // out of the legacy-only set.
-                match self.stored_bytes_match(address).await {
-                    StoredBytes::Good => {
-                        {
-                            let mut stats = self.stats.write();
-                            stats.duplicates = stats.duplicates.saturating_add(1);
-                        }
-                        Ok(false)
-                    }
-                    StoredBytes::Wrong => {
-                        warn!(
-                            "Chunk {} was already on disk but its contents are wrong; \
-                             replacing it with the copy just offered",
-                            hex::encode(address)
-                        );
-                        self.repair(address, content).await.map(|()| true)
-                    }
-                    // The name was taken a moment ago and is not now, or was never a
-                    // readable chunk file. Either way nothing holds these bytes, so say so
-                    // rather than reporting a chunk that is not there.
-                    StoredBytes::Absent => Err(Error::Storage(format!(
-                        "Chunk {} was reported already on disk but nothing is there. Not \
-                         reporting it as stored.",
-                        hex::encode(address)
-                    ))),
-                    // Replacing on an unanswered question would destroy a healthy copy,
-                    // and reporting success would discard the offered one. The index entry
-                    // stays: the file is still there, and dropping the entry would leave
-                    // the chunk in neither this store's view nor the legacy one, which is
-                    // what retirement destroys. Removing an entry is the quarantine path's
-                    // job, and it removes the file with it, after a read that succeeded
-                    // and proved the bytes wrong.
-                    StoredBytes::Unreadable => Err(Error::Storage(format!(
-                        "Chunk {} is on disk but could not be read to check it. Not \
-                         replacing it, and not reporting it as stored.",
-                        hex::encode(address)
-                    ))),
-                }
-            }
+            PutOutcome::Duplicate => self.settle_duplicate(address, content).await,
             PutOutcome::New => {
                 // Freshly published bytes that were checked against their own name on the
-                // way in.
-                self.clear_known_wrong(address);
-                self.clear_suspect(address);
+                // way in. The marks were already cleared inside the work, where a dropped
+                // caller cannot skip them; what is left here is only what a caller who is
+                // still waiting should see.
                 let mut stats = self.stats.write();
                 stats.chunks_stored = stats.chunks_stored.saturating_add(1);
                 stats.bytes_stored = stats.bytes_stored.saturating_add(len);
@@ -861,6 +878,70 @@ impl FileStore {
                 debug!("Stored chunk {} ({len} bytes)", hex::encode(address));
                 Ok(true)
             }
+        }
+    }
+
+    /// Decide what a name that was already taken actually means.
+    ///
+    /// Split out of [`Self::put`] because it is a different question. `put` puts bytes on
+    /// a disk; this reads bytes back to find out whether the ones already there are the
+    /// ones the caller is offering, which is the only thing that makes a duplicate safe to
+    /// report as stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] when the existing file is absent or could not be read,
+    /// both of which mean this node must not report the chunk as held.
+    async fn settle_duplicate(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        // The file was already on disk, and its name is not evidence its contents
+        // are right. The startup scan indexes by name without reading anything,
+        // and on Windows a crash mid-write leaves a partial file under a real
+        // chunk name. Trusting the name here would acknowledge a chunk that was
+        // never stored, and then discard the good copy arriving to repair it.
+        // Every answer handled, because three of the four must not report the
+        // chunk as stored. A caller that hears success acts on it: a client drops
+        // its own copy, replication marks the key held, and the copier takes it
+        // out of the legacy-only set.
+        match self.stored_bytes_match(address).await {
+            StoredBytes::Good => {
+                // Admitted here, which is the first moment the bytes behind the
+                // name have been read and shown to hash to it. Idempotent: the
+                // ordinary case is a key the startup scan already indexed.
+                self.index.write().insert(*address);
+                {
+                    let mut stats = self.stats.write();
+                    stats.duplicates = stats.duplicates.saturating_add(1);
+                }
+                Ok(false)
+            }
+            StoredBytes::Wrong => {
+                warn!(
+                    "Chunk {} was already on disk but its contents are wrong; \
+                     replacing it with the copy just offered",
+                    hex::encode(address)
+                );
+                self.repair(address, content).await.map(|()| true)
+            }
+            // The name was taken a moment ago and is not now, or was never a
+            // readable chunk file. Either way nothing holds these bytes, so say so
+            // rather than reporting a chunk that is not there.
+            StoredBytes::Absent => Err(Error::Storage(format!(
+                "Chunk {} was reported already on disk but nothing is there. Not \
+                 reporting it as stored.",
+                hex::encode(address)
+            ))),
+            // Replacing on an unanswered question would destroy a healthy copy,
+            // and reporting success would discard the offered one. The index entry
+            // stays: the file is still there, and dropping the entry would leave
+            // the chunk in neither this store's view nor the legacy one, which is
+            // what retirement destroys. Removing an entry is the quarantine path's
+            // job, and it removes the file with it, after a read that succeeded
+            // and proved the bytes wrong.
+            StoredBytes::Unreadable => Err(Error::Storage(format!(
+                "Chunk {} is on disk but could not be read to check it. Not \
+                 replacing it, and not reporting it as stored.",
+                hex::encode(address)
+            ))),
         }
     }
 
@@ -1188,10 +1269,17 @@ impl FileStore {
         let index = Arc::clone(&self.index);
         let lane = shard_index(address);
         let key = *address;
+        // Carried into the closure for the reason `put`, `repair` and the startup scan
+        // carry it: this work outlives the future that started it, so a cancelled caller
+        // that drops the last `FileStore` would otherwise release the directory to another
+        // process while an unlink is still queued against it. Deleting is the operation
+        // where that matters most.
+        let lease = Arc::clone(&self.lock);
 
         let (existed, freed) = self
             .blocking_tracker
             .spawn_blocking(move || -> Result<(bool, u64)> {
+                let _lease = lease;
                 let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                 let len = std::fs::metadata(&path).map_or(0, |m| m.len());
                 let removed = match std::fs::remove_file(&path) {
@@ -1351,6 +1439,17 @@ impl FileStore {
     }
 
     /// Number of chunks currently stored.
+    ///
+    /// The physical count: every name in the index, including chunks the node has stopped
+    /// answering for because a read found them wrong or could not read them at all. It is
+    /// deliberately not the same number as `all_keys().len()`, which is what the node is
+    /// willing to claim and so leaves those out.
+    ///
+    /// Anything asking "how much is on this disk" wants this one, and that is what its
+    /// callers ask: the migration's progress, the storage stats, and the size an audit is
+    /// built for. Anything asking "what will this node answer for" wants `all_keys`.
+    /// Quietly filtering this one would move all three of those without saying so, which
+    /// is why the difference is written down here rather than removed.
     ///
     /// # Errors
     ///
@@ -1594,9 +1693,15 @@ impl FileStore {
         // For the reason given on `forget_if_absent`: this closure outlives its awaiter,
         // and the change it makes has to be announced by the same thread that makes it.
         let health = Arc::clone(&self.health);
+        // And the store-lock lease, for the reason `put`, `repair`, `delete` and the
+        // startup scan carry it: this closure outlives its awaiter, so without it a
+        // cancelled verification whose caller dropped the last `FileStore` would unlink
+        // inside a directory a second process had already been handed.
+        let lease = Arc::clone(&self.lock);
         let outcome =
             self.blocking_tracker
                 .spawn_blocking(move || -> std::io::Result<bool> {
+                    let _lease = lease;
                     let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
                     // Nothing is thrown away without proof. A re-read that fails says the
                     // question could not be answered this time, not that the bytes are wrong,
@@ -1617,6 +1722,16 @@ impl FileStore {
                         return Ok(false);
                     }
                     std::fs::remove_file(&path)?;
+                    // The same flush the ordinary delete does, for the same reason: an
+                    // unlink that has not reached the directory can be undone by a power
+                    // loss, and here the entry that comes back is one this node has proven
+                    // wrong. The startup scan would re-index it by name, and the
+                    // known-wrong mark that would otherwise hold it back lives only in
+                    // memory and does not survive the restart, so the node would go back to
+                    // claiming and committing to a chunk it already knows is bad.
+                    if let Some(shard) = path.parent() {
+                        fsync_dir_best_effort(shard);
+                    }
                     index.write().remove(&key);
                     health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                     Ok(true)
@@ -1850,6 +1965,68 @@ pub fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 /// Write `bytes` to `path` so a reader sees either the old content or the new.
+/// Is this the exact name [`write_file_atomic`] gives its temporaries?
+///
+/// `.tmp.<pid>.<8 hex>.marker`, with both middle parts checked. Matching on the prefix and
+/// suffix alone would also take `.tmp.operator-notes.marker`, and this runs over a
+/// directory holding a node's data, so what it removes is not a place to be approximate.
+fn is_marker_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".marker") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pid), Some(nonce), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && nonce.len() == 8
+        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Remove marker temporaries a previous run left beside `path`.
+///
+/// [`write_file_atomic`] writes its temporary next to its target. For the layout marker
+/// that is inside `chunks/`, which the startup scan sweeps; for the migration marker it is
+/// the node root, which nothing sweeps, so a crash between the write and the rename leaves
+/// one there for the life of the node. Each is a few hundred bytes, so this is inodes
+/// rather than capacity, but nothing else was ever going to remove them.
+///
+/// Only the exact shape this module writes, and only files: a name has to carry the temp
+/// prefix and the marker suffix. Anything broader would be this function deciding what
+/// else in a node's root directory is rubbish, which is not its business.
+///
+/// Best effort throughout. Failing to tidy up is not a reason to refuse to start, and the
+/// caller takes the store lock before this runs, so there is no other process whose live
+/// temporary this could take.
+pub(crate) fn sweep_marker_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_marker_temp_name(name) {
+            continue;
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => debug!(
+                "Swept a leftover marker temporary {}",
+                entry.path().display()
+            ),
+            Err(e) => debug!("Could not sweep {}: {e}", entry.path().display()),
+        }
+    }
+}
+
 fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     let Some(dir) = path.parent() else {
         return Err(Error::Storage(format!(
@@ -2180,9 +2357,11 @@ fn scan_shard(dir: &Path, shard: u8, result: &mut ScanResult) -> Result<()> {
 
 /// Remove one orphaned temp file. Returns whether it went.
 ///
-/// When this process owns the store lock, any temp file is by definition an interrupted
-/// write of a previous run and goes immediately. When it does not, another process may
-/// legitimately be writing it, so only clearly abandoned ones are swept.
+/// Always removed. The scan that calls this runs only after the store lock has been taken,
+/// so by then any temp file is an interrupted write of a previous run and there is no other
+/// process that could be writing it. This used to describe a second, gentler mode for the
+/// unlocked case; there was never any such branch and there is no caller that would need
+/// one.
 fn sweep_temp(path: &Path) -> bool {
     match std::fs::remove_file(path) {
         Ok(()) => {
@@ -2412,8 +2591,12 @@ fn publish(
     final_path: &Path,
     payload: &[u8],
     shard: &Path,
-) -> Result<PutOutcome> {
+) -> std::result::Result<PutOutcome, PublishFailed> {
+    // On Unix nothing is ever created under the final name by a failing path: the bytes go
+    // to a temporary and only a successful rename gives them the real name. So every
+    // failure here leaves the name as it found it.
     publish_via_rename(temp_path, final_path, payload, shard)
+        .map_err(PublishFailed::nothing_written)
 }
 
 /// Put `payload` on disk as `final_path`, durably. See [`publish_in_place`] for why this
@@ -2424,7 +2607,7 @@ fn publish(
     final_path: &Path,
     payload: &[u8],
     shard: &Path,
-) -> Result<PutOutcome> {
+) -> std::result::Result<PutOutcome, PublishFailed> {
     let _ = temp_path;
     let _ = shard;
     publish_in_place(final_path, payload)
@@ -2447,7 +2630,10 @@ fn publish(
 /// That is why a duplicate re-reads and verifies rather than trusting the name, and why
 /// the pre-retirement pass re-hashes everything before anything is deleted.
 #[cfg(not(unix))]
-fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
+fn publish_in_place(
+    final_path: &Path,
+    payload: &[u8],
+) -> std::result::Result<PutOutcome, PublishFailed> {
     // Test-only, and here rather than after the write so that it means the same thing on
     // both platforms: the file half of a dual write has not happened yet. On Unix the
     // equivalent point is the temporary file written and the rename not yet made, which is
@@ -2468,44 +2654,54 @@ fn publish_in_place(final_path: &Path, payload: &[u8]) -> Result<PutOutcome> {
         // the caller verifies what is already there rather than assuming it is right.
         Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(PutOutcome::Duplicate),
         Err(e) => {
-            return Err(Error::Storage(format!(
+            // Nothing was created, so nothing was spent.
+            return Err(PublishFailed::nothing_written(Error::Storage(format!(
                 "Failed to create chunk {}: {e}",
                 final_path.display()
-            )))
+            ))));
         }
     };
     if let Err(e) = file.write_all(payload) {
         drop(file);
-        let _ = std::fs::remove_file(final_path);
-        return Err(Error::Storage(format!(
-            "Failed to write {}: {e}",
-            final_path.display()
-        )));
+        // Taken back if it can be. Whether it could is what the caller needs: the file
+        // was created by this call, so if it is still there the space is spent.
+        let left_behind = std::fs::remove_file(final_path).is_err();
+        return Err(PublishFailed {
+            error: Error::Storage(format!("Failed to write {}: {e}", final_path.display())),
+            left_behind,
+        });
     }
     if let Err(e) = file.sync_all() {
         drop(file);
-        let _ = std::fs::remove_file(final_path);
-        return Err(Error::Storage(format!(
-            "Failed to flush {}: {e}",
-            final_path.display()
-        )));
+        // Taken back if it can be. Whether it could is what the caller needs: the file
+        // was created by this call, so if it is still there the space is spent.
+        let left_behind = std::fs::remove_file(final_path).is_err();
+        return Err(PublishFailed {
+            error: Error::Storage(format!("Failed to flush {}: {e}", final_path.display())),
+            left_behind,
+        });
     }
     Ok(PutOutcome::New)
 }
 
 /// Write a temp beside the target and rename it into place. Unix only.
+///
+/// Places the bytes and nothing more. Making the name durable is
+/// [`flush_publication`]'s job, kept separate so a caller can tell a publish that spent no
+/// space from one that spent it and could not be reported.
 #[cfg(unix)]
 fn publish_via_rename(
     temp_path: &Path,
     final_path: &Path,
     payload: &[u8],
-    shard: &Path,
+    _shard: &Path,
 ) -> Result<PutOutcome> {
     // Content is immutable and the name is its hash, so an existing file already holds
     // exactly these bytes. Skipping the write is both cheaper and safer than replacing
     // it: on Windows a rename over a file another thread has open fails outright.
     //
-    // The flush still happens. A name that is already there is not proof it is durable:
+    // The caller flushes either way. A name that is already there is not proof it is
+    // durable:
     // the write that put it there may have been this store's own previous attempt, whose
     // rename landed and whose directory flush then failed. That attempt returned an
     // error, so nothing was retired on the strength of it, but if this call reported a
@@ -2537,10 +2733,47 @@ fn publish_via_rename(
         }
     };
 
-    // NOT best effort. The directory flush is what makes the rename durable, and a copy
-    // reported successful is what authorises deleting the only other copy. Swallowing the
-    // failure would let a power loss discard the directory entry after the legacy store
-    // had already been removed.
+    Ok(outcome)
+}
+
+/// A publish that failed, and whether it left its bytes on the disk.
+///
+/// The second half is the point. A failure before anything was created has spent nothing;
+/// one that created the file and then could not remove it again has spent the space, and
+/// whoever is accounting for free space has to know which happened. Only the code that did
+/// the creating can say.
+struct PublishFailed {
+    error: Error,
+    left_behind: bool,
+}
+
+impl PublishFailed {
+    /// A failure that created nothing.
+    fn nothing_written(error: Error) -> Self {
+        Self {
+            error,
+            left_behind: false,
+        }
+    }
+}
+
+/// Make a publication durable by flushing the directory its name lives in.
+///
+/// Separate from placing the bytes, because the caller has to tell the two failures apart.
+/// A publish that fails before the bytes land has spent nothing; one that fails here has
+/// spent the space and must not be reported as stored, so whoever is accounting for free
+/// space has to charge it while whoever is accounting for chunks must not count it.
+///
+/// NOT best effort. The directory flush is what makes the rename durable, and a copy
+/// reported successful is what authorises deleting the only other copy. Swallowing the
+/// failure would let a power loss discard the directory entry after the legacy store had
+/// already been removed.
+///
+/// # Errors
+///
+/// Returns [`Error::Storage`] if the directory cannot be flushed.
+#[cfg(unix)]
+fn flush_publication(final_path: &Path, shard: &Path) -> Result<()> {
     fsync_dir(shard).map_err(|e| {
         Error::Storage(format!(
             "Published {} but could not flush {}: {e}. Not reporting this chunk as stored, \
@@ -2548,8 +2781,15 @@ fn publish_via_rename(
             final_path.display(),
             shard.display()
         ))
-    })?;
-    Ok(outcome)
+    })
+}
+
+/// Nothing to do off Unix, where the chunk is created under its final name and flushed
+/// with `sync_all`, which is documented to carry its creation metadata with it, and where
+/// there is no way to flush a directory at all.
+#[cfg(not(unix))]
+fn flush_publication(_final_path: &Path, _shard: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2584,7 +2824,17 @@ mod tests {
         let final_path = dir.path().join("chunk");
         let unflushable = dir.path().join("shard-that-does-not-exist");
 
-        let outcome = publish_via_rename(&temp_path, &final_path, b"payload", &unflushable);
+        // Asserted in two steps, not chained. Chaining them means a regression in placing
+        // the bytes also produces an error, and the test passes without the flush ever
+        // being reached: it would be checking that something went wrong rather than that
+        // this went wrong.
+        let placed = publish_via_rename(&temp_path, &final_path, b"payload", &unflushable);
+        assert!(
+            placed.is_ok(),
+            "the bytes must be placed before this can be about the flush: {:?}",
+            placed.err()
+        );
+        let outcome = flush_publication(&final_path, &unflushable);
 
         assert!(
             outcome.is_err(),
@@ -2897,6 +3147,134 @@ mod tests {
 
         let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
         assert_eq!(raw, b"tampered");
+    }
+
+    /// A put whose caller goes away does not admit a key on bytes nothing has read.
+    ///
+    /// The blocking half of a put outlives the future that started it, deliberately, so
+    /// the work is never left half done. That makes anything it writes to memory a claim
+    /// the node keeps whether or not the caller is still there to finish checking it.
+    ///
+    /// For a chunk this call published the claim is earned: the bytes were hashed against
+    /// their own name on the way in. For a name that was already taken it is not. The
+    /// check that decides whether those bytes are good runs after the await, and a dropped
+    /// future skips it, so admitting the key in the closure claims a chunk nobody read.
+    ///
+    /// Staged with a fifo, which is the sharpest case and a real one: the startup scan
+    /// refuses non-regular entries by design, so this is a key the store has already
+    /// decided it must not claim, walked in through the back door.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The gate is held across an await deliberately: holding it is what parks the put
+    // inside its closure, which is the state under test. Dropping it before awaiting would
+    // let the put finish and there would be nothing to cancel.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_cancelled_put_does_not_admit_a_key_whose_bytes_were_never_read() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(reopen(&dir).await);
+
+        // A name a real chunk would use, wearing something that is not a chunk.
+        let content = b"the bytes that belong under this name".to_vec();
+        let addr = crate::client::compute_address(&content);
+        let shard = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", addr[31]));
+        std::fs::create_dir_all(&shard).expect("mkdir");
+        let path = shard.join(hex::encode(addr));
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("a path with no interior nul");
+        // SAFETY: `name` is a valid NUL-terminated C string that outlives the call, and the
+        // mode is a constant. `mkfifo` reads the pointer and returns; nothing is retained.
+        #[allow(clippy::undocumented_unsafe_blocks, unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(made, 0, "could not make the fifo this test needs");
+
+        // Hold the gate so the put parks inside the closure, then drop the future while it
+        // is parked. That is a caller going away mid-put, which is what a cancelled
+        // request, a client disconnect or a shutdown all look like from in here.
+        let gate = store.test_put_gate();
+        let held = gate.write();
+        let put = {
+            let store = Arc::clone(&store);
+            let content = content.clone();
+            tokio::spawn(async move { store.put(&addr, &content).await })
+        };
+        // Waited for rather than slept at. A sleep proves nothing: if the put had not
+        // reached the gated closure yet, aborting would cancel it before it ever got
+        // there and the test would pass having staged nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.tasks_in_flight() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the put never reached the closure, so there was nothing to cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        put.abort();
+        let _ = put.await;
+        drop(held);
+        store.wait_idle().await;
+
+        assert!(
+            !store.is_indexed(&addr),
+            "a cancelled put admitted {} on bytes nothing read; the fifo under that name \
+             would then be advertised, committed to, and audited against",
+            hex::encode(addr)
+        );
+        assert!(
+            !store.exists(&addr).unwrap_or(true),
+            "and the node must not claim it either"
+        );
+    }
+
+    /// A marker temporary left in the node root is swept, and nothing else is.
+    ///
+    /// The migration marker is written next to itself in the root, which no sweep looked
+    /// at, so a crash between its write and its rename left one there for the life of the
+    /// node. Small, but nothing was ever going to remove it.
+    ///
+    /// The second half is the point: this runs over a directory holding a node's data, so
+    /// it has to take only the exact shape this module writes and leave everything else
+    /// where it is.
+    #[tokio::test]
+    async fn a_leftover_marker_temporary_is_swept_and_its_neighbours_are_not() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        let leftover = root.join(format!("{TEMP_PREFIX}1234.abcdef01.marker"));
+        std::fs::write(&leftover, b"an interrupted marker write").expect("plant");
+
+        // Things that must survive: the marker itself, a chunk-shaped temp that belongs to
+        // the chunk tree's own sweep, and anything an operator put there.
+        let keep = [
+            root.join("migration-state.json"),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef01.chunk")),
+            root.join("notes.txt"),
+            // Prefix and suffix alone would take these. The pid and the nonce are checked
+            // because this runs over a directory holding a node's data.
+            root.join(format!("{TEMP_PREFIX}operator-notes.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.nothex01.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef0.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef01.extra.marker")),
+        ];
+        for path in &keep {
+            std::fs::write(path, b"keep me").expect("plant");
+        }
+
+        let store = reopen(&dir).await;
+        drop(store);
+
+        assert!(
+            !leftover.exists(),
+            "the leftover marker temporary is still in the node root"
+        );
+        for path in &keep {
+            assert!(
+                path.exists(),
+                "{} was swept and should not have been",
+                path.display()
+            );
+        }
     }
 
     #[tokio::test]

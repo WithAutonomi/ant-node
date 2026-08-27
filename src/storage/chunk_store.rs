@@ -20,7 +20,7 @@ use crate::storage::migration::{
     CopyReport, MigrationConfig, MigrationPhase, MigrationState, REQUIRED_REBUILDS_BEFORE_RETIRE,
 };
 use crate::storage::StorageStats;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -156,7 +156,67 @@ struct Legacy {
     /// that something is in flight, not a claim: `exists`, `all_keys`, the commitment, the
     /// quote count and the pruner all ignore it. It vetoes retirement, and the driver
     /// resolves each entry against what is actually on disk.
-    pending: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
+    ///
+    /// How many writes were made without a rollback copy of the chunk in the environment.
+    ///
+    /// The rollback copy is best effort by design, and the ADR says so: a bridging node
+    /// whose environment has no reusable page keeps serving from files and simply has no
+    /// second copy to roll back to. What was missing was any way to ask how often that
+    /// happened. One `warn!` per chunk is not an answer to "how many nodes on this fleet
+    /// are actually keeping a rollback copy", which is the question the second release
+    /// turns on, and on a node with no free pages it is also a line per chunk forever.
+    ///
+    /// Writes, not distinct chunks: two attempts at one address count twice, and a later
+    /// attempt that succeeds does not count back down. Counted before the file half runs,
+    /// so a write that then fails outright is counted too. Keeping a set of addresses
+    /// instead would be exact and would also mean holding millions of them in memory to
+    /// answer a question that a rate answers. Read it as "this node is failing to keep
+    /// rollback copies, this often", not as a chunk count.
+    skipped_rollback_copies: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Counted, not a set, for the reason the file store's `writing` map is counted.
+    /// Cancellation can release the facade's key lane while the blocking half survives, so
+    /// a second write for the same key can start behind the first. With one entry between
+    /// them, whichever returned first would clear it while the other was still queued, and
+    /// a delete arriving in that window would see no announcement, skip draining the
+    /// environment, and let the surviving write land afterwards and put the key back.
+    pending: Arc<parking_lot::RwLock<BTreeMap<XorName, usize>>>,
+}
+
+impl Legacy {
+    /// Note that a chunk went to files alone, and say whether to log it.
+    ///
+    /// Throttled by powers of ten. The condition is usually all-or-nothing, so the first
+    /// few lines say it started and the later ones say it is still going without becoming
+    /// the log.
+    fn note_skipped_rollback_copy(&self) -> Option<u64> {
+        let count = self
+            .skipped_rollback_copies
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        let round = matches!(
+            count,
+            10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000 | 10_000_000
+        );
+        (count <= 3 || round).then_some(count)
+    }
+
+    /// Announce a write into the environment, or note a second one for the same key.
+    fn announce(&self, address: &XorName) {
+        *self.pending.write().entry(*address).or_insert(0) += 1;
+    }
+
+    /// Retire one announcement, leaving any other for the same key still standing.
+    fn announced_write_finished(&self, address: &XorName) {
+        let mut pending = self.pending.write();
+        let Some(count) = pending.get_mut(address) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            pending.remove(address);
+        }
+    }
 }
 
 /// Content-addressed chunk storage.
@@ -304,7 +364,8 @@ impl ChunkStore {
                 &legacy_keys,
                 files,
             ))),
-            pending: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
+            skipped_rollback_copies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         })
     }
 
@@ -418,11 +479,26 @@ impl ChunkStore {
                 // there to make a fleet rollback survivable, and losing that for one
                 // chunk is much better than refusing the chunk.
                 if l.lmdb.capacity_verdict() == crate::storage::CapacityVerdict::Full {
-                    debug!(
-                        "Legacy chunk environment is full; storing {} in files only. A \
-                         rollback to a pre-migration build would not have this chunk.",
-                        hex::encode(address)
-                    );
+                    // Counted here as well as on the failure path below, and this is the
+                    // one that matters: a pinned environment with no reusable page answers
+                    // Full for every chunk, so on the node most affected this is the whole
+                    // of the skipping and the other path never runs at all.
+                    if let Some(count) = l.note_skipped_rollback_copy() {
+                        warn!(
+                            migration_event = "no_rollback_copy",
+                            skipped = count,
+                            "Legacy chunk environment is full; storing {} in files only. A \
+                             rollback to a pre-migration build would not have this chunk, \
+                             and {count} write(s) on this node have now gone without a \
+                             rollback copy.",
+                            hex::encode(address)
+                        );
+                    } else {
+                        debug!(
+                            "Legacy chunk environment is full; storing {} in files only.",
+                            hex::encode(address)
+                        );
+                    }
                 } else {
                     // Announced BEFORE the write, not after it. The write runs on a
                     // blocking thread that outlives this future: a shutdown that drops the
@@ -431,7 +507,7 @@ impl ChunkStore {
                     // what retirement destroys. In the in-flight note rather than the key
                     // set, because until the write returns this node does not hold the
                     // chunk and must not say it does.
-                    l.pending.write().insert(*address);
+                    l.announce(address);
                     // Best effort, and only best effort. The verdict above is optimistic
                     // by design: LMDB can still refuse a write for fragmentation, pages
                     // pinned by a long read, or a copy-on-write B-tree split. Propagating
@@ -441,12 +517,20 @@ impl ChunkStore {
                     // file store checks the content address itself.
                     match l.lmdb.put(address, content).await {
                         Ok(_) => dual_written = true,
-                        Err(e) => warn!(
-                            "Could not also write {} to the legacy environment: {e}. \
-                             Storing it in files only. A rollback to a pre-migration \
-                             build would not have this chunk.",
-                            hex::encode(address)
-                        ),
+                        Err(e) => {
+                            if let Some(count) = l.note_skipped_rollback_copy() {
+                                warn!(
+                                    migration_event = "no_rollback_copy",
+                                    skipped = count,
+                                    "Could not also write {} to the legacy environment: \
+                                     {e}. Storing it in files only. A rollback to a \
+                                     pre-migration build would not have this chunk, and \
+                                     {count} write(s) on this node have now gone without a \
+                                     rollback copy.",
+                                    hex::encode(address)
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -469,7 +553,7 @@ impl ChunkStore {
                 // from the in-flight note to the key set, which is the one moment that
                 // promotion is warranted: both outcomes are known.
                 if let Some(ref l) = legacy {
-                    l.pending.write().remove(address);
+                    l.announced_write_finished(address);
                     if dual_written && !self.files.is_indexed(address) {
                         l.only.write().insert(*address);
                     }
@@ -483,7 +567,7 @@ impl ChunkStore {
         // writes have returned, so there is nothing left in flight to protect.
         if let Some(ref l) = legacy {
             l.only.write().remove(address);
-            l.pending.write().remove(address);
+            l.announced_write_finished(address);
         }
         if already_in_legacy {
             // Migrated for free: a hot key the copier no longer has to move.
@@ -781,11 +865,13 @@ impl ChunkStore {
                 // the copier and the repair path also spawn file writes and neither goes
                 // near that journal: using it as a proxy for "is anything writing this
                 // key" was a scope assumption, not a fact.
-                if legacy.pending.read().contains(address) {
+                if legacy.pending.read().contains_key(address) {
                     legacy.lmdb.wait_idle().await;
                 }
                 let deleted = legacy.lmdb.delete(address).await?;
                 let was_only = legacy.only.write().remove(address);
+                // Every announcement for this key, not one of them: the drain above waited
+                // out whatever was in flight and this delete is deliberately last.
                 legacy.pending.write().remove(address);
                 deleted || was_only
             }
@@ -1658,10 +1744,12 @@ impl ChunkStore {
                 lmdb,
                 only,
                 pending,
+                skipped_rollback_copies,
             }) = taken
             {
                 drop(only);
                 drop(pending);
+                drop(skipped_rollback_copies);
                 drop(lmdb);
                 return self.remove_legacy_dir(freed, retiring).await;
             }
@@ -1838,7 +1926,8 @@ impl ChunkStore {
         *self.legacy.write() = Some(Legacy {
             lmdb,
             only: Arc::new(parking_lot::RwLock::new(only)),
-            pending: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
+            skipped_rollback_copies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            pending: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
         });
         // A node that recorded itself file-only and then got an environment back has to
         // go through the migration again from the start: the phase decides what the
@@ -1916,7 +2005,7 @@ impl ChunkStore {
         let Some(legacy) = self.legacy() else {
             return;
         };
-        let waiting: Vec<XorName> = legacy.pending.read().iter().copied().collect();
+        let waiting: Vec<XorName> = legacy.pending.read().keys().copied().collect();
         if waiting.is_empty() {
             return;
         }
@@ -1990,6 +2079,23 @@ impl ChunkStore {
     #[must_use]
     pub fn legacy_is_a_link(&self) -> bool {
         self.has_legacy() && is_a_link(&self.legacy_env_dir)
+    }
+
+    /// How many writes this node made without a rollback copy, cumulatively.
+    ///
+    /// Zero on a node that is not bridging, and zero on a bridging node whose environment
+    /// has room. A number that is climbing says this node would lose those chunks on a
+    /// rollback to a pre-migration build, which is a fleet question the second release
+    /// turns on and which a per-chunk log line cannot answer.
+    ///
+    /// Attempts rather than distinct chunks, for the reason given on the field: it is a
+    /// rate, not an inventory.
+    #[must_use]
+    pub fn writes_without_a_rollback_copy(&self) -> u64 {
+        self.legacy().map_or(0, |l| {
+            l.skipped_rollback_copies
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
     }
 
     /// Is there an environment on disk this node cannot classify at all?
@@ -3978,6 +4084,99 @@ mod tests {
         std::fs::set_permissions(&path, perms).expect("chmod back");
     }
 
+    /// A write with no rollback copy is counted, on the path that actually skips.
+    ///
+    /// The environment is pinned to its current size for the whole bridge, so one with no
+    /// reusable page answers `Full` to every write and the node stores in files alone. That
+    /// is accepted, and the ADR says so. What was missing was any way to ask how often it
+    /// happens: the second release turns on knowing how many nodes are really keeping a
+    /// rollback copy, and a log line per chunk does not answer it.
+    ///
+    /// The first version of this counter missed exactly this path and counted only the
+    /// other one, the write that is attempted and refused. On the node most affected the
+    /// other path never runs, so the counter stayed at zero on precisely the nodes it was
+    /// added for.
+    #[tokio::test]
+    async fn a_write_with_no_rollback_copy_is_counted() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["settled"]).await;
+        let store = open(&dir).await;
+        assert_eq!(
+            store.writes_without_a_rollback_copy(),
+            0,
+            "nothing has been skipped yet"
+        );
+
+        let legacy = store.legacy().expect("legacy");
+        let before = legacy
+            .skipped_rollback_copies
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // Whichever way the environment refuses, the count moves. Driven through the
+        // counter itself rather than by filling a real environment, because what is under
+        // test is that the skip is recorded, and staging a genuinely unwritable LMDB from
+        // here would be testing LMDB.
+        for _ in 0..12 {
+            let _ = legacy.note_skipped_rollback_copy();
+        }
+        assert_eq!(
+            store.writes_without_a_rollback_copy(),
+            before + 12,
+            "skipped writes must be visible to whoever asks the node"
+        );
+
+        // And the log is throttled, or a node with no free pages writes one line per chunk
+        // for the rest of its life.
+        let said: Vec<u64> = (0..1_000)
+            .filter_map(|_| legacy.note_skipped_rollback_copy())
+            .collect();
+        assert!(
+            said.len() < 10,
+            "the warning fired {} times in a thousand writes",
+            said.len()
+        );
+    }
+
+    /// Two writes for one key need two notes, not one shared between them.
+    ///
+    /// The journal used to be a set, so a second write for the same key announced nothing
+    /// and the first to return cleared the entry for both. A delete arriving in that window
+    /// sees no announcement, skips draining the environment, and the surviving write lands
+    /// afterwards and puts the key back, undoing a prune the node had decided on. The key
+    /// then sits in the environment and in neither view, which is the state retirement is
+    /// built to refuse: no data is lost, but a prune and a retirement cycle are.
+    ///
+    /// The file store's own in-flight map is counted for exactly this reason. This is the
+    /// same reasoning applied to the half that did not have it.
+    #[tokio::test]
+    async fn two_writes_for_one_key_are_two_notes_and_the_first_to_return_clears_neither() {
+        let dir = TempDir::new().expect("temp dir");
+        seed_legacy(&dir, &["settled"]).await;
+        let store = open(&dir).await;
+        let legacy = store.legacy().expect("legacy");
+        let (addr, _) = addressed("two-writes");
+
+        legacy.announce(&addr);
+        legacy.announce(&addr);
+        assert!(store.has_pending_writes());
+
+        // The first write returns. The second is still out there, so the note has to stand.
+        legacy.announced_write_finished(&addr);
+        assert!(
+            store.has_pending_writes(),
+            "the first write to return cleared a note the second one was still relying on"
+        );
+
+        // And the second clears it.
+        legacy.announced_write_finished(&addr);
+        assert!(!store.has_pending_writes());
+
+        // Retiring one that was never announced changes nothing, which is what makes the
+        // delete path's unconditional clear safe.
+        legacy.announced_write_finished(&addr);
+        assert!(!store.has_pending_writes());
+    }
+
     /// A write in flight is a note to self, not a claim to hold the chunk.
     ///
     /// The note exists because a write into the environment outlives the future waiting
@@ -3993,7 +4192,7 @@ mod tests {
         let (addr, _) = addressed("in-flight");
 
         // Stand in for a write that announced itself and never came back.
-        legacy.pending.write().insert(addr);
+        legacy.announce(&addr);
 
         assert!(
             !store.exists(&addr).expect("exists"),
@@ -4066,7 +4265,7 @@ mod tests {
         // had started, and a test that sometimes sets up a different state than it claims
         // is worse than no test.
         let legacy = store.legacy().expect("legacy");
-        legacy.pending.write().insert(addr);
+        legacy.announce(&addr);
         let publishing = {
             let files = Arc::clone(&store.files);
             let content = content.clone();
@@ -4141,7 +4340,7 @@ mod tests {
         assert!(
             !store
                 .legacy()
-                .is_some_and(|l| l.pending.read().contains(&addr)),
+                .is_some_and(|l| l.pending.read().contains_key(&addr)),
             "this is the case the journal does not cover, so it must be empty"
         );
 
