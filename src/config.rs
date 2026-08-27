@@ -120,10 +120,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub storage: StorageConfig,
 
-    /// Experimental direct-browser WebRTC Direct listener.
+    /// Direct-browser WebRTC Direct listener.
     ///
-    /// This is the ADR-0009 interoperability proof and is disabled by
-    /// default. Enabling it requires a build with `webrtc-direct`.
+    /// This is enabled automatically when the binary includes the default
+    /// `webrtc-direct` feature. Minimal native-only builds leave it disabled.
     #[serde(default)]
     pub webrtc_direct: WebRtcDirectConfig,
 
@@ -157,7 +157,7 @@ pub struct NodeConfig {
 /// content-addressed writes through the ordinary payment verifier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRtcDirectConfig {
-    /// Enable the experimental listener.
+    /// Enable the browser listener.
     #[serde(default)]
     pub enabled: bool,
 
@@ -167,8 +167,9 @@ pub struct WebRtcDirectConfig {
 
     /// Literal public UDP address advertised to browsers.
     ///
-    /// When omitted, the address is derived from the bound socket. A wildcard
-    /// bind therefore needs an explicit public address.
+    /// When omitted, a wildcard listener uses the native transport's observed
+    /// external IP (or the host's routed IP) and an automatically assigned,
+    /// stable high UDP port.
     #[serde(default)]
     pub advertised_addr: Option<SocketAddr>,
 
@@ -194,7 +195,7 @@ pub struct WebRtcDirectConfig {
 impl Default for WebRtcDirectConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: cfg!(feature = "webrtc-direct"),
             bind: default_webrtc_direct_bind(),
             advertised_addr: None,
             certificate_path: None,
@@ -205,7 +206,7 @@ impl Default for WebRtcDirectConfig {
 }
 
 fn default_webrtc_direct_bind() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
 }
 
 const fn default_webrtc_direct_max_connections() -> usize {
@@ -679,6 +680,13 @@ mod tests {
     fn test_default_config_has_cache_capacity() {
         let config = PaymentConfig::default();
         assert!(config.cache_capacity > 0, "Cache capacity must be positive");
+    }
+
+    #[test]
+    fn default_webrtc_listener_tracks_compile_time_feature() {
+        let config = WebRtcDirectConfig::default();
+        assert_eq!(config.enabled, cfg!(feature = "webrtc-direct"));
+        assert_eq!(config.bind, "0.0.0.0:0".parse().expect("wildcard bind"));
     }
 
     #[test]

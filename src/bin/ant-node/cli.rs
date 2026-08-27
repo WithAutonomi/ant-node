@@ -28,9 +28,9 @@ pub struct Cli {
     #[arg(long, env = "ANT_IPV4_ONLY")]
     pub ipv4_only: bool,
 
-    /// Enable the ADR-0009 WebRTC Direct `PoC` on this UDP address.
+    /// Override the default ADR-0009 WebRTC Direct UDP bind address.
     ///
-    /// The binary must be built with `--features webrtc-direct`.
+    /// Port zero selects the stable automatic port derived from `--port`.
     #[arg(long, env = "ANT_WEBRTC_DIRECT_BIND")]
     pub webrtc_direct_bind: Option<SocketAddr>,
 

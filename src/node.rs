@@ -541,10 +541,23 @@ impl RunningNode {
 
         #[cfg(feature = "webrtc-direct")]
         if self.config.webrtc_direct.enabled {
+            let bind_is_ipv4 = self.config.webrtc_direct.bind.is_ipv4();
+            let observed_ip = self
+                .p2p_node
+                .transport()
+                .non_relay_external_addresses()
+                .into_iter()
+                .find(|addr| addr.is_ipv4() == bind_is_ipv4)
+                .map(|addr| addr.ip());
+            let webrtc_direct_config = crate::web_rtc::resolve_automatic_config(
+                &self.config.webrtc_direct,
+                actual_port,
+                observed_ip,
+            );
             let endpoint_catalog = Arc::new(crate::web_rtc::BrowserEndpointCatalog::default());
             let evm_network = self.config.payment.evm_network.clone().into_evm_network();
             match crate::web_rtc::spawn(
-                &self.config.webrtc_direct,
+                &webrtc_direct_config,
                 &self.config.root_dir,
                 Arc::clone(&self.p2p_node),
                 self.ant_protocol.clone(),
