@@ -7,10 +7,10 @@ and serves browser bootstrap metadata; the companion site lives in the sibling
 
 ## Start the node testnet
 
-Rust 1.88 or newer is required by the optional Saorsa WebRTC Direct transport.
+Rust 1.88 or newer is required by the Saorsa WebRTC Direct transport.
 
 ```bash
-cargo run --features webrtc-direct --bin ant-devnet -- \
+cargo run --bin ant-devnet -- \
   --preset minimal \
   --base-port 23000 \
   --webrtc-direct \
@@ -74,10 +74,16 @@ Use **Download and save file** to fetch the public DataMap and every encrypted
 file chunk directly, reconstruct the complete file, validate its whole-file
 BLAKE3 hash, and save it under its original filename.
 
+For a browser-supported video, use **Prepare video stream** and then the native
+video controls. The Rust/WASM reader fetches and decrypts only records
+overlapping the media element's requested byte ranges. A same-origin service
+worker provides standard HTTP range responses locally; no file bytes pass
+through the manifest server or another gateway.
+
 ## Automated verification
 
 ```bash
-cargo test --features webrtc-direct --test webrtc_direct_devnet -- --ignored
+cargo test --test webrtc_direct_devnet -- --ignored
 ```
 
 This starts Anvil and the five-node network, self-encrypts and publishes a
@@ -92,7 +98,7 @@ back through WebRTC Direct.
 Use `--host <LAN_IPV4>` to advertise the literal LAN address:
 
 ```bash
-cargo run --features webrtc-direct --bin ant-devnet -- \
+cargo run --bin ant-devnet -- \
   --preset minimal \
   --host 192.168.1.50 \
   --webrtc-direct \
@@ -106,3 +112,58 @@ and change its manifest URL to
 `http://192.168.1.50:25000/api/browser-manifest.json`. Both the native and
 WebRTC Direct UDP ranges must be reachable. Do not use this unsigned local
 manifest mode on a public network.
+
+## Public Internet smoke testing
+
+The standard `ant-node` build now includes and enables WebRTC Direct, so the
+sibling `ant-testnet` tool needs no browser-specific preset or flags. On its
+ordinary public droplets, a node maps its native UDP port deterministically
+into the existing allowed UDP 32768-65535 range and advertises the external IP
+learned by the native transport (falling back to the host's routed IP). Its
+persisted DTLS certificate keeps the complete address stable across restarts.
+
+Deploy the normal testnet against this checkout, for example:
+
+```bash
+cd ../ant-testnet
+python3.11 testnet.py \
+  --saorsa-node-repo ../ant-node-web-support \
+  deploy
+```
+
+`ant-testnet` always keeps bootstrap droplets public. Read node 0's canonical
+address using its existing shell command, without modifying the deployment
+tool:
+
+```bash
+python3.11 testnet.py shell --droplet 0
+cat /var/lib/ant/node-0/webrtc-direct.multiaddr
+exit
+```
+
+Start `ant-client-web-support/web`, paste that address into the demo, and use
+**Connect and use as bootstrap**. The operation installs the single address as
+the Rust browser client's seed without DNS or a browser manifest. The address
+contains only the public DTLS certificate hash and ANT peer ID; it contains no
+secret key material. To disable the listener in a custom node configuration,
+set `webrtc_direct.enabled = false`. A minimal binary can omit the transport
+entirely with `--no-default-features`.
+
+Each node publishes its certificate-pinned WebRTC Direct multiaddress through
+Saorsa's extensible V2 address plane as transport `WebRtcDirect`, independently
+of its reachability class. Its signed identity capability selects V2 when the
+remote peer supports it; older peers continue receiving the unchanged V1
+`Quic` address projection. `FindNodeV2` returns browser endpoints separately
+from QUIC addresses, and the browser verifies the peer-ID and certificate
+binding during HELLO.
+Consequently one pasted address is enough to enter the network and discover
+the browser endpoints of closest peers across independently deployed
+processes. Native QUIC dialing ignores the supplemental transport entry.
+
+On 2026-08-27 this path was exercised against the normal 60-node testnet from
+one bootstrap address. Headless Chromium traversed multiple independent nodes,
+obtained four storage quotes from four non-bootstrap closest nodes, submitted
+one payment, and stored all four encrypted records successfully. Nodes behind
+the testnet's deliberate inbound-NAT rules remain unreachable without relayed
+WebRTC, so their 10-second DataChannel timeouts currently make this smoke path
+slower than an all-public fleet.

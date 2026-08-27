@@ -18,14 +18,14 @@ use evmlib::common::{Amount, TxHash};
 use evmlib::{EncodedPeerId, PaymentQuote, ProofOfPayment, RewardsAddress};
 use parking_lot::RwLock;
 use saorsa_core::identity::NodeIdentity;
-use saorsa_core::{P2PNode, PeerId};
+use saorsa_core::{DHTNode, MultiAddr, P2PNode, PeerId};
 use saorsa_transport::webrtc_direct::{
     WebRtcCertificate, WebRtcDataChannel, WebRtcDirectConnection, WebRtcDirectListener,
     MAX_DATA_CHANNEL_MESSAGE_SIZE,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,13 +42,88 @@ const MAX_FIND_NODE_RESULTS: usize = 20;
 const MAX_RESPONSE_HEADER_BYTES: usize = 64 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const WEBRTC_WRITE_CHUNK_BYTES: usize = MAX_DATA_CHANNEL_MESSAGE_SIZE;
+const AUTOMATIC_PORT_MIN: u32 = 32_768;
+const AUTOMATIC_PORT_COUNT: u32 = 65_536 - AUTOMATIC_PORT_MIN;
+
+/// Filename containing the node's canonical browser bootstrap address.
+///
+/// The file is written below the node root directory after the listener has
+/// bound and is safe for deployment tooling to copy or print. Its contents are
+/// public bootstrap metadata, not key material.
+pub const WEBRTC_DIRECT_MULTIADDR_FILENAME: &str = "webrtc-direct.multiaddr";
+
+/// Resolve the zero-configuration listener values used by ordinary nodes.
+///
+/// A zero bind port is mapped deterministically from the native QUIC port into
+/// the high UDP range. That keeps the complete browser multiaddress stable
+/// across restarts and fits the high-port firewall range used by `ant-testnet`.
+/// A wildcard bind without an explicit advertised address prefers the public
+/// IP observed by the native transport and otherwise uses the IP selected by
+/// the host routing table.
+pub fn resolve_automatic_config(
+    config: &WebRtcDirectConfig,
+    native_port: u16,
+    observed_ip: Option<IpAddr>,
+) -> WebRtcDirectConfig {
+    let mut resolved = config.clone();
+    if resolved.bind.port() == 0 {
+        let port = resolved
+            .advertised_addr
+            .map_or_else(|| automatic_webrtc_port(native_port), |addr| addr.port());
+        resolved.bind.set_port(port);
+    }
+
+    if resolved.advertised_addr.is_none() && resolved.bind.ip().is_unspecified() {
+        let bind_is_ipv4 = resolved.bind.is_ipv4();
+        let advertised_ip = observed_ip
+            .filter(|ip| ip.is_ipv4() == bind_is_ipv4 && !ip.is_unspecified())
+            .or_else(|| routed_local_ip(bind_is_ipv4))
+            .unwrap_or({
+                if bind_is_ipv4 {
+                    IpAddr::V4(Ipv4Addr::LOCALHOST)
+                } else {
+                    IpAddr::V6(Ipv6Addr::LOCALHOST)
+                }
+            });
+        resolved.advertised_addr = Some(SocketAddr::new(advertised_ip, resolved.bind.port()));
+    }
+
+    resolved
+}
+
+fn automatic_webrtc_port(native_port: u16) -> u16 {
+    let native = u32::from(native_port);
+    let offset = if native < AUTOMATIC_PORT_MIN {
+        native
+    } else {
+        (native - AUTOMATIC_PORT_MIN + AUTOMATIC_PORT_COUNT / 2) % AUTOMATIC_PORT_COUNT
+    };
+    u16::try_from(AUTOMATIC_PORT_MIN + offset).unwrap_or(u16::MAX)
+}
+
+fn routed_local_ip(ipv4: bool) -> Option<IpAddr> {
+    let (bind, route_probe) = if ipv4 {
+        (
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 9)),
+        )
+    } else {
+        (
+            SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+            SocketAddr::from((Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1), 9)),
+        )
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(route_probe).ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
+}
 
 /// Browser endpoints known to one or more listeners in the same process.
 ///
-/// Production nodes will populate this information from signed endpoint
-/// records. The in-process devnet shares one catalog so browser clients can
-/// exercise a real multi-node iterative lookup before that DHT record type is
-/// available.
+/// The in-process devnet shares this catalog so its listeners can expose one
+/// another immediately. Independently deployed nodes discover endpoints from
+/// the authenticated DHT address sets; this remains a local fast-path and
+/// fallback while those records converge.
 #[derive(Default)]
 pub struct BrowserEndpointCatalog {
     endpoints: RwLock<HashMap<PeerId, BrowserEndpoint>>,
@@ -99,7 +174,9 @@ pub async fn spawn(
     let identity = Arc::clone(p2p.transport().node_identity());
     let browser_endpoint = BrowserEndpoint::new(advertised_addr, &peer_id, certificate_sha256)
         .map_err(Error::Config)?;
+    persist_browser_endpoint(root_dir, &browser_endpoint).await?;
     endpoint_catalog.insert(peer_id, browser_endpoint.clone());
+    let dht = Arc::clone(p2p.dht_manager());
 
     let state = Arc::new(ServerState {
         config: config.clone(),
@@ -122,9 +199,22 @@ pub async fn spawn(
     let task = tokio::spawn(async move {
         serve_webrtc(listener, state, connection_limit, shutdown).await;
     });
+    dht.set_supplemental_self_addresses(vec![browser_endpoint.multiaddr.clone()])
+        .await;
     Ok(WebRtcDirectServer {
         endpoint: browser_endpoint,
         task,
+    })
+}
+
+async fn persist_browser_endpoint(root_dir: &Path, endpoint: &BrowserEndpoint) -> Result<()> {
+    let path = root_dir.join(WEBRTC_DIRECT_MULTIADDR_FILENAME);
+    let contents = format!("{}\n", endpoint.multiaddr);
+    tokio::fs::write(&path, contents).await.map_err(|error| {
+        Error::Startup(format!(
+            "failed to write WebRTC Direct endpoint {}: {error}",
+            path.display()
+        ))
     })
 }
 
@@ -516,30 +606,49 @@ async fn process_find_node(
     let count = count
         .unwrap_or(MAX_FIND_NODE_RESULTS)
         .clamp(1, MAX_FIND_NODE_RESULTS);
-    let nodes = state
-        .p2p
-        .dht_manager()
+    let dht = state.p2p.dht_manager();
+    let dht_nodes = dht
         .find_closest_nodes_local_with_self(&target_bytes, count)
-        .await
-        .into_iter()
-        .map(|node| {
-            let peer_id = node.peer_id.to_hex();
-            BrowserNode {
-                webrtc_direct: state.endpoint_catalog.get(&node.peer_id),
-                peer_id,
-                native_addresses: node
-                    .addresses_by_priority()
-                    .into_iter()
-                    .map(|address| address.to_string())
-                    .collect(),
-                reliability: node.reliability,
-            }
-        })
-        .collect();
+        .await;
+    let mut nodes = Vec::with_capacity(dht_nodes.len());
+    for node in dht_nodes {
+        let supplemental = dht.supplemental_addresses_for_peer(&node.peer_id).await;
+        nodes.push(browser_node_from_dht(
+            &node,
+            &supplemental,
+            &state.endpoint_catalog,
+        ));
+    }
     (
         Response::ok(request_id, ResponseBody::Nodes { target, nodes }, 0),
         None,
     )
+}
+
+fn browser_node_from_dht(
+    node: &DHTNode,
+    supplemental: &[MultiAddr],
+    endpoint_catalog: &BrowserEndpointCatalog,
+) -> BrowserNode {
+    let addresses = node.addresses_by_priority();
+    let discovered_endpoint = supplemental
+        .iter()
+        .find(|address| {
+            address.is_webrtc_direct()
+                && address.peer_id().is_some_and(|peer| peer == &node.peer_id)
+        })
+        .cloned()
+        .map(|multiaddr| BrowserEndpoint { multiaddr });
+    BrowserNode {
+        webrtc_direct: discovered_endpoint.or_else(|| endpoint_catalog.get(&node.peer_id)),
+        peer_id: node.peer_id.to_hex(),
+        native_addresses: addresses
+            .into_iter()
+            .filter(|address| !address.is_webrtc_direct())
+            .map(|address| address.to_string())
+            .collect(),
+        reliability: node.reliability,
+    }
 }
 
 async fn process_get_chunk(
@@ -1104,6 +1213,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn derives_stable_high_port_from_native_port() {
+        assert_eq!(automatic_webrtc_port(10_000), 42_768);
+        assert_eq!(automatic_webrtc_port(10_001), 42_769);
+        assert_eq!(automatic_webrtc_port(32_768), 49_152);
+        assert_ne!(automatic_webrtc_port(40_000), 40_000);
+    }
+
+    #[test]
+    fn resolves_default_public_listener_from_observed_ip() {
+        let config = WebRtcDirectConfig::default();
+        let resolved = resolve_automatic_config(
+            &config,
+            10_000,
+            Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))),
+        );
+
+        assert_eq!(resolved.bind, "0.0.0.0:42768".parse().expect("bind"));
+        assert_eq!(
+            resolved.advertised_addr,
+            Some("203.0.113.7:42768".parse().expect("advertised"))
+        );
+    }
+
+    #[test]
+    fn explicit_listener_addresses_are_preserved() {
+        let config = WebRtcDirectConfig {
+            bind: "0.0.0.0:11000".parse().expect("bind"),
+            advertised_addr: Some("198.51.100.4:11000".parse().expect("advertised")),
+            ..WebRtcDirectConfig::default()
+        };
+
+        assert_eq!(
+            resolve_automatic_config(&config, 10_000, None).bind,
+            config.bind
+        );
+        assert_eq!(
+            resolve_automatic_config(&config, 10_000, None).advertised_addr,
+            config.advertised_addr
+        );
+    }
+
+    #[test]
     fn parses_versioned_requests() {
         let request: Request = serde_json::from_str(
             r#"{"version":3,"request_id":7,"content_length":0,"type":"find_node","target":"0000000000000000000000000000000000000000000000000000000000000000","count":20}"#,
@@ -1177,5 +1328,60 @@ mod tests {
             second.sha256_digest().expect("second fingerprint")
         );
         assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn persists_canonical_browser_bootstrap_address() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let peer_id = PeerId::from_bytes([0x42; 32]);
+        let endpoint = BrowserEndpoint::new(
+            "203.0.113.7:11000".parse().expect("socket address"),
+            &peer_id,
+            [0x24; 32],
+        )
+        .expect("browser endpoint");
+
+        persist_browser_endpoint(directory.path(), &endpoint)
+            .await
+            .expect("persist endpoint");
+
+        let contents =
+            tokio::fs::read_to_string(directory.path().join(WEBRTC_DIRECT_MULTIADDR_FILENAME))
+                .await
+                .expect("read endpoint file");
+        assert_eq!(contents, format!("{}\n", endpoint.multiaddr));
+    }
+
+    #[test]
+    fn find_node_exposes_propagated_webrtc_endpoint_separately() {
+        let peer_id = PeerId::from_bytes([0x31; 32]);
+        let endpoint = BrowserEndpoint::new(
+            "203.0.113.9:42768".parse().expect("socket address"),
+            &peer_id,
+            [0x52; 32],
+        )
+        .expect("browser endpoint");
+        let native = "/ip4/203.0.113.9/udp/10000/quic"
+            .parse()
+            .expect("native multiaddress");
+        let node = DHTNode {
+            peer_id,
+            addresses: vec![native],
+            address_types: Vec::new(),
+            distance: None,
+            reliability: 0.75,
+        };
+
+        let browser_node = browser_node_from_dht(
+            &node,
+            std::slice::from_ref(&endpoint.multiaddr),
+            &BrowserEndpointCatalog::default(),
+        );
+
+        assert_eq!(browser_node.webrtc_direct, Some(endpoint));
+        assert_eq!(
+            browser_node.native_addresses,
+            vec!["/ip4/203.0.113.9/udp/10000/quic"]
+        );
     }
 }

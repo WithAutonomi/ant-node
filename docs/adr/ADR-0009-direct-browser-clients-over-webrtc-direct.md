@@ -152,8 +152,11 @@ to be reconsidered.
 
 ## Decision
 
-We will add a separate, opt-in WebRTC Direct listener to browser-capable
-nodes. Browser clients will use it to connect directly, perform one-hop
+We will add a separate WebRTC Direct listener to browser-capable nodes. It is
+included and enabled in standard node builds so an ordinary deployment is
+browser reachable without deployment-specific flags; custom configuration can
+disable it, and minimal native-only builds can omit the default feature.
+Browser clients will use it to connect directly, perform one-hop
 `FIND_NODE` RPCs iteratively, download chunks with `GET_CHUNK`, and store paid
 chunks with the same quote and payment checks as native clients.
 
@@ -234,8 +237,71 @@ sufficient to initiate DHT lookup without fetching a manifest, resolving DNS,
 or contacting an application service. A newer application release may add or
 retire seeds, but bootstrap does not depend on receiving that release.
 
-Production discovery uses a separately versioned record rather than changing
-the existing Postcard `DHTNode` shape in place:
+The implemented discovery path has two wire-compatible generations backed by
+one canonical in-memory address set. The existing Postcard
+`PublishAddressSet` operation is frozen: it retains the original closed
+`AddressType` enum and carries only the `Quic` projection. Neither WebRTC nor
+any future transport is added to that enum or legacy `FIND_NODE` response.
+
+The new address plane uses a separate `/dht/address/2.0.0` topic and complete
+replacement records:
+
+```text
+PublishAddressSetV2 {
+    seq: u64,
+    records: [TransportAddressRecord]
+}
+
+TransportAddressRecord {
+    transport: u16,
+    reachability: u16,
+    address: bytes
+}
+```
+
+Known transport identifiers are `Quic = 1` and `WebRtcDirect = 2`. Transport
+and reachability are deliberately orthogonal: the known reachability IDs are
+Relay, Direct, Unverified, and Lan, and a WebRTC Direct listener is initially
+published as `WebRtcDirect + Unverified`. Relay acquisition selects
+`Quic + Direct`; native dialing never consumes WebRTC records.
+
+The identifiers are numeric fields rather than serialized Rust enums and are
+never reused. `address` is a bounded, length-delimited payload that is decoded
+only after recognizing `transport`. Consequently a V2-aware node can decode,
+retain, and forward an unknown future transport or reachability value without
+understanding or dialing it. Known records must decode to a multiaddress whose
+transport matches the declared identifier; WebRTC records must also contain
+the authenticated owner's peer ID.
+
+V2 also defines a matching `FindNodeV2` result carrying complete transport
+records. This keeps extension addresses out of the legacy `DHTNode` shape while
+allowing sequence-bearing DHT gossip to distribute WebRTC endpoints beyond the
+direct recipients of a publish.
+
+Support is advertised by the `addr-v2` capability in the signed identity user
+agent. During migration, a new node sends V2 publish and lookup operations to
+capable peers and the unchanged V1 operations to older peers. Thus new-to-old
+and old-to-new links continue to propagate QUIC addresses, while WebRTC and
+future records flow only between upgraded nodes. The V2 topic is separate, so
+an old node also ignores an accidentally delivered V2 frame instead of trying
+to deserialize an unknown operation.
+
+Reachability classification, relay acquisition, relay loss, and rebinding
+mutate the one canonical address set and derive both wire projections from it;
+V1 and V2 are not independent sources of truth. Once the network's minimum
+supported version guarantees V2, nodes may stop publishing V1. Relay
+acquisition continues through the `Quic + Direct` V2 records. Removing V1 is
+an explicit compatibility cutoff: pre-V2 nodes will no longer discover or
+join that network, and V1 decoding may be removed in a later cleanup release.
+
+The browser accepts a discovered endpoint only when its `/p2p` suffix matches
+the returned peer, then proves that binding again through certificate-pinned
+DTLS and ML-DSA HELLO. A malicious DHT responder can omit an endpoint or make a
+client spend a bounded failed dial, but cannot authenticate an endpoint as
+another peer.
+
+A later hardening phase may add a separately versioned, independently
+cacheable record without changing the existing Postcard `DHTNode` shape:
 
 ```text
 BrowserEndpointRecord {
@@ -252,16 +318,17 @@ BrowserEndpointRecord {
 }
 ```
 
-Discovered records expire because IP addresses, ports, relay allocations, and
-capabilities can change. That expiry does not apply to the separately
-configured bootstrap trust anchors and is not driven by routine DTLS
-certificate rotation.
+Such independently cacheable records would expire because IP addresses, ports,
+relay allocations, and capabilities can change. That expiry would not apply to
+the separately configured bootstrap trust anchors and would not be driven by
+routine DTLS certificate rotation.
 
-The ML-DSA signature covers a canonical, domain-separated encoding. The
-browser verifies the public-key-to-peer-ID binding, signature, network ID,
-monotonic sequence, expiry, capabilities, and the entire multiaddress before
-dialing. An address received through an unauthenticated channel is not made
-trustworthy merely by containing a certificate hash.
+For that optional record, the ML-DSA signature covers a canonical,
+domain-separated encoding. The browser would verify the public-key-to-peer-ID
+binding, signature, network ID, monotonic sequence, expiry, capabilities, and
+the entire multiaddress before dialing. An address received through an
+unauthenticated channel is not made trustworthy merely by containing a
+certificate hash.
 
 The multiaddress is the complete dialing input: no separate IP address,
 certificate fingerprint, or peer-ID argument is accepted by the browser
@@ -280,6 +347,21 @@ The native Saorsa QUIC dialer deliberately does not treat a WebRTC Direct
 address as a native QUIC dialing candidate. It is a first-class advertised
 transport address whose browser stack remains separate from the PQ
 node-to-node transport.
+
+For deployment smoke tests, a browser-enabled node also writes its own
+canonical address to `<root-dir>/webrtc-direct.multiaddr`. Deployment tooling
+may print or copy this public artifact so an operator can paste one seed into
+the browser demo without scraping structured logs or running a manifest
+service. This is an operability aid, not the endpoint-discovery protocol; peer
+endpoints propagate through DHT address sets.
+
+With no explicit listener configuration, the node binds IPv4 wildcard and
+maps its native UDP port deterministically into UDP 32768-65535. It advertises
+the same-family non-relay external IP observed by the native transport, or the
+host routing table's selected IP when no observation is available yet. The
+automatic port and persisted certificate make the resulting multiaddress
+stable across routine restarts. Explicit bind and advertised addresses remain
+available for multi-homed and otherwise unusual deployments.
 
 ### WebRTC Direct interoperability status
 
@@ -420,7 +502,12 @@ The earlier feature-gated WebTransport PoC has been replaced by the
   backpressure;
 - a bounded browser connection pool that reuses authenticated DataChannels
   across every lookup, quote, and record in one complete upload or download;
-  and
+- a Rust/WASM random-access reader that resolves the public root DataMap,
+  retrieves only encrypted records overlapping the requested plaintext byte
+  range, and retains a bounded record cache for read-ahead and seeks;
+- a same-origin service-worker adapter that exposes those verified ranges to a
+  native browser media element with standard HTTP range semantics, without
+  proxying bytes through a bootstrap or application server; and
 - the existing local `FIND_NODE`, `GET_CHUNK`, `QUOTE_CHUNK`, and paid
   `PUT_CHUNK` behavior over the new transport.
 
@@ -467,6 +554,40 @@ pre-populates the devnet payment cache for those addresses, while
 content-address verification, DHT responsibility, payment-cache admission,
 LMDB storage, and verified reads remain active.
 
+### Public Internet smoke result
+
+On 2026-08-27 a headless Chromium client loaded the local web application and
+dialed a literal public-IPv4 WebRTC Direct address on a DigitalOcean-hosted
+node. With no browser manifest available, it completed ICE, DTLS, SCTP, the
+DataChannel handshake, and authenticated ML-DSA `HELLO`; the UI then installed
+that single address as the Rust network bootstrap seed and completed a
+`FIND_NODE` query without page errors. Restarting the remote node left the
+complete multiaddress byte-identical and the same browser client reconnected
+using the pre-restart value.
+
+The result was repeated with the unchanged stock `ant-testnet` workflow after
+WebRTC Direct became a default node feature. A normal 60-node deployment used
+no browser-specific build, service, firewall, or advertised-address flags;
+bootstrap node 0 automatically published its public IPv4 endpoint on the
+derived UDP 42768 port.
+
+Using the pre-V2 address-dissemination prototype, Chromium bootstrapped from
+that one address, traversed routing views from dozens of independent peer
+processes, obtained four quotes from four non-bootstrap closest nodes, paid
+once, and stored all four encrypted records. This verifies that the input
+address is a bootstrap seed rather than a storage proxy. Nodes behind the
+testnet's deliberate inbound-NAT rules still require relayed WebRTC; failed
+direct attempts are tolerated but currently add the full DataChannel opening
+timeout to lookup latency.
+
+After replacing that prototype with the compatibility-safe V2 address plane,
+a five-node headless-Chromium test again started with exactly one WebRTC seed.
+It discovered the remaining browser endpoints through `FindNodeV2`, paid for
+and stored eight records across the network, read disjoint and suffix media
+ranges, and downloaded the verified reconstruction. The V1/V2 wire migration
+itself is additionally covered by legacy-decoder and unknown-identifier
+round-trip tests.
+
 ## Consequences
 
 ### Positive
@@ -479,6 +600,8 @@ LMDB storage, and verified reads remain active.
   creates and persists the browser transport credential.
 - Browsers can become application-level full immutable-data clients without a
   lookup, payment, upload, or download gateway.
+- Browser-supported videos can start and seek without downloading or
+  reconstructing the complete file.
 - WebRTC supplies a standardized browser API and an established path toward
   direct ICE and end-to-end relayed connectivity for NATed nodes.
 - The stable DTLS fingerprint is separately bound to the persistent PQ node
@@ -494,6 +617,9 @@ LMDB storage, and verified reads remain active.
 - DataChannels require application fragmentation, reassembly, flow control,
   and cancellation. They are less natural than WebTransport streams for 4 MiB
   chunks.
+- Native media playback needs a small same-origin service-worker bridge because
+  a page-owned WebRTC client cannot itself expose an HTTP range URL. The page
+  must remain open while playback uses its authenticated associations.
 - A stable DTLS transport key has a larger compromise window. ML-DSA
   application authentication limits its authority, but emergency replacement
   of a bootstrap fingerprint still requires overlap and client-list updates.
@@ -547,6 +673,9 @@ The decision advances beyond PoC only after all of the following are covered:
 - Reliable downloads and uploads work at 0 bytes, typical sizes, and 4 MiB,
   with BLAKE3 verification, bounded memory, fragmentation, cancellation, and
   backpressure measurements.
+- Media tests cover disjoint, open-ended, and suffix byte ranges, seeks across
+  self-encryption chunk boundaries, nested DataMaps, bounded cache behavior,
+  invalid/multiple ranges, cancellation, and exact reconstructed bytes.
 - Multi-record uploads and concurrent downloads remain within the browser
   connection-pool bound and complete on Safari without accumulating closed
   `RTCPeerConnection` instances.
