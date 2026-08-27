@@ -231,10 +231,14 @@ Per node, in order:
    because `remove_dir_all` is not: a failure partway through leaves a directory that can
    no longer be opened as an environment, and recording completion on top of that would
    have the node claim it had finished over a half-deleted store. **This is where the disk
-   comes back.** Every gate is rechecked inside the destructive step itself, in the same
-   critical section that proves no other task holds the store, because the verification
-   pass alone can run for hours and a write whose file half failed adds a key in the
-   meantime.
+   comes back.** The gates that can change while nobody is looking are rechecked inside
+   the destructive step itself, in the same critical section that proves no other task
+   holds the store: the proof's health generation, the answerability veto, the announced
+   writes, and that every legacy-only key is in the approved set. The network gates, rank
+   and commitment delivery and possession, are rechecked immediately before that call and
+   outside the guard, so the window on those is the seconds it takes to take the guard
+   rather than the hours the verification pass can run for. Both matter, and they are not
+   the same claim.
 6. **Refetch** the shortfall through ordinary replication, with the freed space to do it in.
 
 The delete gate is the pruner's existing retention contract
@@ -297,8 +301,19 @@ immediately, because it is never unable to serve.
 
 Separately, a host-wide advisory lock serialises migrations sharing a volume, held from the
 first copy through retirement, so a node cannot release it and let eleven others start
-before it has returned a byte. The two limits answer different questions: the lock is about
-one machine's disk, the wave is about one chunk's replicas.
+before it has finished copying. It is released when the environment is unlinked and its
+directory renamed aside, not when the last byte comes back: the deletion itself runs
+detached so the node can serve while it happens, and it can take minutes on a large store.
+So the next node in the queue can begin its copy while the previous one's tombstone is
+still on the disk. That is deliberate, and it is worth stating rather than claiming a
+tighter guarantee than there is. The two limits answer different questions: the lock is
+about one machine's disk, the wave is about one chunk's replicas.
+
+Where the lock file lives is a deployment fact, and the wrong answer is silent: nodes that
+cannot see each other's lock each take one and report success. A host whose nodes do not
+share a `/tmp`, which is any host using `PrivateTmp=true`, has to be told where the lock
+lives through `ANT_MIGRATION_LOCK_DIR`. The node logs the path it locked at so this can be
+answered from a log rather than inferred from a unit file.
 
 ## What the review added
 
