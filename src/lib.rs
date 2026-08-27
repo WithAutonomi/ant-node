@@ -68,7 +68,7 @@ pub use config::{NodeConfig, StorageConfig};
 pub use devnet::{Devnet, DevnetConfig, DevnetEvmInfo, DevnetManifest};
 pub use error::{Error, Result};
 pub use event::{NodeEvent, NodeEventsChannel};
-pub use node::{NodeBuilder, RunningNode};
+pub use node::{NodeBuilder, NodeDaemonBuilder, RunningNode, RunningNodeDaemon};
 pub use payment::{PaymentStatus, PaymentVerifier, PaymentVerifierConfig};
 pub use replication::{config::ReplicationConfig, ReplicationEngine};
 pub use storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};

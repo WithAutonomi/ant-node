@@ -42,7 +42,7 @@ use std::num::NonZeroUsize;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use lru::LruCache;
@@ -97,7 +97,7 @@ use crate::replication::types::{
     NeighborSyncState, PeerSyncRecord, PresenceEvidence, RepairProofs, VerificationEntry,
     VerificationState,
 };
-use crate::storage::LmdbStorage;
+use crate::storage::ChunkStore;
 use saorsa_core::identity::{NodeIdentity, PeerId};
 use saorsa_core::{DhtNetworkEvent, P2PEvent, P2PNode, TrustEvent};
 use saorsa_pqc::api::sig::{MlDsaSecretKey, MlDsaVariant};
@@ -1442,7 +1442,7 @@ impl Drop for FreshOfferEntryGuard {
 struct VerificationCycleContext<'a> {
     p2p_node: &'a Arc<P2PNode>,
     paid_list: &'a Arc<PaidList>,
-    storage: &'a Arc<LmdbStorage>,
+    storage: &'a Arc<dyn ChunkStore>,
     queues: &'a Arc<RwLock<ReplicationQueues>>,
     config: &'a ReplicationConfig,
     bootstrap_state: &'a Arc<RwLock<BootstrapState>>,
@@ -1648,6 +1648,56 @@ const MAX_EVER_CAPABLE_PEERS: usize = 4 * MAX_LAST_COMMITMENT_BY_PEER;
 // ReplicationEngine
 // ---------------------------------------------------------------------------
 
+/// Machine-wide coordination for work that is identical across logical
+/// identities. The first stage is fetch single-flight: one physical download
+/// can satisfy every identity through the shared chunk store.
+pub(crate) struct DaemonReplicationCoordinator {
+    fetch_locks: Mutex<HashMap<XorName, Weak<tokio::sync::Mutex<()>>>>,
+    physical_peer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    audit_challenges: Arc<AuditChallengeCoordinator>,
+}
+
+impl DaemonReplicationCoordinator {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            fetch_locks: Mutex::new(HashMap::new()),
+            physical_peer_locks: Mutex::new(HashMap::new()),
+            audit_challenges: Arc::new(AuditChallengeCoordinator::new()),
+        }
+    }
+
+    fn fetch_lock(&self, key: &XorName) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.fetch_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(*key, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn physical_peer_lock(
+        &self,
+        p2p_node: &P2PNode,
+        peer: &PeerId,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = p2p_node
+            .physical_connection_key(peer)
+            .await
+            .unwrap_or_else(|| format!("logical:{}", peer.to_hex()));
+        let mut locks = self.physical_peer_locks.lock();
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(key, Arc::downgrade(&lock));
+        lock
+    }
+}
+
 /// The replication engine manages all replication background tasks and state.
 pub struct ReplicationEngine {
     /// Replication configuration (shared across spawned tasks).
@@ -1655,7 +1705,9 @@ pub struct ReplicationEngine {
     /// P2P networking node.
     p2p_node: Arc<P2PNode>,
     /// Local chunk storage.
-    storage: Arc<LmdbStorage>,
+    storage: Arc<dyn ChunkStore>,
+    /// Cross-identity fetch and physical-daemon scheduling coordination.
+    daemon_coordinator: Option<Arc<DaemonReplicationCoordinator>>,
     /// Persistent paid-for-list.
     paid_list: Arc<PaidList>,
     /// Payment verifier for `PoP` validation.
@@ -1860,19 +1912,51 @@ impl ReplicationEngine {
     pub async fn new(
         config: ReplicationConfig,
         p2p_node: Arc<P2PNode>,
-        storage: Arc<LmdbStorage>,
+        storage: Arc<dyn ChunkStore>,
         payment_verifier: Arc<PaymentVerifier>,
         identity: Arc<NodeIdentity>,
         root_dir: &Path,
         fresh_write_rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
         shutdown: CancellationToken,
     ) -> Result<Self> {
-        config.validate().map_err(Error::Config)?;
-
         let paid_list = Arc::new(
             PaidList::new(root_dir)
                 .await
                 .map_err(|e| Error::Storage(format!("Failed to open PaidList: {e}")))?,
+        );
+
+        Self::new_with_paid_list(
+            config,
+            p2p_node,
+            storage,
+            paid_list,
+            None,
+            payment_verifier,
+            identity,
+            fresh_write_rx,
+            shutdown,
+        )
+        .await
+    }
+
+    /// Create an engine with a daemon-provided, identity-scoped paid view.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new_with_paid_list(
+        config: ReplicationConfig,
+        p2p_node: Arc<P2PNode>,
+        storage: Arc<dyn ChunkStore>,
+        paid_list: Arc<PaidList>,
+        daemon_coordinator: Option<Arc<DaemonReplicationCoordinator>>,
+        payment_verifier: Arc<PaymentVerifier>,
+        identity: Arc<NodeIdentity>,
+        fresh_write_rx: mpsc::UnboundedReceiver<fresh::FreshWriteEvent>,
+        shutdown: CancellationToken,
+    ) -> Result<Self> {
+        config.validate().map_err(Error::Config)?;
+        let root_dir = storage.root_dir().to_path_buf();
+        let audit_challenge_coordinator = daemon_coordinator.as_ref().map_or_else(
+            || Arc::new(AuditChallengeCoordinator::new()),
+            |coordinator| Arc::clone(&coordinator.audit_challenges),
         );
 
         let initial_neighbors = NeighborSyncState::new_cycle(Vec::new());
@@ -1890,6 +1974,7 @@ impl ReplicationEngine {
             config: Arc::clone(&config),
             p2p_node,
             storage,
+            daemon_coordinator,
             paid_list,
             payment_verifier,
             queues: Arc::new(RwLock::new(ReplicationQueues::new())),
@@ -1914,7 +1999,7 @@ impl ReplicationEngine {
             audit_responder_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_RESPONSES)),
             audit_responder_inflight: Arc::new(RwLock::new(HashMap::new())),
             audit_responder_metrics: Arc::new(AuditResponderMetrics::default()),
-            audit_challenge_coordinator: Arc::new(AuditChallengeCoordinator::new()),
+            audit_challenge_coordinator,
             fetch_responder_worker_semaphore: Arc::new(Semaphore::new(
                 FETCH_RESPONDER_WORKER_LIMIT,
             )),
@@ -3103,6 +3188,7 @@ impl ReplicationEngine {
         let sig_verify_attempts = Arc::clone(&self.sig_verify_attempts);
         let audit_challenge_coordinator = Arc::clone(&self.audit_challenge_coordinator);
         let detached_task_tracker = self.detached_task_tracker.clone();
+        let daemon_coordinator = self.daemon_coordinator.clone();
         // ADR-0002: a peer's commitment also arrives on the sync RESPONSE path
         // (we initiated, they piggybacked theirs). Carry a gossip-audit trigger
         // here too so a peer that only ever answers — never initiates sync —
@@ -3160,6 +3246,7 @@ impl ReplicationEngine {
                         &sig_verify_attempts,
                         &audit_challenge_coordinator,
                         &gossip_audit,
+                        daemon_coordinator.as_ref(),
                     ) => {}
                 }
             }
@@ -3521,6 +3608,7 @@ impl ReplicationEngine {
     fn start_fetch_worker(&mut self) {
         let p2p = Arc::clone(&self.p2p_node);
         let storage = Arc::clone(&self.storage);
+        let daemon_coordinator = self.daemon_coordinator.clone();
         let queues = Arc::clone(&self.queues);
         let config = Arc::clone(&self.config);
         let shutdown = self.shutdown.clone();
@@ -3562,6 +3650,7 @@ impl ReplicationEngine {
                         let p2p = Arc::clone(&p2p);
                         let storage = Arc::clone(&storage);
                         let config = Arc::clone(&config);
+                        let daemon_coordinator = daemon_coordinator.clone();
                         let token = shutdown.clone();
                         let tracker = detached_task_tracker.clone();
                         in_flight.push(Box::pin(async move {
@@ -3577,7 +3666,12 @@ impl ReplicationEngine {
                                         result: FetchResult::SourceFailed,
                                     },
                                     outcome = execute_single_fetch(
-                                        p2p, storage, config, fetch_key, source,
+                                        p2p,
+                                        storage,
+                                        config,
+                                        daemon_coordinator,
+                                        fetch_key,
+                                        source,
                                     ) => outcome,
                                 }
                             });
@@ -3624,6 +3718,7 @@ impl ReplicationEngine {
                                     let p2p = Arc::clone(&p2p);
                                     let storage = Arc::clone(&storage);
                                     let config = Arc::clone(&config);
+                                    let daemon_coordinator = daemon_coordinator.clone();
                                     let token = shutdown.clone();
                                     let tracker = detached_task_tracker.clone();
                                     let fetch_key = key;
@@ -3637,7 +3732,12 @@ impl ReplicationEngine {
                                                     result: FetchResult::SourceFailed,
                                                 },
                                                 outcome = execute_single_fetch(
-                                                    p2p, storage, config, fetch_key, next_peer,
+                                                    p2p,
+                                                    storage,
+                                                    config,
+                                                    daemon_coordinator,
+                                                    fetch_key,
+                                                    next_peer,
                                                 ) => outcome,
                                             }
                                         });
@@ -3924,7 +4024,7 @@ impl ReplicationEngine {
                             admitted.map(|admitted| {
                                 (
                                     *peer,
-                                    queue_admitted_hints(peer, admitted, &storage, &mut q),
+                                    queue_admitted_hints(peer, admitted, storage.as_ref(), &mut q),
                                 )
                             })
                         })
@@ -4216,7 +4316,7 @@ struct PeerResponderSlot {
 #[derive(Clone)]
 struct ReplicationMessageHandlerContext {
     p2p_node: Arc<P2PNode>,
-    storage: Arc<LmdbStorage>,
+    storage: Arc<dyn ChunkStore>,
     paid_list: Arc<PaidList>,
     payment_verifier: Arc<PaymentVerifier>,
     queues: Arc<RwLock<ReplicationQueues>>,
@@ -5081,7 +5181,7 @@ async fn handle_replication_message(
                     content_bytes,
                 } = storage_commitment_audit::handle_subtree_challenge_measured(
                     &challenge,
-                    &storage,
+                    storage.as_ref(),
                     p2p_node.peer_id(),
                     bootstrapping,
                     Some(&my_commitment_state),
@@ -5263,7 +5363,7 @@ async fn handle_replication_message(
                 let processing_started = Instant::now();
                 let response = storage_commitment_audit::handle_subtree_slice_challenge(
                     &challenge,
-                    &storage,
+                    storage.as_ref(),
                     p2p_node.peer_id(),
                     bootstrapping,
                     Some(&my_commitment_state),
@@ -6451,7 +6551,7 @@ async fn handle_neighbor_sync_request(
     source: &PeerId,
     request: &protocol::NeighborSyncRequest,
     p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
@@ -6549,7 +6649,7 @@ async fn handle_neighbor_sync_request(
 async fn handle_verification_request(
     source: &PeerId,
     request: &protocol::VerificationRequest,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     paid_list: &Arc<PaidList>,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
@@ -6843,7 +6943,7 @@ fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
 async fn handle_fetch_request(
     source: &PeerId,
     request: &protocol::FetchRequest,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     p2p_node: &Arc<P2PNode>,
     request_id: u64,
     rr_message_id: Option<&str>,
@@ -6885,7 +6985,7 @@ struct AuditResponderCompletion {
 async fn handle_audit_challenge_msg(
     source: &PeerId,
     challenge: &protocol::AuditChallenge,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     p2p_node: &Arc<P2PNode>,
     is_bootstrapping: bool,
     reply: ReplyRoute<'_>,
@@ -6902,7 +7002,7 @@ async fn handle_audit_challenge_msg(
     let processing_started = Instant::now();
     let response = audit::handle_audit_challenge(
         challenge,
-        storage,
+        storage.as_ref(),
         p2p_node.peer_id(),
         is_bootstrapping,
         stored_chunks,
@@ -7149,7 +7249,7 @@ async fn record_sent_replica_hints(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_neighbor_sync_round(
     p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
     config: &ReplicationConfig,
@@ -7165,6 +7265,7 @@ async fn run_neighbor_sync_round(
     sig_verify_attempts: &Arc<RwLock<HashMap<PeerId, Instant>>>,
     audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
     gossip_audit: &GossipAuditTrigger,
+    daemon_coordinator: Option<&Arc<DaemonReplicationCoordinator>>,
 ) {
     let self_id = *p2p_node.peer_id();
     let bootstrapping = *is_bootstrapping.read().await;
@@ -7231,7 +7332,7 @@ async fn run_neighbor_sync_round(
     }
 
     // Select batch of peers.
-    let batch = {
+    let mut batch = {
         let mut state = sync_state.write().await;
         neighbor_sync::select_sync_batch(
             &mut state,
@@ -7242,6 +7343,19 @@ async fn run_neighbor_sync_round(
 
     if batch.is_empty() {
         return;
+    }
+
+    if daemon_coordinator.is_some() {
+        let mut grouped = Vec::with_capacity(batch.len());
+        for peer in batch {
+            let physical = p2p_node
+                .physical_connection_key(&peer)
+                .await
+                .unwrap_or_else(|| format!("logical:{}", peer.to_hex()));
+            grouped.push((physical, peer));
+        }
+        grouped.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        batch = grouped.into_iter().map(|(_, peer)| peer).collect();
     }
 
     debug!("Neighbor sync: syncing with {} peers", batch.len());
@@ -7268,6 +7382,16 @@ async fn run_neighbor_sync_round(
     // Sync with each peer in the batch.
     for peer in &batch {
         let hints = hints_by_peer.remove(peer).unwrap_or_default();
+        let _physical_peer_guard = match daemon_coordinator {
+            Some(coordinator) => Some(
+                coordinator
+                    .physical_peer_lock(p2p_node, peer)
+                    .await
+                    .lock_owned()
+                    .await,
+            ),
+            None => None,
+        };
         let outcome = neighbor_sync::sync_with_peer_with_hints(
             peer,
             p2p_node,
@@ -7373,7 +7497,7 @@ async fn handle_sync_response(
     config: &ReplicationConfig,
     bootstrapping: bool,
     bootstrap_state: &Arc<RwLock<BootstrapState>>,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
     sync_state: &Arc<RwLock<NeighborSyncState>>,
@@ -7569,7 +7693,7 @@ async fn admit_and_queue_hints(
     paid_hints: &[XorName],
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     paid_list: &Arc<PaidList>,
     queues: &Arc<RwLock<ReplicationQueues>>,
 ) -> AdmissionOutcome {
@@ -7591,13 +7715,13 @@ async fn admit_and_queue_hints(
     .await;
 
     let mut q = queues.write().await;
-    queue_admitted_hints(source_peer, admitted, storage, &mut q)
+    queue_admitted_hints(source_peer, admitted, storage.as_ref(), &mut q)
 }
 
 fn queue_admitted_hints(
     source_peer: &PeerId,
     admitted: admission::AdmissionResult,
-    storage: &LmdbStorage,
+    storage: &dyn ChunkStore,
     q: &mut ReplicationQueues,
 ) -> AdmissionOutcome {
     let mut discovered = HashSet::new();
@@ -8390,11 +8514,16 @@ async fn is_storage_admitted(
 /// topology churn before the key is ever dequeued.
 async fn execute_single_fetch(
     p2p_node: Arc<P2PNode>,
-    storage: Arc<LmdbStorage>,
+    storage: Arc<dyn ChunkStore>,
     config: Arc<ReplicationConfig>,
+    daemon_coordinator: Option<Arc<DaemonReplicationCoordinator>>,
     key: XorName,
     source: PeerId,
 ) -> FetchOutcome {
+    let _single_flight = match daemon_coordinator.as_ref() {
+        Some(coordinator) => Some(coordinator.fetch_lock(&key).lock_owned().await),
+        None => None,
+    };
     let self_id = *p2p_node.peer_id();
     if !is_storage_admitted(&self_id, &key, &p2p_node, &config).await {
         debug!(
@@ -8422,6 +8551,29 @@ async fn execute_single_fetch(
             key,
             result: FetchResult::AlreadyHeld,
         };
+    }
+
+    // Another local identity may already have downloaded the physical blob.
+    // Acquiring its lease here is the daemon-wide local handoff path and is
+    // deliberately checked under the per-key single-flight guard.
+    match storage.acquire_local(&key).await {
+        Ok(true) => {
+            debug!(
+                "Skipping fetch for {}: adopted an existing daemon-local blob",
+                hex::encode(key)
+            );
+            return FetchOutcome {
+                key,
+                result: FetchResult::AlreadyHeld,
+            };
+        }
+        Ok(false) => {}
+        Err(error) => {
+            warn!(
+                "Failed to inspect daemon-local blob for {}: {error}",
+                hex::encode(key)
+            );
+        }
     }
 
     // Capacity is checked before the dial rather than after the bytes arrive.
@@ -8464,6 +8616,21 @@ async fn execute_single_fetch(
                 result: FetchResult::SourceFailed,
             };
         }
+    };
+
+    // Different logical peers hosted by one remote daemon resolve to the same
+    // physical channel key. Grouping here prevents local identities from
+    // independently flooding that connection and establishes the scheduling
+    // seam used by future multi-request wire batches.
+    let _physical_peer_guard = match daemon_coordinator.as_ref() {
+        Some(coordinator) => Some(
+            coordinator
+                .physical_peer_lock(&p2p_node, &source)
+                .await
+                .lock_owned()
+                .await,
+        ),
+        None => None,
     };
 
     let result = p2p_node
@@ -9567,7 +9734,7 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
 /// rotate. The auditor side handles "no commitment for this peer" by
 /// falling back to the legacy plain-digest audit path.
 async fn rebuild_and_rotate_commitment(
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     identity: &Arc<NodeIdentity>,
     state: &Arc<ResponderCommitmentState>,
     p2p: &Arc<P2PNode>,

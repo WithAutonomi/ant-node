@@ -9,7 +9,7 @@ mod cli;
 mod platform;
 
 use ant_node::config::BootstrapSource;
-use ant_node::NodeBuilder;
+use ant_node::{NodeBuilder, NodeDaemonBuilder};
 use clap::Parser;
 use cli::Cli;
 #[cfg(feature = "logging")]
@@ -155,8 +155,13 @@ async fn main() -> color_eyre::Result<()> {
         }
     }
 
-    let mut node = NodeBuilder::new(config).build().await?;
-    node.run().await?;
+    if config.daemon.is_enabled() {
+        let mut daemon = NodeDaemonBuilder::new(config).build().await?;
+        daemon.run().await?;
+    } else {
+        let mut node = NodeBuilder::new(config).build().await?;
+        node.run().await?;
+    }
 
     ant_node::logging::info!("Goodbye!");
     Ok(())

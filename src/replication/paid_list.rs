@@ -28,6 +28,7 @@ use heed::{Database, Env, EnvOpenOptions};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
@@ -64,7 +65,89 @@ pub struct PaidList {
     /// closure owns a cloned [`Env`] and keeps running when its async awaiter
     /// is dropped, so [`Self::wait_idle`] waits on the blocking tasks
     /// themselves before the environment may be reopened.
-    blocking_tracker: TaskTracker,
+    blocking_tracker: Arc<TaskTracker>,
+    /// `None` preserves the standalone on-disk layout. Daemon views prefix
+    /// every key with the owning logical peer ID in one shared catalogue.
+    namespace: Option<[u8; 32]>,
+}
+
+/// One daemon-wide paid-record catalogue. Identity entitlement remains
+/// explicit through namespaced [`PaidList`] views.
+pub(crate) struct PaidListCatalog {
+    env: Env,
+    db: Database<Bytes, Bytes>,
+    blocking_tracker: Arc<TaskTracker>,
+}
+
+impl PaidListCatalog {
+    /// Open the catalogue once for the machine daemon.
+    pub(crate) async fn new(root_dir: &Path) -> Result<Arc<Self>> {
+        let (env, db) = open_paid_list(root_dir).await?;
+        Ok(Arc::new(Self {
+            env,
+            db,
+            blocking_tracker: Arc::new(TaskTracker::new()),
+        }))
+    }
+
+    /// Create an identity-scoped entitlement view.
+    pub(crate) fn view(&self, owner: [u8; 32]) -> PaidList {
+        PaidList::from_parts(
+            self.env.clone(),
+            self.db,
+            Arc::clone(&self.blocking_tracker),
+            Some(owner),
+        )
+    }
+
+    /// Copy legacy per-identity entitlement into the shared catalogue. The
+    /// source is deliberately retained so rollback remains possible.
+    pub(crate) async fn import_legacy(&self, owner: [u8; 32], root: &Path) -> Result<u64> {
+        if !root.join("paid_list.mdb").is_dir() {
+            return Ok(0);
+        }
+        let legacy = PaidList::new(root).await?;
+        let target = self.view(owner);
+        let mut imported = 0;
+        for key in legacy.all_keys()? {
+            if target.insert(&key).await? {
+                imported += 1;
+            }
+        }
+        legacy.wait_idle().await;
+        Ok(imported)
+    }
+}
+
+#[allow(unsafe_code)]
+async fn open_paid_list(root_dir: &Path) -> Result<(Env, Database<Bytes, Bytes>)> {
+    let env_dir = root_dir.join("paid_list.mdb");
+    std::fs::create_dir_all(&env_dir)
+        .map_err(|e| Error::Storage(format!("Failed to create paid-list directory: {e}")))?;
+    let env_dir_clone = env_dir.clone();
+    let opened = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
+        // SAFETY: standalone lists use their identity root. Daemon callers
+        // open one catalogue and clone its handle into namespaced views.
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(DEFAULT_MAP_SIZE)
+                .max_dbs(1)
+                .open(&env_dir_clone)
+                .map_err(|e| Error::Storage(format!("Failed to open paid-list LMDB env: {e}")))?
+        };
+        let mut wtxn = env
+            .write_txn()
+            .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
+        let db = env
+            .create_database(&mut wtxn, None)
+            .map_err(|e| Error::Storage(format!("Failed to create paid-list database: {e}")))?;
+        wtxn.commit()
+            .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
+        Ok((env, db))
+    })
+    .await
+    .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
+    Ok(opened)
 }
 
 impl PaidList {
@@ -74,61 +157,52 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB environment cannot be opened or the
     /// database cannot be created.
-    #[allow(unsafe_code)]
     pub async fn new(root_dir: &Path) -> Result<Self> {
         let env_dir = root_dir.join("paid_list.mdb");
-
-        std::fs::create_dir_all(&env_dir)
-            .map_err(|e| Error::Storage(format!("Failed to create paid-list directory: {e}")))?;
-
-        let env_dir_clone = env_dir.clone();
-        // Constructor-only blocking task: it runs before `self` (and its
-        // `blocking_tracker`) exists, so it is deliberately untracked.  The
-        // constructor awaits it right here, so it cannot outlive this call.
-        let (env, db) = spawn_blocking(move || -> Result<(Env, Database<Bytes, Bytes>)> {
-            // SAFETY: `EnvOpenOptions::open()` is unsafe because LMDB uses
-            // memory-mapped I/O and relies on OS file-locking to prevent
-            // corruption from concurrent access by multiple processes. We
-            // satisfy this by giving each node instance a unique `root_dir`
-            // (typically named by its full 64-hex peer ID), ensuring no two
-            // processes open the same LMDB environment.
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .map_size(DEFAULT_MAP_SIZE)
-                    .max_dbs(1)
-                    .open(&env_dir_clone)
-                    .map_err(|e| {
-                        Error::Storage(format!("Failed to open paid-list LMDB env: {e}"))
-                    })?
-            };
-
-            let mut wtxn = env
-                .write_txn()
-                .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
-            let db: Database<Bytes, Bytes> = env
-                .create_database(&mut wtxn, None)
-                .map_err(|e| Error::Storage(format!("Failed to create paid-list database: {e}")))?;
-            wtxn.commit()
-                .map_err(|e| Error::Storage(format!("Failed to commit db creation: {e}")))?;
-
-            Ok((env, db))
-        })
-        .await
-        .map_err(|e| Error::Storage(format!("Paid-list init task failed: {e}")))??;
-
-        let paid_list = Self {
-            env,
-            db,
-            paid_out_of_range: RwLock::new(HashMap::new()),
-            record_out_of_range: RwLock::new(HashMap::new()),
-            paid_prune_cursor: RwLock::new(0),
-            blocking_tracker: TaskTracker::new(),
-        };
+        let (env, db) = open_paid_list(root_dir).await?;
+        let paid_list = Self::from_parts(env, db, Arc::new(TaskTracker::new()), None);
 
         let count = paid_list.count()?;
         debug!("Initialized paid-list at {env_dir:?} ({count} existing keys)");
 
         Ok(paid_list)
+    }
+
+    fn from_parts(
+        env: Env,
+        db: Database<Bytes, Bytes>,
+        blocking_tracker: Arc<TaskTracker>,
+        namespace: Option<[u8; 32]>,
+    ) -> Self {
+        Self {
+            env,
+            db,
+            paid_out_of_range: RwLock::new(HashMap::new()),
+            record_out_of_range: RwLock::new(HashMap::new()),
+            paid_prune_cursor: RwLock::new(0),
+            blocking_tracker,
+            namespace,
+        }
+    }
+
+    fn encoded_key(&self, key: &XorName) -> Vec<u8> {
+        let mut encoded = Vec::with_capacity(if self.namespace.is_some() { 64 } else { 32 });
+        if let Some(owner) = self.namespace {
+            encoded.extend_from_slice(&owner);
+        }
+        encoded.extend_from_slice(key);
+        encoded
+    }
+
+    fn decode_key(&self, encoded: &[u8]) -> Option<XorName> {
+        let address = match self.namespace {
+            Some(owner) if encoded.len() == 64 && encoded[..32] == owner => &encoded[32..],
+            None if encoded.len() == XORNAME_LEN => encoded,
+            _ => return None,
+        };
+        let mut key = [0_u8; XORNAME_LEN];
+        key.copy_from_slice(address);
+        Some(key)
     }
 
     /// Insert a key into the paid-for set.
@@ -145,7 +219,7 @@ impl PaidList {
             return Ok(false);
         }
 
-        let key_owned = *key;
+        let key_owned = self.encoded_key(key);
         let env = self.env.clone();
         let db = self.db;
 
@@ -195,7 +269,7 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB write transaction fails.
     pub async fn remove(&self, key: &XorName) -> Result<bool> {
-        let key_owned = *key;
+        let key_owned = self.encoded_key(key);
         let env = self.env.clone();
         let db = self.db;
 
@@ -233,13 +307,14 @@ impl PaidList {
     ///
     /// Returns an error if the LMDB read transaction fails.
     pub fn contains(&self, key: &XorName) -> Result<bool> {
+        let encoded = self.encoded_key(key);
         let rtxn = self
             .env
             .read_txn()
             .map_err(|e| Error::Storage(format!("Failed to create read txn: {e}")))?;
         let found = self
             .db
-            .get(&rtxn, key.as_ref())
+            .get(&rtxn, &encoded)
             .map_err(|e| Error::Storage(format!("Failed to check paid-list membership: {e}")))?
             .is_some();
         Ok(found)
@@ -247,12 +322,16 @@ impl PaidList {
 
     /// Return the number of keys in the paid-for set.
     ///
-    /// This is an O(1) read of the B-tree page header, not a full scan.
+    /// Standalone lists read the B-tree metadata in O(1). Namespaced daemon
+    /// views count only their own entries in the shared catalogue.
     ///
     /// # Errors
     ///
     /// Returns an error if the LMDB read transaction fails.
     pub fn count(&self) -> Result<u64> {
+        if self.namespace.is_some() {
+            return Ok(self.all_keys()?.len() as u64);
+        }
         let rtxn = self
             .env
             .read_txn()
@@ -285,11 +364,9 @@ impl PaidList {
         for result in iter {
             let (key_bytes, _) = result
                 .map_err(|e| Error::Storage(format!("Failed to read paid-list entry: {e}")))?;
-            if key_bytes.len() == XORNAME_LEN {
-                let mut key = [0u8; XORNAME_LEN];
-                key.copy_from_slice(key_bytes);
+            if let Some(key) = self.decode_key(key_bytes) {
                 keys.push(key);
-            } else {
+            } else if self.namespace.is_none() {
                 warn!(
                     "PaidList: skipping entry with unexpected key length {} (expected {XORNAME_LEN})",
                     key_bytes.len()
@@ -412,7 +489,10 @@ impl PaidList {
             return Ok(0);
         }
 
-        let keys_owned: Vec<XorName> = keys.to_vec();
+        let keys_owned: Vec<(XorName, Vec<u8>)> = keys
+            .iter()
+            .map(|key| (*key, self.encoded_key(key)))
+            .collect();
         let env = self.env.clone();
         let db = self.db;
 
@@ -424,8 +504,8 @@ impl PaidList {
                     .map_err(|e| Error::Storage(format!("Failed to create write txn: {e}")))?;
 
                 let mut removed = Vec::new();
-                for key in &keys_owned {
-                    let deleted = db.delete(&mut wtxn, key.as_ref()).map_err(|e| {
+                for (key, encoded) in &keys_owned {
+                    let deleted = db.delete(&mut wtxn, encoded).map_err(|e| {
                         Error::Storage(format!("Failed to delete from paid-list: {e}"))
                     })?;
                     if deleted {
@@ -498,6 +578,24 @@ mod tests {
             .await
             .expect("create paid list");
         (paid_list, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn daemon_catalogue_keeps_identity_entitlement_namespaced() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let catalog = PaidListCatalog::new(temp.path()).await.expect("catalog");
+        let one = catalog.view([1; 32]);
+        let two = catalog.view([2; 32]);
+        let key = [9; 32];
+
+        assert!(one.insert(&key).await.expect("insert one"));
+        assert!(one.contains(&key).expect("contains one"));
+        assert!(!two.contains(&key).expect("isolated two"));
+        assert!(two.insert(&key).await.expect("insert two"));
+        assert_eq!(one.count().expect("count one"), 1);
+        assert_eq!(two.count().expect("count two"), 1);
+        assert!(one.remove(&key).await.expect("remove one"));
+        assert!(two.contains(&key).expect("two retained"));
     }
 
     #[tokio::test]

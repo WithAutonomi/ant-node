@@ -41,7 +41,9 @@ use crate::payment::{PaymentVerifier, QuoteGenerator, VerificationContext};
 use crate::replication::admission;
 use crate::replication::config::K_BUCKET_SIZE;
 use crate::replication::fresh::FreshWriteEvent;
-use crate::storage::lmdb::LmdbStorage;
+use crate::storage::ChunkStore;
+#[cfg(test)]
+use crate::storage::LmdbStorage;
 use bytes::Bytes;
 use parking_lot::RwLock;
 use saorsa_core::P2PNode;
@@ -214,7 +216,7 @@ impl Drop for GetRequestTelemetry {
 /// and optional payment verification.
 pub struct AntProtocol {
     /// LMDB storage for chunk persistence.
-    storage: Arc<LmdbStorage>,
+    storage: Arc<dyn ChunkStore>,
     /// Payment verifier for checking payments.
     payment_verifier: Arc<PaymentVerifier>,
     /// Quote generator for creating storage quotes.
@@ -238,7 +240,7 @@ impl AntProtocol {
     /// * `quote_generator` - Quote generator for creating storage quotes
     #[must_use]
     pub fn new(
-        storage: Arc<LmdbStorage>,
+        storage: Arc<dyn ChunkStore>,
         payment_verifier: Arc<PaymentVerifier>,
         quote_generator: Arc<QuoteGenerator>,
     ) -> Self {
@@ -293,7 +295,7 @@ impl AntProtocol {
 
     /// Get a reference to the underlying LMDB storage.
     #[must_use]
-    pub fn storage(&self) -> Arc<LmdbStorage> {
+    pub fn storage(&self) -> Arc<dyn ChunkStore> {
         Arc::clone(&self.storage)
     }
 

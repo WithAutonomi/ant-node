@@ -21,6 +21,8 @@ use crate::replication::protocol::{
 use crate::replication::types::{
     AuditFailureReason, AuditFailureSummary, FailureEvidence, PeerSyncRecord, RepairProofs,
 };
+use crate::storage::ChunkStore;
+#[cfg(test)]
 use crate::storage::LmdbStorage;
 use saorsa_core::identity::PeerId;
 use saorsa_core::P2PNode;
@@ -113,7 +115,7 @@ pub(crate) fn responsible_audit_response_timeout(
 )]
 pub async fn audit_tick_with_repair_proofs(
     p2p_node: &Arc<P2PNode>,
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     config: &ReplicationConfig,
     sync_history: &HashMap<PeerId, PeerSyncRecord>,
     repair_proofs: &Arc<RwLock<RepairProofs>>,
@@ -226,7 +228,10 @@ pub async fn audit_tick_with_repair_proofs(
         }
     };
 
-    let Some(_slot) = audit_challenge_coordinator.acquire(challenged_peer).await else {
+    let Some(_slot) = audit_challenge_coordinator
+        .acquire_physical(p2p_node, challenged_peer)
+        .await
+    else {
         warn!("Audit: failed to acquire outbound audit coordinator slot for {challenged_peer}");
         return AuditTickResult::Idle;
     };
@@ -543,7 +548,7 @@ async fn verify_digests(
     nonce: &[u8; 32],
     keys: &[XorName],
     digests: &[[u8; 32]],
-    storage: &Arc<LmdbStorage>,
+    storage: &Arc<dyn ChunkStore>,
     p2p_node: &Arc<P2PNode>,
     config: &ReplicationConfig,
 ) -> AuditTickResult {
@@ -759,7 +764,7 @@ async fn handle_audit_timeout(
 /// attack where a malicious challenger forges digests for a different peer.
 pub async fn handle_audit_challenge(
     challenge: &AuditChallenge,
-    storage: &LmdbStorage,
+    storage: &dyn ChunkStore,
     self_peer_id: &PeerId,
     is_bootstrapping: bool,
     stored_chunks: usize,

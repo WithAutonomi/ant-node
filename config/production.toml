@@ -6,6 +6,24 @@
 # Root directory for node data
 root_dir = "/var/lib/ant"
 
+# Optional shared full-node daemon. It shares one physical network endpoint,
+# chunk volumes, payment-chain cache and paid catalogue across logical IDs.
+# Existing per-identity state is copied into the shared catalogues on startup;
+# source data is retained for rollback.
+# [daemon]
+# identity_roots = [
+#   "/var/lib/ant/nodes/<peer-id-1>",
+#   "/var/lib/ant/nodes/<peer-id-2>",
+# ]
+# storage_roots = ["/mnt/ant-disk-1", "/mnt/ant-disk-2"]
+# auto_scale_identities = false
+# min_identities = 1
+# max_identities = 0
+# gib_per_identity = 512
+# capacity_reserve_gib = 10
+# scale_interval_secs = 300
+# scale_down_grace_secs = 3600
+
 # Listening port (10000-10999 for production)
 port = 10000
 

@@ -13,7 +13,7 @@ use crate::payment::proof::{
 };
 use crate::replication::commitment::MAX_COMMITMENT_KEY_COUNT;
 use crate::replication::config::K_BUCKET_SIZE;
-use crate::storage::lmdb::LmdbStorage;
+use crate::storage::ChunkStore;
 use ant_protocol::payment::verify::{verify_quote_content, verify_quote_signature};
 use evmlib::common::{Amount, QuoteHash};
 use evmlib::contract::payment_vault;
@@ -533,6 +533,40 @@ impl PaymentStatus {
 /// Default capacity for the merkle pool cache (number of pool hashes to cache).
 const DEFAULT_POOL_CACHE_CAPACITY: usize = 1_000;
 
+/// Daemon-wide cache for identity-independent payment-chain facts.
+///
+/// The cache stores settled merkle-pool information returned by the payment
+/// contract. That result is independent of which local logical identity asks
+/// for it, so a multi-identity daemon can safely reuse it and avoid duplicate
+/// chain queries. Identity-dependent admission state (verified chunk
+/// addresses, DHT closeness, rewards entitlement and price-floor decisions)
+/// deliberately remains in each [`PaymentVerifier`].
+#[derive(Clone)]
+pub struct SharedPaymentCache {
+    pool_cache: Arc<Mutex<LruCache<PoolHash, OnChainPaymentInfo>>>,
+}
+
+impl SharedPaymentCache {
+    /// Create an empty cache with the production capacity.
+    #[must_use]
+    pub fn new() -> Self {
+        let capacity = NonZeroUsize::new(DEFAULT_POOL_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        Self {
+            pool_cache: Arc::new(Mutex::new(LruCache::new(capacity))),
+        }
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, LruCache<PoolHash, OnChainPaymentInfo>> {
+        self.pool_cache.lock()
+    }
+}
+
+impl Default for SharedPaymentCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Capacity of the ADR-0008 parity-telemetry first-emission cache: how many
 /// recently measured pool hashes this node remembers in order to emit one
 /// sample per settlement instead of one per admitted chunk.
@@ -588,7 +622,7 @@ pub struct PaymentVerifier {
     /// LRU cache of verified `XorName` values.
     cache: VerifiedCache,
     /// LRU cache of verified merkle pool hashes → on-chain payment info.
-    pool_cache: Mutex<LruCache<PoolHash, OnChainPaymentInfo>>,
+    pool_cache: SharedPaymentCache,
     /// LRU cache of pool hashes whose candidate closeness has already been
     /// verified by this node. Collapses the per-chunk Kademlia lookup cost
     /// within a batch (256 chunks × 1 pool = 1 lookup instead of 256).
@@ -614,7 +648,7 @@ pub struct PaymentVerifier {
     /// compared unlike counts and false-rejected honest quotes). `None` in unit
     /// tests that don't exercise store-backed checks; production wires it via
     /// [`Self::attach_storage`].
-    storage: RwLock<Option<Arc<LmdbStorage>>>,
+    storage: RwLock<Option<Arc<dyn ChunkStore>>>,
     /// Test-only override for the paid-quote issuer K-closest check.
     ///
     /// Production code derives closest peers from the attached [`P2PNode`].
@@ -776,6 +810,20 @@ impl PaymentVerifier {
     /// Create a new payment verifier.
     #[must_use]
     pub fn new(config: PaymentVerifierConfig) -> Self {
+        Self::new_with_shared_cache(config, SharedPaymentCache::new())
+    }
+
+    /// Create a payment verifier using a daemon-wide cache for safe,
+    /// identity-independent payment-chain results.
+    ///
+    /// Every logical identity still receives its own verified-address and
+    /// closeness caches. Sharing those would incorrectly allow payment or DHT
+    /// admission for one identity to authorize another identity.
+    #[must_use]
+    pub fn new_with_shared_cache(
+        config: PaymentVerifierConfig,
+        pool_cache: SharedPaymentCache,
+    ) -> Self {
         const _: () = assert!(
             DEFAULT_POOL_CACHE_CAPACITY > 0,
             "pool cache capacity must be > 0"
@@ -783,7 +831,6 @@ impl PaymentVerifier {
         let cache = VerifiedCache::with_capacity(config.cache_capacity);
         let pool_cache_size =
             NonZeroUsize::new(DEFAULT_POOL_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
-        let pool_cache = Mutex::new(LruCache::new(pool_cache_size));
         let closeness_pass_cache = Mutex::new(LruCache::new(pool_cache_size));
         let inflight_closeness = Mutex::new(LruCache::new(pool_cache_size));
 
@@ -888,7 +935,7 @@ impl PaymentVerifier {
     /// attached still admits PUTs; this
     /// attachment only feeds any current/future store-count-backed checks.
     /// Idempotent: calling twice replaces the handle.
-    pub fn attach_storage(&self, storage: Arc<LmdbStorage>) {
+    pub fn attach_storage(&self, storage: Arc<dyn ChunkStore>) {
         *self.storage.write() = Some(storage);
         debug!("PaymentVerifier: LmdbStorage attached for paid-quote price-floor checks");
     }
@@ -6127,6 +6174,37 @@ mod tests {
             let found = verifier.pool_cache.lock().get(&other_hash).cloned();
             assert!(found.is_none(), "Unknown pool hash should not be in cache");
         }
+    }
+
+    #[test]
+    fn daemon_cache_shares_chain_facts_but_not_identity_admission() {
+        let config = PaymentVerifierConfig {
+            evm: EvmVerifierConfig::default(),
+            cache_capacity: 100,
+            close_group_size: CLOSE_GROUP_SIZE,
+            local_rewards_address: RewardsAddress::new([1u8; 20]),
+            price_floor: PriceFloorConfig::default(),
+        };
+        let daemon_cache = SharedPaymentCache::new();
+        let first = PaymentVerifier::new_with_shared_cache(config.clone(), daemon_cache.clone());
+        let second = PaymentVerifier::new_with_shared_cache(config, daemon_cache);
+
+        let pool_hash = [0x4Du8; 32];
+        let payment_info = OnChainPaymentInfo {
+            depth: 3,
+            merkle_payment_timestamp: 1_700_000_000,
+            paid_node_addresses: vec![],
+        };
+        first.pool_cache.lock().put(pool_hash, payment_info);
+        assert!(second.pool_cache.lock().get(&pool_hash).is_some());
+
+        let chunk = [0xA7u8; 32];
+        first.cache.insert(chunk);
+        assert_eq!(
+            second.check_payment_required(&chunk, VerificationContext::ClientPut),
+            PaymentStatus::PaymentRequired,
+            "one identity's verified-address cache must not authorize another identity"
+        );
     }
 
     #[tokio::test]

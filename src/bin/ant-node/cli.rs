@@ -18,6 +18,41 @@ pub struct Cli {
     #[arg(long, env = "ANT_ROOT_DIR")]
     pub root_dir: Option<PathBuf>,
 
+    /// Existing node data directory to host in the shared daemon.
+    /// Repeat this option for every logical identity. When omitted, the
+    /// legacy single-identity mode is used.
+    #[arg(
+        long = "identity-root",
+        env = "ANT_IDENTITY_ROOTS",
+        value_delimiter = ','
+    )]
+    pub identity_roots: Vec<PathBuf>,
+
+    /// Physical storage root for the shared daemon chunk catalogue. Repeat for
+    /// multiple drives.
+    #[arg(
+        long = "daemon-storage-root",
+        env = "ANT_DAEMON_STORAGE_ROOTS",
+        value_delimiter = ','
+    )]
+    pub daemon_storage_roots: Vec<PathBuf>,
+
+    /// Dynamically add and drain logical identities based on free storage.
+    #[arg(long, env = "ANT_DAEMON_AUTO_SCALE_IDENTITIES")]
+    pub daemon_auto_scale_identities: bool,
+
+    /// Minimum logical identity count in auto-scale mode.
+    #[arg(long, env = "ANT_DAEMON_MIN_IDENTITIES")]
+    pub daemon_min_identities: Option<usize>,
+
+    /// Maximum logical identity count; zero is unlimited.
+    #[arg(long, env = "ANT_DAEMON_MAX_IDENTITIES")]
+    pub daemon_max_identities: Option<usize>,
+
+    /// Free GiB represented by one logical identity.
+    #[arg(long, env = "ANT_DAEMON_GIB_PER_IDENTITY")]
+    pub daemon_gib_per_identity: Option<u64>,
+
     /// Listening port (0 for auto-select).
     #[arg(long, short, default_value = "0", env = "ANT_PORT")]
     pub port: u16,
@@ -226,6 +261,24 @@ impl Cli {
         // Override with CLI arguments
         if let Some(root_dir) = self.root_dir {
             config.root_dir = root_dir;
+        }
+        if !self.identity_roots.is_empty() {
+            config.daemon.identity_roots = self.identity_roots;
+        }
+        if !self.daemon_storage_roots.is_empty() {
+            config.daemon.storage_roots = self.daemon_storage_roots;
+        }
+        if self.daemon_auto_scale_identities {
+            config.daemon.auto_scale_identities = true;
+        }
+        if let Some(min_identities) = self.daemon_min_identities {
+            config.daemon.min_identities = min_identities;
+        }
+        if let Some(max_identities) = self.daemon_max_identities {
+            config.daemon.max_identities = max_identities;
+        }
+        if let Some(gib_per_identity) = self.daemon_gib_per_identity {
+            config.daemon.gib_per_identity = gib_per_identity;
         }
 
         config.port = self.port;

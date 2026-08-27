@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 /// Filename for the persisted node identity keypair.
 pub const NODE_IDENTITY_FILENAME: &str = "node_identity.key";
 
+/// Filename for the machine daemon's transport identity keypair.
+pub const DAEMON_IDENTITY_FILENAME: &str = "daemon_identity.key";
+
 /// Subdirectory under the root dir that contains per-node data directories.
 pub const NODES_SUBDIR: &str = "nodes";
 
@@ -83,6 +86,12 @@ pub struct NodeConfig {
     #[serde(default = "default_root_dir")]
     pub root_dir: PathBuf,
 
+    /// Optional fixed-roster multi-identity daemon configuration.
+    ///
+    /// An empty roster preserves the legacy one-process/one-identity mode.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
+
     /// Listening port (0 for auto-select).
     #[serde(default)]
     pub port: u16,
@@ -141,6 +150,93 @@ pub struct NodeConfig {
     /// Log level.
     #[serde(default = "default_log_level")]
     pub log_level: String,
+}
+
+/// Multi-identity machine daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    /// Existing per-identity data directories to host behind the daemon's
+    /// shared physical network endpoint.
+    #[serde(default)]
+    pub identity_roots: Vec<PathBuf>,
+
+    /// Physical roots used by the shared content-addressed chunk store. Empty
+    /// uses `{root_dir}/daemon-state/chunk-volumes/volume-0`.
+    #[serde(default)]
+    pub storage_roots: Vec<PathBuf>,
+
+    /// Generate and retire logical identities as capacity changes.
+    #[serde(default)]
+    pub auto_scale_identities: bool,
+
+    /// Minimum number of active identities in auto-scale mode.
+    #[serde(default = "default_daemon_min_identities")]
+    pub min_identities: usize,
+
+    /// Maximum active identities. Zero means no configured maximum.
+    #[serde(default)]
+    pub max_identities: usize,
+
+    /// Free storage represented by one logical identity.
+    #[serde(default = "default_daemon_gib_per_identity")]
+    pub gib_per_identity: u64,
+
+    /// Free space withheld from identity capacity calculations.
+    #[serde(default = "default_daemon_capacity_reserve_gib")]
+    pub capacity_reserve_gib: u64,
+
+    /// How often capacity is sampled.
+    #[serde(default = "default_daemon_scale_interval_secs")]
+    pub scale_interval_secs: u64,
+
+    /// A lower desired count must remain stable for this long before an
+    /// identity is drained. Scale-up is immediate.
+    #[serde(default = "default_daemon_scale_down_grace_secs")]
+    pub scale_down_grace_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            identity_roots: Vec::new(),
+            storage_roots: Vec::new(),
+            auto_scale_identities: false,
+            min_identities: default_daemon_min_identities(),
+            max_identities: 0,
+            gib_per_identity: default_daemon_gib_per_identity(),
+            capacity_reserve_gib: default_daemon_capacity_reserve_gib(),
+            scale_interval_secs: default_daemon_scale_interval_secs(),
+            scale_down_grace_secs: default_daemon_scale_down_grace_secs(),
+        }
+    }
+}
+
+impl DaemonConfig {
+    /// Whether the shared daemon mode is enabled.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        !self.identity_roots.is_empty() || self.auto_scale_identities
+    }
+}
+
+const fn default_daemon_min_identities() -> usize {
+    1
+}
+
+const fn default_daemon_gib_per_identity() -> u64 {
+    512
+}
+
+const fn default_daemon_capacity_reserve_gib() -> u64 {
+    10
+}
+
+const fn default_daemon_scale_interval_secs() -> u64 {
+    300
+}
+
+const fn default_daemon_scale_down_grace_secs() -> u64 {
+    3600
 }
 
 /// Auto-upgrade configuration.
@@ -271,6 +367,7 @@ impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             root_dir: default_root_dir(),
+            daemon: DaemonConfig::default(),
             port: 0,
             ipv4_only: false,
             bootstrap: Vec::new(),

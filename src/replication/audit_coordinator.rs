@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use saorsa_core::identity::PeerId;
+use saorsa_core::P2PNode;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Maximum concurrent `AuditChallenge` requests this auditor may have in
@@ -24,14 +25,14 @@ struct TargetLimiter {
 /// Shared limiter for all auditor-side flows that send `AuditChallenge`.
 #[derive(Debug, Default)]
 pub struct AuditChallengeCoordinator {
-    targets: Mutex<HashMap<PeerId, TargetLimiter>>,
+    targets: Mutex<HashMap<String, TargetLimiter>>,
 }
 
 /// Permit held while one outbound challenge is in flight.
 #[derive(Debug)]
 pub(crate) struct AuditChallengePermit {
     coordinator: Arc<AuditChallengeCoordinator>,
-    peer: PeerId,
+    target_key: String,
     permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -45,7 +46,7 @@ pub(crate) struct AuditChallengePermit {
 /// release on its own drop.
 struct ReferenceGuard<'a> {
     coordinator: &'a AuditChallengeCoordinator,
-    peer: PeerId,
+    target_key: String,
     armed: bool,
 }
 
@@ -58,7 +59,7 @@ impl ReferenceGuard<'_> {
 impl Drop for ReferenceGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            self.coordinator.release_reference(self.peer);
+            self.coordinator.release_reference(&self.target_key);
         }
     }
 }
@@ -72,13 +73,35 @@ impl AuditChallengeCoordinator {
 
     /// Wait for a target-peer slot. Returns `None` only if the internal
     /// semaphore was closed, which the coordinator never does in production.
+    #[cfg(test)]
     pub(crate) async fn acquire(self: &Arc<Self>, peer: PeerId) -> Option<AuditChallengePermit> {
+        self.acquire_key(format!("logical:{}", peer.to_hex())).await
+    }
+
+    /// Wait for a slot keyed by the authenticated physical connection. When
+    /// several logical target IDs are hosted by one remote daemon they share
+    /// this limiter, allowing all local identities to coordinate audit bursts.
+    pub(crate) async fn acquire_physical(
+        self: &Arc<Self>,
+        p2p_node: &P2PNode,
+        peer: PeerId,
+    ) -> Option<AuditChallengePermit> {
+        let key = p2p_node
+            .physical_connection_key(&peer)
+            .await
+            .unwrap_or_else(|| format!("logical:{}", peer.to_hex()));
+        self.acquire_key(key).await
+    }
+
+    async fn acquire_key(self: &Arc<Self>, target_key: String) -> Option<AuditChallengePermit> {
         let semaphore = {
             let mut targets = self.lock_targets();
-            let entry = targets.entry(peer).or_insert_with(|| TargetLimiter {
-                semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_CHALLENGES_PER_TARGET)),
-                references: 0,
-            });
+            let entry = targets
+                .entry(target_key.clone())
+                .or_insert_with(|| TargetLimiter {
+                    semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_AUDIT_CHALLENGES_PER_TARGET)),
+                    references: 0,
+                });
             entry.references = entry.references.saturating_add(1);
             Arc::clone(&entry.semaphore)
         };
@@ -88,7 +111,7 @@ impl AuditChallengeCoordinator {
         // semaphore releases it via the same guard on the early return.
         let mut reference_guard = ReferenceGuard {
             coordinator: self,
-            peer,
+            target_key: target_key.clone(),
             armed: true,
         };
 
@@ -100,7 +123,7 @@ impl AuditChallengeCoordinator {
         reference_guard.disarm();
         Some(AuditChallengePermit {
             coordinator: Arc::clone(self),
-            peer,
+            target_key,
             permit: Some(permit),
         })
     }
@@ -110,18 +133,18 @@ impl AuditChallengeCoordinator {
         self.lock_targets().len()
     }
 
-    fn release_reference(&self, peer: PeerId) {
+    fn release_reference(&self, target_key: &str) {
         let mut targets = self.lock_targets();
-        let Some(entry) = targets.get_mut(&peer) else {
+        let Some(entry) = targets.get_mut(target_key) else {
             return;
         };
         entry.references = entry.references.saturating_sub(1);
         if entry.references == 0 {
-            targets.remove(&peer);
+            targets.remove(target_key);
         }
     }
 
-    fn lock_targets(&self) -> std::sync::MutexGuard<'_, HashMap<PeerId, TargetLimiter>> {
+    fn lock_targets(&self) -> std::sync::MutexGuard<'_, HashMap<String, TargetLimiter>> {
         match self.targets.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -132,7 +155,7 @@ impl AuditChallengeCoordinator {
 impl Drop for AuditChallengePermit {
     fn drop(&mut self) {
         let _permit = self.permit.take();
-        self.coordinator.release_reference(self.peer);
+        self.coordinator.release_reference(&self.target_key);
     }
 }
 

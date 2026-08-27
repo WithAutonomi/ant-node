@@ -23,6 +23,7 @@ name = "ant-devnet"
 path = "src/bin/ant-devnet/main.rs"
 
 [dependencies]
+async-trait = "0.1"
 # Global allocator. musl's default malloc is significantly slower than
 # glibc's under concurrent allocation churn, which matches the node's
 # steady-state workload. mimalloc neutralises that regression for the
@@ -190,6 +191,11 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+# Temporary integration pin for ADR-0011. Replace with the released
+# saorsa-core version containing SharedTransport before merge/release.
+saorsa-core = { git = "https://github.com/WithAutonomi/saorsa-core.git", branch = "feat/multi-identity-daemon" }
 
 [profile.dev]
 # Faster builds for development
