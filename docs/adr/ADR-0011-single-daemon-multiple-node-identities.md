@@ -198,6 +198,11 @@ Identity-specific rewards, closeness and price-floor outcomes are not globally c
 ### Stage three: shared chunk storage and replication planning
 
 The daemon uses a content-addressed machine store plus durable `(peer ID, chunk address)` leases.
+Lease metadata lives in one daemon-owned embedded SQLite catalogue, separate from chunk bytes. The
+catalogue indexes both identity-to-chunk and chunk-to-identity queries, applies lease handoffs in
+bounded transactions, and durably records last-owner garbage collection that remains unfinished
+after a crash. It uses full commit durability and a bounded write-ahead log; no external database
+service is required.
 Blob creation precedes lease creation and final lease removal precedes blob deletion: a crash can
 leave a reclaimable orphan but cannot leave an acknowledged obligation with no blob. A daemon-wide
 mutation lock coordinates store, handoff, prune, drain and rebalance operations. The maintenance

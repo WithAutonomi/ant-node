@@ -11,18 +11,23 @@ use crate::ant_protocol::XORNAME_LEN;
 use crate::error::{Error, Result};
 use crate::logging::{debug, info, warn};
 use async_trait::async_trait;
-use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
+use parking_lot::Mutex as SyncMutex;
+use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
 use saorsa_core::identity::PeerId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tokio_util::task::TaskTracker;
 
-const LEASE_KEY_LEN: usize = 32 + XORNAME_LEN;
-const LEASE_MAP_SIZE: usize = 512 * 1_024 * 1_024;
+const LEASE_DB_FILENAME: &str = "chunk-leases.sqlite3";
+const LEASE_SCHEMA_VERSION: i64 = 1;
+const LEASE_TRANSFER_BATCH_SIZE: usize = 4_096;
+const MAX_LEASE_READ_CONNECTIONS: usize = 8;
+const PENDING_GC_BATCH_SIZE: usize = 4_096;
 
 /// Configuration for one daemon-wide chunk store.
 #[derive(Debug, Clone)]
@@ -55,231 +60,381 @@ impl SharedChunkStoreConfig {
 }
 
 struct LeaseCatalog {
-    env: Env,
-    db: Database<Bytes, Bytes>,
-    refs: Database<Bytes, Bytes>,
+    writer: Arc<SyncMutex<Connection>>,
+    readers: Vec<SyncMutex<Connection>>,
+    next_reader: AtomicUsize,
     tracker: TaskTracker,
 }
 
 impl LeaseCatalog {
-    #[allow(unsafe_code)]
     async fn new(root: &Path) -> Result<Self> {
-        let env_dir = root.join("chunk-leases.mdb");
-        std::fs::create_dir_all(&env_dir).map_err(|error| {
-            Error::Storage(format!("Failed to create shared lease directory: {error}"))
+        std::fs::create_dir_all(root).map_err(|error| {
+            Error::Storage(format!("Failed to create daemon state directory: {error}"))
         })?;
-        let open_dir = env_dir.clone();
-        let (env, db, refs) = spawn_blocking(move || -> Result<_> {
-            // SAFETY: only one SharedChunkStoreBase is created for a daemon
-            // root, and it owns this environment for the process lifetime.
-            let env = unsafe {
-                EnvOpenOptions::new()
-                    .map_size(LEASE_MAP_SIZE)
-                    .max_dbs(2)
-                    .open(&open_dir)
-                    .map_err(|error| {
-                        Error::Storage(format!("Failed to open shared lease catalogue: {error}"))
-                    })?
-            };
-            let mut txn = env.write_txn().map_err(|error| {
-                Error::Storage(format!(
-                    "Failed to create shared lease transaction: {error}"
-                ))
+        let db_path = root.join(LEASE_DB_FILENAME);
+        let open_path = db_path.clone();
+        let writer = spawn_blocking(move || -> Result<Connection> {
+            let connection = Connection::open(&open_path).map_err(|error| {
+                Error::Storage(format!("Failed to open shared lease catalogue: {error}"))
             })?;
-            let db: Database<Bytes, Bytes> =
-                env.create_database(&mut txn, None).map_err(|error| {
-                    Error::Storage(format!("Failed to create shared lease database: {error}"))
-                })?;
-            let refs: Database<Bytes, Bytes> = env
-                .create_database(&mut txn, Some("chunk_refs"))
+            connection
+                .busy_timeout(Duration::from_secs(5))
                 .map_err(|error| {
-                    Error::Storage(format!(
-                        "Failed to create shared reference database: {error}"
-                    ))
+                    Error::Storage(format!("Failed to configure shared lease timeout: {error}"))
                 })?;
-
-            // Rebuild the reverse count index from the authoritative lease
-            // set on every open. This also upgrades catalogues created before
-            // the reverse index existed and repairs an interrupted index write.
-            refs.clear(&mut txn).map_err(|error| {
-                Error::Storage(format!("Failed to reset shared reference index: {error}"))
-            })?;
-            let mut counts = HashMap::<XorName, u64>::new();
-            {
-                let iter = db.iter(&txn).map_err(|error| {
-                    Error::Storage(format!("Failed to scan shared leases: {error}"))
+            connection
+                .execute_batch(
+                    "PRAGMA journal_mode = WAL;
+                     PRAGMA synchronous = FULL;
+                     PRAGMA foreign_keys = ON;
+                     PRAGMA journal_size_limit = 16777216;
+                     PRAGMA wal_autocheckpoint = 1000;",
+                )
+                .map_err(|error| {
+                    Error::Storage(format!("Failed to configure shared lease catalogue: {error}"))
                 })?;
-                for entry in iter {
-                    let (key, _) = entry.map_err(|error| {
-                        Error::Storage(format!("Failed to rebuild shared references: {error}"))
-                    })?;
-                    if key.len() == LEASE_KEY_LEN {
-                        let mut address = [0_u8; XORNAME_LEN];
-                        address.copy_from_slice(&key[32..]);
-                        *counts.entry(address).or_default() += 1;
-                    }
-                }
+            let version = connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .map_err(|error| {
+                    Error::Storage(format!("Failed to read shared lease schema version: {error}"))
+                })?;
+            if version != 0 && version != LEASE_SCHEMA_VERSION {
+                return Err(Error::Storage(format!(
+                    "Unsupported shared lease schema version {version}; expected {LEASE_SCHEMA_VERSION}"
+                )));
             }
-            for (address, count) in counts {
-                let encoded_count = count.to_be_bytes();
-                refs.put(&mut txn, address.as_ref(), encoded_count.as_ref())
-                    .map_err(|error| {
-                        Error::Storage(format!("Failed to rebuild shared reference: {error}"))
-                    })?;
-            }
-            txn.commit().map_err(|error| {
-                Error::Storage(format!("Failed to commit shared lease database: {error}"))
-            })?;
-            Ok((env, db, refs))
+            connection
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS leases (
+                         owner   BLOB NOT NULL CHECK(length(owner) = 32),
+                         address BLOB NOT NULL CHECK(length(address) = 32),
+                         PRIMARY KEY (owner, address)
+                     ) WITHOUT ROWID;
+                     CREATE INDEX IF NOT EXISTS leases_by_address
+                         ON leases(address, owner);
+                     CREATE TABLE IF NOT EXISTS gc_queue (
+                         address BLOB PRIMARY KEY CHECK(length(address) = 32)
+                     ) WITHOUT ROWID;
+                     PRAGMA user_version = 1;",
+                )
+                .map_err(|error| {
+                    Error::Storage(format!("Failed to initialize shared lease schema: {error}"))
+                })?;
+            Ok(connection)
         })
         .await
         .map_err(|error| Error::Storage(format!("Shared lease init task failed: {error}")))??;
-        info!(path = %env_dir.display(), "Opened daemon-wide chunk lease catalogue");
+
+        let reader_count = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .clamp(1, MAX_LEASE_READ_CONNECTIONS);
+        let mut readers = Vec::with_capacity(reader_count);
+        for _ in 0..reader_count {
+            let reader = Connection::open_with_flags(
+                &db_path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_FULL_MUTEX,
+            )
+            .map_err(|error| {
+                Error::Storage(format!("Failed to open shared lease reader: {error}"))
+            })?;
+            reader
+                .busy_timeout(Duration::from_secs(5))
+                .map_err(|error| {
+                    Error::Storage(format!("Failed to configure shared lease reader: {error}"))
+                })?;
+            readers.push(SyncMutex::new(reader));
+        }
+
+        info!(path = %db_path.display(), "Opened SQLite daemon-wide chunk lease catalogue");
         Ok(Self {
-            env,
-            db,
-            refs,
+            writer: Arc::new(SyncMutex::new(writer)),
+            readers,
+            next_reader: AtomicUsize::new(0),
             tracker: TaskTracker::new(),
         })
     }
 
-    fn encoded(owner: &PeerId, address: &XorName) -> [u8; LEASE_KEY_LEN] {
-        let mut key = [0_u8; LEASE_KEY_LEN];
-        key[..32].copy_from_slice(owner.as_bytes());
-        key[32..].copy_from_slice(address);
-        key
+    fn with_reader<T>(
+        &self,
+        context: &str,
+        operation: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+    ) -> Result<T> {
+        let index = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        operation(&self.readers[index].lock())
+            .map_err(|error| Error::Storage(format!("{context}: {error}")))
     }
 
     fn contains(&self, owner: &PeerId, address: &XorName) -> Result<bool> {
-        let key = Self::encoded(owner, address);
-        let txn = self.env.read_txn().map_err(|error| {
-            Error::Storage(format!("Failed to read shared lease catalogue: {error}"))
-        })?;
-        self.db
-            .get(&txn, &key)
-            .map(|value| value.is_some())
-            .map_err(|error| Error::Storage(format!("Failed to check shared lease: {error}")))
+        self.with_reader("Failed to check shared lease", |connection| {
+            connection.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM leases WHERE owner = ?1 AND address = ?2
+                 )",
+                params![owner.as_bytes().as_slice(), address.as_slice()],
+                |row| row.get(0),
+            )
+        })
     }
 
     async fn insert(&self, owner: PeerId, address: XorName) -> Result<bool> {
-        let env = self.env.clone();
-        let db = self.db;
-        let refs = self.refs;
-        let key = Self::encoded(&owner, &address);
+        let writer = Arc::clone(&self.writer);
         self.tracker
             .spawn_blocking(move || -> Result<bool> {
-                let mut txn = env.write_txn().map_err(|error| {
-                    Error::Storage(format!("Failed to write shared lease catalogue: {error}"))
-                })?;
-                if db
-                    .get(&txn, &key)
+                let mut connection = writer.lock();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|error| {
-                        Error::Storage(format!("Failed to check shared lease: {error}"))
-                    })?
-                    .is_some()
-                {
-                    return Ok(false);
-                }
-                db.put(&mut txn, &key, &[]).map_err(|error| {
-                    Error::Storage(format!("Failed to insert shared lease: {error}"))
-                })?;
-                let count = refs
-                    .get(&txn, &address)
-                    .map_err(|error| {
-                        Error::Storage(format!("Failed to read shared reference: {error}"))
-                    })?
-                    .and_then(|bytes| bytes.try_into().ok())
-                    .map_or(0, u64::from_be_bytes)
-                    .saturating_add(1);
-                refs.put(&mut txn, &address, &count.to_be_bytes())
-                    .map_err(|error| {
-                        Error::Storage(format!("Failed to update shared reference: {error}"))
+                        Error::Storage(format!("Failed to begin shared lease insert: {error}"))
                     })?;
-                txn.commit().map_err(|error| {
+                let inserted = transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO leases(owner, address) VALUES (?1, ?2)",
+                        params![owner.as_bytes().as_slice(), address.as_slice()],
+                    )
+                    .map_err(|error| {
+                        Error::Storage(format!("Failed to insert shared lease: {error}"))
+                    })?;
+                transaction
+                    .execute(
+                        "DELETE FROM gc_queue WHERE address = ?1",
+                        params![address.as_slice()],
+                    )
+                    .map_err(|error| {
+                        Error::Storage(format!("Failed to cancel shared chunk GC: {error}"))
+                    })?;
+                transaction.commit().map_err(|error| {
                     Error::Storage(format!("Failed to commit shared lease: {error}"))
                 })?;
-                Ok(true)
+                drop(connection);
+                Ok(inserted == 1)
             })
             .await
             .map_err(|error| Error::Storage(format!("Shared lease insert task failed: {error}")))?
     }
 
     async fn remove(&self, owner: PeerId, address: XorName) -> Result<bool> {
-        let env = self.env.clone();
-        let db = self.db;
-        let refs = self.refs;
-        let key = Self::encoded(&owner, &address);
+        let writer = Arc::clone(&self.writer);
         self.tracker
             .spawn_blocking(move || -> Result<bool> {
-                let mut txn = env.write_txn().map_err(|error| {
-                    Error::Storage(format!("Failed to write shared lease catalogue: {error}"))
-                })?;
-                let removed = db.delete(&mut txn, &key).map_err(|error| {
-                    Error::Storage(format!("Failed to remove shared lease: {error}"))
-                })?;
-                if removed {
-                    let count = refs
-                        .get(&txn, &address)
+                let mut connection = writer.lock();
+                let transaction = connection
+                    .transaction_with_behavior(TransactionBehavior::Immediate)
+                    .map_err(|error| {
+                        Error::Storage(format!("Failed to begin shared lease removal: {error}"))
+                    })?;
+                let removed = transaction
+                    .execute(
+                        "DELETE FROM leases WHERE owner = ?1 AND address = ?2",
+                        params![owner.as_bytes().as_slice(), address.as_slice()],
+                    )
+                    .map_err(|error| {
+                        Error::Storage(format!("Failed to remove shared lease: {error}"))
+                    })?;
+                if removed == 1 {
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO gc_queue(address)
+                             SELECT ?1
+                             WHERE NOT EXISTS(
+                                 SELECT 1 FROM leases WHERE address = ?1
+                             )",
+                            params![address.as_slice()],
+                        )
                         .map_err(|error| {
-                            Error::Storage(format!("Failed to read shared reference: {error}"))
-                        })?
-                        .and_then(|bytes| bytes.try_into().ok())
-                        .map_or(1, u64::from_be_bytes);
-                    if count <= 1 {
-                        refs.delete(&mut txn, &address).map_err(|error| {
-                            Error::Storage(format!("Failed to remove shared reference: {error}"))
+                            Error::Storage(format!("Failed to queue unowned chunk for GC: {error}"))
                         })?;
-                    } else {
-                        refs.put(&mut txn, &address, &(count - 1).to_be_bytes())
-                            .map_err(|error| {
-                                Error::Storage(format!(
-                                    "Failed to decrement shared reference: {error}"
-                                ))
-                            })?;
-                    }
                 }
-                txn.commit().map_err(|error| {
+                transaction.commit().map_err(|error| {
                     Error::Storage(format!("Failed to commit shared lease removal: {error}"))
                 })?;
-                Ok(removed)
+                drop(connection);
+                Ok(removed == 1)
             })
             .await
             .map_err(|error| Error::Storage(format!("Shared lease remove task failed: {error}")))?
     }
 
     fn owner_keys(&self, owner: &PeerId) -> Result<Vec<XorName>> {
-        let txn = self.env.read_txn().map_err(|error| {
-            Error::Storage(format!("Failed to read shared lease catalogue: {error}"))
+        let encoded = self.with_reader("Failed to iterate identity leases", |connection| {
+            let mut statement = connection
+                .prepare("SELECT address FROM leases WHERE owner = ?1 ORDER BY address")?;
+            let rows = statement
+                .query_map(params![owner.as_bytes().as_slice()], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })?;
-        let iter = self
-            .db
-            .prefix_iter(&txn, owner.as_bytes())
-            .map_err(|error| {
-                Error::Storage(format!("Failed to iterate identity leases: {error}"))
-            })?;
-        let mut keys = Vec::new();
-        for entry in iter {
-            let (key, _) = entry
-                .map_err(|error| Error::Storage(format!("Failed to read shared lease: {error}")))?;
-            if key.len() == LEASE_KEY_LEN && &key[..32] == owner.as_bytes() {
+        let mut keys = Vec::with_capacity(encoded.len());
+        for bytes in encoded {
+            if bytes.len() == XORNAME_LEN {
                 let mut address = [0_u8; XORNAME_LEN];
-                address.copy_from_slice(&key[32..]);
+                address.copy_from_slice(&bytes);
                 keys.push(address);
+            } else {
+                return Err(Error::Storage(format!(
+                    "Shared lease catalogue contains an invalid {}-byte chunk address",
+                    bytes.len()
+                )));
             }
         }
         Ok(keys)
     }
 
     fn has_any_owner(&self, address: &XorName) -> Result<bool> {
-        let txn = self.env.read_txn().map_err(|error| {
-            Error::Storage(format!("Failed to read shared lease catalogue: {error}"))
+        self.with_reader("Failed to check shared chunk ownership", |connection| {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM leases WHERE address = ?1)",
+                params![address.as_slice()],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    fn pending_gc(&self, limit: usize) -> Result<Vec<XorName>> {
+        let encoded = self.with_reader("Failed to list pending chunk GC", |connection| {
+            let mut statement = connection.prepare(
+                "SELECT address FROM gc_queue
+                 ORDER BY address
+                 LIMIT ?1",
+            )?;
+            let rows = statement
+                .query_map(params![i64::try_from(limit).unwrap_or(i64::MAX)], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
         })?;
-        self.refs
-            .get(&txn, address)
-            .map(|count| count.is_some())
-            .map_err(|error| {
-                Error::Storage(format!("Failed to read shared reference count: {error}"))
+        let mut keys = Vec::with_capacity(encoded.len());
+        for bytes in encoded {
+            if bytes.len() != XORNAME_LEN {
+                return Err(Error::Storage(format!(
+                    "Shared GC queue contains an invalid {}-byte chunk address",
+                    bytes.len()
+                )));
+            }
+            let mut address = [0_u8; XORNAME_LEN];
+            address.copy_from_slice(&bytes);
+            keys.push(address);
+        }
+        Ok(keys)
+    }
+
+    async fn finish_gc(&self, address: XorName) -> Result<()> {
+        let writer = Arc::clone(&self.writer);
+        self.tracker
+            .spawn_blocking(move || -> Result<()> {
+                writer
+                    .lock()
+                    .execute(
+                        "DELETE FROM gc_queue WHERE address = ?1",
+                        params![address.as_slice()],
+                    )
+                    .map_err(|error| {
+                        Error::Storage(format!("Failed to finish shared chunk GC: {error}"))
+                    })?;
+                Ok(())
             })
+            .await
+            .map_err(|error| Error::Storage(format!("Shared chunk GC task failed: {error}")))?
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn transfer_owner(&self, from: PeerId, to: PeerId) -> Result<u64> {
+        let writer = Arc::clone(&self.writer);
+        self.tracker
+            .spawn_blocking(move || -> Result<u64> {
+                let mut connection = writer.lock();
+                let mut transferred = 0_u64;
+                loop {
+                    let transaction = connection
+                        .transaction_with_behavior(TransactionBehavior::Immediate)
+                        .map_err(|error| {
+                            Error::Storage(format!("Failed to begin lease transfer: {error}"))
+                        })?;
+                    let addresses = {
+                        let mut statement = transaction
+                            .prepare(
+                                "SELECT address FROM leases
+                                 WHERE owner = ?1
+                                 ORDER BY address
+                                 LIMIT ?2",
+                            )
+                            .map_err(|error| {
+                                Error::Storage(format!("Failed to prepare lease transfer: {error}"))
+                            })?;
+                        let rows = statement
+                            .query_map(
+                                params![
+                                    from.as_bytes().as_slice(),
+                                    i64::try_from(LEASE_TRANSFER_BATCH_SIZE).unwrap_or(i64::MAX)
+                                ],
+                                |row| row.get::<_, Vec<u8>>(0),
+                            )
+                            .map_err(|error| {
+                                Error::Storage(format!(
+                                    "Failed to read leases for transfer: {error}"
+                                ))
+                            })?
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map_err(|error| {
+                                Error::Storage(format!(
+                                    "Failed to collect leases for transfer: {error}"
+                                ))
+                            })?;
+                        rows
+                    };
+                    if addresses.is_empty() {
+                        transaction.commit().map_err(|error| {
+                            Error::Storage(format!("Failed to finish lease transfer: {error}"))
+                        })?;
+                        break;
+                    }
+                    for address in &addresses {
+                        transaction
+                            .execute(
+                                "INSERT OR IGNORE INTO leases(owner, address) VALUES (?1, ?2)",
+                                params![to.as_bytes().as_slice(), address],
+                            )
+                            .map_err(|error| {
+                                Error::Storage(format!(
+                                    "Failed to acquire transferred lease: {error}"
+                                ))
+                            })?;
+                        transaction
+                            .execute("DELETE FROM gc_queue WHERE address = ?1", params![address])
+                            .map_err(|error| {
+                                Error::Storage(format!(
+                                    "Failed to cancel GC during lease transfer: {error}"
+                                ))
+                            })?;
+                        transferred = transferred.saturating_add(
+                            u64::try_from(
+                                transaction
+                                    .execute(
+                                        "DELETE FROM leases WHERE owner = ?1 AND address = ?2",
+                                        params![from.as_bytes().as_slice(), address],
+                                    )
+                                    .map_err(|error| {
+                                        Error::Storage(format!(
+                                            "Failed to release transferred lease: {error}"
+                                        ))
+                                    })?,
+                            )
+                            .unwrap_or(0),
+                        );
+                    }
+                    transaction.commit().map_err(|error| {
+                        Error::Storage(format!("Failed to commit lease transfer batch: {error}"))
+                    })?;
+                }
+                drop(connection);
+                Ok(transferred)
+            })
+            .await
+            .map_err(|error| {
+                Error::Storage(format!("Shared lease transfer task failed: {error}"))
+            })?
     }
 
     async fn wait_idle(&self) {
@@ -331,12 +486,14 @@ impl SharedChunkStoreBase {
             volumes.push(Arc::new(storage));
         }
         let leases = LeaseCatalog::new(&config.daemon_root).await?;
-        Ok(Arc::new(Self {
+        let base = Arc::new(Self {
             volumes,
             leases,
             mutation: Mutex::new(()),
             retiring: parking_lot::RwLock::new(HashSet::new()),
-        }))
+        });
+        base.reconcile_pending_gc(PENDING_GC_BATCH_SIZE).await?;
+        Ok(base)
     }
 
     /// Create the identity-scoped logical view consumed by node business logic.
@@ -498,8 +655,36 @@ impl SharedChunkStoreBase {
                 for volume in &self.volumes {
                     volume.delete(&address).await?;
                 }
+                self.leases.finish_gc(address).await?;
                 removed += 1;
             }
+        }
+        Ok(removed)
+    }
+
+    /// Finish last-owner deletions interrupted by a process crash. Candidates
+    /// are recorded transactionally with lease removal, so this path does not
+    /// need to scan every physical chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when pending metadata or a physical volume cannot be
+    /// read or updated.
+    pub async fn reconcile_pending_gc(&self, limit: usize) -> Result<usize> {
+        let _guard = self.mutation.lock().await;
+        let pending = self.leases.pending_gc(limit)?;
+        let mut removed = 0;
+        for address in pending {
+            if self.leases.has_any_owner(&address)? {
+                self.leases.finish_gc(address).await?;
+                continue;
+            }
+            let existed = self.physical_volume(&address)?.is_some();
+            for volume in &self.volumes {
+                volume.delete(&address).await?;
+            }
+            self.leases.finish_gc(address).await?;
+            removed += usize::from(existed);
         }
         Ok(removed)
     }
@@ -516,15 +701,7 @@ impl SharedChunkStoreBase {
             return Ok(0);
         }
         let _guard = self.mutation.lock().await;
-        let keys = self.leases.owner_keys(&from)?;
-        let mut transferred = 0;
-        for address in keys {
-            self.leases.insert(to, address).await?;
-            if self.leases.remove(from, address).await? {
-                transferred += 1;
-            }
-        }
-        Ok(transferred)
+        self.leases.transfer_owner(from, to).await
     }
 
     /// Prevent an identity from acquiring new storage obligations before its
@@ -569,7 +746,8 @@ impl ChunkStore for SharedChunkStore {
             return Ok(false);
         }
         // Crash-safe ordering: bytes before lease can leave only a harmless
-        // orphan; the inverse could leave a durable obligation with no bytes.
+        // reclaimable orphan; the inverse could leave a durable obligation
+        // with no bytes.
         self.base.put_physical(address, content).await?;
         let inserted = self.base.leases.insert(self.owner, *address).await?;
         debug!(owner = %self.owner, address = %hex::encode(address), "Acquired shared chunk lease");
@@ -597,6 +775,7 @@ impl ChunkStore for SharedChunkStore {
             for volume in &self.base.volumes {
                 volume.delete(address).await?;
             }
+            self.base.leases.finish_gc(*address).await?;
         }
         Ok(true)
     }
@@ -803,7 +982,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reverse_reference_index_rebuilds_across_restart() {
+    async fn sqlite_leases_persist_across_restart() {
         let root = tempdir().expect("tempdir");
         let shared_config = config(root.path(), 1);
         let address = LmdbStorage::compute_address(b"restart bytes");
@@ -818,6 +997,18 @@ mod tests {
             one.wait_idle().await;
         }
 
+        let lease_db = root.path().join("daemon").join(LEASE_DB_FILENAME);
+        assert!(lease_db.is_file(), "SQLite lease catalogue exists");
+        assert!(
+            !root.path().join("daemon").join("chunk-leases.mdb").exists(),
+            "unreleased LMDB lease catalogue is no longer created"
+        );
+        let connection = Connection::open(&lease_db).expect("open SQLite catalogue");
+        let integrity = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+            .expect("SQLite integrity check");
+        assert_eq!(integrity, "ok");
+
         let reopened = SharedChunkStoreBase::new(shared_config)
             .await
             .expect("reopen");
@@ -828,6 +1019,97 @@ mod tests {
         assert_eq!(
             two.get(&address).await.expect("physical retained"),
             Some(b"restart bytes".to_vec())
+        );
+    }
+
+    #[tokio::test]
+    async fn interrupted_last_owner_deletion_is_reconciled_on_restart() {
+        let root = tempdir().expect("tempdir");
+        let shared_config = config(root.path(), 1);
+        let address = LmdbStorage::compute_address(b"interrupted bytes");
+        let owner = PeerId::from_bytes([11; 32]);
+        {
+            let base = SharedChunkStoreBase::new(shared_config.clone())
+                .await
+                .expect("base");
+            base.view(owner, root.path().join("owner"))
+                .put(&address, b"interrupted bytes")
+                .await
+                .expect("put");
+            assert!(base
+                .leases
+                .remove(owner, address)
+                .await
+                .expect("remove final lease"));
+            assert!(base.volumes[0].exists(&address).expect("physical remains"));
+            assert_eq!(
+                base.leases.pending_gc(1).expect("pending GC"),
+                vec![address]
+            );
+            base.leases.wait_idle().await;
+        }
+
+        let reopened = SharedChunkStoreBase::new(shared_config)
+            .await
+            .expect("reopen");
+        assert!(
+            !reopened.volumes[0]
+                .exists(&address)
+                .expect("physical lookup"),
+            "unowned chunk from interrupted deletion was removed"
+        );
+        assert!(
+            reopened
+                .leases
+                .pending_gc(1)
+                .expect("pending GC")
+                .is_empty(),
+            "durable GC record was cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_transfer_crosses_internal_batch_boundary() {
+        let root = tempdir().expect("tempdir");
+        let base = SharedChunkStoreBase::new(config(root.path(), 1))
+            .await
+            .expect("base");
+        let from = PeerId::from_bytes([9; 32]);
+        let to = PeerId::from_bytes([10; 32]);
+        let lease_count = LEASE_TRANSFER_BATCH_SIZE + 1;
+        {
+            let mut connection = base.leases.writer.lock();
+            let transaction = connection.transaction().expect("transaction");
+            {
+                let mut insert = transaction
+                    .prepare("INSERT INTO leases(owner, address) VALUES (?1, ?2)")
+                    .expect("insert statement");
+                for index in 0..lease_count {
+                    let mut address = [0_u8; XORNAME_LEN];
+                    address[..8].copy_from_slice(&(index as u64).to_be_bytes());
+                    insert
+                        .execute(params![from.as_bytes().as_slice(), address.as_slice()])
+                        .expect("insert lease");
+                }
+            }
+            transaction.commit().expect("commit fixtures");
+            drop(connection);
+        }
+
+        assert_eq!(
+            base.transfer_identity_leases(from, to)
+                .await
+                .expect("transfer"),
+            lease_count as u64
+        );
+        assert!(base
+            .leases
+            .owner_keys(&from)
+            .expect("source leases")
+            .is_empty());
+        assert_eq!(
+            base.leases.owner_keys(&to).expect("target leases").len(),
+            lease_count
         );
     }
 }

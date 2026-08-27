@@ -1385,6 +1385,10 @@ impl RunningNodeDaemon {
         &self,
         active: &HashMap<String, ActiveDaemonIdentity>,
     ) -> Result<()> {
+        let cleaned = self.services.chunk_store.reconcile_pending_gc(128).await?;
+        if cleaned > 0 {
+            info!(cleaned, "Reconciled interrupted shared chunk mutations");
+        }
         self.plan_shared_replication(active).await?;
         let moved = self.services.chunk_store.rebalance_once(128).await?;
         if moved > 0 {

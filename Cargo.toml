@@ -54,8 +54,10 @@ xor_name = "5"
 lru = "0.16.3"
 parking_lot = "0.12"  # Efficient mutex for cache
 
-# Storage - LMDB via heed for content-addressed chunk store
+# Storage - LMDB via heed for content-addressed chunk blobs, and SQLite for
+# daemon-wide logical-identity lease metadata.
 heed = "0.22"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled"] }
 
 blake3 = "1"
 
