@@ -1,6 +1,5 @@
 //! Configuration for ant-node.
 
-use crate::storage::MigrationConfig;
 use evmlib::Network as EvmNetwork;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -410,7 +409,7 @@ const fn default_staged_rollout_hours() -> u64 {
 /// Controls how chunks are stored, including:
 /// - Whether storage is enabled
 /// - Content verification on read
-/// - Database size limits (auto-scales with available disk by default)
+/// - How much free disk to leave unused
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Enable chunk storage.
@@ -423,27 +422,12 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_verify_on_read")]
     pub verify_on_read: bool,
 
-    /// Explicit LMDB database size cap in GiB.
-    ///
-    /// When set to 0 (default), the map size is computed automatically from
-    /// available disk space at startup and grows on demand when the operator
-    /// adds storage.  Set a non-zero value to impose a hard cap.
-    #[serde(default)]
-    pub db_size_gb: usize,
-
     /// Minimum free disk space (in MiB) to preserve on the storage partition.
     ///
     /// Writes are refused when available space drops below this threshold,
     /// preventing the node from filling the disk completely.  Default: 500 MiB.
     #[serde(default = "default_disk_reserve_mb")]
     pub disk_reserve_mb: u64,
-
-    /// Controls for moving this node off the legacy LMDB chunk store.
-    ///
-    /// The two release switches inside it are deliberately not serialised: see
-    /// [`MigrationConfig`].
-    #[serde(default)]
-    pub migration: MigrationConfig,
 }
 
 impl Default for StorageConfig {
@@ -451,14 +435,12 @@ impl Default for StorageConfig {
         Self {
             enabled: default_storage_enabled(),
             verify_on_read: default_storage_verify_on_read(),
-            db_size_gb: 0,
             disk_reserve_mb: default_disk_reserve_mb(),
-            migration: MigrationConfig::default(),
         }
     }
 }
 
-/// Default: 500 MiB — matches `DEFAULT_DISK_RESERVE` in `storage::lmdb`.
+/// Default: 500 MiB — matches `DEFAULT_DISK_RESERVE` in `storage`.
 const fn default_disk_reserve_mb() -> u64 {
     500
 }
@@ -608,31 +590,52 @@ fn default_testnet_bootstrap() -> Vec<SocketAddr> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
 
+    /// A config file written by the previous release still loads.
+    ///
+    /// The settings that drove the migration off the old chunk store are gone from this
+    /// build, and so is the database size cap, which configured a memory map that no longer
+    /// exists. Every node on the fleet has a config file on disk carrying them, written by
+    /// the release that did the migrating. If those keys made the file unparseable, every
+    /// one of those nodes would fail to start on upgrade, all at once.
+    ///
+    /// Nothing declares `deny_unknown_fields`, so serde ignores them. That is the behaviour
+    /// this depends on, which makes it worth a test rather than an assumption: adding that
+    /// attribute later would look harmless and would take down the fleet.
+    #[test]
+    fn a_config_file_from_the_previous_release_still_loads() {
+        let previous = r"
+[storage]
+enabled = true
+verify_on_read = true
+db_size_gb = 32
+disk_reserve_mb = 500
+
+[storage.migration]
+shed_hold_hours = 72
+wave_hours = 24
+copier_throttle_mib_per_sec = 32
+copier_slack_mb = 2048
+retire_delay_hours = 4
+";
+        let whole: toml::Value =
+            toml::from_str(previous).expect("the fixture itself must be valid TOML");
+        let parsed: StorageConfig = whole
+            .get("storage")
+            .cloned()
+            .expect("the fixture has a storage table")
+            .try_into()
+            .expect("a config file from the previous release must still parse");
+
+        assert!(parsed.enabled);
+        assert!(parsed.verify_on_read);
+        assert_eq!(
+            parsed.disk_reserve_mb, 500,
+            "the settings this build still uses must survive the ones it dropped"
+        );
+    }
+
     use super::*;
     use serial_test::serial;
-
-    #[test]
-    fn the_shipped_storage_config_parses() {
-        // The migration section is operator-facing, so a typo in it would only surface on
-        // a node that had already shipped. Only `[storage]` is checked: the rest of
-        // `production.toml` does not currently deserialize as a `NodeConfig` (its
-        // `evm_network` is a bare string where an internally tagged enum is expected),
-        // which is a separate, pre-existing problem.
-        let raw = include_str!("../config/production.toml");
-        let doc: toml::Value = toml::from_str(raw).expect("production.toml must be valid TOML");
-        let storage = doc.get("storage").expect("a [storage] section").clone();
-        let config: StorageConfig = storage.try_into().expect("[storage] must deserialize");
-
-        assert!(config.migration.enabled);
-        assert!(config.migration.dual_write_legacy);
-        assert_eq!(config.migration.shed_hold_hours, 72);
-        assert_eq!(config.migration.copier_throttle_mib_per_sec, 32);
-        assert_eq!(config.migration.copier_slack_mb, 2048);
-        // The release switches are absent from the file on purpose, so they come from the
-        // build rather than from whatever an operator's config last recorded.
-        let build = MigrationConfig::default();
-        assert_eq!(config.migration.retire_legacy, build.retire_legacy);
-    }
 
     #[test]
     fn test_default_config_has_cache_capacity() {

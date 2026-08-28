@@ -1241,53 +1241,6 @@ async fn collect_record_prune_proofs(
     present_by_key
 }
 
-/// Prove that other nodes actually hold `keys`, by cryptographic challenge.
-///
-/// Exposed for the storage migration, which has to answer the same question the pruner
-/// answers before it deletes: is this chunk somewhere else? It deliberately reuses this
-/// path rather than the cheaper `VerificationRequest`, because that one carries a
-/// self-reported `present: bool` and a node that has silently lost a chunk will still say
-/// yes. Here the peer has to return `compute_audit_digest(nonce, peer, key, bytes)` over a
-/// nonce it has never seen, which it cannot do without the bytes.
-///
-/// Returns, per key, the set of peers that proved possession. The caller decides how many
-/// are enough; [`prune_proofs_needed`] is the rule the pruner uses.
-pub(crate) async fn prove_peers_hold_records(
-    keys_by_peer: &HashMap<PeerId, Vec<XorName>>,
-    local_stored_key_count: usize,
-    storage: &Arc<ChunkStore>,
-    p2p_node: &Arc<P2PNode>,
-    config: &ReplicationConfig,
-    sync_state: &Arc<RwLock<NeighborSyncState>>,
-    audit_challenge_coordinator: &Arc<AuditChallengeCoordinator>,
-) -> HashMap<XorName, HashSet<PeerId>> {
-    if keys_by_peer.is_empty() {
-        return HashMap::new();
-    }
-    let candidates: Vec<RecordPruneCandidate> = {
-        let mut by_key: HashMap<XorName, Vec<PeerId>> = HashMap::new();
-        for (peer, keys) in keys_by_peer {
-            for key in keys {
-                by_key.entry(*key).or_default().push(*peer);
-            }
-        }
-        by_key
-            .into_iter()
-            .map(|(key, target_peers)| RecordPruneCandidate { key, target_peers })
-            .collect()
-    };
-    collect_record_prune_proofs(
-        &candidates,
-        local_stored_key_count,
-        storage,
-        p2p_node,
-        config,
-        sync_state,
-        audit_challenge_coordinator,
-    )
-    .await
-}
-
 async fn revalidated_fast_prune_keys(
     candidates: &[FastPruneCandidate],
     ctx: &PrunePassContext<'_>,

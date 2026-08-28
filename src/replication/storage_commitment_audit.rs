@@ -1250,7 +1250,7 @@ pub async fn handle_subtree_challenge(
 pub struct Round1Work {
     /// What to send back.
     pub response: SubtreeAuditResponse,
-    /// Chunk content read from LMDB and hashed BEFORE this response was
+    /// Chunk content read from the store and hashed BEFORE this response was
     /// produced.
     ///
     /// Counted on the rejecting paths too, which is the point. A subtree is read
@@ -1363,7 +1363,7 @@ async fn subtree_challenge_response(
     let mut leaves = Vec::with_capacity(plan.leaf_keys.len());
     for key in &plan.leaf_keys {
         // Charge the fixed cost of ATTEMPTING a leaf before the read, because
-        // it is owed whether or not the read succeeds: the LMDB lookup and its
+        // it is owed whether or not the read succeeds: the lookup and its
         // retries, and the blocking-task round trip below. Charging only
         // content bytes left both a failing leaf and a tiny one nearly free,
         // and nothing bounds a chunk from below, so a commitment of a million
@@ -1603,7 +1603,7 @@ pub async fn handle_subtree_slice_challenge(
     };
 
     // Coalesce openings by key, preserving first-seen order and deduplicating
-    // block indices per key, so each committed chunk is read from LMDB and hashed
+    // block indices per key, so each committed chunk is read from the store and hashed
     // at most once even when the auditor opens several of its blocks (the normal
     // random + final pair, or a forged duplicate). Without this a ten-opening
     // request could re-read and re-hash the same chunk ten times.
@@ -1758,7 +1758,7 @@ async fn serve_committed_key_openings(
         }
         // Persistent transient read error after retries → do NOT brand the peer a
         // deleter. Reject `Transient`; the auditor routes it to the timeout lane
-        // so a flaky LMDB read never manufactures a confirmed possession failure
+        // so a flaky read never manufactures a confirmed possession failure
         // on an honest holder (which also gains no credit).
         Err(e) => {
             warn!(
