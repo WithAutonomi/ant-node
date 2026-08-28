@@ -1143,7 +1143,7 @@ async fn test_paid_list_persistence() {
         dir
     };
 
-    // Shut down the replication engine so the LMDB env is released
+    // Shut down the replication engine so the chunk store is released
     {
         let node = harness.network_mut().node_mut(3).expect("node");
         if let Some(ref mut engine) = node.replication_engine {
@@ -3307,7 +3307,7 @@ async fn scenario_43_paid_list_persists_across_restart() {
         dir
     };
 
-    // Shut down the replication engine so the LMDB env is released
+    // Shut down the replication engine so the chunk store is released
     {
         let node = harness.network_mut().node_mut(3).expect("node");
         if let Some(ref mut engine) = node.replication_engine {

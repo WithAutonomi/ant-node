@@ -20,7 +20,7 @@ use std::time::{Duration, SystemTime};
 use super::TestHarness;
 use ant_node::replication::audit::AuditTickResult;
 use ant_node::replication::{FirstAuditStats, MonetizedPinEvent, ReplicationEngine};
-use ant_node::storage::file_store::CHUNKS_DIR_NAME;
+use ant_node::storage::chunk_store::CHUNKS_DIR_NAME;
 use serial_test::serial;
 use tokio::time::sleep;
 
