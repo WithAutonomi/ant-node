@@ -69,6 +69,18 @@ jobs:
         run: cargo test --test poc_audit_handler_live --features test-utils
       - name: Run bootstrap-stall PoC regression marker
         run: cargo test --test poc_bootstrap_stall --features test-utils
+
+  filesystems:
+    name: Storage on ${{ matrix.fs }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        fs: [ext4, xfs, btrfs]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Install the filesystem tools
         run: sudo apt-get update && sudo apt-get install -y xfsprogs btrfs-progs
       - name: Make a ${{ matrix.fs }} volume and mount it
@@ -104,6 +116,14 @@ jobs:
           cargo test --lib --features test-utils storage:: 2>&1 | tee /tmp/storage.log
           grep -qE 'test result: ok\. [1-9]' /tmp/storage.log \
             || { echo 'the storage tests ran nothing'; exit 1; }
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Build documentation
         run: cargo doc --all-features --no-deps
         env:

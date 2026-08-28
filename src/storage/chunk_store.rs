@@ -441,15 +441,6 @@ impl Drop for Reservation {
 #[cfg(any(test, feature = "test-utils"))]
 pub const HALT_BEFORE_PUBLISH: &str = "ANT_HALT_BEFORE_PUBLISH";
 
-/// Environment variable naming a failpoint: stop once the legacy environment is renamed
-/// aside and marked retired, before any of it is deleted.
-///
-/// The most destructive window in the migration. What a start that finds a marked
-/// directory must do is finish the deletion, never reopen it, because the node has already
-/// told the network it holds those chunks from the file store.
-#[cfg(any(test, feature = "test-utils"))]
-pub const HALT_AFTER_RETIRE_MARK: &str = "ANT_HALT_AFTER_RETIRE_MARK";
-
 /// Park forever at a named failpoint, once a marker says the process has reached it.
 ///
 /// For crash tests, which need a process to die *inside* an operation rather than at

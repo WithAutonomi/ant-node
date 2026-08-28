@@ -1467,6 +1467,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn the_unheld_chunk_penalty_switch_follows_the_release_it_is_compiled_into() {
         // A build that never applies the policy still behaves like THIS release, not the
         // previous one. `ReplicationEngine::new` is public and is constructed directly by

@@ -2331,9 +2331,10 @@ impl ReplicationEngine {
         // waiter does not cancel `spawn_blocking`, and would let shutdown return
         // while a blocking storage operation is still running.
         //
-        // Deliberately unbounded: the LMDB contract requires every worker to
-        // release its `Arc<ChunkStore>` before the caller may reopen the
-        // environment, and a timeout here could return with one still held.
+        // Deliberately unbounded: every worker has to release its
+        // `Arc<ChunkStore>` before the caller may reopen the store, whose lock
+        // admits one process at a time, and a timeout here could return with one
+        // still held.
         // What makes that safe is that every detached task is now guaranteed to
         // finish — the pools above are closed, stale work is shed at dequeue,
         // and the one genuinely unbounded await (payment verification) races
@@ -3335,7 +3336,7 @@ impl ReplicationEngine {
     ///
     /// Phase 3 of the v12 storage-bound audit. Once per
     /// [`COMMITMENT_ROTATION_INTERVAL_SECS`], the responder reads the
-    /// current LMDB key set, builds a Merkle tree (for content-addressed
+    /// current key set, builds a Merkle tree (for content-addressed
     /// chunks `bytes_hash == key`, so no chunk re-read is needed), signs
     /// the root with the node's `MlDsaSecretKey`, and rotates the result
     /// into `commitment_state`. Old `previous` slot is dropped by the
@@ -6995,9 +6996,9 @@ fn request_is_stale(received_at: Instant, timeout: Duration) -> bool {
 enum FetchFault {
     /// The peer does not hold a chunk it was expected to hold.
     ///
-    /// This is the lane the release withholds, because a node part-way through moving
-    /// off the legacy store answers exactly this way about chunks it has legitimately
-    /// given up.
+    /// This was the lane the migration releases withheld, because a node part-way through
+    /// moving off the old store answered exactly this way about chunks it had legitimately
+    /// given up. That is over, and it is penalised again.
     UnheldChunk,
     /// The peer's own storage failed, or served bytes that no longer hash to their
     /// address.

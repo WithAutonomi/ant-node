@@ -106,10 +106,11 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
-        // One release-level decision, applied before anything can audit: while the fleet
-        // moves off the legacy chunk store, a peer is not penalised for failing to hold a
-        // chunk it was supposed to be holding. It is still penalised for failing a
-        // commitment-bound audit. Audits of both kinds run and record throughout.
+        // One release-level decision, applied before anything can audit. It was suspended
+        // for two releases while the fleet moved off the old chunk store, because a node
+        // that has to give chunks up cannot stop its peers punishing it for that. This
+        // release restores it, so a peer is penalised again for failing to hold a chunk it
+        // was supposed to be holding. The commitment-bound audit penalised throughout.
         crate::replication::config::apply_close_group_storage_penalty_policy();
 
         // Create shutdown token
@@ -137,6 +138,13 @@ impl NodeBuilder {
         };
 
         let repl_config = ReplicationConfig::default();
+
+        // Before anything is built, and whether or not this node is going to open a store.
+        // The store's own constructor checks too, but a node with `storage.enabled = false`
+        // never reaches it, and "turn storage off" is not consent to run beside chunks this
+        // build cannot read while the commitment that claims them is still live.
+        crate::storage::legacy_artifacts::refuse_if_unmigrated(&self.config.root_dir)
+            .map_err(|e| Error::Startup(e.to_string()))?;
 
         // Initialize ANT protocol handler for chunk storage and
         // wire the fresh-write channel so PUTs trigger replication.
@@ -734,6 +742,17 @@ impl RunningNode {
         // The main event loop, with signal handling. Everything above this starts
         // something; this is where the node waits.
         self.run_event_loop().await?;
+
+        // Protocol routing stops first, loop and children both. The routing loop waits on
+        // `events.recv()` and has no cancellation branch of its own, and it holds an `Arc`
+        // on the P2P node that keeps the sender it is waiting on alive, so nothing else
+        // here will ever wake it. Left running it holds the chunk store and its
+        // single-process lock open after the node has returned. Aborting the accept loop
+        // alone is not enough either: the requests already in flight run in their own
+        // tasks, which is what the drain below is for.
+        if let Some(handle) = self.protocol_task.take() {
+            handle.abort();
+        }
         // Cancelled first, so anything still queued behind the concurrency permits gives
         // up rather than starting fresh storage work, then given a moment to finish what
         // is genuinely in flight.
@@ -1006,14 +1025,9 @@ mod tests {
         }
     }
 
-    /// A real, fully built node with a legacy store is actually migrating it.
-    ///
-    /// This goes through `build()` rather than calling the spawn helper, because the
-    /// failure that already happened here was the *call site* going missing, not the
-    /// helper being wrong. A test of the helper alone stays green through exactly that
-    /// A node with nothing to migrate does not start a driver for it.
+    /// A node builds on a root with nothing left over from the old store.
     #[tokio::test]
-    async fn a_built_node_without_a_legacy_store_starts_no_migration() {
+    async fn a_node_builds_on_a_clean_root() {
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("node");
         std::fs::create_dir_all(&root).expect("mkdir");
@@ -1041,6 +1055,51 @@ mod tests {
         };
 
         node.shutdown.cancel();
+    }
+
+    /// A node with chunks in a store this build cannot read does not start, however it is
+    /// configured.
+    ///
+    /// Both ways, because they are different code paths and only one of them was covered.
+    /// The store's own constructor asks the question, but a node with `storage.enabled =
+    /// false` never builds a store and so never reaches it. Turning storage off is not
+    /// consent to run beside chunks that this node's own published commitment still claims
+    /// and that this build cannot read, so the question is asked before anything is built.
+    ///
+    /// Goes through `build()` rather than the check directly. The failure worth catching
+    /// here is the call site going missing, which is what happened: the check existed and
+    /// one of the two routes into the node walked straight past it.
+    #[tokio::test]
+    async fn a_node_with_an_unmigrated_store_refuses_to_build_however_it_is_configured() {
+        for storage_enabled in [true, false] {
+            let dir = TempDir::new().expect("temp dir");
+            let root = dir.path().join("node");
+            let env = root.join(crate::storage::LEGACY_ENV_DIR);
+            std::fs::create_dir_all(&env).expect("mkdir");
+            std::fs::write(env.join("data.mdb"), b"chunks that were never copied out")
+                .expect("seed");
+
+            let port = rand::thread_rng().gen_range(TEST_PORT_RANGE);
+            let mut config = local_node_config(&root, port);
+            config.storage.enabled = storage_enabled;
+
+            let err = NodeBuilder::new(config)
+                .build()
+                .await
+                .err()
+                .unwrap_or_else(|| {
+                    panic!(
+                        "a node with an unmigrated store built with storage.enabled = \
+                         {storage_enabled}"
+                    )
+                });
+            let said = err.to_string();
+            assert!(
+                said.contains("chunks.mdb"),
+                "the refusal must name the directory (storage.enabled = {storage_enabled}): \
+                 {said}"
+            );
+        }
     }
     use super::*;
     use crate::config::NODES_SUBDIR;
