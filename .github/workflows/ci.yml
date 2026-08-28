@@ -50,6 +50,13 @@ jobs:
           version: ${{ env.FOUNDRY_VERSION }}
       - name: Run unit tests
         run: cargo test --lib --features test-utils
+      - name: Kill a node mid-write and check what survived
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --test chunk_store_crash_safety --features test-utils -- --test-threads=1 2>&1 | tee /tmp/crash_safety.log
+          grep -qE 'test result: ok\. [1-9]' /tmp/crash_safety.log \
+            || { echo 'chunk_store_crash_safety ran no tests'; exit 1; }
       - name: Startup scan, index memory and inode cost at scale
         if: runner.os == 'Linux'
         shell: bash
@@ -143,7 +150,8 @@ jobs:
       - name: Build release (no logging)
         run: cargo build --release --no-default-features
       # The crash harness drives the store through a failpoint that parks the process
-      # forever on an environment variable. It is compiled only under `test-utils`, which
+      # forever on an environment variable, and the store's own tests use the same one. It
+      # is compiled only under `test-utils`, which
       # is not a default feature and is not passed by the release workflow, so a shipped
       # binary does not contain it. This proves that rather than trusting it: the variable
       # name is a string literal, so it survives into the binary whenever the code that

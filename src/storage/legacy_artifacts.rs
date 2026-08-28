@@ -7,7 +7,7 @@
 //!
 //! Starting anyway is the tempting answer and it is the wrong one. Those chunks are
 //! unreachable, but the commitment the node published before the upgrade claimed them, and
-//! a commitment is good to its neighbours for hours. The one accusation the migration
+//! a commitment stays answerable to its neighbours for three hours. The one accusation the migration
 //! releases suspended was "you did not have a chunk you were supposed to hold"; the
 //! commitment-bound audit was never suspended in any release, precisely because it rests
 //! on a signed claim. So a node that starts half-migrated spends those hours failing audits

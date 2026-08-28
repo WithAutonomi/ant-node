@@ -45,8 +45,9 @@ arguing.
 
 The tempting answer is to start anyway, serve what is in the file store, and warn. It is
 wrong. The chunks in that environment are unreachable to this build, but the commitment this
-node published before the upgrade *claimed* them, and a commitment is good to its neighbours
-for two hours. The accusation the first release suspended was "you did not have a chunk you
+node published before the upgrade *claimed* them, and a commitment stays answerable to its
+neighbours for three hours (`GOSSIP_ANSWERABILITY_TTL`, which is `(RETAINED_GOSSIPED_
+COMMITMENTS + 1)` rotations). The accusation the first release suspended was "you did not have a chunk you
 were supposed to hold". The commitment-bound subtree audit was never suspended in any
 release, precisely because it rests on a signed claim. So a node that starts half-migrated
 spends hours failing audits, at the full weight, on the one lane that always counted. It is
@@ -142,10 +143,18 @@ else about the directory keeps working, which is a state any user can reach and 
 skip. Restoring the penalty is pinned by a test that fails if the constant is flipped back.
 
 **Deleted, and what replaced it.** ADR-0014's validation section describes four harnesses.
-Three of them existed to prove the bridge worked: that the disk came back when the old store
-was deleted, that a node killed mid-copy lost nothing, and that several nodes on one disk
-took turns. There is no bridge left for them to test, so they go with it. The fourth, which
-measures what one file per chunk costs at scale, stays.
+Most of three of them existed to prove the bridge worked: that the disk came back when the
+old store was deleted, that a node killed mid-copy lost nothing, and that several nodes on
+one disk took turns. There is no bridge left for those to test. The fourth, which measures
+what one file per chunk costs at scale, stays.
+
+Not all of it went, and saying it did was wrong. Two tests inside the crash harness were
+never about the bridge: that a process killed mid-publish leaves no chunk the store cannot
+serve, and that what an interrupted write leaves behind is swept. Those are about the store's
+own publish path, which is now the only one there is, so they matter more after this release
+rather than less. They are back as `tests/chunk_store_crash_safety.rs` and run in CI. A third
+property, that engine shutdown waits for a detached store write, is named under the gaps
+below.
 
 That leaves the loopback filesystem job with nothing to run, and deleting it would quietly
 drop ext4, XFS and btrfs coverage of the store itself. It now runs the storage unit tests
@@ -157,6 +166,13 @@ from the names.
 Scale at one and ten million keys. How many short-of-disk nodes can clear the possession
 gate, which this decision makes sharper: under ADR-0014 such a node kept serving from both
 stores, and under this one it does not start.
+
+**Coverage this release drops, named rather than lost.** A harness proved that
+`ReplicationEngine::shutdown()` waits for a store write whose awaiter was dropped before it
+returns. It was written against the old store and went with it. The property is still
+current and still claimed by that method's own documentation, and nothing tests it now. It
+needs a live P2P node to stage, which is why it is called out here rather than quietly
+rewritten in the same change that deleted it.
 
 **A fleet gate this decision adds.** Before this ships, the fleet has to show that nodes are
 actually on the file store. The count that answers it is nodes reporting a completed
