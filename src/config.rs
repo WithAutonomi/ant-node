@@ -603,7 +603,10 @@ mod tests {
     /// attribute later would look harmless and would take down the fleet.
     #[test]
     fn a_config_file_from_the_previous_release_still_loads() {
-        let previous = r"
+        let previous = r#"
+[network]
+port = 10000
+
 [storage]
 enabled = true
 verify_on_read = true
@@ -616,20 +619,23 @@ wave_hours = 24
 copier_throttle_mib_per_sec = 32
 copier_slack_mb = 2048
 retire_delay_hours = 4
-";
-        let whole: toml::Value =
-            toml::from_str(previous).expect("the fixture itself must be valid TOML");
-        let parsed: StorageConfig = whole
-            .get("storage")
-            .cloned()
-            .expect("the fixture has a storage table")
-            .try_into()
-            .expect("a config file from the previous release must still parse");
 
-        assert!(parsed.enabled);
-        assert!(parsed.verify_on_read);
+[payment]
+rewards_address = "0x0000000000000000000000000000000000000001"
+"#;
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, previous).expect("write the previous release's config");
+
+        // Through the loader a node actually uses, not a hand-picked table. The whole file
+        // has to parse, because that is what a node does with it on start.
+        let parsed = NodeConfig::from_file(&path)
+            .expect("a config file from the previous release must still load");
+
+        assert!(parsed.storage.enabled);
+        assert!(parsed.storage.verify_on_read);
         assert_eq!(
-            parsed.disk_reserve_mb, 500,
+            parsed.storage.disk_reserve_mb, 500,
             "the settings this build still uses must survive the ones it dropped"
         );
     }
