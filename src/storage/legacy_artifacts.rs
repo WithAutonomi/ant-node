@@ -101,13 +101,20 @@ fn legacy_directories(root_dir: &Path) -> Result<Vec<PathBuf>> {
     // The same for the tombstones. A directory that cannot be listed hides every one of
     // them, and a single unreadable entry inside it hides that one.
     let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
-    let entries = std::fs::read_dir(root_dir).map_err(|e| {
-        Error::Storage(format!(
-            "Cannot list {} ({e}), so this node cannot tell what the storage migration left \
-             behind. Refusing to start rather than assume it left nothing.",
-            root_dir.display()
-        ))
-    })?;
+    let entries = match std::fs::read_dir(root_dir) {
+        Ok(entries) => entries,
+        // A root that is not there yet holds nothing, which is every node starting for the
+        // first time and every test that names a directory before creating it. That is an
+        // answer, not a failure to get one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(e) => {
+            return Err(Error::Storage(format!(
+                "Cannot list {} ({e}), so this node cannot tell what the storage migration \
+                 left behind. Refusing to start rather than assume it left nothing.",
+                root_dir.display()
+            )))
+        }
+    };
     for entry in entries {
         let entry = entry.map_err(|e| {
             Error::Storage(format!(
@@ -191,6 +198,19 @@ mod tests {
     fn a_node_with_no_leftovers_starts() {
         let dir = TempDir::new().expect("temp dir");
         assert!(refuse_if_unmigrated(dir.path()).is_ok());
+    }
+
+    /// A node whose root does not exist yet starts.
+    ///
+    /// Every node starting for the first time, and every caller that names a directory
+    /// before creating it. Reading a missing root fails, and treating that failure the way
+    /// the unreadable cases are treated would refuse every fresh node on the network. A
+    /// root that is not there holds nothing, which is an answer.
+    #[test]
+    fn a_root_that_does_not_exist_yet_is_not_a_refusal() {
+        let dir = TempDir::new().expect("temp dir");
+        let never_created = dir.path().join("node").join("deeper");
+        assert!(refuse_if_unmigrated(&never_created).is_ok());
     }
 
     /// A directory that says it was retired is not a reason to stay down.
