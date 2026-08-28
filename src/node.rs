@@ -758,6 +758,11 @@ impl RunningNode {
         // tasks, which is what the drain below is for.
         if let Some(handle) = self.protocol_task.take() {
             handle.abort();
+            // Awaited, not just asked to stop. `abort` schedules cancellation; it does not
+            // establish that the task is gone, and what matters here is that it has
+            // dropped its `Arc` on the protocol and with it the store's single-process
+            // lock before this function returns. The join resolves as cancelled.
+            let _ = handle.await;
         }
         // Cancelled first, so anything still queued behind the concurrency permits gives
         // up rather than starting fresh storage work, then given a moment to finish what

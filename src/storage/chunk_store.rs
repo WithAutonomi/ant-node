@@ -775,6 +775,13 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the content does not hash to `address`, the disk
     /// is too full, or the write fails.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        // The key's whole transition, not just the part that touches the disk. Registering
+        // the write is what a delete waits for, and everything before that registration
+        // happens outside it: validation, the duplicate read, the capacity reservation. A
+        // put that got that far before a delete arrived would otherwise be invisible to the
+        // delete's wait, register while the delete was already committed to going ahead,
+        // and publish afterwards. The node would then hold a chunk it had decided to prune.
+        let _lane = self.key_lock(address).await;
         let computed = crate::client::compute_address(content);
         if computed != *address {
             return Err(Error::Storage(format!(
@@ -974,7 +981,9 @@ impl ChunkStore {
                      replacing it with the copy just offered",
                     hex::encode(address)
                 );
-                self.repair(address, content).await.map(|()| true)
+                self.repair_holding_the_lane(address, content)
+                    .await
+                    .map(|()| true)
             }
             // The name was taken a moment ago and is not now, or was never a
             // readable chunk file. Either way nothing holds these bytes, so say so
@@ -1034,9 +1043,16 @@ impl ChunkStore {
     /// and not replaced either: the offer goes through the ordinary write path instead,
     /// which never truncates a healthy file on the strength of an unanswered question.
     pub async fn holds_verified(&self, address: &XorName, content: &[u8]) -> bool {
-        // The key's critical section for the whole check. Without it a prune can remove
-        // the file between the read below and this method's answer, and the caller is told
-        // the chunk is already held while the good copy it was offering is discarded.
+        // The key's critical section for the whole check, so the answer is a linearizable
+        // statement about the store: at the moment this returns, the chunk was held and its
+        // bytes were these.
+        //
+        // It does not follow the answer out to the caller. The handler turns a `true` into
+        // an `AlreadyExists` and sends it afterwards, outside this lock, so a prune landing
+        // in between still means a peer is told to drop a copy of a chunk this node no
+        // longer has. Closing that would mean holding a per-key lock across a network
+        // response, which trades a narrow window for a much worse one. Replication finds
+        // the key missing and re-offers it.
         let _lane = self.key_lock(address).await;
 
         if !self.is_indexed(address) {
@@ -1063,7 +1079,7 @@ impl ChunkStore {
                 // can fail for capacity or I/O, and a chunk proven wrong that goes on
                 // looking healthy is one the node keeps answering for.
                 self.note_known_wrong(address);
-                self.repair(address, content).await.is_ok()
+                self.repair_holding_the_lane(address, content).await.is_ok()
             }
             // Unanswerable this time. Not claimed as held, so the offer goes through the
             // ordinary path, which writes it rather than replacing anything.
@@ -1128,7 +1144,11 @@ impl ChunkStore {
                      copy just offered",
                     hex::encode(address)
                 );
-                Some(self.repair(address, content).await.map(|()| true))
+                Some(
+                    self.repair_holding_the_lane(address, content)
+                        .await
+                        .map(|()| true),
+                )
             }
             // Indexed but gone: publish it fresh rather than replacing something that is
             // not there.
@@ -1196,6 +1216,16 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if `content` does not hash to `address`, or the write
     /// fails. The old file is left untouched on every error path.
     pub async fn repair(&self, address: &XorName, content: &[u8]) -> Result<()> {
+        let _lane = self.key_lock(address).await;
+        self.repair_holding_the_lane(address, content).await
+    }
+
+    /// The body of [`Self::repair`], for callers that already hold the key's lane.
+    ///
+    /// Split because the lane is a `tokio::sync::Mutex` and so is not reentrant: every
+    /// internal caller reaches this while holding it, and taking it again would deadlock
+    /// the task on itself.
+    async fn repair_holding_the_lane(&self, address: &XorName, content: &[u8]) -> Result<()> {
         // The same ceiling `put` enforces. Without it a repair can install bytes the read
         // path will refuse for ever, which is a chunk that verifies as present and can
         // never be served.
@@ -2635,10 +2665,20 @@ fn write_and_replace(
     // durable under a documented contract.
     //
     // The cost is that this is not atomic: a crash part-way leaves the file holding a mix
-    // of old and new bytes. That is safe here and only here, because the only caller that
-    // matters runs before the legacy store is deleted, and a crash means no report was
-    // produced and nothing was deleted. The next start re-reads the file, sees it does not
-    // match its address, and repairs it again from the store that is still there.
+    // of old and new bytes.
+    //
+    // That used to be justified by the legacy store still being there to repair from, which
+    // it no longer is. The argument now is narrower and does not depend on a second copy:
+    // every caller reaches this only after a read has proven the bytes under that name
+    // wrong. A crash part-way therefore leaves wrong bytes where wrong bytes already were,
+    // which is not a loss, and the next verified read finds them and repairs again. What it
+    // is NOT safe for is replacing bytes that were good, so this must not be reached on any
+    // path that has not established otherwise: today those are the three `StoredBytes::
+    // Wrong` arms.
+    //
+    // A temporary and a rename would make it atomic, at the cost of a directory entry
+    // change that cannot be flushed here. That trade is worth revisiting on a platform
+    // where it can actually be tested; it is not worth making blind.
     #[cfg(not(unix))]
     {
         let _ = temp_path;
@@ -3272,6 +3312,56 @@ mod tests {
 
         let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
         assert_eq!(raw, b"tampered");
+    }
+
+    /// A put that started before a delete does not land after it.
+    ///
+    /// The narrower ordering, and the one waiting for registered writes does not cover. A
+    /// put does a lot before it registers itself: it checks the address, reads to see
+    /// whether the name is taken, and reserves capacity. A delete arriving in that window
+    /// sees nothing registered, waits for nothing, and goes ahead; the put registers and
+    /// publishes afterwards, and the node keeps a chunk it decided to prune.
+    ///
+    /// Staged by holding the delete's own lane so the put is guaranteed to be mid-flight
+    /// and unregistered when the delete starts. What closes it is the put taking the key's
+    /// lane for its whole transition rather than only for the part that touches disk.
+    #[tokio::test]
+    async fn a_put_that_started_before_a_delete_does_not_land_after_it() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(reopen(&dir).await);
+        let content = b"a chunk the pruner has decided to drop".to_vec();
+        let addr = crate::client::compute_address(&content);
+
+        // Already stored, so the delete has something to remove.
+        store.put(&addr, &content).await.expect("seed");
+        store.wait_idle().await;
+
+        // A put and a delete issued together for the same key. Whatever the interleaving,
+        // the delete is the later decision and must win: the alternative is a node that
+        // keeps a chunk its pruner has already given up.
+        let writing = {
+            let store = Arc::clone(&store);
+            let content = content.clone();
+            tokio::spawn(async move { store.put(&addr, &content).await })
+        };
+        let deleting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.delete(&addr).await })
+        };
+        let _ = writing.await.expect("the put task must not panic");
+        let _ = deleting.await.expect("the delete task must not panic");
+        store.wait_idle().await;
+
+        // Serialised by the lane, so the outcome is one of the two orderings and never a
+        // mixture: either the put went first and the delete removed it, or the delete went
+        // first and the put stored it again. What must never happen is the index and the
+        // disk disagreeing about which.
+        assert_eq!(
+            store.is_indexed(&addr),
+            store.chunk_path(&addr).exists(),
+            "the index and the disk disagree about {} after a concurrent put and delete",
+            hex::encode(addr)
+        );
     }
 
     /// A delete outlasts a write nobody waited for.

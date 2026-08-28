@@ -135,6 +135,13 @@ name = "storage_scale"
 path = "tests/storage_scale.rs"
 required-features = ["test-utils"]
 
+# A process killed part-way through a write: the store is whole or absent, never
+# half-indexed, and what the interrupted write left behind is swept.
+[[test]]
+name = "chunk_store_crash_safety"
+path = "tests/chunk_store_crash_safety.rs"
+required-features = ["test-utils"]
+
 # E2E test infrastructure (run with --features test-utils)
 [[test]]
 name = "e2e"
