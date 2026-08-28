@@ -2053,21 +2053,6 @@ fn decode_chunk_name(name: &str) -> Option<XorName> {
     XorName::try_from(bytes.as_slice()).ok()
 }
 
-/// Flush a directory and report whether it worked, for callers outside this module.
-///
-/// For the one caller whose next step is destructive: retirement moves the legacy
-/// environment aside and then deletes it under its new name, so if the rename has not
-/// reached the disk when the delete lands, a power loss brings the environment back under
-/// its old name with its contents gone.
-///
-/// # Errors
-///
-/// Returns the underlying I/O error. Off Unix there is no way to flush a directory through
-/// the standard library, so this reports success without being able to promise anything.
-pub fn fsync_path(path: &Path) -> std::io::Result<()> {
-    fsync_dir(path)
-}
-
 /// Flush a directory so a rename or creation inside it survives power loss.
 ///
 /// Best effort by design. Linux and XFS require it, macOS accepts it with undocumented
@@ -2141,15 +2126,6 @@ fn check_path_budget(chunks_dir: &Path) {
 /// No-op where path length is not a practical constraint.
 #[cfg(not(windows))]
 fn check_path_budget(_chunks_dir: &Path) {}
-
-/// Write `bytes` to `path` durably, for small metadata files outside the shard tree.
-///
-/// # Errors
-///
-/// Returns [`Error::Storage`] if the file cannot be written or published.
-pub fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
-    write_file_atomic(path, bytes)
-}
 
 /// Write `bytes` to `path` so a reader sees either the old content or the new.
 /// Is this the exact name [`write_file_atomic`] gives its temporaries?
