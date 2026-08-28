@@ -93,9 +93,13 @@ leaves an intact environment wearing a retired-looking name; the previous releas
 restored and reopened it, and this one cannot, so it must not be waved through on the
 strength of what it is called.
 
-Nothing is deleted. This build has no migration code, so it has no business deciding that a
-directory it cannot read is safe to remove, and leaving it is what keeps a rollback to the
-previous release possible.
+Nothing of the old store is deleted. This build has no migration code, so it has no business
+deciding that a directory it cannot read is safe to remove, and leaving it is what keeps a
+rollback to the previous release possible. To be exact about what "nothing" covers: this
+release does not migrate, delete, rename or rewrite `chunks.mdb`, does not rewrite the
+migration marker, and does not change the file-store layout. It still does everything a node
+normally does to its own chunks, and opening the store still creates the store's own files
+and sweeps orphaned temporaries, as the previous release did.
 
 ## Consequences
 
@@ -135,9 +139,12 @@ previous release possible.
 
 ## Validation
 
-**Proved here.** A node with no leftovers starts; one with a retired leftover starts and
-says so; one with an unretired environment refuses; one with an unretired tombstone refuses;
-one whose mark cannot be read refuses and says which. The unreadable case is staged with a
+**Proved here.** A node with no leftovers starts; one with a retired leftover starts; one
+with an empty leftover starts; one whose root does not exist yet starts. One with an
+unretired environment refuses, and the test reads the message to check it names the
+directory; one with an unretired tombstone refuses; one whose mark cannot be read refuses
+with a message that says so; one whose root cannot be listed refuses. The warnings the
+starting cases emit are not asserted, only the refusals' messages are. The unreadable case is staged with a
 symbolic link pointing at itself, so looking for the mark returns a loop while everything
 else about the directory keeps working, which is a state any user can reach and root cannot
 skip. Restoring the penalty is pinned by a test that fails if the constant is flipped back.

@@ -110,10 +110,11 @@ jobs:
       #
       # These used to be the migration harnesses. The migration is gone, and what is left
       # worth asking of a filesystem is what the store itself does on it: publish a chunk
-      # through a temporary and a rename, flush the directory, delete and have the space
-      # come back, and rebuild an index from the names afterwards. The storage tests do all
-      # of that, and running them here is what keeps ext4, XFS and btrfs covered now that
-      # the harnesses that used to cover them have been deleted.
+      # through a temporary and a rename, flush the directory, unlink it again, and rebuild
+      # an index from the names afterwards. The storage tests do all of that, and running
+      # them here is what keeps ext4, XFS and btrfs covered now that the harnesses that used
+      # to cover them have been deleted. They do not measure free space before and after;
+      # the harness that did was about the migration and went with it.
       - name: Storage behaviour on ${{ matrix.fs }}
         env:
           TMPDIR: /mnt/antfs
