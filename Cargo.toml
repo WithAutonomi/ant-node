@@ -53,7 +53,8 @@ xor_name = "5"
 lru = "0.16.3"
 parking_lot = "0.12"  # Efficient mutex for cache
 
-# Storage - LMDB via heed for content-addressed chunk store
+# LMDB via heed for the paid-key list. The chunk store is one file per chunk and does
+# not use it.
 heed = "0.22"
 
 blake3 = "1"
@@ -129,32 +130,11 @@ proptest = "1"
 alloy = { version = "1", features = ["node-bindings"] }
 serial_test = "3"
 
-# Proves the migration returns disk to the filesystem, which is the claim the whole
-# change exists to make good. Needs the test-only migration-state accessor.
-[[test]]
-name = "migration_reclaims_disk"
-path = "tests/migration_reclaims_disk.rs"
-required-features = ["test-utils"]
-
-# Kills a real child process part-way through writing and migrating, then checks what
-# survived. The automatable half of the power-loss gate.
-[[test]]
-name = "migration_crash_safety"
-path = "tests/migration_crash_safety.rs"
-required-features = ["test-utils"]
-
 # Startup scan time, index memory and inode cost at scale. Regression gates, not
 # benchmarks; ANT_SCALE_KEYS raises the count for a deliberate larger run.
 [[test]]
 name = "storage_scale"
 path = "tests/storage_scale.rs"
-required-features = ["test-utils"]
-
-# Several nodes migrating on one disk: the volume lock, and that each finishes with its
-# own chunks and only its own.
-[[test]]
-name = "migration_shared_volume"
-path = "tests/migration_shared_volume.rs"
 required-features = ["test-utils"]
 
 # E2E test infrastructure (run with --features test-utils)
@@ -192,14 +172,6 @@ required-features = ["test-utils"]
 [[test]]
 name = "poc_price_floor_live"
 path = "tests/poc_price_floor_live.rs"
-required-features = ["test-utils"]
-
-# Shutdown/LMDB-drain regression: `ReplicationEngine::shutdown()` must not
-# return while a detached LMDB blocking op is still running. Uses the
-# test-only storage put gate, so it requires the test-utils feature.
-[[test]]
-name = "poc_shutdown_lmdb_drain"
-path = "tests/poc_shutdown_lmdb_drain.rs"
 required-features = ["test-utils"]
 
 [features]

@@ -24,7 +24,7 @@
     clippy::cast_possible_truncation
 )]
 
-use ant_node::storage::{FileStore, FileStoreConfig};
+use ant_node::storage::{ChunkStore, ChunkStoreConfig};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -149,7 +149,7 @@ async fn opening_a_large_store_stays_quick() {
 
     let before = resident_bytes();
     let opening = Instant::now();
-    let store = FileStore::new(FileStoreConfig {
+    let store = ChunkStore::new(ChunkStoreConfig {
         root_dir: root.clone(),
         verify_on_read: true,
         disk_reserve: 0,
@@ -229,7 +229,7 @@ async fn opening_a_large_store_stays_quick() {
 /// Open a store at `root`, time the scan, and close it again.
 async fn time_a_scan(root: &Path) -> Duration {
     let started = Instant::now();
-    let store = FileStore::new(FileStoreConfig {
+    let store = ChunkStore::new(ChunkStoreConfig {
         root_dir: root.to_path_buf(),
         verify_on_read: true,
         disk_reserve: 0,
@@ -328,7 +328,7 @@ async fn child_reports_index_memory() {
     let keys = key_count();
 
     let before = resident_bytes().expect("linux reports this");
-    let store = FileStore::new(FileStoreConfig {
+    let store = ChunkStore::new(ChunkStoreConfig {
         root_dir: root,
         verify_on_read: true,
         disk_reserve: 0,
@@ -360,7 +360,7 @@ async fn each_chunk_the_store_writes_costs_one_directory_entry() {
     let root = tmp.path().join("node");
     std::fs::create_dir_all(&root).expect("mkdir");
 
-    let store = FileStore::new(FileStoreConfig {
+    let store = ChunkStore::new(ChunkStoreConfig {
         root_dir: root.clone(),
         verify_on_read: true,
         disk_reserve: 0,
@@ -415,7 +415,7 @@ fn count_entries(path: &Path) -> Entries {
             // layout marker, and the lock that keeps a second process out. Both are
             // fixed, so neither grows with the store.
             Ok(_)
-                if entry.file_name() == ant_node::storage::file_store::LAYOUT_FILE_NAME
+                if entry.file_name() == ant_node::storage::chunk_store::LAYOUT_FILE_NAME
                     || entry.file_name() == ".lock" => {}
             Ok(_) => counted.files += 1,
             Err(_) => {}
@@ -447,7 +447,7 @@ async fn the_startup_scan_does_not_read_chunk_contents() {
     plant_sized(&root.join("chunks"), keys, chunk);
 
     let before = bytes_read().expect("linux reports this");
-    let store = FileStore::new(FileStoreConfig {
+    let store = ChunkStore::new(ChunkStoreConfig {
         root_dir: root.clone(),
         verify_on_read: true,
         disk_reserve: 0,

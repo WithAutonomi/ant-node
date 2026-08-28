@@ -1,111 +1,203 @@
-//! The node's chunk store: a file store, plus the legacy LMDB environment for as long
-//! as one still exists on disk.
+//! One immutable file per chunk, content-addressed, with the filesystem as the
+//! only authority.
 //!
-//! Every caller in the node talks to this type and sees **one** key set. That is the
-//! detail that keeps quoting, commitments, hints, audits and pruning coherent while a
-//! chunk moves from LMDB to a file: the backing changes, the logical key set does not.
+//! ```text
+//! {root}/chunks/                     store root
+//! {root}/chunks/layout.json          versioned layout marker
+//! {root}/chunks/.lock                advisory single-process guard
+//! {root}/chunks/<xy>/<64-hex>        xy = the LAST two hex characters of the address
+//! {root}/chunks/<xy>/.tmp.<pid>.<n>  an in-flight write, in the destination directory
+//! ```
 //!
-//! There is one deliberate asymmetry, and it is the whole safety argument of the
-//! migration. Serving reads the **union**, so the node answers for everything it ever
-//! committed to. The commitment builder reads only the **file-backed** set once the node
-//! has settled on what it will keep, so the node stops claiming keys it is about to give
-//! up. Between those two, a node is at worst over-honest: it serves more than it claims.
+//! # Why the *last* two hex characters
+//!
+//! A node holds keys for which it is among the [`CLOSE_GROUP_SIZE`] closest, so its
+//! holdings share roughly `log2(N / CLOSE_GROUP_SIZE)` leading bits with its own node
+//! ID, and that shared prefix grows as the network grows. Sharding on a prefix therefore
+//! does not degrade, it collapses: at ~800 nodes a two-hex prefix already resolves to
+//! about two distinct directories, and past a million nodes even a four-hex prefix
+//! resolves to one. Close-group membership constrains the leading bits and places no
+//! constraint at all on the trailing ones, and the address is a BLAKE3 output, so the
+//! last byte is uniform by construction at every network size.
+//!
+//! 256 shards keeps a 24 GiB node at ~23 files per directory and a 1 TiB node at ~977,
+//! for 1 MiB of directory inodes. The scheme and depth are recorded in `layout.json` at
+//! creation so a future layout can be detected rather than silently misread.
+//!
+//! # Why lowercase hex names
+//!
+//! NTFS and default APFS fold case. Under an encoding with both cases (base64url,
+//! base58) two distinct 32-byte keys can share one case-folded filename, which is a
+//! silent overwrite. Hex has one case-folded form per key, and no hex string can ever
+//! spell a reserved Windows device name (`CON`, `NUL`, `AUX`, `COM1`, ...) because none
+//! of those letters is in `0-9a-f`. The full 64-character key stays in the filename, so
+//! a `find` over the tree recovers the whole store even if the directory layer is lost.
+//!
+//! [`CLOSE_GROUP_SIZE`]: crate::ant_protocol::CLOSE_GROUP_SIZE
 
-use crate::ant_protocol::XorName;
+use crate::ant_protocol::{XorName, MAX_CHUNK_SIZE, XORNAME_LEN};
 use crate::error::{Error, Result};
-use crate::logging::{debug, error, info, warn};
-use crate::storage::file_store::{FileStore, FileStoreConfig};
-use crate::storage::lmdb::{LmdbStorage, LmdbStorageConfig};
-use crate::storage::migration::{
-    CopyReport, MigrationConfig, MigrationPhase, MigrationState, REQUIRED_REBUILDS_BEFORE_RETIRE,
-};
+use crate::logging::{debug, info, trace, warn};
 use crate::storage::StorageStats;
-use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio_util::sync::CancellationToken;
+use std::time::{Duration, Instant};
+use tokio::task::spawn_blocking;
+use tokio_util::task::TaskTracker;
 
-/// Directory name of the legacy LMDB environment, under the node root.
-pub const LEGACY_ENV_DIR: &str = "chunks.mdb";
+/// Directory under the node root that holds the chunk files.
+pub const CHUNKS_DIR_NAME: &str = "chunks";
 
-/// Suffix for a legacy environment that has been retired but not yet deleted.
-pub const RETIRED_SUFFIX: &str = ".retired";
+/// Name of the layout marker written once at store creation.
+pub const LAYOUT_FILE_NAME: &str = "layout.json";
 
-/// Written inside a chunk environment directory once it has been retired.
+/// Name of the advisory single-process lock file.
+const LOCK_FILE_NAME: &str = ".lock";
+
+/// Prefix that marks an in-flight write. Never a valid chunk name (chunk names are
+/// exactly [`CHUNK_NAME_LEN`] lowercase hex characters, and `.` is not hex).
+const TEMP_PREFIX: &str = ".tmp.";
+
+/// Number of shard directories. One level, `00` through `ff`.
+const SHARD_COUNT: usize = 256;
+
+/// Length of a chunk filename: the full address in lowercase hex.
+const CHUNK_NAME_LEN: usize = XORNAME_LEN * 2;
+
+/// How often to re-query available disk space, in seconds.
 ///
-/// The rename that moves the environment aside cannot be shown to be durable off Unix:
-/// there is no way to flush a directory through the standard library, and `MoveFileEx` is
-/// not documented as durable at return without a flag std does not use. So a power loss
-/// can bring the directory back under its old name with its contents already deleted, and
-/// a node that tried to open that would fail to start.
+/// Matches the LMDB store's cadence so the capacity predicate behaves identically
+/// for callers that only ask "is there room at all".
+const DISK_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// Allocation granularity assumed when charging a pending write against free space.
 ///
-/// This file is what makes that unambiguous, and it is *inside* the directory rather than
-/// beside it so that it travels with it: a directory that reverts to its old name reverts
-/// carrying its own evidence. It is created with the same create-and-flush that publishes
-/// a chunk, which is documented as durable everywhere, and only after the rename has
-/// already succeeded. So a directory holding it has been retired, whatever it is called,
-/// and one that does not is a live environment and is opened normally.
+/// Every filesystem we support allocates in units of at least 4 KiB, so a write of
+/// `n` bytes consumes at least `ceil(n / 4096) * 4096`. One extra unit covers the
+/// directory entry and inode.
+const ALLOC_UNIT: u64 = 4096;
+
+/// How many times a publish retries a transient Windows sharing violation.
+const RENAME_RETRY_ATTEMPTS: u32 = 5;
+
+/// Base backoff between those retries; the wait grows linearly with the attempt.
+const RENAME_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Longest absolute path a chunk file may need, checked once at open.
 ///
-/// Deliberately not a file beside the environment. A marker that can outlive the thing it
-/// describes has to be cancelled, cancellation can fail or be lost, and a stale one would
-/// authorise deleting an environment that had since taken a chunk.
-const RETIRED_MARKER: &str = "RETIRED";
+/// Windows caps a non-verbatim path at `MAX_PATH` (260) including the terminating NUL.
+/// Rust's standard library transparently switches to the `\\?\` verbatim form for long
+/// absolute paths, so this is a warning rather than a hard failure, but an operator who
+/// buries the node root ten directories deep should hear about it before the first write
+/// fails rather than after.
+#[cfg(windows)]
+const WINDOWS_PATH_WARN_LEN: usize = 240;
 
-/// How many times the background reaper retries deleting a retired directory.
+/// The on-disk layout marker.
 ///
-/// Generous, because giving up strands the disk until the next restart and the thread
-/// costs nothing while it sleeps. With the backoff below this keeps trying for about a
-/// day.
-const RETIRED_DELETE_ATTEMPTS: u32 = 60;
+/// Written once when the store directory is created and read on every subsequent open.
+/// Nothing in this survey of comparable stores (IPFS flatfs, Storj, borgbackup) shipped
+/// an in-place re-sharder, and all three paid for it. Recording the scheme costs one
+/// small file and is the difference between changing the default later and never being
+/// able to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoreLayout {
+    /// Marker schema version. A store written by a newer schema is refused.
+    pub schema: u32,
+    /// How a chunk address maps to a shard directory.
+    pub scheme: String,
+    /// How many hex characters of the address name the shard directory.
+    pub shard_chars: u8,
+    /// How many directory levels of sharding.
+    pub depth: u8,
+    /// How a chunk address maps to a filename.
+    pub name_encoding: String,
+}
 
-/// Base wait between those attempts, multiplied by the attempt number up to the cap.
-const RETIRED_DELETE_BACKOFF: Duration = Duration::from_secs(10);
+/// Marker schema this build writes and understands.
+const LAYOUT_SCHEMA: u32 = 1;
+/// Shard scheme this build implements: the trailing hex characters of the address.
+const LAYOUT_SCHEME_SUFFIX_HEX: &str = "suffix-hex";
+/// Filename encoding this build implements.
+const LAYOUT_NAME_LOWER_HEX: &str = "lower-hex";
 
-/// The longest the reaper waits between attempts.
-const RETIRED_DELETE_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+impl Default for StoreLayout {
+    fn default() -> Self {
+        Self {
+            schema: LAYOUT_SCHEMA,
+            scheme: LAYOUT_SCHEME_SUFFIX_HEX.to_string(),
+            shard_chars: 2,
+            depth: 1,
+            name_encoding: LAYOUT_NAME_LOWER_HEX.to_string(),
+        }
+    }
+}
 
-/// How many retired directories may be waiting to be deleted before the node stops
-/// finding new names for them. Far more than a node should ever accumulate.
-const MAX_TOMBSTONES: u32 = 64;
+impl StoreLayout {
+    /// Return an error unless this build can read a store written with this layout.
+    fn check_supported(&self) -> Result<()> {
+        if self.schema > LAYOUT_SCHEMA {
+            return Err(Error::Storage(format!(
+                "Chunk store layout schema {} is newer than this build understands ({LAYOUT_SCHEMA}). \
+                 Refusing to open rather than misread the store.",
+                self.schema
+            )));
+        }
+        if self.scheme != LAYOUT_SCHEME_SUFFIX_HEX {
+            return Err(Error::Storage(format!(
+                "Chunk store uses shard scheme '{}', this build implements '{LAYOUT_SCHEME_SUFFIX_HEX}'",
+                self.scheme
+            )));
+        }
+        if self.shard_chars != 2 || self.depth != 1 {
+            return Err(Error::Storage(format!(
+                "Chunk store uses {} shard characters at depth {}, this build implements 2 at depth 1",
+                self.shard_chars, self.depth
+            )));
+        }
+        if self.name_encoding != LAYOUT_NAME_LOWER_HEX {
+            return Err(Error::Storage(format!(
+                "Chunk store names files with '{}', this build implements '{LAYOUT_NAME_LOWER_HEX}'",
+                self.name_encoding
+            )));
+        }
+        Ok(())
+    }
+}
 
-/// The legacy environment's data file. Its presence is what says a node still has one.
-const LEGACY_DATA_FILE: &str = "data.mdb";
-
-/// How many times retirement retries taking sole ownership of the legacy handle before
-/// giving up for this tick.
-const RETIRE_UNWRAP_ATTEMPTS: u32 = 20;
-
-/// How long to wait between those attempts.
-const RETIRE_UNWRAP_BACKOFF: Duration = Duration::from_millis(100);
-
-/// How many chunks the verification pass checks between progress lines.
-const VERIFY_LOG_EVERY: u64 = 2000;
-
-/// How many per-key critical sections the facade keeps.
+/// What the store can say about free space right now.
 ///
-/// Keyed on the address's LAST byte, for the same reason the shard directories are: a
-/// node's keys share their leading bytes, so lanes keyed on the first byte would all
-/// collapse into one.
-const KEY_LOCK_LANES: usize = 256;
+/// Three answers, because deciding how long to stand down needs the distinction: a full
+/// disk is a standing condition worth waiting minutes on, while a failed query may have
+/// cleared by the next attempt and must not be treated as one.
+///
+/// Lived alongside the LMDB store until that was removed. It was never about LMDB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityVerdict {
+    /// Available space is at or above the configured reserve. That is what the query
+    /// establishes, and possibly from the TTL cache, not a promise the next write succeeds.
+    Writable,
+    /// Available space is below the configured reserve.
+    Full,
+    /// The query itself failed, so nothing is known about available space.
+    Unknown,
+}
 
 /// Configuration for [`ChunkStore`].
 #[derive(Debug, Clone)]
 pub struct ChunkStoreConfig {
-    /// Node root directory.
+    /// Node root directory. The store lives at `{root_dir}/chunks/`.
     pub root_dir: PathBuf,
     /// Verify `BLAKE3(content) == address` on read.
     pub verify_on_read: bool,
-    /// Explicit LMDB map size cap in bytes, used only while a legacy environment exists.
-    ///
-    /// Dies with LMDB. Kept so an operator's existing `storage.db_size_gb` still means
-    /// what it meant during the bridge.
-    pub max_map_size: usize,
-    /// Minimum free disk space to preserve on the storage partition.
+    /// Free bytes to keep on the storage partition. Writes are refused below this.
     pub disk_reserve: u64,
-    /// Migration controls.
-    pub migration: MigrationConfig,
 }
 
 impl Default for ChunkStoreConfig {
@@ -113,16 +205,13 @@ impl Default for ChunkStoreConfig {
         Self {
             root_dir: PathBuf::from(".ant/chunks"),
             verify_on_read: true,
-            max_map_size: 0,
             disk_reserve: crate::storage::DEFAULT_DISK_RESERVE,
-            migration: MigrationConfig::default(),
         }
     }
 }
 
 impl ChunkStoreConfig {
-    /// A test-friendly default with the disk reserve disabled, so unit tests do not
-    /// depend on the host having spare gigabytes.
+    /// The shipped defaults with the disk reserve removed, for tests on small volumes.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn test_default() -> Self {
@@ -133,537 +222,1083 @@ impl ChunkStoreConfig {
     }
 }
 
-/// The legacy environment and the keys only it still holds.
-#[derive(Clone)]
-struct Legacy {
-    /// The LMDB handle.
-    lmdb: Arc<LmdbStorage>,
-    /// Keys in the legacy environment that are **not** in the file store.
-    ///
-    /// Kept in memory so the union view costs nothing on the hot paths: `exists` and
-    /// `current_chunks` never touch LMDB, and `all_keys` merges two already-sorted
-    /// sequences. It is derived at open (LMDB keys minus file keys) and maintained by
-    /// every write, copy and delete.
-    only: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
-    /// Writes that have started and whose outcome is not yet known.
-    ///
-    /// A write into the legacy environment runs on a blocking thread that outlives the
-    /// future waiting for it, so a shutdown can leave the environment holding a chunk
-    /// while nothing ran to record it. A key in neither view is what retirement destroys,
-    /// so every write announces itself here first.
-    ///
-    /// Deliberately NOT part of what the node says it holds. This is a note to itself
-    /// that something is in flight, not a claim: `exists`, `all_keys`, the commitment, the
-    /// quote count and the pruner all ignore it. It vetoes retirement, and the driver
-    /// resolves each entry against what is actually on disk.
-    ///
-    /// How many writes were made without a rollback copy of the chunk in the environment.
-    ///
-    /// The rollback copy is best effort by design, and the ADR says so: a bridging node
-    /// whose environment has no reusable page keeps serving from files and simply has no
-    /// second copy to roll back to. What was missing was any way to ask how often that
-    /// happened. One `warn!` per chunk is not an answer to "how many nodes on this fleet
-    /// are actually keeping a rollback copy", which is the question the second release
-    /// turns on, and on a node with no free pages it is also a line per chunk forever.
-    ///
-    /// Writes, not distinct chunks: two attempts at one address count twice, and a later
-    /// attempt that succeeds does not count back down. Counted before the file half runs,
-    /// so a write that then fails outright is counted too. Keeping a set of addresses
-    /// instead would be exact and would also mean holding millions of them in memory to
-    /// answer a question that a rate answers. Read it as "this node is failing to keep
-    /// rollback copies, this often", not as a chunk count.
-    skipped_rollback_copies: Arc<std::sync::atomic::AtomicU64>,
-
-    /// Counted, not a set, for the reason the file store's `writing` map is counted.
-    /// Cancellation can release the facade's key lane while the blocking half survives, so
-    /// a second write for the same key can start behind the first. With one entry between
-    /// them, whichever returned first would clear it while the other was still queued, and
-    /// a delete arriving in that window would see no announcement, skip draining the
-    /// environment, and let the surviving write land afterwards and put the key back.
-    pending: Arc<parking_lot::RwLock<BTreeMap<XorName, usize>>>,
+/// Outcome of a single write attempt, used to keep the duplicate accounting honest.
+enum PutOutcome {
+    /// The chunk was newly published.
+    New,
+    /// The chunk was already on disk.
+    Duplicate,
 }
 
-impl Legacy {
-    /// Note that a chunk went to files alone, and say whether to log it.
+/// Snapshot of free space, plus what has been written since it was taken.
+#[derive(Debug)]
+struct CapacitySnapshot {
+    /// When `available` was measured. `None` means never.
+    measured_at: Option<Instant>,
+    /// Free bytes reported by the filesystem at `measured_at`.
+    available: u64,
+    /// Bytes published since `measured_at`, charged against `available`.
     ///
-    /// Throttled by powers of ten. The condition is usually all-or-nothing, so the first
-    /// few lines say it started and the later ones say it is still going without becoming
-    /// the log.
-    fn note_skipped_rollback_copy(&self) -> Option<u64> {
-        let count = self
-            .skipped_rollback_copies
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1);
-        let round = matches!(
-            count,
-            10 | 100 | 1_000 | 10_000 | 100_000 | 1_000_000 | 10_000_000
-        );
-        (count <= 3 || round).then_some(count)
-    }
+    /// Cleared by a fresh measurement, which already accounts for them.
+    written_since: u64,
+    /// Bytes reserved by writes that have not landed yet.
+    ///
+    /// Deliberately **not** cleared by a measurement: a `statvfs` taken while writes are
+    /// in flight reports space those writes are about to consume, so forgetting their
+    /// reservations at that moment would hand the same bytes out twice. That is precisely
+    /// the over-admission the reservation exists to prevent.
+    in_flight: u64,
+}
 
-    /// Announce a write into the environment, or note a second one for the same key.
-    fn announce(&self, address: &XorName) {
-        *self.pending.write().entry(*address).or_insert(0) += 1;
-    }
+/// Size-aware free-space predicate with a short-lived cache.
+///
+/// Free bytes alone stopped being a sufficient answer the moment chunks became files:
+/// a caller wants to know whether *this* write fits, not whether the disk is non-empty.
+/// The cache keeps the common case at one `statvfs` per interval while staying correct
+/// under a burst, because bytes written since the measurement are charged against it.
+#[derive(Debug)]
+struct CapacityGuard {
+    /// Directory whose partition is measured.
+    dir: PathBuf,
+    /// Free bytes to keep unused.
+    reserve: u64,
+    /// The cached measurement.
+    snapshot: parking_lot::Mutex<CapacitySnapshot>,
+}
 
-    /// Retire one announcement, leaving any other for the same key still standing.
-    fn announced_write_finished(&self, address: &XorName) {
-        let mut pending = self.pending.write();
-        let Some(count) = pending.get_mut(address) else {
-            return;
-        };
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            pending.remove(address);
+impl CapacitySnapshot {
+    /// Free bytes, less everything written or promised since the measurement.
+    fn free_estimate(&self) -> u64 {
+        self.available
+            .saturating_sub(self.written_since)
+            .saturating_sub(self.in_flight)
+    }
+}
+
+impl CapacityGuard {
+    /// Create a guard over the partition hosting `dir`.
+    fn new(dir: PathBuf, reserve: u64) -> Self {
+        Self {
+            dir,
+            reserve,
+            snapshot: parking_lot::Mutex::new(CapacitySnapshot {
+                measured_at: None,
+                available: 0,
+                written_since: 0,
+                in_flight: 0,
+            }),
         }
     }
-}
 
-/// Content-addressed chunk storage.
-pub struct ChunkStore {
-    /// The file store. Always present, always the write target.
-    files: Arc<FileStore>,
-    /// The legacy environment, until it is retired.
-    legacy: parking_lot::RwLock<Option<Legacy>>,
-    /// Excludes retirement while any operation that touches the legacy environment runs.
-    ///
-    /// Reads, writes and deletes take it shared for their whole duration; retirement takes
-    /// it exclusively before it takes the environment away. Sole ownership of the handle
-    /// is not enough on its own: a read that has decided the file store cannot answer, and
-    /// has not yet taken a legacy handle, holds nothing and would be invisible to that
-    /// check. Nor would holding a handle throughout do instead, because on a busy node
-    /// there would always be one and retirement would never see the environment
-    /// unreferenced. Retirement also waits for the environment to go idle, which never
-    /// happens if new work can keep starting in it.
-    ///
-    /// A shared/exclusive lock states the actual requirement, and because it is fair, a
-    /// waiting retirement stops new work starting rather than starving behind it.
-    retirement: tokio::sync::RwLock<()>,
-    /// Where the legacy environment lives.
-    legacy_env_dir: PathBuf,
-    /// Store configuration.
-    config: ChunkStoreConfig,
-    /// The persisted migration marker.
-    state: parking_lot::RwLock<MigrationState>,
-    /// One lock per shard, held across a whole logical key transition.
-    ///
-    /// The file store has its own lane locks, but those only make a single file write
-    /// atomic. The races that matter here span two stores and an await point: the copier
-    /// reads a chunk out of LMDB, the pruner deletes that chunk from both stores, and
-    /// then the copier's write lands and resurrects it. One critical section per key,
-    /// held across put, delete and copy, is what closes that.
-    key_locks: Vec<tokio::sync::Mutex<()>>,
-}
+    /// Bytes actually consumed on disk by a payload of `len` bytes.
+    fn charge(len: u64) -> u64 {
+        // Round the payload up to the allocation unit, then add one unit for the
+        // directory entry and inode.
+        len.div_ceil(ALLOC_UNIT)
+            .saturating_mul(ALLOC_UNIT)
+            .saturating_add(ALLOC_UNIT)
+    }
 
-impl ChunkStore {
-    /// Open the store under `config.root_dir`.
+    /// Free bytes right now, or `None` if the question could not be answered.
     ///
-    /// Opens the legacy environment only if one is already on disk. A fresh node never
-    /// creates one, so it never pays for a memory map it will not use.
+    /// Deliberately separate from [`Self::measure`], which folds a failure into an error
+    /// the caller cannot tell from "below the reserve".
+    fn measure_available(&self) -> Option<u64> {
+        let mut snapshot = self.snapshot.lock();
+        match self.measure(&mut snapshot) {
+            Ok(()) => Some(snapshot.free_estimate()),
+            Err(_) => None,
+        }
+    }
+
+    /// Query the filesystem and refresh the snapshot.
+    fn measure(&self, snapshot: &mut CapacitySnapshot) -> Result<()> {
+        let available = fs2::available_space(&self.dir)
+            .map_err(|e| Error::Storage(format!("Failed to query available disk space: {e}")))?;
+        snapshot.available = available;
+        // Reservations survive: their bytes are not on the platter yet, so the fresh
+        // measurement does not include them.
+        snapshot.written_since = 0;
+        snapshot.measured_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Test `needed` against the snapshot, refreshing it if it is stale or short.
     ///
-    /// # Errors
+    /// Only *passing* results are cached, so a low-space condition is rechecked on every
+    /// call and freed space is noticed promptly.
+    fn admit(&self, snapshot: &mut CapacitySnapshot, needed: u64) -> Result<()> {
+        let want = self.reserve.saturating_add(Self::charge(needed));
+
+        let cache_fresh = snapshot
+            .measured_at
+            .is_some_and(|t| t.elapsed().as_secs() < DISK_CHECK_INTERVAL_SECS);
+        if cache_fresh && snapshot.free_estimate() >= want {
+            return Ok(());
+        }
+
+        self.measure(snapshot)?;
+        if snapshot.free_estimate() < want {
+            // Do not cache a failing result: `measured_at` is left set so the next call
+            // still re-measures, because the branch above only short-circuits a pass.
+            return Err(Error::Storage(format!(
+                "Insufficient disk space: {:.2} GiB available, {:.2} GiB reserve required. \
+                 Free disk space or increase the partition to continue storing chunks.",
+                bytes_to_gib(snapshot.free_estimate()),
+                bytes_to_gib(self.reserve),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Drop the cached measurement so the next question hits the filesystem.
+    fn invalidate(&self) {
+        let mut snapshot = self.snapshot.lock();
+        snapshot.measured_at = None;
+        snapshot.written_since = 0;
+    }
+
+    /// Return `Ok(())` if a write of `needed` bytes would fit. Charges nothing.
+    fn check(&self, needed: u64) -> Result<()> {
+        let mut snapshot = self.snapshot.lock();
+        self.admit(&mut snapshot, needed)
+    }
+
+    /// Admit a write of `needed` bytes and charge it in the same critical section.
     ///
-    /// Returns [`Error::Storage`] if either store cannot be opened.
-    pub async fn new(config: ChunkStoreConfig) -> Result<Self> {
-        let files = Arc::new(
-            FileStore::new(FileStoreConfig {
-                root_dir: config.root_dir.clone(),
-                verify_on_read: config.verify_on_read,
-                disk_reserve: config.disk_reserve,
-            })
-            .await?,
-        );
-
-        // Before anything looks at the legacy environment: a directory carrying its own
-        // retirement mark is the remains of a removal a power loss interrupted, and is
-        // moved aside rather than opened.
-        let openable = finish_interrupted_retirement(&config.root_dir);
-        let legacy_env_dir = config.root_dir.join(LEGACY_ENV_DIR);
-        let legacy =
-            if openable == LiveEnvironment::WhateverIsOnDisk && legacy_present(&config.root_dir)? {
-                Some(Self::open_legacy(&config, &files).await?)
-            } else {
-                None
-            };
-
-        let phase = if legacy.is_some() {
-            MigrationPhase::Bridging
-        } else {
-            MigrationPhase::FilesOnly
-        };
-        let mut state = MigrationState::load_or_create(&config.root_dir, phase);
-
-        // The filesystem is the authority on whether a legacy environment exists; the
-        // marker only records decisions. Reconcile rather than trust.
-        if legacy.is_none() && state.phase != MigrationPhase::FilesOnly {
-            info!("No legacy chunk environment on disk; the migration is already complete");
-            state.phase = MigrationPhase::FilesOnly;
-            if let Err(e) = state.save(&config.root_dir) {
-                warn!("Could not persist the migration marker: {e}");
-            }
-        } else if legacy.is_some()
-            && state.phase == MigrationPhase::Committed
-            && files.current_chunks().unwrap_or(0) < state.kept_key_count
+    /// Checking and charging separately is the bug this exists to prevent: dozens of
+    /// protocol handlers can each pass against the same cached measurement before any of
+    /// them has written a byte, and collectively cross the reserve.
+    ///
+    /// The returned [`Reservation`] settles itself when dropped, so a caller whose future
+    /// is dropped mid-write cannot strand it. Nothing else ever decrements the in-flight
+    /// count, so a stranded reservation would be permanent, and enough of them would make
+    /// an empty disk look full until the process restarted.
+    fn reserve(self: &Arc<Self>, needed: u64) -> Result<Reservation> {
         {
-            // The marker says this node already settled on what it would keep, but the
-            // file store holds less than it recorded keeping. Something outside the node
-            // changed the data directory, and trusting the marker here would skip the
-            // copier, the shed rules and their rank checks on the way to deleting the
-            // legacy environment. The filesystem wins.
-            warn!(
-                "The migration marker says this node kept {} chunk(s) but the file store \
-                 holds {}. Restarting the migration from the copying stage.",
-                state.kept_key_count,
-                files.current_chunks().unwrap_or(0)
-            );
-            state.phase = MigrationPhase::Bridging;
-            state.committed_at_unix = None;
-            state.rebuilds_since_commit = 0;
-            if let Err(e) = state.save(&config.root_dir) {
-                warn!("Could not persist the migration marker: {e}");
-            }
-        } else if legacy.is_some() && state.phase == MigrationPhase::FilesOnly {
-            warn!(
-                "The migration marker says this node is done but {} is still on disk. \
-                 Resuming the bridge.",
-                legacy_env_dir.display()
-            );
-            state.phase = MigrationPhase::Bridging;
-            if let Err(e) = state.save(&config.root_dir) {
-                warn!("Could not persist the migration marker: {e}");
-            }
+            let mut snapshot = self.snapshot.lock();
+            self.admit(&mut snapshot, needed)?;
+            snapshot.in_flight = snapshot.in_flight.saturating_add(Self::charge(needed));
         }
-
-        let store = Self {
-            files,
-            legacy: parking_lot::RwLock::new(legacy),
-            retirement: tokio::sync::RwLock::new(()),
-            legacy_env_dir,
-            config,
-            state: parking_lot::RwLock::new(state),
-            key_locks: std::iter::repeat_with(|| tokio::sync::Mutex::new(()))
-                .take(KEY_LOCK_LANES)
-                .collect(),
-        };
-
-        let (file_keys, legacy_keys) = store.split_counts();
-        info!(
-            "Chunk store ready: {file_keys} chunks in files, {legacy_keys} still only in the \
-             legacy environment, phase {:?}",
-            store.migration_phase()
-        );
-        Ok(store)
-    }
-
-    /// Open the legacy environment and work out which keys only it holds.
-    async fn open_legacy(config: &ChunkStoreConfig, files: &FileStore) -> Result<Legacy> {
-        let (lmdb, legacy_keys) = Self::open_legacy_env(config).await?;
-        Ok(Legacy {
-            lmdb,
-            only: Arc::new(parking_lot::RwLock::new(Self::keys_only_in_legacy(
-                &legacy_keys,
-                files,
-            ))),
-            skipped_rollback_copies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
+        Ok(Reservation {
+            capacity: Arc::clone(self),
+            bytes: needed,
+            settled: false,
         })
     }
 
-    /// Open the legacy environment and read every key in it.
-    ///
-    /// Split from the diff against the file store because the two want different timing:
-    /// this is slow and safe to do at any moment, the diff has to be the last thing before
-    /// the handle is installed.
-    async fn open_legacy_env(
-        config: &ChunkStoreConfig,
-    ) -> Result<(Arc<LmdbStorage>, Vec<XorName>)> {
-        let lmdb = Arc::new(
-            LmdbStorage::new(LmdbStorageConfig {
-                root_dir: config.root_dir.clone(),
-                verify_on_read: config.verify_on_read,
-                max_map_size: config.max_map_size,
-                disk_reserve: config.disk_reserve,
-            })
-            .await?,
-        );
-        // From here it never grows. Two stores on one disk each measure the same free
-        // space and neither knows what the other is about to spend, so a chunk written to
-        // both can be admitted twice against one lot of headroom and the pair can cross
-        // the reserve together. Pinned, this one writes only from pages it already has,
-        // so the file store's accounting is the only claim on free disk.
-        //
-        // What it costs is that the rollback copy is made only when the environment has
-        // room of its own. That is the right way round: the copy exists to make a fleet
-        // rollback survivable, not to be the write that has to succeed, and an
-        // environment this migration exists to delete should not be taking new disk to
-        // hold a second copy of something the file store already has.
-        lmdb.pin_growth().await?;
-        let legacy_keys = lmdb.all_keys().await?;
-        Ok((lmdb, legacy_keys))
+    /// Give back a reservation whose write did not happen.
+    fn release(&self, needed: u64) {
+        let mut snapshot = self.snapshot.lock();
+        snapshot.in_flight = snapshot.in_flight.saturating_sub(Self::charge(needed));
     }
 
-    /// Which of `legacy_keys` the file store does not have.
-    ///
-    /// In memory, no I/O: the file store answers from its index. Cheap enough to redo
-    /// immediately before installing a handle, which is the point. A key that lost its
-    /// file while the environment was being read must be in this set, or nothing will
-    /// look for it again and retirement will destroy the copy that is left.
-    fn keys_only_in_legacy(legacy_keys: &[XorName], files: &FileStore) -> BTreeSet<XorName> {
-        legacy_keys
-            .iter()
-            .filter(|key| !files.is_indexed(key))
-            .copied()
-            .collect()
+    /// Turn a reservation into bytes that are now on disk.
+    fn commit_reservation(&self, needed: u64) {
+        let charge = Self::charge(needed);
+        let mut snapshot = self.snapshot.lock();
+        snapshot.in_flight = snapshot.in_flight.saturating_sub(charge);
+        snapshot.written_since = snapshot.written_since.saturating_add(charge);
     }
 
-    /// Take the critical section for one key.
-    async fn key_lock(&self, address: &XorName) -> Option<tokio::sync::MutexGuard<'_, ()>> {
-        let lane = address.last().copied().unwrap_or(0) as usize;
-        match self.key_locks.get(lane) {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
+    /// Credit a completed delete back to the cached measurement.
+    fn record_removed(&self, len: u64) {
+        let mut snapshot = self.snapshot.lock();
+        snapshot.written_since = snapshot.written_since.saturating_sub(Self::charge(len));
+    }
+}
+
+/// A charged, unsettled write.
+///
+/// Held by whatever is actually doing the write, so the charge is released even if the
+/// caller's future is dropped and only the blocking closure survives.
+struct Reservation {
+    /// The guard this was taken from.
+    capacity: Arc<CapacityGuard>,
+    /// Payload size, before rounding.
+    bytes: u64,
+    /// Whether it has already been accounted for.
+    settled: bool,
+}
+
+impl Reservation {
+    /// The write landed: move the charge from in-flight to written.
+    fn commit(mut self) {
+        self.capacity.commit_reservation(self.bytes);
+        self.settled = true;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.capacity.release(self.bytes);
         }
     }
+}
 
-    /// A cheap clone of the legacy handle, or `None` once it is retired.
-    fn legacy(&self) -> Option<Legacy> {
-        self.legacy.read().clone()
+/// Environment variable naming a failpoint: stop after the temp file, before the rename.
+#[cfg(any(test, feature = "test-utils"))]
+pub const HALT_BEFORE_PUBLISH: &str = "ANT_HALT_BEFORE_PUBLISH";
+
+/// Environment variable naming a failpoint: stop once the legacy environment is renamed
+/// aside and marked retired, before any of it is deleted.
+///
+/// The most destructive window in the migration. What a start that finds a marked
+/// directory must do is finish the deletion, never reopen it, because the node has already
+/// told the network it holds those chunks from the file store.
+#[cfg(any(test, feature = "test-utils"))]
+pub const HALT_AFTER_RETIRE_MARK: &str = "ANT_HALT_AFTER_RETIRE_MARK";
+
+/// Park forever at a named failpoint, once a marker says the process has reached it.
+///
+/// For crash tests, which need a process to die *inside* an operation rather than at
+/// whatever point a sleep in another process happened to land. The variable holds a path:
+/// this writes it, so the parent knows the child is exactly here, and then waits to be
+/// killed.
+///
+/// Costs one environment read per write when the feature is compiled in, and the feature
+/// is not in a release build.
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn halt_here_if_asked(variable: &str, reached: &Path) {
+    let Ok(marker) = std::env::var(variable) else {
+        return;
+    };
+    // Let the first few through. A test that stops the very first write leaves a store
+    // with nothing successfully in it, and an assertion over what it holds then passes by
+    // iterating nothing. Letting some land first means the crash happens to a store that
+    // has real chunks in it, which is the situation worth checking.
+    let skip: u64 = std::env::var(HALT_AFTER)
+        .ok()
+        .and_then(|raw| raw.parse().ok())
+        .unwrap_or(0);
+    if HALTS_SEEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel) < skip {
+        return;
     }
+    if let Err(e) = std::fs::write(&marker, reached.as_os_str().as_encoded_bytes()) {
+        // The parent waits for this file. Saying so on the way past is the difference
+        // between a test that fails and one that hangs until the job times out.
+        eprintln!("failpoint could not write its marker {marker}: {e}");
+        return;
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
 
-    /// `(chunks in files, chunks only in the legacy environment)`.
-    fn split_counts(&self) -> (u64, u64) {
-        // Legacy first, for the reason given on `exists`: a key mid-copy is then counted
-        // twice for an instant rather than not at all, and over-reporting what the node
-        // holds is the safe direction for every caller of `current_chunks`.
-        let legacy = self
-            .legacy()
-            .map_or(0, |l| l.only.read().len().try_into().unwrap_or(u64::MAX));
-        let files = self.files.current_chunks().unwrap_or(0);
-        (files, legacy)
+/// How many writes to let through before the failpoint fires.
+#[cfg(any(test, feature = "test-utils"))]
+pub const HALT_AFTER: &str = "ANT_HALT_AFTER";
+
+/// How many times the failpoint has been reached in this process.
+#[cfg(any(test, feature = "test-utils"))]
+static HALTS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Clears a write's registration when the work finishes, however it finishes.
+///
+/// Held by the blocking closure rather than by the caller, so a dropped future cannot
+/// leave an entry behind, and a panic in the work cannot either.
+struct WriteInFlight {
+    writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
+    finished: Arc<tokio::sync::Notify>,
+    address: XorName,
+}
+
+impl Drop for WriteInFlight {
+    fn drop(&mut self) {
+        let was_last = {
+            let mut writing = self.writing.lock();
+            match writing.get_mut(&self.address) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                _ => {
+                    writing.remove(&self.address);
+                    true
+                }
+            }
+        };
+        // Only when this was the last one. Waking a waiter while another write for the
+        // same key is still queued is exactly what the count exists to prevent.
+        if was_last {
+            self.finished.notify_waiters();
+        }
+    }
+}
+
+/// What is behind a chunk's name on disk.
+///
+/// Four answers, not two, because "could not read it" must never be treated as "wrong":
+/// replacing a chunk is destructive, and off Unix it truncates the file in place, so a
+/// transient fault would turn a healthy sole copy into an empty one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredBytes {
+    /// The bytes are there and hash to the name.
+    Good,
+    /// The bytes are there and do not.
+    Wrong,
+    /// There is nothing behind the name.
+    Absent,
+    /// The question could not be answered this time.
+    Unreadable,
+}
+
+/// Convert a byte count to GiB for human-readable log messages.
+#[allow(clippy::cast_precision_loss)] // display only — sub-byte precision is irrelevant
+fn bytes_to_gib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+/// Content-addressed store holding one immutable file per chunk.
+///
+/// The filesystem is the sole authority. The in-memory index is a cache of what the
+/// directory tree already contains, rebuilt from directory entries at every open, and
+/// every mutation of it mirrors a filesystem operation that has *already* completed.
+/// Bitcask's issue #114 is the cautionary tale for the opposite order: an index that is
+/// rebuilt at startup and then mutated in anticipation drifts, and the drift is silent.
+#[derive(Debug)]
+pub struct ChunkStore {
+    /// Store configuration.
+    config: ChunkStoreConfig,
+    /// `{root_dir}/chunks`.
+    chunks_dir: PathBuf,
+    /// Every address whose file is published, in ascending order.
+    ///
+    /// `BTreeSet` rather than a hash set because `all_keys()` must be sorted (the
+    /// commitment builder truncates with `take(cap)` *before* the Merkle tree sorts, so
+    /// an unstable order would make the node's published commitment depend on iteration
+    /// luck), and because it never spikes memory while growing.
+    index: Arc<parking_lot::RwLock<BTreeSet<XorName>>>,
+    /// One mutex per shard, serialising writers of the same address.
+    ///
+    /// LMDB gave exactly-once `put` semantics for free: the duplicate test happened
+    /// inside the write transaction. Two threads publishing the same address here would
+    /// otherwise both see an absent file, both rename, and both report "newly stored",
+    /// double-counting the chunk. The lane is indexed by the address's LAST byte for the
+    /// same reason the shard is: a node's keys share their leading bytes, so lanes keyed
+    /// on the first byte would all collapse into one.
+    write_lanes: Arc<Vec<parking_lot::Mutex<()>>>,
+    /// Operation counters, same shape as the LMDB store reported.
+    stats: parking_lot::RwLock<StorageStats>,
+    /// Which of the 256 shard directories are known to exist, so a steady-state write
+    /// does not pay a `create_dir_all` syscall.
+    shards_present: Arc<parking_lot::Mutex<[bool; SHARD_COUNT]>>,
+    /// Indexed chunks this store currently cannot read.
+    ///
+    /// Held back from everything the node says it has, while the files themselves are
+    /// left alone. See [`Self::mark_suspect`].
+    suspect: Arc<parking_lot::RwLock<HashSet<XorName>>>,
+    /// Indexed chunks a read has proven do not match their name.
+    ///
+    /// Separate from the above because they clear differently. Not being able to read a
+    /// file is a question a later read answers; bytes that are wrong stay wrong however
+    /// often they are read, and only a repair or a removal settles it. A raw read that
+    /// does not hash anything must not take a chunk out of this set.
+    known_wrong: Arc<parking_lot::RwLock<HashSet<XorName>>>,
+    /// Addresses this store is part-way through writing.
+    ///
+    /// Every mutation registers here before it spawns its blocking work and clears the
+    /// entry *inside* that work, so a caller whose future is dropped cannot skip the
+    /// clearing while the write itself goes on to land. That is the difference that
+    /// matters: the blocking half is not cancelled with the future, so anything the
+    /// future was going to do afterwards is not a record of what happened.
+    ///
+    /// It lets a delete queue behind the exact write it would otherwise race, rather than
+    /// behind every write this store has in flight.
+    ///
+    /// Counted, not a set. Cancellation can release the facade's key lane while the
+    /// blocking half survives, so a second write for the same key can start behind the
+    /// first. With one entry between them, whichever finished first would remove it and a
+    /// waiter would be told the key is free while the other was still queued.
+    writing: Arc<parking_lot::Mutex<HashMap<XorName, usize>>>,
+    /// Woken when [`Self::writing`] loses its last entry for a key.
+    write_finished: Arc<tokio::sync::Notify>,
+    /// Bumped whenever a chunk stops being servable.
+    ///
+    /// The pre-retirement pass reads every chunk, and its result is reused for a while
+    /// rather than re-read on every tick. This is how the caller can tell that the store
+    /// has not changed underneath that result: a proof carries the value it saw, and a
+    /// file that has since gone or stopped being readable makes it stale.
+    health: Arc<std::sync::atomic::AtomicU64>,
+    /// Size-aware free-space predicate.
+    capacity: Arc<CapacityGuard>,
+    /// Monotonic counter that makes temp filenames unique within this store.
+    temp_seq: AtomicU64,
+    /// Random per-instance discriminator for temp filenames.
+    nonce: u32,
+    /// Held for the store's lifetime. Startup fails without it.
+    ///
+    /// Shared rather than owned so the blocking work that depends on it can hold a lease
+    /// of its own: that work outlives the future that spawned it, and a cancelled caller
+    /// releasing the lock would leave it writing into a directory another process had
+    /// just been let into.
+    lock: Arc<File>,
+    /// Tracks every blocking task, so [`ChunkStore::wait_idle`] can wait for writes that
+    /// outlived their awaiting future.
+    blocking_tracker: TaskTracker,
+    /// Test-only gate read-acquired at the top of the put blocking closure.
+    ///
+    /// Tests hold the write half to park an in-flight write on the blocking pool, which
+    /// is the shape a `select!` losing to a shutdown token leaves behind.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_put_gate: Arc<parking_lot::RwLock<()>>,
+}
+
+impl ChunkStore {
+    /// Open (or create) the store at `{root_dir}/chunks/`.
+    ///
+    /// Sweeps orphaned temp files, then rebuilds the index from directory entries.
+    /// The scan reads names only: it never `stat`s an entry and never reads a chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if the directory cannot be created, the layout marker
+    /// is unreadable or describes a layout this build does not implement, or the scan
+    /// fails.
+    pub async fn new(config: ChunkStoreConfig) -> Result<Self> {
+        // Before anything is created. A node that still has chunks in the store this build
+        // cannot read must not start, and it must not leave a half-made file store behind
+        // when it declines to.
+        crate::storage::legacy_artifacts::refuse_if_unmigrated(&config.root_dir)?;
+
+        let chunks_dir = config.root_dir.join(CHUNKS_DIR_NAME);
+        std::fs::create_dir_all(&chunks_dir).map_err(|e| {
+            Error::Storage(format!(
+                "Failed to create chunk store directory {}: {e}",
+                chunks_dir.display()
+            ))
+        })?;
+
+        check_path_budget(&chunks_dir);
+
+        let layout = read_or_write_layout(&chunks_dir)?;
+        layout.check_supported()?;
+
+        // Startup fails without it, so from here this process is the only one using this
+        // directory and an interrupted write can only be its own.
+        let lock = acquire_store_lock(&chunks_dir)?;
+
+        let scan_dir = chunks_dir.clone();
+        // The scan holds the lease itself. It sweeps interrupted writes on the strength of
+        // being alone here, and it runs on a thread that outlives this future: a
+        // cancelled startup that released the lock would leave it sweeping a directory
+        // another process had just been let into.
+        let scan_lease = Arc::clone(&lock);
+        // The node root as well as the chunk tree. The scan sweeps interrupted writes
+        // under `chunks/`, which covers the layout marker's temporary because that lives
+        // there; the migration marker's lives in the root, where nothing looked.
+        let root = config.root_dir.clone();
+        let scan = spawn_blocking(move || {
+            let _lease = scan_lease;
+            sweep_marker_temps(&root);
+            scan_store(&scan_dir)
+        })
+        .await
+        .map_err(|e| Error::Storage(format!("Chunk store scan task failed: {e}")))??;
+
+        let ScanResult {
+            keys,
+            shards_present,
+            swept_temps,
+            skipped,
+        } = scan;
+
+        let key_count = keys.len();
+        // Build from a sorted vector: bulk-building packs every B-tree node to its
+        // capacity, where repeated `insert` converges on ~68% fill for the same keys.
+        let index: BTreeSet<XorName> = keys.into_iter().collect();
+
+        if swept_temps > 0 {
+            info!("Chunk store: removed {swept_temps} orphaned temporary file(s) from interrupted writes");
+        }
+        if skipped > 0 {
+            warn!("Chunk store: ignored {skipped} directory entr(ies) that are not chunk files");
+        }
+        info!(
+            "Chunk store open at {} ({key_count} chunks)",
+            chunks_dir.display()
+        );
+
+        let capacity = Arc::new(CapacityGuard::new(chunks_dir.clone(), config.disk_reserve));
+
+        Ok(Self {
+            config,
+            chunks_dir,
+            index: Arc::new(parking_lot::RwLock::new(index)),
+            write_lanes: Arc::new(
+                std::iter::repeat_with(|| parking_lot::Mutex::new(()))
+                    .take(SHARD_COUNT)
+                    .collect(),
+            ),
+            stats: parking_lot::RwLock::new(StorageStats::default()),
+            shards_present: Arc::new(parking_lot::Mutex::new(shards_present)),
+            suspect: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            known_wrong: Arc::new(parking_lot::RwLock::new(HashSet::new())),
+            writing: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            write_finished: Arc::new(tokio::sync::Notify::new()),
+            health: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            capacity,
+            temp_seq: AtomicU64::new(0),
+            nonce: rand::random(),
+            lock,
+            blocking_tracker: TaskTracker::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_put_gate: Arc::new(parking_lot::RwLock::new(())),
+        })
     }
 
     /// Store a chunk.
     ///
-    /// While a legacy environment exists and dual-writing is on, the chunk goes there
-    /// **first**. A chunk uploaded during the bridge to holders that all revert to a
-    /// pre-migration build would otherwise be gone from every one of them, and that is
-    /// real client data, not a replica.
+    /// On Unix, publishing is a rename within the destination directory, so the final name
+    /// can never appear on partial content: the name *is* the hash, and the content is
+    /// fully written and flushed before the name exists. Off Unix there is no rename, for
+    /// the reason `publish_in_place` gives (it is compiled only on those platforms, so this
+    /// is not a link), and a partial file can wear a real name; that
+    /// is why a duplicate is read and compared rather than trusted.
     ///
     /// # Returns
     ///
-    /// `true` if the chunk was newly stored, `false` if either store already had it.
+    /// `true` if the chunk was newly stored, `false` if it was already present.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] if the content does not hash to `address`, the disk is
-    /// too full, or the write fails.
+    /// Returns [`Error::Storage`] if the content does not hash to `address`, the disk
+    /// is too full, or the write fails.
     pub async fn put(&self, address: &XorName, content: &[u8]) -> Result<bool> {
-        // Shared, for the reason given on the field: retirement waits for the legacy
-        // environment to go idle, and a write that keeps starting new work in it while
-        // that wait runs makes the wait unbounded. It also stops a write inserting a key
-        // into the legacy-only set after the gates have approved the set that may go.
-        let _using_legacy = self.retirement.read().await;
-        let _lane = self.key_lock(address).await;
-        let legacy = self.legacy();
-        let already_in_legacy = legacy
-            .as_ref()
-            .is_some_and(|l| l.only.read().contains(address));
+        let computed = crate::client::compute_address(content);
+        if computed != *address {
+            return Err(Error::Storage(format!(
+                "Content address mismatch: expected {}, computed {}",
+                hex::encode(address),
+                hex::encode(computed)
+            )));
+        }
+        // The read path refuses anything over the ceiling, so writing one would create a
+        // file the store could never read back and could never repair.
+        if content.len() > MAX_CHUNK_SIZE {
+            return Err(Error::Storage(format!(
+                "Chunk {} is {} bytes, over the {MAX_CHUNK_SIZE} byte maximum",
+                hex::encode(address),
+                content.len()
+            )));
+        }
 
-        let mut dual_written = false;
-        if let Some(ref l) = legacy {
-            if self.config.migration.dual_write_legacy && !already_in_legacy {
-                // The legacy store's own verdict, not the file store's. It accounts for
-                // pages it can reuse internally, which is the right question for a write
-                // into it and the wrong one for the file about to be written. A full
-                // legacy store must not fail a put the file store can serve: the copy is
-                // there to make a fleet rollback survivable, and losing that for one
-                // chunk is much better than refusing the chunk.
-                if l.lmdb.capacity_verdict() == crate::storage::CapacityVerdict::Full {
-                    // Counted here as well as on the failure path below, and this is the
-                    // one that matters: a pinned environment with no reusable page answers
-                    // Full for every chunk, so on the node most affected this is the whole
-                    // of the skipping and the other path never runs at all.
-                    if let Some(count) = l.note_skipped_rollback_copy() {
-                        warn!(
-                            migration_event = "no_rollback_copy",
-                            skipped = count,
-                            "Legacy chunk environment is full; storing {} in files only. A \
-                             rollback to a pre-migration build would not have this chunk, \
-                             and {count} write(s) on this node have now gone without a \
-                             rollback copy.",
-                            hex::encode(address)
-                        );
-                    } else {
-                        debug!(
-                            "Legacy chunk environment is full; storing {} in files only.",
-                            hex::encode(address)
-                        );
-                    }
-                } else {
-                    // Announced BEFORE the write, not after it. The write runs on a
-                    // blocking thread that outlives this future: a shutdown that drops the
-                    // caller mid-way can leave the environment holding a chunk while
-                    // nothing here ever ran to record it, and a key in neither view is
-                    // what retirement destroys. In the in-flight note rather than the key
-                    // set, because until the write returns this node does not hold the
-                    // chunk and must not say it does.
-                    l.announce(address);
-                    // Best effort, and only best effort. The verdict above is optimistic
-                    // by design: LMDB can still refuse a write for fragmentation, pages
-                    // pinned by a long read, or a copy-on-write B-tree split. Propagating
-                    // that would let a store this node is in the middle of abandoning
-                    // reject paid chunks the file store has ample room for, for the whole
-                    // bridge period. The chunk's own validity is not at stake here; the
-                    // file store checks the content address itself.
-                    match l.lmdb.put(address, content).await {
-                        Ok(_) => dual_written = true,
-                        Err(e) => {
-                            if let Some(count) = l.note_skipped_rollback_copy() {
-                                warn!(
-                                    migration_event = "no_rollback_copy",
-                                    skipped = count,
-                                    "Could not also write {} to the legacy environment: \
-                                     {e}. Storing it in files only. A rollback to a \
-                                     pre-migration build would not have this chunk, and \
-                                     {count} write(s) on this node have now gone without a \
-                                     rollback copy.",
-                                    hex::encode(address)
-                                );
-                            }
+        // An indexed name is not proof of the bytes under it. The index is built from
+        // names, by the startup scan and by a completed publish, and a name can outlive
+        // what it points at: off Unix a chunk is created under its final name before its
+        // bytes are written, so a crash leaves a short file wearing a real name, and rot
+        // leaves a full-length one. Answering "already have it" to the copy that would fix
+        // either is how a node discards its own repair and is never offered another.
+        //
+        // So the bytes decide. Checked before the reservation below, so re-storing a chunk
+        // this node already holds stays a no-op on a full disk.
+        if self.index.read().contains(address) {
+            if let Some(answer) = self.settle_indexed_duplicate(address, content).await {
+                return answer;
+            }
+        }
+
+        let len = content.len() as u64;
+        // Reserved after the duplicate test so re-storing an existing chunk stays a
+        // harmless no-op on a full disk, matching the LMDB store's ordering.
+        let reservation = self.capacity.reserve(len)?;
+
+        let shard = self.chunks_dir.join(shard_name(address));
+        let final_path = shard.join(hex::encode(address));
+        let temp_path = shard.join(self.next_temp_name());
+        let payload = content.to_vec();
+        let lanes = Arc::clone(&self.write_lanes);
+        let index = Arc::clone(&self.index);
+        let shards_present = Arc::clone(&self.shards_present);
+        let chunks_dir = self.chunks_dir.clone();
+        let lane = shard_index(address);
+        let key = *address;
+        #[cfg(any(test, feature = "test-utils"))]
+        let test_put_gate = Arc::clone(&self.test_put_gate);
+        // Registered before the work is spawned and cleared by the work itself, so a
+        // caller that goes away cannot leave a delete free to race this publish.
+        let in_flight = self.begin_write(address);
+        // And the lease, for the same reason the scan holds it: this thread writes into a
+        // directory whose exclusivity the lock is what establishes, and it can outlive
+        // the last owner of the store.
+        let lease = Arc::clone(&self.lock);
+        let known_wrong = Arc::clone(&self.known_wrong);
+        let suspect = Arc::clone(&self.suspect);
+
+        let outcome = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<PutOutcome> {
+                let _in_flight = in_flight;
+                let _lease = lease;
+                // Test-only: parks here while a test holds the write half.
+                #[cfg(any(test, feature = "test-utils"))]
+                let _test_put_gate = test_put_gate.read();
+                let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                // `mkdir` plus a directory flush are syscalls, so they belong here and
+                // not on a runtime worker.
+                ensure_shard_dir(&chunks_dir, &shard, lane, &shards_present)?;
+                let outcome = match publish(&temp_path, &final_path, &payload, &shard) {
+                    Ok(outcome) => outcome,
+                    Err(PublishFailed { error, left_behind }) => {
+                        // A publish that failed can still have left the bytes there: off
+                        // Unix the chunk is created under its final name, and if the write
+                        // or the flush then fails, the cleanup that removes it can fail
+                        // too. Releasing the reservation would hand back a charge for a
+                        // file that is on the disk.
+                        //
+                        // The publish says so rather than this deciding from a later
+                        // `is_file`. Asking the filesystem afterwards infers ownership from
+                        // a name being occupied, which is true under the store lock and the
+                        // shard lane and not true against anything out of band, and this
+                        // file spends a lot of its length arguing that a name is not
+                        // evidence. A bit set by the code that created the file is.
+                        if left_behind {
+                            reservation.commit();
                         }
+                        return Err(error);
                     }
-                }
-            }
-        }
-
-        let stored_in_files = match self.files.put(address, content).await {
-            Ok(stored) => stored,
-            Err(e) => {
-                // The bytes reached LMDB but not the file store. Record the key as
-                // legacy-only so the union still finds it and the copier retries later;
-                // without this the node would hold a chunk it could not serve.
+                };
+                // Placed, not yet durable. A failure from here on leaves the bytes on the
+                // disk: the chunk is rightly not reported as stored, because a copy that is
+                // not durable must not authorise deleting another, but the space is spent
+                // all the same. Dropping the reservation would hand that charge back and
+                // admit the next write against room that is already gone.
                 //
-                // Only when the file store really does not have it. A write can fail
-                // because the file that is already there could not be read to check it,
-                // and calling that key legacy-only while the file index still names it
-                // puts it in both views, where it stays answerable and vetoes retirement
-                // for good.
-                // The file half failed and the legacy half did not, so the environment
-                // holds the only copy and the key really is legacy-only now. Promoted
-                // from the in-flight note to the key set, which is the one moment that
-                // promotion is warranted: both outcomes are known.
-                if let Some(ref l) = legacy {
-                    l.announced_write_finished(address);
-                    if dual_written && !self.files.is_indexed(address) {
-                        l.only.write().insert(*address);
+                // Only for a chunk this call published. `Duplicate` means the file was
+                // already there and was charged by whoever wrote it, so charging it again
+                // here would count one file twice and shrink the store's idea of its own
+                // disk on every retry.
+                if let Err(e) = flush_publication(&final_path, &shard) {
+                    if matches!(outcome, PutOutcome::New) {
+                        reservation.commit();
                     }
+                    return Err(e);
                 }
-                return Err(e);
-            }
-        };
+                // Index inside the lane, and only after the rename has returned. A
+                // concurrent delete of the same address therefore cannot interleave
+                // between publishing the file and admitting the key.
+                //
+                // Only for a chunk this call actually published. `Duplicate` says a file
+                // already wears the name, and a name is not evidence about the bytes under
+                // it: the four-way answer that decides whether they are good, wrong, absent
+                // or unreadable runs after the await below, and a caller whose future is
+                // dropped never reaches it. Admitting the key here would leave the node
+                // claiming, advertising and committing to bytes nothing has read, with no
+                // suspect or known-wrong mark to hold it back, and the sharpest case is a
+                // name the startup scan deliberately refused because what wears it is a
+                // fifo, a socket or a directory. The duplicate arm admits the key itself,
+                // once a read has proven the bytes.
+                if matches!(outcome, PutOutcome::New) {
+                    index.write().insert(key);
+                    // With the marks that would otherwise hold the key back. These bytes
+                    // were hashed against their own name on the way in, so an older
+                    // instance proven wrong or merely unreadable has just been replaced by
+                    // a good one. Cleared here rather than after the await for the same
+                    // reason the insert is here: a cancelled caller would leave the key
+                    // indexed and suppressed at once, so a chunk this node really does hold
+                    // would stay hidden from `exists` and `all_keys` until some later read
+                    // happened to settle it.
+                    known_wrong.write().remove(&key);
+                    suspect.write().remove(&key);
+                    // Settled here, inside the work, so a dropped awaiter cannot strand it.
+                    reservation.commit();
+                }
+                Ok(outcome)
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Chunk store put task failed: {e}")))??;
 
-        // The file store has it, so it is not legacy-only, whether it was already there
-        // or this call put it there. The in-flight note goes at the same time: both
-        // writes have returned, so there is nothing left in flight to protect.
-        if let Some(ref l) = legacy {
-            l.only.write().remove(address);
-            l.announced_write_finished(address);
+        match outcome {
+            PutOutcome::Duplicate => self.settle_duplicate(address, content).await,
+            PutOutcome::New => {
+                // Freshly published bytes that were checked against their own name on the
+                // way in. The marks were already cleared inside the work, where a dropped
+                // caller cannot skip them; what is left here is only what a caller who is
+                // still waiting should see.
+                let mut stats = self.stats.write();
+                stats.chunks_stored = stats.chunks_stored.saturating_add(1);
+                stats.bytes_stored = stats.bytes_stored.saturating_add(len);
+                drop(stats);
+                debug!("Stored chunk {} ({len} bytes)", hex::encode(address));
+                Ok(true)
+            }
         }
-        if already_in_legacy {
-            // Migrated for free: a hot key the copier no longer has to move.
-            return Ok(false);
+    }
+
+    /// Decide what a name that was already taken actually means.
+    ///
+    /// Split out of [`Self::put`] because it is a different question. `put` puts bytes on
+    /// a disk; this reads bytes back to find out whether the ones already there are the
+    /// ones the caller is offering, which is the only thing that makes a duplicate safe to
+    /// report as stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] when the existing file is absent or could not be read,
+    /// both of which mean this node must not report the chunk as held.
+    async fn settle_duplicate(&self, address: &XorName, content: &[u8]) -> Result<bool> {
+        // The file was already on disk, and its name is not evidence its contents
+        // are right. The startup scan indexes by name without reading anything,
+        // and on Windows a crash mid-write leaves a partial file under a real
+        // chunk name. Trusting the name here would acknowledge a chunk that was
+        // never stored, and then discard the good copy arriving to repair it.
+        // Every answer handled, because three of the four must not report the
+        // chunk as stored. A caller that hears success acts on it: a client drops
+        // its own copy, replication marks the key held, and the copier takes it
+        // out of the legacy-only set.
+        match self.stored_bytes_match(address).await {
+            StoredBytes::Good => {
+                // Admitted here, which is the first moment the bytes behind the
+                // name have been read and shown to hash to it. Idempotent: the
+                // ordinary case is a key the startup scan already indexed.
+                self.index.write().insert(*address);
+                {
+                    let mut stats = self.stats.write();
+                    stats.duplicates = stats.duplicates.saturating_add(1);
+                }
+                Ok(false)
+            }
+            StoredBytes::Wrong => {
+                warn!(
+                    "Chunk {} was already on disk but its contents are wrong; \
+                     replacing it with the copy just offered",
+                    hex::encode(address)
+                );
+                self.repair(address, content).await.map(|()| true)
+            }
+            // The name was taken a moment ago and is not now, or was never a
+            // readable chunk file. Either way nothing holds these bytes, so say so
+            // rather than reporting a chunk that is not there.
+            StoredBytes::Absent => Err(Error::Storage(format!(
+                "Chunk {} was reported already on disk but nothing is there. Not \
+                 reporting it as stored.",
+                hex::encode(address)
+            ))),
+            // Replacing on an unanswered question would destroy a healthy copy,
+            // and reporting success would discard the offered one. The index entry
+            // stays: the file is still there, and dropping the entry would leave
+            // the chunk in neither this store's view nor the legacy one, which is
+            // what retirement destroys. Removing an entry is the quarantine path's
+            // job, and it removes the file with it, after a read that succeeded
+            // and proved the bytes wrong.
+            StoredBytes::Unreadable => Err(Error::Storage(format!(
+                "Chunk {} is on disk but could not be read to check it. Not \
+                 replacing it, and not reporting it as stored.",
+                hex::encode(address)
+            ))),
         }
-        Ok(stored_in_files)
+    }
+
+    /// The address content hashes to.
+    ///
+    /// A convenience the old facade offered and callers still use, so it stays with the
+    /// store rather than making every one of them reach for the client module.
+    #[must_use]
+    pub fn compute_address(content: &[u8]) -> XorName {
+        crate::client::compute_address(content)
+    }
+
+    /// Does this store already hold exactly these bytes under this address?
+    ///
+    /// Asked by the protocol handler before it accepts a client's PUT, so the answer has
+    /// to be about the bytes and not about the name. A name on disk is not evidence: the
+    /// startup scan indexes by name without reading anything, and a partial file can wear a
+    /// real chunk name. Answering yes on a name would acknowledge a chunk that was never
+    /// stored and then discard the good copy that had just arrived to replace it.
+    ///
+    /// A chunk that is on disk with the wrong bytes is repaired from what the caller
+    /// offered rather than turned away, because the caller has already checked those bytes
+    /// against the address. A chunk that cannot be read this time is not claimed as held
+    /// and not replaced either: the offer goes through the ordinary write path instead,
+    /// which never truncates a healthy file on the strength of an unanswered question.
+    pub async fn holds_verified(&self, address: &XorName, content: &[u8]) -> bool {
+        if !self.is_indexed(address) {
+            return false;
+        }
+        // No cheap length pre-check. `metadata` failing is not the same as a length that
+        // does not match, and off Unix replacing a chunk truncates it in place, so acting
+        // on an unanswered question would empty a healthy sole copy. The read below
+        // distinguishes them.
+        match self.get_raw(address).await {
+            // Byte-for-byte what the caller has, and the caller checked those bytes against
+            // the address before getting here. Nothing is wrong with this file.
+            Ok(Some(stored)) if stored == content => {
+                self.note_bytes_proven_good(address);
+                true
+            }
+            Ok(_) => {
+                warn!(
+                    "Chunk {} is on disk but its contents are wrong; replacing it with the \
+                     copy just offered",
+                    hex::encode(address)
+                );
+                // Recorded before the repair is attempted, not after it succeeds. A repair
+                // can fail for capacity or I/O, and a chunk proven wrong that goes on
+                // looking healthy is one the node keeps answering for.
+                self.note_known_wrong(address);
+                self.repair(address, content).await.is_ok()
+            }
+            // Unanswerable this time. Not claimed as held, so the offer goes through the
+            // ordinary path, which writes it rather than replacing anything.
+            Err(_) => false,
+        }
+    }
+
+    /// Flush every directory a chunk can live in, so the names in them are durable.
+    ///
+    /// Byte integrity is not the whole of what the pre-retirement proof has to establish.
+    /// A chunk whose contents are on the platter but whose *name* is not is still lost to
+    /// a power loss, and a publish whose rename landed and whose directory flush failed
+    /// leaves exactly that: the next attempt sees the name, the next verification reads
+    /// the right bytes, and nothing goes back to retry the flush. So the proof flushes
+    /// them itself rather than trusting that each publish did.
+    ///
+    /// Cheap: at most 257 directory flushes for a store of any size, and nothing off Unix,
+    /// where directories cannot be flushed and the retirement marker covers the same
+    /// ground instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] on the first directory that cannot be flushed. The
+    /// caller must treat that as a proof it did not get.
+    pub fn flush_namespace(&self) -> Result<()> {
+        fsync_dir(&self.chunks_dir).map_err(|e| {
+            Error::Storage(format!(
+                "Could not flush {}: {e}",
+                self.chunks_dir.display()
+            ))
+        })?;
+        let present = *self.shards_present.lock();
+        for (shard, _) in present.iter().enumerate().filter(|(_, here)| **here) {
+            let dir = self.chunks_dir.join(format!("{shard:02x}"));
+            fsync_dir(&dir)
+                .map_err(|e| Error::Storage(format!("Could not flush {}: {e}", dir.display())))?;
+        }
+        Ok(())
+    }
+
+    /// Decide what to do about a write of a chunk the index already names.
+    ///
+    /// `None` means the index was wrong and there is nothing on disk, so the caller
+    /// publishes it as new. Everything else is the answer.
+    async fn settle_indexed_duplicate(
+        &self,
+        address: &XorName,
+        content: &[u8],
+    ) -> Option<Result<bool>> {
+        match self.stored_bytes_match(address).await {
+            StoredBytes::Good => {
+                trace!("Chunk {} already exists", hex::encode(address));
+                {
+                    let mut stats = self.stats.write();
+                    stats.duplicates = stats.duplicates.saturating_add(1);
+                }
+                Some(Ok(false))
+            }
+            StoredBytes::Wrong => {
+                warn!(
+                    "Chunk {} is indexed but its bytes are wrong; replacing it with the \
+                     copy just offered",
+                    hex::encode(address)
+                );
+                Some(self.repair(address, content).await.map(|()| true))
+            }
+            // Indexed but gone: publish it fresh rather than replacing something that is
+            // not there.
+            StoredBytes::Absent => None,
+            // Unanswerable this time. Do not touch what is there, and do not tell the
+            // caller the chunk is safely stored either: a client would take that as an
+            // acknowledgement and drop the only other copy. The index entry stays, for
+            // the reason given on the same case after publication.
+            StoredBytes::Unreadable => Some(Err(Error::Storage(format!(
+                "Chunk {} is indexed but could not be read to check it. Not replacing it, \
+                 and not reporting it as stored.",
+                hex::encode(address)
+            )))),
+        }
+    }
+
+    /// The size of the file behind `address`, if there is one.
+    ///
+    /// One `metadata` call, no read. Used where an indexed name has to be checked against
+    /// what a caller is offering before that offer is turned away.
+    #[must_use]
+    pub fn stored_len(&self, address: &XorName) -> Option<usize> {
+        std::fs::metadata(self.chunk_path(address))
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .and_then(|m| usize::try_from(m.len()).ok())
+    }
+
+    /// Whether the file already stored under `address` really hashes to it.
+    async fn stored_bytes_match(&self, address: &XorName) -> StoredBytes {
+        match self.get_raw(address).await {
+            Ok(Some(bytes)) if crate::client::compute_address(&bytes) == *address => {
+                // A read that hashed. It settles both questions.
+                self.clear_suspect(address);
+                self.clear_known_wrong(address);
+                StoredBytes::Good
+            }
+            Ok(Some(_)) => {
+                self.mark_known_wrong(address);
+                StoredBytes::Wrong
+            }
+            Ok(None) => StoredBytes::Absent,
+            // NOT the same as wrong. A file that could not be read this once may be
+            // perfectly good, and off Unix replacing it means opening it with `truncate`,
+            // which would destroy a healthy sole copy on the strength of a transient
+            // fault. Say so and let the caller leave it alone.
+            Err(e) => {
+                debug!("Could not read {} to check it: {e}", hex::encode(address));
+                self.mark_suspect(address);
+                StoredBytes::Unreadable
+            }
+        }
+    }
+
+    /// Replace the file behind an address with known-good bytes, atomically.
+    ///
+    /// Unlike [`Self::put`], this deliberately publishes **over** an existing name. It
+    /// exists for one caller: repairing a file whose bytes no longer hash to their own
+    /// name, from a copy held elsewhere, before that copy is destroyed. Doing it as
+    /// delete-then-put would leave a window where the only remaining copy is the one
+    /// about to be deleted, and any failure in that window is unrecoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Storage`] if `content` does not hash to `address`, or the write
+    /// fails. The old file is left untouched on every error path.
+    pub async fn repair(&self, address: &XorName, content: &[u8]) -> Result<()> {
+        // The same ceiling `put` enforces. Without it a repair can install bytes the read
+        // path will refuse for ever, which is a chunk that verifies as present and can
+        // never be served.
+        if content.len() > MAX_CHUNK_SIZE {
+            return Err(Error::Storage(format!(
+                "Refusing to repair {} with {} bytes, over the {MAX_CHUNK_SIZE} byte \
+                 maximum",
+                hex::encode(address),
+                content.len()
+            )));
+        }
+        let computed = crate::client::compute_address(content);
+        if computed != *address {
+            return Err(Error::Storage(format!(
+                "Refusing to repair {} with content that hashes to {}",
+                hex::encode(address),
+                hex::encode(computed)
+            )));
+        }
+        // The replacement exists alongside the original until the rename, so the room for
+        // it has to be there first. Reserved rather than merely checked: a plain check
+        // passes against a cached measurement, so concurrent repairs and PUTs can each be
+        // admitted against the same headroom and cross the reserve together.
+        // Moved into the work below, so it is released when the write finishes rather
+        // than when its caller stops waiting. A caller that goes away otherwise frees
+        // room that the detached write is still about to consume.
+        let reservation = self.capacity.reserve(content.len() as u64)?;
+
+        let shard = self.chunks_dir.join(shard_name(address));
+        let final_path = shard.join(hex::encode(address));
+        let temp_path = shard.join(self.next_temp_name());
+        let payload = content.to_vec();
+        let lanes = Arc::clone(&self.write_lanes);
+        let index = Arc::clone(&self.index);
+        let shards_present = Arc::clone(&self.shards_present);
+        let chunks_dir = self.chunks_dir.clone();
+        let lane = shard_index(address);
+        let key = *address;
+        let in_flight = self.begin_write(address);
+        let lease = Arc::clone(&self.lock);
+        let capacity = Arc::clone(&self.capacity);
+        let suspect = Arc::clone(&self.suspect);
+        let known_wrong = Arc::clone(&self.known_wrong);
+
+        self.blocking_tracker
+            .spawn_blocking(move || -> Result<()> {
+                let _in_flight = in_flight;
+                let _lease = lease;
+                let _reservation = reservation;
+                let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                ensure_shard_dir(&chunks_dir, &shard, lane, &shards_present)?;
+                write_and_replace(&temp_path, &final_path, &payload, &shard)?;
+                index.write().insert(key);
+                // Settled here rather than after the await. The replacement has landed
+                // and hashes to its own name, so nothing is wrong with this chunk any
+                // more; a caller that stopped waiting would otherwise leave a healthy
+                // file excluded from everything the node claims to hold, and the
+                // measurement believing the store is a chunk smaller than it is.
+                suspect.write().remove(&key);
+                known_wrong.write().remove(&key);
+                capacity.invalidate();
+                Ok(())
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Chunk store repair task failed: {e}")))??;
+
+        // Everything the success means was recorded by the work that succeeded: the
+        // reservation released, the marks cleared, the measurement thrown away. Released
+        // rather than committed because a repair is not a new chunk, and the measurement
+        // discarded rather than adjusted because the file it replaced may have been
+        // shorter, which is exactly the case a repair fixes.
+        debug!("Repaired chunk {}", hex::encode(address));
+        Ok(())
     }
 
     /// Retrieve a chunk, verifying it against its address when configured to.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] on an I/O failure, or when verification fails and no
-    /// intact copy is available.
+    /// Returns [`Error::Storage`] on an I/O failure, or when verification fails. A
+    /// chunk whose bytes do not hash to its name is removed and dropped from the index
+    /// before the error is returned, so it leaves `all_keys()` and ordinary replication
+    /// repairs it.
     pub async fn get(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        // Held for the whole read. A verifying read that finds rotted bytes throws the
-        // file away, and until this key is back in the legacy-only set there is a moment
-        // when it appears to live in neither store. Retirement waits behind this rather
-        // than deleting the copy the read is about to fall back on.
-        let _reading = self.retirement.read().await;
-        let fallback = self.legacy();
-        match self.files.get(address).await {
-            Ok(Some(content)) => Ok(Some(content)),
-            Ok(None) => {
-                // The file store missed. If the legacy store answers, the key has to go
-                // back into the union view: the file index has just dropped it, and a key
-                // in neither view is skipped by the verification pass and destroyed by
-                // retirement.
-                self.serve_from_legacy(address, fallback).await
-            }
-            Err(e) => {
-                // Whatever went wrong with the file, the legacy environment may still
-                // have the bytes, and while it is there it is the point of the bridge to
-                // use them. A verification failure means the file was thrown away; every
-                // other error (a full descriptor table, an I/O fault, an oversized file)
-                // leaves the file in place and unreadable. Both are unservable from the
-                // file store, and both are worth asking the other store about.
-                let verification_failed = format!("{e}").contains("verification failed");
-                warn!(
-                    "Chunk {} could not be served from the file store ({e}); looking for a \
-                     copy in the legacy environment",
-                    hex::encode(address)
-                );
-                let from_legacy = self.serve_from_legacy(address, fallback).await;
-                match from_legacy {
-                    Ok(Some(content)) => Ok(Some(content)),
-                    // Nothing anywhere. Report the original failure rather than a plain
-                    // miss, so the caller can tell the difference. The key is only
-                    // re-queued for copying when the file really went: an unreadable file
-                    // that is still there is not legacy-only, and calling it so is how a
-                    // key ends up claimed through one view and servable through neither.
-                    Ok(None) => Err(e),
-                    Err(legacy_error) => {
-                        if verification_failed {
-                            Err(e)
-                        } else {
-                            Err(legacy_error)
-                        }
-                    }
-                }
-            }
-        }
-    }
+        let Some(content) = self.read_file(address).await? else {
+            trace!("Chunk {} not found", hex::encode(address));
+            return Ok(None);
+        };
 
-    /// Serve a key the file store could not, from the legacy store, and put it back on
-    /// the copier's list.
-    ///
-    /// The whole sequence runs under the key's critical section, including the legacy
-    /// read. Reading first and locking afterwards would let a concurrent delete remove
-    /// both backings in between, and the key would then be re-inserted from bytes that no
-    /// longer exist anywhere: a phantom entry that `exists` reports and `get` never
-    /// satisfies.
-    async fn serve_from_legacy(
-        &self,
-        address: &XorName,
-        legacy: Option<Legacy>,
-    ) -> Result<Option<Vec<u8>>> {
-        // The handle the caller took before it read the file. Not re-fetched here: the
-        // point of taking it early is that it has been held continuously since before the
-        // file could be thrown away, so retirement cannot have run in between.
-        let Some(legacy) = legacy else {
-            return Ok(None);
-        };
-        let _lane = self.key_lock(address).await;
-        let Some(content) = legacy.lmdb.get(address).await? else {
-            return Ok(None);
-        };
-        // Only if the file really is gone: a concurrent write or repair may have put a
-        // good one back while this was waiting for the lock.
-        if !self.files.is_indexed(address) {
-            legacy.only.write().insert(*address);
-            debug!(
-                "Chunk {} served from the legacy environment and re-queued for copying",
-                hex::encode(address)
-            );
+        if self.config.verify_on_read {
+            let computed = crate::client::compute_address(&content);
+            if computed != *address {
+                {
+                    let mut stats = self.stats.write();
+                    stats.verification_failures = stats.verification_failures.saturating_add(1);
+                }
+                warn!(
+                    "Chunk verification failed: expected {}, computed {}",
+                    hex::encode(address),
+                    hex::encode(computed)
+                );
+                // Said before it is acted on. Removing the file can fail or be cancelled,
+                // and a chunk proven wrong that goes on looking healthy is one the node
+                // keeps committing to and, worse, one a cached pre-retirement pass still
+                // covers: the legacy copy that would repair it gets deleted.
+                self.mark_known_wrong(address);
+                self.quarantine_corrupt(address).await;
+                return Err(Error::Storage(format!(
+                    "Chunk verification failed for {}",
+                    hex::encode(address)
+                )));
+            }
         }
+
+        if self.config.verify_on_read {
+            // The bytes hashed to their name. Whatever this store thought was wrong with
+            // them is not wrong with them, and a mark that outlives the fault it
+            // describes means the node can serve a chunk it will not claim, commit or
+            // offer.
+            self.clear_known_wrong(address);
+        }
+
+        let len = content.len() as u64;
+        {
+            let mut stats = self.stats.write();
+            stats.chunks_retrieved = stats.chunks_retrieved.saturating_add(1);
+            stats.bytes_retrieved = stats.bytes_retrieved.saturating_add(len);
+        }
+        debug!("Retrieved chunk {} ({len} bytes)", hex::encode(address));
         Ok(Some(content))
     }
 
@@ -673,287 +1308,265 @@ impl ChunkStore {
     ///
     /// Returns [`Error::Storage`] on an I/O failure.
     pub async fn get_raw(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
-        // For the reason given on `get`: retirement must not run in the gap between the
-        // file going missing and this key being put back in the union view.
-        let _reading = self.retirement.read().await;
-        let fallback = self.legacy();
-        let from_files = self.files.get_raw(address).await;
-        match from_files {
-            Ok(Some(content)) => return Ok(Some(content)),
-            Ok(None) => {}
-            // Same rule as `get`: while the legacy environment is there it may have the
-            // bytes, and this is the read that drives digest audits, possession checks
-            // and pruning. Answering "no digest" for a chunk the node can still produce
-            // is a failed audit for nothing.
-            Err(e) => {
-                let Some(legacy) = fallback else {
-                    return Err(e);
-                };
-                let _lane = self.key_lock(address).await;
-                return match legacy.lmdb.get_raw(address).await {
-                    Ok(Some(content)) => Ok(Some(content)),
-                    // Nothing anywhere: report the original failure, not a plain miss.
-                    Ok(None) | Err(_) => Err(e),
-                };
-            }
-        }
-        // Deliberately not gated on the legacy-only set. A chunk that was copied and then
-        // lost its file is not in that set, and the legacy environment is exactly where
-        // its bytes still are. An LMDB miss is cheap. Goes through the same path as
-        // `get`, so the key is restored to the union view rather than being served once
-        // and then quietly retired away.
-        let Some(legacy) = fallback else {
-            return Ok(None);
-        };
-        let _lane = self.key_lock(address).await;
-        let raw = legacy.lmdb.get_raw(address).await?;
-        let missing_locally = !self.files.is_indexed(address);
-        if raw.is_some() && missing_locally {
-            legacy.only.write().insert(*address);
-        }
-        Ok(raw)
+        self.read_file(address).await
     }
 
-    /// Check whether a chunk is stored, in either backing.
+    /// Check whether a chunk is stored.
     ///
-    /// An in-memory lookup: no syscall, no I/O, in both phases.
+    /// An in-memory lookup: no syscall, no I/O.
     ///
     /// # Errors
     ///
-    /// Never fails. The signature is kept because callers treat an error as "absent".
+    /// Never fails. The signature keeps the shape the LMDB store had, because callers
+    /// treat the error as "assume absent".
     pub fn exists(&self, address: &XorName) -> Result<bool> {
-        // Legacy first, deliberately. The copier writes the file and only then drops the
-        // key from the legacy-only set, so a reader that checked files first could
-        // observe the gap between those two steps and report a chunk the node definitely
-        // holds as absent. In this order the same interleaving yields a harmless
-        // duplicate instead.
-        if self
-            .legacy()
-            .is_some_and(|l| l.only.read().contains(address))
-        {
-            return Ok(true);
+        if self.is_unservable(address) {
+            return Ok(false);
         }
-        self.files.exists(address)
+        Ok(self.is_indexed(address))
     }
 
-    /// Does this node already hold `address` with exactly these bytes, and if it holds a
-    /// damaged copy, replace it with these?
+    /// Is this chunk one the node must not answer for?
+    #[must_use]
+    fn is_unservable(&self, address: &XorName) -> bool {
+        self.suspect.read().contains(address) || self.known_wrong.read().contains(address)
+    }
+
+    /// Is this chunk in the index, whether or not it can currently be read?
     ///
-    /// The question a responder has to answer before turning away an offered copy. Plain
-    /// [`Self::exists`] answers from names alone, and a name can outlive the bytes under
-    /// it: off Unix a chunk is created under its final name before it is written, so a
-    /// crash leaves a short file that `exists` reports as a chunk, and bit rot leaves a
-    /// full-length one. Acknowledging a client on the strength of either throws away the
-    /// copy that would repair it, and nothing offers it again.
+    /// The physical question, as against [`Self::exists`]'s question about what the node
+    /// is willing to claim. The migration must ask this one: a suspect chunk is still a
+    /// file this store has, and treating it as absent would put the key in the legacy-only
+    /// set, from where the union view advertises it again — a key the node claims through
+    /// one view and cannot serve through either.
+    #[must_use]
+    pub fn is_indexed(&self, address: &XorName) -> bool {
+        self.index.read().contains(address)
+    }
+
+    /// Delete a chunk, returning whether it was present.
     ///
-    /// So this reads. It is affordable because the only caller is the client-facing PUT
-    /// path, reached when a client offers a chunk this node already has, and because the
-    /// alternative is keeping a chunk this node cannot serve and being penalised for it at
-    /// the next audit.
-    ///
-    /// `content` must already hash to `address`; the caller checks that before this is
-    /// reached, and a repair from bytes that do not would be worse than the damage.
+    /// `unlink` returns the blocks to the filesystem immediately. That is the whole
+    /// point of this store: no free list, no compaction, no free space required to
+    /// reclaim space.
     ///
     /// # Errors
     ///
-    /// Never fails. An unreadable chunk answers `false`, so the offered copy is stored
-    /// through the ordinary path rather than refused.
-    pub async fn holds_verified(&self, address: &XorName, content: &[u8]) -> bool {
-        // Held for the whole check, like every other operation that can reach the legacy
-        // environment.
-        let _using_legacy = self.retirement.read().await;
-        // And the key's own critical section, for the whole of it. Without it the pruner
-        // can delete both backings between the read and the answer, and the offered copy
-        // would be turned away for a chunk the node no longer has at all.
-        let _lane = self.key_lock(address).await;
-
-        if let Some(legacy) = self.legacy() {
-            if legacy.only.read().contains(address) {
-                // Held only in the legacy environment. Not taken on trust either: the
-                // bytes in there can be wrong too, and the copier drops such a key from
-                // the union when it finds out, which would leave no copy anywhere if this
-                // had turned the good one away.
-                if matches!(legacy.lmdb.get_raw(address).await, Ok(Some(bytes)) if bytes == content)
-                {
-                    return true;
-                }
-                warn!(
-                    "Chunk {} is in the legacy environment but its bytes are wrong; \
-                     storing the copy just offered instead",
-                    hex::encode(address)
-                );
-                if self.files.put(address, content).await.is_err() {
-                    return false;
-                }
-                legacy.only.write().remove(address);
-                return true;
-            }
-        }
-        if !self.files.is_indexed(address) {
-            return false;
-        }
-        // No cheap length pre-check. `metadata` failing is not the same as a length that
-        // does not match, and off Unix replacing a chunk truncates it in place, so acting
-        // on an unanswered question would empty a healthy sole copy. The read below
-        // distinguishes them.
-        match self.files.get_raw(address).await {
-            // Byte-for-byte what the caller has, and the caller checked those bytes
-            // against the address before getting here. Nothing is wrong with this file.
-            Ok(Some(stored)) if stored == content => {
-                self.files.note_bytes_proven_good(address);
-                true
-            }
-            Ok(_) => {
-                warn!(
-                    "Chunk {} is on disk but its contents are wrong; replacing it with the \
-                     copy just offered",
-                    hex::encode(address)
-                );
-                // Recorded before the repair is attempted, not after it succeeds. A
-                // repair can fail for capacity or I/O, and a chunk proven wrong that goes
-                // on looking healthy leaves a cached pre-retirement pass covering it,
-                // which deletes the legacy copy the repair would have come from.
-                self.files.note_known_wrong(address);
-                self.files.repair(address, content).await.is_ok()
-            }
-            // Unanswerable this time. Not claimed as held, so the offer goes through the
-            // ordinary path, which writes it rather than replacing anything.
-            Err(e) => {
-                warn!("Could not read {} to check it: {e}", hex::encode(address));
-                false
-            }
-        }
-    }
-
-    /// Delete a chunk from both backings.
-    ///
-    /// A logical delete has to reach the legacy environment too, or the union view would
-    /// resurrect the key on the next read. It frees no space there — only removing the
-    /// environment whole does that — but it keeps the two views honest.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if a file exists but cannot be removed.
+    /// Returns [`Error::Storage`] if the file exists but cannot be removed. The index
+    /// keeps the key in that case, because the bytes are still on disk.
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
-        // Shared, like every other operation that touches the legacy environment. Without
-        // it, retirement takes the exclusive guard and then waits for the environment to
-        // go idle while deletes keep starting new work in it, and the wait never ends.
-        let _using_legacy = self.retirement.read().await;
-        let _lane = self.key_lock(address).await;
-        // Behind whatever is already writing this key, and only this key. A write's
-        // blocking half outlives the future that started it, so one landing after this
-        // would put back a chunk the node had decided to prune.
-        self.files.wait_for_write(address).await;
-        // Legacy first, and only then the in-memory views. The other order removes the
-        // key from `only` and then, if the legacy delete fails, leaves bytes that live
-        // solely in the legacy store and are invisible to `exists`, `all_keys` and the
-        // pre-retirement verification, so retirement would take the only copy.
-        let from_legacy = match self.legacy() {
-            Some(legacy) => {
-                // A write for this key that nobody waited for may still be queued behind
-                // this delete. Letting it land afterwards would resurrect the key: the
-                // next reconciliation finds it in the environment and puts it back on the
-                // copier's list, undoing a prune the node decided on. Waited out here,
-                // holding the lane, so the delete is genuinely last.
-                //
-                // Both halves. A write has an environment half and a file half, either of
-                // which can be the one still running, and draining only the first leaves
-                // the second free to publish the file after this has deleted it.
-                //
-                // The environment half is found through the journal, which only dual
-                // writes keep. The file half is asked of the file store directly, because
-                // the copier and the repair path also spawn file writes and neither goes
-                // near that journal: using it as a proxy for "is anything writing this
-                // key" was a scope assumption, not a fact.
-                if legacy.pending.read().contains_key(address) {
-                    legacy.lmdb.wait_idle().await;
-                }
-                let deleted = legacy.lmdb.delete(address).await?;
-                let was_only = legacy.only.write().remove(address);
-                // Every announcement for this key, not one of them: the drain above waited
-                // out whatever was in flight and this delete is deliberately last.
-                legacy.pending.write().remove(address);
-                deleted || was_only
-            }
-            None => false,
-        };
-        let from_files = self.files.delete(address).await?;
-        Ok(from_files || from_legacy)
+        let path = self.chunk_path(address);
+        let lanes = Arc::clone(&self.write_lanes);
+        let index = Arc::clone(&self.index);
+        let lane = shard_index(address);
+        let key = *address;
+        // Carried into the closure for the reason `put`, `repair` and the startup scan
+        // carry it: this work outlives the future that started it, so a cancelled caller
+        // that drops the last `ChunkStore` would otherwise release the directory to another
+        // process while an unlink is still queued against it. Deleting is the operation
+        // where that matters most.
+        let lease = Arc::clone(&self.lock);
+
+        let (existed, freed) = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<(bool, u64)> {
+                let _lease = lease;
+                let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+                let removed = match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        // Without this a crash can resurrect the entry on ext4, XFS,
+                        // btrfs and APFS: the unlink is in the page cache, the directory
+                        // is not.
+                        if let Some(shard) = path.parent() {
+                            fsync_dir_best_effort(shard);
+                        }
+                        true
+                    }
+                    // Already gone: the index was stale. Still a successful delete as
+                    // far as the caller is concerned.
+                    Err(e) if e.kind() == ErrorKind::NotFound => false,
+                    Err(e) => {
+                        return Err(Error::Storage(format!(
+                            "Failed to delete chunk file {}: {e}",
+                            path.display()
+                        )))
+                    }
+                };
+                // Index only after the filesystem operation has succeeded. On the error
+                // path above the entry stays, because the bytes are still on disk.
+                let was_indexed = index.write().remove(&key);
+                Ok((removed || was_indexed, if removed { len } else { 0 }))
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Chunk store delete task failed: {e}")))??;
+
+        if freed > 0 {
+            self.capacity.record_removed(freed);
+            debug!("Deleted chunk {}", hex::encode(address));
+        }
+        Ok(existed)
     }
 
-    /// Every stored key, in ascending order, across both backings.
+    /// Return every stored key, in ascending order.
     ///
-    /// The order is a correctness requirement: the commitment builder truncates the
-    /// responsible subset with `take(cap)` *before* the Merkle tree sorts it, so an
-    /// unstable order would make the node's published commitment depend on iteration
-    /// luck rather than on what it holds.
+    /// The order is a correctness requirement, not a convenience: the commitment
+    /// builder truncates the responsible subset with `take(cap)` before the Merkle tree
+    /// sorts it, so an unstable order would make the node's published commitment depend
+    /// on iteration luck.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] if the file index cannot be read.
+    /// Never fails. The signature matches the LMDB store's.
+    // Async without awaiting anything, deliberately: the whole point of this store is
+    // that the key set is already in memory. Callers are spread across the replication
+    // engine and cannot all be de-async'd in this change.
+    //
+    // Two lint names because they were renamed between toolchains, and `unknown_lints`
+    // so whichever one the compiler in use has never heard of stays quiet.
+    #[allow(unknown_lints)]
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
     pub async fn all_keys(&self) -> Result<Vec<XorName>> {
-        // Legacy first, for the reason given on `exists`. `merge_sorted` drops the
-        // duplicate that the overlap produces.
-        let legacy_only: Vec<XorName> = self
-            .legacy()
-            .map(|l| l.only.read().iter().copied().collect())
-            .unwrap_or_default();
-        let file_keys = self.files.all_keys().await?;
-        if legacy_only.is_empty() {
-            return Ok(file_keys);
+        // Copied out first so neither lock is held while the other is taken, and so the
+        // usual case, where nothing is suspect, costs one clone of an empty set.
+        let mut unservable: HashSet<XorName> = self.suspect.read().clone();
+        unservable.extend(self.known_wrong.read().iter().copied());
+        let keys = self.index.read().clone();
+        if unservable.is_empty() {
+            return Ok(keys.into_iter().collect());
         }
-        Ok(merge_sorted(&file_keys, legacy_only.iter()))
+        Ok(keys
+            .into_iter()
+            .filter(|key| !unservable.contains(key))
+            .collect())
     }
 
-    /// The keys the commitment builder should commit to.
+    /// Stop answering for a chunk this store could not read.
     ///
-    /// While the node is still bridging this is the whole union, because it can still
-    /// serve all of it and dropping the claim early would collapse its commitment (and
-    /// with it its quoted price) for no reason. Once it has settled on what it will keep,
-    /// this narrows to the file-backed set, which is exactly the point at which the node
-    /// stops claiming keys it is about to give up.
+    /// The file stays. It may be perfectly good and unreadable only for the moment, and
+    /// deleting it, or dropping it from the index, is how a chunk ends up in neither this
+    /// store's view nor the legacy one, which is what retirement destroys.
+    ///
+    /// What does change is what the node says about it. A chunk it cannot read is one it
+    /// cannot serve, and claiming it anyway puts the key in signed commitments, answers
+    /// presence probes with a yes, suppresses the replication that would repair it, and
+    /// earns a penalty at the next commitment-bound audit. Those penalties are not
+    /// suspended.
+    fn mark_suspect(&self, address: &XorName) {
+        if self.suspect.write().insert(*address) {
+            self.note_health_changed();
+            warn!(
+                "Chunk {} is on disk but could not be read; this node stops answering for \
+                 it until a read succeeds",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// What the store's health looked like at this moment.
+    ///
+    /// Compare a value taken before a long-running check with one taken after, or after
+    /// taking a lock: different means a chunk stopped being servable in between and any
+    /// conclusion drawn from that check is out of date.
+    #[must_use]
+    pub fn health_generation(&self) -> u64 {
+        self.health.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that a chunk stopped being servable.
+    fn note_health_changed(&self) {
+        self.health
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Stop answering for a chunk a read has proven wrong.
+    ///
+    /// Unlike a chunk that merely could not be read, a later read does not clear this.
+    /// The bytes are wrong, and reading them again says the same thing; only replacing
+    /// them or removing them settles it. Bumping health matters as much as the suppression: a chunk that
+    /// has become unservable since the last pre-retirement pass must invalidate that pass,
+    /// or a repair that fails leaves the node deleting the copy it would have repaired
+    /// from.
+    ///
+    /// For callers outside this module that have proven it themselves.
+    pub fn note_known_wrong(&self, address: &XorName) {
+        self.mark_known_wrong(address);
+    }
+
+    /// Stop answering for a chunk a read has proven wrong.
+    fn mark_known_wrong(&self, address: &XorName) {
+        if self.known_wrong.write().insert(*address) {
+            self.note_health_changed();
+            warn!(
+                "Chunk {} does not match its name; this node stops answering for it until \
+                 it is repaired or removed",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// A caller outside this module has proven the stored bytes are right.
+    pub fn note_bytes_proven_good(&self, address: &XorName) {
+        self.clear_known_wrong(address);
+        self.clear_suspect(address);
+    }
+
+    /// Answer for a chunk again, after it has been replaced or removed.
+    fn clear_known_wrong(&self, address: &XorName) {
+        self.known_wrong.write().remove(address);
+    }
+
+    /// Answer for a chunk again, after a read that worked.
+    fn clear_suspect(&self, address: &XorName) {
+        if !self.suspect.read().contains(address) {
+            return;
+        }
+        if self.suspect.write().remove(address) {
+            info!(
+                "Chunk {} could be read again; this node answers for it once more",
+                hex::encode(address)
+            );
+        }
+    }
+
+    /// Number of chunks currently stored.
+    ///
+    /// The physical count: every name in the index, including chunks the node has stopped
+    /// answering for because a read found them wrong or could not read them at all. It is
+    /// deliberately not the same number as `all_keys().len()`, which is what the node is
+    /// willing to claim and so leaves those out.
+    ///
+    /// Anything asking "how much is on this disk" wants this one, and that is what its
+    /// callers ask: the migration's progress, the storage stats, and the size an audit is
+    /// built for. Anything asking "what will this node answer for" wants `all_keys`.
+    /// Quietly filtering this one would move all three of those without saying so, which
+    /// is why the difference is written down here rather than removed.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Storage`] if the file index cannot be read.
-    pub async fn committable_keys(&self) -> Result<Vec<XorName>> {
-        match self.migration_phase() {
-            MigrationPhase::Bridging => self.all_keys().await,
-            MigrationPhase::Committed | MigrationPhase::FilesOnly => self.files.all_keys().await,
-        }
-    }
-
-    /// Number of chunks currently stored, counted across both backings without
-    /// double-counting a chunk that is in each.
-    ///
-    /// # Errors
-    ///
-    /// Never fails.
+    /// Never fails. The signature matches the LMDB store's.
     pub fn current_chunks(&self) -> Result<u64> {
-        let (files, legacy) = self.split_counts();
-        Ok(files.saturating_add(legacy))
+        Ok(self.index.read().len() as u64)
     }
 
-    /// Operation statistics.
-    ///
-    /// The cumulative counters are the file store's; `current_chunks` is the union.
+    /// Operation statistics, with the live chunk count filled in.
     #[must_use]
     pub fn stats(&self) -> StorageStats {
-        let mut stats = self.files.stats();
-        stats.current_chunks = self.current_chunks().unwrap_or(0);
+        let mut stats = self.stats.read().clone();
+        stats.current_chunks = self.index.read().len() as u64;
         stats
     }
 
-    /// Compute a content address (BLAKE3 hash).
-    #[must_use]
-    pub fn compute_address(content: &[u8]) -> XorName {
-        crate::client::compute_address(content)
-    }
-
-    /// The node root directory.
+    /// The node root directory this store was configured with.
     #[must_use]
     pub fn root_dir(&self) -> &Path {
         &self.config.root_dir
+    }
+
+    /// The directory holding the shard tree.
+    #[must_use]
+    pub fn chunks_dir(&self) -> &Path {
+        &self.chunks_dir
     }
 
     /// Reject work early when the disk cannot take another chunk at all.
@@ -962,2019 +1575,1521 @@ impl ChunkStore {
     ///
     /// Returns [`Error::Storage`] when free space is below the configured reserve.
     pub fn check_capacity(&self) -> Result<()> {
-        self.files.check_capacity()
+        self.capacity.check(0)
     }
 
-    /// Whether the store can take a write at all right now.
+    /// Three-way answer to "can this store take a write right now".
     ///
-    /// Answered by the file store, which is where writes land. The legacy environment's
-    /// own verdict is deliberately not consulted: it accounts for pages it can reuse
-    /// internally, and a reusable page in a store this node is moving *off* says nothing
-    /// about whether the file it is about to write will fit.
-    ///
-    /// Three-way, not two. The verification cycle treats `Full` as a standing condition
-    /// worth minutes of backoff, so folding a failed free-space query into it would latch
-    /// a transient filesystem hiccup into a stall on a node that is not full at all.
+    /// Kept distinct from [`Self::check_capacity`] because a failed free-space query and a
+    /// genuinely full disk are not the same thing, and the replication verification cycle
+    /// depends on the difference: a full disk is a standing condition worth minutes of
+    /// backoff, while a `statvfs` that failed says nothing about available space and may
+    /// well succeed on the next pass.
     #[must_use]
-    pub(crate) fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
-        self.files.capacity_verdict()
+    pub fn capacity_verdict(&self) -> crate::storage::CapacityVerdict {
+        match self.capacity.measure_available() {
+            Some(available) if available < self.capacity.reserve => {
+                crate::storage::CapacityVerdict::Full
+            }
+            Some(_) => crate::storage::CapacityVerdict::Writable,
+            None => crate::storage::CapacityVerdict::Unknown,
+        }
     }
 
     /// Reject work early when the disk cannot take `bytes` more.
-    ///
-    /// Free bytes alone stopped being a sufficient answer once chunks became files.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] when the write would not fit above the reserve.
     pub fn check_capacity_for(&self, bytes: u64) -> Result<()> {
-        self.files.check_capacity_for(bytes)
+        self.capacity.check(bytes)
     }
 
-    /// Wait until every blocking task in either backing has finished.
-    pub async fn wait_idle(&self) {
-        self.files.wait_idle().await;
-        if let Some(legacy) = self.legacy() {
-            legacy.lmdb.wait_idle().await;
-        }
+    /// Force the next capacity question to re-measure the filesystem.
+    ///
+    /// Called after the legacy environment is removed, because that is a step change in
+    /// free space that the short-lived cache would otherwise hide for a few seconds.
+    pub fn invalidate_capacity_cache(&self) {
+        self.capacity.invalidate();
     }
 
-    // ── Migration ───────────────────────────────────────────────────────────
-
-    /// Where the node is in the migration.
-    #[must_use]
-    pub fn migration_phase(&self) -> MigrationPhase {
-        self.state.read().phase
-    }
-
-    /// A snapshot of the persisted migration marker.
-    #[must_use]
-    pub fn migration_state(&self) -> MigrationState {
-        self.state.read().clone()
-    }
-
-    /// The migration settings this store was built with.
-    #[must_use]
-    pub fn migration_config(&self) -> &MigrationConfig {
-        &self.config.migration
-    }
-
-    /// Whether a legacy environment is still open.
-    #[must_use]
-    pub fn has_legacy(&self) -> bool {
-        self.legacy.read().is_some()
-    }
-
-    /// The keys the legacy environment still holds alone, ascending.
-    #[must_use]
-    pub fn legacy_only_keys(&self) -> Vec<XorName> {
-        self.legacy()
-            .map(|l| l.only.read().iter().copied().collect())
-            .unwrap_or_default()
-    }
-
-    /// Bytes the legacy environment occupies, as the filesystem sees it.
-    #[must_use]
-    pub fn legacy_bytes(&self) -> u64 {
-        std::fs::metadata(self.legacy_env_dir.join(LEGACY_DATA_FILE)).map_or(0, |m| m.len())
-    }
-
-    /// Test-only handle to the file store's put gate.
+    /// Test-only handle to the put gate.
+    ///
+    /// Hold the write half to park the next write inside its blocking closure, for
+    /// example to prove that shutdown waits for a write whose awaiter was dropped.
     #[cfg(any(test, feature = "test-utils"))]
     #[must_use]
     pub fn test_put_gate(&self) -> Arc<parking_lot::RwLock<()>> {
-        self.files.test_put_gate()
+        Arc::clone(&self.test_put_gate)
     }
 
-    /// Test-only: adjust the persisted migration marker directly.
+    /// Register a write of `address` and hand back the token that clears it.
     ///
-    /// Real transitions go through [`Self::commit_to_files`] and
-    /// [`Self::note_commitment_rebuilt`]; this exists so a test can put a store into a
-    /// state that would otherwise take hours of wall clock to reach.
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn force_migration_state<F: FnOnce(&mut MigrationState)>(&self, f: F) {
-        f(&mut self.state.write());
-    }
-
-    /// Copy up to `keys.len()` chunks out of the legacy environment into files.
-    ///
-    /// Stops as soon as free space would fall below `slack` above the configured
-    /// reserve, so a migration never fills the disk it is trying to free.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] only for failures that are not per-key: a per-key
-    /// problem is counted in the report and the pass continues.
-    pub async fn copy_batch(
-        &self,
-        keys: &[XorName],
-        slack: u64,
-        throttle_mib_per_sec: u64,
-        shutdown: &CancellationToken,
-    ) -> Result<CopyReport> {
-        let mut report = CopyReport::default();
-        let Some(legacy) = self.legacy() else {
-            return Ok(report);
-        };
-
-        for key in keys {
-            // Checked per chunk, not per batch. Everything here is idempotent and
-            // re-derived at the next start, so stopping between two chunks costs nothing
-            // and stops shutdown waiting out a whole pass.
-            if shutdown.is_cancelled() {
-                break;
-            }
-            let lane = self.key_lock(key).await;
-            // Re-checked inside the critical section. A prune that landed while this
-            // pass was running has already taken the key out of the legacy-only set, and
-            // copying it now would resurrect a chunk the node deliberately deleted.
-            if !legacy.only.read().contains(key) {
-                continue;
-            }
-            // Physically, again: a chunk the store holds and cannot read is not one to
-            // copy over the top of, and it is not legacy-only either.
-            if self.files.is_indexed(key) {
-                legacy.only.write().remove(key);
-                continue;
-            }
-            // Reserve room for a full chunk plus the slack floor before reading, so the
-            // copier stops with headroom rather than on a failed write.
-            if self.files.check_capacity_for(slack).is_err() {
-                report.stopped_for_space = true;
-                break;
-            }
-
-            let Some(bytes) = legacy.lmdb.get_raw(key).await? else {
-                report.vanished += 1;
-                legacy.only.write().remove(key);
-                continue;
-            };
-            let len = bytes.len() as u64;
-
-            match self.files.put(key, &bytes).await {
-                Ok(_) => {
-                    legacy.only.write().remove(key);
-                    report.copied += 1;
-                    report.bytes += len;
-                }
-                Err(e) => {
-                    let message = format!("{e}");
-                    // Bigger than this build will ever serve. The legacy store took it
-                    // through an API with no size bound; the file store will not, and no
-                    // amount of retrying changes that. Counted as unusable and removed,
-                    // like a record whose bytes do not match, or one such record would
-                    // stop this node and every node sharing its disk from ever reclaiming
-                    // space.
-                    if message.contains("byte maximum") {
-                        warn!(
-                            "Chunk {} in the legacy environment is larger than this build \
-                             will store; removing it. It cannot be served either way.",
-                            hex::encode(key)
-                        );
-                        match legacy.lmdb.delete(key).await {
-                            Ok(_) => {
-                                legacy.only.write().remove(key);
-                                report.unusable += 1;
-                            }
-                            Err(e) => warn!(
-                                "Oversized chunk {} could not be removed from the legacy \
-                                 environment: {e}. The environment stays.",
-                                hex::encode(key)
-                            ),
-                        }
-                        continue;
-                    }
-                    if message.contains("Content address mismatch") {
-                        // The legacy bytes do not hash to their own key, so this chunk
-                        // cannot be reproduced and was never servable. Stop advertising
-                        // it rather than carrying a key we cannot answer for.
-                        //
-                        // Deleted from the environment too, and only dropped from the key
-                        // set once that has worked. Leaving the record behind puts the
-                        // key in neither view, which the pre-retirement pass reads as a
-                        // chunk to protect and puts straight back — and the next copier
-                        // pass drops it again. One malformed record would keep a node,
-                        // and every node sharing its disk, from ever reclaiming space.
-                        warn!(
-                            "Chunk {} in the legacy environment does not match its address; \
-                             removing it so replication can repair it",
-                            hex::encode(key)
-                        );
-                        match legacy.lmdb.delete(key).await {
-                            Ok(_) => {
-                                legacy.only.write().remove(key);
-                                report.unusable += 1;
-                            }
-                            Err(e) => warn!(
-                                "Chunk {} does not match its address and could not be \
-                                 removed from the legacy environment: {e}. It stays on the \
-                                 list and the environment stays.",
-                                hex::encode(key)
-                            ),
-                        }
-                        continue;
-                    }
-                    if message.contains("Insufficient disk space") {
-                        report.stopped_for_space = true;
-                        break;
-                    }
-                    return Err(e);
-                }
-            }
-
-            // Outside the critical section on purpose: at 32 MiB/s a 4 MiB chunk sleeps
-            // for over a tenth of a second, and a shard lane held for that would stall
-            // every write sharing its last address byte for the whole pass.
-            drop(lane);
-            if let Some(delay) = throttle_delay(len, throttle_mib_per_sec) {
-                tokio::time::sleep(delay).await;
-            }
+    /// The token must be moved into the blocking closure that does the work, so the entry
+    /// is cleared by the thread that finishes rather than by a caller that may be gone.
+    fn begin_write(&self, address: &XorName) -> WriteInFlight {
+        *self.writing.lock().entry(*address).or_insert(0) += 1;
+        WriteInFlight {
+            writing: Arc::clone(&self.writing),
+            finished: Arc::clone(&self.write_finished),
+            address: *address,
         }
-        Ok(report)
     }
 
-    /// Settle on the file-backed set: from now on the node commits only to what it will
-    /// keep, while still serving everything it ever committed to.
+    /// Wait until nothing is part-way through writing `address`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if the marker cannot be persisted.
-    pub fn commit_to_files(&self) -> Result<()> {
-        let shed = self
-            .legacy()
-            .map_or(0, |l| l.only.read().len().try_into().unwrap_or(u64::MAX));
-        let kept = self.files.current_chunks().unwrap_or(0);
-        // Written to disk before it is published in memory. The other order leaves this
-        // process acting as `Committed` (and so committing only to file-backed keys)
-        // while the marker still says `Bridging`, so a restart would silently undo it.
-        let candidate = {
-            let state = self.state.read();
-            if state.phase != MigrationPhase::Bridging {
-                return Ok(());
-            }
-            MigrationState {
-                phase: MigrationPhase::Committed,
-                committed_at_unix: None,
-                rebuilds_since_commit: 0,
-                shed_key_count: shed,
-                kept_key_count: kept,
-                ..state.clone()
-            }
-        };
-        candidate.save(&self.config.root_dir)?;
-        *self.state.write() = candidate;
-        if shed == 0 {
-            info!("Committed to the file-backed key set; nothing has to be shed");
-        } else {
-            info!(
-                "Committed to the file-backed key set; {shed} chunk(s) will be shed and \
-                 refetched once the legacy environment is gone and there is room"
-            );
-        }
-        Ok(())
-    }
-
-    /// Record that the commitment builder has read and published the committable set.
-    ///
-    /// The retirement gate counts these: one proves the builder saw the new set, two
-    /// prove it survived a rotation, which is what makes the answerability window
-    /// meaningful rather than notional.
-    pub fn note_commitment_rebuilt(&self) {
-        let should_save = {
-            let mut state = self.state.write();
-            if state.phase != MigrationPhase::Committed {
+    /// For callers that must be last: a delete whose key still has a write in flight
+    /// would be undone by that write landing afterwards.
+    pub async fn wait_for_write(&self, address: &XorName) {
+        loop {
+            // Registered before the check, so a clear between the two is not missed.
+            let waiting = self.write_finished.notified();
+            if !self.writing.lock().contains_key(address) {
                 return;
             }
-            if state.committed_at_unix.is_none() {
-                state.committed_at_unix = Some(crate::storage::migration::now_unix());
-            }
-            state.rebuilds_since_commit = state.rebuilds_since_commit.saturating_add(1);
-            state.rebuilds_since_commit <= REQUIRED_REBUILDS_BEFORE_RETIRE
-        };
-        if should_save {
-            let snapshot = self.state.read().clone();
-            if let Err(e) = snapshot.save(&self.config.root_dir) {
-                warn!("Could not persist the migration marker: {e}");
-            }
+            waiting.await;
         }
     }
 
-    /// Whether every gate on deleting the legacy environment is satisfied.
+    /// How many blocking tasks this store currently has in flight. Tests only.
     ///
-    /// `still_answerable` is asked of each key the node is about to give up: the pruner's
-    /// existing retention contract, reused verbatim. A key still covered by a retained
-    /// commitment slot vetoes the delete, because the node could still be challenged on it.
-    pub fn retirement_blocker<F>(&self, still_answerable: F) -> Option<String>
-    where
-        F: Fn(&XorName) -> bool,
-    {
-        // Before anything else, and whether or not there is a handle. An environment this
-        // node cannot classify must not be retired, and asking only on the no-handle path
-        // meant the ordinary path never asked: a node holding its store open went through
-        // every gate, renamed the directory aside and deleted it.
-        if self.legacy_cannot_be_classified() {
-            return Some(format!(
-                "{} cannot be read well enough to say whether it was already retired. \
-                 Nothing will be deleted until it can. Check that the directory and \
-                 anything inside it can be read.",
-                self.legacy_env_dir.display()
-            ));
-        }
-        if !self.has_legacy() {
-            // No handle is not the same as no environment. A rename that failed and then
-            // could not be reopened leaves exactly that: the directory is still on disk
-            // and this node can no longer read it. Answering "nothing blocks retirement"
-            // would have the driver log the migration complete over a store that is still
-            // there and still holding chunks nothing else can serve.
-            let mark = retirement_mark(&self.legacy_env_dir);
-            if legacy_present(&self.config.root_dir).unwrap_or(true) && !mark.permits_removal() {
-                // Two different situations wearing one message would send an operator to
-                // the wrong place. One is a store this node cannot open; the other is a
-                // store nothing can even classify, which usually means a permission or a
-                // mount, and which the node deliberately will not act on either way.
-                if mark == RetirementMark::Unknown {
-                    return Some(format!(
-                        "{} is still on disk and this node cannot tell whether it was \
-                         retired, so it will neither open it nor remove it. Check that the \
-                         directory and anything inside it can be read.",
-                        self.legacy_env_dir.display()
-                    ));
-                }
-                return Some(format!(
-                    "{} is still on disk but this node has no handle to it. It cannot be \
-                     read, verified or removed until the node is restarted.",
-                    self.legacy_env_dir.display()
-                ));
-            }
-            return None;
-        }
-        if !self.config.migration.retire_legacy {
-            return Some(
-                "retirement is disabled in this release (storage.migration.retire_legacy)".into(),
-            );
-        }
-        // A linked environment is never retired automatically. Retirement renames the
-        // path and then deletes what is behind it, and behind a link is a directory
-        // somewhere else that this node does not own. Copying still happens; only the
-        // removal is refused, so the node ends up serving from files with its old store
-        // intact and its operator told what to do about it.
-        if is_a_link(&self.legacy_env_dir) {
-            return Some(format!(
-                "{} is a link rather than a directory. The chunks are being copied out of \
-                 it, but it will not be deleted: what it points at is not this node's to \
-                 remove. Once the migration has settled, delete it by hand.",
-                self.legacy_env_dir.display()
-            ));
-        }
-        let state = self.state.read().clone();
-        if state.phase != MigrationPhase::Committed {
-            return Some(format!("phase is {:?}, not Committed", state.phase));
-        }
-        if state.rebuilds_since_commit < REQUIRED_REBUILDS_BEFORE_RETIRE {
-            return Some(format!(
-                "only {} of {REQUIRED_REBUILDS_BEFORE_RETIRE} commitment rebuilds observed",
-                state.rebuilds_since_commit
-            ));
-        }
-        if !state.retire_delay_elapsed(&self.config.migration) {
-            return Some(format!(
-                "the {}h retirement delay has not elapsed",
-                self.config.migration.effective_retire_delay_hours()
-            ));
-        }
-        if let Some(key) = self
-            .legacy_only_keys()
-            .into_iter()
-            .find(|k| still_answerable(k))
-        {
-            return Some(format!(
-                "chunk {} is still answerable under a retained commitment",
-                hex::encode(key)
-            ));
-        }
-        None
+    /// Lets a test wait for work to have actually started rather than guessing at a
+    /// delay, which is the difference between a test that proves something and one that
+    /// passes because the machine was quick.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn tasks_in_flight(&self) -> usize {
+        self.blocking_tracker.len()
     }
 
-    /// Re-hash every chunk that both stores hold, repairing the file from the legacy
-    /// copy when they disagree.
+    /// Wait until every blocking task this store spawned has finished.
     ///
-    /// A filename is not proof the bytes behind it are good. The startup scan reads
-    /// names only, so a file that was truncated or that rotted while the node was down is
-    /// indexed, counted as copied, committed to, and would have its intact legacy copy
-    /// deleted underneath it. The first verified read would then find the corruption with
-    /// nothing left to repair from. This pass is what turns "a file with that name
-    /// exists" into "those bytes are that chunk", and it is why it runs before
-    /// retirement rather than after.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if the legacy key set cannot be read.
-    pub async fn verify_before_retire(
-        &self,
-        throttle_mib_per_sec: u64,
-        shutdown: &CancellationToken,
-    ) -> Result<VerifyReport> {
-        let mut report = VerifyReport::default();
-        // Taken BEFORE anything is read. Stamping it at the end would absorb exactly the
-        // failures this exists to catch: a chunk verified early in the pass that stops
-        // being readable before the pass finishes would leave the report carrying the
-        // already-incremented count, and both later checks would see it match.
-        let health_at_start = self.files.health_generation();
-        let Some(legacy) = self.legacy() else {
-            report.ran = true;
-            report.health = health_at_start;
-            return Ok(report);
-        };
-        report.ran = true;
-
-        // Names before bytes. A chunk whose contents are durable but whose directory entry
-        // is not is still lost to a power loss, and the legacy copy is about to be deleted
-        // on the strength of this proof. Any failure here is a proof this pass did not
-        // produce.
-        if let Err(e) = self.files.flush_namespace() {
-            report.unrepairable = report.unrepairable.saturating_add(1);
-            warn!(
-                "Could not make the file store's directory entries durable: {e}. The legacy \
-                 environment stays until they are."
-            );
-            return Ok(report);
-        }
-
-        let legacy_keys = legacy.lmdb.all_keys().await?;
-        let total = legacy_keys.len();
-        info!("Verifying {total} chunk(s) before removing the legacy environment");
-        let mut since_log = 0u64;
-        for key in legacy_keys {
-            // This pass is a full read of the store and can run for hours. A shutdown
-            // must not wait it out, and an incomplete pass is simply not a clean proof.
-            if shutdown.is_cancelled() {
-                report.unrepairable = report.unrepairable.saturating_add(1);
-                debug!("Pre-retirement verification stopped for shutdown");
-                return Ok(report);
-            }
-            // Under the key's critical section, so the two questions below are asked of
-            // one moment. Without it a write can publish the file and take the key out of
-            // the legacy-only set in between, and this pass would put it straight back.
-            let classified = {
-                let _lane = self.key_lock(&key).await;
-                // The physical question. A chunk the store holds but cannot currently
-                // read is still one it holds, and calling it absent here would put the
-                // key in the legacy-only set, where the union view advertises it again.
-                let in_files = self.files.is_indexed(&key);
-                let legacy_only = legacy.only.read().contains(&key);
-                if in_files && legacy_only {
-                    // In both views at once, which nothing else clears once the copier
-                    // has stopped running. The file store has it, so the legacy-only set
-                    // is the one that is wrong: an answerable key in that set vetoes
-                    // retirement for as long as the process lives.
-                    debug!(
-                        "Chunk {} was in both views; the file store has it, so it is no \
-                         longer legacy-only",
-                        hex::encode(key)
-                    );
-                    legacy.only.write().remove(&key);
-                }
-                (in_files, legacy_only)
-            };
-            if !classified.0 {
-                // Known to be legacy-only, which is what a key this node is giving up
-                // looks like. Whether it may go is the gates' decision, not this pass's.
-                if classified.1 {
-                    continue;
-                }
-                // In neither view. However that came about — a publish that failed, a
-                // file quarantined for corruption, a name this store stopped advertising —
-                // the environment holds the only copy, and nothing is looking after it:
-                // the gates only ever see the legacy-only set. Put it back there and
-                // refuse the proof this pass. What neither view protects is exactly what
-                // retirement destroys.
-                warn!(
-                    "Chunk {} is in the legacy environment, is not in the file store, and \
-                     was in neither view; re-queued for copying and the legacy environment \
-                     stays",
-                    hex::encode(key)
-                );
-                legacy.only.write().insert(key);
-                report.unrepairable = report.unrepairable.saturating_add(1);
-                continue;
-            }
-            since_log += 1;
-            if since_log >= VERIFY_LOG_EVERY {
-                since_log = 0;
-                info!(
-                    "Pre-retirement verification: {} of at most {total} chunk(s) checked",
-                    report.checked
-                );
-            }
-            let outcome = self.verify_one(&legacy, &key).await;
-            report.checked += 1;
-            report.bytes += outcome.bytes;
-            match outcome.verdict {
-                VerifyVerdict::Intact => {}
-                VerifyVerdict::Repaired => report.repaired += 1,
-                VerifyVerdict::Vanished => {
-                    // The file went away while this pass was running, so the key is no
-                    // longer file-backed. Put it back on the copier's list rather than
-                    // republishing it here, where it could resurrect something the
-                    // pruner deleted a moment ago.
-                    legacy.only.write().insert(key);
-                    report.unrepairable += 1;
-                }
-                VerifyVerdict::Unrepairable => report.unrepairable += 1,
-            }
-            if let Some(delay) = throttle_delay(outcome.bytes, throttle_mib_per_sec) {
-                tokio::time::sleep(delay).await;
-            }
-        }
-
-        if report.unrepairable == 0 {
-            info!(
-                "Pre-retirement verification passed: {} chunk(s) checked, {} repaired",
-                report.checked, report.repaired
-            );
-        }
-        // The count this pass started from, and a refusal if the store moved while it
-        // ran. Retirement compares the same value again immediately before deleting
-        // anything, so one number covers both windows: during the pass, and after it.
-        report.health = health_at_start;
-        if self.files.health_generation() != health_at_start {
-            warn!(
-                "A chunk stopped being servable while the pre-retirement pass was running, \
-                 so this pass does not describe the store. Another runs on the next tick."
-            );
-            report.unrepairable = report.unrepairable.saturating_add(1);
-        }
-        Ok(report)
+    /// Dropping the awaiting future does not cancel a `spawn_blocking` closure, so
+    /// shutdown has to wait for the closure itself.
+    pub async fn wait_idle(&self) {
+        self.blocking_tracker.close();
+        self.blocking_tracker.wait().await;
+        self.blocking_tracker.reopen();
     }
 
-    /// Check one chunk that both stores hold, repairing the file if it is wrong.
-    async fn verify_one(&self, legacy: &Legacy, key: &XorName) -> VerifyOutcome {
-        // The throttle sleep is deliberately outside this critical section: at 32 MiB/s a
-        // 4 MiB chunk sleeps for over a tenth of a second, and holding a shard lane for
-        // that would stall every write to a sixteenth of the address space for hours.
-        let _lane = self.key_lock(key).await;
+    /// Absolute path of a chunk file.
+    fn chunk_path(&self, address: &XorName) -> PathBuf {
+        self.chunks_dir
+            .join(shard_name(address))
+            .join(hex::encode(address))
+    }
 
-        let bytes = match self.files.get_raw(key).await {
-            Ok(bytes) => bytes,
-            // Not the same as gone. `Vanished` puts the key back on the copier's list,
-            // and doing that for a file that is still there and still indexed leaves the
-            // key in both views at once: the file index keeps it in every commitment, so
-            // it stays answerable, and an answerable legacy-only key vetoes retirement for
-            // as long as the process lives. Refuse this pass instead.
+    /// A temp name unique to this store instance, and distinguishable from a chunk name.
+    ///
+    /// The nonce matters: two `ChunkStore`s on one root in one process share a PID, and a
+    /// recycled PID collides with an age-gated leftover. Either way `create_new` would
+    /// fail and surface as a spurious write error.
+    fn next_temp_name(&self) -> String {
+        let seq = self.temp_seq.fetch_add(1, Ordering::Relaxed);
+        format!(
+            "{TEMP_PREFIX}{}.{:08x}.{seq}",
+            std::process::id(),
+            self.nonce
+        )
+    }
+
+    /// Read a chunk file, dropping the index entry if the file has vanished.
+    async fn read_file(&self, address: &XorName) -> Result<Option<Vec<u8>>> {
+        let path = self.chunk_path(address);
+        let read = self
+            .blocking_tracker
+            .spawn_blocking(move || -> Result<Option<Vec<u8>>> {
+                match open_regular(&path) {
+                    Ok(Some(f)) => read_bounded(f, &path).map(Some),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .map_err(|e| Error::Storage(format!("Chunk store read task failed: {e}")))?;
+
+        // Every read decides the question, not only the ones that were checking. A read
+        // that failed means this chunk cannot be served, whoever asked; a read that
+        // worked means it can be, whoever asked. Doing this anywhere else leaves a key
+        // stuck unadvertised after the fault has cleared, or advertised after it has not.
+        let read = match read {
+            Ok(read) => {
+                self.clear_suspect(address);
+                read
+            }
             Err(e) => {
-                warn!(
-                    "Chunk {} could not be read while verifying: {e}. The legacy \
-                     environment stays.",
-                    hex::encode(key)
-                );
-                return VerifyOutcome {
-                    bytes: 0,
-                    verdict: VerifyVerdict::Unrepairable,
-                };
+                self.mark_suspect(address);
+                return Err(e);
             }
         };
-        let len = bytes.as_ref().map_or(0, Vec::len) as u64;
-        let Some(bytes) = bytes else {
-            return VerifyOutcome {
-                bytes: 0,
-                verdict: VerifyVerdict::Vanished,
-            };
-        };
-        if crate::client::compute_address(&bytes) == *key {
-            // The pass hashed these bytes and they are right, so whatever this store
-            // thought was wrong with them is not. It reads raw, which does not settle
-            // that on its own, and leaving the mark would retire the environment while a
-            // healthy chunk stayed unadvertised until some later verified read.
-            self.files.note_bytes_proven_good(key);
-            return VerifyOutcome {
-                bytes: len,
-                verdict: VerifyVerdict::Intact,
-            };
-        }
 
-        warn!(
-            "Chunk {} is in the file store but does not match its address; rewriting it \
-             from the legacy environment before that environment is removed",
-            hex::encode(key)
-        );
-        // Replace in place. Deleting first and writing after would leave a window whose
-        // only surviving copy is the one this whole pass exists to make safe to delete.
-        let verdict = match legacy.lmdb.get_raw(key).await {
-            Ok(Some(good)) if self.files.repair(key, &good).await.is_ok() => {
-                VerifyVerdict::Repaired
-            }
-            _ => {
-                warn!(
-                    "Chunk {} could not be rewritten from the legacy environment. \
-                     Retirement stays blocked so its bytes are not thrown away.",
-                    hex::encode(key)
-                );
-                VerifyVerdict::Unrepairable
-            }
-        };
-        VerifyOutcome {
-            bytes: len,
-            verdict,
+        if read.is_none() && self.forget_if_absent(address).await {
+            // The file went away underneath us. Stop advertising the key so the close
+            // group notices the shortfall and replication puts it back.
+            warn!(
+                "Chunk {} is indexed but its file is missing; dropped from the index so \
+                 replication can repair it",
+                hex::encode(address)
+            );
         }
+        Ok(read)
     }
 
-    /// Is this verification still worth acting on?
+    /// Drop an index entry whose file is genuinely gone.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] naming what has changed since the pass ran.
-    fn proof_is_usable(&self, proof: &VerifyReport) -> Result<()> {
-        if !proof.is_clean() {
-            return Err(Error::Storage(format!(
-                "Refusing to remove the legacy environment: verification reported {} \
-                 unrepairable chunk(s) (ran: {})",
-                proof.unrepairable, proof.ran
-            )));
-        }
-        if !proof.still_describes(&self.files) {
-            return Err(Error::Storage(
-                "Refusing to remove the legacy environment: a chunk stopped being \
-                 servable since it was verified, so that verification no longer describes \
-                 the file store. A fresh pass runs on the next tick."
-                    .into(),
-            ));
-        }
-        if self.has_pending_writes() {
-            return Err(Error::Storage(
-                "Refusing to remove the legacy environment: a write announced itself and \
-                 has not reported back, so what the environment holds is not yet settled."
-                    .into(),
-            ));
-        }
-        Ok(())
+    /// Re-checks under the address's write lane, so a chunk republished between the
+    /// failing read and this call keeps its entry.
+    async fn forget_if_absent(&self, address: &XorName) -> bool {
+        // Not suspect any more: it is not unreadable, it is not there.
+        self.clear_suspect(address);
+        let path = self.chunk_path(address);
+        let lanes = Arc::clone(&self.write_lanes);
+        let index = Arc::clone(&self.index);
+        let lane = shard_index(address);
+        let key = *address;
+        // The bump happens inside the closure, with the mutation it describes. The
+        // closure runs to completion on its own thread whether or not anyone is still
+        // awaiting it, so bumping after the await is skipped entirely when a shutdown
+        // drops the caller — and the index change it was meant to announce still lands.
+        // A cached pre-retirement proof would then stay valid over a store that had
+        // quietly lost a chunk.
+        let health = Arc::clone(&self.health);
+        self.blocking_tracker
+            .spawn_blocking(move || {
+                let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                if path.exists() {
+                    return false;
+                }
+                let forgotten = index.write().remove(&key);
+                if forgotten {
+                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                }
+                forgotten
+            })
+            .await
+            .unwrap_or(false)
     }
 
-    /// Close the legacy environment and remove it, returning the bytes freed.
+    /// Remove a chunk whose bytes do not match its name, and stop advertising it.
     ///
-    /// This is the only destructive step in the migration and the only one that cannot
-    /// be undone. It is also the only moment the disk comes back.
-    ///
-    /// Takes a [`VerifyReport`] rather than a flag so the verification pass cannot be
-    /// skipped: there is no way to call this without having produced one.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Storage`] if verification did not pass or no longer describes the
-    /// store, if a write has not reported back, if the handle is still shared (the caller
-    /// should retry on the next tick), or if the directory cannot be removed.
-    pub async fn retire_legacy<F>(
-        &self,
-        proof: &VerifyReport,
-        still_answerable: &F,
-        approved_to_shed: &BTreeSet<XorName>,
-    ) -> Result<u64>
-    where
-        F: Fn(&XorName) -> bool + Send + Sync,
-    {
-        self.proof_is_usable(proof)?;
-        // Rechecked here, not only by the caller. Everything between the caller's check
-        // and this point is a window: the verification pass alone can run for hours, and
-        // a write whose file half failed inserts a new legacy-only key in the meantime.
-        if let Some(reason) = self.retirement_blocker(still_answerable) {
-            return Err(Error::Storage(format!(
-                "Refusing to remove the legacy environment: {reason}"
-            )));
-        }
-        // Exclusive from here until the handle is out. Every read, write and delete holds
-        // this shared, so taking it means none is in progress and none can start: no
-        // reader is mid-way between discarding a corrupt file and reaching the copy that
-        // would replace it, and nothing new can start work in an environment that is about
-        // to go idle.
-        //
-        // Released as soon as the handle has been taken and the directory renamed away,
-        // which is the point after which nothing can reach the environment anyway. The
-        // deletion that follows can take a long time on a large store, and holding every
-        // chunk request on the node behind it would turn retirement into an outage.
-        //
-        let retiring = self.retirement.write().await;
-        // Asked again with the guard held, which is the only moment the answer cannot
-        // change underneath it. The check above can be overtaken by a read that fails
-        // between there and here.
-        if !proof.still_describes(&self.files) {
-            drop(retiring);
-            return Err(Error::Storage(
-                "Refusing to remove the legacy environment: a chunk stopped being \
-                 servable while retirement was starting. A fresh pass runs on the next \
-                 tick."
-                    .into(),
-            ));
-        }
-        let Some(legacy) = self.legacy() else {
-            return Ok(0);
-        };
-        let freed = self.legacy_bytes();
-        // Let go of our own clone straight away, so the only strong reference that should
-        // remain is the one the store itself holds.
-        drop(legacy);
-
-        for attempt in 0..RETIRE_UNWRAP_ATTEMPTS {
-            // Drained on every attempt, not once up front: `LmdbStorage`'s blocking
-            // closures capture a cloned `Env` rather than the `Arc`, so the strong count
-            // alone would not notice a read that is still mapped. The tracker does, and
-            // it reopens itself, so a read that started since the last drain needs
-            // another one.
-            if let Some(l) = self.legacy() {
-                l.lmdb.wait_idle().await;
-                drop(l);
-            }
-            // Taking the handle out and proving sole ownership happen in the same
-            // critical section. Deliberately not two steps: taking it first and putting
-            // it back on failure would leave a window in which reads see no legacy store
-            // and report a chunk that lives only there as missing.
-            let taken = {
-                let mut guard = self.legacy.write();
-                match guard.as_ref() {
-                    // A strong count of one means nobody else holds a handle, so nobody
-                    // can be reading the legacy store *or* mutating its key set. That is
-                    // what makes the final check below atomic with the removal: this is
-                    // the only moment at which the answer cannot change underneath us.
-                    Some(l) if Arc::strong_count(&l.lmdb) == 1 => {
-                        // Asked here, in the same critical section as the checks below
-                        // and immediately before the handle is taken. Asking earlier is
-                        // not enough: a write can announce itself under the shared guard,
-                        // be cancelled so the guard is released, and leave its blocking
-                        // half running past the drain above. Its note is the only thing
-                        // that says so, and dropping the journal with the environment
-                        // would take the evidence with it.
-                        if !l.pending.read().is_empty() {
-                            return Err(Error::Storage(
-                                "Refusing to remove the legacy environment: a write \
-                                 announced itself and has not reported back, so what the \
-                                 environment holds is not yet settled."
-                                    .into(),
-                            ));
+    /// Re-reads and re-verifies under the address's write lane first. A read that failed
+    /// verification is rare enough that paying for one extra read is worth never
+    /// discarding a chunk that a concurrent write had already repaired.
+    async fn quarantine_corrupt(&self, address: &XorName) {
+        let path = self.chunk_path(address);
+        let lanes = Arc::clone(&self.write_lanes);
+        let index = Arc::clone(&self.index);
+        let lane = shard_index(address);
+        let key = *address;
+        // For the reason given on `forget_if_absent`: this closure outlives its awaiter,
+        // and the change it makes has to be announced by the same thread that makes it.
+        let health = Arc::clone(&self.health);
+        // And the store-lock lease, for the reason `put`, `repair`, `delete` and the
+        // startup scan carry it: this closure outlives its awaiter, so without it a
+        // cancelled verification whose caller dropped the last `ChunkStore` would unlink
+        // inside a directory a second process had already been handed.
+        let lease = Arc::clone(&self.lock);
+        let outcome =
+            self.blocking_tracker
+                .spawn_blocking(move || -> std::io::Result<bool> {
+                    let _lease = lease;
+                    let _lane = lanes.get(lane).map(parking_lot::Mutex::lock);
+                    // Nothing is thrown away without proof. A re-read that fails says the
+                    // question could not be answered this time, not that the bytes are wrong,
+                    // and a repair may have published a good copy since the read that brought
+                    // us here. Treating either as corruption deletes a chunk this node has.
+                    let buf = match open_regular(&path) {
+                        Ok(Some(f)) => read_bounded(f, &path)
+                            .map_err(|e| std::io::Error::other(e.to_string()))?,
+                        Ok(None) => {
+                            index.write().remove(&key);
+                            health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                            return Ok(true);
                         }
-                        let only = l.only.read();
-                        // A count of one proves nobody else holds a handle, so nobody can
-                        // be mutating this set. That is what makes the two checks below
-                        // authoritative rather than a snapshot that has already moved.
-                        if let Some(key) = only.iter().find(|k| still_answerable(k)) {
-                            return Err(Error::Storage(format!(
-                                "Refusing to remove the legacy environment: chunk {} became \
-                                 answerable again while retirement was in progress",
-                                hex::encode(key)
-                            )));
-                        }
-                        // Only the keys the caller cleared may go. A write whose file half
-                        // failed adds a legacy-only key that is in no commitment, so the
-                        // answerability check above cannot see it, and it would otherwise
-                        // be destroyed without ever facing the rank, delivery or
-                        // possession gates.
-                        if let Some(key) = only.iter().find(|k| !approved_to_shed.contains(*k)) {
-                            return Err(Error::Storage(format!(
-                                "Refusing to remove the legacy environment: chunk {} entered \
-                                 the legacy-only set after the gates were cleared and has \
-                                 passed none of them",
-                                hex::encode(key)
-                            )));
-                        }
-                        drop(only);
-                        guard.take()
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    };
+                    if crate::client::compute_address(&buf) == key {
+                        // Repaired between the failing read and now. Leave it alone.
+                        return Ok(false);
                     }
-                    Some(_) => None,
-                    None => return Ok(0),
-                }
-            };
-            if let Some(Legacy {
-                lmdb,
-                only,
-                pending,
-                skipped_rollback_copies,
-            }) = taken
-            {
-                drop(only);
-                drop(pending);
-                drop(skipped_rollback_copies);
-                drop(lmdb);
-                return self.remove_legacy_dir(freed, retiring).await;
-            }
-            if attempt + 1 < RETIRE_UNWRAP_ATTEMPTS {
-                tokio::time::sleep(RETIRE_UNWRAP_BACKOFF).await;
-            }
-        }
-
-        // Nothing was taken and nothing will be this tick, so let the node get on with
-        // serving rather than leaving this held until the function returns.
-        drop(retiring);
-        Err(Error::Storage(
-            "Legacy environment is still being read; retirement deferred to the next tick".into(),
-        ))
-    }
-
-    /// Remove the legacy directory and record that the migration is over.
-    ///
-    /// The handle is already closed by the time this runs, so the node is file-only
-    /// either way. If the removal fails the phase still moves on, because there is no
-    /// going back to a half-removed environment, and the operator is told exactly which
-    /// directory to delete by hand to get the space back.
-    async fn remove_legacy_dir(
-        &self,
-        freed: u64,
-        retiring: tokio::sync::RwLockWriteGuard<'_, ()>,
-    ) -> Result<u64> {
-        // Renamed aside first, because `remove_dir_all` is not atomic: a failure partway
-        // through leaves a directory that can no longer be opened as an environment, and
-        // recording the migration as finished on top of that would have the node claim
-        // completion over a half-deleted store. A rename either happens or does not.
-        let tombstone = free_tombstone_path(&self.config.root_dir);
-
-        if let Err(e) = std::fs::rename(&self.legacy_env_dir, &tombstone) {
-            // Nothing was deleted, but the handle is already closed, so this node has
-            // stopped being able to serve anything that lives only in there. Put it back
-            // rather than carrying on with chunks it holds and cannot read, and rather
-            // than letting the next tick see no handle and call that success.
-            let restored = self.reopen_legacy().await;
-            return Err(Error::Storage(format!(
-                "Could not move the legacy environment {} aside: {e}. Nothing was deleted{}",
-                self.legacy_env_dir.display(),
-                if restored {
-                    " and it has been reopened, so the node keeps serving from both stores."
-                } else {
-                    ". IT COULD NOT BE REOPENED: this node cannot serve chunks that live                      only there until it is restarted."
-                }
-            )));
-        }
-        // The rename has to reach the directory itself, not just the page cache, and this
-        // one is not best effort. The tombstone is deleted a few lines below. If the
-        // rename has not reached the disk when that happens, a power loss brings the
-        // environment back under its old name with its contents already removed, and the
-        // next start finds a corrupt environment it cannot open. Stopping here instead
-        // leaves the tombstone in place, which the next start sweeps.
-        // Marked from the inside, now that the rename has succeeded and before anything
-        // is deleted. This is what a directory that reverts to its old name carries with
-        // it, and it is the only thing a later start treats as permission to delete.
-        if let Err(e) = mark_directory_retired(&tombstone) {
-            // Nothing has been deleted and the directory is intact, so put it back rather
-            // than recording the migration as finished over a store that is still there.
-            // Recording finished would be worse than it sounds: the next tick restores the
-            // unmarked directory to its own name, and a node that has already called
-            // itself file-only would then exit with a live environment on disk and no
-            // handle to it.
-            // Only when the mark is provably gone. A mark left inside would have the
-            // next cleanup pass reap a live, open environment.
-            let restored =
-                e.mark_definitely_gone && std::fs::rename(&tombstone, &self.legacy_env_dir).is_ok();
-            let reopened = restored && self.reopen_legacy().await;
-            return Err(Error::Storage(format!(
-                "Moved the legacy environment to {} but could not mark it retired: {e}. \
-                 Nothing was deleted{}",
-                tombstone.display(),
-                if reopened {
-                    ", and it has been put back, so the node keeps serving from both \
-                     stores and retirement is tried again."
-                } else if e.mark_definitely_gone {
-                    ". IT COULD NOT BE PUT BACK: this node cannot serve chunks that live \
-                     only there until it is restarted."
-                } else {
-                    ". It has been left where nothing will open it, because a partial \
-                     retirement mark may still be inside it. Its chunks are in the file \
-                     store; move it back by hand only after removing that mark."
-                }
-            )));
-        }
-
-        // Test-only: renamed aside and marked, nothing deleted yet. A process killed here
-        // is what the recovery on the next start exists for.
-        #[cfg(any(test, feature = "test-utils"))]
-        crate::storage::file_store::halt_here_if_asked(
-            crate::storage::file_store::HALT_AFTER_RETIRE_MARK,
-            &tombstone,
-        );
-
-        if let Err(e) = crate::storage::file_store::fsync_path(&self.config.root_dir) {
-            warn!(
-                "The legacy environment was moved aside but {} could not be flushed: {e}. \
-                 Leaving {} in place rather than deleting a directory whose new name may \
-                 not have reached the disk. The next start finishes this.",
-                self.config.root_dir.display(),
-                tombstone.display()
-            );
-            self.finish_migration();
-            return Ok(0);
-        }
-        self.finish_migration();
-
-        // From here nothing can reach the environment: its handle is gone and its
-        // directory is under a name no code looks for. Let the node serve again rather
-        // than holding every chunk request behind a deletion that can run for minutes.
-        drop(retiring);
-
-        // Only now, and best effort: the bytes come back when this completes, and if it
-        // does not the next start sweeps the tombstone.
-        //
-        // On a detached OS thread, and not awaited. This is a synchronous recursive delete
-        // of a directory that can hold hundreds of gigabytes and cannot be interrupted
-        // once it starts. Inside the migration task it would sit through shutdown's grace
-        // and past it, because an abort is not observed until the call returns; on the
-        // runtime's blocking pool a normal runtime shutdown would wait for it anyway. A
-        // plain thread is the only one the process can genuinely walk away from, and the
-        // directory carries its own retirement mark, so whatever is left is finished by
-        // the next start.
-        delete_retired_directory(tombstone);
-        Ok(freed)
-    }
-
-    /// Try again to open a legacy environment this node has lost its handle to.
-    ///
-    /// A rename that failed and then could not be reopened leaves the directory on disk
-    /// with no way to read it, and every chunk that lives only there unserved. Saying so
-    /// once and waiting for a restart is not enough: the reason is usually transient, and
-    /// a node that is otherwise healthy should not stay half-blind until somebody notices.
-    ///
-    /// Returns whether it came back. Does nothing when there is a handle already, or when
-    /// there is nothing on disk to open.
-    pub async fn recover_lost_legacy_handle(&self) -> bool {
-        if self.has_legacy() || !retirement_mark(&self.legacy_env_dir).permits_opening() {
-            return false;
-        }
-        if !legacy_present(&self.config.root_dir).unwrap_or(false) {
-            return false;
-        }
-        // Opened WITHOUT the exclusive guard. Opening scans every key in the environment,
-        // which on a large store is minutes, and every read and write on the node would
-        // wait behind it. Nothing else can be installing a handle: retirement does nothing
-        // while there is none, and this runs from the one migration task.
-        let (lmdb, legacy_keys) = match Self::open_legacy_env(&self.config).await {
-            Ok(opened) => opened,
-            Err(e) => {
+                    std::fs::remove_file(&path)?;
+                    // The same flush the ordinary delete does, for the same reason: an
+                    // unlink that has not reached the directory can be undone by a power
+                    // loss, and here the entry that comes back is one this node has proven
+                    // wrong. The startup scan would re-index it by name, and the
+                    // known-wrong mark that would otherwise hold it back lives only in
+                    // memory and does not survive the restart, so the node would go back to
+                    // claiming and committing to a chunk it already knows is bad.
+                    if let Some(shard) = path.parent() {
+                        fsync_dir_best_effort(shard);
+                    }
+                    index.write().remove(&key);
+                    health.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    Ok(true)
+                })
+                .await;
+        match outcome {
+            Ok(Ok(true)) => {
+                self.clear_known_wrong(address);
+                self.clear_suspect(address);
                 warn!(
-                    "Could not reopen {}: {e}. The chunks that live only there stay \
-                     unreadable until this succeeds.",
-                    self.legacy_env_dir.display()
+                    "Removed corrupt chunk file {}; replication will repair it",
+                    hex::encode(address)
                 );
-                return false;
             }
-        };
-        // Exclusive only to install it, which is instant.
-        let _recovering = self.retirement.write().await;
-        if self.has_legacy() {
-            return false;
-        }
-        // The diff happens HERE, not when the environment was read. Reading it takes
-        // minutes on a large store, and a verifying read in that time can find a file
-        // rotted and throw it away. With no handle installed there was nothing to put the
-        // key back into, so a set computed beforehand would be missing it, every gate
-        // would skip it, and retirement would destroy the intact copy in the environment.
-        // Under this guard no read, write or delete is in flight, so the file store's
-        // answer cannot move while it is being asked.
-        let only = Self::keys_only_in_legacy(&legacy_keys, &self.files);
-        *self.legacy.write() = Some(Legacy {
-            lmdb,
-            only: Arc::new(parking_lot::RwLock::new(only)),
-            skipped_rollback_copies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            pending: Arc::new(parking_lot::RwLock::new(BTreeMap::new())),
-        });
-        // A node that recorded itself file-only and then got an environment back has to
-        // go through the migration again from the start: the phase decides what the
-        // driver does, and file-only does no copying, so leaving it there would give the
-        // node a handle it never uses. Conservative on purpose; the copier finds most of
-        // the work already done.
-        if self.migration_phase() == MigrationPhase::FilesOnly {
-            warn!(
-                "Recovered a legacy chunk environment after recording this node as \
-                 file-only. Starting the migration again from the copying stage."
-            );
-            let mut state = self.state.write();
-            state.phase = MigrationPhase::Bridging;
-            state.committed_at_unix = None;
-            state.rebuilds_since_commit = 0;
-            let snapshot = state.clone();
-            drop(state);
-            if let Err(e) = snapshot.save(&self.config.root_dir) {
-                warn!("Could not persist the migration marker: {e}");
+            Ok(Ok(false)) => {
+                // The re-read hashed and matched: a repair landed between the failing
+                // read and this one.
+                self.clear_known_wrong(address);
+                self.clear_suspect(address);
+                debug!(
+                    "Chunk {} verified on re-read; leaving it in place",
+                    hex::encode(address)
+                );
             }
-        }
-        warn!(
-            "Reopened {} after losing its handle",
-            self.legacy_env_dir.display()
-        );
-        true
-    }
-
-    /// Is there a retired directory still waiting to be deleted?
-    ///
-    /// Separate from having a legacy environment: a node whose removal was interrupted has
-    /// no handle and nothing to migrate, but its disk has not come back. Something has to
-    /// keep trying during this uptime rather than leaving it until the next restart.
-    #[must_use]
-    pub fn has_cleanup_pending(&self) -> bool {
-        !retired_tombstones(&self.config.root_dir).is_empty()
-            || !retirement_mark(&self.legacy_env_dir).permits_opening()
-    }
-
-    /// Try again to finish a removal a previous attempt left behind.
-    ///
-    /// Safe to call at any time: it only ever moves or deletes a directory that carries
-    /// its own retirement mark.
-    pub fn retry_cleanup(&self) {
-        // Never while this node has the environment open. Cleanup decides what to do from
-        // the directory's own mark, and a mark that outlived a failed retirement would
-        // have it rename a live, mapped environment out from under the handle.
-        if self.has_legacy() {
-            sweep_retired_legacy(&self.config.root_dir);
-            return;
-        }
-        finish_interrupted_retirement(&self.config.root_dir);
-    }
-
-    /// Resolve writes whose outcome was never recorded.
-    ///
-    /// A write announces itself before it starts and clears the note when both halves
-    /// have returned. A note still there afterwards belongs to a write nobody waited for,
-    /// and only the disk can say what became of it: the file store has the chunk, or the
-    /// environment does and nothing else, or neither and there was never anything to
-    /// protect.
-    pub async fn reconcile_pending_writes(&self) {
-        if !self.has_pending_writes() {
-            return;
-        }
-        // Exclusively, and before the snapshot. Draining is not a barrier on its own:
-        // writes hold this shared, and a new one for the same key could announce itself,
-        // be cancelled, and leave its blocking half running while this decided the older
-        // one's fate and removed the single entry they share. Held here, nothing new can
-        // start, so what the disk says once the drain returns is final.
-        //
-        // Only reached when something is waiting, which after a clean run is never, so
-        // this is not a stall on the ordinary path.
-        let _settling = self.retirement.write().await;
-        let Some(legacy) = self.legacy() else {
-            return;
-        };
-        let waiting: Vec<XorName> = legacy.pending.read().keys().copied().collect();
-        if waiting.is_empty() {
-            return;
-        }
-        legacy.lmdb.wait_idle().await;
-        self.files.wait_idle().await;
-        for key in waiting {
-            let _lane = self.key_lock(&key).await;
-            if self.files.is_indexed(&key) {
-                legacy.only.write().remove(&key);
-                legacy.pending.write().remove(&key);
-                continue;
-            }
-            match legacy.lmdb.get_raw(&key).await {
-                Ok(Some(_)) => {
-                    debug!(
-                        "Chunk {} was written to the legacy environment by a call that \
-                         never returned; recording it so the copier picks it up",
-                        hex::encode(key)
-                    );
-                    legacy.only.write().insert(key);
-                    legacy.pending.write().remove(&key);
-                }
-                // Nothing behind it: there was never anything to protect.
-                Ok(None) => {
-                    legacy.pending.write().remove(&key);
-                }
-                // NOT the same as nothing behind it. Dropping the note on a read that
-                // failed would leave a committed write with no protection at all, which
-                // is the case this journal exists for. Keep it and ask again next tick;
-                // retirement stays vetoed meanwhile.
-                Err(e) => warn!(
-                    "Could not tell what became of the write for {}: {e}. Asking again on \
-                     the next tick.",
-                    hex::encode(key)
-                ),
-            }
-        }
-    }
-
-    /// Are there writes in flight whose outcome nothing has recorded?
-    #[must_use]
-    pub fn has_pending_writes(&self) -> bool {
-        self.legacy().is_some_and(|l| !l.pending.read().is_empty())
-    }
-
-    /// Is there anything at the legacy environment's path at all?
-    ///
-    /// Asked without a handle, and answered conservatively: a path this node cannot even
-    /// look at counts as present. The migration is not finished while something is there,
-    /// whether or not this node can currently read it.
-    #[must_use]
-    pub fn legacy_dir_is_on_disk(&self) -> bool {
-        // `symlink_metadata`, not `try_exists`, which follows links. An operator's link to
-        // storage that is not mounted right now reads as nothing at all through the
-        // second, and the node would call its migration finished and go file-only, blind
-        // to every chunk that lives only there until somebody restarts it.
-        match std::fs::symlink_metadata(&self.legacy_env_dir) {
-            Ok(_) => true,
-            // Only "it is not there" means it is not there. A permission change or a
-            // transient fault is an unanswered question, and answering it with "nothing
-            // here" is how the driver declares the migration finished over a store it has
-            // merely lost sight of.
-            Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-        }
-    }
-
-    /// Is the legacy environment a link this node must not delete?
-    ///
-    /// Copying out of it works; only the removal is refused. Callers use this to stop
-    /// waiting for a retirement that is never going to happen.
-    #[must_use]
-    pub fn legacy_is_a_link(&self) -> bool {
-        self.has_legacy() && is_a_link(&self.legacy_env_dir)
-    }
-
-    /// How many writes this node made without a rollback copy, cumulatively.
-    ///
-    /// Zero on a node that is not bridging, and zero on a bridging node whose environment
-    /// has room. A number that is climbing says this node would lose those chunks on a
-    /// rollback to a pre-migration build, which is a fleet question the second release
-    /// turns on and which a per-chunk log line cannot answer.
-    ///
-    /// Attempts rather than distinct chunks, for the reason given on the field: it is a
-    /// rate, not an inventory.
-    #[must_use]
-    pub fn writes_without_a_rollback_copy(&self) -> u64 {
-        self.legacy().map_or(0, |l| {
-            l.skipped_rollback_copies
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
-    }
-
-    /// Is there an environment on disk this node cannot classify at all?
-    ///
-    /// Neither removable nor openable, which is not a state waiting will clear: something
-    /// about the path has to change first, and until it does the node will refuse to touch
-    /// it in either direction. The driver treats this the way it treats a lost handle or a
-    /// link, by standing down from the shared volume and saying so where an operator looks,
-    /// because holding a disk exclusively to wait for a person is a disk nobody else can
-    /// use.
-    #[must_use]
-    pub fn legacy_cannot_be_classified(&self) -> bool {
-        retirement_mark(&self.legacy_env_dir) == RetirementMark::Unknown
-    }
-
-    /// Is there an environment on disk this node can no longer read?
-    #[must_use]
-    pub fn has_lost_its_legacy_handle(&self) -> bool {
-        !self.has_legacy()
-            && retirement_mark(&self.legacy_env_dir).permits_opening()
-            // Conservative in the same direction as the retirement blocker, which reads the
-            // same failure as "there is one". A question that cannot be answered is not an
-            // answer of no, and answering no here left the node holding the shared volume
-            // for the six-hour cap over work no amount of disk will finish.
-            && legacy_present(&self.config.root_dir).unwrap_or(true)
-    }
-
-    /// Reopen the legacy store after a failed retirement, so the node keeps serving.
-    ///
-    /// Returns whether it came back. The handle is closed before the rename is attempted,
-    /// so a rename that fails leaves the node holding chunks it can no longer read; that
-    /// is worth undoing rather than living with until the next restart.
-    async fn reopen_legacy(&self) -> bool {
-        if !legacy_present(&self.config.root_dir).unwrap_or(false) {
-            return false;
-        }
-        match Self::open_legacy(&self.config, &self.files).await {
-            Ok(legacy) => {
-                *self.legacy.write() = Some(legacy);
-                warn!("Reopened the legacy chunk environment after a failed retirement");
-                true
+            // Still indexed, so it must not still be claimed: the read that brought us
+            // here proved the bytes wrong, and the node would otherwise go on committing
+            // to a chunk it knows it cannot serve.
+            Ok(Err(e)) => {
+                self.mark_suspect(address);
+                warn!(
+                    "Corrupt chunk {} could not be removed: {e}. It stays on disk, and \
+                     this node stops answering for it.",
+                    hex::encode(address)
+                );
             }
             Err(e) => {
-                error!("Could not reopen the legacy chunk environment: {e}");
-                false
+                self.mark_suspect(address);
+                warn!("Corrupt-chunk removal task failed: {e}");
             }
         }
     }
-
-    /// Record that this node serves from files alone from here on.
-    fn finish_migration(&self) {
-        self.files.invalidate_capacity_cache();
-        {
-            let mut state = self.state.write();
-            state.phase = MigrationPhase::FilesOnly;
-        }
-        let snapshot = self.state.read().clone();
-        if let Err(e) = snapshot.save(&self.config.root_dir) {
-            warn!("Could not persist the migration marker: {e}");
-        }
-    }
 }
 
-/// What checking one chunk concluded.
-enum VerifyVerdict {
-    /// The file matches its name.
-    Intact,
-    /// The file was wrong and was rewritten from the legacy copy.
-    Repaired,
-    /// The file was wrong and could not be rewritten.
-    Unrepairable,
-    /// The file disappeared while the pass was running.
-    Vanished,
-}
+// ────────────────────────────────────────────────────────────────────────────
+// Free functions
+// ────────────────────────────────────────────────────────────────────────────
 
-/// One chunk's verification result.
-struct VerifyOutcome {
-    /// Bytes read, for the throttle.
-    bytes: u64,
-    /// What was concluded.
-    verdict: VerifyVerdict,
-}
-
-/// What the pre-retirement verification pass found.
+/// Create the destination shard directory if this store has not seen it yet.
 ///
-/// Every field is private, and the only way to obtain one is
-/// [`ChunkStore::verify_before_retire`]. That is deliberate: it is the sole evidence
-/// [`ChunkStore::retire_legacy`] accepts that the file store really holds what it claims,
-/// and a report anyone could construct would be no evidence at all.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct VerifyReport {
-    /// Whether the pass actually ran.
-    ran: bool,
-    /// Chunks re-hashed.
-    checked: u64,
-    /// Bytes read.
-    bytes: u64,
-    /// Chunks whose file was wrong and was rewritten from the legacy copy.
-    repaired: u64,
-    /// Chunks whose file was wrong and could not be repaired.
-    unrepairable: u64,
-    /// What the file store's health looked like when this pass finished.
-    ///
-    /// A clean report is reused for a while rather than re-read on every tick, and a lot
-    /// can happen in that window: a kept file can start failing to read while ordinary
-    /// requests are served from the legacy copy, and the node would then delete the
-    /// legacy copy on the strength of a pass that no longer describes the store. This is
-    /// how retirement tells, immediately before it deletes anything.
-    health: u64,
+/// A newly created directory entry is only durable once its parent is flushed; without
+/// that a crash could take the directory and the chunk inside it together.
+fn ensure_shard_dir(
+    chunks_dir: &Path,
+    dir: &Path,
+    shard: usize,
+    present: &parking_lot::Mutex<[bool; SHARD_COUNT]>,
+) -> Result<()> {
+    if present.lock().get(shard).copied().unwrap_or(false) {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| {
+        Error::Storage(format!(
+            "Failed to create shard directory {}: {e}",
+            dir.display()
+        ))
+    })?;
+    // Load-bearing, like the flush that publishes a chunk into this directory. Until the
+    // parent is flushed the shard's own entry can be lost, and losing it loses every chunk
+    // inside it. Reporting the shard present anyway would let the very first chunk written
+    // into it count as durably stored.
+    fsync_dir(chunks_dir).map_err(|e| {
+        Error::Storage(format!(
+            "Created shard directory {} but could not flush {}: {e}. Not marking the shard \
+             usable, because a directory that is not durable cannot hold a chunk that is.",
+            dir.display(),
+            chunks_dir.display()
+        ))
+    })?;
+    if let Some(slot) = present.lock().get_mut(shard) {
+        *slot = true;
+    }
+    Ok(())
 }
 
-impl VerifyReport {
-    /// Whether this report clears the way for retirement.
-    #[must_use]
-    pub fn is_clean(&self) -> bool {
-        self.ran && self.unrepairable == 0
-    }
+/// Shard directory index for an address: its last byte.
+fn shard_index(address: &XorName) -> usize {
+    address.last().copied().unwrap_or(0) as usize
+}
 
-    /// Does this report still describe the store?
-    #[must_use]
-    fn still_describes(&self, files: &FileStore) -> bool {
-        self.health == files.health_generation()
-    }
+/// Shard directory name for an address: the last two characters of its hex form.
+fn shard_name(address: &XorName) -> String {
+    format!("{:02x}", shard_index(address))
+}
 
-    /// Chunks re-hashed.
-    #[must_use]
-    pub fn checked(&self) -> u64 {
-        self.checked
-    }
+/// True for a string of hex digits in either case.
+fn is_hex_any_case(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
 
-    /// Chunks rewritten from the legacy copy.
-    #[must_use]
-    pub fn repaired(&self) -> u64 {
-        self.repaired
-    }
-
-    /// Chunks that could not be made good.
-    #[must_use]
-    pub fn unrepairable(&self) -> u64 {
-        self.unrepairable
+/// Move an entry aside under a name that can never be read as a chunk.
+fn quarantine_entry(path: &Path) {
+    let aside = path.with_extension("not-a-chunk");
+    match std::fs::rename(path, &aside) {
+        Ok(()) => warn!(
+            "Chunk store: moved {} aside to {}; a name that differs from a chunk name only \
+             by case collides with it on Windows and macOS",
+            path.display(),
+            aside.display()
+        ),
+        Err(e) => warn!(
+            "Chunk store: {} collides with a chunk name by case folding and could not be \
+             moved aside: {e}. Rename or delete it.",
+            path.display()
+        ),
     }
 }
 
-/// Mark a retired environment directory as retired, from the inside, durably.
+/// True for a string of lowercase hex digits only.
+fn is_lower_hex(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Decode a filename back into the address it names, or `None` if it is not one.
 ///
-/// Called only after the directory has already been renamed aside, so it can never land
-/// inside a live environment. See [`RETIRED_MARKER`] for why it goes inside.
+/// Rejects uppercase deliberately. On a case-folding filesystem (NTFS, default APFS)
+/// accepting both cases would let one file answer to two index entries.
+fn decode_chunk_name(name: &str) -> Option<XorName> {
+    if name.len() != CHUNK_NAME_LEN || !is_lower_hex(name) {
+        return None;
+    }
+    let bytes = hex::decode(name).ok()?;
+    XorName::try_from(bytes.as_slice()).ok()
+}
+
+/// Flush a directory and report whether it worked, for callers outside this module.
+///
+/// For the one caller whose next step is destructive: retirement moves the legacy
+/// environment aside and then deletes it under its new name, so if the rename has not
+/// reached the disk when the delete lands, a power loss brings the environment back under
+/// its old name with its contents gone.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Storage`] if it cannot be created or flushed.
-fn mark_directory_retired(dir: &Path) -> std::result::Result<(), MarkFailure> {
-    match write_retirement_mark(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if e.pre_existing => {
-            // Nothing here was created by this attempt, so there is nothing to take back.
-            // Removing a mark that was already there because re-flushing it failed is how
-            // a correctly retired directory comes to look unmarked, and an unmarked
-            // directory is restored as a live environment.
-            Err(MarkFailure {
-                pre_existing: true,
-                ..e
-            })
+/// Returns the underlying I/O error. Off Unix there is no way to flush a directory through
+/// the standard library, so this reports success without being able to promise anything.
+pub fn fsync_path(path: &Path) -> std::io::Result<()> {
+    fsync_dir(path)
+}
+
+/// Flush a directory so a rename or creation inside it survives power loss.
+///
+/// Best effort by design. Linux and XFS require it, macOS accepts it with undocumented
+/// effect, and Windows offers no way to do it at all through the standard library. The
+/// content is content-addressed and re-replicable, so a lost directory entry costs a
+/// refetch rather than data. Pretending otherwise in the code would be dishonest.
+#[cfg(unix)]
+fn fsync_dir_best_effort(path: &Path) {
+    if let Err(e) = fsync_dir(path) {
+        debug!("Directory flush of {} failed: {e}", path.display());
+    }
+}
+
+/// Flush a directory, reporting whether it worked.
+///
+/// Used where the answer is load-bearing: a chunk copied out of the legacy store is only
+/// durable once its directory entry is, and that copy is what permits the legacy store to
+/// be deleted.
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> std::io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+/// Off Unix there is no way to flush a directory through the standard library, so this
+/// reports success without being able to promise anything.
+///
+/// That is why the publish path off Unix does not use a rename at all: it creates the
+/// chunk under its final name and flushes the file, which Microsoft documents as flushing
+/// the creation metadata with it. Directory creation has no equivalent, so the guarantee
+/// there rests on the pre-retirement pass, which re-reads every chunk before the legacy
+/// store is deleted, and on the operator gate that keeps retirement off a platform until
+/// forced power loss has been shown to hold old-or-new on it.
+///
+/// Returns a `Result` so the callers that must handle a flush failure on Unix read the
+/// same on every platform.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)]
+fn fsync_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// No-op on platforms with no way to flush a directory handle.
+#[cfg(not(unix))]
+fn fsync_dir_best_effort(_path: &Path) {}
+
+/// Warn if the deepest chunk path this store can produce is close to `MAX_PATH`.
+#[cfg(windows)]
+fn check_path_budget(chunks_dir: &Path) {
+    // Measured absolute, because that is what the filesystem sees. A relative root is the
+    // case that still fails hard at MAX_PATH, since the standard library's long-path
+    // handling only applies to paths it resolves as absolute.
+    let absolute = if chunks_dir.is_absolute() {
+        chunks_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_or_else(|_| chunks_dir.to_path_buf(), |cwd| cwd.join(chunks_dir))
+    };
+    // `{chunks_dir}\{xy}\{64 hex}` — two separators, two shard characters, 64 name
+    // characters.
+    let deepest = absolute.as_os_str().len() + 1 + 2 + 1 + CHUNK_NAME_LEN;
+    if deepest > WINDOWS_PATH_WARN_LEN {
+        warn!(
+            "Chunk file paths will be {deepest} characters, close to the {} character \
+             Windows limit. Move the node root closer to the drive letter if writes start \
+             failing.",
+            WINDOWS_PATH_WARN_LEN
+        );
+    }
+}
+
+/// No-op where path length is not a practical constraint.
+#[cfg(not(windows))]
+fn check_path_budget(_chunks_dir: &Path) {}
+
+/// Write `bytes` to `path` durably, for small metadata files outside the shard tree.
+///
+/// # Errors
+///
+/// Returns [`Error::Storage`] if the file cannot be written or published.
+pub fn write_file_durably(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_file_atomic(path, bytes)
+}
+
+/// Write `bytes` to `path` so a reader sees either the old content or the new.
+/// Is this the exact name [`write_file_atomic`] gives its temporaries?
+///
+/// `.tmp.<pid>.<8 hex>.marker`, with both middle parts checked. Matching on the prefix and
+/// suffix alone would also take `.tmp.operator-notes.marker`, and this runs over a
+/// directory holding a node's data, so what it removes is not a place to be approximate.
+fn is_marker_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMP_PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".marker") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pid), Some(nonce), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && nonce.len() == 8
+        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Remove marker temporaries a previous run left beside `path`.
+///
+/// [`write_file_atomic`] writes its temporary next to its target. For the layout marker
+/// that is inside `chunks/`, which the startup scan sweeps; for the migration marker it is
+/// the node root, which nothing sweeps, so a crash between the write and the rename leaves
+/// one there for the life of the node. Each is a few hundred bytes, so this is inodes
+/// rather than capacity, but nothing else was ever going to remove them.
+///
+/// Only the exact shape this module writes, and only files: a name has to carry the temp
+/// prefix and the marker suffix. Anything broader would be this function deciding what
+/// else in a node's root directory is rubbish, which is not its business.
+///
+/// Best effort throughout. Failing to tidy up is not a reason to refuse to start, and the
+/// caller takes the store lock before this runs, so there is no other process whose live
+/// temporary this could take.
+pub(crate) fn sweep_marker_temps(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !is_marker_temp_name(name) {
+            continue;
         }
-        Err(e) => {
-            // A half-written mark is worse than none: the caller puts the directory back
-            // under the live name and reopens it, and a mark left inside would have the
-            // next cleanup pass reap a live, open environment. If it cannot be taken away,
-            // say so, and the caller keeps the directory where nothing will open it.
-            let path = dir.join(RETIRED_MARKER);
-            match std::fs::remove_file(&path) {
-                Ok(()) => {}
-                Err(gone) if gone.kind() == std::io::ErrorKind::NotFound => {}
-                Err(stuck) => {
-                    return Err(MarkFailure {
-                        reason: format!(
-                            "{e}. The partial mark at {} could not be removed either \
-                             ({stuck})",
-                            path.display()
-                        ),
-                        mark_definitely_gone: false,
-                        pre_existing: false,
-                    })
-                }
-            }
-            if let Err(flush) = crate::storage::file_store::fsync_path(dir) {
-                return Err(MarkFailure {
-                    reason: format!(
-                        "{e}. Removing the partial mark at {} could not be flushed \
-                         ({flush})",
-                        path.display()
-                    ),
-                    mark_definitely_gone: false,
-                    pre_existing: false,
-                });
-            }
-            Err(MarkFailure {
-                reason: format!("{e}"),
-                mark_definitely_gone: true,
-                pre_existing: false,
-            })
+        if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => debug!(
+                "Swept a leftover marker temporary {}",
+                entry.path().display()
+            ),
+            Err(e) => debug!("Could not sweep {}: {e}", entry.path().display()),
         }
     }
 }
 
-/// Why a directory could not be marked retired, and whether it is safe to reopen.
-#[derive(Debug)]
-struct MarkFailure {
-    /// What went wrong, for the operator.
-    reason: String,
-    /// Is the directory provably free of a partial mark?
-    ///
-    /// Only then may the caller put it back under the live name. A mark left inside would
-    /// have the next cleanup pass reap a live, open environment.
-    mark_definitely_gone: bool,
-    /// Was the mark already there before this attempt?
-    ///
-    /// Then this attempt created nothing and must take nothing away. Removing a mark that
-    /// was already there because re-flushing it failed is how a correctly retired
-    /// directory comes to look unmarked, and an unmarked directory is restored as a live
-    /// environment.
-    pre_existing: bool,
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let Some(dir) = path.parent() else {
+        return Err(Error::Storage(format!(
+            "Refusing to write {} — it has no parent directory",
+            path.display()
+        )));
+    };
+    let temp = dir.join(format!(
+        "{TEMP_PREFIX}{}.{:08x}.marker",
+        std::process::id(),
+        rand::random::<u32>()
+    ));
+    write_temp(&temp, bytes)?;
+    // Through the retry, because these small files (the layout marker, the migration
+    // state) are rewritten while the node runs, and on Windows a scanner holding a handle
+    // for a few milliseconds turns an ordinary rewrite into a hard failure.
+    rename_with_retry(&temp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&temp);
+        Error::Storage(format!("Failed to publish {}: {e}", path.display()))
+    })?;
+    fsync_dir_best_effort(dir);
+    Ok(())
 }
 
-impl std::fmt::Display for MarkFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.reason)
+/// Read the layout marker, writing the current one if the store is new.
+fn read_or_write_layout(chunks_dir: &Path) -> Result<StoreLayout> {
+    let path = chunks_dir.join(LAYOUT_FILE_NAME);
+    match read_small_file(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            Error::Storage(format!(
+                "Chunk store layout marker {} is unreadable: {e}. Refusing to open rather \
+                 than guess the layout.",
+                path.display()
+            ))
+        }),
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            if store_has_entries(chunks_dir) {
+                warn!(
+                    "Chunk store at {} has data but no layout marker. Adopting it under \
+                     the current scheme, which is the only one this build implements. If \
+                     it was written by a build with a different layout its chunks will \
+                     appear to be missing.",
+                    chunks_dir.display()
+                );
+            }
+            let layout = StoreLayout::default();
+            let bytes = serde_json::to_vec_pretty(&layout)
+                .map_err(|e| Error::Storage(format!("Failed to encode chunk store layout: {e}")))?;
+            write_file_atomic(&path, &bytes)?;
+            debug!("Wrote chunk store layout marker to {}", path.display());
+            Ok(layout)
+        }
+        Err(e) => Err(Error::Storage(format!(
+            "Failed to read chunk store layout marker {}: {e}",
+            path.display()
+        ))),
     }
 }
 
-/// Create the mark. See [`mark_directory_retired`], which owns the failure handling.
-fn write_retirement_mark(dir: &Path) -> std::result::Result<(), MarkFailure> {
-    let path = dir.join(RETIRED_MARKER);
-    let mut file = match std::fs::OpenOptions::new()
+/// Whether the store directory already holds at least one shard.
+fn store_has_entries(chunks_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(chunks_dir) else {
+        return false;
+    };
+    entries.filter_map(std::result::Result::ok).any(|e| {
+        e.file_name()
+            .to_str()
+            .is_some_and(|n| n.len() == 2 && is_lower_hex(n))
+    })
+}
+
+/// Largest a metadata marker may be before it is treated as corrupt.
+const MAX_MARKER_BYTES: u64 = 64 * 1024;
+
+/// Read a small metadata file, refusing an implausibly large one.
+///
+/// The chunk path is bounded for exactly this reason; the markers live in the same data
+/// directory and deserve the same ceiling.
+///
+/// # Errors
+///
+/// Returns an I/O error, including `NotFound`, so callers can distinguish "no marker yet".
+pub fn read_small_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    let read = file.take(MAX_MARKER_BYTES + 1).read_to_end(&mut bytes)?;
+    if read as u64 > MAX_MARKER_BYTES {
+        return Err(std::io::Error::other(format!(
+            "{} is larger than the {MAX_MARKER_BYTES} byte limit for a marker file",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Take the store lock, or refuse to open the store.
+///
+/// Both failures are refusals, deliberately. Unlike LMDB, which was genuinely
+/// multi-process safe, two of these stores on one directory keep independent in-memory
+/// indices, independent views of what is in flight, and independent opinions about
+/// whether the legacy environment may be deleted: both would report the same write as
+/// new and each would keep serving keys the other had deleted. A node that cannot create
+/// the lock file has no way to know it is alone, and this is the one migration where
+/// being wrong about that destroys data.
+///
+/// The lock is an [`Arc`] so the work that relies on it can hold a lease. The startup
+/// scan sweeps interrupted writes on the strength of being alone in the directory, and it
+/// runs on a thread that outlives the future that started it.
+///
+/// # Errors
+///
+/// Returns [`Error::Storage`] when another process owns the directory, or when the lock
+/// file cannot be created.
+fn acquire_store_lock(chunks_dir: &Path) -> Result<Arc<File>> {
+    let path = chunks_dir.join(LOCK_FILE_NAME);
+    let file = match OpenOptions::new()
         .write(true)
-        .create_new(true)
+        .create(true)
+        .truncate(false)
         .open(&path)
     {
         Ok(f) => f,
-        // Already there, from an attempt that got this far and no further. Flushed
-        // again rather than taken on trust: the attempt that wrote it may have been the
-        // one that could not flush it.
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Something is already at that name. That it could not be created is not the
-            // same as its being a mark this node can read, and everything downstream
-            // deletes an environment on the strength of it. The rest of this file insists
-            // the name is not the evidence; this is the one place that was taking it.
-            if retirement_mark(dir) != RetirementMark::Present {
-                return Err(MarkFailure {
-                    reason: format!(
-                        "{} already exists but cannot be read as a retirement mark, so it \
-                         is not one this node will delete on. Check what is at that path.",
-                        path.display()
-                    ),
-                    mark_definitely_gone: false,
-                    pre_existing: true,
-                });
-            }
-            return crate::storage::file_store::fsync_path(dir).map_err(|flush| MarkFailure {
-                reason: format!(
-                    "{} is already there but could not be flushed: {flush}",
-                    path.display()
-                ),
-                mark_definitely_gone: false,
-                pre_existing: true,
-            });
-        }
+        // Not a warning and carry on. Without this lock two processes can open the same
+        // directory, each with its own index, its own view of what is in flight, and its
+        // own opinion about whether the legacy environment may be deleted. A node that
+        // cannot take it has no way to know it is alone, and this is the one migration
+        // where being wrong about that destroys data.
         Err(e) => {
-            return Err(MarkFailure {
-                reason: format!("Could not mark {} as retired: {e}", path.display()),
-                mark_definitely_gone: true,
-                pre_existing: false,
-            })
+            return Err(Error::Storage(format!(
+                "Could not create the chunk store lock {}: {e}. Refusing to start: \
+                 without it this node cannot tell whether another is using the same data \
+                 directory. Fix the permissions on that path, or remove a stale lock file \
+                 left by a different user.",
+                path.display()
+            )))
         }
     };
-    // For whoever reads the directory. To the node, presence is the whole signal.
-    if let Err(e) = file.write_all(
-        b"This chunk environment was verified as fully copied into the file store and \n\
-retired. It is being deleted; if it is still here, that was interrupted and the next \n\
-node start finishes it. Nothing needs it.\n",
-    ) {
-        drop(file);
-        return Err(MarkFailure {
-            reason: format!("Could not write {}: {e}", path.display()),
-            mark_definitely_gone: false,
-            pre_existing: false,
-        });
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(Arc::new(file)),
+        Err(e) => Err(Error::Storage(format!(
+            "Another process already has the chunk store at {} open ({e}). Two nodes \
+             cannot share one data directory: each keeps its own index and they would \
+             disagree about what is stored. Stop the other node first.",
+            chunks_dir.display()
+        ))),
     }
-    file.sync_all().map_err(|e| MarkFailure {
-        reason: format!(
-            "Could not flush {}: {e}. Not deleting on the strength of a mark that may not \
-             survive a power loss.",
-            path.display()
-        ),
-        mark_definitely_gone: false,
-        pre_existing: false,
+}
+
+/// What a startup scan found.
+struct ScanResult {
+    /// Every published address, ascending.
+    keys: Vec<XorName>,
+    /// Which shard directories already exist.
+    shards_present: [bool; SHARD_COUNT],
+    /// Orphaned temp files removed.
+    swept_temps: usize,
+    /// Entries that were neither a chunk nor one of ours.
+    skipped: usize,
+}
+
+/// Rebuild the key set from directory entries.
+///
+/// Reads names only. A `stat` per entry costs about ten times the enumeration on Linux
+/// and macOS and fifty to sixty times on Windows, and buys nothing: the filename is the
+/// key, and the content is verified on read.
+fn scan_store(chunks_dir: &Path) -> Result<ScanResult> {
+    let mut result = ScanResult {
+        keys: Vec::new(),
+        shards_present: [false; SHARD_COUNT],
+        swept_temps: 0,
+        skipped: 0,
+    };
+
+    let top = std::fs::read_dir(chunks_dir).map_err(|e| {
+        Error::Storage(format!(
+            "Failed to enumerate chunk store {}: {e}",
+            chunks_dir.display()
+        ))
     })?;
-    // And the directory that now contains it. Flushing the file makes its contents
-    // durable; the entry naming it is in the directory, and on Unix that needs its own
-    // flush. Without this the mark can be missing after a crash from a directory that
-    // was in fact retired, which is the whole question this file answers.
-    crate::storage::file_store::fsync_path(dir).map_err(|e| MarkFailure {
-        reason: format!(
-            "Marked {} retired but could not flush {}: {e}. Not deleting on the strength \
-             of a mark that may not survive a power loss.",
-            path.display(),
-            dir.display()
-        ),
-        mark_definitely_gone: false,
-        pre_existing: false,
-    })
-}
 
-/// Delete a retired directory in the background, without anything waiting for it.
-///
-/// The caller is finished with it either way: the environment is closed, the directory is
-/// under a name nothing looks for, and it carries its own mark, so an interrupted deletion
-/// is finished by the next start. What matters is that neither shutdown nor startup ever
-/// blocks on a recursive delete that can run for minutes.
-fn delete_retired_directory(dir: PathBuf) {
-    // One at a time per directory. The driver asks for cleanup on every tick while
-    // anything is pending, and starting a fresh thread each time would leave hundreds of
-    // them asleep on the same path, all retrying the same failure.
-    if !REAPING.lock().insert(dir.clone()) {
-        return;
-    }
-    let named = dir.clone();
-    let started = std::thread::Builder::new()
-        .name("chunk-store-retire".into())
-        .spawn(move || {
-            let _done = ReapingGuard(dir.clone());
-            for attempt in 1..=RETIRED_DELETE_ATTEMPTS {
-                match remove_marked_directory(&dir) {
-                    Ok(()) => {
-                        info!(
-                            migration_event = "space_returned",
-                            "Removed the retired chunk environment {} and returned its \
-                             space",
-                            dir.display()
-                        );
-                        return;
-                    }
-                    // Worth another go: on Windows a scanner or an antivirus can hold a
-                    // handle inside it for a moment, and a partial delete leaves less to
-                    // do next time.
-                    Err(e) if attempt < RETIRED_DELETE_ATTEMPTS => {
-                        debug!(
-                            "Could not delete {} (attempt {attempt}): {e}. Trying again.",
-                            dir.display()
-                        );
-                        std::thread::sleep(
-                            (RETIRED_DELETE_BACKOFF * attempt).min(RETIRED_DELETE_BACKOFF_MAX),
-                        );
-                    }
-                    Err(e) => warn!(
-                        "The chunk environment has been retired but {} could not be \
-                         deleted: {e}. Its space is not returned until it is, and the node \
-                         needs nothing from it. The next start tries again.",
-                        dir.display()
-                    ),
-                }
-            }
-        });
-    if let Err(e) = started {
-        REAPING.lock().remove(&named);
-        warn!(
-            "Could not start the thread to delete the retired chunk environment {}: {e}. \
-             The next start sweeps it.",
-            named.display()
-        );
-    }
-}
-
-/// Directories a reaper thread is already working on.
-static REAPING: parking_lot::Mutex<BTreeSet<PathBuf>> = parking_lot::Mutex::new(BTreeSet::new());
-
-/// Releases a directory from [`REAPING`] however its thread ends.
-struct ReapingGuard(PathBuf);
-
-impl Drop for ReapingGuard {
-    fn drop(&mut self) {
-        REAPING.lock().remove(&self.0);
-    }
-}
-
-/// Delete a retired directory, taking its mark away last of all.
-///
-/// `remove_dir_all` walks in whatever order the filesystem hands back, so it can unlink
-/// the mark and then fail on the next entry, which is exactly what a Windows sharing
-/// violation on the data file produces. What is left is a genuinely retired, partly
-/// deleted directory carrying no evidence that it was retired, and the next start would
-/// read that as an intact environment and restore it.
-///
-/// Emptying it first and removing the mark last means the mark is only ever absent from a
-/// directory that has nothing else left in it.
-///
-/// # Errors
-///
-/// Returns the underlying I/O error. The directory is left with its mark intact on every
-/// failure that happens before the mark is reached.
-fn remove_marked_directory(dir: &Path) -> std::io::Result<()> {
-    // Never through a link. An operator who points the chunk environment at another
-    // volume leaves a symlink here, and walking it would delete the contents of a
-    // directory that is not this node's to delete. Retirement refuses such a root before
-    // it gets this far; this is the second line, because the check and the walk are not
-    // one operation.
-    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
-        return Err(std::io::Error::other(format!(
-            "{} is a link, not a directory. Refusing to delete through it.",
-            dir.display()
-        )));
-    }
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_name() == RETIRED_MARKER {
+    for entry in top {
+        let entry = entry.map_err(|e| {
+            Error::Storage(format!(
+                "Failed to read an entry of {}: {e}",
+                chunks_dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            result.skipped = result.skipped.saturating_add(1);
+            continue;
+        };
+        if name == LAYOUT_FILE_NAME || name == LOCK_FILE_NAME {
             continue;
         }
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            std::fs::remove_dir_all(&path)?;
-        } else {
-            std::fs::remove_file(&path)?;
+        if name.starts_with(TEMP_PREFIX) {
+            if sweep_temp(&entry.path()) {
+                result.swept_temps = result.swept_temps.saturating_add(1);
+            }
+            continue;
         }
+        if name.len() != 2 || !is_lower_hex(name) {
+            warn!(
+                "Chunk store: ignoring unexpected entry {name} in {}",
+                chunks_dir.display()
+            );
+            result.skipped = result.skipped.saturating_add(1);
+            continue;
+        }
+        let Ok(shard) = u8::from_str_radix(name, 16) else {
+            result.skipped = result.skipped.saturating_add(1);
+            continue;
+        };
+        // `shards_present` is set inside `scan_shard`, on success only. Setting it from
+        // the name alone would make a stray regular file called `ab` look like a shard
+        // that already exists, and every write to that shard would then fail with a
+        // misleading error until the node was restarted.
+        scan_shard(&entry.path(), shard, &mut result)?;
     }
-    match std::fs::remove_file(dir.join(RETIRED_MARKER)) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    match std::fs::remove_dir(dir) {
-        Ok(()) => Ok(()),
+
+    result.keys.sort_unstable();
+    result.keys.dedup();
+    Ok(result)
+}
+
+/// Scan one shard directory into `result`.
+fn scan_shard(dir: &Path, shard: u8, result: &mut ScanResult) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        // A stray file named like a shard, or a directory removed between the two reads.
+        // Neither is fatal, and neither marks the shard as present.
+        Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            warn!(
+                "Chunk store: {} is not a shard directory ({e}); ignoring it",
+                dir.display()
+            );
+            result.skipped = result.skipped.saturating_add(1);
+            return Ok(());
+        }
+        // Anything else is a real fault: a permission problem, exhausted descriptors, or
+        // failing hardware. Opening with a shard's worth of keys silently missing would
+        // make the node under-claim in its published commitment and stop serving chunks
+        // it still holds and is answerable for, so refuse to open at all.
         Err(e) => {
-            // The mark is gone and the directory is not, which is the one state the whole
-            // scheme says cannot happen: a start that found it would read an unmarked
-            // directory as an intact environment. Put the mark back before giving up.
-            if let Err(remark) = mark_directory_retired(dir) {
-                error!(
-                    "Could not remove {} ({e}) and could not restore its retirement mark \
-                     ({remark}). It is empty and nothing needs it; delete it by hand.",
+            return Err(Error::Storage(format!(
+                "Failed to enumerate shard {}: {e}. Refusing to open with an incomplete \
+                 key set.",
+                dir.display()
+            )))
+        }
+    };
+    if let Some(slot) = result.shards_present.get_mut(shard as usize) {
+        *slot = true;
+    }
+
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| Error::Storage(format!("Failed to read {}: {e}", dir.display())))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            result.skipped = result.skipped.saturating_add(1);
+            continue;
+        };
+        if name.starts_with(TEMP_PREFIX) {
+            if sweep_temp(&entry.path()) {
+                result.swept_temps = result.swept_temps.saturating_add(1);
+            }
+            continue;
+        }
+        let Some(key) = decode_chunk_name(name) else {
+            if name.len() == CHUNK_NAME_LEN && is_hex_any_case(name) {
+                // A case-folded twin of a real chunk name. On NTFS and default APFS the
+                // existence check in the write path folds onto it, so a paid write would
+                // be answered "already stored" and its bytes dropped. Move it aside.
+                quarantine_entry(&entry.path());
+            } else {
+                warn!(
+                    "Chunk store: ignoring non-chunk entry {name} in {}",
                     dir.display()
                 );
             }
-            Err(e)
-        }
-    }
-}
-
-/// What a directory's own contents say about whether it was retired.
-///
-/// Three answers, not two. Reading the mark can fail for reasons that are neither yes nor
-/// no: a permission change, a descriptor limit, a filesystem that has gone away underneath
-/// the node. Folding that into "no" is the failure mode the rest of this file exists to
-/// avoid, and it fails in the worst direction: a retired environment that reads as unmarked
-/// is put back under the live name and reopened, and its keys re-enter a commitment they
-/// have already left.
-///
-/// So an unreadable answer is its own answer, and the two questions callers actually ask
-/// are asked separately. Neither of them treats "cannot tell" as permission.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RetirementMark {
-    /// The directory carries its mark. It is the remains of a removal.
-    Present,
-    /// The directory carries no mark, and that is known rather than assumed.
-    Absent,
-    /// Whether it carries one could not be determined.
-    Unknown,
-}
-
-impl RetirementMark {
-    /// May this directory be deleted, or treated as already gone?
-    ///
-    /// Only a mark actually read says yes. Deleting on a guess destroys chunks.
-    const fn permits_removal(self) -> bool {
-        matches!(self, Self::Present)
-    }
-
-    /// May this directory be opened and served from?
-    ///
-    /// Only a mark known to be absent says yes. Opening a retired environment puts keys
-    /// back into a commitment they have already left.
-    const fn permits_opening(self) -> bool {
-        matches!(self, Self::Absent)
-    }
-}
-
-/// Has this directory been retired?
-///
-/// A link is never treated as retired, whatever it points at: the mark would have been
-/// written through it into somebody else's directory, and acting on it would delete
-/// somebody else's data. A path whose kind cannot be determined is not a link either way,
-/// and is reported as unknown rather than as a link, so that neither question gets a yes.
-fn retirement_mark(dir: &Path) -> RetirementMark {
-    match std::fs::symlink_metadata(dir) {
-        Ok(meta) if meta.file_type().is_symlink() => return RetirementMark::Absent,
-        Ok(_) => {}
-        // Nothing here at all, which is the ordinary case on a node that has already
-        // finished or never had a legacy store. There is no mark because there is nothing
-        // to carry one, and that is known rather than undetermined.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return RetirementMark::Absent,
-        Err(e) => {
-            // Debug, not warn: this is asked on every tick, so a warn here would be a
-            // wall of the same line. The operator-facing version is the retirement
-            // blocker, which says what it means for the node.
-            debug!(
-                "Could not tell what {} is ({e}); treating it as neither removable nor \
-                 openable until it can be read",
-                dir.display()
-            );
-            return RetirementMark::Unknown;
-        }
-    }
-    match dir.join(RETIRED_MARKER).try_exists() {
-        Ok(true) => RetirementMark::Present,
-        Ok(false) => RetirementMark::Absent,
-        Err(e) => {
-            debug!(
-                "Could not read the retirement mark in {} ({e}); treating it as neither \
-                 removable nor openable until it can be read",
-                dir.display()
-            );
-            RetirementMark::Unknown
-        }
-    }
-}
-
-/// Is this path a symbolic link, or something whose kind cannot be determined?
-///
-/// Unknown counts as yes. Every caller is deciding whether it is safe to delete through
-/// the path, and a question that cannot be answered is not a yes to that.
-fn is_a_link(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).map_or(true, |m| m.file_type().is_symlink())
-}
-
-/// Finish a removal a previous run did not, before anything tries to open the environment.
-///
-/// The only thing that counts as evidence is the directory's own mark. An open that fails
-/// is not: `open_legacy` queries free space, maps the file, takes a write transaction and
-/// scans every key, so a full disk, a permission change, a mapping limit or a transient
-/// I/O fault all look identical to corruption, and deleting on any of those would destroy
-/// a perfectly good environment.
-fn finish_interrupted_retirement(root_dir: &Path) -> LiveEnvironment {
-    let env = root_dir.join(LEGACY_ENV_DIR);
-    // Three answers, three branches. Asking only whether it may be removed and letting
-    // everything else fall through would put "cannot tell" back on the opening path, which
-    // is the whole failure this is three states to avoid: the mark check can fail for a
-    // moment and succeed the next, and the open in between would resurrect a store that
-    // really had been retired.
-    //
-    // Asked of the mark alone, with no separate "is it there" first. A `try_exists` that
-    // could not answer would have folded straight back into "nothing here" and skipped both
-    // branches below, which is the same fold one level up. The mark already tells the three
-    // apart: a path that is not there carries no mark and says so, and a path that cannot be
-    // reached at all says it cannot be reached.
-    // Asked once. Asking twice is asking two different questions: the answer can change
-    // between them, and a second answer of "cannot tell" after a first of "retired" fell
-    // through to opening the very directory the first answer said not to open.
-    let mark = retirement_mark(&env);
-    if mark == RetirementMark::Unknown {
-        error!(
-            "{} is under the live name and this node cannot tell whether it was retired. \
-             It will NOT be opened and it will NOT be removed. The node serves from files \
-             alone. Check that the directory and anything inside it can be read.",
-            env.display()
-        );
-        return LiveEnvironment::None;
-    }
-    if mark.permits_removal() {
-        // Its own contents say it was retired, so whatever name it is wearing now, it is
-        // the remains of a removal that a power loss undid the rename of.
-        warn!(
-            "{} carries its own retirement mark, so it is what an interrupted removal left \
-             behind rather than a live environment. Finishing that removal.",
-            env.display()
-        );
-        // Renamed rather than deleted here, so the node can get on with starting: the
-        // deletion itself is detached below and can take minutes on a large store. Under a
-        // name nothing else is using, so a tombstone whose deletion is still running does
-        // not force a synchronous delete first.
-        let tombstone = free_tombstone_path(root_dir);
-        if let Err(e) = std::fs::rename(&env, &tombstone) {
-            error!(
-                "{} carries its own retirement mark but could not be moved aside: {e}. It \
-                 will NOT be opened: it says it has been retired, so it may be partly \
-                 deleted, and its chunks are in the file store. The node serves from files \
-                 alone and the next start tries again.",
-                env.display()
-            );
-            sweep_retired_legacy(root_dir);
-            return LiveEnvironment::None;
-        }
-    }
-    sweep_retired_legacy(root_dir);
-    LiveEnvironment::WhateverIsOnDisk
-}
-
-/// Whether the ordinary open may look at what is under the live environment name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LiveEnvironment {
-    /// Nothing is claiming it should not be opened.
-    WhateverIsOnDisk,
-    /// A directory under the live name says it has been retired, and could not be moved
-    /// out of the way. It must not be opened: a retired directory may be partly deleted,
-    /// and opening it would put its keys back into a commitment they have left.
-    None,
-}
-
-fn sweep_retired_legacy(root_dir: &Path) {
-    let tombstones = retired_tombstones(root_dir);
-    if tombstones.is_empty() {
-        return;
-    }
-    // Flushed first, and only best effort is not good enough here for the same reason it
-    // was not good enough when the rename was made: deleting the contents of a directory
-    // whose new name may not have reached the disk is what turns a power loss into a
-    // resurrected, half-empty environment. If it cannot be flushed, leave them for a later
-    // start. It costs disk, not data.
-    if let Err(e) = crate::storage::file_store::fsync_path(root_dir) {
-        warn!(
-            "Leaving {} retired chunk environment(s) in place: {} could not be flushed \
-             ({e}), so the rename that put them there may not be on disk yet.",
-            tombstones.len(),
-            root_dir.display()
-        );
-        return;
-    }
-    for tombstone in tombstones {
-        // The name is not the evidence. Only the directory's own mark is: a crash between
-        // the rename and the mark leaves an intact environment sitting under the retired
-        // name, and deleting that because of what it is called would destroy every chunk
-        // in it.
-        let mark = retirement_mark(&tombstone);
-        if mark == RetirementMark::Unknown {
-            // Neither restored nor deleted. Restoring would put a directory that may be
-            // half-deleted back under the live name for the next start to open, and
-            // deleting would destroy an intact one. It costs disk until somebody looks,
-            // which is the right price for not knowing.
-            warn!(
-                "{} cannot be classified: this node cannot tell whether it carries a \
-                 retirement mark, so it will be neither restored nor deleted. Check that \
-                 the directory and anything inside it can be read.",
-                tombstone.display()
-            );
+            result.skipped = result.skipped.saturating_add(1);
             continue;
-        }
-        if mark.permits_removal() {
-            // The mark is re-established before anything is deleted on the strength of
-            // it. A retirement that failed part-way can leave one that was never flushed,
-            // and this is the pass that would otherwise act on it thirty seconds after
-            // the failure that said it would be left alone.
-            if let Err(e) = mark_directory_retired(&tombstone) {
+        };
+        // `file_type` comes from the directory entry itself on Linux and macOS and from
+        // the enumeration on Windows, so this is not the per-entry `stat` the scan
+        // deliberately avoids. A pipe, socket, device or directory wearing a chunk name
+        // must never enter the index: nothing downstream can read it, and it would sit in
+        // the published commitment forever.
+        match entry.file_type() {
+            Ok(kind) if kind.is_file() => {}
+            Ok(_) => {
                 warn!(
-                    "{} says it was retired but that could not be confirmed ({e}). \
-                     Leaving it.",
-                    tombstone.display()
+                    "Chunk store: {name} in {} is not a regular file; ignoring it",
+                    dir.display()
                 );
+                result.skipped = result.skipped.saturating_add(1);
                 continue;
             }
-            // Detached, so a node starting beside a large leftover directory serves
-            // immediately rather than waiting out a recursive delete before it opens its
-            // store.
-            delete_retired_directory(tombstone);
+            // Not the same as knowing it is not a file. Treating an unanswered question
+            // as a no would drop a real chunk from the index and from the commitment
+            // while its bytes sit on disk, and the node would not serve it again until
+            // some later restart happened to succeed. Fail the scan instead: an index
+            // that is missing keys must never be published as this node's key set.
+            Err(e) => {
+                return Err(Error::Storage(format!(
+                    "Could not tell what {name} in {} is: {e}. Refusing to publish an \
+                     index that may be missing chunks.",
+                    dir.display()
+                )));
+            }
+        }
+        // A file in the wrong shard is unreachable through `chunk_path`, so indexing it
+        // would make the index claim a key the read path cannot find.
+        if shard_index(&key) != shard as usize {
+            warn!(
+                "Chunk store: {name} is filed under shard {shard:02x} but belongs in {:02x}; \
+                 ignoring it. Move it or delete it.",
+                shard_index(&key)
+            );
+            result.skipped = result.skipped.saturating_add(1);
             continue;
         }
-        restore_unmarked_environment(root_dir, &tombstone);
+        result.keys.push(key);
     }
+    Ok(())
 }
 
-/// Put an intact environment back under its own name.
+/// Remove one orphaned temp file. Returns whether it went.
 ///
-/// An environment under the retired name with no mark inside it was renamed and then
-/// interrupted before it could be marked. Nothing was deleted, so it is whole, and the
-/// answer is to give it its name back and let the migration run again from the beginning:
-/// every gate is re-derived, and a second retirement costs a pass, not data.
-fn restore_unmarked_environment(root_dir: &Path, tombstone: &Path) {
-    // An empty one is what a deletion that removed the contents and the mark and then
-    // could not remove the directory leaves. There is nothing in it to restore, and
-    // putting it back under the live name would strand an empty path the node then tries
-    // to open.
-    if std::fs::read_dir(tombstone).is_ok_and(|mut entries| entries.next().is_none()) {
-        if let Err(e) = std::fs::remove_dir(tombstone) {
-            warn!("Could not remove the empty {}: {e}", tombstone.display());
-        }
-        return;
-    }
-    let env = root_dir.join(LEGACY_ENV_DIR);
-    if env.try_exists().unwrap_or(true) {
-        // Both names are taken, so which one the node should serve is not this code's
-        // decision to make.
-        error!(
-            "{} and {} both exist, and {} carries no retirement mark, so it may hold \
-             chunks. Neither has been touched. Move or remove one by hand: the node is \
-             using {}.",
-            env.display(),
-            tombstone.display(),
-            tombstone.display(),
-            env.display()
-        );
-        return;
-    }
-    match std::fs::rename(tombstone, &env) {
+/// Always removed. The scan that calls this runs only after the store lock has been taken,
+/// so by then any temp file is an interrupted write of a previous run and there is no other
+/// process that could be writing it. This used to describe a second, gentler mode for the
+/// unlocked case; there was never any such branch and there is no caller that would need
+/// one.
+fn sweep_temp(path: &Path) -> bool {
+    match std::fs::remove_file(path) {
         Ok(()) => {
-            let _ = crate::storage::file_store::fsync_path(root_dir);
-            warn!(
-                "{} was moved aside for retirement but never marked retired, so it is \
-                 intact. It has been restored to {} and the migration starts again.",
-                tombstone.display(),
-                env.display()
-            );
+            debug!("Removed orphaned temporary file {}", path.display());
+            true
         }
-        Err(e) => error!(
-            "{} carries no retirement mark, so it may hold chunks, but it could not be \
-             restored to {}: {e}. It has not been deleted.",
-            tombstone.display(),
-            env.display()
-        ),
+        Err(e) => {
+            debug!("Could not remove {}: {e}", path.display());
+            false
+        }
     }
 }
 
-/// Every retired environment directory under `root_dir`.
+/// Open a chunk file, refusing anything that is not a regular file.
 ///
-/// More than one can be there: a node that retires, is restarted before the deletion
-/// finishes, and somehow acquires another environment would leave the first behind. Each
-/// is named so it cannot collide with the next.
-fn retired_tombstones(root_dir: &Path) -> Vec<PathBuf> {
-    let prefix = format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}");
-    let entries = match std::fs::read_dir(root_dir) {
-        Ok(entries) => entries,
+/// `Ok(None)` means the file is not there. A named pipe wearing a valid chunk name would
+/// otherwise block the opening thread forever: `open` on a FIFO with no writer does not
+/// return, and enough of them would exhaust the blocking pool and stall every file and
+/// database operation in the process. `O_NOFOLLOW` refuses a symlink for the same reason,
+/// and both are checked on the handle rather than the path, so nothing can be swapped
+/// underneath between the check and the open.
+fn open_regular(path: &Path) -> Result<Option<File>> {
+    #[cfg(unix)]
+    let opened = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let opened = OpenOptions::new().read(true).open(path);
+
+    let file = match opened {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            // Cannot tell. Not the same as nothing here, and the caller uses this to
-            // decide whether cleanup is finished, so answer with the one that keeps it
-            // looking rather than the one that declares victory.
-            warn!(
-                "Could not list {} to look for retired chunk environments: {e}",
-                root_dir.display()
-            );
-            return vec![root_dir.join(&prefix)];
+            return Err(Error::Storage(format!(
+                "Failed to open chunk file {}: {e}",
+                path.display()
+            )))
         }
     };
-    let mut found = Vec::new();
-    for entry in entries {
-        match entry {
-            Ok(entry) => {
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| n.starts_with(&prefix))
-                {
-                    found.push(entry.path());
-                }
-            }
-            // One unreadable entry is not evidence there is nothing here, and the caller
-            // uses this to decide whether cleanup is finished. Answer with the one that
-            // keeps it looking.
-            Err(e) => {
-                warn!(
-                    "Could not read an entry of {} while looking for retired chunk \
-                     environments: {e}",
-                    root_dir.display()
-                );
-                found.push(root_dir.join(&prefix));
-            }
-        }
+    let is_regular = file.metadata().is_ok_and(|m| m.file_type().is_file());
+    if !is_regular {
+        return Err(Error::Storage(format!(
+            "{} is not a regular file; refusing to read it as a chunk",
+            path.display()
+        )));
     }
-    found
+    Ok(Some(file))
 }
 
-/// A directory name to retire the environment under that nothing else is using.
+/// Read a chunk file, refusing anything larger than a chunk can legitimately be.
 ///
-/// A fixed name would collide with a tombstone whose deletion is still running, and
-/// clearing that one first would put a synchronous recursive delete back on the path this
-/// is trying to keep clear.
-fn free_tombstone_path(root_dir: &Path) -> PathBuf {
-    let base = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-    if !base.try_exists().unwrap_or(true) {
-        return base;
+/// A corrupt, sparse, or locally planted file wearing a valid 64-hex name would
+/// otherwise be read straight into memory, so a single bad entry could exhaust the node
+/// during an ordinary GET or an audit response.
+fn read_bounded(file: File, path: &Path) -> Result<Vec<u8>> {
+    let ceiling = MAX_CHUNK_SIZE as u64;
+    let mut buf = Vec::new();
+    let read = file.take(ceiling + 1).read_to_end(&mut buf).map_err(|e| {
+        Error::Storage(format!("Failed to read chunk file {}: {e}", path.display()))
+    })?;
+    if read as u64 > ceiling {
+        return Err(Error::Storage(format!(
+            "Chunk file {} is larger than the {ceiling} byte maximum; refusing to read it",
+            path.display()
+        )));
     }
-    for n in 1..=MAX_TOMBSTONES {
-        let candidate = root_dir.join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.{n}"));
-        if !candidate.try_exists().unwrap_or(true) {
-            return candidate;
-        }
-    }
-    // Every name taken, which means many retirements have been interrupted without their
-    // deletions finishing. Reuse the base: the rename fails, retirement defers, and the
-    // operator sees a directory full of them.
-    base
+    Ok(buf)
 }
 
-/// Whether a legacy environment is on disk under `root_dir`.
+/// Whether a Windows error is one a scanner or indexer holding a handle would produce.
+///
+/// `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`, `ERROR_LOCK_VIOLATION`. Every other
+/// failure is deterministic and retrying it only burns a blocking thread.
+fn is_windows_sharing_violation(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Publish `temp_path` as `final_path`, retrying a transient sharing violation.
+///
+/// On Windows an antivirus scanner or the search indexer can hold a handle to either
+/// file for a few milliseconds after it is created, and `MoveFileEx` fails outright
+/// rather than queueing. Retrying a bounded number of times turns that from a failed
+/// write into a short pause. Every other error returns immediately.
+fn rename_with_retry(temp_path: &Path, final_path: &Path) -> std::io::Result<()> {
+    let mut last = match std::fs::rename(temp_path, final_path) {
+        Ok(()) => return Ok(()),
+        Err(e) => e,
+    };
+    if !cfg!(windows) || !is_windows_sharing_violation(&last) {
+        return Err(last);
+    }
+    for attempt in 1..=RENAME_RETRY_ATTEMPTS {
+        std::thread::sleep(RENAME_RETRY_BACKOFF * attempt);
+        match std::fs::rename(temp_path, final_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// Write `payload` and publish it as `final_path`, replacing whatever is there.
+///
+/// Success here means the bytes are durable, not merely written. The repair path this
+/// serves runs during the pre-retirement pass, where a chunk that fails to match its
+/// address is rewritten from the legacy store and the legacy store is then deleted. A
+/// replacement that a power loss can undo would leave that chunk with the wrong bytes and
+/// no other copy.
+fn write_and_replace(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    shard: &Path,
+) -> Result<()> {
+    // Unix: an intra-directory rename is atomic, so a reader sees the old content or the
+    // new one and never an absence, and the directory flush is what makes it durable.
+    #[cfg(unix)]
+    {
+        write_temp(temp_path, payload)?;
+        if let Err(e) = rename_with_retry(temp_path, final_path) {
+            let _ = std::fs::remove_file(temp_path);
+            return Err(Error::Storage(format!(
+                "Failed to replace chunk {}: {e}",
+                final_path.display()
+            )));
+        }
+        fsync_dir(shard).map_err(|e| {
+            Error::Storage(format!(
+                "Replaced {} but could not flush {}: {e}. Not reporting the repair as \
+                 done, because a rewrite that is not durable must not authorise deleting \
+                 the copy it was rewritten from.",
+                final_path.display(),
+                shard.display()
+            ))
+        })?;
+        Ok(())
+    }
+    // Everywhere else, Windows included: there is no way to flush a directory through the
+    // standard library, so a rename cannot be shown to be durable at return. Overwriting
+    // the existing file changes no directory entry at all, and `sync_all` (FlushFileBuffers
+    // on Windows) is documented to flush the file's data, so a successful return is
+    // durable under a documented contract.
+    //
+    // The cost is that this is not atomic: a crash part-way leaves the file holding a mix
+    // of old and new bytes. That is safe here and only here, because the only caller that
+    // matters runs before the legacy store is deleted, and a crash means no report was
+    // produced and nothing was deleted. The next start re-reads the file, sees it does not
+    // match its address, and repairs it again from the store that is still there.
+    #[cfg(not(unix))]
+    {
+        let _ = temp_path;
+        let _ = shard;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(final_path)
+            .map_err(|e| {
+                Error::Storage(format!(
+                    "Failed to open {} for replacement: {e}",
+                    final_path.display()
+                ))
+            })?;
+        file.write_all(payload).map_err(|e| {
+            Error::Storage(format!("Failed to rewrite {}: {e}", final_path.display()))
+        })?;
+        file.sync_all().map_err(|e| {
+            Error::Storage(format!(
+                "Rewrote {} but could not flush it: {e}. Not reporting the repair as \
+                 done, because a rewrite that is not durable must not authorise deleting \
+                 the copy it was rewritten from.",
+                final_path.display()
+            ))
+        })?;
+        Ok(())
+    }
+}
+
+/// Create `temp_path`, write `payload` into it, and flush it.
+///
+/// Flushed before any rename. On ext4 `auto_da_alloc` only orders the data before the
+/// rename's own commit; it does not make the data durable, and btrfs has been observed
+/// reordering. A name must never become visible on bytes that are not on the platter.
+fn write_temp(temp_path: &Path, payload: &[u8]) -> Result<()> {
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .map_err(|e| {
+            Error::Storage(format!(
+                "Failed to create temporary file {}: {e}",
+                temp_path.display()
+            ))
+        })?;
+    if let Err(e) = f.write_all(payload) {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(Error::Storage(format!(
+            "Failed to write {}: {e}",
+            temp_path.display()
+        )));
+    }
+    if let Err(e) = f.sync_all() {
+        let _ = std::fs::remove_file(temp_path);
+        return Err(Error::Storage(format!(
+            "Failed to flush {}: {e}",
+            temp_path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Write `payload` and publish it under `final_path`.
+///
+/// The temp lives in the destination directory, so the publish is an intra-directory
+/// rename: atomic on every filesystem we support, and needing only that one directory
+/// Put `payload` on disk as `final_path`, durably.
+///
+/// Returns [`PutOutcome::Duplicate`] when the name is already taken. The name is a hash
+/// of the content, so that is not treated as proof the bytes are right: the caller
+/// re-reads and verifies them.
+#[cfg(unix)]
+fn publish(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    shard: &Path,
+) -> std::result::Result<PutOutcome, PublishFailed> {
+    // On Unix nothing is ever created under the final name by a failing path: the bytes go
+    // to a temporary and only a successful rename gives them the real name. So every
+    // failure here leaves the name as it found it.
+    publish_via_rename(temp_path, final_path, payload, shard)
+        .map_err(PublishFailed::nothing_written)
+}
+
+/// Put `payload` on disk as `final_path`, durably. See [`publish_in_place`] for why this
+/// takes a different route off Unix.
+#[cfg(not(unix))]
+fn publish(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    shard: &Path,
+) -> std::result::Result<PutOutcome, PublishFailed> {
+    let _ = temp_path;
+    let _ = shard;
+    publish_in_place(final_path, payload)
+}
+
+/// Create the chunk under its final name and flush it. Everywhere but Unix.
+///
+/// There is no way to flush a directory through the standard library, and Microsoft does
+/// not document `MoveFileEx` as durable at return unless it is called with
+/// `MOVEFILE_WRITE_THROUGH`, which std does not use. So off Unix a rename cannot be
+/// relied on to have reached the disk before the legacy store is deleted.
+///
+/// Creating the file under its final name sidesteps the rename entirely. Microsoft
+/// documents that creation metadata is cached and that `FlushFileBuffers`, which
+/// `sync_all` calls on Windows, is the way to flush it. So a successful create, write and
+/// flush is a durable publication under a documented contract, with no directory flush
+/// and no rename involved.
+///
+/// The cost is that a crash mid-write leaves a partial file wearing a real chunk name.
+/// That is why a duplicate re-reads and verifies rather than trusting the name, and why
+/// the pre-retirement pass re-hashes everything before anything is deleted.
+#[cfg(not(unix))]
+fn publish_in_place(
+    final_path: &Path,
+    payload: &[u8],
+) -> std::result::Result<PutOutcome, PublishFailed> {
+    // Test-only, and here rather than after the write so that it means the same thing on
+    // both platforms: the file half of a dual write has not happened yet. On Unix the
+    // equivalent point is the temporary file written and the rename not yet made, which is
+    // also before the chunk's name exists on disk. Stopping after the write instead would
+    // put the file under its real name already, so a crash there is not between the two
+    // halves at all, and it could not demonstrate anything about the missing flush either:
+    // killing a process does not empty the page cache, so the bytes are still there to be
+    // read. Only losing power loses them, which no test that kills a process can stage.
+    #[cfg(any(test, feature = "test-utils"))]
+    halt_here_if_asked(HALT_BEFORE_PUBLISH, final_path);
+    let mut file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(final_path)
+    {
+        Ok(f) => f,
+        // Someone got there first. Immutable content under a content-addressed name, so
+        // the caller verifies what is already there rather than assuming it is right.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => return Ok(PutOutcome::Duplicate),
+        Err(e) => {
+            // Nothing was created, so nothing was spent.
+            return Err(PublishFailed::nothing_written(Error::Storage(format!(
+                "Failed to create chunk {}: {e}",
+                final_path.display()
+            ))));
+        }
+    };
+    if let Err(e) = file.write_all(payload) {
+        drop(file);
+        // Taken back if it can be. Whether it could is what the caller needs: the file
+        // was created by this call, so if it is still there the space is spent.
+        let left_behind = std::fs::remove_file(final_path).is_err();
+        return Err(PublishFailed {
+            error: Error::Storage(format!("Failed to write {}: {e}", final_path.display())),
+            left_behind,
+        });
+    }
+    if let Err(e) = file.sync_all() {
+        drop(file);
+        // Taken back if it can be. Whether it could is what the caller needs: the file
+        // was created by this call, so if it is still there the space is spent.
+        let left_behind = std::fs::remove_file(final_path).is_err();
+        return Err(PublishFailed {
+            error: Error::Storage(format!("Failed to flush {}: {e}", final_path.display())),
+            left_behind,
+        });
+    }
+    Ok(PutOutcome::New)
+}
+
+/// Write a temp beside the target and rename it into place. Unix only.
+///
+/// Places the bytes and nothing more. Making the name durable is
+/// [`flush_publication`]'s job, kept separate so a caller can tell a publish that spent no
+/// space from one that spent it and could not be reported.
+#[cfg(unix)]
+fn publish_via_rename(
+    temp_path: &Path,
+    final_path: &Path,
+    payload: &[u8],
+    _shard: &Path,
+) -> Result<PutOutcome> {
+    // Content is immutable and the name is its hash, so an existing file already holds
+    // exactly these bytes. Skipping the write is both cheaper and safer than replacing
+    // it: on Windows a rename over a file another thread has open fails outright.
+    //
+    // The caller flushes either way. A name that is already there is not proof it is
+    // durable:
+    // the write that put it there may have been this store's own previous attempt, whose
+    // rename landed and whose directory flush then failed. That attempt returned an
+    // error, so nothing was retired on the strength of it, but if this call reported a
+    // durable duplicate without flushing, the retry would silently launder an unflushed
+    // rename into a copy that authorises deleting the last other one.
+    let outcome = if final_path.exists() {
+        PutOutcome::Duplicate
+    } else {
+        write_temp(temp_path, payload)?;
+        // Test-only: the one moment a complete chunk exists on disk under a name nothing
+        // looks for. A crash test needs to die at a named point rather than wherever a
+        // sleep in another process happened to land.
+        #[cfg(any(test, feature = "test-utils"))]
+        halt_here_if_asked(HALT_BEFORE_PUBLISH, temp_path);
+        match rename_with_retry(temp_path, final_path) {
+            Ok(()) => PutOutcome::New,
+            Err(e) => {
+                let _ = std::fs::remove_file(temp_path);
+                // Another writer of the same address won the race, or the destination was
+                // open. Either way the bytes are already published.
+                if !final_path.exists() {
+                    return Err(Error::Storage(format!(
+                        "Failed to publish chunk {}: {e}",
+                        final_path.display()
+                    )));
+                }
+                PutOutcome::Duplicate
+            }
+        }
+    };
+
+    Ok(outcome)
+}
+
+/// A publish that failed, and whether it left its bytes on the disk.
+///
+/// The second half is the point. A failure before anything was created has spent nothing;
+/// one that created the file and then could not remove it again has spent the space, and
+/// whoever is accounting for free space has to know which happened. Only the code that did
+/// the creating can say.
+struct PublishFailed {
+    error: Error,
+    left_behind: bool,
+}
+
+impl PublishFailed {
+    /// A failure that created nothing.
+    fn nothing_written(error: Error) -> Self {
+        Self {
+            error,
+            left_behind: false,
+        }
+    }
+}
+
+/// Make a publication durable by flushing the directory its name lives in.
+///
+/// Separate from placing the bytes, because the caller has to tell the two failures apart.
+/// A publish that fails before the bytes land has spent nothing; one that fails here has
+/// spent the space and must not be reported as stored, so whoever is accounting for free
+/// space has to charge it while whoever is accounting for chunks must not count it.
+///
+/// NOT best effort. The directory flush is what makes the rename durable, and a copy
+/// reported successful is what authorises deleting the only other copy. Swallowing the
+/// failure would let a power loss discard the directory entry after the legacy store had
+/// already been removed.
 ///
 /// # Errors
 ///
-/// Returns [`Error::Storage`] if the answer cannot be determined. `Path::exists` would
-/// turn a permission problem into "absent", and a node that starts in file-only mode
-/// beside a `chunks.mdb` holding every chunk it has stops serving all of them.
-pub fn legacy_present(root_dir: &Path) -> Result<bool> {
-    let path = root_dir.join(LEGACY_ENV_DIR).join(LEGACY_DATA_FILE);
-    path.try_exists().map_err(|e| {
+/// Returns [`Error::Storage`] if the directory cannot be flushed.
+#[cfg(unix)]
+fn flush_publication(final_path: &Path, shard: &Path) -> Result<()> {
+    fsync_dir(shard).map_err(|e| {
         Error::Storage(format!(
-            "Cannot tell whether the legacy chunk environment {} exists: {e}. Refusing to \
-             start rather than ignore it.",
-            path.display()
+            "Published {} but could not flush {}: {e}. Not reporting this chunk as stored, \
+             because a copy that is not durable must not authorise deleting another.",
+            final_path.display(),
+            shard.display()
         ))
     })
 }
 
-/// How long to sleep after copying `bytes` to hold the copier to a rate ceiling.
-fn throttle_delay(bytes: u64, mib_per_sec: u64) -> Option<Duration> {
-    if mib_per_sec == 0 {
-        return None;
-    }
-    let per_sec = mib_per_sec.saturating_mul(1024 * 1024);
-    if per_sec == 0 {
-        return None;
-    }
-    let micros = bytes.saturating_mul(1_000_000) / per_sec;
-    if micros == 0 {
-        None
-    } else {
-        Some(Duration::from_micros(micros))
-    }
-}
-
-/// Merge two ascending key sequences into one, dropping duplicates.
-fn merge_sorted<'a, I>(sorted: &[XorName], other: I) -> Vec<XorName>
-where
-    I: Iterator<Item = &'a XorName>,
-{
-    let other: Vec<XorName> = other.copied().collect();
-    let mut out = Vec::with_capacity(sorted.len() + other.len());
-    let mut a = sorted.iter().copied().peekable();
-    let mut b = other.into_iter().peekable();
-    loop {
-        match (a.peek(), b.peek()) {
-            (Some(x), Some(y)) => match x.cmp(y) {
-                std::cmp::Ordering::Less => out.extend(a.next()),
-                std::cmp::Ordering::Greater => out.extend(b.next()),
-                std::cmp::Ordering::Equal => {
-                    out.extend(a.next());
-                    let _ = b.next();
-                }
-            },
-            (Some(_), None) => out.extend(a.next()),
-            (None, Some(_)) => out.extend(b.next()),
-            (None, None) => break,
-        }
-    }
-    out
+/// Nothing to do off Unix, where the chunk is created under its final name and flushed
+/// with `sync_all`, which is documented to carry its creation metadata with it, and where
+/// there is no way to flush a directory at all.
+#[cfg(not(unix))]
+fn flush_publication(_final_path: &Path, _shard: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::storage::migration::{now_unix, rank_closest_first, MIN_RETIRE_DELAY_HOURS};
+    use std::collections::HashSet;
+
+    /// A directory flush that fails must say so.
+    ///
+    /// The quiet version of this function is only used where the answer does not change
+    /// what happens next. On the publish path it does.
+    #[cfg(unix)]
+    #[test]
+    fn flushing_a_directory_that_is_not_there_reports_the_failure() {
+        let dir = TempDir::new().expect("temp dir");
+        assert!(fsync_dir(dir.path()).is_ok());
+        assert!(fsync_dir(&dir.path().join("no-such-shard")).is_err());
+    }
+
+    /// A chunk whose directory entry was never flushed is not reported as stored.
+    ///
+    /// This is the whole safety argument for retirement: the legacy store is deleted
+    /// because every chunk was copied durably. A published file whose directory flush
+    /// failed can vanish on power loss, so counting it as copied would lose data. The
+    /// file staying on disk afterwards is fine, the next pass republishes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_publish_whose_directory_flush_fails_is_not_reported_as_stored() {
+        let dir = TempDir::new().expect("temp dir");
+        let temp_path = dir.path().join("chunk.tmp");
+        let final_path = dir.path().join("chunk");
+        let unflushable = dir.path().join("shard-that-does-not-exist");
+
+        // Asserted in two steps, not chained. Chaining them means a regression in placing
+        // the bytes also produces an error, and the test passes without the flush ever
+        // being reached: it would be checking that something went wrong rather than that
+        // this went wrong.
+        let placed = publish_via_rename(&temp_path, &final_path, b"payload", &unflushable);
+        assert!(
+            placed.is_ok(),
+            "the bytes must be placed before this can be about the flush: {:?}",
+            placed.err()
+        );
+        let outcome = flush_publication(&final_path, &unflushable);
+
+        assert!(
+            outcome.is_err(),
+            "an unflushed publication must not be reported as stored"
+        );
+        assert!(
+            !temp_path.exists(),
+            "the temp file must not be left behind either way"
+        );
+    }
+
     use tempfile::TempDir;
 
-    /// Everything currently legacy-only, as the set a test has "approved" for shedding.
-    fn approved_shed(store: &ChunkStore) -> BTreeSet<XorName> {
-        store.legacy_only_keys().into_iter().collect()
+    /// Open a store on a fresh temp directory with the disk reserve disabled.
+    async fn test_store() -> (ChunkStore, TempDir) {
+        let dir = TempDir::new().expect("temp dir");
+        let store = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("open store");
+        (store, dir)
     }
 
-    /// A token that is never cancelled, for tests that are not exercising shutdown.
-    fn never_cancelled() -> CancellationToken {
-        CancellationToken::new()
+    /// Open a store on an existing directory, as a restart would.
+    async fn reopen(dir: &TempDir) -> ChunkStore {
+        ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: 0,
+        })
+        .await
+        .expect("reopen store")
     }
 
-    /// Put a store through every gate a real node passes before it may retire.
+    /// An ordinary read settles whether the node answers for a chunk.
     ///
-    /// Deliberately not a shortcut around them: `retire_legacy` rechecks the whole set
-    /// itself, so a test that skipped them would exercise a path production never takes.
-    fn open_the_retirement_gate(store: &ChunkStore) {
-        store.commit_to_files().expect("commit");
-        store.note_commitment_rebuilt();
-        store.note_commitment_rebuilt();
-        store.force_migration_state(|s| {
-            s.committed_at_unix =
-                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
-        });
+    /// Not only the reads that were checking something. A read that failed means the
+    /// chunk cannot be served, whoever asked; a read that worked means it can be. Deciding
+    /// this anywhere else leaves a key stuck unadvertised after the fault has cleared, or
+    /// advertised after it has not.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_ordinary_read_decides_whether_the_node_answers_for_a_chunk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("read-decides");
+        store.put(&addr, &content).await.expect("put");
+        let path = store.chunk_path(&addr);
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        assert!(store.get(&addr).await.is_err(), "the read must fail");
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "and a plain read that failed must stop the node answering for it"
+        );
+
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
+
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("present"),
+            content
+        );
+        assert!(
+            store.exists(&addr).expect("exists"),
+            "and a plain read that worked must start it answering again"
+        );
+        drop(dir);
+    }
+
+    /// Two writes for one key: waiting means waiting for both.
+    ///
+    /// Cancellation releases the caller's lane while the blocking half survives, so a
+    /// second write for the same key can start behind the first. If the registry only
+    /// recorded that *something* was writing, whichever finished first would clear it and
+    /// a delete would be told the key was free while the other was still queued, then be
+    /// undone by it.
+    #[tokio::test]
+    async fn waiting_for_a_key_waits_for_every_write_of_it() {
+        let (store, dir) = test_store().await;
+        let store = Arc::new(store);
+        let (addr, content) = addressed("two-writers");
+
+        // Two registrations, as two overlapping writes would make.
+        let first = store.begin_write(&addr);
+        let second = store.begin_write(&addr);
+
+        let waiting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.wait_for_write(&addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+
+        // One finishes. The other has not, so the wait must continue.
+        drop(first);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !waiting.is_finished(),
+            "one write finishing does not mean the key is free"
+        );
+
+        drop(second);
+        waiting
+            .await
+            .expect("the wait ends once both have finished");
+
+        // And the store is still usable afterwards.
+        store.put(&addr, &content).await.expect("put");
+        assert!(store.exists(&addr).expect("exists"));
+        drop(dir);
+    }
+
+    /// A chunk this store cannot read is kept but not claimed.
+    ///
+    /// Both halves matter. Deleting it, or dropping it from the index, is how a chunk ends
+    /// up in neither this store's view nor the legacy one, which is what retirement
+    /// destroys. Claiming it anyway puts the key in signed commitments and answers
+    /// presence probes with a yes for a chunk the node cannot serve, and the audit that
+    /// catches that still penalises.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_chunk_that_cannot_be_read_is_kept_but_not_claimed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("unreadable-for-now");
+        store.put(&addr, &content).await.expect("put");
+        assert!(store.exists(&addr).expect("exists"));
+
+        let path = store.chunk_path(&addr);
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+
+        // Offering the same bytes again must not be acknowledged, and must not replace
+        // what is there on the strength of a read that did not happen.
+        assert!(
+            store.put(&addr, &content).await.is_err(),
+            "an unreadable chunk must not be reported as stored"
+        );
+        assert!(path.exists(), "and the file must be left alone");
+        assert!(
+            !store.exists(&addr).expect("exists"),
+            "but the node must stop claiming it"
+        );
+        assert!(!store.all_keys().await.expect("keys").contains(&addr));
+
+        // Readable again: the node answers for it once more.
+        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&path, perms).expect("chmod back");
+        assert!(!store.put(&addr, &content).await.expect("put again"));
+        assert!(store.exists(&addr).expect("exists"));
+        assert!(store.all_keys().await.expect("keys").contains(&addr));
+        drop(dir);
     }
 
     /// Content plus the address it hashes to.
@@ -2983,1856 +3098,700 @@ mod tests {
         (crate::client::compute_address(&content), content)
     }
 
-    fn test_config(dir: &TempDir) -> ChunkStoreConfig {
-        ChunkStoreConfig {
-            root_dir: dir.path().to_path_buf(),
-            ..ChunkStoreConfig::test_default()
+    #[tokio::test]
+    async fn put_then_get_returns_the_same_bytes() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("a");
+
+        assert!(store.put(&addr, &content).await.expect("put"));
+        let got = store.get(&addr).await.expect("get").expect("present");
+        assert_eq!(got, content);
+    }
+
+    #[tokio::test]
+    async fn a_second_put_of_the_same_chunk_reports_not_new() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("b");
+
+        assert!(store.put(&addr, &content).await.expect("first put"));
+        assert!(!store.put(&addr, &content).await.expect("second put"));
+        assert_eq!(store.current_chunks().expect("count"), 1);
+        assert_eq!(store.stats().duplicates, 1);
+    }
+
+    #[tokio::test]
+    async fn get_of_an_unknown_address_is_none() {
+        let (store, _dir) = test_store().await;
+        let (addr, _) = addressed("missing");
+        assert!(store.get(&addr).await.expect("get").is_none());
+    }
+
+    #[tokio::test]
+    async fn exists_tracks_the_store() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("c");
+
+        assert!(!store.exists(&addr).expect("exists"));
+        store.put(&addr, &content).await.expect("put");
+        assert!(store.exists(&addr).expect("exists"));
+        store.delete(&addr).await.expect("delete");
+        assert!(!store.exists(&addr).expect("exists"));
+    }
+
+    #[tokio::test]
+    async fn delete_unlinks_the_file_and_returns_the_space() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("d");
+        store.put(&addr, &content).await.expect("put");
+
+        let path = store.chunk_path(&addr);
+        assert!(path.exists(), "the chunk file should be on disk");
+
+        assert!(store.delete(&addr).await.expect("delete"));
+        assert!(!path.exists(), "delete must actually unlink the file");
+        assert_eq!(store.current_chunks().expect("count"), 0);
+
+        // Deleting again is a no-op that reports nothing was there.
+        assert!(!store.delete(&addr).await.expect("second delete"));
+    }
+
+    #[tokio::test]
+    async fn content_that_does_not_hash_to_its_address_is_rejected() {
+        let (store, _dir) = test_store().await;
+        let (addr, _) = addressed("e");
+        let err = store
+            .put(&addr, b"different content")
+            .await
+            .expect_err("must reject");
+        assert!(
+            format!("{err}").contains("Content address mismatch"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(store.current_chunks().expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_is_filed_under_the_last_two_hex_characters_of_its_address() {
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("f");
+        store.put(&addr, &content).await.expect("put");
+
+        let name = hex::encode(addr);
+        let expected_shard = name
+            .get(name.len() - 2..)
+            .expect("64-character name")
+            .to_string();
+        let path = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(&expected_shard)
+            .join(&name);
+        assert!(path.exists(), "expected the chunk at {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn the_index_is_rebuilt_from_the_filesystem_on_restart() {
+        let (store, dir) = test_store().await;
+        let mut written = Vec::new();
+        for i in 0..64 {
+            let (addr, content) = addressed(&format!("restart-{i}"));
+            store.put(&addr, &content).await.expect("put");
+            written.push(addr);
+        }
+        drop(store);
+
+        let reopened = reopen(&dir).await;
+        assert_eq!(reopened.current_chunks().expect("count"), 64);
+        for addr in &written {
+            assert!(reopened.exists(addr).expect("exists"), "lost a key");
         }
     }
 
-    async fn open(dir: &TempDir) -> ChunkStore {
-        ChunkStore::new(test_config(dir)).await.expect("open store")
+    #[tokio::test]
+    async fn all_keys_is_sorted_ascending() {
+        let (store, dir) = test_store().await;
+        for i in 0..128 {
+            let (addr, content) = addressed(&format!("sorted-{i}"));
+            store.put(&addr, &content).await.expect("put");
+        }
+
+        let keys = store.all_keys().await.expect("all_keys");
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "all_keys() must be ordered");
+
+        // And the order has to survive a restart, because the commitment builder
+        // truncates the responsible subset before the Merkle tree sorts it.
+        drop(store);
+        let reopened = reopen(&dir).await;
+        assert_eq!(reopened.all_keys().await.expect("all_keys"), keys);
     }
 
-    /// Populate a legacy LMDB environment the way an existing node would have one, then
-    /// close it so the facade can adopt it.
-    async fn seed_legacy(dir: &TempDir, seeds: &[&str]) -> Vec<XorName> {
-        let lmdb = LmdbStorage::new(LmdbStorageConfig {
+    #[tokio::test]
+    async fn get_raw_skips_verification() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("raw");
+        store.put(&addr, &content).await.expect("put");
+
+        // Corrupt the file behind the store's back.
+        std::fs::write(store.chunk_path(&addr), b"tampered").expect("tamper");
+
+        let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
+        assert_eq!(raw, b"tampered");
+    }
+
+    /// A put whose caller goes away does not admit a key on bytes nothing has read.
+    ///
+    /// The blocking half of a put outlives the future that started it, deliberately, so
+    /// the work is never left half done. That makes anything it writes to memory a claim
+    /// the node keeps whether or not the caller is still there to finish checking it.
+    ///
+    /// For a chunk this call published the claim is earned: the bytes were hashed against
+    /// their own name on the way in. For a name that was already taken it is not. The
+    /// check that decides whether those bytes are good runs after the await, and a dropped
+    /// future skips it, so admitting the key in the closure claims a chunk nobody read.
+    ///
+    /// Staged with a fifo, which is the sharpest case and a real one: the startup scan
+    /// refuses non-regular entries by design, so this is a key the store has already
+    /// decided it must not claim, walked in through the back door.
+    #[cfg(unix)]
+    #[tokio::test]
+    // The gate is held across an await deliberately: holding it is what parks the put
+    // inside its closure, which is the state under test. Dropping it before awaiting would
+    // let the put finish and there would be nothing to cancel.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_cancelled_put_does_not_admit_a_key_whose_bytes_were_never_read() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(reopen(&dir).await);
+
+        // A name a real chunk would use, wearing something that is not a chunk.
+        let content = b"the bytes that belong under this name".to_vec();
+        let addr = crate::client::compute_address(&content);
+        let shard = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{:02x}", addr[31]));
+        std::fs::create_dir_all(&shard).expect("mkdir");
+        let path = shard.join(hex::encode(addr));
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("a path with no interior nul");
+        // SAFETY: `name` is a valid NUL-terminated C string that outlives the call, and the
+        // mode is a constant. `mkfifo` reads the pointer and returns; nothing is retained.
+        #[allow(clippy::undocumented_unsafe_blocks, unsafe_code)]
+        let made = unsafe { libc::mkfifo(name.as_ptr(), 0o644) };
+        assert_eq!(made, 0, "could not make the fifo this test needs");
+
+        // Hold the gate so the put parks inside the closure, then drop the future while it
+        // is parked. That is a caller going away mid-put, which is what a cancelled
+        // request, a client disconnect or a shutdown all look like from in here.
+        let gate = store.test_put_gate();
+        let held = gate.write();
+        let put = {
+            let store = Arc::clone(&store);
+            let content = content.clone();
+            tokio::spawn(async move { store.put(&addr, &content).await })
+        };
+        // Waited for rather than slept at. A sleep proves nothing: if the put had not
+        // reached the gated closure yet, aborting would cancel it before it ever got
+        // there and the test would pass having staged nothing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.tasks_in_flight() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the put never reached the closure, so there was nothing to cancel"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        put.abort();
+        let _ = put.await;
+        drop(held);
+        store.wait_idle().await;
+
+        assert!(
+            !store.is_indexed(&addr),
+            "a cancelled put admitted {} on bytes nothing read; the fifo under that name \
+             would then be advertised, committed to, and audited against",
+            hex::encode(addr)
+        );
+        assert!(
+            !store.exists(&addr).unwrap_or(true),
+            "and the node must not claim it either"
+        );
+    }
+
+    /// A marker temporary left in the node root is swept, and nothing else is.
+    ///
+    /// The migration marker is written next to itself in the root, which no sweep looked
+    /// at, so a crash between its write and its rename left one there for the life of the
+    /// node. Small, but nothing was ever going to remove it.
+    ///
+    /// The second half is the point: this runs over a directory holding a node's data, so
+    /// it has to take only the exact shape this module writes and leave everything else
+    /// where it is.
+    #[tokio::test]
+    async fn a_leftover_marker_temporary_is_swept_and_its_neighbours_are_not() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        let leftover = root.join(format!("{TEMP_PREFIX}1234.abcdef01.marker"));
+        std::fs::write(&leftover, b"an interrupted marker write").expect("plant");
+
+        // Things that must survive: the marker itself, a chunk-shaped temp that belongs to
+        // the chunk tree's own sweep, and anything an operator put there.
+        let keep = [
+            root.join("migration-state.json"),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef01.chunk")),
+            root.join("notes.txt"),
+            // Prefix and suffix alone would take these. The pid and the nonce are checked
+            // because this runs over a directory holding a node's data.
+            root.join(format!("{TEMP_PREFIX}operator-notes.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.nothex01.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef0.marker")),
+            root.join(format!("{TEMP_PREFIX}1234.abcdef01.extra.marker")),
+        ];
+        for path in &keep {
+            std::fs::write(path, b"keep me").expect("plant");
+        }
+
+        let store = reopen(&dir).await;
+        drop(store);
+
+        assert!(
+            !leftover.exists(),
+            "the leftover marker temporary is still in the node root"
+        );
+        for path in &keep {
+            assert!(
+                path.exists(),
+                "{} was swept and should not have been",
+                path.display()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_chunk_is_removed_so_replication_can_repair_it() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("corrupt");
+        store.put(&addr, &content).await.expect("put");
+        std::fs::write(store.chunk_path(&addr), b"tampered").expect("tamper");
+
+        let err = store.get(&addr).await.expect_err("verification must fail");
+        assert!(format!("{err}").contains("verification failed"), "{err}");
+
+        assert!(!store.chunk_path(&addr).exists(), "corrupt file must go");
+        assert!(!store.exists(&addr).expect("exists"));
+        assert!(
+            !store.all_keys().await.expect("all_keys").contains(&addr),
+            "a corrupt chunk must stop being advertised"
+        );
+        assert_eq!(store.stats().verification_failures, 1);
+    }
+
+    #[tokio::test]
+    async fn a_file_removed_underneath_the_store_drops_out_of_the_index() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("vanished");
+        store.put(&addr, &content).await.expect("put");
+
+        std::fs::remove_file(store.chunk_path(&addr)).expect("remove behind our back");
+
+        assert!(store.get(&addr).await.expect("get").is_none());
+        assert!(!store.exists(&addr).expect("exists"));
+        assert_eq!(store.current_chunks().expect("count"), 0);
+    }
+
+    #[tokio::test]
+    async fn interrupted_writes_are_swept_at_startup() {
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("sweep");
+        store.put(&addr, &content).await.expect("put");
+        let shard = store
+            .chunk_path(&addr)
+            .parent()
+            .expect("shard")
+            .to_path_buf();
+        drop(store);
+
+        let orphan = shard.join(format!("{TEMP_PREFIX}999.7"));
+        std::fs::write(&orphan, b"half a chunk").expect("write orphan");
+        let stray_root = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{TEMP_PREFIX}999.8"));
+        std::fs::write(&stray_root, b"half a marker").expect("write stray");
+
+        let reopened = reopen(&dir).await;
+        assert!(!orphan.exists(), "an interrupted write must not survive");
+        assert!(!stray_root.exists(), "nor one at the store root");
+        assert_eq!(reopened.current_chunks().expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_writers_of_one_address_store_it_exactly_once() {
+        let (store, _dir) = test_store().await;
+        let store = Arc::new(store);
+        let (addr, content) = addressed("racing");
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let content = content.clone();
+            tasks.push(tokio::spawn(
+                async move { store.put(&addr, &content).await },
+            ));
+        }
+
+        let mut new_count = 0;
+        for task in tasks {
+            if task.await.expect("join").expect("put") {
+                new_count += 1;
+            }
+        }
+        assert_eq!(new_count, 1, "exactly one writer may report a new chunk");
+        assert_eq!(store.current_chunks().expect("count"), 1);
+        assert_eq!(
+            store.get(&addr).await.expect("get").expect("present"),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn names_that_are_not_lowercase_hex_are_ignored_by_the_scan() {
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("scan");
+        store.put(&addr, &content).await.expect("put");
+        let shard = store
+            .chunk_path(&addr)
+            .parent()
+            .expect("shard")
+            .to_path_buf();
+        drop(store);
+
+        // Uppercase is deliberately rejected: on a case-folding filesystem accepting it
+        // would let one file answer to two index entries.
+        let upper = shard.join(hex::encode_upper(addressed("upper").0));
+        std::fs::write(&upper, b"x").expect("write upper");
+        std::fs::write(shard.join("not-a-chunk"), b"x").expect("write junk");
+        std::fs::write(shard.join("deadbeef"), b"x").expect("write short");
+
+        let reopened = reopen(&dir).await;
+        assert_eq!(reopened.current_chunks().expect("count"), 1);
+    }
+
+    #[tokio::test]
+    async fn a_chunk_filed_in_the_wrong_shard_is_not_indexed() {
+        let (store, dir) = test_store().await;
+        let (addr, content) = addressed("misfiled");
+        store.put(&addr, &content).await.expect("put");
+        drop(store);
+
+        // Move it one shard over: the read path would never find it there, so indexing
+        // it would make the store advertise a key it cannot serve.
+        let correct = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(shard_name(&addr))
+            .join(hex::encode(addr));
+        let wrong_shard_index = (shard_index(&addr) + 1) % SHARD_COUNT;
+        let wrong_dir = dir
+            .path()
+            .join(CHUNKS_DIR_NAME)
+            .join(format!("{wrong_shard_index:02x}"));
+        std::fs::create_dir_all(&wrong_dir).expect("mkdir");
+        std::fs::rename(&correct, wrong_dir.join(hex::encode(addr))).expect("misfile");
+
+        let reopened = reopen(&dir).await;
+        assert_eq!(reopened.current_chunks().expect("count"), 0);
+        assert!(!reopened.exists(&addr).expect("exists"));
+    }
+
+    #[tokio::test]
+    async fn the_layout_marker_is_written_once_and_checked_on_reopen() {
+        let (store, dir) = test_store().await;
+        drop(store);
+
+        let marker = dir.path().join(CHUNKS_DIR_NAME).join(LAYOUT_FILE_NAME);
+        let layout: StoreLayout =
+            serde_json::from_slice(&std::fs::read(&marker).expect("read marker"))
+                .expect("parse marker");
+        assert_eq!(layout, StoreLayout::default());
+
+        // A store written by a future build must be refused, not misread.
+        let future = StoreLayout {
+            schema: LAYOUT_SCHEMA + 1,
+            ..StoreLayout::default()
+        };
+        std::fs::write(&marker, serde_json::to_vec(&future).expect("encode")).expect("write");
+        let err = ChunkStore::new(ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: true,
-            max_map_size: 0,
             disk_reserve: 0,
         })
         .await
-        .expect("open legacy");
-        let mut keys = Vec::new();
-        for seed in seeds {
-            let (addr, content) = addressed(seed);
-            lmdb.put(&addr, &content).await.expect("legacy put");
-            keys.push(addr);
-        }
-        lmdb.wait_idle().await;
-        drop(lmdb);
-        keys
+        .expect_err("must refuse a newer layout");
+        assert!(format!("{err}").contains("newer than this build"), "{err}");
     }
 
     #[tokio::test]
-    async fn a_fresh_node_never_creates_a_legacy_environment() {
+    async fn an_unknown_shard_scheme_is_refused() {
+        let (store, dir) = test_store().await;
+        drop(store);
+        let marker = dir.path().join(CHUNKS_DIR_NAME).join(LAYOUT_FILE_NAME);
+        let other = StoreLayout {
+            scheme: "prefix-hex".to_string(),
+            ..StoreLayout::default()
+        };
+        std::fs::write(&marker, serde_json::to_vec(&other).expect("encode")).expect("write");
+        let err = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: 0,
+        })
+        .await
+        .expect_err("must refuse an unknown scheme");
+        assert!(format!("{err}").contains("shard scheme"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn writes_are_refused_when_the_disk_reserve_cannot_be_met() {
         let dir = TempDir::new().expect("temp dir");
-        let store = open(&dir).await;
+        let store = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: u64::MAX / 2,
+        })
+        .await
+        .expect("open store");
 
-        assert!(!store.has_legacy());
-        assert_eq!(store.migration_phase(), MigrationPhase::FilesOnly);
-        assert!(!dir.path().join(LEGACY_ENV_DIR).exists());
+        let (addr, content) = addressed("full");
+        let err = store.put(&addr, &content).await.expect_err("must refuse");
+        assert!(
+            format!("{err}").contains("Insufficient disk space"),
+            "{err}"
+        );
+        assert!(store.check_capacity().is_err());
+    }
 
-        let (addr, content) = addressed("fresh");
-        assert!(store.put(&addr, &content).await.expect("put"));
+    #[tokio::test]
+    async fn capacity_is_size_aware() {
+        // Wide enough that a test running alongside this one cannot move the answer.
+        const MARGIN: u64 = 512 * 1024 * 1024;
+
+        let dir = TempDir::new().expect("temp dir");
+        let available = fs2::available_space(dir.path()).expect("free space");
+        // A reserve that leaves room for a small write but not a huge one. This is the
+        // whole reason the predicate takes a size: free bytes alone stopped being a
+        // sufficient answer once chunks became files.
+        let store = ChunkStore::new(ChunkStoreConfig {
+            root_dir: dir.path().to_path_buf(),
+            verify_on_read: true,
+            disk_reserve: available.saturating_sub(MARGIN),
+        })
+        .await
+        .expect("open store");
+
+        assert!(store.check_capacity_for(1024).is_ok());
+        assert!(store.check_capacity_for(4 * MARGIN).is_err());
+    }
+
+    #[test]
+    fn suffix_shards_stay_uniform_for_a_close_group_of_keys() {
+        // The real distribution: a node holds keys it is closest to, so they share a
+        // long leading prefix with its own ID. Sharding on that prefix collapses to one
+        // directory. The trailing byte is untouched by close-group membership.
+        let mut prefix_dirs = HashSet::new();
+        let mut suffix_dirs = HashSet::new();
+        for i in 0u32..4096 {
+            let mut key = [0u8; XORNAME_LEN];
+            // 20 shared leading bits, as a ~1M-node network would impose.
+            let tail = crate::client::compute_address(&i.to_le_bytes());
+            key.copy_from_slice(&tail);
+            if let Some(b) = key.first_mut() {
+                *b = 0xab;
+            }
+            if let Some(b) = key.get_mut(1) {
+                *b = 0xcd;
+            }
+            if let Some(b) = key.get_mut(2) {
+                *b &= 0x0f;
+            }
+            prefix_dirs.insert(key.first().copied().unwrap_or(0));
+            suffix_dirs.insert(shard_index(&key));
+        }
         assert_eq!(
-            store.get(&addr).await.expect("get").expect("present"),
-            content
+            prefix_dirs.len(),
+            1,
+            "prefix sharding collapses for a node's own holdings"
+        );
+        assert!(
+            suffix_dirs.len() > 250,
+            "suffix sharding must stay uniform, got {} of 256 directories",
+            suffix_dirs.len()
         );
     }
 
-    #[tokio::test]
-    async fn an_existing_legacy_store_is_adopted_and_served() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["a", "b", "c"]).await;
-        let store = open(&dir).await;
-
-        assert!(store.has_legacy());
-        assert_eq!(store.migration_phase(), MigrationPhase::Bridging);
-        assert_eq!(store.current_chunks().expect("count"), 3);
-        for key in &keys {
-            assert!(store.exists(key).expect("exists"), "union must see it");
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    #[tokio::test]
-    async fn the_union_key_set_is_sorted_and_free_of_duplicates() {
-        let dir = TempDir::new().expect("temp dir");
-        let mut expected = seed_legacy(&dir, &["u1", "u2", "u3", "u4"]).await;
-        let store = open(&dir).await;
-
-        // One chunk written now lives in both backings, and must be counted once.
-        let (addr, content) = addressed("u2");
-        assert!(expected.contains(&addr));
-        assert!(!store.put(&addr, &content).await.expect("put"));
-
-        let (fresh, fresh_content) = addressed("u5");
-        store.put(&fresh, &fresh_content).await.expect("put");
-        expected.push(fresh);
-        expected.sort_unstable();
-
-        let keys = store.all_keys().await.expect("all_keys");
-        assert_eq!(keys, expected);
-        assert_eq!(store.current_chunks().expect("count"), 5);
-    }
-
-    /// The legacy environment takes no new disk during the bridge.
-    ///
-    /// Both stores sit on one disk, each measures the same free space, and neither knows
-    /// what the other is about to spend. A chunk written to both could be admitted twice
-    /// against one lot of headroom, and enough of them could cross the reserve together
-    /// and fill the volume this migration exists to free.
-    ///
-    /// So the environment is pinned to what it already occupies. It still takes the
-    /// rollback copy when it has room of its own, which on a real node it usually does:
-    /// this migration exists because deleting millions of chunks left the free list full
-    /// and returned nothing to the filesystem. What it will not do is grow.
-    #[tokio::test]
-    async fn the_legacy_environment_takes_no_new_disk_during_the_bridge() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["seed"]).await;
-        let store = open(&dir).await;
-
-        let data_file = dir.path().join(LEGACY_ENV_DIR).join(LEGACY_DATA_FILE);
-        let before = std::fs::metadata(&data_file).expect("meta").len();
-
-        for seed in ["dual-1", "dual-2", "dual-3", "dual-4"] {
-            let (addr, content) = addressed(seed);
-            assert!(store.put(&addr, &content).await.expect("put"));
+    #[test]
+    fn no_chunk_filename_can_spell_a_reserved_windows_device_name() {
+        // Hex has no `n`, `u`, `x`, `p`, `r`, `l`, `t`, `o` or `s`, so `CON`, `NUL`,
+        // `AUX`, `PRN`, `COM1` and `LPT1` are all unspellable at any length. This is why
+        // the encoding is hex and not base32 or base64url.
+        for reserved in ["con", "prn", "aux", "nul", "com1", "com9", "lpt1", "lpt9"] {
             assert!(
-                store.exists(&addr).expect("exists"),
-                "the file store is the one that has to have it"
+                !is_lower_hex(reserved),
+                "{reserved} must not be a valid chunk or shard name"
             );
         }
-        store.wait_idle().await;
+    }
 
-        let after = std::fs::metadata(&data_file).expect("meta").len();
-        assert_eq!(
-            after, before,
-            "the environment must not claim disk the file store is also counting on"
-        );
+    #[test]
+    fn only_full_length_lowercase_hex_decodes_to_an_address() {
+        // 0xab so the hex form actually contains letters, which is where case matters.
+        assert!(decode_chunk_name(&hex::encode([0xabu8; XORNAME_LEN])).is_some());
+        assert!(decode_chunk_name(&hex::encode_upper([0xabu8; XORNAME_LEN])).is_none());
+        assert!(decode_chunk_name("deadbeef").is_none());
+        assert!(decode_chunk_name("").is_none());
+        assert!(decode_chunk_name(&"g".repeat(CHUNK_NAME_LEN)).is_none());
     }
 
     #[tokio::test]
-    async fn the_copier_moves_keys_into_files_and_is_resumable() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["c1", "c2", "c3", "c4", "c5"]).await;
-        let store = open(&dir).await;
-        assert_eq!(store.legacy_only_keys().len(), 5);
-
-        let first = store
-            .copy_batch(&keys[..2], 0, 0, &never_cancelled())
-            .await
-            .expect("copy first batch");
-        assert_eq!(first.copied, 2);
-        assert_eq!(store.legacy_only_keys().len(), 3);
-        store.wait_idle().await;
-        drop(store);
-
-        // A restart re-derives what is left from the filesystem: no progress file to
-        // corrupt, and no work repeated.
-        let store = open(&dir).await;
-        assert_eq!(store.legacy_only_keys().len(), 3);
-        let rest = store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy rest");
-        assert_eq!(rest.copied, 3);
-        assert!(store.legacy_only_keys().is_empty());
-        assert_eq!(store.current_chunks().expect("count"), 5);
-    }
-
-    #[tokio::test]
-    async fn a_delete_reaches_both_stores() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["d1", "d2"]).await;
-        let store = open(&dir).await;
-
-        let target = keys.first().copied().expect("a key");
-        assert!(store.delete(&target).await.expect("delete"));
-        assert!(!store.exists(&target).expect("exists"));
-        assert!(store.get(&target).await.expect("get").is_none());
-        assert_eq!(store.current_chunks().expect("count"), 1);
-
-        // And it stays gone across a restart, which is what proves it left the legacy
-        // environment too rather than only the union view.
-        store.wait_idle().await;
-        drop(store);
-        let store = open(&dir).await;
-        assert!(!store.exists(&target).expect("exists"));
-    }
-
-    #[tokio::test]
-    async fn the_copier_does_not_resurrect_a_deleted_chunk() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["r1", "r2"]).await;
-        let store = open(&dir).await;
-
-        let target = keys.first().copied().expect("a key");
-        store.delete(&target).await.expect("delete");
-
-        let report = store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        assert_eq!(report.copied, 1, "only the surviving chunk may be copied");
-        assert!(!store.exists(&target).expect("exists"));
-    }
-
-    #[tokio::test]
-    async fn committing_narrows_the_commitment_but_not_what_is_served() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["k1", "k2", "k3"]).await;
-        let store = open(&dir).await;
-
-        // Copy one, leave two behind as if the disk had run out.
-        store
-            .copy_batch(&keys[..1], 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-
-        // While bridging, the node still claims everything it can serve.
-        assert_eq!(
-            store.committable_keys().await.expect("committable").len(),
-            3
-        );
-
-        store.commit_to_files().expect("commit");
-        assert_eq!(store.migration_phase(), MigrationPhase::Committed);
-        assert_eq!(store.migration_state().shed_key_count, 2);
-
-        // It now claims only what it will keep...
-        assert_eq!(
-            store.committable_keys().await.expect("committable").len(),
-            1
-        );
-        // ...while still serving everything it ever claimed.
-        assert_eq!(store.all_keys().await.expect("all_keys").len(), 3);
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    #[tokio::test]
-    async fn retirement_is_refused_until_every_gate_is_satisfied() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["g1", "g2"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-
-        // Still bridging.
-        assert!(store
-            .retirement_blocker(|_| false)
-            .expect("blocked")
-            .contains("Bridging"));
-
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        store.commit_to_files().expect("commit");
-
-        // No commitment rebuild observed yet.
-        assert!(store
-            .retirement_blocker(|_| false)
-            .expect("blocked")
-            .contains("commitment rebuilds"));
-
-        store.note_commitment_rebuilt();
-        store.note_commitment_rebuilt();
-
-        // The retention delay has not elapsed.
-        assert!(store
-            .retirement_blocker(|_| false)
-            .expect("blocked")
-            .contains("retirement delay"));
-
-        store.force_migration_state(|s| {
-            s.committed_at_unix =
-                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
-        });
-        assert!(store.retirement_blocker(|_| false).is_none());
-    }
-
-    #[tokio::test]
-    async fn a_chunk_still_answerable_vetoes_retirement() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["h1", "h2"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-
-        // Shed both, as a node short of disk would.
-        store.commit_to_files().expect("commit");
-        store.note_commitment_rebuilt();
-        store.note_commitment_rebuilt();
-        store.force_migration_state(|s| {
-            s.committed_at_unix =
-                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
-        });
-
-        // The pruner's existing retention contract, reused verbatim: a key the node
-        // could still be challenged on keeps its last local copy.
-        assert!(store
-            .retirement_blocker(|_| true)
-            .expect("blocked")
-            .contains("still answerable"));
-        assert!(store.retirement_blocker(|_| false).is_none());
-    }
-
-    /// The stock configuration retires, with no environment variable and no operator step.
-    ///
-    /// This is the property the whole release rests on. Deleting `chunks.mdb` is the only
-    /// step that returns disk: LMDB never gives freed pages back, which is why the fleet
-    /// deleted millions of chunks and recovered nothing. A build that shipped with this
-    /// off would migrate every node and reclaim not one byte.
-    #[tokio::test]
-    async fn the_shipped_configuration_retires_without_an_operator_setting_anything() {
-        // Asked of the configuration a node actually builds, not of the constant behind
-        // it, so neither the constant nor a serde default nor the `Default` impl can turn
-        // retirement off without this failing.
-        assert!(
-            crate::storage::MigrationConfig::default().retire_legacy,
-            "this release must delete the legacy environment, or it frees no disk"
-        );
-
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["shipped"]).await;
-        let store = open(&dir).await;
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        open_the_retirement_gate(&store);
-        assert!(
-            store.retirement_blocker(|_| false).is_none(),
-            "with every gate met, the shipped configuration must not refuse to retire"
-        );
-    }
-
-    /// Retirement waits for a read that is already running.
-    ///
-    /// The window this closes: a verifying read finds rotted bytes, throws the file away,
-    /// and has not yet reached the legacy copy that would replace it. If retirement ran in
-    /// that gap it would delete the only remaining copy. Holding the barrier shared for
-    /// the whole read, and exclusively for the removal, is what makes that impossible.
-    #[tokio::test]
-    async fn retirement_waits_for_a_read_that_is_already_running() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["held"]).await;
-        let store = Arc::new(open(&dir).await);
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        open_the_retirement_gate(&store);
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-
-        // Stand in for a read that has started and not finished.
-        let reading = store.retirement.read().await;
-
-        let retiring = {
-            let store = Arc::clone(&store);
-            let approved = approved_shed(&store);
-            tokio::spawn(async move {
-                store
-                    .retire_legacy(&proof, &|_: &XorName| false, &approved)
-                    .await
-            })
-        };
-
-        // It must not have got anywhere. Given a generous window rather than a tight one,
-        // so this fails on the behaviour rather than on scheduling luck.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            !retiring.is_finished(),
-            "retirement removed the legacy environment while a read was still running"
-        );
-        assert!(
-            store.has_legacy(),
-            "the legacy environment went while a read was still running"
-        );
-
-        drop(reading);
-        let freed = retiring.await.expect("join").expect("retire");
-        assert!(freed > 0, "retirement should have freed the environment");
-        assert!(!store.has_legacy());
-    }
-
-    /// A good copy is never turned away because a damaged one wears its name.
-    ///
-    /// Two shapes of damage, because they are caught differently: a short file, which is
-    /// what an interrupted create leaves on a platform that writes under the final name,
-    /// and a full-length file with wrong bytes, which is what rot leaves. Answering
-    /// "already have it" to either discards the copy that would fix it, and nothing offers
-    /// it again.
-    #[tokio::test]
-    async fn a_damaged_chunk_is_repaired_from_the_copy_being_offered() {
-        let dir = TempDir::new().expect("temp dir");
-        let store = open(&dir).await;
-        let (addr, content) = addressed("repairable-by-offer");
+    async fn repair_replaces_bad_bytes_without_the_file_ever_being_absent() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("repairable");
         store.put(&addr, &content).await.expect("put");
+        let path = store.chunk_path(&addr);
 
-        // Intact: the offer is correctly refused.
-        assert!(store.holds_verified(&addr, &content).await);
+        std::fs::write(&path, b"rotted").expect("corrupt");
+        store.repair(&addr, &content).await.expect("repair");
 
-        // Truncated.
-        let path = dir
-            .path()
-            .join("chunks")
-            .join(format!("{:02x}", addr.last().copied().unwrap_or(0)))
-            .join(hex::encode(addr));
-        std::fs::write(&path, &content[..content.len() / 2]).expect("truncate");
-        assert!(
-            store.holds_verified(&addr, &content).await,
-            "a short file must be replaced from the offered copy, not left in place"
-        );
         assert_eq!(
             store.get(&addr).await.expect("get").expect("present"),
             content
         );
-
-        // Same length, wrong bytes.
-        let rotted = vec![b'x'; content.len()];
-        assert_ne!(rotted, content);
-        std::fs::write(&path, &rotted).expect("rot");
-        assert!(
-            store.holds_verified(&addr, &content).await,
-            "a rotted file must be replaced from the offered copy"
-        );
-        assert_eq!(
-            store.get(&addr).await.expect("get").expect("present"),
-            content
-        );
-    }
-
-    /// A chunk held only in the legacy environment is checked, not assumed good.
-    ///
-    /// The bytes in there can be wrong too, and when the copier finds that out it drops
-    /// the key from the union view. Having turned the good copy away on the strength of
-    /// the key being present, the node would then hold nothing at all.
-    #[tokio::test]
-    async fn a_legacy_only_chunk_with_wrong_bytes_is_replaced_by_the_offer() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["legacy-side"]).await;
-        let key = *keys.first().expect("one key");
-        let content = format!("chunk-content-{}", "legacy-side").into_bytes();
-        let store = open(&dir).await;
-        assert!(store.legacy_only_keys().contains(&key));
-
-        // Intact: the offer is correctly refused.
-        assert!(store.holds_verified(&key, &content).await);
-
-        // Wreck the legacy copy underneath, leaving the key in the union view.
-        let legacy = store.legacy().expect("legacy");
-        legacy.lmdb.delete(&key).await.expect("delete");
-        assert!(
-            store.holds_verified(&key, &content).await,
-            "with no readable legacy copy the offered bytes must be taken, not refused"
-        );
-        assert_eq!(
-            store.get(&key).await.expect("get").expect("present"),
-            content
-        );
-        assert!(
-            !store.legacy_only_keys().contains(&key),
-            "and the key must leave the legacy-only set now that a file holds it"
-        );
-    }
-
-    /// A chunk this node does not have is not claimed as held.
-    #[tokio::test]
-    async fn a_chunk_this_node_does_not_have_is_not_claimed() {
-        let dir = TempDir::new().expect("temp dir");
-        let store = open(&dir).await;
-        let (addr, content) = addressed("never-stored");
-        assert!(!store.holds_verified(&addr, &content).await);
-    }
-
-    /// An environment is never deleted because it failed to open.
-    ///
-    /// Opening is not a corruption test. It queries free space, maps the file, takes a
-    /// write transaction and scans every key, so a full disk, a permission change or a
-    /// transient fault all look identical to corruption. The only thing that counts is the
-    /// directory's own mark.
-    #[tokio::test]
-    async fn an_unmarked_environment_is_kept_however_badly_it_reads() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["unmarked"]).await;
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        assert_eq!(retirement_mark(&env), RetirementMark::Absent);
-
-        finish_interrupted_retirement(dir.path());
-        assert!(
-            env.exists(),
-            "an environment carrying no retirement mark must never be removed"
-        );
-    }
-
-    /// A directory carrying its own retirement mark is finished off, whatever it is named.
-    ///
-    /// This is the case the mark exists for. Off Unix the rename that moves the
-    /// environment aside cannot be shown to be durable, so a power loss can bring it back
-    /// under its old name with its contents already deleted. Without the mark the node
-    /// would refuse to start on it forever; with it, the directory says what it is.
-    #[tokio::test]
-    async fn a_directory_that_says_it_was_retired_is_removed_under_any_name() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["reverted"]).await;
-        {
-            let store = open(&dir).await;
-            store
-                .copy_batch(&keys, 0, 0, &never_cancelled())
-                .await
-                .expect("copy");
-        }
-        // What a reverted rename leaves: the old name, the retirement mark inside it.
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        mark_directory_retired(&env).expect("mark");
-
-        let store = open(&dir).await;
-        assert!(
-            !store.has_legacy(),
-            "the remains of an interrupted removal must not be adopted"
-        );
-        assert!(!env.exists(), "and the next start must finish the removal");
-        // Every chunk is still served, from the file store.
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    /// The mark goes inside the directory, so a rename cannot separate them.
-    ///
-    /// A mark beside the environment would have to be cancelled when a retirement is
-    /// abandoned, cancellation can fail or be lost, and a stale one would then authorise
-    /// deleting an environment that had since taken a chunk.
-    #[test]
-    fn the_retirement_mark_travels_with_the_directory() {
-        let dir = TempDir::new().expect("temp dir");
-        let original = dir.path().join("chunks.mdb");
-        std::fs::create_dir_all(&original).expect("mkdir");
-        mark_directory_retired(&original).expect("mark");
-        assert_eq!(retirement_mark(&original), RetirementMark::Present);
-
-        let renamed = dir.path().join("chunks.mdb.retired");
-        std::fs::rename(&original, &renamed).expect("rename");
-        assert!(
-            retirement_mark(&renamed) == RetirementMark::Present,
-            "the mark must survive the rename it exists to outlive"
-        );
-        // And back again, which is what a power loss undoing the rename looks like.
-        std::fs::rename(&renamed, &original).expect("rename back");
-        assert_eq!(retirement_mark(&original), RetirementMark::Present);
-    }
-
-    /// Losing the handle to an environment that is still there is not completion.
-    ///
-    /// A rename that failed and then could not be reopened leaves the directory on disk
-    /// with no way to read it. Treating the missing handle as "nothing left to migrate"
-    /// would have the driver log the migration finished over a store still holding chunks
-    /// nothing else can serve.
-    #[tokio::test]
-    async fn a_lost_handle_beside_a_live_environment_blocks_retirement() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["orphaned"]).await;
-        let store = open(&dir).await;
-        assert!(store.has_legacy());
-
-        // Stand in for a failed rename followed by a failed reopen.
-        *store.legacy.write() = None;
-        assert!(!store.has_legacy());
-        assert!(dir.path().join(LEGACY_ENV_DIR).exists());
-
-        let blocker = store
-            .retirement_blocker(|_| false)
-            .expect("a live environment with no handle must block");
-        assert!(
-            blocker.contains("no handle"),
-            "the reason must name the actual problem, got: {blocker}"
-        );
-    }
-
-    /// A node that still holds its store open is gated too.
-    ///
-    /// The classification used to be asked only when there was no handle, which meant the
-    /// ordinary path never asked it: a node holding its environment open went through every
-    /// gate, renamed the directory aside and deleted it, whatever the mark said or failed to
-    /// say. Retirement deletes the last other copy of these chunks, so it is not a question
-    /// to skip because a different question already had an answer.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn an_environment_that_cannot_be_classified_blocks_retirement_even_with_a_handle() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["still-open"]).await;
-        let store = open(&dir).await;
-        assert!(
-            store.has_legacy(),
-            "this one keeps its handle, deliberately"
-        );
-        // Whatever else is in the way at this point, it is not this. Compared rather than
-        // required to be nothing, because the other gates have their own tests and their
-        // own reasons to be unmet here.
-        let before = store.retirement_blocker(|_| false).unwrap_or_default();
-        assert!(
-            !before.contains("already retired"),
-            "a readable environment must not be blocked for being unclassifiable: {before}"
-        );
-
-        make_the_mark_unreadable(&dir.path().join(LEGACY_ENV_DIR));
-
-        let blocker = store
-            .retirement_blocker(|_| false)
-            .expect("an environment that cannot be classified must block retirement");
-        assert!(
-            blocker.contains("already retired"),
-            "the reason must name the actual problem, got: {blocker}"
-        );
-        assert!(
-            store.legacy_cannot_be_classified(),
-            "and the driver must see it as work only a person can finish, so that it \
-             gives the shared volume back"
-        );
-    }
-
-    /// A directory under the retired name with no mark inside it is an intact store.
-    ///
-    /// It got that name from a rename, and the rename happens after every gate; the mark
-    /// is written straight afterwards. A crash in between leaves a whole environment
-    /// wearing a name that says otherwise, and deleting it because of what it is called
-    /// would destroy every chunk in it. It is put back instead.
-    #[tokio::test]
-    async fn an_unmarked_retired_directory_is_restored_rather_than_deleted() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["not-really-retired"]).await;
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-        std::fs::rename(&env, &tombstone).expect("rename");
-        assert_eq!(retirement_mark(&tombstone), RetirementMark::Absent);
-
-        let store = open(&dir).await;
-        assert!(
-            store.has_legacy(),
-            "an unmarked environment must be restored and served, not deleted"
-        );
-        assert!(env.exists(), "it must be back under its own name");
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    /// A mark already at that name is not a mark until it can be read.
-    ///
-    /// The one place in this file that was taking the name as the evidence, which is the
-    /// thing every other part of it refuses to do. Retirement writes the mark with
-    /// `create_new`, and a failure saying something is already there was accepted as "the
-    /// mark is present" and the environment deleted on the strength of it. What is at that
-    /// name might be anything.
-    ///
-    /// It matters most for a node that already has its store open. That path never
-    /// consulted the mark at all until this round, so an unreadable one would have gone
-    /// through every gate and been deleted.
-    #[cfg(unix)]
-    #[test]
-    fn a_mark_already_at_that_name_is_not_accepted_until_it_can_be_read() {
-        let dir = TempDir::new().expect("temp dir");
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        std::fs::create_dir_all(&env).expect("mkdir");
-        make_the_mark_unreadable(&env);
-
-        let refused = mark_directory_retired(&env).expect_err("an unreadable mark is not a mark");
-        assert!(
-            !refused.mark_definitely_gone,
-            "something is at that name, so the caller must not treat it as absent and put \
-             the directory back under a name that will be opened"
-        );
-        assert_eq!(retirement_mark(&env), RetirementMark::Unknown);
-
-        // And a real one is still accepted, so the refusal above is about being unable to
-        // read it rather than about there being something there at all.
-        std::fs::remove_file(env.join(RETIRED_MARKER)).expect("clear the link");
-        mark_directory_retired(&env).expect("a first mark");
-        mark_directory_retired(&env).expect("and the same mark again, which is readable");
-        assert_eq!(retirement_mark(&env), RetirementMark::Present);
-    }
-
-    /// A directory nothing can classify is neither restored nor deleted.
-    ///
-    /// The half of the three-state answer that a first attempt at this got wrong. Asking
-    /// only "may it be removed" and letting everything else fall through puts "cannot tell"
-    /// straight back on the restoring path, which is the resurrection this exists to
-    /// prevent: the mark check can fail for a moment and succeed the next, and the restore
-    /// in between brings back a store that really had been retired.
-    ///
-    /// Unix only: the state is staged with a symbolic link, which Windows does not offer
-    /// on the same terms.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_tombstone_that_cannot_be_classified_is_left_where_it_is() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["unclassifiable"]).await;
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-        std::fs::rename(&env, &tombstone).expect("rename");
-        make_the_mark_unreadable(&tombstone);
-        assert_eq!(retirement_mark(&tombstone), RetirementMark::Unknown);
-
-        sweep_retired_legacy(dir.path());
-        let still_there = tombstone.exists();
-        let restored = env.exists();
-
-        assert!(
-            still_there,
-            "a directory that cannot be classified must not be deleted: it may be intact"
-        );
-        assert!(
-            !restored,
-            "a directory that cannot be classified must not be put back under the live \
-             name: it may be half deleted"
-        );
-    }
-
-    /// The same directory under the live name is not opened either.
-    ///
-    /// Opening it would put keys back into a commitment they may already have left, and
-    /// this node cannot tell whether they have. Serving from files alone is the answer that
-    /// is right either way.
-    #[cfg(unix)]
-    #[test]
-    fn a_live_environment_that_cannot_be_classified_is_not_opened() {
-        let dir = TempDir::new().expect("temp dir");
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join("data.mdb"), b"not really an environment").expect("seed");
-        assert_eq!(
-            finish_interrupted_retirement(dir.path()),
-            LiveEnvironment::WhateverIsOnDisk,
-            "a readable directory with no mark is ordinary and may be opened"
-        );
-
-        make_the_mark_unreadable(&env);
-        assert_eq!(retirement_mark(&env), RetirementMark::Unknown);
-
-        let verdict = finish_interrupted_retirement(dir.path());
-        let still_there = env.exists();
-
-        assert_eq!(
-            verdict,
-            LiveEnvironment::None,
-            "a directory that cannot be classified must not be opened"
-        );
-        assert!(
-            still_there,
-            "and it must not be deleted either: it may be a live environment"
-        );
-    }
-
-    /// Make the retirement mark in `dir` unreadable without touching the directory itself.
-    ///
-    /// A symbolic link pointing at itself. Looking for the mark follows it, gets
-    /// `FilesystemLoop` back, and the answer is neither "there" nor "not there", which is
-    /// the state under test.
-    ///
-    /// Taking the directory's permissions away instead was the first attempt and staged too
-    /// much: at mode 000 the operating system refuses the rename as well, so the code being
-    /// tested was never reached and the test passed with its own protection removed. Root
-    /// can also read a mode-000 directory, which would have made it fail on any CI that
-    /// runs as root. A link loop is neither: everything else about the directory keeps
-    /// working, for every user.
-    #[cfg(unix)]
-    fn make_the_mark_unreadable(dir: &Path) {
-        let link = dir.join(RETIRED_MARKER);
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&link, &link).expect("a link to itself");
-    }
-
-    /// Both names taken is not a decision this code makes.
-    #[tokio::test]
-    async fn an_unmarked_retired_directory_beside_a_live_one_is_left_alone() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["live"]).await;
-        let tombstone = dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"));
-        std::fs::create_dir_all(&tombstone).expect("mkdir");
-        std::fs::write(tombstone.join("data.mdb"), b"something").expect("write");
-
-        let store = open(&dir).await;
-        assert!(store.has_legacy());
-        assert!(
-            tombstone.exists(),
-            "an unmarked directory must never be deleted, even beside a live one"
-        );
-        assert!(dir.path().join(LEGACY_ENV_DIR).exists());
-    }
-
-    /// The mark is the last thing a deletion takes away.
-    ///
-    /// A recursive delete walks in whatever order the filesystem gives, so it can unlink
-    /// the mark and then fail on the next entry, which is what a sharing violation on the
-    /// data file looks like. That leaves a genuinely retired, partly deleted directory
-    /// carrying no evidence of it, and the next start would read that as intact and
-    /// restore it.
-    /// Unix only: the failure is provoked with directory permissions, which is not how
-    /// the same thing happens on Windows. The behaviour under test is platform-neutral.
-    #[cfg(unix)]
-    #[test]
-    fn a_failed_deletion_leaves_the_mark_in_place() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new().expect("temp dir");
-        let retired = dir.path().join("chunks.mdb.retired");
-        std::fs::create_dir_all(&retired).expect("mkdir");
-        std::fs::write(retired.join(LEGACY_DATA_FILE), b"payload").expect("write");
-        mark_directory_retired(&retired).expect("mark");
-
-        // An entry that cannot be removed, standing in for whatever the filesystem
-        // refuses on the day.
-        std::fs::create_dir_all(retired.join("stuck")).expect("mkdir");
-        let mut perms = std::fs::metadata(&retired).expect("meta").permissions();
-        perms.set_mode(0o500);
-        std::fs::set_permissions(&retired, perms.clone()).expect("chmod");
-
-        let failed = remove_marked_directory(&retired).is_err();
-
-        perms.set_mode(0o700);
-        std::fs::set_permissions(&retired, perms).expect("chmod back");
-
-        assert!(failed, "the deletion was supposed to fail");
-        assert!(
-            retirement_mark(&retired) == RetirementMark::Present,
-            "a deletion that failed must leave the mark, or the directory stops saying \
-             what it is"
-        );
-    }
-
-    /// A mark that cannot be read is not permission to do anything.
-    ///
-    /// The reason this is three states and not two. Reading the mark can fail for reasons
-    /// that are neither yes nor no, and the old answer for those was "no mark", which is
-    /// the worst of the three: a retired environment reads as live, goes back under its own
-    /// name, and its keys re-enter a commitment they have already left. Deleting on an
-    /// unreadable answer would be just as wrong in the other direction.
-    ///
-    /// Unix only: the state is staged with a symbolic link, which Windows does not offer
-    /// on the same terms.
-    #[cfg(unix)]
-    #[test]
-    fn a_mark_that_cannot_be_read_permits_nothing() {
-        let dir = TempDir::new().expect("temp dir");
-        let env = dir.path().join(LEGACY_ENV_DIR);
-
-        // Nothing there is not the same as cannot tell, and it is the ordinary case: every
-        // node that never had a legacy store, and every node that has finished with one,
-        // asks this question on every tick. Answering "cannot tell" for those would have a
-        // fresh node run a migration driver forever over a store it does not have.
-        assert_eq!(
-            retirement_mark(&env),
-            RetirementMark::Absent,
-            "a directory that is not there carries no mark, and that is known"
-        );
-        assert!(retirement_mark(&env).permits_opening());
-
-        std::fs::create_dir_all(&env).expect("mkdir");
-        std::fs::write(env.join(RETIRED_MARKER), b"retired").expect("mark");
-        assert_eq!(retirement_mark(&env), RetirementMark::Present);
-
-        // Looking for the mark now goes round in a circle, so the answer is neither there
-        // nor not there.
-        make_the_mark_unreadable(&env);
-        let unreadable = retirement_mark(&env);
-
-        assert_eq!(
-            unreadable,
-            RetirementMark::Unknown,
-            "a mark that cannot be read must not report as absent"
-        );
-        assert!(
-            !unreadable.permits_removal(),
-            "an unreadable mark must not authorise deleting the environment"
-        );
-        assert!(
-            !unreadable.permits_opening(),
-            "an unreadable mark must not authorise reopening the environment"
-        );
-    }
-
-    /// A directory under the live name that says it was retired is never opened.
-    ///
-    /// It may be partly deleted, and opening it would put keys back into a commitment
-    /// they have already left. Its chunks are in the file store, which is what the mark
-    /// records, so serving from files alone is correct.
-    #[tokio::test]
-    async fn a_marked_directory_under_the_live_name_is_not_served_from() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["marked-live"]).await;
-        {
-            let store = open(&dir).await;
-            store
-                .copy_batch(&keys, 0, 0, &never_cancelled())
-                .await
-                .expect("copy");
-        }
-        let env = dir.path().join(LEGACY_ENV_DIR);
-        mark_directory_retired(&env).expect("mark");
-
-        // Every name it could be moved to is taken by something that is not empty, so the
-        // rename fails and the marked directory stays under the live name. That is the
-        // case this is about: it must be left alone rather than opened.
-        for n in 0..=MAX_TOMBSTONES {
-            let taken = if n == 0 {
-                dir.path().join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}"))
-            } else {
-                dir.path()
-                    .join(format!("{LEGACY_ENV_DIR}{RETIRED_SUFFIX}.{n}"))
-            };
-            std::fs::create_dir_all(&taken).expect("mkdir");
-            std::fs::write(taken.join("occupied"), b"x").expect("write");
-        }
-
-        let store = open(&dir).await;
-        assert!(
-            env.exists(),
-            "the rename was supposed to fail, leaving the marked directory in place"
-        );
-        assert!(
-            !store.has_legacy(),
-            "a directory that says it was retired must never be opened as live"
-        );
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    /// A linked environment is copied out of but never deleted.
-    ///
-    /// An operator who points the chunk store at another volume leaves a link here.
-    /// Retirement renames the path and then deletes what is behind it, and behind a link
-    /// is a directory somewhere else that this node does not own.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_linked_environment_is_never_retired() {
-        let outside = TempDir::new().expect("temp dir");
-        let dir = TempDir::new().expect("temp dir");
-        // A real environment that lives in `outside`; the node root only links to it.
-        seed_legacy(&outside, &["someone-elses"]).await;
-        let real = outside.path().join(LEGACY_ENV_DIR);
-        let bystander = outside.path().join("unrelated");
-        std::fs::create_dir_all(&bystander).expect("mkdir");
-        std::os::unix::fs::symlink(&real, dir.path().join(LEGACY_ENV_DIR)).expect("symlink");
-
-        let store = open(&dir).await;
-        let blocker = store
-            .retirement_blocker(|_| false)
-            .expect("a linked environment must block retirement");
-        assert!(
-            blocker.contains("link"),
-            "the reason must name the actual problem, got: {blocker}"
-        );
-
-        // And nothing walks through it, whatever it is marked with.
-        std::fs::write(real.join(RETIRED_MARKER), b"x").expect("mark through the link");
-        assert!(
-            retirement_mark(&dir.path().join(LEGACY_ENV_DIR)) != RetirementMark::Present,
-            "a link must never be treated as a retired directory"
-        );
-        assert!(
-            remove_marked_directory(&dir.path().join(LEGACY_ENV_DIR)).is_err(),
-            "deleting through a link must be refused"
-        );
-        assert!(
-            real.join(LEGACY_DATA_FILE).exists(),
-            "and must delete nothing"
-        );
-        assert!(bystander.exists());
-    }
-
-    /// A deletion that cannot remove the directory itself puts the mark back.
-    ///
-    /// An unmarked directory that still exists is the one state the scheme says cannot
-    /// happen: the next start would read it as an intact environment.
-    ///
-    /// Unix only: the failure is provoked with directory permissions, which is not how
-    /// the same thing happens on Windows. The behaviour under test is platform-neutral.
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_that_cannot_be_removed_keeps_saying_it_was_retired() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new().expect("temp dir");
-        let retired = dir.path().join("chunks.mdb.retired");
-        std::fs::create_dir_all(&retired).expect("mkdir");
-        std::fs::write(retired.join(LEGACY_DATA_FILE), b"payload").expect("write");
-        mark_directory_retired(&retired).expect("mark");
-
-        // The parent read-only, so the directory cannot be unlinked from it while its own
-        // contents still can be. That is the shape that leaves an emptied, unmarked
-        // directory behind.
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o500);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod");
-
-        let failed = remove_marked_directory(&retired).is_err();
-
-        let mut perms = std::fs::metadata(dir.path()).expect("meta").permissions();
-        perms.set_mode(0o700);
-        std::fs::set_permissions(dir.path(), perms).expect("chmod back");
-
-        assert!(failed, "the removal was supposed to fail");
-        assert!(retired.exists(), "and to leave the directory behind");
-        assert!(
-            retirement_mark(&retired) == RetirementMark::Present,
-            "a directory that outlived its deletion must still say what it is"
-        );
-    }
-
-    /// A key the environment holds that is in neither view stops retirement.
-    ///
-    /// The gates only ever see the legacy-only set, so a key that has fallen out of both
-    /// the file index and that set has been through nothing and is protected by nothing.
-    /// It is the environment's only copy, and retirement would take it.
-    #[tokio::test]
-    async fn a_legacy_key_in_neither_view_refuses_the_proof_and_is_re_queued() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["orphan"]).await;
-        let key = *keys.first().expect("one key");
-        let store = open(&dir).await;
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        assert!(!store.legacy_only_keys().contains(&key));
-
-        // Stand in for whatever takes the file out from under the index: a quarantine, a
-        // publish that failed, an operator. The key is now in neither view.
-        let path = dir
-            .path()
-            .join("chunks")
-            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
-            .join(hex::encode(key));
-        std::fs::remove_file(&path).expect("remove the file");
-        store.files.forget_for_test(&key);
-        assert!(!store.files.exists(&key).unwrap_or(false));
-        assert!(!store.legacy_only_keys().contains(&key));
-
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(
-            !proof.is_clean(),
-            "a key protected by neither view must refuse the proof"
-        );
-        assert!(
-            store.legacy_only_keys().contains(&key),
-            "and must be put back where the gates can see it"
-        );
-    }
-
-    /// A verification that no longer describes the store does not authorise a deletion.
-    ///
-    /// The pass reads every chunk and its result is reused for a while rather than re-read
-    /// on every tick. Retirement is often deferred in that window by a gate that has
-    /// nothing to do with the files. If a kept chunk stops being readable meanwhile,
-    /// ordinary requests are still served from the legacy copy, and deleting that copy on
-    /// the strength of the older pass leaves the node holding only the unreadable one.
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn a_verification_overtaken_by_a_failing_file_does_not_authorise_retirement() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["kept-then-unreadable"]).await;
-        let key = *keys.first().expect("one key");
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        open_the_retirement_gate(&store);
-
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(proof.is_clean());
-
-        // The window: the file stops being readable after the pass and before the
-        // deletion it authorised.
-        let path = dir
-            .path()
-            .join("chunks")
-            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
-            .join(hex::encode(key));
-        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-        perms.set_mode(0o000);
-        std::fs::set_permissions(&path, perms).expect("chmod");
-        assert!(
-            store.get(&key).await.is_ok(),
-            "the legacy copy still serves it, which is what hides the problem"
-        );
-
-        let err = store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect_err("a verification the store has outrun must not authorise a delete");
-        assert!(format!("{err}").contains("no longer describes"), "{err}");
-        assert!(
-            store.has_legacy(),
-            "and the legacy environment must survive"
-        );
-
-        let mut perms = std::fs::metadata(&path).expect("meta").permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(&path, perms).expect("chmod back");
-    }
-
-    /// A write with no rollback copy is counted, on the path that actually skips.
-    ///
-    /// The environment is pinned to its current size for the whole bridge, so one with no
-    /// reusable page answers `Full` to every write and the node stores in files alone. That
-    /// is accepted, and the ADR says so. What was missing was any way to ask how often it
-    /// happens: the second release turns on knowing how many nodes are really keeping a
-    /// rollback copy, and a log line per chunk does not answer it.
-    ///
-    /// The first version of this counter missed exactly this path and counted only the
-    /// other one, the write that is attempted and refused. On the node most affected the
-    /// other path never runs, so the counter stayed at zero on precisely the nodes it was
-    /// added for.
-    #[tokio::test]
-    async fn a_write_with_no_rollback_copy_is_counted() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["settled"]).await;
-        let store = open(&dir).await;
-        assert_eq!(
-            store.writes_without_a_rollback_copy(),
-            0,
-            "nothing has been skipped yet"
-        );
-
-        let legacy = store.legacy().expect("legacy");
-        let before = legacy
-            .skipped_rollback_copies
-            .load(std::sync::atomic::Ordering::Relaxed);
-
-        // Whichever way the environment refuses, the count moves. Driven through the
-        // counter itself rather than by filling a real environment, because what is under
-        // test is that the skip is recorded, and staging a genuinely unwritable LMDB from
-        // here would be testing LMDB.
-        for _ in 0..12 {
-            let _ = legacy.note_skipped_rollback_copy();
-        }
-        assert_eq!(
-            store.writes_without_a_rollback_copy(),
-            before + 12,
-            "skipped writes must be visible to whoever asks the node"
-        );
-
-        // And the log is throttled, or a node with no free pages writes one line per chunk
-        // for the rest of its life.
-        let said: Vec<u64> = (0..1_000)
-            .filter_map(|_| legacy.note_skipped_rollback_copy())
-            .collect();
-        assert!(
-            said.len() < 10,
-            "the warning fired {} times in a thousand writes",
-            said.len()
-        );
-    }
-
-    /// Two writes for one key need two notes, not one shared between them.
-    ///
-    /// The journal used to be a set, so a second write for the same key announced nothing
-    /// and the first to return cleared the entry for both. A delete arriving in that window
-    /// sees no announcement, skips draining the environment, and the surviving write lands
-    /// afterwards and puts the key back, undoing a prune the node had decided on. The key
-    /// then sits in the environment and in neither view, which is the state retirement is
-    /// built to refuse: no data is lost, but a prune and a retirement cycle are.
-    ///
-    /// The file store's own in-flight map is counted for exactly this reason. This is the
-    /// same reasoning applied to the half that did not have it.
-    #[tokio::test]
-    async fn two_writes_for_one_key_are_two_notes_and_the_first_to_return_clears_neither() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["settled"]).await;
-        let store = open(&dir).await;
-        let legacy = store.legacy().expect("legacy");
-        let (addr, _) = addressed("two-writes");
-
-        legacy.announce(&addr);
-        legacy.announce(&addr);
-        assert!(store.has_pending_writes());
-
-        // The first write returns. The second is still out there, so the note has to stand.
-        legacy.announced_write_finished(&addr);
-        assert!(
-            store.has_pending_writes(),
-            "the first write to return cleared a note the second one was still relying on"
-        );
-
-        // And the second clears it.
-        legacy.announced_write_finished(&addr);
-        assert!(!store.has_pending_writes());
-
-        // Retiring one that was never announced changes nothing, which is what makes the
-        // delete path's unconditional clear safe.
-        legacy.announced_write_finished(&addr);
-        assert!(!store.has_pending_writes());
-    }
-
-    /// A write in flight is a note to self, not a claim to hold the chunk.
-    ///
-    /// The note exists because a write into the environment outlives the future waiting
-    /// for it, so a cancelled one could leave a chunk nothing had recorded. But until both
-    /// halves have returned the node does not hold it, and saying it does puts the key in
-    /// signed commitments and in the count a quote is priced from.
-    #[tokio::test]
-    async fn a_write_in_flight_is_not_claimed_but_does_stop_retirement() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["settled"]).await;
-        let store = open(&dir).await;
-        let legacy = store.legacy().expect("legacy");
-        let (addr, _) = addressed("in-flight");
-
-        // Stand in for a write that announced itself and never came back.
-        legacy.announce(&addr);
-
-        assert!(
-            !store.exists(&addr).expect("exists"),
-            "a write in flight must not be reported as held"
-        );
-        assert!(!store.all_keys().await.expect("keys").contains(&addr));
-        assert!(!store.legacy_only_keys().contains(&addr));
-        assert!(store.has_pending_writes());
-
-        // The distinction is the point: the same key in the key set IS claimed. If a
-        // write announced itself there instead, every one of the assertions above would
-        // be the opposite for as long as the write took.
-        legacy.only.write().insert(addr);
         assert!(store.exists(&addr).expect("exists"));
-        assert!(store.all_keys().await.expect("keys").contains(&addr));
-        legacy.only.write().remove(&addr);
+    }
 
-        // But it does stop the environment going, because what it holds is unsettled.
-        store.commit_to_files().expect("commit");
-        store.note_commitment_rebuilt();
-        store.note_commitment_rebuilt();
-        store.force_migration_state(|s| {
-            s.committed_at_unix =
-                Some(now_unix().saturating_sub(MIN_RETIRE_DELAY_HOURS * 3600 + 60));
-        });
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
+    #[tokio::test]
+    async fn a_repair_with_the_wrong_bytes_is_refused_and_changes_nothing() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("guarded");
+        store.put(&addr, &content).await.expect("put");
+        let path = store.chunk_path(&addr);
+
+        // The whole point of repairing in place is that a failure must leave the old file
+        // where it was. Deleting first and writing after would open a window whose only
+        // surviving copy is the one the caller is about to destroy.
         let err = store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
+            .repair(&addr, b"not this chunk")
             .await
-            .expect_err("an unsettled write must stop the removal");
-        assert!(format!("{err}").contains("not reported back"), "{err}");
-
-        // And the note is resolved against what is actually there: nothing, so it goes.
-        store.reconcile_pending_writes().await;
-        assert!(!store.has_pending_writes());
-        assert!(!store.legacy_only_keys().contains(&addr));
-    }
-
-    /// A delete outlasts a write for the same key that nobody waited for.
-    ///
-    /// A write has an environment half and a file half, and either can still be running
-    /// when its caller is dropped: the blocking work is not cancelled with the future.
-    /// A delete that did not wait for both would be undone by whichever half landed
-    /// afterwards, putting back a chunk the node had decided to prune.
-    #[tokio::test]
-    async fn a_delete_outlasts_a_write_nobody_waited_for() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["neighbour"]).await;
-        let store = Arc::new(open(&dir).await);
-        let (addr, content) = addressed("written-then-pruned");
-
-        // The gate is held from its own thread, so nothing holds a blocking guard across
-        // an await, and it is released through a channel when the test is ready.
-        let gate = store.files.test_put_gate();
-        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let _parked = gate.write();
-            held_tx.send(()).ok();
-            release_rx.recv().ok();
-        });
-        held_rx.recv().expect("the gate is held");
-
-        // The state under test, built directly rather than by racing a real put: a write
-        // that announced itself, whose file half is parked mid-publish, and whose caller
-        // is gone. Driving it through `put` and aborting would be a race about which half
-        // had started, and a test that sometimes sets up a different state than it claims
-        // is worse than no test.
-        let legacy = store.legacy().expect("legacy");
-        legacy.announce(&addr);
-        let publishing = {
-            let files = Arc::clone(&store.files);
-            let content = content.clone();
-            tokio::spawn(async move { files.put(&addr, &content).await })
-        };
-        // Until the publish is genuinely in flight and parked at the gate.
-        while store.files.tasks_in_flight() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        publishing.abort();
-        let _ = publishing.await;
-
-        // The delete has to wait the parked half out rather than racing it.
-        let deleting = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move { store.delete(&addr).await })
-        };
-        tokio::time::sleep(Duration::from_millis(100)).await;
+            .expect_err("must refuse");
+        assert!(format!("{err}").contains("Refusing to repair"), "{err}");
         assert!(
-            !deleting.is_finished(),
-            "the delete must wait for the write it would otherwise race"
+            path.exists(),
+            "the existing file must survive a refused repair"
         );
-
-        release_tx.send(()).ok();
-        holder.join().ok();
-        deleting.await.expect("join").expect("delete");
-
-        // Whichever half landed, the key is gone and stays gone.
-        store.files.wait_idle().await;
-        assert!(
-            !store.exists(&addr).unwrap_or(true),
-            "a write that landed after the delete would resurrect a pruned chunk"
-        );
-        assert!(!store.legacy_only_keys().contains(&addr));
-    }
-
-    /// A delete outlasts a file write that no journal knows about.
-    ///
-    /// The journal is kept by writes that touch both stores. The copier and the repair
-    /// path write only the file, so a delete that consulted the journal to decide whether
-    /// to wait would not wait for either of them, and whichever landed afterwards would
-    /// put back a chunk the node had decided to prune. What is writing a key is the file
-    /// store's own question to answer.
-    #[tokio::test]
-    async fn a_delete_outlasts_a_file_write_with_no_journal_entry() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["neighbour"]).await;
-        let store = Arc::new(open(&dir).await);
-        let (addr, content) = addressed("copied-then-pruned");
-
-        let gate = store.files.test_put_gate();
-        let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let holder = std::thread::spawn(move || {
-            let _parked = gate.write();
-            held_tx.send(()).ok();
-            release_rx.recv().ok();
-        });
-        held_rx.recv().expect("the gate is held");
-
-        // Deliberately no journal entry: this is the copier's shape, not a dual write.
-        let publishing = {
-            let files = Arc::clone(&store.files);
-            let content = content.clone();
-            tokio::spawn(async move { files.put(&addr, &content).await })
-        };
-        while store.files.tasks_in_flight() == 0 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        publishing.abort();
-        let _ = publishing.await;
-        assert!(
-            !store
-                .legacy()
-                .is_some_and(|l| l.pending.read().contains_key(&addr)),
-            "this is the case the journal does not cover, so it must be empty"
-        );
-
-        let deleting = {
-            let store = Arc::clone(&store);
-            tokio::spawn(async move { store.delete(&addr).await })
-        };
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(
-            !deleting.is_finished(),
-            "the delete must wait for a write the journal never knew about"
-        );
-
-        release_tx.send(()).ok();
-        holder.join().ok();
-        deleting.await.expect("join").expect("delete");
-
-        store.files.wait_idle().await;
-        assert!(
-            !store.exists(&addr).unwrap_or(true),
-            "a write that landed after the delete would resurrect a pruned chunk"
-        );
-    }
-
-    /// A single node can still be told to keep both stores.
-    #[tokio::test]
-    async fn retirement_is_refused_when_the_switch_is_turned_off() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["off"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = false;
-        let store = ChunkStore::new(config).await.expect("open store");
-        store.commit_to_files().expect("commit");
-        assert!(store
-            .retirement_blocker(|_| false)
-            .expect("blocked")
-            .contains("retirement is disabled"));
-    }
-
-    #[tokio::test]
-    async fn retiring_removes_the_legacy_environment_and_frees_its_space() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["f1", "f2", "f3"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        open_the_retirement_gate(&store);
-
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(proof.is_clean());
-        assert_eq!(proof.checked, 3);
-
-        let freed = store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect("retire");
-        assert!(freed > 0, "retirement must report the space it returned");
-        assert!(
-            !dir.path().join(LEGACY_ENV_DIR).exists(),
-            "the legacy environment must actually be removed"
-        );
-        assert!(!store.has_legacy());
-        assert_eq!(store.migration_phase(), MigrationPhase::FilesOnly);
-
-        // Everything is still readable, from files alone.
-        assert_eq!(store.current_chunks().expect("count"), 3);
-        for key in &keys {
-            assert!(store.get(key).await.expect("get").is_some());
-        }
-    }
-
-    #[tokio::test]
-    async fn a_reader_holding_the_legacy_handle_defers_retirement_without_hiding_chunks() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["busy"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = Arc::new(ChunkStore::new(config).await.expect("open"));
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        open_the_retirement_gate(&store);
-
-        // Stand in for a read that is still holding the legacy handle. Retirement must
-        // defer rather than unmap underneath it, and the chunk must stay readable
-        // throughout: a retirement attempt that briefly hid the legacy store would make a
-        // node answer "not found" for a chunk it holds.
-        let squatter = store.legacy().expect("a legacy handle");
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        let err = store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect_err("must defer while the handle is held");
-        assert!(format!("{err}").contains("deferred"), "{err}");
-
-        assert!(store.has_legacy(), "the store must keep its legacy handle");
-        let key = keys.first().copied().expect("a key");
-        assert!(
-            store.get(&key).await.expect("get").is_some(),
-            "the chunk must stay readable across a deferred retirement"
-        );
-
-        // Once the reader lets go, the next attempt succeeds.
-        drop(squatter);
-        store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect("retire");
-        assert!(!store.has_legacy());
-    }
-
-    #[tokio::test]
-    async fn retirement_needs_a_clean_verification_report() {
-        let dir = TempDir::new().expect("temp dir");
-        // Left uncopied on purpose, so this node is about to give the chunk up and the
-        // answerability veto has something to fire on.
-        seed_legacy(&dir, &["v1"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-
-        // A report cannot be fabricated: every field is private and the only source is
-        // the verification pass. The one available here is the default, which never ran.
-        let absent = VerifyReport::default();
-        let err = store
-            .retire_legacy(&absent, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect_err("must refuse a report that never ran");
-        assert!(format!("{err}").contains("unrepairable"), "{err}");
-        assert!(store.has_legacy(), "the legacy environment must survive");
-
-        // And a real, clean report is still refused while any gate is unmet, because
-        // retirement rechecks them all itself rather than trusting its caller.
-        open_the_retirement_gate(&store);
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(proof.is_clean());
-        let err = store
-            .retire_legacy(&proof, &|_: &XorName| true, &approved_shed(&store))
-            .await
-            .expect_err("must refuse while a chunk is still answerable");
-        assert!(format!("{err}").contains("still answerable"), "{err}");
-        assert!(store.has_legacy());
-    }
-
-    #[tokio::test]
-    async fn verification_repairs_a_file_that_rotted_before_retirement() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["w1", "w2"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-
-        // A filename is not proof the bytes behind it are good. Corrupt one, exactly as
-        // a truncated write or a bad sector would, then prove retirement repairs it
-        // rather than deleting the only intact copy.
-        let victim = keys.first().copied().expect("a key");
-        let path = dir
-            .path()
-            .join(crate::storage::file_store::CHUNKS_DIR_NAME)
-            .join(format!("{:02x}", victim.last().copied().unwrap_or(0)))
-            .join(hex::encode(victim));
-        std::fs::write(&path, b"rotted").expect("corrupt the file");
-        open_the_retirement_gate(&store);
-
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert_eq!(proof.repaired(), 1);
-        assert_eq!(proof.unrepairable(), 0);
-        assert!(proof.is_clean());
-
-        store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .expect("retire");
         assert_eq!(
-            store.get(&victim).await.expect("get").expect("present"),
-            addressed("w1").1
+            store.get(&addr).await.expect("get").expect("present"),
+            content
         );
     }
 
     #[tokio::test]
-    async fn a_corrupt_file_is_served_from_the_legacy_copy_and_requeued() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["s1"]).await;
-        let store = open(&dir).await;
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        assert!(store.legacy_only_keys().is_empty());
+    async fn a_chunk_can_be_deleted_and_stored_again() {
+        let (store, _dir) = test_store().await;
+        let (addr, content) = addressed("cycle");
 
-        let victim = keys.first().copied().expect("a key");
-        let path = dir
-            .path()
-            .join(crate::storage::file_store::CHUNKS_DIR_NAME)
-            .join(format!("{:02x}", victim.last().copied().unwrap_or(0)))
-            .join(hex::encode(victim));
-        std::fs::write(&path, b"rotted").expect("corrupt the file");
-
-        // The file store removes the bad file and stops advertising it; the facade must
-        // still find the intact copy rather than reporting a failure.
+        assert!(store.put(&addr, &content).await.expect("put"));
+        assert!(store.delete(&addr).await.expect("delete"));
+        assert!(
+            store.put(&addr, &content).await.expect("re-put"),
+            "a re-stored chunk is new again"
+        );
         assert_eq!(
-            store.get(&victim).await.expect("get").expect("present"),
-            addressed("s1").1
-        );
-        assert!(
-            store.legacy_only_keys().contains(&victim),
-            "the key must go back on the copier's list"
+            store.get(&addr).await.expect("get").expect("present"),
+            content
         );
     }
 
-    #[tokio::test]
-    async fn a_marker_claiming_more_than_the_file_store_holds_restarts_the_copy() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["p1", "p2", "p3"]).await;
-        let store = open(&dir).await;
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        store.commit_to_files().expect("commit");
-        assert_eq!(store.migration_state().kept_key_count, 3);
-        store.wait_idle().await;
-        drop(store);
+    /// Write a chunk file straight into its shard, the way an existing store already
+    /// contains thousands of them. Bypasses the write path deliberately: this exercises
+    /// the startup scan, not `put`.
+    fn plant(chunks_dir: &Path, key: &XorName) {
+        let dir = chunks_dir.join(shard_name(key));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(dir.join(hex::encode(key)), key).expect("plant");
+    }
 
-        // Someone clears the chunk directory to reclaim space, keeping chunks.mdb.
-        // Trusting the marker here would skip the copier, the shed rules and their rank
-        // checks on the way to deleting the legacy environment.
-        let chunks = dir.path().join(crate::storage::file_store::CHUNKS_DIR_NAME);
-        for key in &keys {
-            let path = chunks
-                .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
-                .join(hex::encode(key));
-            std::fs::remove_file(path).expect("clear the file store");
+    #[tokio::test]
+    async fn a_populated_and_churned_store_scans_correctly_at_scale() {
+        // Every shard populated, then aged the way a long-lived node ages: some keys
+        // deleted, others added in their place, so the directories carry holes rather
+        // than being freshly written. APFS enumeration is known to degrade with churn
+        // rather than with size, so a fresh corpus is not a realistic one.
+        const PLANTED: u32 = 20_000;
+        const CHURN: u32 = 1_000;
+
+        let dir = TempDir::new().expect("temp dir");
+        let chunks_dir = dir.path().join(CHUNKS_DIR_NAME);
+        std::fs::create_dir_all(&chunks_dir).expect("mkdir");
+
+        let mut expected: Vec<XorName> = Vec::new();
+        for i in 0..PLANTED {
+            let key = crate::client::compute_address(&i.to_le_bytes());
+            plant(&chunks_dir, &key);
+            expected.push(key);
         }
-
-        let store = open(&dir).await;
-        assert_eq!(
-            store.migration_phase(),
-            MigrationPhase::Bridging,
-            "the filesystem must win over the marker"
-        );
-        assert_eq!(store.legacy_only_keys().len(), 3);
-    }
-
-    #[tokio::test]
-    async fn a_file_that_vanished_mid_verification_is_requeued_not_republished() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["gone"]).await;
-        let mut config = test_config(&dir);
-        config.migration.retire_legacy = true;
-        let store = ChunkStore::new(config).await.expect("open");
-        store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        assert!(store.legacy_only_keys().is_empty());
-
-        // Remove the file without telling the store, which is what the pruner's own
-        // delete looks like if it lands mid-pass. Republishing from the legacy copy here
-        // would resurrect a chunk the node had deliberately deleted, so the key goes back
-        // on the copier's list instead and retirement is refused.
-        let key = keys.first().copied().expect("a key");
-        let path = dir
-            .path()
-            .join(crate::storage::file_store::CHUNKS_DIR_NAME)
-            .join(format!("{:02x}", key.last().copied().unwrap_or(0)))
-            .join(hex::encode(key));
-        std::fs::remove_file(&path).expect("remove behind the store's back");
-
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(
-            proof.unrepairable >= 1,
-            "the vanished file must be counted against the proof"
-        );
-        assert!(!proof.is_clean());
-        assert!(!path.exists(), "the pass must not republish it");
-        assert!(store.legacy_only_keys().contains(&key));
-        assert!(store
-            .retire_legacy(&proof, &|_: &XorName| false, &approved_shed(&store))
-            .await
-            .is_err());
-        assert!(store.has_legacy());
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_shutdown_stops_the_copier_and_refuses_to_pass_verification() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["s1", "s2", "s3"]).await;
-        let store = open(&dir).await;
-
-        // Shutdown must not have to wait out a pass that can run for hours, and a pass
-        // that stopped early is not evidence of anything.
-        let cancelled = CancellationToken::new();
-        cancelled.cancel();
-
-        let report = store
-            .copy_batch(&keys, 0, 0, &cancelled)
-            .await
-            .expect("copy");
-        assert_eq!(report.copied, 0, "the copier must stop immediately");
-        assert_eq!(store.legacy_only_keys().len(), 3);
-
-        let proof = store
-            .verify_before_retire(0, &cancelled)
-            .await
-            .expect("verify");
-        assert!(
-            !proof.is_clean(),
-            "an interrupted verification must never read as a pass"
-        );
-    }
-
-    #[tokio::test]
-    async fn the_migration_marker_survives_a_restart() {
-        let dir = TempDir::new().expect("temp dir");
-        let keys = seed_legacy(&dir, &["m1", "m2"]).await;
-        let store = open(&dir).await;
-        store
-            .copy_batch(&keys[..1], 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        store.commit_to_files().expect("commit");
-        store.note_commitment_rebuilt();
-        let first_start = store.migration_state().first_start_unix;
-        store.wait_idle().await;
-        drop(store);
-
-        let store = open(&dir).await;
-        let state = store.migration_state();
-        assert_eq!(state.phase, MigrationPhase::Committed);
-        assert_eq!(state.shed_key_count, 1);
-        assert_eq!(
-            state.first_start_unix, first_start,
-            "a restart must not restart the shed hold"
-        );
-        assert!(
-            state.committed_at_unix.is_some(),
-            "nor the retirement clock"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_marker_that_disagrees_with_the_filesystem_loses() {
-        let dir = TempDir::new().expect("temp dir");
-        seed_legacy(&dir, &["x1"]).await;
-        let store = open(&dir).await;
-        store.force_migration_state(|s| s.phase = MigrationPhase::FilesOnly);
-        store.migration_state().save(dir.path()).expect("save");
-        store.wait_idle().await;
-        drop(store);
-
-        // The marker claims the migration is done, but `chunks.mdb` is right there. The
-        // filesystem is the authority.
-        let store = open(&dir).await;
-        assert_eq!(store.migration_phase(), MigrationPhase::Bridging);
-        assert!(store.has_legacy());
-    }
-
-    /// A legacy record whose bytes do not hash to its key is removed, not passed around.
-    ///
-    /// Leaving it in the environment while dropping it from the key set puts it in
-    /// neither view, and the pre-retirement pass reads a key in neither view as one to
-    /// protect and puts it straight back. The next copier pass drops it again. One rotted
-    /// record would keep this node, and every node sharing its disk, from ever reclaiming
-    /// space.
-    #[tokio::test]
-    async fn a_legacy_chunk_that_does_not_match_its_address_is_removed_not_recycled() {
-        let dir = TempDir::new().expect("temp dir");
-        let (addr, _) = addressed("bad");
-        let other = addressed("other").1;
-        {
-            let lmdb = LmdbStorage::new(LmdbStorageConfig {
-                root_dir: dir.path().to_path_buf(),
-                verify_on_read: false,
-                max_map_size: 0,
-                disk_reserve: 0,
-            })
-            .await
-            .expect("open legacy");
-            // Under a key it does not hash to: what a record that rotted in place looks
-            // like, and the one shape the ordinary path refuses to create.
-            lmdb.put_unchecked(&addr, &other).await.expect("put");
-            lmdb.wait_idle().await;
+        for i in 0..CHURN {
+            let key = crate::client::compute_address(&i.to_le_bytes());
+            std::fs::remove_file(chunks_dir.join(shard_name(&key)).join(hex::encode(key)))
+                .expect("churn out");
+            let replacement = crate::client::compute_address(&(PLANTED + i).to_le_bytes());
+            plant(&chunks_dir, &replacement);
         }
-        let store = open(&dir).await;
-        let keys = store.legacy_only_keys();
-        assert_eq!(keys, vec![addr]);
-
-        let report = store
-            .copy_batch(&keys, 0, 0, &never_cancelled())
-            .await
-            .expect("copy");
-        assert_eq!(report.copied, 0);
-        assert_eq!(report.unusable, 1);
-        assert!(store.legacy_only_keys().is_empty());
-
-        // And it is gone from the environment, so the pass below cannot find it and put
-        // it back. That is the loop this is about.
-        let proof = store
-            .verify_before_retire(0, &never_cancelled())
-            .await
-            .expect("verify");
-        assert!(
-            store.legacy_only_keys().is_empty(),
-            "a removed record must not come back on the copier's list"
-        );
-        assert!(
-            proof.is_clean(),
-            "and must not go on refusing the proof for ever"
-        );
-    }
-
-    #[test]
-    fn the_release_switches_are_never_written_to_an_operator_config_file() {
-        // A node writes its effective configuration back to disk. If these round-tripped,
-        // R1's values would be baked into every operator's file and the next release
-        // would change nothing.
-        let mut config = MigrationConfig::default();
-        config.retire_legacy = !config.retire_legacy;
-        config.allow_shed = false;
-        config.shed_hold_hours = 5;
-
-        let encoded = toml::to_string(&config).expect("encode");
-        assert!(!encoded.contains("retire_legacy"), "{encoded}");
-
-        let decoded: MigrationConfig = toml::from_str(&encoded).expect("decode");
-        let fresh = MigrationConfig::default();
-        assert_eq!(decoded.retire_legacy, fresh.retire_legacy);
-        // Genuine operator controls do survive.
-        assert!(!decoded.allow_shed);
-        assert_eq!(decoded.shed_hold_hours, 5);
-    }
-
-    #[test]
-    fn the_copy_order_is_closest_first() {
-        let me = [0u8; XORNAME_LEN_LOCAL];
-        let mut near = [0u8; XORNAME_LEN_LOCAL];
-        if let Some(b) = near.last_mut() {
-            *b = 1;
+        expected.retain(|k| chunks_dir.join(shard_name(k)).join(hex::encode(k)).exists());
+        for i in 0..CHURN {
+            expected.push(crate::client::compute_address(&(PLANTED + i).to_le_bytes()));
         }
-        let mut far = [0u8; XORNAME_LEN_LOCAL];
-        if let Some(b) = far.first_mut() {
-            *b = 0xff;
-        }
-        let ordered = rank_closest_first(vec![far, near], Some(me));
-        assert_eq!(ordered.first().copied(), Some(near));
-        assert_eq!(ordered.last().copied(), Some(far));
-
-        // With no identity the order is still stable, which is all the copier needs.
-        let ordered = rank_closest_first(vec![far, near], None);
-        let mut expected = vec![far, near];
         expected.sort_unstable();
-        assert_eq!(ordered, expected);
+        expected.dedup();
+
+        let started = std::time::Instant::now();
+        let store = reopen(&dir).await;
+        let scan = started.elapsed();
+
+        assert_eq!(
+            store.current_chunks().expect("count"),
+            expected.len() as u64
+        );
+        assert_eq!(store.all_keys().await.expect("all_keys"), expected);
+
+        // Every shard should be in use at this size: 20,000 keys over 256 directories is
+        // about 78 each, and the last byte of a BLAKE3 output is uniform.
+        let occupied = std::fs::read_dir(&chunks_dir)
+            .expect("read store root")
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.len() == 2))
+            .count();
+        assert_eq!(occupied, SHARD_COUNT, "the suffix must reach every shard");
+
+        println!(
+            "scan of {} keys across {SHARD_COUNT} shards took {scan:?}",
+            expected.len()
+        );
     }
 
-    /// Local alias so the test does not import from the protocol crate.
-    const XORNAME_LEN_LOCAL: usize = 32;
-
-    #[test]
-    fn the_retirement_delay_can_never_be_shortened_below_the_retention_window() {
-        let config = MigrationConfig {
-            retire_delay_hours: 0,
-            ..MigrationConfig::default()
-        };
-        assert_eq!(
-            config.effective_retire_delay_hours(),
-            MIN_RETIRE_DELAY_HOURS
-        );
+    #[tokio::test]
+    async fn wait_idle_returns_once_writes_have_drained() {
+        let (store, _dir) = test_store().await;
+        let store = Arc::new(store);
+        for i in 0..32 {
+            let store = Arc::clone(&store);
+            let (addr, content) = addressed(&format!("drain-{i}"));
+            tokio::spawn(async move { store.put(&addr, &content).await });
+        }
+        // Not a synchronisation point for tasks that have not been spawned yet, but it
+        // must not hang and it must leave the store usable.
+        store.wait_idle().await;
+        let (addr, content) = addressed("after-drain");
+        assert!(store.put(&addr, &content).await.expect("put after drain"));
     }
 }

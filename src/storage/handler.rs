@@ -1,7 +1,7 @@
 //! ANT protocol handler for autonomi protocol messages.
 //!
 //! This handler processes chunk PUT/GET requests with optional payment verification,
-//! storing chunks to LMDB and using the DHT for network-wide retrieval.
+//! storing chunks on disk and using the DHT for network-wide retrieval.
 //!
 //! # Architecture
 //!
@@ -210,10 +210,10 @@ impl Drop for GetRequestTelemetry {
 
 /// ANT protocol handler.
 ///
-/// Handles chunk PUT/GET/Quote requests using LMDB storage for persistence
+/// Handles chunk PUT/GET/Quote requests, persisting each chunk as its own file
 /// and optional payment verification.
 pub struct AntProtocol {
-    /// LMDB storage for chunk persistence.
+    /// The chunk store.
     storage: Arc<ChunkStore>,
     /// Payment verifier for checking payments.
     payment_verifier: Arc<PaymentVerifier>,
@@ -233,7 +233,7 @@ impl AntProtocol {
     ///
     /// # Arguments
     ///
-    /// * `storage` - LMDB storage for chunk persistence
+    /// * `storage` - the chunk store
     /// * `payment_verifier` - Payment verifier for validating payments
     /// * `quote_generator` - Quote generator for creating storage quotes
     #[must_use]
@@ -291,7 +291,7 @@ impl AntProtocol {
         CHUNK_PROTOCOL_ID
     }
 
-    /// Get a reference to the underlying LMDB storage.
+    /// Get a reference to the underlying chunk store.
     #[must_use]
     pub fn storage(&self) -> Arc<ChunkStore> {
         Arc::clone(&self.storage)
@@ -682,13 +682,13 @@ impl AntProtocol {
     /// actually holds.
     ///
     /// The quote price is driven by `QuoteGenerator::records_stored()`. Reading
-    /// the live LMDB entry count (an O(1) B-tree page-header read) right before
+    /// the live chunk count right before
     /// pricing makes the metric deletion-aware: any chunk removed by
     /// [`ChunkStore::delete`] or by the replication prune pass is reflected
     /// immediately, with no risk of missing a delete path.
     ///
     /// On a storage read error — or a count that does not fit `usize` — the
-    /// previous metric value is left untouched so a transient LMDB error never
+    /// previous metric value is left untouched so a transient read error never
     /// disrupts quote generation.
     fn resync_quote_metric(&self) {
         match self.storage.current_chunks() {
@@ -1189,7 +1189,7 @@ mod tests {
     /// "Full" now means both halves of the predicate: the volume is below the
     /// reserve **and** the store has no reusable space. A freshly created store
     /// has no freed pages, so both hold and the pre-check short-circuits, as it
-    /// always did. The companion cases in `storage::lmdb::tests` cover the half
+    /// always did. The companion cases in `storage::chunk_store::tests` cover the half
     /// that changed, where pruning has left reusable pages and the node must be
     /// admitted rather than refused on `statvfs` alone.
     ///

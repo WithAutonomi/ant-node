@@ -605,7 +605,7 @@ pub struct PaymentVerifier {
     /// midpoint in the live DHT. `None` in unit tests that don't exercise
     /// live-DHT checks; production startup MUST call [`attach_p2p_node`].
     p2p_node: RwLock<Option<Arc<P2PNode>>>,
-    /// LMDB storage handle, attached post-construction. Retained for
+    /// Chunk store handle, attached post-construction. Retained for
     /// store-backed verifier checks that need the authoritative on-disk record
     /// count without depending on a side counter that may drift from
     /// replication/repair/prune paths. NOTE: the ADR-0006 price floor does NOT

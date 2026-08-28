@@ -602,7 +602,7 @@ impl Devnet {
         };
         let storage = ChunkStore::new(storage_config)
             .await
-            .map_err(|e| DevnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
+            .map_err(|e| DevnetError::Core(format!("Failed to create the chunk store: {e}")))?;
 
         let evm_config = EvmVerifierConfig {
             network: config

@@ -992,7 +992,7 @@ const INBOUND_REPLICATION_SERIAL_QUEUE_CAPACITY: usize = 64;
 /// Maximum fresh-replication offers processed concurrently, away from the
 /// serial non-audit loop.
 ///
-/// Fresh offers can perform an on-chain payment verification and a 4 MiB LMDB
+/// Fresh offers can perform an on-chain payment verification and a 4 MiB
 /// write. Four workers keep that latency off the responder dispatch path while
 /// keeping concurrent EVM/storage pressure small and predictable.
 const FRESH_OFFER_WORKER_LIMIT: usize = 4;
@@ -1126,7 +1126,7 @@ const FETCH_RESPONDER_MAX_OUTSTANDING_PER_PEER: u32 = 2;
 
 /// Maximum verification batches served concurrently.
 ///
-/// LMDB point lookups are fast, but a batch can contain 8,192 of them. Two
+/// Point lookups are fast, but a batch can contain 8,192 of them. Two
 /// workers isolate that synchronous work from message dispatch without turning
 /// large batches into an I/O fan-out throughput contest.
 const VERIFICATION_RESPONDER_WORKER_LIMIT: usize = 2;
@@ -1484,13 +1484,13 @@ const BOOTSTRAP_DRAIN_CHECK_SECS: u64 = 5;
 /// observe the cancellation token and terminate before aborting it.
 ///
 /// Detached tasks are drained without a timeout because storage-capable work
-/// may be awaiting a `spawn_blocking` LMDB operation, which continues running
+/// may be awaiting a `spawn_blocking` storage operation, which continues running
 /// if its async waiter is dropped.
 const SHUTDOWN_TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the responder rebuilds + rotates its storage commitment.
 ///
-/// Each rebuild scans LMDB to compute leaf hashes; for ~10k keys this is
+/// Each rebuild scans the store to compute leaf hashes; for ~10k keys this is
 /// sub-100ms (BLAKE3 + tree build). Retention is gossip-anchored, NOT
 /// rotation-anchored: the responder stays answerable for the current
 /// commitment plus every root it recently gossiped that is still in-window
@@ -1700,7 +1700,7 @@ pub struct ReplicationEngine {
     identity: Arc<NodeIdentity>,
     /// Responder-side commitment state (two-slot atomic rotation).
     ///
-    /// Periodically rebuilt from the live LMDB key set; gossiped on
+    /// Periodically rebuilt from the live key set; gossiped on
     /// outbound `NeighborSyncRequest`/`Response`; consulted by the
     /// commitment-bound audit handler.
     commitment_state: Arc<ResponderCommitmentState>,
@@ -2281,14 +2281,14 @@ impl ReplicationEngine {
     ///
     /// This must be awaited before dropping the engine when the caller needs
     /// the `Arc<ChunkStore>` references held by background tasks to be
-    /// released (e.g. before reopening the same LMDB environment).
+    /// released (e.g. before reopening the same store).
     ///
     /// When this returns, no engine-spawned task still holds
-    /// `Arc<ChunkStore>` or `Arc<PaidList>`, and no LMDB blocking operation
-    /// (read or write, on either the chunk store or the paid-list
+    /// `Arc<ChunkStore>` or `Arc<PaidList>`, and no blocking storage operation
+    /// (read or write, against either the chunk store or the paid-list LMDB
     /// environment) is still running.  Engine tasks race their work against
     /// the shutdown token; a dropped future may leave a `spawn_blocking`
-    /// LMDB transaction running detached, so this method additionally waits
+    /// operation running detached, so this method additionally waits
     /// for both storage layers to go quiescent before returning.
     pub async fn shutdown(&mut self) {
         self.shutdown.cancel();
@@ -2329,7 +2329,7 @@ impl ReplicationEngine {
         // All producers have stopped, so close and drain their detached work.
         // A started storage operation must run to completion: dropping an async
         // waiter does not cancel `spawn_blocking`, and would let shutdown return
-        // while an LMDB transaction still owns the environment.
+        // while a blocking storage operation is still running.
         //
         // Deliberately unbounded: the LMDB contract requires every worker to
         // release its `Arc<ChunkStore>` before the caller may reopen the
@@ -9897,12 +9897,8 @@ async fn rebuild_and_rotate_commitment(
     config: &Arc<ReplicationConfig>,
 ) -> Result<()> {
     // Not `all_keys()`. While the node is bridging off the legacy store these are the
-    // same thing, but once it has settled on what it can hold this narrows to the
-    // file-backed set, which is what stops it claiming keys it is about to give up. It is
-    // also what lets `is_held` eventually go false for those keys, which is the gate on
-    // removing the legacy environment at all.
     let stored_keys = storage
-        .committable_keys()
+        .all_keys()
         .await
         .map_err(|e| Error::Storage(format!("commitment build: read keys: {e}")))?;
 
@@ -9935,7 +9931,6 @@ async fn rebuild_and_rotate_commitment(
                 debug!("Commitment rotation: storage empty, clearing retained slots");
                 state.clear_all();
             }
-            storage.note_commitment_rebuilt();
             return Ok(());
         }
         // Bytes are still on disk but no key is currently in range. We must NOT
@@ -9955,7 +9950,6 @@ async fn rebuild_and_rotate_commitment(
              (stays answerable until its gossip TTL lapses, bytes still on disk)"
         );
         state.retire_current();
-        storage.note_commitment_rebuilt();
         return Ok(());
     }
 
@@ -10022,9 +10016,6 @@ async fn rebuild_and_rotate_commitment(
             // committed key set is frozen here for many rotations. Without this,
             // the no-op guard would pin a stale slot — and its key — forever.
             state.age_out();
-            // The advertised commitment already equals the committable set, which is
-            // exactly what the retirement gate is counting.
-            storage.note_commitment_rebuilt();
             return Ok(());
         }
     }
@@ -10047,10 +10038,6 @@ async fn rebuild_and_rotate_commitment(
     let key_count = built.commitment().key_count;
     state.rotate(built);
     info!("Storage commitment rotated: hash={hash} key_count={key_count}");
-    // Counted only on the paths where the advertised commitment now genuinely reflects
-    // the committable set, never merely on having read it. The retirement gate is what
-    // consumes this, and it authorises deleting the legacy store.
-    storage.note_commitment_rebuilt();
     Ok(())
 }
 
@@ -10091,15 +10078,14 @@ mod tests {
     /// to a response is what the classification above rests on.
     ///
     /// A key the peer does not hold reads as `Ok(None)`. A read that fails, whether from
-    /// an I/O fault or a failed integrity check, reads as `Err`. Nothing in the migration
-    /// turns the first into the second.
+    /// an I/O fault or a failed integrity check, reads as `Err`. Nothing turns the first
+    /// into the second.
     #[tokio::test]
     async fn a_missing_key_reads_as_a_plain_miss_and_a_failed_read_as_a_fault() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let storage = crate::storage::LmdbStorage::new(crate::storage::LmdbStorageConfig {
+        let storage = crate::storage::ChunkStore::new(crate::storage::ChunkStoreConfig {
             root_dir: dir.path().to_path_buf(),
             verify_on_read: true,
-            max_map_size: 0,
             disk_reserve: 0,
         })
         .await

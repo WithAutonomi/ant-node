@@ -230,7 +230,7 @@ pub const AUDIT_RESPONDER_TOP_ORIGINS: usize = 10;
 /// round-1 proofs from starving the light audits, and bounds concurrent
 /// multi-gigabyte hashing to this many at once. Two allows overlap without
 /// admitting many simultaneous full-subtree hashes; there is little benefit in
-/// more concurrent large LMDB scans against one disk.
+/// more concurrent large store scans against one disk.
 pub const MAX_CONCURRENT_SUBTREE_ROUND1: usize = 2;
 
 /// Per-peer concurrency cap for the heavy subtree-audit round 1. One in-flight
@@ -293,7 +293,7 @@ pub const SUBTREE_ROUND1_WORK_BURST_BYTES: i64 = 8 * 1024 * 1024 * 1024;
 /// Floor charged against the round-1 work budget per leaf attempted, in bytes.
 ///
 /// The budget counts content bytes, which is the right unit for the hashing but
-/// misses what a leaf costs before its size is known: an LMDB point lookup with
+/// misses what a leaf costs before its size is known: a point lookup with
 /// its retries, and a `spawn_blocking` dispatch and join. Nothing bounds a
 /// chunk from below, so a commitment made of a million tiny records would run a
 /// full subtree of reads and task round-trips per audit while charging almost
@@ -611,7 +611,7 @@ pub const MAX_VERIFICATION_KEYS_PER_CYCLE: usize = 8_192;
 ///
 /// Senders aggregate all keys for a peer into one request. Matching this limit
 /// to the cycle bound lets an honest round use one request per peer while still
-/// bounding the LMDB work performed on the responder's serial replication
+/// bounding the storage work performed on the responder's serial replication
 /// message path. Oversized requests are rejected as an empty, wire-compatible
 /// verification response.
 pub const MAX_INCOMING_VERIFICATION_KEYS: usize = MAX_VERIFICATION_KEYS_PER_CYCLE;

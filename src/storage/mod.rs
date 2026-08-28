@@ -1,8 +1,8 @@
 //! Storage subsystem for chunk persistence.
 //!
-//! This module provides content-addressed LMDB storage for chunks,
-//! along with a protocol handler that integrates with saorsa-core's
-//! `Protocol` trait for automatic message routing.
+//! This module provides content-addressed storage for chunks, one immutable file per
+//! chunk, along with a protocol handler that integrates with saorsa-core's `Protocol`
+//! trait for automatic message routing.
 //!
 //! # Architecture
 //!
@@ -19,7 +19,7 @@
 //! │   QuoteRequest           ChunkPutRequest    ChunkGetRequest
 //! │         │                         │                 │  │
 //! │         ▼                         ▼                 ▼  │
-//! │   QuoteGenerator          PaymentVerifier   LmdbStorage│
+//! │   QuoteGenerator          PaymentVerifier    ChunkStore│
 //! │         │                         │                 │  │
 //! │         └─────────────────────────┴─────────────────┘  │
 //! │                           │                             │
@@ -31,11 +31,11 @@
 //!
 //! ```rust,ignore
 //! use std::sync::Arc;
-//! use ant_node::storage::{AntProtocol, LmdbStorage, LmdbStorageConfig};
+//! use ant_node::storage::{AntProtocol, ChunkStore, ChunkStoreConfig};
 //!
 //! // Create storage
-//! let config = LmdbStorageConfig::default();
-//! let storage = Arc::new(LmdbStorage::new(config).await?);
+//! let config = ChunkStoreConfig::default();
+//! let storage = Arc::new(ChunkStore::new(config).await?);
 //!
 //! // Create protocol handler
 //! let protocol = AntProtocol::new(storage, Arc::new(payment_verifier), Arc::new(quote_generator));
@@ -44,23 +44,18 @@
 //! listener.register_protocol(protocol).await?;
 //! ```
 
-pub(crate) mod chunk_store;
 #[cfg(any(test, feature = "test-utils"))]
-pub mod file_store;
+pub mod chunk_store;
 #[cfg(not(any(test, feature = "test-utils")))]
-pub(crate) mod file_store;
+pub(crate) mod chunk_store;
 mod handler;
-pub(crate) mod lmdb;
-pub mod migration;
+pub mod legacy_artifacts;
 
 pub use crate::ant_protocol::XorName;
-pub use chunk_store::{ChunkStore, ChunkStoreConfig, VerifyReport, LEGACY_ENV_DIR};
-pub use file_store::{FileStore, FileStoreConfig, StoreLayout};
+pub use chunk_store::{CapacityVerdict, ChunkStore, ChunkStoreConfig, StoreLayout};
 pub use handler::AntProtocol;
 pub(crate) use handler::ChunkRequestContext;
-pub(crate) use lmdb::CapacityVerdict;
-pub use lmdb::{LmdbStorage, LmdbStorageConfig};
-pub use migration::{MigrationConfig, MigrationPhase, MigrationState};
+pub use legacy_artifacts::LEGACY_ENV_DIR;
 
 /// Bytes in one MiB.
 pub const MIB: u64 = 1024 * 1024;
