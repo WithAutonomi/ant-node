@@ -620,10 +620,11 @@ pub struct ChunkStore {
     write_finished: Arc<tokio::sync::Notify>,
     /// Bumped whenever a chunk stops being servable.
     ///
-    /// The pre-retirement pass reads every chunk, and its result is reused for a while
-    /// rather than re-read on every tick. This is how the caller can tell that the store
-    /// has not changed underneath that result: a proof carries the value it saw, and a
-    /// file that has since gone or stopped being readable makes it stale.
+    /// A caller that reads every chunk and then reuses the result rather than re-reading
+    /// can tell from this that the store has not changed underneath it: the result carries
+    /// the value it saw, and a file that has since gone or stopped being readable makes it
+    /// stale. The verification pass before the old store was deleted worked this way; the
+    /// counter outlived it because the property is general.
     health: Arc<std::sync::atomic::AtomicU64>,
     /// Size-aware free-space predicate.
     capacity: Arc<CapacityGuard>,
@@ -647,6 +648,21 @@ pub struct ChunkStore {
     /// is the shape a `select!` losing to a shutdown token leaves behind.
     #[cfg(any(test, feature = "test-utils"))]
     test_put_gate: Arc<parking_lot::RwLock<()>>,
+
+    /// Test-only: parks a put after it has taken the key's lane and before it registers
+    /// itself as in flight.
+    ///
+    /// Asynchronous, unlike the gate above. That one is taken inside a blocking closure on
+    /// its own thread; this one is taken on the runtime, so a synchronous lock here would
+    /// block the executor and the test would deadlock instead of observing anything.
+    ///
+    /// A separate gate from the one above, because that one sits inside the blocking
+    /// closure, which is after registration. The window this opens is the one the key lane
+    /// exists for: a put that a delete's wait cannot see yet, because there is nothing to
+    /// see. Without a hook here, a test cannot tell a delete blocked by the lane from a
+    /// delete blocked by the wait, and so cannot show the lane is doing anything.
+    #[cfg(any(test, feature = "test-utils"))]
+    test_pre_registration_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ChunkStore {
@@ -754,6 +770,8 @@ impl ChunkStore {
             blocking_tracker: TaskTracker::new(),
             #[cfg(any(test, feature = "test-utils"))]
             test_put_gate: Arc::new(parking_lot::RwLock::new(())),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_pre_registration_gate: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -834,6 +852,9 @@ impl ChunkStore {
         let test_put_gate = Arc::clone(&self.test_put_gate);
         // Registered before the work is spawned and cleared by the work itself, so a
         // caller that goes away cannot leave a delete free to race this publish.
+        // Test-only: the window between taking the lane and being visible to a delete.
+        #[cfg(any(test, feature = "test-utils"))]
+        drop(self.test_pre_registration_gate.read().await);
         let in_flight = self.begin_write(address);
         // And the lease, for the same reason the scan holds it: this thread writes into a
         // directory whose exclusivity the lock is what establishes, and it can outlive
@@ -1089,11 +1110,11 @@ impl ChunkStore {
 
     /// Flush every directory a chunk can live in, so the names in them are durable.
     ///
-    /// Byte integrity is not the whole of what the pre-retirement proof has to establish.
-    /// A chunk whose contents are on the platter but whose *name* is not is still lost to
-    /// a power loss, and a publish whose rename landed and whose directory flush failed
-    /// leaves exactly that: the next attempt sees the name, the next verification reads
-    /// the right bytes, and nothing goes back to retry the flush. So the proof flushes
+    /// Byte integrity is not the whole of what a verification pass establishes. A chunk
+    /// whose contents are on the platter but whose *name* is not is still lost to a power
+    /// loss, and a publish whose rename landed and whose directory flush failed leaves
+    /// exactly that: the next attempt sees the name, the next verification reads the right
+    /// bytes, and nothing goes back to retry the flush. So the pass flushes
     /// them itself rather than trusting that each publish did.
     ///
     /// Cheap: at most 257 directory flushes for a store of any size, and nothing off Unix,
@@ -1203,18 +1224,23 @@ impl ChunkStore {
         }
     }
 
-    /// Replace the file behind an address with known-good bytes, atomically.
+    /// Replace the file behind an address with bytes that hash to it.
     ///
-    /// Unlike [`Self::put`], this deliberately publishes **over** an existing name. It
-    /// exists for one caller: repairing a file whose bytes no longer hash to their own
-    /// name, from a copy held elsewhere, before that copy is destroyed. Doing it as
-    /// delete-then-put would leave a window where the only remaining copy is the one
-    /// about to be deleted, and any failure in that window is unrecoverable.
+    /// Unlike [`Self::put`], this deliberately publishes **over** an existing name, for
+    /// repairing a file whose bytes no longer hash to their own. Doing it as
+    /// delete-then-put would leave a window with no copy at all.
+    ///
+    /// **Only call this once a read has shown the existing bytes are wrong.** On Unix the
+    /// replacement is atomic and a failure leaves the old file untouched. Off Unix it is
+    /// not: there is no durable rename there, so the existing file is truncated and
+    /// rewritten in place, and a crash part-way leaves a mixture. That is tolerable when
+    /// the bytes being replaced were already known to be wrong, and is data loss when they
+    /// were not. Nothing enforces the precondition, which is why it is stated here.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Storage`] if `content` does not hash to `address`, or the write
-    /// fails. The old file is left untouched on every error path.
+    /// fails.
     pub async fn repair(&self, address: &XorName, content: &[u8]) -> Result<()> {
         let _lane = self.key_lock(address).await;
         self.repair_holding_the_lane(address, content).await
@@ -1329,8 +1355,7 @@ impl ChunkStore {
                 );
                 // Said before it is acted on. Removing the file can fail or be cancelled,
                 // and a chunk proven wrong that goes on looking healthy is one the node
-                // keeps committing to and, worse, one a cached pre-retirement pass still
-                // covers: the legacy copy that would repair it gets deleted.
+                // keeps committing to and keeps being audited for.
                 self.mark_known_wrong(address);
                 self.quarantine_corrupt(address).await;
                 return Err(Error::Storage(format!(
@@ -1685,6 +1710,13 @@ impl ChunkStore {
     #[must_use]
     pub fn test_put_gate(&self) -> Arc<parking_lot::RwLock<()>> {
         Arc::clone(&self.test_put_gate)
+    }
+
+    /// Test-only handle to the gate that parks a put before it registers itself.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn test_pre_registration_gate(&self) -> Arc<tokio::sync::RwLock<()>> {
+        Arc::clone(&self.test_pre_registration_gate)
     }
 
     /// Register a write of `address` and hand back the token that clears it.
@@ -2673,8 +2705,10 @@ fn write_and_replace(
     // wrong. A crash part-way therefore leaves wrong bytes where wrong bytes already were,
     // which is not a loss, and the next verified read finds them and repairs again. What it
     // is NOT safe for is replacing bytes that were good, so this must not be reached on any
-    // path that has not established otherwise: today those are the three `StoredBytes::
-    // Wrong` arms.
+    // path that has not established otherwise. In this crate that holds: the two
+    // `StoredBytes::Wrong` arms get there from a read that hashed and disagreed, and
+    // `holds_verified` gets there from a read that returned bytes which were not the
+    // caller's. The public entry point makes no such check and says so.
     //
     // A temporary and a rename would make it atomic, at the cost of a directory entry
     // change that cannot be flushed here. That trade is worth revisiting on a platform
@@ -3314,53 +3348,66 @@ mod tests {
         assert_eq!(raw, b"tampered");
     }
 
-    /// A put that started before a delete does not land after it.
+    /// A delete waits for a put that is already under way for the same key.
     ///
     /// The narrower ordering, and the one waiting for registered writes does not cover. A
     /// put does a lot before it registers itself: it checks the address, reads to see
     /// whether the name is taken, and reserves capacity. A delete arriving in that window
-    /// sees nothing registered, waits for nothing, and goes ahead; the put registers and
-    /// publishes afterwards, and the node keeps a chunk it decided to prune.
+    /// would see nothing registered, wait for nothing, and go ahead; the put would register
+    /// and publish afterwards, and the node would keep a chunk it had decided to prune.
     ///
-    /// Staged by holding the delete's own lane so the put is guaranteed to be mid-flight
-    /// and unregistered when the delete starts. What closes it is the put taking the key's
-    /// lane for its whole transition rather than only for the part that touches disk.
+    /// Staged deterministically rather than by racing two tasks. A put parked inside its
+    /// own closure is holding the key's lane, so the delete must not be able to finish
+    /// while it is parked. An earlier version of this test started both and accepted either
+    /// ordering, which the bug also satisfies: it proved nothing.
     #[tokio::test]
-    async fn a_put_that_started_before_a_delete_does_not_land_after_it() {
+    #[allow(clippy::await_holding_lock)]
+    async fn a_delete_waits_for_a_put_already_under_way() {
         let dir = TempDir::new().expect("temp dir");
         let store = Arc::new(reopen(&dir).await);
         let content = b"a chunk the pruner has decided to drop".to_vec();
         let addr = crate::client::compute_address(&content);
 
-        // Already stored, so the delete has something to remove.
-        store.put(&addr, &content).await.expect("seed");
-        store.wait_idle().await;
-
-        // A put and a delete issued together for the same key. Whatever the interleaving,
-        // the delete is the later decision and must win: the alternative is a node that
-        // keeps a chunk its pruner has already given up.
+        // Park the put in the window that matters: it has taken the key's lane and has NOT
+        // yet registered itself, so a delete's wait for in-flight writes would see nothing.
+        // Parking it later, inside its closure, cannot show the lane doing anything: the
+        // delete would block on the wait instead and the test would pass either way.
+        let gate = store.test_pre_registration_gate();
+        let held = gate.write().await;
         let writing = {
             let store = Arc::clone(&store);
             let content = content.clone();
             tokio::spawn(async move { store.put(&addr, &content).await })
         };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The delete must not get past the lane while that put holds it. Without the lane
+        // on `put` this finishes immediately, which is the regression.
         let deleting = {
             let store = Arc::clone(&store);
             tokio::spawn(async move { store.delete(&addr).await })
         };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !deleting.is_finished(),
+            "the delete finished while a put for the same key was still under way"
+        );
+
+        // Released: the put completes, then the delete runs. The delete is the later
+        // decision, so the chunk must be gone.
+        drop(held);
         let _ = writing.await.expect("the put task must not panic");
         let _ = deleting.await.expect("the delete task must not panic");
         store.wait_idle().await;
 
-        // Serialised by the lane, so the outcome is one of the two orderings and never a
-        // mixture: either the put went first and the delete removed it, or the delete went
-        // first and the put stored it again. What must never happen is the index and the
-        // disk disagreeing about which.
-        assert_eq!(
-            store.is_indexed(&addr),
-            store.chunk_path(&addr).exists(),
-            "the index and the disk disagree about {} after a concurrent put and delete",
+        assert!(
+            !store.is_indexed(&addr),
+            "the put landed after the delete and put {} back",
             hex::encode(addr)
+        );
+        assert!(
+            !store.chunk_path(&addr).exists(),
+            "and left its file behind"
         );
     }
 

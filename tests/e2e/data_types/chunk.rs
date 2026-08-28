@@ -358,7 +358,7 @@ mod tests {
         //    so all Arc<ChunkStore> clones are released.
         // 2. Abort the protocol task that holds an Arc<AntProtocol>.
         // 3. Drop the node's own Arc<AntProtocol>.
-        // This ensures the LMDB env is fully closed before reopening.
+        // This ensures the the chunk store is fully closed before reopening.
         let data_dir = {
             let node = harness
                 .network_mut()

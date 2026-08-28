@@ -2343,7 +2343,7 @@ impl ReplicationEngine {
         self.detached_task_tracker.wait().await;
 
         // Every producer is gone, but a select! racing the shutdown token may
-        // have dropped a future while it awaited an LMDB `spawn_blocking` op
+        // have dropped a future while it awaited a storage `spawn_blocking` op
         // (fetch `storage.put`, prune `storage.delete` /
         // `paid_list.remove_batch`, verification `paid_list.insert`).  The
         // detached blocking closure owns a cloned `Env`; wait for both
@@ -2480,12 +2480,12 @@ impl ReplicationEngine {
                             // so those waiters would drain only at the probe timeout
                             // (roughly `queued / per-target-limit` probes deep) while
                             // `detached_task_tracker.wait()` — deliberately unbounded
-                            // for the LMDB contract — held shutdown open.
+                            // for the storage contract — held shutdown open.
                             //
                             // Dropping this future mid-probe is safe and is the same
                             // shape the neighbor-sync round uses: a parked coordinator
                             // acquire releases its counted reference via
-                            // `ReferenceGuard`, and a dropped LMDB `spawn_blocking` is
+                            // `ReferenceGuard`, and a dropped storage `spawn_blocking` is
                             // covered by the storage-quiescence wait in `shutdown`.
                             tokio::select! {
                                 () = shutdown.cancelled() => {}
@@ -4309,7 +4309,7 @@ struct ReplicationMessageHandlerContext {
     /// The engine's shutdown token, for detached responder work.
     ///
     /// Workers on [`Self::detached_task_tracker`] race this around their
-    /// *network* phase only — never around an LMDB `spawn_blocking` await,
+    /// *network* phase only — never around a storage `spawn_blocking` await,
     /// where dropping the awaiter would detach a live transaction. This is
     /// what lets `shutdown()` keep its unbounded `tracker.wait()` and still
     /// terminate: the wait stays safe because it is now guaranteed finite.
@@ -5486,7 +5486,7 @@ async fn handle_replication_message(
 /// is guaranteed to end.
 ///
 /// Deliberately NOT applied to `storage.put`: that awaits `spawn_blocking`, so
-/// dropping its awaiter would detach a live LMDB transaction and break the
+/// dropping its awaiter would detach a live storage operation and break the
 /// very contract the unbounded wait exists to uphold.
 async fn verify_payment_until_shutdown(
     payment_verifier: &Arc<PaymentVerifier>,
@@ -5716,7 +5716,7 @@ async fn refuse_stranded_fresh_offers(
 ///
 /// This runs on the serial non-audit message loop, so it must stay cheap: every
 /// path here is a set insert, a permit try, or a small response send. The offer
-/// itself — an on-chain payment verification and a multi-MiB LMDB write — always
+/// itself — an on-chain payment verification and a multi-MiB write — always
 /// runs on a tracked worker task, never inline, because stalling this loop backs
 /// up the inbound queue and ultimately drops replication messages wholesale.
 ///
@@ -5873,7 +5873,7 @@ async fn dispatch_fresh_offer(
 ///
 /// Split out so `dispatch_fresh_offer` stays a readable admission decision.
 /// A started handler is never cancelled: `storage.put()` awaits
-/// `spawn_blocking`, and dropping that awaiter would detach the live LMDB
+/// `spawn_blocking`, and dropping that awaiter would detach the live storage
 /// transaction. Shutdown responsiveness comes from the closed worker semaphore
 /// and from `handle_fresh_offer` racing the token around payment verification.
 ///
@@ -8907,7 +8907,7 @@ async fn execute_single_fetch(
                     if let Err(e) = storage.put(&resp_key, &data).await {
                         // The bytes arrived and passed the content-address
                         // check, so the source did its job; the failure is
-                        // entirely local (disk-full, or an LMDB error). Any
+                        // entirely local (disk-full, or a storage error). Any
                         // valid source must serve identical content, so trying
                         // the next one cannot cure a local error — it only
                         // re-downloads the same chunk into the same store.
@@ -9878,7 +9878,7 @@ async fn write_retention_atomic(path: &Path, bytes: Vec<u8>) -> bool {
     }
 }
 
-/// Read the current LMDB key set, build + sign a fresh
+/// Read the current key set, build + sign a fresh
 /// `StorageCommitment`, and rotate it into `state` as the new `current`.
 /// The prior `current` is demoted to `previous`; the prior `previous` is
 /// dropped (per `ResponderCommitmentState::rotate`).

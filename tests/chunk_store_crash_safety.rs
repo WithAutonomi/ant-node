@@ -143,7 +143,16 @@ async fn a_process_killed_mid_publish_leaves_no_chunk_it_cannot_serve() {
     // Reopening is itself part of the assertion: a store that cannot start after a crash
     // is a node that cannot start.
     let store = reopen(&root).await;
-    for key in store.all_keys().await.expect("all_keys") {
+    // The child discards its put results and the failpoint counts arrivals, not successes,
+    // so every publish before the kill could in principle have failed. An empty store makes
+    // the loop below pass over nothing, which is the one outcome that would let this test
+    // report success having checked no chunk at all.
+    let held = store.all_keys().await.expect("all_keys");
+    assert!(
+        !held.is_empty(),
+        "the child published nothing before it was killed, so there is nothing to check"
+    );
+    for key in held {
         let served = store.get(&key).await;
         assert!(
             matches!(served, Ok(Some(_))),
