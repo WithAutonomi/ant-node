@@ -675,8 +675,10 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 
 /// Whether this build penalises a peer for not holding a chunk it was supposed to hold.
 ///
-/// **`true` while the fleet moves off the legacy LMDB chunk store; back to `false` once it
-/// has.** Flipping it is a one-line change in one release.
+/// **`false` again.** It was `true` for two releases while the fleet moved off the legacy
+/// LMDB chunk store, because a node that has to give up chunks cannot stop its peers
+/// penalising it for that, so the peers had to stop first. The fleet is on the file store
+/// now, so the accusation means what it used to mean and is enforced again.
 ///
 /// Deliberately narrow. It covers exactly one accusation: "you did not have a chunk you
 /// were supposed to be holding". It does **not** cover the commitment-bound subtree audit,
@@ -691,9 +693,15 @@ pub const AUDIT_FAILURE_TRUST_WEIGHT: f64 = 5.0;
 /// A build constant rather than a config field on purpose: a node writes its effective
 /// configuration back to disk, so shipping this as an ordinary setting would bake this
 /// release's value into every operator's file and the next release would change nothing.
-pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = true;
+pub const RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY: bool = false;
 
 /// Environment override for [`RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY`], for a canary.
+///
+/// Kept after the flip rather than removed with the rest of the bridge. It is the cheapest
+/// lever there is if restoring the penalty turns out to have been early, and the moment it
+/// is most likely to be needed is the release that restores it. It suspends only the
+/// penalties this node hands out, so an emergency suspension has to go to the fleet, not to
+/// the node being penalised.
 pub const SUSPEND_CLOSE_GROUP_STORAGE_PENALTY_ENV: &str = "ANT_SUSPEND_UNHELD_CHUNK_PENALTY";
 
 /// The live switch.
@@ -1439,6 +1447,26 @@ mod tests {
     /// would race each other under the default parallel runner.
     #[test]
     #[serial]
+    fn this_release_penalises_a_peer_for_not_holding_a_close_group_chunk() {
+        // The one assertion that names the value on purpose. The suspension existed for
+        // two releases so the fleet could move off a store that never returned disk, and
+        // leaving it on after that is a network that has quietly stopped enforcing the
+        // thing it suspended: nodes could drop close-group chunks and nobody would say so.
+        //
+        // A switch nobody notices is the failure this guards. Flipping it back is a
+        // legitimate emergency lever, and it should cost a deliberate edit to a test that
+        // says why, not a one-character change nothing reports.
+        // Asked of the live switch after applying this release's policy, rather than of
+        // the constant. Clippy rejects an assertion on a constant, and going through the
+        // switch is the better question anyway: what a node actually does.
+        apply_and_announce(RELEASE_SUSPEND_CLOSE_GROUP_STORAGE_PENALTY);
+        assert!(
+            !close_group_storage_penalty_suspended(),
+            "this release restores the penalty; suspending it again needs a reason"
+        );
+    }
+
+    #[test]
     fn the_unheld_chunk_penalty_switch_follows_the_release_it_is_compiled_into() {
         // A build that never applies the policy still behaves like THIS release, not the
         // previous one. `ReplicationEngine::new` is public and is constructed directly by
