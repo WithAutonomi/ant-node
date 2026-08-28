@@ -1102,12 +1102,12 @@ impl TestNetwork {
     ///
     /// # Arguments
     ///
-    /// * `data_dir` - Directory for LMDB storage
+    /// * `data_dir` - Directory for the chunk store
     /// * `payment_enforcement` - Whether to enable EVM payment verification
     ///
     /// # Errors
     ///
-    /// Returns an error if LMDB storage initialisation fails.
+    /// Returns an error if the chunk store cannot be opened.
     pub async fn create_ant_protocol(
         data_dir: &std::path::Path,
         evm_network: Option<EvmNetwork>,
@@ -1120,14 +1120,14 @@ impl TestNetwork {
     ///
     /// # Errors
     ///
-    /// Returns an error if LMDB storage initialisation fails.
+    /// Returns an error if the chunk store cannot be opened.
     pub async fn create_ant_protocol_with_disk_reserve(
         data_dir: &std::path::Path,
         evm_network: Option<EvmNetwork>,
         disk_reserve: u64,
         identity: &saorsa_core::identity::NodeIdentity,
     ) -> Result<AntProtocol> {
-        // Create LMDB storage
+        // Create the chunk store
         let storage_config = ChunkStoreConfig {
             root_dir: data_dir.to_path_buf(),
             disk_reserve,
@@ -1135,7 +1135,7 @@ impl TestNetwork {
         };
         let storage = ChunkStore::new(storage_config)
             .await
-            .map_err(|e| TestnetError::Core(format!("Failed to create LMDB storage: {e}")))?;
+            .map_err(|e| TestnetError::Core(format!("Failed to create the chunk store: {e}")))?;
 
         // Create payment verifier (EVM is always on).
         // When an EVM network is provided (e.g. Anvil), use it for on-chain verification.
