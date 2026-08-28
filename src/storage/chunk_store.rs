@@ -570,6 +570,19 @@ pub struct ChunkStore {
     /// same reason the shard is: a node's keys share their leading bytes, so lanes keyed
     /// on the first byte would all collapse into one.
     write_lanes: Arc<Vec<parking_lot::Mutex<()>>>,
+
+    /// One lock per shard, held across a whole logical transition for a key.
+    ///
+    /// Not the same thing as the write lanes above, which are taken inside a blocking
+    /// closure and make one file write atomic. These are held across await points, which is
+    /// what the races that matter need: a delete has to exclude a read that is deciding
+    /// whether to accept an offered copy, and both span an await. Without it a prune can
+    /// remove the file between that read and its answer, and the caller is told the chunk
+    /// is already held while the copy that would have replaced it is discarded.
+    ///
+    /// Indexed by the address's LAST byte, for the reason the shard is: a node's keys share
+    /// their leading bytes, so lanes keyed on the first would collapse into one.
+    key_locks: Arc<Vec<tokio::sync::Mutex<()>>>,
     /// Operation counters, same shape as the LMDB store reported.
     stats: parking_lot::RwLock<StorageStats>,
     /// Which of the 256 shard directories are known to exist, so a steady-state write
@@ -717,6 +730,11 @@ impl ChunkStore {
             config,
             chunks_dir,
             index: Arc::new(parking_lot::RwLock::new(index)),
+            key_locks: Arc::new(
+                std::iter::repeat_with(|| tokio::sync::Mutex::new(()))
+                    .take(SHARD_COUNT)
+                    .collect(),
+            ),
             write_lanes: Arc::new(
                 std::iter::repeat_with(|| parking_lot::Mutex::new(()))
                     .take(SHARD_COUNT)
@@ -981,6 +999,18 @@ impl ChunkStore {
         }
     }
 
+    /// Take the critical section for one key.
+    ///
+    /// Held across await points, unlike the write lanes, so a whole logical transition for
+    /// a key excludes another. `None` only if the table were empty, which it is not.
+    async fn key_lock(&self, address: &XorName) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        let lane = address.last().copied().unwrap_or(0) as usize;
+        match self.key_locks.get(lane) {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        }
+    }
+
     /// The address content hashes to.
     ///
     /// A convenience the old facade offered and callers still use, so it stays with the
@@ -1004,6 +1034,11 @@ impl ChunkStore {
     /// and not replaced either: the offer goes through the ordinary write path instead,
     /// which never truncates a healthy file on the strength of an unanswered question.
     pub async fn holds_verified(&self, address: &XorName, content: &[u8]) -> bool {
+        // The key's critical section for the whole check. Without it a prune can remove
+        // the file between the read below and this method's answer, and the caller is told
+        // the chunk is already held while the good copy it was offering is discarded.
+        let _lane = self.key_lock(address).await;
+
         if !self.is_indexed(address) {
             return false;
         }
@@ -1346,6 +1381,14 @@ impl ChunkStore {
     /// Returns [`Error::Storage`] if the file exists but cannot be removed. The index
     /// keeps the key in that case, because the bytes are still on disk.
     pub async fn delete(&self, address: &XorName) -> Result<bool> {
+        // The key's whole critical section, held across the wait below and the unlink.
+        let _lane = self.key_lock(address).await;
+        // Behind whatever is already writing this key, and only this key. A write's
+        // blocking half outlives the future that started it, so one landing after this
+        // would put back a chunk the node had decided to prune, and the next thing to look
+        // would find it in a store that no longer claims it.
+        self.wait_for_write(address).await;
+
         let path = self.chunk_path(address);
         let lanes = Arc::clone(&self.write_lanes);
         let index = Arc::clone(&self.index);
@@ -3229,6 +3272,70 @@ mod tests {
 
         let raw = store.get_raw(&addr).await.expect("get_raw").expect("bytes");
         assert_eq!(raw, b"tampered");
+    }
+
+    /// A delete outlasts a write nobody waited for.
+    ///
+    /// A write's blocking half outlives the future that started it, deliberately, so the
+    /// work is never left half done. That means a cancelled put can still be queued when a
+    /// delete arrives, and if the delete does not wait for it the write lands afterwards
+    /// and puts back a chunk the node had decided to prune. The key is then in a store that
+    /// no longer claims it, which is what the next verification has to clean up.
+    ///
+    /// This ordering had a regression test before the migration facade was deleted, and the
+    /// test went with the facade even though the requirement did not.
+    #[tokio::test]
+    // The gate is held across awaits deliberately: holding it is what parks the put, which
+    // is the state the delete has to be ordered against.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_delete_outlasts_a_write_nobody_waited_for() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = Arc::new(reopen(&dir).await);
+        let content = b"a chunk that is about to be pruned".to_vec();
+        let addr = crate::client::compute_address(&content);
+
+        // Park the put inside its closure, then drop the future waiting on it.
+        let gate = store.test_put_gate();
+        let held = gate.write();
+        let put = {
+            let store = Arc::clone(&store);
+            let content = content.clone();
+            tokio::spawn(async move { store.put(&addr, &content).await })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while store.tasks_in_flight() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the put never reached the closure"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        put.abort();
+        let _ = put.await;
+
+        // The delete must not finish ahead of that write. Released after the delete has
+        // had time to be waiting, so if it does not wait, it wins the race and the test
+        // catches it.
+        let deleting = {
+            let store = Arc::clone(&store);
+            tokio::spawn(async move { store.delete(&addr).await })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held);
+        let _ = deleting
+            .await
+            .expect("the delete task itself must not fail");
+        store.wait_idle().await;
+
+        assert!(
+            !store.is_indexed(&addr),
+            "the write landed after the delete and put {} back",
+            hex::encode(addr)
+        );
+        assert!(
+            !store.chunk_path(&addr).exists(),
+            "and left its file on disk"
+        );
     }
 
     /// A put whose caller goes away does not admit a key on bytes nothing has read.

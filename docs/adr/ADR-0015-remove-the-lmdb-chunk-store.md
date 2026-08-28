@@ -61,10 +61,22 @@ is the mark the retirement wrote *inside* the directory before deleting anything
 
 | what is on disk | what happens |
 |---|---|
-| nothing | start |
+| nothing, or a root that does not exist yet | start |
 | `chunks.mdb` or a tombstone carrying its `RETIRED` mark | start, warn that it is costing disk |
-| either one without that mark | refuse, and name the directory |
+| either one with nothing in it | start, warn that it can be removed |
+| either one, non-empty, without that mark | refuse, and name the directory |
 | either one whose mark cannot be read | refuse, and say which |
+| a root that cannot be read well enough to answer | refuse, and say so |
+
+The empty case is not a nicety. The previous release's cleanup emptied the directory,
+removed the mark and then removed the directory, so a crash between the last two steps
+leaves one that is empty, unmarked, and fully migrated. That release recognised the state
+and tidied it. Refusing over a directory with nothing in it would be an outage for
+bookkeeping.
+
+The check runs as soon as the root is known and before the transport is built. Asking later
+lets a bind failure mask the answer, and charges a node for a transport it is about to throw
+away.
 
 Three states rather than two, for the same reason the release that wrote those marks needed
 three: reading one can fail for a reason that is neither yes nor no, and folding that into

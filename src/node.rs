@@ -106,6 +106,19 @@ impl NodeBuilder {
         // Ensure root directory exists
         std::fs::create_dir_all(&self.config.root_dir)?;
 
+        // As soon as the root is known, and before anything is built on top of it. The
+        // store's own constructor asks this too, but a node with `storage.enabled = false`
+        // never builds a store and would walk straight past it, and turning storage off is
+        // not consent to run beside chunks this build cannot read while the commitment that
+        // claims them is still live.
+        //
+        // Ahead of the P2P node specifically. That binds transports and spawns background
+        // tasks, so asking afterwards means a bind failure can mask this answer, and a
+        // caller that does see the refusal has already been charged for a transport it is
+        // about to throw away.
+        crate::storage::legacy_artifacts::refuse_if_unmigrated(&self.config.root_dir)
+            .map_err(|e| Error::Startup(e.to_string()))?;
+
         // One release-level decision, applied before anything can audit. It was suspended
         // for two releases while the fleet moved off the old chunk store, because a node
         // that has to give chunks up cannot stop its peers punishing it for that. This
@@ -138,13 +151,6 @@ impl NodeBuilder {
         };
 
         let repl_config = ReplicationConfig::default();
-
-        // Before anything is built, and whether or not this node is going to open a store.
-        // The store's own constructor checks too, but a node with `storage.enabled = false`
-        // never reaches it, and "turn storage off" is not consent to run beside chunks this
-        // build cannot read while the commitment that claims them is still live.
-        crate::storage::legacy_artifacts::refuse_if_unmigrated(&self.config.root_dir)
-            .map_err(|e| Error::Startup(e.to_string()))?;
 
         // Initialize ANT protocol handler for chunk storage and
         // wire the fresh-write channel so PUTs trigger replication.
@@ -1100,6 +1106,28 @@ mod tests {
                  {said}"
             );
         }
+
+        // And it answers before the transport is built, not after. Asking afterwards means
+        // a bind failure masks this answer, and a caller that does see it has already been
+        // charged for a transport it is about to throw away. Staged with a privileged port,
+        // which an ordinary user cannot bind, so P2P construction would fail if it were
+        // reached: the refusal still has to be the one that comes back.
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("node");
+        let env = root.join(crate::storage::LEGACY_ENV_DIR);
+        std::fs::create_dir_all(&env).expect("mkdir");
+        std::fs::write(env.join("data.mdb"), b"never copied out").expect("seed");
+
+        let said = NodeBuilder::new(local_node_config(&root, 1))
+            .build()
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(
+            said.contains("chunks.mdb"),
+            "the store answer must come back before the transport is built, got: {said}"
+        );
     }
     use super::*;
     use crate::config::NODES_SUBDIR;
